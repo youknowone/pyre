@@ -310,18 +310,15 @@ impl W_ListObject {
             ListStrategy::Empty | ListStrategy::Size => 0,
             ListStrategy::SimpleRange | ListStrategy::Range => unsafe { range_list_length(self) },
             ListStrategy::Object => self.length_relaxed(),
-            // Direct rlist `length` field reads keep this helper in the
-            // annotator's structural subset.  The `.len()` wrappers take
-            // `&self` on the by-value storage struct, and the address of a GC
-            // substructure passed to a call is what `rewrite_op_getsubstruct`
-            // refuses ("only supported for gckind=raw"): each arm became an
-            // `abort/` in the jitcode and a traced `len(list)` could not
-            // descend through here.  A relaxed atomic load of the field
-            // itself lowers to the one word read the `len` fold records.
-            ListStrategy::Integer | ListStrategy::IntOrFloat => {
-                self.int_items.len.load(Ordering::Relaxed)
-            }
-            ListStrategy::Float => self.float_items.len.load(Ordering::Relaxed),
+            // rlist.py `ll_length` is the `list.int_len` / `list.float_len`
+            // oopspec leaf.  Keep that call boundary: jtransform lowers the
+            // nested `int_items.len` / `float_items.len` path to one field read
+            // off the list owner.  Inlining the Rust field path instead first
+            // materialises the by-value storage struct as a GC Ref and then
+            // reads through it, which is neither an RPython getsubstruct nor a
+            // valid pointer.
+            ListStrategy::Integer | ListStrategy::IntOrFloat => ll_list_int_length(self),
+            ListStrategy::Float => ll_list_float_length(self),
             ListStrategy::Bytes => self.bytes_items.len,
             ListStrategy::Ascii => self.ascii_items.len,
         }

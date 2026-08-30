@@ -140,8 +140,10 @@ pub fn get_instantiate(tp: &PyType) -> PyObjectRef {
 /// and let a subclass fall through to the MRO `lookup` path.
 ///
 /// A fresh builtin carries `w_class == get_instantiate(ob_type)` (see
-/// `w_int_new` etc.); the read-only singletons (`True` / `False` / `None` /
-/// `Ellipsis` / `NotImplemented`) leave `w_class` null and are always exact.
+/// `w_int_new` etc.); the specialised arity-2 tuple layouts instead carry the
+/// canonical `tuple` class, exactly as [`is_exact_tuple`] requires.  The
+/// read-only singletons (`True` / `False` / `None` / `Ellipsis` /
+/// `NotImplemented`) leave `w_class` null and are always exact.
 ///
 /// # Safety
 /// `obj` must be null or a valid `PyObjectRef`.
@@ -158,7 +160,22 @@ pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
     }
     unsafe {
         let w_class = (*obj).w_class;
-        w_class.is_null() || std::ptr::eq(w_class, get_instantiate(&*(*obj).ob_type))
+        if w_class.is_null() {
+            return true;
+        }
+        let ob_type = (*obj).ob_type;
+        use crate::specialisedtupleobject::{
+            SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
+        };
+        let builtin_class = if std::ptr::eq(ob_type, &SPECIALISED_TUPLE_II_TYPE)
+            || std::ptr::eq(ob_type, &SPECIALISED_TUPLE_FF_TYPE)
+            || std::ptr::eq(ob_type, &SPECIALISED_TUPLE_OO_TYPE)
+        {
+            get_instantiate(&TUPLE_TYPE)
+        } else {
+            get_instantiate(&*ob_type)
+        };
+        std::ptr::eq(w_class, builtin_class)
     }
 }
 
@@ -168,8 +185,7 @@ pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
 /// Unlike [`is_exact_builtin_instance`] this is correct for the specialised
 /// arity-2 tuples: they carry a distinct `ob_type`
 /// (`SPECIALISED_TUPLE_*_TYPE`) but a `w_class` of the canonical `tuple` type
-/// object, so `is_exact_type(t, &TUPLE_TYPE)` is `true` for them while
-/// `is_exact_builtin_instance` (which keys off `ob_type`) is not.  A user
+/// object, so `is_exact_type(t, &TUPLE_TYPE)` is `true` for them.  A user
 /// subclass retags `w_class` to its own type object and so is rejected.
 ///
 /// # Safety

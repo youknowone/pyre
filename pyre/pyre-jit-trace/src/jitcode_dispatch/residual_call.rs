@@ -6646,25 +6646,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // `len(x)` on an exact canonical list: inline the strategy-guarded
-    // length read (guard_value callable + guard_class + exact w_class +
-    // guard_value strategy + length getfield + wrapint) instead of the
-    // opaque `bh_call_fn(len_builtin, NULL, x)` residual — the shape the
-    // meta-tracer produces upstream (descroperation.py `_len` →
-    // `W_ListObject.length()`).  Read-only like the SUBSCR fold, so no
-    // sub-walk restriction; any non-matching shape falls through to the
-    // generic residual (SAFE).
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::BuiltinLen, || {
-            try_walker_specialize_builtin_len(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // `isinstance(x, C)` for a class whose metaclass is exactly `type`: the
     // answer is `issubtype`'s elidable MRO test on two promoted types
     // (typeobject.py), so pin both and bake it instead of leaving the opaque

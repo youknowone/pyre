@@ -675,10 +675,20 @@ unsafe fn w_tuple_getitem_known(obj: PyObjectRef, idx: usize) -> PyObjectRef {
 /// # Safety
 /// `obj` must point to a valid tuple of any of the four variants.
 pub unsafe fn w_tuple_len(obj: PyObjectRef) -> usize {
-    if is_specialised_tuple_ii(obj) || is_specialised_tuple_ff(obj) || is_specialised_tuple_oo(obj)
+    // specialisedtupleobject.py's three generated classes each implement
+    // `length()` as the constant `typelen`.  Dispatch on the payload vtable
+    // directly, as `w_tuple_getitem_known` does below: routing this through
+    // `py_type_check` makes the generated walk mix the user-visible canonical
+    // tuple class with the three payload layouts and can fall through to a
+    // `W_TupleObject.wrappeditems` read on an inline specialised payload.
+    let ob_type = unsafe { (*obj).ob_type };
+    if std::ptr::eq(ob_type, &SPECIALISED_TUPLE_II_TYPE)
+        || std::ptr::eq(ob_type, &SPECIALISED_TUPLE_FF_TYPE)
+        || std::ptr::eq(ob_type, &SPECIALISED_TUPLE_OO_TYPE)
     {
         return 2;
     }
+    debug_assert!(std::ptr::eq(ob_type, &TUPLE_TYPE));
     let tuple = &*(obj as *const W_TupleObject);
     items_block_capacity(tuple.wrappeditems)
 }

@@ -38,6 +38,54 @@ struct AttributeErrorInlineContext {
     name_concrete: pyre_object::PyObjectRef,
 }
 
+/// Whether this concrete receiver takes PyPy's installed `__len__` shortcut
+/// straight to a builtin layout's length body.
+///
+/// `typedef.py use_special_method_shortcut('__len__')` replaces the generic
+/// lookup in `descroperation.py _len` for builtin implementations.  The
+/// generated walk is execution-driven and therefore follows just that body,
+/// while [`descent_blocker_summary`] deliberately joins the generic error and
+/// override arms too.  Those arms contain formatting helpers after apparent
+/// effects and make the static pre-scan reject a clean exact-builtin walk.
+///
+/// This predicate emits no IR and proves no later value.  It only admits the
+/// generated body; that body still records the payload-class and promoted
+/// `w_class` guards which keep the recording-time shortcut valid at runtime.
+unsafe fn exact_builtin_len_shortcut_receiver(obj: pyre_object::PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let ob_type = unsafe { (*obj).ob_type };
+    let exact_w_class = if std::ptr::eq(ob_type, &pyre_object::pyobject::LIST_TYPE) {
+        // Keep the admission set equal to the retired direct emitter until a
+        // fixture proves each additional PyPy list strategy.  In particular,
+        // Bytes/Ascii and range strategies use different nested storage
+        // shapes; exact `list` alone does not prove their lowering.
+        if !(unsafe { pyre_object::w_list_uses_int_storage(obj) }
+            || unsafe { pyre_object::w_list_uses_float_storage(obj) }
+            || unsafe { pyre_object::w_list_uses_object_storage(obj) }
+            || unsafe { pyre_object::w_list_uses_empty_storage(obj) })
+        {
+            return false;
+        }
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE)
+    } else if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE)
+        || std::ptr::eq(ob_type, &pyre_object::pyobject::STR_TYPE)
+        || std::ptr::eq(ob_type, &pyre_object::bytesobject::BYTES_TYPE)
+        || std::ptr::eq(ob_type, &pyre_object::bytearrayobject::BYTEARRAY_TYPE)
+        || std::ptr::eq(ob_type, &pyre_object::setobject::SET_TYPE)
+        || std::ptr::eq(ob_type, &pyre_object::setobject::FROZENSET_TYPE)
+        || std::ptr::eq(ob_type, &pyre_object::functional::RANGE_TYPE)
+    {
+        pyre_object::pyobject::get_instantiate(unsafe { &*ob_type })
+    } else if specialised_pair_kind(ob_type).is_some() {
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE)
+    } else {
+        return false;
+    };
+    std::ptr::eq(unsafe { (*obj).w_class }, exact_w_class)
+}
+
 /// Where an element of a `defs_w` tuple lives, and therefore what the trace
 /// emits to read one.  `w_tuple_new` routes EVERY arity-2 tuple through
 /// `makespecialisedtuple2` (`specialisedtupleobject.py`), so a callee
@@ -4198,7 +4246,31 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         builtin_inline_decline!("wrapper body has no ref register", fnaddr);
         return Ok(None);
     }
-    if let Some(decline) = descent_decline(jitcode.index()) {
+    // PyPy installs the builtin `__len__` implementations through
+    // `use_special_method_shortcut`, so an exact builtin receiver enters its
+    // layout body without visiting the generic lookup/error arms.  Admit that
+    // execution path even when the body-wide safety scan sees a blocker on a
+    // different arm.  Suppressing the row restores the conservative scan and
+    // is the A/B proof that the generated descent, rather than a hand emitter,
+    // supplies the trace.
+    let builtin_len_shortcut = if receiver.is_none()
+        && r_args.len() == 3
+        && pyre_interpreter::builtins::is_builtin_len_function(callable)
+    {
+        let concrete_receiver = match arg_concretes.get(2) {
+            Some(ConcreteValue::Ref(obj)) => *obj,
+            _ => pyre_object::PY_NULL,
+        };
+        spec_gate(SpecFold::BuiltinLenDescent, || {
+            Ok::<Option<()>, DispatchError>(
+                unsafe { exact_builtin_len_shortcut_receiver(concrete_receiver) }.then_some(()),
+            )
+        })?
+        .is_some()
+    } else {
+        false
+    };
+    if !builtin_len_shortcut && let Some(decline) = descent_decline(jitcode.index()) {
         if matches!(decline, DescentDecline::Helper(_)) {
             log_descent_unlowered_helper_blockers(jitcode.index());
         }
