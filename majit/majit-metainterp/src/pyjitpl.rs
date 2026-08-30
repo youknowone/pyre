@@ -17022,6 +17022,11 @@ impl<M: Clone> MetaInterp<M> {
         _descr_ref: majit_ir::DescrRef,
         _descr_view: &dyn majit_ir::descr::CallDescr,
     ) -> Option<OpRef> {
+        // pyjitpl.py `assert self.staticdata.has_libffi_call`.
+        assert!(
+            self.staticdata.has_libffi_call,
+            "direct_libffi_call requires a codewriter-published libffi oopspec"
+        );
         // pyjitpl.py:3622-3624: box_cif_description = argboxes[1];
         //   if not isinstance(box_cif_description, ConstInt): return None
         let box_cif_description = *argboxes.get(1)?;
@@ -18744,6 +18749,9 @@ pub struct MetaInterpStaticData {
     /// pyjitpl.py `finish_setup(...)` populates this from
     /// `codewriter.callcontrol.callinfocollection`.
     pub callinfocollection: majit_ir::effectinfo::CallInfoCollection,
+    /// pyjitpl.py `self.has_libffi_call =
+    /// codewriter.callcontrol.has_libffi_call`.
+    pub has_libffi_call: bool,
     /// pyjitpl.py `self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd`.
     ///
     /// Indexed by `JitCode.jitdriver_sd` so `is_main_jitcode(jitcode)`
@@ -19214,9 +19222,7 @@ impl MetaInterpStaticData {
         self.callinfocollection = callcontrol.callinfocollection.clone();
 
         // pyjitpl.py `self.has_libffi_call = codewriter.callcontrol.has_libffi_call`
-        // TODO: pyre's `CallControl` has no
-        // `has_libffi_call` field; libffi handling is currently not
-        // implemented.
+        self.has_libffi_call = callcontrol.has_libffi_call;
 
         // pyjitpl.py:2273-2284
         //     exc_descr = compile.PropagateExceptionDescr()
@@ -23090,6 +23096,19 @@ mod metainterp_static_data_tests {
         // names were registered yet; the staticdata mirror must reflect
         // that empty state.
         assert!(sd.opcode_names.is_empty());
+    }
+
+    #[test]
+    fn finish_setup_copies_has_libffi_call() {
+        use majit_translate::codewriter::call::CallControl;
+        use majit_translate::codewriter::codewriter::CodeWriter;
+
+        let mut callcontrol = CallControl::new();
+        callcontrol.has_libffi_call = true;
+        let mut sd = MetaInterpStaticData::new();
+        sd.finish_setup(&CodeWriter::new(), &callcontrol);
+
+        assert!(sd.has_libffi_call);
     }
 
     #[test]

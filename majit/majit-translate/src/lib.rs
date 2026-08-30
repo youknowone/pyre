@@ -2018,6 +2018,28 @@ fn analyze_pipeline_from_module_paths(
         );
     }
 
+    // `LLHelpers.ll_str2unicode` owns
+    // `@jit.oopspec("str.str2unicode(str)")` in `rstr.py`.  Pyre's rtyper
+    // synthesizes that helper graph (`build_ll_str2unicode_helper_graph`), so
+    // it has no source-level Rust attribute for the hint harvester above to
+    // see. Attach the upstream function-owned oopspec to the synthesized
+    // graph name, just as the neighboring synthesized list and builder
+    // helpers receive theirs.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["ll_str2unicode"]),
+        "str.str2unicode(str)".to_string(),
+    );
+
+    // `ll_math.sqrt_nonneg` assigns
+    // `sqrt_nonneg.oopspec = "math.sqrt_nonneg(x)"` after the function
+    // definition. That owner is translator-provided rather than part of the
+    // extracted interpreter sources, so preserve the same function metadata
+    // on the helper path explicitly.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["sqrt_nonneg"]),
+        "math.sqrt_nonneg(x)".to_string(),
+    );
+
     // rbuilder.py `ll_shrink_final` calls `rgc.ll_shrink_array(buf, size)`,
     // whose `@jit.oopspec("rgc.ll_shrink_array")` is minted by the rtyper
     // (`rtype_builder_build`'s nested `ll_shrink_array` helper) with a stub
