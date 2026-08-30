@@ -7278,7 +7278,11 @@ fn drive_portal_metatrace(
         let started = meta.is_tracing();
         eprintln!(
             "[jd0-mt] force_start_tracing -> {}",
-            if started { "StartedTracing" } else { "NotTracing" }
+            if started {
+                "StartedTracing"
+            } else {
+                "NotTracing"
+            }
         );
         if !started {
             return;
