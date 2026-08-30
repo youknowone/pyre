@@ -4145,27 +4145,48 @@ impl majit_backend::Backend for WasmBackend {
                 });
             // The JUMP hands input `k` back at position `k` only when it
             // re-presents the state the guard failed on unchanged. One that
-            // reorders those inputs — or repeats one of them — starts the next
-            // pass from a different state vector, which is the same reasoning
-            // the heap carve-out below uses: the shield refuses PROVABLY static
-            // bridges, and a permuted state is not the byte-identical one the
-            // livelock argument rests on. An arg that is not an input reload at
-            // all (a baked constant, a fresh allocation) is static by itself
-            // and does not make the JUMP a permutation.
+            // reorders those inputs starts the next pass from a different state
+            // vector, which is the same reasoning the heap carve-out below
+            // uses: the shield refuses PROVABLY static bridges, and a permuted
+            // state is not the byte-identical one the livelock argument rests
+            // on. An arg that is not an input reload at all (a baked constant,
+            // a fresh allocation) is static by itself and does not make the
+            // JUMP a permutation.
+            //
+            // Reordering is not by itself enough, though. Read the arg list as
+            // a map from JUMP position to the input position it reloads: the
+            // state one pass produces is `s'[j] = s[source[j]]`, so a second
+            // pass leaves it unchanged exactly when every position a source
+            // names reloads ITSELF. `JUMP(input0, input0)` is the smallest
+            // case — it moves slot 0 into slot 1 once and is a fixed point from
+            // then on, so it re-presents byte-identical state and is refused
+            // here as any verbatim reload is. A source chain that is not
+            // stationary after one pass (a swap, a rotation) is admitted: its
+            // orbit does have a finite period, but the shield is a static
+            // approximation of the bridge alone — it does not model the loop
+            // body that runs between two passes, which is where such a bridge's
+            // advance actually comes from. Refusing one is not local to the
+            // bridge either: the decline registers the guard in
+            // `declined_bridge_guards`, which sends every later failure of it
+            // to blackhole resume.
             let permutes_inputs = ops
                 .iter()
                 .rev()
                 .find(|op| op.opcode == majit_ir::OpCode::Jump)
                 .is_some_and(|jump| {
-                    jump.getarglist()
+                    let sources: Vec<Option<usize>> = jump
+                        .getarglist()
                         .iter()
-                        .enumerate()
-                        .any(|(j, arg)| match arg {
+                        .map(|arg| match arg {
                             majit_ir::operand::Operand::InputArg(ia) => {
-                                input_pos.get(&ia.index).is_some_and(|&k| k != j)
+                                input_pos.get(&ia.index).copied()
                             }
-                            _ => false,
+                            _ => None,
                         })
+                        .collect();
+                    sources.iter().any(|source| {
+                        source.is_some_and(|k| sources.get(k).copied().flatten() != Some(k))
+                    })
                 });
             // Loop state carried on the HEAP (a permutation array flipped via
             // setarrayitem, an object field bumped via setfield, a residual
