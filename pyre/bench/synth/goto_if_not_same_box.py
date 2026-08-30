@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=5.6
+# pyre-check: max-pypy-ratio=5
+# Ubuntu run 33279264115: 2.5x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # pyre-check: skip-cpython
 # cpython 1.98s vs pyre 0.09s (22x), and it is not gated on — only pypy is.
 # Fused `goto_if_not_<cmp>` with the SAME box on both sides (`b1 is b2`).

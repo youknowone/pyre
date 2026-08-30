@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=31
+# pyre-check: max-pypy-ratio=19.6
+# Ubuntu run 33279264115: 5.6-9.8x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # The ratio is deliberately loose: pypy folds this loop to near nothing
 # (0.01s at any N tried), so the denominator is collapsed and the number
 # measures pypy's constant folding rather than pyre's throughput. What this

@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=26
+# pyre-check: max-pypy-ratio=18.4
+# Ubuntu run 33279264115: 9.2x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 N = 10000
 
 

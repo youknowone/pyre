@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=5.2
+# Ubuntu run 33279264115: 2.1-2.6x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # A module-scope LOAD_NAME whose name misses the module dict resolves through
 # the frame's builtin module.  The builtins cell folds under the module dict's
 # version? (so a later global binding shadows the builtin) and the builtins

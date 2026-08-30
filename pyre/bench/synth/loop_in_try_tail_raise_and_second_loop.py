@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=26
+# pyre-check: max-pypy-ratio=6.4
+# Ubuntu run 33279264115: 2.1-3.2x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # The post-loop tail itself is the raising region, and a second hot loop lives
 # after the handler.
 #

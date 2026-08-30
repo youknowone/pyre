@@ -1,9 +1,10 @@
-# pyre-check: max-pypy-ratio=18
+# pyre-check: max-pypy-ratio=6.4
+# Ubuntu run 33279264115: 1.3-3.2x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # The fixture predates the ratio-gate convention and carried no ceiling. It
 # compiles two loops and, at this trip count, pypy's execution clears the
 # startup-subtraction floor, so a ratio here is a measurement of generated
-# code rather than of two interpreters' startup. The ceiling is twice the
-# slowest of the three backends observed (8.6x on wasm).
+# code rather than of two interpreters' startup.
 # Regression oracle for the #14 inline-frame heap-store double-commit via the
 # loop-bearing-callee path. A loop-bearing callee that mutates a caller-owned
 # heap object inside its own loop double-commits the mutation when the outer

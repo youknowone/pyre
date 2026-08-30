@@ -349,20 +349,10 @@ FLOOR_GATE_MIN_BASELINE_S = 10 * EXEC_TIME_FLOOR_S
 # reporting that a ceiling has gone stale, so it sits at parity: reaching it is
 # the event worth a red run.
 PERF_GATE_FLOOR_RATIO = 1.0
-# Below a ceiling of this many times parity, a floor AT parity would sit inside
-# the band the ceiling itself allows, so the floor drops proportionally instead.
-#
-# The divisor is what lets ONE number bound a fixture at both ends, so it has to
-# clear the span that fixture reads across the runners TWICE OVER: a ceiling is
-# set at twice the slowest runner's ratio, and the derived floor still has to
-# land under the fastest runner's.  Measured over the runner logs, a fixture's
-# own ratio spans as much as 17.8x end to end (`defaults_reassigned_midloop`
-# reads 1.0x and 17.8x), and `class_attrs_methods` and
-# `foriter_inplace_immutable` are barely narrower -- so a ceiling honestly
-# fitted to the slow end sits ~36x above the fast end's reading.  A divisor
-# under that turns raising a ceiling into a floor failure on the fast runner,
-# which is the one way this pair of bounds can fight itself.
-PERF_GATE_FLOOR_DIVISOR = 40
+# A ceiling also sets a lower bound at one sixth of itself, capped at
+# parity.  A wider runner-to-runner spread is a measurement or fixture defect
+# to investigate, not slack for this global policy to absorb.
+PERF_GATE_FLOOR_DIVISOR = 6
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
 # quantized (see WIN_TIMER_QUANTUM_S above).
@@ -1832,9 +1822,8 @@ def wasm_ratio_gate(path):
 def perf_gate_floor(ceiling):
     """The pypy ratio a bench with this ceiling must not read below.
 
-    See `PERF_GATE_FLOOR_RATIO`: a bench is asked to reach parity, never to
-    stay slow, so the floor is parity itself until the ceiling comes close
-    enough that parity would sit inside the allowance.
+    Use one sixth of the ceiling, capped at parity so a benchmark is never
+    required to remain slower than pypy.
     """
     return min(PERF_GATE_FLOOR_RATIO, ceiling / PERF_GATE_FLOOR_DIVISOR)
 

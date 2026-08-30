@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=0.5
+# pyre-check: max-pypy-ratio=0.4
+# Ubuntu run 33279264115: 0.1-0.2x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # pyre-check: spec-folds=store_attr_direct
 try:
     import pypyjit

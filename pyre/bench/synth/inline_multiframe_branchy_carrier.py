@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=28
+# pyre-check: max-pypy-ratio=8
+# Ubuntu run 33279264115: 2.8-4x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # Module-scope hot loop inlining a 2-level call chain whose middle function has
 # a data-dependent branch — regression guard for the branchy inlined-callee
 # multi-frame carrier miscompile, in a pure and a journaled shape.

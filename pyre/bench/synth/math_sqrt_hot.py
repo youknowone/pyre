@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=1
+# pyre-check: max-pypy-ratio=0.6
+# Ubuntu run 33279264115: 0.2-0.3x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # The ceiling sits between the two measured states: folded this runs 0.1x
 # pypy, and with `math_isqrt` suppressed it runs about 2.1x.
 # pyre-check: skip-cpython

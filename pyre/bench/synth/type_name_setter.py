@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=9.7
+# pyre-check: max-pypy-ratio=7.2
+# Ubuntu run 33279264115: 2.6-3.6x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 N = 80000
 
 # Exercises the writable type.__name__ setter under the JIT: a successful

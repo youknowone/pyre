@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=20
+# pyre-check: max-pypy-ratio=15.4
+# Ubuntu run 33279264115: 3.5-7.7x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # pyre-check: skip-cpython
 # cpython 2.63s vs pyre 0.72s (3.7x on the ubuntu runner), and it is not
 # gated on — only pypy is.

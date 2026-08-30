@@ -1,12 +1,10 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=4.8
+# Ubuntu run 33279264115: 2-2.4x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # pyre-check: spec-folds=unary_negative_descent,unary_negative_int
 # The trip count puts pypy's execution above the startup-subtraction floor, so
-# this ratio is a measurement. The loop runs at parity: ubuntu 1.7x / 1.7x /
-# 1.6x (dynasm / cranelift / wasm), macos 1.1x / 0.6x, windows 1.2x / 1.5x.
-# The ceiling is twice the slowest of those, which puts the derived floor
-# `min(1, ceiling / PERF_GATE_FLOOR_DIVISOR)` at 0.2x -- 2.5x under the fastest
-# reading, so both bounds keep room. A ceiling far above the measurement would
-# disable the gate at BOTH ends, the floor included.
+# this ratio is a measurement. A ceiling far above the measurement would
+# disable the gate at both ends, the derived floor included.
 N = 38000000
 
 
