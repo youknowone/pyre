@@ -2685,6 +2685,12 @@ impl BlackholeInterpBuilder {
     /// `__init__`, which stores `self.cpu = builder.cpu`. We propagate
     /// the `cpu` field from the builder to each acquired interpreter.
     pub fn acquire_interp(&mut self) -> Box<BlackholeInterpreter> {
+        // `res` is the pooled object itself, not a copy of it: upstream
+        // returns the same instance the free list held, so a pool hit costs
+        // no allocation.  The Rust equivalent is to thread the `Box` through
+        // unchanged — moving the interpreter out of its box and re-boxing it
+        // in `release_interp` would malloc and free once per acquire/release
+        // pair, which is exactly what the free list exists to avoid.
         let mut bh = if let Some(mut head) = self.blackholeinterps.take() {
             self.blackholeinterps = head.back.take();
             head
@@ -4860,7 +4866,7 @@ mod tests {
             let mut inner = builder.acquire_interp();
             inner.nextblackholeinterp = Some(caller);
 
-            let mut frame = Some(&inner);
+            let mut frame = Some(&*inner);
             let mut depth = 0;
             while let Some(f) = frame {
                 assert_eq!(
@@ -4870,7 +4876,7 @@ mod tests {
                 );
                 assert_eq!(f.get_portal_runner(0).0, 0);
                 depth += 1;
-                frame = f.nextblackholeinterp.as_ref();
+                frame = f.nextblackholeinterp.as_deref();
             }
             assert_eq!(depth, 2, "expected a two-frame chain");
 
