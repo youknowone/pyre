@@ -9990,6 +9990,20 @@ fn exception_group_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 enum ExceptionGroupCondition {
     Class(PyObjectRef),
     Callable(PyObjectRef),
+    /// `app_group.py _exception_group_projection`'s `resultset`, which upstream
+    /// keeps as an `identity_dict` of the leaf objects.
+    ///
+    /// Addresses stand in for the objects here, and that is sound only because
+    /// every member is an exception: `w_exception_new_empty_impl` allocates one
+    /// through `try_gc_alloc_stable_raw`, the non-moving oldgen, precisely so a
+    /// carrier may hold it as a bare word across allocating code, and
+    /// `check_new_args` refuses a group member that is not a `BaseException`.
+    /// The walk between collecting these and testing the last child runs
+    /// arbitrary Python -- an overridden `derive`, a metaclass
+    /// `__instancecheck__`, a callable condition -- so were a leaf ever
+    /// nursery-allocated, a minor collection there would relocate one not yet
+    /// tested and this set would silently drop it.
+    /// `except_star_projection_gc_roots` is the guard on that invariant.
     Identity(Vec<usize>),
 }
 
