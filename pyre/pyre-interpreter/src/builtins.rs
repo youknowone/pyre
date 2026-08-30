@@ -3366,7 +3366,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         make_module_builtin_function_with_arity("globals", builtin_globals, 0)
     });
     crate::module_ns_get_or_insert_with(ns, "locals", || {
-        make_module_builtin_function_with_arity("locals", builtin_locals, 0)
+        make_module_builtin_function_with_arity("locals", __majit_wrap_builtin_locals, 0)
     });
     crate::module_ns_get_or_insert_with(ns, "exec", || {
         make_module_builtin_function("exec", builtin_exec)
@@ -16246,7 +16246,15 @@ fn topframe_for_locals() -> *mut crate::PyFrame {
     // The force materializes the fastlocals through a backend hook whose callee
     // this crate cannot follow, so it is judged as able to collect.
     let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-    crate::executioncontext::force_frame_before_locals_read(frame);
+    // Spelled as the marker, not as a direct `force_frame_before_locals_read`.
+    // Both bodies are the same call, but only this name is what
+    // `jtransform.py rewrite_op_jit_force_virtualizable` deletes, and this
+    // graph now HAS a jitcode: `__majit_wrap_builtin_locals` puts `locals`
+    // in the `BuiltinCode.func` family, so the codewriter looks inside here.
+    // A direct force would survive into the traced copy and force a
+    // virtualizable the trace is meanwhile keeping symbolic; the residual
+    // copy still runs the body and still forces.
+    crate::executioncontext::jit_force_virtualizable(frame);
     anchor.live()
 }
 
@@ -16270,6 +16278,30 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let frame_mut = unsafe { &mut *frame };
     frame_mut.frame_locals_snapshot()
 }
+
+/// `BuiltinCode.func` PBC member for `locals`.
+///
+/// Builtins installed by hand must publish one, or
+/// `CallControl::compute_builtin_wrapper_indirect_graphs` leaves the builtin
+/// out of the family, `get_jitcode` is never called for its body, and the
+/// walker declines the CALL with `no jitcode for address` — measured on
+/// `locals_proxy_extra_key_hot`, where `locals` was one of three such names.
+///
+/// Unlike `__majit_wrap_builtin_len` this adds no JIT-shaped body: `locals`
+/// takes no arguments, so there is no args-array element read whose shape the
+/// gateway descent walker's heap-cache keys have to match.
+pub fn __majit_wrap_builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_locals(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_builtin_locals_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_builtin_locals"),
+        func: __majit_wrap_builtin_locals,
+    };
 
 fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
