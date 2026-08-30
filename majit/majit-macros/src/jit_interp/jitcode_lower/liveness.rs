@@ -327,12 +327,16 @@ pub(super) fn remove_repeated_live(
             }
         }
         if markers.len() == 1 {
-            new_meta.push(op_metadata[first_marker_idx].clone());
-            new_stmts.push(statements[first_marker_idx].clone());
+            // RPython `remove_repeated_live`: labels collected after a lone
+            // `-live-` still move in front of it.  A jump to one of those
+            // labels must execute the liveness snapshot too; retaining the
+            // original `live, label` order lets that entry path skip it.
             for li in &interleaved_labels {
                 new_meta.push(op_metadata[*li].clone());
                 new_stmts.push(statements[*li].clone());
             }
+            new_meta.push(op_metadata[first_marker_idx].clone());
+            new_stmts.push(statements[first_marker_idx].clone());
             continue;
         }
         // TODO: `liveness.py remove_repeated_live`
