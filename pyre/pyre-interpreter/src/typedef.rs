@@ -16720,6 +16720,10 @@ fn cell_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
 /// the version oracle where it differs: its public cell type deliberately
 /// omits PyPy 3.11's `__reduce__` and `__setstate__` pickle hooks.
 fn init_cell_type(ns: PyObjectRef) {
+    let new_descr = make_new_descr_with_doc(
+        cell_descr_new,
+        "Create and return a new object.  See help(type) for accurate signature.",
+    );
     let entries = [
         (
             "__doc__",
@@ -16727,39 +16731,92 @@ fn init_cell_type(ns: PyObjectRef) {
                 "Create a new cell object.\n\n  contents\n    the contents of the cell. If not specified, the cell will be empty,\n    and \n further attempts to access its cell_contents attribute will\n    raise a ValueError.",
             ),
         ),
-        ("__new__", make_new_descr(cell_descr_new)),
+        ("__new__", new_descr),
         (
             "__eq__",
-            make_builtin_function_with_arity("__eq__", cell_descr_eq, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__eq__",
+                cell_descr_eq,
+                2,
+                "Return self==value.",
+            ),
         ),
         (
             "__ne__",
-            make_builtin_function_with_arity("__ne__", cell_descr_ne, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__ne__",
+                cell_descr_ne,
+                2,
+                "Return self!=value.",
+            ),
         ),
         (
             "__lt__",
-            make_builtin_function_with_arity("__lt__", cell_descr_lt, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__lt__",
+                cell_descr_lt,
+                2,
+                "Return self<value.",
+            ),
         ),
         (
             "__gt__",
-            make_builtin_function_with_arity("__gt__", cell_descr_gt, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__gt__",
+                cell_descr_gt,
+                2,
+                "Return self>value.",
+            ),
         ),
         (
             "__le__",
-            make_builtin_function_with_arity("__le__", cell_descr_le, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__le__",
+                cell_descr_le,
+                2,
+                "Return self<=value.",
+            ),
         ),
         (
             "__ge__",
-            make_builtin_function_with_arity("__ge__", cell_descr_ge, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__ge__",
+                cell_descr_ge,
+                2,
+                "Return self>=value.",
+            ),
         ),
         ("__hash__", w_none()),
         (
             "__repr__",
-            make_builtin_function_with_arity("__repr__", cell_descr_repr, 1),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__repr__",
+                cell_descr_repr,
+                1,
+                "Return repr(self).",
+            ),
         ),
     ];
     for (name, value) in entries {
         unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    // PyPy `Cell.typedef` supplies the callable carriers above in its source
+    // order.  [3.14-spec] CPython 3.14's cell slots expose these public
+    // signatures and docs; attach only the metadata after the PyPy-shaped
+    // registration rather than replacing any cell operation.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__repr__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("cell TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
     // `nestedscope.py descr__cell_contents`:
     //

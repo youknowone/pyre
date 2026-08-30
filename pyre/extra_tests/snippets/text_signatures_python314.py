@@ -1055,6 +1055,39 @@ EXPECTED_TYPES = {
 for owner, signature in EXPECTED_TYPES.items():
     assert owner.__text_signature__ == signature, (owner, owner.__text_signature__)
 
+
+# cell_text_signatures_python314
+
+EXPECTED_CELL_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__eq__": "($self, value, /)",
+    "__ne__": "($self, value, /)",
+    "__lt__": "($self, value, /)",
+    "__le__": "($self, value, /)",
+    "__gt__": "($self, value, /)",
+    "__ge__": "($self, value, /)",
+    "__repr__": "($self, /)",
+}
+check_descriptors(types.CellType, EXPECTED_CELL_METHODS)
+
+EXPECTED_CELL_DOCS = {
+    "__new__": "Create and return a new object.  See help(type) for accurate signature.",
+    "__eq__": "Return self==value.",
+    "__ne__": "Return self!=value.",
+    "__lt__": "Return self<value.",
+    "__le__": "Return self<=value.",
+    "__gt__": "Return self>value.",
+    "__ge__": "Return self>=value.",
+    "__repr__": "Return repr(self).",
+}
+for name, doc in EXPECTED_CELL_DOCS.items():
+    assert getattr(types.CellType, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.CellType.__new__)) == "(*args, **kwargs)"
+assert str(inspect.signature(types.CellType.__eq__)) == "(self, value, /)"
+assert str(inspect.signature(types.CellType.__repr__)) == "(self, /)"
+
+
 assert types.CodeType.__dict__["__new__"].__text_signature__ == "($type, *args, **kwargs)"
 assert str(inspect.signature(types.CodeType.__new__)) == "(*args, **kwargs)"
 assert types.CodeType.__new__.__doc__ == (
