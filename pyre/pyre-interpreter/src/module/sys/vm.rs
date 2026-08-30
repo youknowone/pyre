@@ -948,39 +948,20 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// a stub, so `frame.f_globals is globals()` holds and `f_back` chains lazily
 /// through `pyframe.py GetSetProperty(PyFrame.fget_f_back)`.
 ///
-/// DEVIATION — the VIRTUALIZABLE force on `current`. The vref force is common
-/// to both worlds and is not optional (`ExecutionContext::gettopframe_raw`), so
-/// `gettopframe_nohidden` is not "force-free" — it is free of the
-/// *virtualizable* force. Upstream takes neither, because
-/// `look_inside_iff(isconstant(depth))` traces a constant `depth` THROUGH, so
-/// the walk never becomes a residual call — and the frame it hands to app level
-/// materialises through the force `rvirtualizable.py hook_access_field`
-/// injects at every redirected FIELD access, which
-/// `jtransform.py rewrite_op_jit_force_virtualizable` deletes only in
-/// the graphs the codewriter looks inside.  Pyre has no such injection —
-/// `rclass.rs buildinstancerepr` declines a virtualizable `InstanceRepr`
-/// outright — so the `force_frame` below IS that mechanism, relocated to one
-/// consumer.
+/// The walk takes no virtualizable force.  This is load-bearing upstream
+/// structure, not merely a fast path: `getframe` follows `f_backref`, marks the
+/// result escaped and returns it.  `rvirtualizable.py hook_access_field` puts
+/// `jit_force_virtualizable` at the later redirected FIELD access, and
+/// `jtransform.py rewrite_op_jit_force_virtualizable` deletes it only from a
+/// graph the codewriter looks inside.  Pyre mirrors that split in the manual
+/// frame descriptor gateways (`pyframe.rs __majit_wrap_descr_typecheck_fget_*`): their
+/// runtime bodies retain the marker, while every gateway is published through
+/// `BUILTIN_WRAPPER_DESCRIPTORS` so the JIT sees and deletes it.
 ///
-/// It is relocated onto the frame the injection would have fired for: the one
-/// this call RETURNS, whose `f_lineno` / `f_locals` app code is about to read.
-/// The walk itself needs no such force. It reads `hide()` (`pycode`, written at
-/// construction) and `f_backref` (not a virtualizable field at all), and a level
-/// the JIT kept virtual is materialised by the vref force
-/// `gettopframe_nohidden` already takes.
-///
-/// Which frame carries the force decides whether the caller's loop survives.
-/// `force_pyframe` (`pyre-jit/src/eval.rs`) clears the traced virtualizable's
-/// `TOKEN_TRACING_RESCALL` only for a frame `flush_active_frame_escape` matches
-/// — the portal itself, or the concrete frame an inline sub-walk published — and
-/// that clear is what `tracing_after_residual_call` reads as
-/// `VableEscapedDuringResidualCall`. Forcing the top of the stack regardless of
-/// `depth` therefore escaped the portal on every call, including the ones whose
-/// answer lies BELOW it; upstream escapes nothing there, because
-/// `pyjitpl.py _do_jit_force_virtual` answers `topframeref` with
-/// `virtualizable_boxes[-1]` and never forces it. Measured over the `getframe_*`
-/// corpus: five fixtures that had never compiled a loop now compile one, and the
-/// two bridge fixtures read `guard_failures` 4114 → 201.
+/// Putting the force here, before the consumer is known, is not an equivalent
+/// relocation.  Inside a `CALL_MAY_FORCE` it clears `TOKEN_TRACING_RESCALL`, so
+/// `vable_after_residual_call` aborts a trace even when the caller only asks for
+/// frame identity or an invariant field whose gateway the JIT can see.
 ///
 /// `try_walker_specialize_sys_getframe`
 /// (`pyre-jit-trace/src/jitcode_dispatch/specialize.rs`) reproduces upstream's
@@ -1018,17 +999,9 @@ pub fn getframe(depth: i64) -> crate::PyResult {
         current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
     }
     unsafe { (*current).mark_as_escaped() };
-    // The force reaches the JIT's virtualizable writeback through a backend
-    // hook whose callee this crate cannot follow, and the audit hook below is
-    // handed this frame.
-    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
-    crate::executioncontext::force_frame(current);
-    current = anchor.live();
-    // `vm.py audit(space, "sys._getframe", [f])`.  Ordered after the force
-    // because a hook is app code that reads the frame it is handed, and the
-    // force is what makes those reads see the JIT's live virtualizable fields —
-    // upstream gets that ordering from the `hook_access_field` injection at
-    // each field read, which pyre has relocated to this one call site.
+    // `vm.py audit(space, "sys._getframe", [f])`.  The event follows
+    // `mark_as_escaped`; a hook that reads a redirected frame field reaches
+    // that field's descriptor gateway and forces there.
     if audit_hooks_armed() {
         // The wrap of the event name and the hooks themselves are both
         // collection points, and the frame this is about to return reaches them
@@ -2040,7 +2013,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // forcing a walk escapes the traced virtualizable and
             // `vable_after_residual_call` aborts the trace with ABORT_ESCAPE.
             let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
-            crate::executioncontext::force_frame(current);
+            crate::executioncontext::jit_force_virtualizable(anchor.live());
             let w_globals = unsafe { (*anchor.live()).get_w_globals() };
             if w_globals.is_null() {
                 return Ok(pyre_object::w_none());

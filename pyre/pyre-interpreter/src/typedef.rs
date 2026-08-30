@@ -8732,8 +8732,11 @@ fn init_frame_type(ns: PyObjectRef) {
     }
 
     // f_code — read-only; the `PyCode` wrapper (pyframe.py fget_code).
-    let code_getter =
-        make_builtin_function_with_arity("f_code", crate::pyframe::descr_typecheck_fget_f_code, 2);
+    let code_getter = make_builtin_function_with_arity(
+        "f_code",
+        crate::pyframe::__majit_wrap_descr_typecheck_fget_f_code,
+        2,
+    );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -8745,7 +8748,7 @@ fn init_frame_type(ns: PyObjectRef) {
     // f_globals — read-only (pyframe.py fget_w_globals).
     let globals_getter = make_builtin_function_with_arity(
         "f_globals",
-        crate::pyframe::descr_typecheck_get_w_globals,
+        crate::pyframe::__majit_wrap_descr_typecheck_get_w_globals,
         2,
     );
     unsafe {
@@ -8774,8 +8777,11 @@ fn init_frame_type(ns: PyObjectRef) {
     };
 
     // f_back — read-only; the next non-hidden frame (pyframe.py:767).
-    let back_getter =
-        make_builtin_function_with_arity("f_back", crate::pyframe::descr_typecheck_fget_f_back, 2);
+    let back_getter = make_builtin_function_with_arity(
+        "f_back",
+        crate::pyframe::__majit_wrap_descr_typecheck_fget_f_back,
+        2,
+    );
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -8790,7 +8796,7 @@ fn init_frame_type(ns: PyObjectRef) {
     // internally through get_generator(); surface that exact backlink.
     let generator_getter = make_builtin_function_with_arity(
         "f_generator",
-        crate::pyframe::descr_typecheck_get_generator,
+        crate::pyframe::__majit_wrap_descr_typecheck_get_generator,
         2,
     );
     unsafe {
@@ -8803,10 +8809,10 @@ fn init_frame_type(ns: PyObjectRef) {
 
     // f_lasti — read-only bytecode offset (pyframe.py:770).  Both
     // adaptations live on the wrapper; see
-    // [`crate::pyframe::descr_typecheck_fget_f_lasti`].
+    // [`crate::pyframe::__majit_wrap_descr_typecheck_fget_f_lasti`].
     let lasti_getter = make_builtin_function_with_arity(
         "f_lasti",
-        crate::pyframe::descr_typecheck_fget_f_lasti,
+        crate::pyframe::__majit_wrap_descr_typecheck_fget_f_lasti,
         2,
     );
     unsafe {
@@ -8820,7 +8826,7 @@ fn init_frame_type(ns: PyObjectRef) {
     // f_builtins — read-only builtin dict (pyframe.py:761).
     let builtins_getter = make_builtin_function_with_arity(
         "f_builtins",
-        crate::pyframe::descr_typecheck_fget_f_builtins,
+        crate::pyframe::__majit_wrap_descr_typecheck_fget_f_builtins,
         2,
     );
     unsafe {
@@ -8838,12 +8844,12 @@ fn init_frame_type(ns: PyObjectRef) {
     // target (only permitted from within a trace function).
     let lineno_getter = make_builtin_function_with_arity(
         "f_lineno",
-        crate::pyframe::descr_typecheck_fget_f_lineno,
+        crate::pyframe::__majit_wrap_descr_typecheck_fget_f_lineno,
         2,
     );
     let lineno_setter = make_builtin_function_with_arity(
         "f_lineno",
-        crate::pyframe::descr_typecheck_fset_f_lineno,
+        crate::pyframe::__majit_wrap_descr_typecheck_fset_f_lineno,
         3,
     );
     unsafe {
@@ -8862,17 +8868,17 @@ fn init_frame_type(ns: PyObjectRef) {
     // f_trace — read/write/delete (pyframe.py:773-785).
     let trace_getter = make_builtin_function_with_arity(
         "f_trace",
-        crate::pyframe::descr_typecheck_fget_f_trace,
+        crate::pyframe::__majit_wrap_descr_typecheck_fget_f_trace,
         2,
     );
     let trace_setter = make_builtin_function_with_arity(
         "f_trace",
-        crate::pyframe::descr_typecheck_fset_f_trace,
+        crate::pyframe::__majit_wrap_descr_typecheck_fset_f_trace,
         3,
     );
     let trace_deleter = make_builtin_function_with_arity(
         "f_trace",
-        crate::pyframe::descr_typecheck_fdel_f_trace,
+        crate::pyframe::__majit_wrap_descr_typecheck_fdel_f_trace,
         2,
     );
     unsafe {
@@ -8886,12 +8892,12 @@ fn init_frame_type(ns: PyObjectRef) {
     // f_trace_lines — read/write bool (pyframe.py:787-791).
     let trace_lines_getter = make_builtin_function_with_arity(
         "f_trace_lines",
-        crate::pyframe::descr_typecheck_fget_f_trace_lines,
+        crate::pyframe::__majit_wrap_descr_typecheck_fget_f_trace_lines,
         2,
     );
     let trace_lines_setter = make_builtin_function_with_arity(
         "f_trace_lines",
-        crate::pyframe::descr_typecheck_fset_f_trace_lines,
+        crate::pyframe::__majit_wrap_descr_typecheck_fset_f_trace_lines,
         3,
     );
     unsafe {
@@ -8910,12 +8916,12 @@ fn init_frame_type(ns: PyObjectRef) {
     // f_trace_opcodes — read/write bool (pyframe.py:793-797).
     let trace_opcodes_getter = make_builtin_function_with_arity(
         "f_trace_opcodes",
-        crate::pyframe::descr_typecheck_fget_f_trace_opcodes,
+        crate::pyframe::__majit_wrap_descr_typecheck_fget_f_trace_opcodes,
         2,
     );
     let trace_opcodes_setter = make_builtin_function_with_arity(
         "f_trace_opcodes",
-        crate::pyframe::descr_typecheck_fset_f_trace_opcodes,
+        crate::pyframe::__majit_wrap_descr_typecheck_fset_f_trace_opcodes,
         3,
     );
     unsafe {

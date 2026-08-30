@@ -82,7 +82,15 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// `#[inline(never)]` keeps the callee name on the Call so the rewrite can
 /// see it.
 ///
-/// # Reach, and why the readers do not carry it
+/// # Reach: gateways, not redirected-array readers
+///
+/// Manual frame getset gateways publish their bodies through
+/// `gateway::BUILTIN_WRAPPER_DESCRIPTORS`, the Rust counterpart of
+/// `BuiltinCode.func`'s SomePBC family.  Each gateway carries this marker next
+/// to its redirected access.  The untranslated interpreter therefore retains
+/// the force, while `jtransform` deletes it from every gateway graph admitted
+/// by the codewriter — the same two populations `hook_access_field` creates
+/// upstream.
 ///
 /// Upstream reaches the rewrite because `hook_access_field` puts the marker
 /// at every redirected FIELD access, which lands it inside graphs the
@@ -110,9 +118,9 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// `__majit_wrap_descr_typecheck_fget_getdictscope` gateway, so a marker at the readers
 /// is redundant where it would matter and new only where it costs.
 ///
-/// So the readers carry no force.
+/// So the redirected-array readers carry no force.
 ///
-/// The other force sites call [`force_frame`] or
+/// Non-gateway force sites call [`force_frame`] or
 /// [`force_frame_before_locals_read`] directly, and only two of them sit in
 /// a graph that has a jitcode — `pyframe.rs`
 /// `FrameLocalsProxy::force_locals` and `builtins.rs`

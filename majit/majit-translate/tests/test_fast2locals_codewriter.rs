@@ -134,10 +134,60 @@ fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
     );
 }
 
+/// Every hand-written frame getset is an interp2app gateway on the same terms
+/// as `f_locals`: the untranslated interpreter keeps the residual force, and
+/// the codewriter deletes it before lowering the redirected field access.
+///
+/// Keeping this as one census is deliberate.  The bug this guards was a
+/// structural split where only `f_locals` published a candidate graph; a set
+/// of independent happy-path tests would let the next manually-added frame
+/// descriptor fall outside the family again.
+#[test]
+fn every_redirected_frame_getter_carries_a_deletable_force() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    for leaf in [
+        "__majit_wrap_descr_typecheck_fget_f_code",
+        "__majit_wrap_descr_typecheck_get_w_globals",
+        "__majit_wrap_descr_typecheck_fget_f_back",
+        "__majit_wrap_descr_typecheck_fget_f_lasti",
+        "__majit_wrap_descr_typecheck_fget_f_builtins",
+        "__majit_wrap_descr_typecheck_fget_f_lineno",
+        "__majit_wrap_descr_typecheck_fget_f_trace",
+        "__majit_wrap_descr_typecheck_fget_f_trace_lines",
+        "__majit_wrap_descr_typecheck_fget_f_trace_opcodes",
+    ] {
+        let gateway = lower_named(&llbc, leaf);
+        let before = call_leafs(&gateway);
+        assert!(
+            before
+                .iter()
+                .any(|callee| callee == "jit_force_virtualizable"),
+            "{leaf} must retain the residual force in the interpreter graph, got {before:?}",
+        );
+        let transformed = majit_translate::transform_graph(&gateway, &config());
+        let after = call_leafs(&transformed.graph);
+        assert!(
+            after
+                .iter()
+                .all(|callee| callee != "jit_force_virtualizable"),
+            "{leaf}: rewrite_op_jit_force_virtualizable left the marker in jitcode: {after:?}",
+        );
+    }
+}
+
 /// The virtualizable configuration the production pipeline passes
 /// (`pyre-jit-trace/src/virtualizable_spec.rs PYFRAME_VABLE_ARRAYS`).
 fn config() -> GraphTransformConfig {
     GraphTransformConfig {
+        vable_fields: ["last_instr", "pycode", "valuestackdepth", "debugdata"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                VirtualizableFieldDescriptor::new(name, Some("PyFrame".to_string()), index)
+            })
+            .collect(),
         vable_arrays: vec![VirtualizableFieldDescriptor::new(
             "locals_cells_stack_w",
             Some("PyFrame".to_string()),
