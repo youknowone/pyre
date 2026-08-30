@@ -2189,6 +2189,7 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "coroutine_wrapper" => pyre_object::generator::is_coroutine_wrapper,
         "async_generator_asend" => pyre_object::generator::is_async_gen_asend,
         "async_generator_athrow" => pyre_object::generator::is_async_gen_athrow,
+        "types.SimpleNamespace" => crate::module::sys::vm::is_simple_namespace,
         "property" => pyre_object::descriptor::is_property,
         "super" => pyre_object::descriptor::is_super,
     }
@@ -9508,7 +9509,7 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         "__class_getitem__",
         crate::_pypy_generic_alias::generic_alias_class_getitem,
         2,
-        "See PEP 585",
+        "mappingproxy objects are generic over two types, signifying (respectively) the types of their keys and values",
     );
     unsafe {
         crate::function::fset_func_text_signature(class_getitem, w_str_new("($type, object, /)"))
@@ -29172,7 +29173,7 @@ fn init_generator_type(ns: PyObjectRef) {
         "__class_getitem__",
         crate::_pypy_generic_alias::generic_alias_class_getitem,
         2,
-        "See PEP 585",
+        "generators are generic over the types of their yield, send, and return values",
     ));
     let signature_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_str_new("($type, object, /)"));
@@ -29350,7 +29351,7 @@ fn init_coroutine_type(ns: PyObjectRef) {
         "__class_getitem__",
         crate::_pypy_generic_alias::generic_alias_class_getitem,
         2,
-        "See PEP 585",
+        "coroutines are generic over the types of their yield, send, and return values",
     ));
     let signature_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_str_new("($type, object, /)"));
@@ -29586,7 +29587,7 @@ fn init_async_generator_type(ns: PyObjectRef) {
         "__class_getitem__",
         crate::_pypy_generic_alias::generic_alias_class_getitem,
         2,
-        "See PEP 585",
+        "async generators are generic over the types of their yield and send values",
     ));
     let signature_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_str_new("($type, object, /)"));

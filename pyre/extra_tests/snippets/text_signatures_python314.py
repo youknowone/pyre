@@ -1148,7 +1148,7 @@ EXPECTED_GENERATOR_DOCS = {
     "__iter__": "Implement iter(self).",
     "__del__": "Called when the instance is about to be destroyed.",
     "__sizeof__": "gen.__sizeof__() -> size of gen in memory, in bytes",
-    "__class_getitem__": "See PEP 585",
+    "__class_getitem__": "generators are generic over the types of their yield, send, and return values",
 }
 for name, doc in EXPECTED_GENERATOR_DOCS.items():
     assert getattr(types.GeneratorType, name).__doc__ == doc, name
@@ -1181,7 +1181,7 @@ EXPECTED_COROUTINE_DOCS = {
     ),
     "close": "close() -> raise GeneratorExit inside coroutine.",
     "__sizeof__": "gen.__sizeof__() -> size of gen in memory, in bytes",
-    "__class_getitem__": "See PEP 585",
+    "__class_getitem__": "coroutines are generic over the types of their yield, send, and return values",
 }
 for name, doc in EXPECTED_COROUTINE_DOCS.items():
     assert getattr(types.CoroutineType, name).__doc__ == doc, name
@@ -1215,7 +1215,7 @@ EXPECTED_ASYNC_GENERATOR_DOCS = {
     ),
     "aclose": "aclose() -> raise GeneratorExit inside generator.",
     "__sizeof__": "gen.__sizeof__() -> size of gen in memory, in bytes",
-    "__class_getitem__": "See PEP 585",
+    "__class_getitem__": "async generators are generic over the types of their yield and send values",
 }
 for name, doc in EXPECTED_ASYNC_GENERATOR_DOCS.items():
     assert getattr(types.AsyncGeneratorType, name).__doc__ == doc, name
@@ -1408,7 +1408,10 @@ EXPECTED_MAPPINGPROXY_DOCS = {
     "__ror__": "Return value|self.",
     "__ior__": "Return self|=value.",
     "__reversed__": "D.__reversed__() -> reverse iterator",
-    "__class_getitem__": "See PEP 585",
+    "__class_getitem__": (
+        "mappingproxy objects are generic over two types, signifying "
+        "(respectively) the types of their keys and values"
+    ),
     "get": "Return the value for key if key is in the mapping, else default.",
     "keys": "D.keys() -> a set-like object providing a view on D's keys",
     "values": "D.values() -> an object providing a view on D's values",
@@ -1553,6 +1556,51 @@ assert str(inspect.signature(types.MethodType.__get__)) == "(self, instance, own
 
 assert str(inspect.signature(types.MethodType)) == "(function, instance, /)"
 assert str(inspect.signature(types.ModuleType)) == "(name, doc=None)"
+
+
+# simple_namespace_text_signatures_python314
+
+assert types.SimpleNamespace.__doc__ == "A simple attribute-based namespace."
+assert types.SimpleNamespace.__text_signature__ == (
+    "(mapping_or_iterable=(), /, **kwargs)"
+)
+EXPECTED_SIMPLE_NAMESPACE_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__repr__": "($self, /)",
+    "__lt__": "($self, value, /)",
+    "__le__": "($self, value, /)",
+    "__eq__": "($self, value, /)",
+    "__ne__": "($self, value, /)",
+    "__gt__": "($self, value, /)",
+    "__ge__": "($self, value, /)",
+    "__init__": "($self, /, *args, **kwargs)",
+    "__reduce__": "($self, /)",
+    "__replace__": "($self, /, **changes)",
+}
+check_descriptors(types.SimpleNamespace, EXPECTED_SIMPLE_NAMESPACE_METHODS)
+
+EXPECTED_SIMPLE_NAMESPACE_DOCS = {
+    "__new__": "Create and return a new object.  See help(type) for accurate signature.",
+    "__repr__": "Return repr(self).",
+    "__lt__": "Return self<value.",
+    "__le__": "Return self<=value.",
+    "__eq__": "Return self==value.",
+    "__ne__": "Return self!=value.",
+    "__gt__": "Return self>value.",
+    "__ge__": "Return self>=value.",
+    "__init__": "Initialize self.  See help(type(self)) for accurate signature.",
+    "__reduce__": "Return state information for pickling",
+    "__replace__": (
+        "Return a copy of the namespace object with new values for the "
+        "specified attributes."
+    ),
+}
+for name, doc in EXPECTED_SIMPLE_NAMESPACE_DOCS.items():
+    assert getattr(types.SimpleNamespace, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.SimpleNamespace)) == (
+    "(mapping_or_iterable=(), /, **kwargs)"
+)
 
 
 # module_doc_python314

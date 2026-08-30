@@ -14,6 +14,64 @@ with assert_raises(AttributeError):
     _ = ns.c
 
 
+def _simple_namespace_type_contract():
+    owner = types.SimpleNamespace
+    # PyPy owns this as the app-level `_structseq.SimpleNamespace`; keep its
+    # class-body ordering while appending the 3.14-only observable methods.
+    if sys.implementation.name == "pyre":
+        assert list(owner.__dict__) == [
+            "__module__",
+            "__doc__",
+            "__new__",
+            "__init__",
+            "__repr__",
+            "__eq__",
+            "__ne__",
+            "__lt__",
+            "__le__",
+            "__gt__",
+            "__ge__",
+            "__reduce__",
+            "__replace__",
+            "__dict__",
+            "__hash__",
+        ]
+        assert type(owner.__dict__["__dict__"]).__name__ == "getset_descriptor"
+        assert owner.__basicsize__ == object.__basicsize__
+    assert type(owner.__repr__) is types.WrapperDescriptorType
+    assert type(owner.__eq__) is types.WrapperDescriptorType
+    assert type(owner.__reduce__) is types.MethodDescriptorType
+    assert type(owner.__replace__) is types.MethodDescriptorType
+    for name, args, message in (
+        (
+            "__repr__",
+            ({},),
+            "descriptor '__repr__' requires a 'types.SimpleNamespace' object but received a 'dict'",
+        ),
+        (
+            "__eq__",
+            ({}, owner()),
+            "descriptor '__eq__' requires a 'types.SimpleNamespace' object but received a 'dict'",
+        ),
+        (
+            "__reduce__",
+            ({},),
+            "descriptor '__reduce__' for 'types.SimpleNamespace' objects doesn't apply to a 'dict' object",
+        ),
+        (
+            "__replace__",
+            ({},),
+            "descriptor '__replace__' for 'types.SimpleNamespace' objects doesn't apply to a 'dict' object",
+        ),
+    ):
+        with assert_raises(TypeError) as raised:
+            getattr(owner, name)(*args)
+        assert str(raised.exception) == message
+
+
+_simple_namespace_type_contract()
+
+
 def _module_type_receiver_contract():
     for name, args, message in (
         (
