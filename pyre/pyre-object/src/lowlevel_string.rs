@@ -161,14 +161,24 @@ fn shrink_lowlevel_array(buf: i64, new_len: i64, base_size: usize, item_size: us
     if buf == 0 {
         return 0;
     }
+    // `rgc.ll_shrink_array` is bracketed by the translated graph's GC
+    // transform.  Until pyre's transform inserts that bracket, publish the
+    // residual argument explicitly: the native ABI copy can otherwise still
+    // name a nursery forwarding stub after a collection at call entry.
+    let roots = crate::gc_roots::push_roots();
+    let buf_slot = roots.base();
+    let buf = roots.pin_root(buf as crate::PyObjectRef) as i64;
     let new_len = if new_len < 0 { 0 } else { new_len as usize };
     if majit_gc::gc_shrink_array(buf as usize, new_len) {
-        return buf;
+        return roots.get(buf_slot) as i64;
     }
     let new_buf = bh_alloc_lowlevel_string(new_len, base_size, item_size);
     if new_buf == 0 {
         return 0;
     }
+    // The allocation is the collecting half of `rgc.ll_shrink_array`; reload
+    // the old buffer from its transformed livevar slot before copying it.
+    let buf = roots.get(buf_slot) as i64;
     // SAFETY: `buf` holds at least `new_len` valid items (the builder shrinks to
     // its own `current_pos`), and `new_buf` was allocated for exactly `new_len`.
     unsafe {
@@ -196,6 +206,11 @@ fn shrink_lowlevel_array(buf: i64, new_len: i64, base_size: usize, item_size: us
 /// `extern "C"` with an `(i64, i64) -> i64` ABI so the JIT residual call reaches
 /// it through the fnaddr registry.
 pub extern "C" fn jit_ll_shrink_array(buf: i64, new_len: i64) -> i64 {
+    // Width discovery reads the GC type header, so it needs the same entry
+    // livevar normalization as the shrink itself rather than dereferencing the
+    // raw residual-call word first.
+    let roots = crate::gc_roots::push_roots();
+    let buf = roots.pin_root(buf as crate::PyObjectRef) as i64;
     let (base_size, item_size) = shrink_array_width(buf);
     shrink_lowlevel_array(buf, new_len, base_size, item_size)
 }

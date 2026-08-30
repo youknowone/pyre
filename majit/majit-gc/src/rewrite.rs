@@ -1018,7 +1018,9 @@ impl RewriteState {
 impl GcRewriterImpl {
     /// Can we use the nursery for this allocation size?
     fn can_use_nursery(&self, size: usize) -> bool {
-        size <= self.max_nursery_size
+        // gc.py `can_use_nursery_malloc`: `max_size_of_young_obj` is
+        // `large_object` (`nonlarge_max + 1`), hence an exclusive boundary.
+        size < self.max_nursery_size
     }
 
     /// rewrite.py `could_merge_with_next_guard` parity.
@@ -4078,6 +4080,13 @@ mod tests {
             .unwrap();
         // rewrite.py:858: [ConstInt(kind), ConstInt(itemsize), v_length]
         assert_eq!(varsize.arg(2).to_opref(), length_ref);
+    }
+
+    #[test]
+    fn nursery_size_boundary_is_exclusive() {
+        let rw = make_rewriter();
+        assert!(rw.can_use_nursery(rw.max_nursery_size - 1));
+        assert!(!rw.can_use_nursery(rw.max_nursery_size));
     }
 
     /// Constant-length oversized arrays: rewrite.py:573-584 routes these

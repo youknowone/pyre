@@ -1386,13 +1386,31 @@ impl MiniMarkGC {
     /// [`Self::alloc_varsize_nonmoving_prefer_young`] is the dispatch between
     /// them that upstream performs inside the one function.
     ///
-    /// No production caller reaches any of the three, so no card array exists
-    /// in a running heap.  One arrives owing two things that the per-item
-    /// barrier does not supply, because a card records a *position*: a bulk
-    /// copy into it owes [`Self::writebarrier_before_copy`], and any move of
-    /// items within it — a list insert, remove, splice or reverse — owes
+    /// A card array arrives owing two things that the per-item barrier does not
+    /// supply, because a card records a *position*: a bulk copy into it owes
+    /// [`Self::writebarrier_before_copy`], and any move of items within it — a
+    /// list insert, remove, splice or reverse — owes
     /// [`Self::writebarrier_before_move`], which is what generalizes the cards
     /// back to "any item may be young" before the positions change.
+    ///
+    /// The tail is [`finish_alloc_in_oldgen`](Self::finish_alloc_in_oldgen)'s,
+    /// which is how upstream reaches it too: `external_malloc`'s arms rejoin at
+    /// "Common code to fill the header and length of the object". A destructor
+    /// or weakref type born here has no other route onto the old-generation
+    /// lists that give it a destructor run and a `weakptr` invalidation, and
+    /// the rawmalloc bytes have no other route into the major-progress
+    /// accounting.
+    ///
+    /// The zero-fill is *not* upstream's — `external_malloc` says "the memory
+    /// returned is not cleared", and for compiled code `clear_varsize_gc_fields`
+    /// emits the `ZeroArray` that covers it. It is here because the alternative
+    /// is a birth whose contract depends on which arm it took:
+    /// [`try_alloc_young_nonmoving_with_cards`](Self::try_alloc_young_nonmoving_with_cards)
+    /// clears, and so does the [`alloc_in_oldgen_clear`](Self::alloc_in_oldgen_clear)
+    /// this stands beside in `alloc_with_type_slow`, so a caller of
+    /// [`alloc_varsize_nonmoving_prefer_young`](Self::alloc_varsize_nonmoving_prefer_young)
+    /// would otherwise get zeroed memory or dirty memory according to whether
+    /// the young rawmalloc happened to take the request.
     pub fn alloc_in_oldgen_with_cards(
         &mut self,
         type_id: u32,
@@ -1402,19 +1420,18 @@ impl MiniMarkGC {
     ) -> GcRef {
         let (card_header_bytes, extra_flags) =
             self.card_header_and_flags(total_size, length, has_gc_ptrs_in_var, false);
-        // incminimark.py:1080: the old birth adds GCFLAG_TRACK_YOUNG_PTRS after
-        // the card question, so it is set on the cardless arm too.
-        let extra_flags = extra_flags | flags::GCFLAG_TRACK_YOUNG_PTRS;
-
         let ptr = self
             .oldgen
             .alloc_with_card_header(total_size, card_header_bytes);
-        let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
-        *hdr = GcHeader::with_flags(type_id, self.oldgen_birth_flags(extra_flags));
+        let obj = self.finish_alloc_in_oldgen(type_id, total_size, ptr, extra_flags);
+        // `allocsize = cardheadersize + round_up_for_allocation(totalsize)` is
+        // what upstream adds to `rawmalloced_total_size`; the shared tail
+        // accounted for the object, so the card header is what is left.
         self.bytes_made_old_since_cycle = self
             .bytes_made_old_since_cycle
-            .saturating_add(card_header_bytes + total_size);
-        GcRef((ptr as usize) + GcHeader::SIZE)
+            .saturating_add(card_header_bytes);
+        Self::raw_memclear(obj, total_size);
+        obj
     }
 
     /// incminimark.py:1017-1030, the card question `external_malloc` asks once
@@ -1422,16 +1439,13 @@ impl MiniMarkGC {
     ///
     /// Three clauses deny cards, and the third is a *size* test: upstream
     /// spells it `raw_malloc_usage(totalsize) <= self.nonlarge_max`, and
-    /// `large_object_threshold` holds `nonlarge_max + 1` (line 637). It is
+    /// `large_object_threshold` holds `nonlarge_max + 1` (see
+    /// [`LARGE_OBJECT_THRESHOLD`]), so equality is already the large arm. It is
     /// written here the way every other large-arm test in this file is
     /// written, so an object gets cards exactly when it took the arm that can
     /// hold them — a small object that reached rawmalloc only because the
     /// nursery was full must not come back carrying a card array.
     ///
-    /// `length > 0` carries the part of `has_gcptr_in_varsize(typeid)` a bool
-    /// argument cannot: a zero-length array reserves zero card words, and
-    /// GCFLAG_HAS_CARDS over no card bytes is a state no reader of
-    /// [`Self::card_byte_ptr`] survives.
     fn card_header_and_flags(
         &self,
         total_size: usize,
@@ -1441,8 +1455,7 @@ impl MiniMarkGC {
     ) -> (usize, u64) {
         if self.card_page_shift == 0
             || !has_gc_ptrs_in_var
-            || length == 0
-            || total_size <= self.config.large_object_threshold
+            || total_size < self.config.large_object_threshold
         {
             return (0, 0);
         }
@@ -1602,7 +1615,7 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
-        if total_size <= self.config.large_object_threshold {
+        if total_size < self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
             if !ptr.is_null() {
                 return self.finish_nursery_object(ptr, type_id);
@@ -1623,7 +1636,7 @@ impl MiniMarkGC {
         // entry point already collects on its nursery arm below, so its callers
         // already present a complete root set at an allocation; the young birth
         // adds no requirement they do not already meet.
-        if total_size > self.config.large_object_threshold {
+        if total_size >= self.config.large_object_threshold {
             if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
                 return obj;
             }
@@ -1762,7 +1775,7 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
-        if total_size <= self.config.large_object_threshold {
+        if total_size < self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
             if !ptr.is_null() {
                 return self.finish_bumped_nursery_object::<FAST>(ptr, type_id);
@@ -1794,7 +1807,7 @@ impl MiniMarkGC {
         // caller then emits finds the flag clear and does nothing — a cost, not
         // a hazard, and the alternative is a caller that has to know which of
         // the two births it got.
-        if total_size > self.config.large_object_threshold {
+        if total_size >= self.config.large_object_threshold {
             unsafe { *needs_write_barrier = true };
             if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
                 return obj;
@@ -2038,7 +2051,7 @@ impl MiniMarkGC {
         // arm turns every such gap into an immediate use-after-free, which is
         // why it waits on the shadow-stack coverage rather than on anything
         // in this function.
-        if total_size > self.config.large_object_threshold {
+        if total_size >= self.config.large_object_threshold {
             return self.alloc_in_oldgen_nursery_substitute(type_id, total_size);
         }
 
@@ -2156,7 +2169,7 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
-        if total_size <= self.config.large_object_threshold {
+        if total_size < self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
             if !ptr.is_null() {
                 let obj = self.finish_bumped_nursery_object::<FAST>(ptr, type_id);
@@ -2560,7 +2573,7 @@ impl MiniMarkGC {
     /// see [`alloc_in_oldgen_clear`](Self::alloc_in_oldgen_clear).
     fn alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> GcRef {
         let ptr = self.oldgen.alloc(total_size);
-        self.finish_alloc_in_oldgen(type_id, total_size, ptr)
+        self.finish_alloc_in_oldgen(type_id, total_size, ptr, 0)
     }
 
     /// `framework.py gct_do_malloc_fixedsize_clear`: the plain malloc
@@ -2654,7 +2667,7 @@ impl MiniMarkGC {
     /// rawmalloc failure returns NULL so the caller can raise `MemoryError`.
     fn try_alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> Option<GcRef> {
         let ptr = self.oldgen.try_alloc(total_size)?;
-        Some(self.finish_alloc_in_oldgen(type_id, total_size, ptr))
+        Some(self.finish_alloc_in_oldgen(type_id, total_size, ptr, 0))
     }
 
     /// `PYRE_GC_SIZE_AUDIT`: refuse a block too small for the type its header
@@ -2700,7 +2713,13 @@ impl MiniMarkGC {
         );
     }
 
-    fn finish_alloc_in_oldgen(&mut self, type_id: u32, total_size: usize, ptr: *mut u8) -> GcRef {
+    fn finish_alloc_in_oldgen(
+        &mut self,
+        type_id: u32,
+        total_size: usize,
+        ptr: *mut u8,
+        extra_flags: u64,
+    ) -> GcRef {
         if crate::bh_probe_enabled() {
             let lo = self.nursery.start_ptr() as usize;
             crate::BH_PROBE_NURSERY_LO.store(lo, std::sync::atomic::Ordering::Relaxed);
@@ -2711,11 +2730,13 @@ impl MiniMarkGC {
         }
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
+        // incminimark.py:1080 ORs it in after the card question, so it reaches
+        // the carded arm as well as `extra_flags = 0`.
         // An object born into the old generation while a major marking cycle is
         // in progress must also be allocated black (see `oldgen_birth_flags`).
         *hdr = GcHeader::with_flags(
             type_id,
-            self.oldgen_birth_flags(flags::GCFLAG_TRACK_YOUNG_PTRS),
+            self.oldgen_birth_flags(extra_flags | flags::GCFLAG_TRACK_YOUNG_PTRS),
         );
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
@@ -2988,9 +3009,11 @@ impl MiniMarkGC {
         self.bytes_made_old_since_cycle = self
             .bytes_made_old_since_cycle
             .saturating_add(GcHeader::SIZE + payload);
-        // incminimark.py:2285-2297. TRACK_YOUNG_PTRS is clear on every young
-        // birth, so the first arm always runs; the remembered walk is what sets
-        // the flag and forwards whatever nursery children the object holds.
+        // incminimark.py `_visit_young_rawmalloced_object`.
+        // TRACK_YOUNG_PTRS is clear on an ordinary young rawmalloced birth, so
+        // the first arm records it for the remembered walk.  A young card array
+        // is the exception: it is born with TRACK_YOUNG_PTRS and CARDS_SET and
+        // takes the second arm when promotion puts it on the dirty-card list.
         if unsafe { !(*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) } {
             self.old_objects_pointing_to_young.push(obj_addr);
         }
@@ -4616,7 +4639,7 @@ impl MiniMarkGC {
     /// `false` means the caller must allocate a smaller object and copy, which
     /// is exactly what `rgc.ll_shrink_array` does with that answer
     /// (`rgc.py:475-478`).
-    pub fn shrink_array(&self, obj_addr: usize, smaller_length: usize) -> bool {
+    pub fn shrink_array(&mut self, obj_addr: usize, smaller_length: usize) -> bool {
         if !self.is_in_nursery(obj_addr) {
             return false;
         }
@@ -4636,7 +4659,7 @@ impl MiniMarkGC {
             return false;
         }
         let length_ptr = (obj_addr + type_info.length_offset) as *mut usize;
-        debug_assert!(
+        assert!(
             smaller_length <= unsafe { *length_ptr },
             "shrink_array asked to grow an array: {smaller_length} > {}",
             unsafe { *length_ptr }
@@ -8343,7 +8366,7 @@ impl GcAllocator for MiniMarkGC {
         MiniMarkGC::writebarrier_before_move(self, obj.0);
     }
 
-    fn shrink_array(&self, addr: usize, smaller_length: usize) -> bool {
+    fn shrink_array(&mut self, addr: usize, smaller_length: usize) -> bool {
         MiniMarkGC::shrink_array(self, addr, smaller_length)
     }
 
@@ -8444,7 +8467,40 @@ impl GcAllocator for MiniMarkGC {
         else {
             return GcRef(0);
         };
-        self.alloc_with_type(type_id, payload_size)
+        let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
+            return GcRef(0);
+        };
+        if (type_id as usize) >= self.types.len() {
+            return GcRef(0);
+        }
+        let type_info = self.types.get(type_id);
+        let registered_varsize = type_info.item_size != 0;
+        let length_offset = type_info.length_offset;
+        let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
+        let obj = if total_size >= self.config.large_object_threshold {
+            // incminimark.py `malloc_varsize`: the oversized arm calls
+            // `external_malloc(typeid, length, alloc_young=True)`, whose card
+            // decision comes from the registered type layout.  Routing through
+            // generic `alloc_with_type` loses both `length` and that predicate,
+            // so a production large pointer array is born cardless even though
+            // the collector's card allocator exists.
+            self.alloc_varsize_nonmoving_prefer_young(
+                type_id,
+                total_size,
+                length,
+                items_have_gc_ptrs,
+            )
+        } else {
+            self.alloc_with_type(type_id, payload_size)
+        };
+        // incminimark.py `malloc_varsize` common/young paths both initialize
+        // `varsize_offset_to_length(typeid)` before returning.  The backend
+        // slow helper must not receive a typed array whose walker still sees
+        // the allocator's zero-fill as its length.
+        if !obj.is_null() && registered_varsize {
+            unsafe { *((obj.0 + length_offset) as *mut usize) = length };
+        }
+        obj
     }
 
     fn alloc_varsize_no_collect(
@@ -9155,6 +9211,53 @@ mod tests {
             baseline,
             "and dies at the next minor when nothing reached it"
         );
+    }
+
+    /// The public typed varsize entry must retain `external_malloc`'s card
+    /// decision; otherwise the private card allocator exists only in tests and
+    /// compiled pointer arrays are silently born cardless.
+    #[test]
+    fn an_oversized_pointer_array_uses_the_production_card_path() {
+        let mut gc = test_gc(4096);
+        let item_size = std::mem::size_of::<GcRef>();
+        let tid = gc.register_type(TypeInfo::varsize(item_size, item_size, 0, true, Vec::new()));
+        let length = CARD_ARRAY_LEN;
+        let obj = GcAllocator::alloc_varsize_typed(&mut gc, tid, item_size, item_size, length);
+
+        let hdr = unsafe { header_of(obj.0) };
+        assert!(gc.is_young_rawmalloced(obj.0));
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_CARDS) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_CARDS_SET) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
+        assert_eq!(unsafe { *(obj.0 as *const usize) }, length);
+    }
+
+    #[test]
+    fn a_rooted_young_card_array_forwards_a_child_on_its_marked_card() {
+        let mut gc = test_gc(4096);
+        let item_size = std::mem::size_of::<GcRef>();
+        let array_tid =
+            gc.register_type(TypeInfo::varsize(item_size, item_size, 0, true, Vec::new()));
+        let child_tid = gc.register_type(TypeInfo::simple(item_size));
+        let mut array = GcAllocator::alloc_varsize_typed(
+            &mut gc,
+            array_tid,
+            item_size,
+            item_size,
+            CARD_ARRAY_LEN,
+        );
+        let child = gc.alloc_with_type(child_tid, item_size);
+        unsafe { *((array.0 + item_size) as *mut GcRef) = child };
+        gc.remember_young_pointer_from_array2(array, 0, gc.card_page_shift);
+        unsafe { gc.add_root(&mut array) };
+
+        gc.do_collect_nursery();
+
+        let forwarded_child = unsafe { *((array.0 + item_size) as *const GcRef) };
+        assert!(gc.is_managed_heap_object(forwarded_child.0));
+        assert!(!gc.is_in_nursery(forwarded_child.0));
+        assert_ne!(forwarded_child, child);
+        gc.remove_root(&mut array);
     }
 
     /// The other side of the entry-point split, pinned because it is what
@@ -10707,6 +10810,23 @@ mod tests {
         assert!(needs_write_barrier);
     }
 
+    /// incminimark.py `malloc_fixedsize` and gc.py
+    /// `can_use_nursery_malloc`: `large_object` is `nonlarge_max + 1`, an
+    /// exclusive boundary rather than the largest admitted nursery size.
+    #[test]
+    fn large_object_threshold_itself_takes_the_large_arm() {
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let boundary = gc.config.large_object_threshold;
+
+        let below = gc.alloc_with_type(tid, boundary - GcHeader::SIZE - GcHeader::ALIGN);
+        assert!(gc.is_in_nursery(below.0));
+
+        let at_boundary = gc.alloc_with_type(tid, boundary - GcHeader::SIZE);
+        assert!(!gc.is_in_nursery(at_boundary.0));
+        assert!(gc.is_young_rawmalloced(at_boundary.0));
+    }
+
     // --- Lightweight destructor tests (incminimark.py:2884-2912 parity) ---
     //
     // The counting destructor below deliberately does NOT `drop_in_place`
@@ -11073,7 +11193,7 @@ mod tests {
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, Vec::new()));
         let total_size = GcHeader::SIZE + 8 + 8 * 4;
-        assert!(total_size <= gc.config.large_object_threshold);
+        assert!(total_size < gc.config.large_object_threshold);
 
         let obj = gc
             .try_alloc_young_nonmoving_with_cards(tid, total_size, 4, true)
@@ -11084,6 +11204,75 @@ mod tests {
         assert!(!unsafe { (*hdr).has_flag(flags::GCFLAG_CARDS_SET) });
         assert!(!unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
         assert!(gc.is_young_rawmalloced(obj.0));
+    }
+
+    /// `external_malloc`'s two arms share one tail — "Common code to fill the
+    /// header and length of the object" — so the old-gen card birth owes every
+    /// registration and the zero-fill that `alloc_in_oldgen_clear` owes.
+    ///
+    /// The arm became reachable when `alloc_varsize_typed` started routing its
+    /// oversized requests through `alloc_varsize_nonmoving_prefer_young`, whose
+    /// fallback this is: it is taken whenever the young rawmalloc is refused
+    /// (`MAJIT_GC_YOUNG_RAWMALLOC=0`, a weakref type) or fails.
+    #[test]
+    fn the_oldgen_card_birth_clears_and_takes_the_shared_oldgen_tail() {
+        let mut gc = test_gc(4096);
+        let item_size = std::mem::size_of::<GcRef>();
+        let base_size = 8;
+        let length = CARD_ARRAY_LEN;
+        let total_size = GcHeader::SIZE + base_size + item_size * length;
+        assert!(total_size >= gc.config.large_object_threshold);
+        let tid = gc.register_type(
+            TypeInfo::varsize(base_size, item_size, 0, true, Vec::new())
+                .with_destructor_fn(counting_destructor),
+        );
+        let bytes_before = gc.bytes_made_old_since_cycle;
+        // `arena_malloc(allocsize, 0)` — "the memory returned is not cleared".
+        // Hand this allocation a really dirty block, so the zero assertion
+        // below can fail; a fresh `alloc::alloc` reads zero on its own and
+        // would pass whether or not the clear ran.
+        gc.oldgen.set_poison_on_alloc(true);
+
+        let obj = gc.alloc_in_oldgen_with_cards(tid, total_size, length, true);
+
+        let hdr = unsafe { header_of(obj.0) };
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_CARDS) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
+        // `do_malloc_varsize_clear`: the block the caller gets is zeroed, so
+        // the tracer reads item slots and not whatever the allocator held.
+        let payload =
+            unsafe { std::slice::from_raw_parts(obj.0 as *const u8, total_size - GcHeader::SIZE) };
+        assert!(
+            payload.iter().all(|&b| b == 0),
+            "the card block was handed back unzeroed"
+        );
+        // Reached only through the shared tail: a destructor type born on this
+        // arm has no other route onto the list a major collection drains.
+        assert!(gc.old_objects_with_destructors.contains(&obj.0));
+        // `allocsize = cardheadersize + round_up_for_allocation(totalsize)`.
+        let card_header_bytes = 8 * gc.card_marking_words_for_length(length);
+        assert!(card_header_bytes > 0);
+        assert_eq!(
+            gc.bytes_made_old_since_cycle - bytes_before,
+            card_header_bytes + total_size
+        );
+    }
+
+    /// `external_malloc`'s card predicate has no `length > 0` clause.  A
+    /// large fixed prefix with an empty variable part therefore carries the
+    /// flags with a zero-byte card header; no valid item access can ask for a
+    /// card byte.
+    #[test]
+    fn a_large_zero_length_array_keeps_upstreams_card_flags() {
+        let mut gc = test_gc(4096);
+        let base_size = gc.config.large_object_threshold;
+        let tid = gc.register_type(TypeInfo::varsize(base_size, 8, 0, true, Vec::new()));
+        let obj = gc.alloc_in_oldgen_with_cards(tid, base_size, 0, true);
+
+        let hdr = unsafe { header_of(obj.0) };
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_CARDS) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
+        assert_eq!(gc.card_marking_words_for_length(0), 0);
     }
 
     /// incminimark.py:1019, the size clause of the card question: an object
@@ -11099,7 +11288,7 @@ mod tests {
         let tid = gc.register_type(TypeInfo::varsize(8, ptr_size, 0, true, Vec::new()));
         let length = 4usize;
         let total_size = GcHeader::SIZE + 8 + ptr_size * length;
-        assert!(total_size <= gc.config.large_object_threshold);
+        assert!(total_size < gc.config.large_object_threshold);
         assert!(gc.config.card_page_indices > 0);
 
         let obj = gc.alloc_in_oldgen_with_cards(tid, total_size, length, true);

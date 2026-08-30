@@ -859,8 +859,12 @@ pub(crate) fn dir_list(ga: PyObjectRef) -> crate::PyResult {
     }
     names.sort();
     names.dedup();
-    let items: Vec<PyObjectRef> = names.iter().map(|s| w_str_new(s)).collect();
-    Ok(w_list_new(items))
+    // One `w_str_new` per name, each allocating over the names already boxed.
+    let mut items = pyre_object::gc_roots::RootedItems::new();
+    for s in names.iter() {
+        items.push(w_str_new(s));
+    }
+    Ok(w_list_new(items.take()))
 }
 
 /// `add_recurse` (`_pypy_generic_alias.py:253-255`) maps a bare `None`

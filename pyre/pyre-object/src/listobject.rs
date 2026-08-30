@@ -3600,6 +3600,10 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
         }
     };
     if result.is_some() {
+        // The object-strategy remove runs the before-move barrier, whose
+        // entry is a safepoint.  Reload the list the outer bracket kept live
+        // before updating its accounting fields.
+        let list = &mut *(crate::gc_roots::shadow_stack_get(root_base) as *mut W_ListObject);
         list.sync_allocated(old_size);
     }
     result
@@ -3645,6 +3649,11 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
         // `list_resize` shrinks from.  The metadata stays out here, as it does
         // for `w_list_append`, because the inner body is descended by the fold.
         let w_item = w_list_pop_end_inner(obj);
+        // The inner body allocates the popped item, so the list can have moved
+        // under the `&mut` taken above.  Reload from the bracket's slot before
+        // the accounting write, as `w_list_pop` and every `w_list_insert` arm
+        // do.
+        let list = &mut *(crate::gc_roots::shadow_stack_get(root_base) as *mut W_ListObject);
         list.sync_allocated(length);
         Some(w_item)
     }
@@ -4031,6 +4040,8 @@ pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_reverse(obj: PyObjectRef) {
+    let roots = crate::gc_roots::push_roots();
+    let obj = roots.pin_root(obj);
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         // Empty has nothing to reverse — falls through ListStrategy.reverse
@@ -4055,6 +4066,9 @@ pub unsafe fn w_list_reverse(obj: PyObjectRef) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
+    let roots = crate::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    let obj = roots.pin_root(obj);
     let list = &mut *(obj as *mut W_ListObject);
     let old_size = list.live_len();
     let mut changed = false;
@@ -4122,6 +4136,9 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
         }
     }
     if changed {
+        // Object storage can cross the before-move safepoint.  The scope's
+        // slot, not the pre-barrier `&mut`, names the live list afterwards.
+        let list = &mut *(roots.get(obj_slot) as *mut W_ListObject);
         list.sync_allocated(old_size);
     }
 }

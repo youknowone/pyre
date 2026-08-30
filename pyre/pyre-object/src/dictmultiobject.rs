@@ -3025,7 +3025,6 @@ pub unsafe fn w_dict_store_hashed_checked(
     w_dict_store_checked_inner(obj, key, value, Some(hash))
 }
 
-#[pyre_macros::gc_roots]
 unsafe fn w_dict_store_checked_inner(
     mut obj: PyObjectRef,
     key: PyObjectRef,
@@ -4060,7 +4059,6 @@ pub unsafe fn w_dict_delitem_checked(
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-#[pyre_macros::gc_roots]
 pub unsafe fn w_dict_delitem_if_value_is_checked(
     mut obj: PyObjectRef,
     key: PyObjectRef,

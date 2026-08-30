@@ -4021,12 +4021,19 @@ fn find_in_sys_path(partname: &str) -> Result<Option<FindInfo>, crate::PyError> 
 pub(crate) fn create_sys_path_list() -> PyObjectRef {
     #[cfg(not(target_arch = "wasm32"))]
     ensure_stdlib_path();
-    let items: Vec<PyObjectRef> = SYS_PATH
+    // Snapshot the paths first so the lock is not held across an allocation,
+    // then pin each decoded string as it is produced -- a plain `Vec` is not a
+    // root area (`build_list_storage`).
+    let paths: Vec<std::ffi::OsString> = SYS_PATH
         .lock()
         .iter()
-        .map(|d| crate::gateway::fsdecode_os_str(d.as_os_str()))
+        .map(|d| d.as_os_str().to_os_string())
         .collect();
-    pyre_object::w_list_new(items)
+    let mut items = pyre_object::gc_roots::RootedItems::new();
+    for d in &paths {
+        items.push(crate::gateway::fsdecode_os_str(d.as_os_str()));
+    }
+    pyre_object::w_list_new(items.take())
 }
 
 /// Off-`host_env` builds have no native seed; `sys.path` starts empty.

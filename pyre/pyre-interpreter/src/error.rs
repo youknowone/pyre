@@ -139,7 +139,13 @@ impl ExceptionNormalization {
             if crate::baseobjspace::exception_is_valid_obj_as_class_w(w_type) {
                 if w_value.is_null() || w_value == pyre_object::w_none() {
                     // error.py:208-210 (Class, None): instantiate Class()
-                    w_value = crate::baseobjspace::call_function(w_type, &[]);
+                    // `error.py OperationError.normalize_exception` reads
+                    // `w_type` again after each application-level constructor
+                    // call.  The RPython GC transform restores that livevar;
+                    // native Rust must perform the same pop-roots writeback.
+                    w_value = pyre_object::with_roots!(w_type =>
+                        crate::baseobjspace::call_function(w_type, &[])
+                    );
                     if w_value.is_null() {
                         return Err(crate::call::take_call_error()
                             .unwrap_or_else(|| PyError::type_error("constructor failed")));
@@ -162,10 +168,25 @@ impl ExceptionNormalization {
                         {
                             // error.py:218-220 (Class, tuple): Class(*tuple)
                             let items = pyre_object::w_tuple_items_copy_as_vec(w_value);
-                            w_value = crate::baseobjspace::call_function(w_type, &items);
+                            // The snapshot is a plain `Vec` and roots nothing:
+                            // on a specialised tuple its elements are freshly
+                            // re-boxed, and `call_function` runs application
+                            // code.  Publish them and read the live words back
+                            // at the call.
+                            let item_roots = pyre_object::gc_roots::push_roots();
+                            let item_base = item_roots.publish(&items);
+                            item_roots.normalize(item_base, items.len());
+                            let items: Vec<pyre_object::PyObjectRef> = (0..items.len())
+                                .map(|i| item_roots.get(item_base + i))
+                                .collect();
+                            w_value = pyre_object::with_roots!(w_type =>
+                                crate::baseobjspace::call_function(w_type, &items)
+                            );
                         } else {
                             // error.py:221-223 (Class, x): Class(x)
-                            w_value = crate::baseobjspace::call_function(w_type, &[w_value]);
+                            w_value = pyre_object::with_roots!(w_type =>
+                                crate::baseobjspace::call_function(w_type, &[w_value])
+                            );
                         }
                         if w_value.is_null() {
                             return Err(crate::call::take_call_error()

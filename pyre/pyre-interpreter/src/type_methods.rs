@@ -1047,12 +1047,12 @@ fn resolve_split_args(
 /// all of them yields `recv` itself — see [`pyre_object::w_str_cut`].  The runs
 /// a splitter emits are disjoint pieces of the receiver, so an equal WTF-8 byte
 /// count means this one spans the whole string.
-fn cps_to_str_cut(recv: PyObjectRef, cps: &[CodePoint]) -> PyObjectRef {
+fn cps_to_str_cut(recv_slot: usize, cps: &[CodePoint]) -> PyObjectRef {
     let mut buf = Wtf8Buf::with_capacity(cps.len());
     for &cp in cps {
         buf.push(cp);
     }
-    unsafe { pyre_object::w_str_cut(recv, &buf) }
+    unsafe { pyre_object::w_str_cut(pyre_object::gc_roots::shadow_stack_get(recv_slot), &buf) }
 }
 
 /// A lone surrogate is not whitespace.
@@ -1066,9 +1066,13 @@ fn cp_is_whitespace(cp: CodePoint) -> bool {
 /// `str.split()` with no separator: split on runs of whitespace,
 /// dropping leading/trailing runs.  When `maxsplit >= 0`, after that
 /// many splits the rest (leading whitespace stripped) is one tail token.
-fn wtf8_split_whitespace(recv: PyObjectRef, s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
+fn wtf8_split_whitespace(
+    recv_slot: usize,
+    s: &Wtf8,
+    maxsplit: i64,
+    out: &mut pyre_object::gc_roots::RootedItems,
+) {
     let cps: Vec<CodePoint> = s.code_points().collect();
-    let mut out: Vec<PyObjectRef> = Vec::new();
     let mut i = 0usize;
     loop {
         if maxsplit >= 0 && out.len() as i64 >= maxsplit {
@@ -1084,25 +1088,33 @@ fn wtf8_split_whitespace(recv: PyObjectRef, s: &Wtf8, maxsplit: i64) -> Vec<PyOb
         while i < cps.len() && !cp_is_whitespace(cps[i]) {
             i += 1;
         }
-        out.push(cps_to_str_cut(recv, &cps[start..i]));
+        out.push(cps_to_str_cut(recv_slot, &cps[start..i]));
     }
     while i < cps.len() && cp_is_whitespace(cps[i]) {
         i += 1;
     }
     if i < cps.len() {
-        out.push(cps_to_str_cut(recv, &cps[i..]));
+        out.push(cps_to_str_cut(recv_slot, &cps[i..]));
     }
-    out
 }
 
 /// `str.rsplit()` with no separator: like `wtf8_split_whitespace` but
 /// scanning from the right, so the tail token is the leading remainder.
-fn wtf8_rsplit_whitespace(recv: PyObjectRef, s: &Wtf8, maxsplit: i64) -> Vec<PyObjectRef> {
+fn wtf8_rsplit_whitespace(
+    recv_slot: usize,
+    s: &Wtf8,
+    maxsplit: i64,
+    out: &mut pyre_object::gc_roots::RootedItems,
+) {
     let cps: Vec<CodePoint> = s.code_points().collect();
-    let mut tokens: Vec<PyObjectRef> = Vec::new();
+    // The scan runs right to left but the result reads left to right.  Collect
+    // the ranges first -- they borrow `cps` and hold no GC reference, so the
+    // reversal costs nothing -- and cut in final order afterwards, so every
+    // allocation lands in the rooted set with the earlier cuts already pinned.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut i = cps.len();
     loop {
-        if maxsplit >= 0 && tokens.len() as i64 >= maxsplit {
+        if maxsplit >= 0 && ranges.len() as i64 >= maxsplit {
             break;
         }
         while i > 0 && cp_is_whitespace(cps[i - 1]) {
@@ -1115,32 +1127,42 @@ fn wtf8_rsplit_whitespace(recv: PyObjectRef, s: &Wtf8, maxsplit: i64) -> Vec<PyO
         while i > 0 && !cp_is_whitespace(cps[i - 1]) {
             i -= 1;
         }
-        tokens.push(cps_to_str_cut(recv, &cps[i..end]));
+        ranges.push((i, end));
     }
-    tokens.reverse();
+    ranges.reverse();
     let mut prefix_end = i;
     while prefix_end > 0 && cp_is_whitespace(cps[prefix_end - 1]) {
         prefix_end -= 1;
     }
     if prefix_end > 0 {
-        let mut out = vec![cps_to_str_cut(recv, &cps[..prefix_end])];
-        out.extend(tokens);
-        out
-    } else {
-        tokens
+        out.push(cps_to_str_cut(recv_slot, &cps[..prefix_end]));
+    }
+    for (start, end) in ranges {
+        out.push(cps_to_str_cut(recv_slot, &cps[start..end]));
     }
 }
 
 pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "split")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
+    // `parse_split_maxsplit` can run `__index__`, and every result cut can
+    // allocate.  Keep the receiver below the result-set bracket and read its
+    // rewritten slot for each identity-preserving `w_str_cut`.  The text is an
+    // owned snapshot so no `&Wtf8` points into a receiver that may move.
+    let recv_roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = recv_roots.publish(&[args[0]]);
+    recv_roots.normalize(recv_slot, 1);
+    let s = unsafe { w_str_get_wtf8(recv_roots.get(recv_slot)) }.to_wtf8_buf();
     let (sep_arg, maxsplit_arg) = resolve_split_args(args, "split")?;
     let sep = parse_split_sep(sep_arg)?;
     // `unicodeobject.py @unwrap_spec(maxsplit=int) descr_split` —
     // `space.int_w(w_maxsplit)` routes through `__index__`, so any
     // int-like object (subclass, numpy int, etc.) is accepted.
     let maxsplit = parse_split_maxsplit(maxsplit_arg)?;
-    let parts: Vec<PyObjectRef> = match sep.as_deref() {
+    // Every cut allocates over the cuts already made, and a plain `Vec` is not
+    // a root area, so each is pinned as it is produced -- `build_list_storage`
+    // requires the elements to be pinned before it is handed them.
+    let mut parts = pyre_object::gc_roots::RootedItems::new();
+    match sep.as_deref() {
         Some(sep) => {
             // `unicodeobject.py:1028 _split_with_separator` raises
             // ValueError on empty separator before the slow path.
@@ -1151,18 +1173,28 @@ pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             // `split`), so a separator-free receiver yields itself back — see
             // [`pyre_object::w_str_cut`].
             if maxsplit < 0 {
-                s.split(sep)
-                    .map(|p| unsafe { pyre_object::w_str_cut(args[0], p) })
-                    .collect()
+                for p in s.split(sep) {
+                    parts.push(unsafe {
+                        pyre_object::w_str_cut(
+                            pyre_object::gc_roots::shadow_stack_get(recv_slot),
+                            p,
+                        )
+                    });
+                }
             } else {
-                s.splitn((maxsplit as usize) + 1, sep)
-                    .map(|p| unsafe { pyre_object::w_str_cut(args[0], p) })
-                    .collect()
+                for p in s.splitn((maxsplit as usize) + 1, sep) {
+                    parts.push(unsafe {
+                        pyre_object::w_str_cut(
+                            pyre_object::gc_roots::shadow_stack_get(recv_slot),
+                            p,
+                        )
+                    });
+                }
             }
         }
-        None => wtf8_split_whitespace(args[0], s, maxsplit),
-    };
-    Ok(w_list_new(parts))
+        None => wtf8_split_whitespace(recv_slot, &s, maxsplit, &mut parts),
+    }
+    Ok(w_list_new(parts.take()))
 }
 
 /// `pypy/objspace/std/unicodeobject.py W_UnicodeObject
@@ -1207,11 +1239,16 @@ fn parse_split_maxsplit(value: PyObjectRef) -> Result<i64, crate::PyError> {
 /// as `descr_split`.
 pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "rsplit")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let recv_roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = recv_roots.publish(&[args[0]]);
+    recv_roots.normalize(recv_slot, 1);
+    let s = unsafe { w_str_get_wtf8(recv_roots.get(recv_slot)) }.to_wtf8_buf();
     let (sep_arg, maxsplit_arg) = resolve_split_args(args, "rsplit")?;
     let sep = parse_split_sep(sep_arg)?;
     let maxsplit = parse_split_maxsplit(maxsplit_arg)?;
-    let parts: Vec<PyObjectRef> = match sep.as_deref() {
+    // As in `str_method_split`: the cuts are pinned as they are produced.
+    let mut parts = pyre_object::gc_roots::RootedItems::new();
+    match sep.as_deref() {
         Some(sep) => {
             // `unicodeobject.py:1028 _split_with_separator` raises
             // ValueError on empty separator before the slow path —
@@ -1225,13 +1262,15 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                 s.rsplitn((maxsplit as usize) + 1, sep).collect()
             };
             out.reverse();
-            out.into_iter()
-                .map(|p| unsafe { pyre_object::w_str_cut(args[0], p) })
-                .collect()
+            for p in out {
+                parts.push(unsafe {
+                    pyre_object::w_str_cut(pyre_object::gc_roots::shadow_stack_get(recv_slot), p)
+                });
+            }
         }
-        None => wtf8_rsplit_whitespace(args[0], s, maxsplit),
-    };
-    Ok(w_list_new(parts))
+        None => wtf8_rsplit_whitespace(recv_slot, &s, maxsplit, &mut parts),
+    }
+    Ok(w_list_new(parts.take()))
 }
 
 /// `pypy/objspace/std/unicodeobject.py W_UnicodeObject.descr_casefold`:
@@ -6239,14 +6278,20 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         "keepends",
         pos.get(1).is_some(),
     )?;
-    let cps: Vec<CodePoint> = unsafe { w_str_get_wtf8(pos[0]) }.code_points().collect();
+    let recv_roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = recv_roots.publish(&[pos[0]]);
+    recv_roots.normalize(recv_slot, 1);
+    let cps: Vec<CodePoint> = unsafe { w_str_get_wtf8(recv_roots.get(recv_slot)) }
+        .code_points()
+        .collect();
     // keepends is positional-or-keyword.
     let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
         .or_else(|| pos.get(1).copied())
         .map(crate::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
-    let mut parts: Vec<PyObjectRef> = Vec::new();
+    // Each `cps_to_str_cut` allocates over the pieces already cut.
+    let mut parts = pyre_object::gc_roots::RootedItems::new();
     let mut start = 0usize;
     let mut i = 0usize;
     while i < cps.len() {
@@ -6259,7 +6304,7 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
                 term_end += 1;
             }
             let end = if keepends { term_end } else { i };
-            parts.push(cps_to_str_cut(pos[0], &cps[start..end]));
+            parts.push(cps_to_str_cut(recv_slot, &cps[start..end]));
             start = term_end;
             i = term_end;
         } else {
@@ -6267,9 +6312,9 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         }
     }
     if start < cps.len() {
-        parts.push(cps_to_str_cut(pos[0], &cps[start..]));
+        parts.push(cps_to_str_cut(recv_slot, &cps[start..]));
     }
-    Ok(w_list_new(parts))
+    Ok(w_list_new(parts.take()))
 }
 
 /// PyPy: unicodeobject.py descr_removeprefix (Python 3.9+)

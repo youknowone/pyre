@@ -248,18 +248,14 @@ fn main() {
         // *necessary* condition, so a function that fails it holds a bracket
         // that nothing in this crate can justify.
         //
-        // Two functions open one.  `push_roots` is the naive per-operation
-        // bracket `shadowstack.py` emits; `enter_roots_frame` is the single
-        // coloured frame `shadowcolor.py`'s passes reduce a graph to, which
-        // `#[gc_roots]` produces.  A scan that knew only the first would read
-        // every transformed function as unbracketed -- and would go quieter,
-        // not louder, as more of the interpreter moved across.
+        // `push_roots` opens the native source-level bracket. The translator's
+        // separate `gc_push_roots` graph marker is later reduced to one
+        // coloured frame per function, but that graph operation is not a Rust
+        // callee in the extracted ULLBC and therefore does not belong here.
         let pin_ids: Vec<u64> = cg
             .names
             .iter()
-            .filter(|(_, n)| {
-                n.ends_with("gc_roots::push_roots") || n.ends_with("gc_roots::enter_roots_frame")
-            })
+            .filter(|(_, n)| n.ends_with("gc_roots::push_roots"))
             .map(|(&id, _)| id)
             .collect();
         if pin_ids.is_empty() {

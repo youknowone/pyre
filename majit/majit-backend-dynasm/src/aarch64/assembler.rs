@@ -3299,8 +3299,11 @@ impl<'a> AssemblerARM64<'a> {
             // aarch64/assembler.py malloc_cond_varsize
             // arglocs = [lengthloc, imm(itemsize), imm(kind)]
             OpCode::CallMallocNurseryVarsize => {
-                let base_size = op.with_array_descr(|ad| ad.base_size()).unwrap_or(16) as i64;
-                let type_id = op.with_array_descr(|ad| ad.type_id()).unwrap_or(0) as i64;
+                let (base_size, type_id) = op
+                    .with_array_descr(|ad| (ad.base_size(), ad.type_id()))
+                    .expect("CallMallocNurseryVarsize requires an ArrayDescr");
+                let base_size = base_size as i64;
+                let type_id = type_id as i64;
                 let itemsize = match arglocs.get(1) {
                     Some(Loc::Immed(i)) => i.value,
                     _ => 8,
@@ -3319,8 +3322,26 @@ impl<'a> AssemblerARM64<'a> {
                 // The tid comes from the descr: a varsize object allocated as
                 // type 0 is traced with the layout of whatever registered
                 // first, so its items are never walked.
-                self.emit_mov_imm64(0, base_size);
-                self.emit_mov_imm64(1, itemsize);
+                // Preserve a length held in x0/x1/x3 before those registers
+                // become the helper's other arguments.
+                //
+                // assembler.py:745-751 `malloc_cond_varsize`:
+                //
+                //     if lengthloc.is_core_reg():
+                //         varsizeloc = lengthloc
+                //     else:
+                //         assert lengthloc.is_stack()
+                //         self.regalloc_mov(lengthloc, r.x1)
+                //
+                // The stack arm carries an assertion rather than a fallback
+                // because it is the expected shape: `prepare_op_call_malloc_
+                // nursery_varsize` reads `lengthloc` *after*
+                // `spill_or_move_registers_before_call(SAVE_ALL_REGS)` has
+                // popped every register binding, so a live length is in its
+                // frame slot by the time this asks. Substituting an immediate
+                // 0 sizes the block for no items at all, and the
+                // `gen_initialize_len` store that follows stamps the true
+                // length into it.
                 match arglocs.first() {
                     Some(Loc::Reg(len_r)) => {
                         dynasm!(self.mc ; .arch aarch64 ; mov x2, X(len_r.value));
@@ -3328,10 +3349,16 @@ impl<'a> AssemblerARM64<'a> {
                     Some(Loc::Immed(len_i)) => {
                         self.emit_mov_imm64(2, len_i.value);
                     }
-                    _ => {
-                        self.emit_mov_imm64(2, 0);
+                    Some(Loc::Frame(len_f)) => {
+                        self.emit_ldr_fp(2, len_f.ebp_loc.value);
                     }
+                    Some(Loc::Ebp(len_e)) => {
+                        self.emit_ldr_fp(2, len_e.value);
+                    }
+                    other => panic!("CallMallocNurseryVarsize length is not a value: {other:?}"),
                 }
+                self.emit_mov_imm64(0, base_size);
+                self.emit_mov_imm64(1, itemsize);
                 // assembler.py:649-650 push_gcmap — a null gcmap tells the
                 // collector this frame holds no references, so every pointer
                 // spilled above would survive the collection unforwarded.
@@ -7279,7 +7306,7 @@ mod tests {
         // stopped clearing the threshold would disarm this test into asserting
         // that two clean arrays match.
         assert!(
-            total_size > majit_gc::GcAllocator::max_nursery_object_size(gc),
+            total_size >= majit_gc::GcAllocator::max_nursery_object_size(gc),
             "CARD_ARRAY_LENGTH no longer describes a large object, so it gets no cards"
         );
         let obj = gc.alloc_in_oldgen_with_cards(type_id, total_size, CARD_ARRAY_LENGTH, true);

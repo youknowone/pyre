@@ -145,7 +145,7 @@ pub(crate) unsafe fn buffer_export_decref(obj: PyObjectRef) {
 
 /// `_check_exports` — reject a size-changing mutation of a bytearray while a
 /// buffer export (a live memoryview) is outstanding.
-pub(crate) unsafe fn bytearray_check_exports(obj: PyObjectRef) -> Result<(), crate::PyError> {
+pub(crate) unsafe fn bytearray_check_exports(mut obj: PyObjectRef) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
         // A tracing collector does not reclaim an expression-temporary
         // `memoryview` at the end of the statement as CPython's refcounting
@@ -161,9 +161,13 @@ pub(crate) unsafe fn bytearray_check_exports(obj: PyObjectRef) -> Result<(), cra
         // consumer which reads a redirected field receives
         // `force_virtualizable_if_necessary` before the read.
         crate::executioncontext::force_frame(crate::eval::current_frame());
-        // `collect_oldgen` is essential here: callers still hold `obj` in a
-        // by-value interpreter local, so this check must not move it.
-        pyre_object::gc_hook::try_gc_collect_oldgen();
+        // `collect_oldgen` is essential here: this check must not move `obj`.
+        // It can still sweep an unregistered object, so publish `obj` for the
+        // mark walk and mirror framework.py's pop-roots reload before reading
+        // the export count again.
+        pyre_object::with_roots!(obj =>
+            pyre_object::gc_hook::try_gc_collect_oldgen()
+        );
     }
     if unsafe { pyre_object::bytearrayobject::w_bytearray_exports(obj) } > 0 {
         return Err(crate::PyError::new(
@@ -17274,7 +17278,7 @@ fn frozenset_hash_from_storage(obj: PyObjectRef) -> i64 {
 /// CPython 3.14's `_Py_HashBytes` uses SipHash-1-3 and returns zero for empty
 /// input. Strings hash their PEP 393 canonical code-unit representation rather
 /// than pyre's internal WTF-8 bytes, keeping all seeded values bit-identical.
-pub fn hash_value(obj: PyObjectRef) -> i64 {
+pub fn hash_value(mut obj: PyObjectRef) -> i64 {
     unsafe {
         // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
         if is_bool(obj) {
@@ -17388,7 +17392,12 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
-                let r = crate::call_function(method, &[obj]);
+                // `hash_value` is the infallible callback arm, so a failed or
+                // non-int `__hash__` falls through and reads `obj` again for
+                // the identity hash.  `framework.py get_livevars_for_roots`
+                // restores that livevar after `space.call_function`; native
+                // Rust needs the same pop-roots writeback explicitly.
+                let r = pyre_object::with_roots!(obj => crate::call_function(method, &[obj]));
                 if !r.is_null() && is_int(r) {
                     return w_int_get_value(r);
                 }
@@ -19321,13 +19330,17 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             args.len().saturating_sub(1)
         )));
     }
-    let self_obj = args[0];
+    let mut self_obj = args[0];
     file_check_closed(self_obj)?;
     file_check_writable(self_obj)?;
     let size_obj = match args.get(1).copied() {
         Some(value) if !unsafe { pyre_object::is_none(value) } => value,
         _ => {
-            let value = crate::baseobjspace::call_method(self_obj, "tell", &[]);
+            // `interp_fileio.py W_FileIO.truncate_w` keeps `self` live from
+            // the app-level `tell` through the later truncate/store path.
+            let value = pyre_object::with_roots!(self_obj =>
+                crate::baseobjspace::call_method(self_obj, "tell", &[])
+            );
             if value.is_null() {
                 return Err(crate::call::take_call_error()
                     .unwrap_or_else(|| crate::PyError::runtime_error("tell failed")));
@@ -19335,8 +19348,12 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             value
         }
     };
-    let index = crate::baseobjspace::space_index(size_obj)?;
-    let size = crate::baseobjspace::int_w(index)?;
+    let mut index = pyre_object::with_roots!(self_obj =>
+        crate::baseobjspace::space_index(size_obj)
+    )?;
+    let size = pyre_object::with_roots!(self_obj, index =>
+        crate::baseobjspace::int_w(index)
+    )?;
     if size < 0 {
         #[cfg(unix)]
         let invalid_argument = libc::EINVAL;
@@ -19369,9 +19386,11 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             use rustpython_host_env::os::ErrorExt;
 
             let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
-            let (result, _errno) = crate::module::thread::call_external_function(|| {
-                rustpython_host_env::crt_fd::ftruncate(borrowed, size)
-            });
+            let (result, _errno) = pyre_object::with_roots!(self_obj, index =>
+                crate::module::thread::call_external_function(|| {
+                    rustpython_host_env::crt_fd::ftruncate(borrowed, size)
+                })
+            );
             result.map_err(|error| fd_errno_err(error.posix_errno()))?;
             fileio_clear_stat_atopen(self_obj);
             return Ok(index);
@@ -19390,12 +19409,18 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
     let mut data = file_get_data(self_obj);
     data.resize(size as usize, 0);
-    crate::baseobjspace::setattr_str(
-        self_obj,
-        "__file_data__",
-        pyre_object::bytesobject::w_bytes_from_bytes(&data),
+    let mut data_obj = pyre_object::with_roots!(self_obj, index =>
+        pyre_object::bytesobject::w_bytes_from_bytes(&data)
+    );
+    // `data_obj` is a fresh object reachable only through this local, and
+    // `setattr_str` can run a Python `__setattr__`, so it belongs in the
+    // bracket rather than being passed as a bare word.
+    pyre_object::with_roots!(self_obj, index, data_obj =>
+        crate::baseobjspace::setattr_str(self_obj, "__file_data__", data_obj)
     )?;
-    crate::baseobjspace::setattr_str(self_obj, "__file_dirty__", w_bool_from(true))?;
+    pyre_object::with_roots!(self_obj, index =>
+        crate::baseobjspace::setattr_str(self_obj, "__file_dirty__", w_bool_from(true))
+    )?;
     fileio_clear_stat_atopen(self_obj);
     Ok(index)
 }

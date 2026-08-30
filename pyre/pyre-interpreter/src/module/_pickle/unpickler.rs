@@ -1480,27 +1480,55 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
 /// Build a tuple from the items of a (popped) stack list.
 fn list_to_tuple(items: PyObjectRef) -> PyObjectRef {
     let n = unsafe { pyre_object::listobject::w_list_len(items) };
-    let v: Vec<PyObjectRef> = (0..n)
-        .map(|i| unsafe { pyre_object::listobject::w_list_getitem(items, i as i64).unwrap() })
-        .collect();
+    // `w_list_getitem` boxes on the Range/Integer/Float strategies, so each
+    // item is pinned as it arrives rather than gathered into a plain `Vec`.
+    // The popped list has no stack owner left, so retain and reload it too.
+    let list_roots = pyre_object::gc_roots::push_roots();
+    let list_slot = list_roots.publish(&[items]);
+    list_roots.normalize(list_slot, 1);
+    let mut rooted = pyre_object::gc_roots::RootedItems::new();
+    for i in 0..n {
+        rooted.push(unsafe {
+            pyre_object::listobject::w_list_getitem(list_roots.get(list_slot), i as i64).unwrap()
+        });
+    }
+    let v = rooted.take();
     pyre_object::tupleobject::w_tuple_new(v)
 }
 
 /// Build a frozenset from the items of a (popped) stack list.
 fn list_to_frozenset(items: PyObjectRef) -> PyObjectRef {
     let n = unsafe { pyre_object::listobject::w_list_len(items) };
-    let v: Vec<PyObjectRef> = (0..n)
-        .map(|i| unsafe { pyre_object::listobject::w_list_getitem(items, i as i64).unwrap() })
-        .collect();
+    // `w_list_getitem` boxes on the Range/Integer/Float strategies, so each
+    // item is pinned as it arrives rather than gathered into a plain `Vec`.
+    let list_roots = pyre_object::gc_roots::push_roots();
+    let list_slot = list_roots.publish(&[items]);
+    list_roots.normalize(list_slot, 1);
+    let mut rooted = pyre_object::gc_roots::RootedItems::new();
+    for i in 0..n {
+        rooted.push(unsafe {
+            pyre_object::listobject::w_list_getitem(list_roots.get(list_slot), i as i64).unwrap()
+        });
+    }
+    let v = rooted.take();
     pyre_object::setobject::w_frozenset_from_items(&v)
 }
 
 /// Copy a (popped) stack list into a fresh list.
 fn list_copy(items: PyObjectRef) -> PyObjectRef {
     let n = unsafe { pyre_object::listobject::w_list_len(items) };
-    let v: Vec<PyObjectRef> = (0..n)
-        .map(|i| unsafe { pyre_object::listobject::w_list_getitem(items, i as i64).unwrap() })
-        .collect();
+    // `w_list_getitem` boxes on the Range/Integer/Float strategies, so each
+    // item is pinned as it arrives rather than gathered into a plain `Vec`.
+    let list_roots = pyre_object::gc_roots::push_roots();
+    let list_slot = list_roots.publish(&[items]);
+    list_roots.normalize(list_slot, 1);
+    let mut rooted = pyre_object::gc_roots::RootedItems::new();
+    for i in 0..n {
+        rooted.push(unsafe {
+            pyre_object::listobject::w_list_getitem(list_roots.get(list_slot), i as i64).unwrap()
+        });
+    }
+    let v = rooted.take();
     pyre_object::listobject::w_list_new(v)
 }
 

@@ -2436,8 +2436,8 @@ pub struct NurseryAllocParams {
     pub free_addr: u32,
     /// Linear-memory address of the GC's `nursery_top` limit pointer.
     pub top_addr: u32,
-    /// `max_nursery_object_size` — a total size above this allocates in
-    /// old-gen, so the inline path only applies below it.
+    /// `max_nursery_object_size` / `JIT_max_size_of_young_obj` — the exclusive
+    /// `large_object` boundary, so the inline path applies strictly below it.
     pub large_threshold: usize,
     /// Type ids whose allocation is a plain bump + header write (no
     /// destructor / weakref side-list registration).
@@ -6228,7 +6228,7 @@ fn build_function(
                     ((GcHeader::SIZE + size as usize).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7) & !7
                 };
                 let inline_nursery = nursery.filter(|_| !non_moving).filter(|na| {
-                    total_size <= na.large_threshold
+                    total_size < na.large_threshold
                         && u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
                 });
                 if let (Some(base), Some(na)) = (residual_type_base, inline_nursery) {
@@ -6470,7 +6470,7 @@ fn build_function(
                     let total =
                         ((GcHeader::SIZE + payload).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7) & !7;
                     let na = nursery.filter(|na| {
-                        total <= na.large_threshold
+                        total < na.large_threshold
                             && u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
                     })?;
                     Some((total, len, na))
@@ -6486,10 +6486,13 @@ fn build_function(
                         })?;
                         // malloc_cond_varsize checks the length before doing
                         // the scaled size calculation.  Use the largest length
-                        // whose rounded total still fits under the nursery
-                        // large-object threshold, capped to wasm32's usize
-                        // length field.
-                        let threshold = na.large_threshold.min(u32::MAX as usize) & !7;
+                        // whose rounded total is strictly below the nursery
+                        // large-object boundary, capped to wasm32's usize
+                        // length field.  Totals are eight-byte aligned, so
+                        // round the largest admitted word down after removing
+                        // the exclusive endpoint.
+                        let threshold =
+                            na.large_threshold.saturating_sub(1).min(u32::MAX as usize) & !7;
                         if threshold < GcHeader::MIN_NURSERY_OBJ_SIZE || base_total > threshold {
                             return None;
                         }

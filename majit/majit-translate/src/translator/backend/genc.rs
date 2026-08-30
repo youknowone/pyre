@@ -347,8 +347,9 @@ impl CBuilder {
                     crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
                 ),
             );
-            let transformer =
+            let mut transformer =
                 crate::memory::gctransform::shadowstack::ShadowStackFrameworkGCTransformer::new(
+                    self.translator.as_ref(),
                     c_gcdata,
                 );
             let graphs = self.translator.graphs.borrow().clone();

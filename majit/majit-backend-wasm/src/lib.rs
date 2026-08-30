@@ -1157,7 +1157,7 @@ fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
             jitframe_tid, 0,
             "wasm CA inline frame path requires the registered JitFrame type id"
         );
-        if total > gc.max_nursery_object_size() || !gc.type_alloc_is_plain(jitframe_tid) {
+        if total >= gc.max_nursery_object_size() || !gc.type_alloc_is_plain(jitframe_tid) {
             return None;
         }
         let nursery_free_addr = gc.nursery_free_addr();
@@ -1779,13 +1779,11 @@ fn wasm_gc_owns_object(addr: usize) -> bool {
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
 }
 
-/// `llop.shrink_array`. Read-only on the collector, as `wasm_gc_owns_object` is.
+/// `llop.shrink_array`.  This changes a GC-owned object's length word and must
+/// therefore take the exclusive collector path; `gc_query_reentrant` is for
+/// read-only queries made while a collection may already hold `&mut`.
 fn wasm_gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
-    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.shrink_array(addr, smaller_length)) {
-        return r;
-    }
-    majit_gc::gc_sync::is_initialized()
-        && majit_gc::gc_sync::gc_query_reentrant(|g| g.shrink_array(addr, smaller_length))
+    with_wasm_active_gc_mut(|gc| gc.shrink_array(addr, smaller_length)).unwrap_or(false)
 }
 
 pub struct WasmBackend {

@@ -243,6 +243,14 @@ impl OldGen {
         }
     }
 
+    /// Arm the poison for one collector without going through the process-wide
+    /// `MAJIT_GC_NURSERY_POISON`, so a test asserting that an allocator clears
+    /// what it hands back can be handed a block that is really dirty.
+    #[cfg(test)]
+    pub(crate) fn set_poison_on_alloc(&mut self, on: bool) {
+        self.poison_on_alloc = on;
+    }
+
     /// incminimark.py:1219-1221, the second half of `is_young_object`.
     #[inline]
     /// Whether the young raw-malloced generation is empty.

@@ -261,12 +261,14 @@ impl W_Random {
 
     fn getstate(&self) -> PyObjectRef {
         let rnd = self.rnd();
-        let mut state: Vec<PyObjectRef> = Vec::with_capacity(N + 1);
+        // 625 successive allocations, each over the words already produced,
+        // and a plain `Vec` is not a root area (`build_list_storage`).
+        let mut state = pyre_object::gc_roots::RootedItems::new();
         for i in 0..N {
             state.push(w_int_new(rnd.state[i] as i64));
         }
         state.push(w_int_new(rnd.index as i64));
-        w_tuple_new(state)
+        w_tuple_new(state.take())
     }
 
     fn setstate(&mut self, w_state: PyTuple) -> Result<(), crate::PyError> {
