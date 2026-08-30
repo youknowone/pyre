@@ -5028,7 +5028,14 @@ impl<'a> Lowering<'a> {
         value: LinkArg,
         declared_ty: Option<&TyRef>,
     ) -> LinkArg {
-        let Some(root) = declared_ty.and_then(|ty| tyref_class_root(ty, self.llbc)) else {
+        let Some(root) = declared_ty.and_then(|ty| {
+            let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
+            if let Some(reference) = node.as_object()?.get("Ref") {
+                let pointee = reference.as_array()?.get(1)?;
+                return adt_node_class_root(strip_ty_indirections(pointee, self.llbc)?, self.llbc);
+            }
+            raw_ptr_pointee_class_root(node, self.llbc)
+        }) else {
             return value;
         };
         self.narrow_value_to_instance_root(bb_id, value, &root)
@@ -34506,6 +34513,49 @@ mod tests {
                     )
             }),
             "dstrategy assignment must retain the declared DictStrategyRef class"
+        );
+    }
+
+    /// PyPy's `instantiate(W_IntObject)` is lowered to a real allocation plus
+    /// `intval` store, never left as the Rust helper that accepted the
+    /// stack-built aggregate.  The real LLBC constructor must therefore leave
+    /// this frontend with `NewWithVtable`, not residual `malloc_typed`.
+    #[test]
+    #[ignore]
+    fn w_int_new_fuses_typed_allocation() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "pyre_object::intobject::w_int_new",
+            crate::HostStaticAddrs {
+                pytypes: &[("pyobject::INT_TYPE", 0x1020_3040)],
+                ..crate::HostStaticAddrs::default()
+            },
+        )
+        .expect("lower w_int_new");
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, .. }
+                    if owner.ends_with("W_IntObject"))
+            }),
+            "w_int_new must lower instantiate(W_IntObject) to NewWithVtable: {graph:#?}"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "w_int_new must not retain residual malloc_typed: {graph:#?}"
         );
     }
 
