@@ -9253,12 +9253,20 @@ pub(crate) struct GeneratorResumeCensus {
     resume_py_pc: usize,
     /// The JitCode byte offset that coordinate resolves to, once it does.
     marker_offset: Option<usize>,
-    /// Whether the body's jitcode carries a `jit_merge_point`.  This is the
+    /// Whether the code object owns a Python-level loop header, read as a
+    /// `merge_entry_by_green` entry other than function entry.  This is the
     /// one gate a resume cannot simply refuse: a `while` generator's own loop
     /// header sits between the resume and the yield, and upstream crosses it
     /// exactly once because `should_unroll_one_iteration` answers True for a
     /// generator code object.  Counting the bodies that have one prices that
     /// hook against the ones a straight-line resume would already serve.
+    ///
+    /// NOT [`callee_body_owns_loop_header`], which asks the jitcode for a
+    /// `jit_merge_point` op.  That op is emitted only under `is_true_portal`,
+    /// and a generator body is never one, so the jitcode test answers `false`
+    /// for every generator whatever its source says.  `merge_entry_by_green`
+    /// is `find_loop_header_pcs` plus function entry and is built for every
+    /// code object, so it survives the portal distinction.
     owns_loop_header: bool,
     /// `n_py_instrs`, so a `NoResumeEntry` naming an out-of-range coordinate is
     /// distinguishable from one whose tables simply do not resolve it.
@@ -9333,7 +9341,7 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
     let Some(pjc) = crate::state::pyjitcode_for_code(w_pycode) else {
         decline!(V::NoJitcode)
     };
-    census.owns_loop_header = callee_body_owns_loop_header(body.code);
+    census.owns_loop_header = pjc.metadata.merge_entry_by_green.iter().any(|&(py, _)| py != 0);
     census.n_py_instrs = pjc.metadata.n_py_instrs as usize;
     census.tables = (
         pjc.metadata.py_exact_by_jit_pc.len(),
