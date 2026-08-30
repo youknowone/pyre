@@ -8,7 +8,7 @@
 _OMITTED = object()
 
 
-def _codec_errors_arg(name, errors):
+def _codec_errors_arg(name, errors, _str_getitem=str.__getitem__, _whole=slice(None)):
     # The `errors: str(accept={str, NoneType})` the two `MultibyteCodec`
     # methods declare: `None` is the "strict" spelling.
     if errors is None:
@@ -18,10 +18,13 @@ def _codec_errors_arg(name, errors):
             f"{name}() argument 'errors' must be str or None, "
             f"not {type(errors).__name__}"
         )
-    return str.__getitem__(errors, slice(None))
+    # `text_or_none` is a gateway conversion in PyPy, so rebinding names in
+    # the app module cannot change it.  Capture the two builtin operands in
+    # defaults instead of resolving `str` or `slice` through mutable globals.
+    return _str_getitem(errors, _whole)
 
 
-def _errors_arg(name, position, errors):
+def _errors_arg(name, position, errors, _str_getitem=str.__getitem__, _whole=slice(None)):
     # The plain `s` the four initializers declare: only a str, and an omitted
     # one means "strict".
     if errors is _OMITTED:
@@ -30,7 +33,7 @@ def _errors_arg(name, position, errors):
         # `seterror` names `None` itself rather than its type.
         got = "None" if errors is None else type(errors).__name__
         raise TypeError(f"{name}() argument {position} must be str, not {got}")
-    return str.__getitem__(errors, slice(None))
+    return _str_getitem(errors, _whole)
 
 
 def _codec_of(obj):
@@ -58,14 +61,14 @@ def _get_errors(self):
     return self._errors
 
 
-def _set_errors(self, value):
+def _set_errors(self, value, _str_getitem=str.__getitem__, _whole=slice(None)):
     if not isinstance(value, str):
         raise TypeError("errors must be a string")
     # PyPy `fset_errors` stores `space.text_w(w_errors)` and `fget_errors`
     # mints a fresh text object, so a str subclass never becomes the stored
     # observable value.  Call the base implementation directly to bypass a
     # subclass's `__getitem__` override while normalizing it to exact `str`.
-    self._errors = str.__getitem__(value, slice(None))
+    self._errors = _str_getitem(value, _whole)
 
 
 def _del_errors(self):
@@ -99,10 +102,11 @@ class MultibyteIncrementalDecoder:
         self.state = bytearray(_initial_state(self.codec.name, True))
 
     def decode(self, object, final=False):
-        # PyPy `decode_w(object='bufferstr')` preserves the original buffer
-        # when no pending prefix has to be joined.  Materialize only for the
-        # concatenation case; the Rust boundary accepts every buffer provider.
-        data = self.pending + memoryview(object).tobytes() if self.pending else object
+        # PyPy `decode_w(object='bufferstr')` hands the RPython codec a byte
+        # string.  `consumed` is consequently a byte offset even when the
+        # caller supplied a multi-byte-element buffer such as array('H').
+        # Materialize before both dispatch and the pending suffix slice.
+        data = self.pending + memoryview(object).tobytes()
         output, consumed = _decode_stateful(
             self.codec.name, data, self.errors, (final, self.state)
         )

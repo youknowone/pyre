@@ -2,6 +2,7 @@
 """PyPy's `_codecs_jp` state machines, ported without the C engine."""
 
 import _codecs_jp
+import array
 import codecs
 
 
@@ -20,12 +21,39 @@ for name, text, encoded, decoded in cases:
     assert codec.decode(encoded) == (decoded, len(encoded)), name
 
 
+# PyPy performs `text_or_none` conversion in the gateway, outside mutable app
+# globals.  Pyre's app-level carrier keeps the same property even if its
+# private globals dictionary is reached through the function object.
+codec = _codecs_jp.getcodec("shift_jis")
+encode_globals = getattr(type(codec).encode, "__globals__", None)
+if encode_globals is not None:
+    missing = object()
+    original_slice = encode_globals.get("slice", missing)
+    encode_globals["slice"] = lambda *_args: (_ for _ in ()).throw(AssertionError("slice"))
+    try:
+        assert codec.encode("A") == (b"A", 1)
+    finally:
+        if original_slice is missing:
+            del encode_globals["slice"]
+        else:
+            encode_globals["slice"] = original_slice
+
+
 for name in ("shift_jis_2004", "euc_jis_2004"):
     encoder = codecs.getincrementalencoder(name)()
     assert encoder.encode("か", False) == b""
     assert encoder.encode("\u309a", True) == (
         bytes.fromhex("82f5") if name == "shift_jis_2004" else bytes.fromhex("a4f7")
     )
+
+
+# PyPy's `bufferstr` gateway converts multi-byte-element buffers to a byte
+# string before the decoder reports its byte-based consumed position.
+decoder = codecs.getincrementaldecoder("shift_jis")()
+word_buffer = array.array("H")
+word_buffer.frombytes(b"A\x82")
+assert decoder.decode(word_buffer, False) == "A"
+assert decoder.getstate()[0] == b"\x82"
 
 
 for name in ("shift_jis_2004", "shift_jisx0213"):

@@ -9,18 +9,27 @@ import tempfile
 
 
 with tempfile.TemporaryDirectory() as directory:
-    path = os.path.join(directory, "nul.py")
-    with open(path, "wb") as stream:
-        stream.write(b"x = '\0' nothing to see here\n")
+    for name, source, lineno in (
+        ("nul_lf.py", b"x = '\0' nothing to see here\n", 1),
+        ("nul_cr.py", b"x = 1\rx = '\0' nothing to see here\r", 2),
+        ("nul_crlf.py", b"x = 1\r\nx = '\0' nothing to see here\r\n", 2),
+    ):
+        path = os.path.join(directory, name)
+        with open(path, "wb") as stream:
+            stream.write(source)
 
-    result = subprocess.run(
-        [sys.executable, path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert result.returncode != 0, result.stdout
-    stderr = result.stderr.decode("utf-8", "replace")
-    assert 'File "%s", line 1' % path in stderr, stderr
-    assert "SyntaxError: source code cannot contain null bytes" in stderr, stderr
+        result = subprocess.run(
+            [sys.executable, path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode != 0, result.stdout
+        stderr = result.stderr.decode("utf-8", "replace")
+        assert 'File "%s", line %d' % (path, lineno) in stderr, stderr
+        assert stderr.splitlines()[-2:] == [
+            "    x = '",
+            "SyntaxError: source code cannot contain null bytes",
+        ], stderr
+        assert "\0" not in stderr, stderr
 
 print("OK")

@@ -249,29 +249,36 @@ fn decode_source_bytes_impl(
         if locate_null {
             let line_start = source[..null_pos]
                 .iter()
-                .rposition(|byte| *byte == b'\n')
+                .rposition(|byte| *byte == b'\n' || *byte == b'\r')
                 .map_or(0, |index| index + 1);
-            let line_end = source[null_pos..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(source.len(), |relative| null_pos + relative);
-            let text = String::from_utf8_lossy(&source[line_start..line_end]);
-            let lineno = source[..null_pos]
-                .iter()
-                .filter(|byte| **byte == b'\n')
-                .count()
-                + 1;
-            let offset = String::from_utf8_lossy(&source[line_start..null_pos])
-                .chars()
-                .count()
-                + 1;
+            // PyPy `pytokenizer.universal_newline` folds CRLF and bare CR to
+            // LF before token positions are counted.  Count those same
+            // logical terminators without allocating a normalized source.
+            let mut line_breaks = 0usize;
+            let mut index = 0usize;
+            while index < null_pos {
+                match source[index] {
+                    b'\r' => {
+                        line_breaks += 1;
+                        index += usize::from(index + 1 < null_pos && source[index + 1] == b'\n');
+                    }
+                    b'\n' => line_breaks += 1,
+                    _ => {}
+                }
+                index += 1;
+            }
+            // CPython 3.14's tokenizer reports only the bytes preceding the
+            // NUL on its logical line and uses offset zero, which deliberately
+            // suppresses a caret for this boundary error.
+            let text = String::from_utf8_lossy(&source[line_start..null_pos]);
+            let lineno = line_breaks + 1;
             return Err(crate::PyError::syntax_error_located(
                 "source code cannot contain null bytes",
                 filename,
                 lineno as i64,
-                offset as i64,
+                0,
                 lineno as i64,
-                offset as i64,
+                0,
                 Some(&text),
             ));
         }
