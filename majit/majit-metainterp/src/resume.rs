@@ -3618,6 +3618,32 @@ impl ResumeDataLoopMemo {
         profiler.count(crate::pyjitpl::counters::NVREUSED, self.nvreused);
     }
 
+    /// Drop what a previous guard's numbering left in this memo, keeping the
+    /// per-trace statistics `update_counters` reports.
+    ///
+    /// resume.py has no counterpart: `optimizer.py:732` keeps one memo per
+    /// `Optimizer`, so every guard in a trace numbers against the pool and the
+    /// `cached_boxes` the guards before it filled, and `rebuild_state_after_failure`
+    /// then hands the bridge the compact live-box list that shared numbering
+    /// produced. `jitdriver.rs start_bridge_tracing` instead mints one
+    /// `InputArg` per resume position (`descr_fd.fail_arg_types().len()`), so a
+    /// pyre bridge's inputargs are positional: a number carried over from an
+    /// earlier guard addresses a slot this guard never filled, and the deopt
+    /// resumes the interpreter on values it never held.
+    /// `synth/foriter_segment_cut_resumes_forward` witnesses it — the
+    /// `range_object` loop totals 159328699804 where the genexp and the
+    /// interpreter both total 170272071504.
+    ///
+    /// Sharing the pools again is blocked on the same work as the compact
+    /// backend location vector: live-filtering `bridge_inputargs` in
+    /// `pyjitpl.rs compile_entry_bridge`.
+    pub fn reset_pools_for_guard(&mut self) {
+        self.consts.clear();
+        self.large_ints.clear();
+        self.refs.clear();
+        self.clear_box_virtual_numbers();
+    }
+
     /// resume.py clear_box_virtual_numbers.
     pub fn clear_box_virtual_numbers(&mut self) {
         self.cached_boxes.clear();

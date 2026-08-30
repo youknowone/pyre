@@ -6593,6 +6593,10 @@ impl OptContext {
         // resume.py: delegate to ResumeDataVirtualAdder.finish()
         let env = OptBoxEnv { ctx: self };
         let mut memo = self.resumedata_memo.borrow_mut();
+        // Number this guard against empty pools — see
+        // `ResumeDataLoopMemo::reset_pools_for_guard` for why pyre cannot carry
+        // an earlier guard's numbering forward the way optimizer.py:732 does.
+        memo.reset_pools_for_guard();
         // resume.py:403-405 passes `minimum_virtualizable_size` here, which
         // arms the `resume.py` length check inside `number()`. This
         // call site used to hardcode `-1`, so the check — ported faithfully in
