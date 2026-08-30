@@ -625,6 +625,7 @@ fn guard_fail_args_advanced(
         .map(|g| {
             g.fail_arg_refs
                 .iter()
+                .filter(|r| !r.is_none())
                 .map(|r| !r.is_constant() && advanced_ids.contains(&r.raw()))
                 .collect()
         })
@@ -2759,7 +2760,13 @@ impl WasmBackend {
                         guard_fail_arg_advanced: guard_fail_args_advanced(&region.ops, exits),
                         guard_fail_arg_counts: exits
                             .iter()
-                            .map(|guard| guard.fail_arg_refs.len())
+                            .map(|guard| {
+                                guard
+                                    .fail_arg_refs
+                                    .iter()
+                                    .filter(|arg| !arg.is_none())
+                                    .count()
+                            })
                             .collect(),
                         bridge_param_dispatch: inputs.bridge_param_dispatch,
                     },
@@ -3717,7 +3724,13 @@ impl majit_backend::Backend for WasmBackend {
             guard_fail_arg_advanced,
             guard_fail_arg_counts: guard_exits
                 .iter()
-                .map(|guard| guard.fail_arg_refs.len())
+                .map(|guard| {
+                    guard
+                        .fail_arg_refs
+                        .iter()
+                        .filter(|arg| !arg.is_none())
+                        .count()
+                })
                 .collect(),
             bridge_param_dispatch: bridge_params_enabled(),
             bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
@@ -4602,7 +4615,13 @@ impl majit_backend::Backend for WasmBackend {
                     guard_fail_arg_advanced: guard_fail_args_advanced(ops, &guard_exits),
                     guard_fail_arg_counts: guard_exits
                         .iter()
-                        .map(|guard| guard.fail_arg_refs.len())
+                        .map(|guard| {
+                            guard
+                                .fail_arg_refs
+                                .iter()
+                                .filter(|arg| !arg.is_none())
+                                .count()
+                        })
                         .collect(),
                     bridge_param_dispatch: bridge_params_enabled(),
                 },

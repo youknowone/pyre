@@ -1302,7 +1302,11 @@ pub struct Op {
     /// Each write sheds to a bound producer (`Operand::Op` / `InputArg`) or
     /// an inline `Const`; the position-remap passes skip bound operands and
     /// rewrite no longer-existing position-only snapshot, mirroring `args`.
-    pub fail_args: std::cell::RefCell<Option<SmallVec<[Operand; 3]>>>,
+    // `GuardResOp` owns `_fail_args` upstream; ordinary ResOperations do not
+    // embed room for a fail-argument list.  Keep the optional Vec header here
+    // instead of a three-Operand inline SmallVec, which otherwise bloats every
+    // recorded non-guard op by the size of three Rc-bearing Operands.
+    pub fail_args: std::cell::RefCell<Option<Vec<Operand>>>,
     /// Types of fail_args, set by the optimizer (`set_fail_arg_types`)
     /// from each fail-arg operand's type.
     /// When present, the backend uses these instead of inferring types.
@@ -3737,6 +3741,18 @@ static OPNAME: [&str; OPCODE_COUNT] = {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ordinary_op_does_not_embed_guard_failarg_inline_storage() {
+        // GuardResOp owns `_fail_args` upstream. A previous SmallVec<[Operand;
+        // 3]> in the unified Rust Op made every ordinary operation reserve
+        // three Operand slots; keep the common allocation below that old
+        // 280-byte payload on 64-bit targets.
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(std::mem::size_of::<Op>() < 280);
+        }
+    }
+
     macro_rules! op {
         ($($field:tt)*) => {{
             let mut __op = Op {
@@ -4908,7 +4924,7 @@ mod tests {
             args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::NONE),
-            fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)])),
+            fail_args: std::cell::RefCell::new(Some(vec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)])),
 
 
             fail_arg_types: std::cell::RefCell::new(None),
@@ -4975,7 +4991,7 @@ mod tests {
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
-                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)])),
+                fail_args: std::cell::RefCell::new(Some(vec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)])),
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
@@ -5007,7 +5023,7 @@ mod tests {
             args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
             descr: std::cell::RefCell::new(None),
             pos: std::cell::Cell::new(OpRef::NONE),
-            fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)])),
+            fail_args: std::cell::RefCell::new(Some(vec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)])),
 
 
             fail_arg_types: std::cell::RefCell::new(None),
@@ -5129,7 +5145,7 @@ mod tests {
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
-                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)])),
+                fail_args: std::cell::RefCell::new(Some(vec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)])),
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
@@ -5236,7 +5252,7 @@ mod tests {
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
-                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)])),
+                fail_args: std::cell::RefCell::new(Some(vec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)])),
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
@@ -5292,7 +5308,7 @@ mod tests {
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
-                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)])),
+                fail_args: std::cell::RefCell::new(Some(vec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)])),
 
                 fail_arg_types: std::cell::RefCell::new(None),
                 rd_resume_position: std::cell::Cell::new(-1),
@@ -5303,7 +5319,7 @@ mod tests {
                 args: std::cell::RefCell::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
                 descr: std::cell::RefCell::new(None),
                 pos: std::cell::Cell::new(OpRef::NONE),
-                fail_args: std::cell::RefCell::new(Some(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)])),
+                fail_args: std::cell::RefCell::new(Some(vec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)])),
 
 
                 fail_arg_types: std::cell::RefCell::new(None),

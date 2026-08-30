@@ -531,6 +531,23 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     };
 
     let helper_name = func.sig.ident.to_string();
+    let (reserved_i, reserved_r, reserved_f) = inline_helper_param_counts(func)?;
+    let return_register = match return_kind {
+        InlineReturnKind::Int => Some(Register::int(return_reg)),
+        InlineReturnKind::Ref => Some(Register::ref_(return_reg)),
+        InlineReturnKind::Float => Some(Register::float(return_reg)),
+        InlineReturnKind::Void => None,
+    };
+    let (_, compact_return) = super::regalloc::compact_registers(
+        &mut lowerer,
+        super::regalloc::RegisterCounts {
+            ints: reserved_i,
+            refs: reserved_r,
+            floats: reserved_f,
+        },
+        return_register,
+    );
+    let return_reg = compact_return.map_or(return_reg, |reg| u16::from(reg.index));
     annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
     remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
     rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);

@@ -204,6 +204,13 @@ pub struct Trace {
     /// carries the `Rc<InputArg>` directly), and the same `Rc<InputArg>` flows
     /// through `into_parts` / `from_oprc` into `TreeLoop.inputargs` unchanged.
     inputargs: Vec<InputArgRc>,
+    /// Positions reserved by `Trace(max_num_inputargs)` that survived
+    /// `initialize_state_from_guard_failure`'s hole filtering.
+    ///
+    /// The backing vector stays dense while recording so an original TAGBOX
+    /// position resolves directly. `into_parts` exposes only live FrontendOps,
+    /// matching `History.set_inputargs` in RPython.
+    inputarg_live: Vec<bool>,
     /// Next OpRef index to assign.
     op_count: u32,
     /// Running count of recorded guards, kept in sync by the two
@@ -235,6 +242,7 @@ impl Trace {
         Trace {
             ops: Vec::with_capacity(256),
             inputargs: Vec::new(),
+            inputarg_live: Vec::new(),
             op_count: 0,
             guard_count: 0,
             box_count: 0,
@@ -260,6 +268,15 @@ impl Trace {
         recorder
     }
 
+    /// Reserve the full guard failarg coordinate space while exposing only
+    /// the live positions when the trace is handed to the optimizer.
+    pub fn with_input_layout(input_types: &[Type], live_inputs: &[bool]) -> Self {
+        assert_eq!(input_types.len(), live_inputs.len());
+        let mut recorder = Self::with_input_types(input_types);
+        recorder.inputarg_live.copy_from_slice(live_inputs);
+        recorder
+    }
+
     /// Register an input argument of the given type.
     /// Returns an OpRef that can be used as an argument to subsequent operations.
     /// Input arguments are numbered starting from 0; the OpRef index matches
@@ -274,6 +291,7 @@ impl Trace {
         );
         let index = self.inputargs.len() as u32;
         self.inputargs.push(InputArg::from_type_rc(tp, index));
+        self.inputarg_live.push(true);
         let opref = match tp {
             Type::Int => OpRef::input_arg_int(self.op_count),
             Type::Float => OpRef::input_arg_float(self.op_count),
@@ -628,7 +646,27 @@ impl Trace {
     /// to the optimizer as a `TreeLoop`. See `TraceCtx::into_tree_loop` for
     /// the snapshot-bearing path.
     pub fn into_parts(self) -> (Vec<InputArgRc>, Vec<OpRc>) {
-        (self.inputargs, self.ops)
+        let inputargs = self
+            .inputargs
+            .into_iter()
+            .zip(self.inputarg_live)
+            .filter_map(|(arg, live)| live.then_some(arg))
+            .collect();
+        (inputargs, self.ops)
+    }
+
+    /// Materialize the history's live input box list without consuming it.
+    ///
+    /// `pyjitpl.py initialize_state_from_guard_failure` installs the
+    /// hole-filtered list with `History.set_inputargs`; each surviving box
+    /// retains its original position in the recorder's reserved coordinate
+    /// space.  This is the pre-`into_parts` view used while closing a bridge.
+    pub fn live_inputargs_cloned(&self) -> Vec<InputArg> {
+        self.inputargs
+            .iter()
+            .zip(self.inputarg_live.iter())
+            .filter_map(|(arg, &live)| live.then(|| arg.fresh_value_copy()))
+            .collect()
     }
 
     /// Convenience: consume the recorder and produce a `TreeLoop`.
@@ -638,7 +676,8 @@ impl Trace {
     pub fn get_trace(self) -> crate::history::TreeLoop {
         // `self.ops` is already `Vec<OpRc>`; `from_oprc` preserves that
         // shared identity.
-        crate::history::TreeLoop::from_oprc(self.inputargs, self.ops, Vec::new())
+        let (inputargs, ops) = self.into_parts();
+        crate::history::TreeLoop::from_oprc(inputargs, ops, Vec::new())
     }
 
     /// opencoder.py `cut_point()` — the recorder's local slice of
@@ -1280,6 +1319,30 @@ mod tests {
         let rec = Trace::with_num_inputs(3);
         assert_eq!(rec.num_inputargs(), 3);
         assert_eq!(rec.num_ops(), 0);
+    }
+
+    #[test]
+    fn guard_failure_history_drops_holes_but_keeps_frontend_positions() {
+        let mut rec =
+            Trace::with_input_layout(&[Type::Int, Type::Ref, Type::Int], &[true, false, true]);
+        let result = rec.record_op(OpCode::IntAdd, &[iarg(0), iarg(2)]);
+        assert_eq!(
+            result.raw(),
+            3,
+            "the hole remains reserved in trace positions"
+        );
+
+        let live = rec.live_inputargs_cloned();
+        assert_eq!(
+            live.iter().map(InputArg::opref).collect::<Vec<_>>(),
+            vec![OpRef::input_arg_int(0), OpRef::input_arg_int(2)]
+        );
+
+        let (inputargs, ops) = rec.into_parts();
+        assert_eq!(inputargs.len(), 2);
+        assert_eq!(inputargs[0].opref(), iarg(0));
+        assert_eq!(inputargs[1].opref(), iarg(2));
+        assert_eq!(ops[0].arg(1).to_opref(), iarg(2));
     }
 
     #[test]

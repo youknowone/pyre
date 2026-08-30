@@ -2938,7 +2938,11 @@ pub fn build_wasm_module(
                     "wasm backend: inlined bridge source guard is outside the owner stream".into(),
                 )
             })?;
-        let source_args = source_guard.fail_arg_refs.len();
+        let source_args = source_guard
+            .fail_arg_refs
+            .iter()
+            .filter(|arg| !arg.is_none())
+            .count();
         if source_args != bridge.inputargs.len() {
             return Err(BackendError::Unsupported(format!(
                 "wasm backend: inlined bridge input arity {} differs from source guard arity {source_args}",
@@ -2979,7 +2983,13 @@ pub fn build_wasm_module(
     let bridge_param_arities: Vec<usize> = if *bridge_param_dispatch && bridge_dispatch {
         let mut arities: Vec<usize> = guards
             .iter()
-            .map(|guard| guard.fail_arg_refs.len())
+            .map(|guard| {
+                guard
+                    .fail_arg_refs
+                    .iter()
+                    .filter(|arg| !arg.is_none())
+                    .count()
+            })
             .collect();
         arities.sort_unstable();
         arities.dedup();
@@ -7687,8 +7697,11 @@ fn emit_guard_param_tail_call(
 ) {
     let fail_args: Vec<OpRef> = op
         .getfailargs()
-        .map(|args| args.iter().map(|arg| arg.to_opref()).collect())
-        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect());
+        .map(|args| args.iter().map(|arg| arg.to_opref()).collect::<Vec<_>>())
+        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect())
+        .into_iter()
+        .filter(|arg| !arg.is_none())
+        .collect();
     let arity = fail_args.len();
     let type_idx = *dispatch
         .param_type_indices
@@ -7730,8 +7743,11 @@ fn emit_guard_inline_bridge_move(
 ) {
     let fail_args: Vec<OpRef> = op
         .getfailargs()
-        .map(|args| args.iter().map(|arg| arg.to_opref()).collect())
-        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect());
+        .map(|args| args.iter().map(|arg| arg.to_opref()).collect::<Vec<_>>())
+        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect())
+        .into_iter()
+        .filter(|arg| !arg.is_none())
+        .collect();
     assert_eq!(
         fail_args.len(),
         inputargs.len(),

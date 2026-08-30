@@ -3298,7 +3298,7 @@ pub struct ResumeDataLoopMemo {
     /// resume.py:147 — shared constant pool.
     /// RPython stores Const objects (with type INT/REF/FLOAT).
     /// We store (value, type) pairs to preserve type information.
-    consts: Vec<majit_ir::Const>,
+    consts: Arc<majit_ir::SharedConstPool>,
     /// resume.py — large integers (outside TAGINT range) → tagged const.
     large_ints: indexmap::IndexMap<i64, i16>,
     /// resume.py:149 — ref pointers → tagged const.
@@ -3318,7 +3318,7 @@ pub struct ResumeDataLoopMemo {
 impl ResumeDataLoopMemo {
     pub fn new() -> Self {
         ResumeDataLoopMemo {
-            consts: Vec::new(),
+            consts: majit_ir::SharedConstPool::new(Vec::new()),
             large_ints: indexmap::IndexMap::new(),
             refs: indexmap::IndexMap::new(),
             cached_boxes: indexmap::IndexMap::new(),
@@ -3388,7 +3388,10 @@ impl ResumeDataLoopMemo {
     ///
     /// `large_ints` needs no such pass — an integer key does not move.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        for c in self.consts.iter_mut() {
+        // SAFETY: the stop-the-world root walker is the only code running and
+        // holds exclusive access to this optimizer memo.
+        let consts = unsafe { self.consts.as_mut_vec_for_gc() };
+        for c in consts.iter_mut() {
             if let majit_ir::Const::Ref(slot) = c {
                 visitor(slot);
             }
@@ -3474,7 +3477,12 @@ impl ResumeDataLoopMemo {
     /// tag leaves the pool exactly as it was.
     fn newconst(&mut self, val: i64, tp: majit_ir::Type) -> Result<i16, TagOverflow> {
         let tagged = tag(self.consts.len() as i32 + TAG_CONST_OFFSET, TAGCONST)?;
-        self.consts.push(majit_ir::Const::from_raw_i64(val, tp));
+        // SAFETY: numbering is the sole mutator and no resume reader exists
+        // until the optimized trace is published.
+        unsafe {
+            self.consts
+                .push_during_optimization(majit_ir::Const::from_raw_i64(val, tp));
+        }
         Ok(tagged)
     }
 
@@ -3493,7 +3501,10 @@ impl ResumeDataLoopMemo {
                     return tag_i64(encode_len((num - TAG_CONST_OFFSET) as usize), TAGCONST);
                 }
                 let index = self.consts.len();
-                self.consts.push(majit_ir::Const::Int(*value));
+                unsafe {
+                    self.consts
+                        .push_during_optimization(majit_ir::Const::Int(*value));
+                }
                 // Also publish through the i16 cache so that a later
                 // `getconst_int(value)` returns the same pool slot
                 // (resume.py:171 self.large_ints[val] = tagged). The cache
@@ -3523,7 +3534,10 @@ impl ResumeDataLoopMemo {
                     return tag_i64(encode_len((num - TAG_CONST_OFFSET) as usize), TAGCONST);
                 }
                 let index = self.consts.len();
-                self.consts.push(majit_ir::Const::Ref(*gcref));
+                unsafe {
+                    self.consts
+                        .push_during_optimization(majit_ir::Const::Ref(*gcref));
+                }
                 // See the Int arm on why an unrepresentable tag skips the cache.
                 if let Ok(tagged_i16) = tag((index as i32) + TAG_CONST_OFFSET, TAGCONST) {
                     self.refs.insert(raw, tagged_i16);
@@ -3533,7 +3547,10 @@ impl ResumeDataLoopMemo {
             majit_ir::Const::Float(v) => {
                 // resume.py _newconst (no dedup for floats in RPython).
                 let index = self.consts.len();
-                self.consts.push(majit_ir::Const::Float(*v));
+                unsafe {
+                    self.consts
+                        .push_during_optimization(majit_ir::Const::Float(*v));
+                }
                 tag_i64(encode_len(index), TAGCONST)
             }
         }
@@ -3618,32 +3635,6 @@ impl ResumeDataLoopMemo {
         profiler.count(crate::pyjitpl::counters::NVREUSED, self.nvreused);
     }
 
-    /// Drop what a previous guard's numbering left in this memo, keeping the
-    /// per-trace statistics `update_counters` reports.
-    ///
-    /// resume.py has no counterpart: `optimizer.py:732` keeps one memo per
-    /// `Optimizer`, so every guard in a trace numbers against the pool and the
-    /// `cached_boxes` the guards before it filled, and `rebuild_state_after_failure`
-    /// then hands the bridge the compact live-box list that shared numbering
-    /// produced. `jitdriver.rs start_bridge_tracing` instead mints one
-    /// `InputArg` per resume position (`descr_fd.fail_arg_types().len()`), so a
-    /// pyre bridge's inputargs are positional: a number carried over from an
-    /// earlier guard addresses a slot this guard never filled, and the deopt
-    /// resumes the interpreter on values it never held.
-    /// `synth/foriter_segment_cut_resumes_forward` witnesses it — the
-    /// `range_object` loop totals 159328699804 where the genexp and the
-    /// interpreter both total 170272071504.
-    ///
-    /// Sharing the pools again is blocked on the same work as the compact
-    /// backend location vector: live-filtering `bridge_inputargs` in
-    /// `pyjitpl.rs compile_entry_bridge`.
-    pub fn reset_pools_for_guard(&mut self) {
-        self.consts.clear();
-        self.large_ints.clear();
-        self.refs.clear();
-        self.clear_box_virtual_numbers();
-    }
-
     /// resume.py clear_box_virtual_numbers.
     pub fn clear_box_virtual_numbers(&mut self) {
         self.cached_boxes.clear();
@@ -3653,13 +3644,13 @@ impl ResumeDataLoopMemo {
     /// Access the shared constant pool (value, type) pairs. Parity with
     /// RPython `memo.consts` list access (resume.py).
     pub fn consts(&self) -> &[majit_ir::Const] {
-        &self.consts
+        self.consts.as_slice()
     }
 
     /// Take ownership of the shared constant pool — used by single-shot
     /// encoders that discard the memo after encoding.
     pub fn take_consts(&mut self) -> Vec<majit_ir::Const> {
-        std::mem::take(&mut self.consts)
+        self.consts.snapshot()
     }
 
     /// resume.py register_box — add a non-const, non-seen box to
@@ -4277,7 +4268,7 @@ impl ResumeDataLoopMemo {
     ) -> Result<
         (
             Vec<u8>,
-            Vec<majit_ir::Const>,
+            Arc<majit_ir::SharedConstPool>,
             Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
             Vec<majit_ir::OpRef>,
             LiveboxTypeMap,
@@ -4631,7 +4622,7 @@ impl ResumeDataLoopMemo {
         EncodedResumeData {
             rd_numb,
             // resume.py:451 storage.rd_consts = self.memo.consts — single pool.
-            rd_consts: self.consts.clone(),
+            rd_consts: self.consts.snapshot(),
             rd_pendingfields,
             rd_virtuals,
             liveboxes,
@@ -5408,6 +5399,24 @@ mod tests {
             rebuilt_frames[0].values[3],
             RebuiltValue::Box(1, majit_ir::Type::Int)
         );
+    }
+
+    #[test]
+    fn guard_storages_share_the_memos_growing_const_pool() {
+        let mut memo = ResumeDataLoopMemo::new();
+        let env = SimpleBoxEnv::new();
+
+        let first = Snapshot::single_frame(0, 1, vec![OpRef::const_int(1)]);
+        let first_state = memo.number(&first, &env, -1).unwrap();
+        let (_, first_pool, _, _, _) = memo.finish(first_state, &env, &mut [], None).unwrap();
+        assert!(first_pool.is_empty());
+
+        let second = Snapshot::single_frame(0, 2, vec![OpRef::const_int(100_000)]);
+        let second_state = memo.number(&second, &env, -1).unwrap();
+        let (_, second_pool, _, _, _) = memo.finish(second_state, &env, &mut [], None).unwrap();
+
+        assert!(std::sync::Arc::ptr_eq(&first_pool, &second_pool));
+        assert_eq!(first_pool.as_slice(), &[majit_ir::Const::Int(100_000)]);
     }
 
     #[test]

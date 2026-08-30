@@ -262,6 +262,23 @@ impl SharedConstPool {
         self.as_slice().to_vec()
     }
 
+    /// Append while the owning optimizer is still constructing its trace.
+    ///
+    /// RPython's `ResumeDataLoopMemo.consts` is one mutable list shared by
+    /// every guard storage in that optimizer.  The optimizer is single-
+    /// threaded and no resume-data reader can run until backend compilation
+    /// publishes the completed trace, so extending the list in that window is
+    /// the Rust analogue of `self.consts.append(const)`.
+    ///
+    /// # Safety
+    /// No slice returned by [`SharedConstPool::as_slice`] may be live across
+    /// this call.
+    pub unsafe fn push_during_optimization(&self, value: Const) {
+        unsafe { &mut *self.values.get() }.push(value);
+        self.minor_scan_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// # Safety
     ///
     /// The caller must be the exclusive GC root walker; no resume-data reader

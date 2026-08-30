@@ -6593,10 +6593,6 @@ impl OptContext {
         // resume.py: delegate to ResumeDataVirtualAdder.finish()
         let env = OptBoxEnv { ctx: self };
         let mut memo = self.resumedata_memo.borrow_mut();
-        // Number this guard against empty pools — see
-        // `ResumeDataLoopMemo::reset_pools_for_guard` for why pyre cannot carry
-        // an earlier guard's numbering forward the way optimizer.py:732 does.
-        memo.reset_pools_for_guard();
         // resume.py:403-405 passes `minimum_virtualizable_size` here, which
         // arms the `resume.py` length check inside `number()`. This
         // call site used to hardcode `-1`, so the check — ported faithfully in
@@ -6713,6 +6709,17 @@ impl OptContext {
                     .unwrap_or_else(|| Operand::from_opref(*a))
             })
             .collect();
+        let logical_rd_locs: Vec<u16> = final_operands
+            .iter()
+            .enumerate()
+            .map(|(index, operand)| {
+                if operand.is_none() {
+                    0xFFFF
+                } else {
+                    u16::try_from(index).expect("resume failarg position must fit in rd_locs")
+                }
+            })
+            .collect();
         if crate::callee_rca_enabled() {
             let final_oprefs: Vec<_> = final_operands
                 .iter()
@@ -6794,8 +6801,19 @@ impl OptContext {
         };
         let __descr_arc = op.getdescr();
         if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
+            // pyjitpl.py `initialize_state_from_guard_failure` receives
+            // `inputargs_and_holes` and returns only its non-None boxes.
+            // Keep that distinction on the ResumeGuardDescr before handing
+            // it to a backend: dynasm replaces these identity locations with
+            // its compact frame locations, while cranelift and wasm keep
+            // failargs in their logical slots and therefore need this
+            // identity-with-holes layout as-is.  Deriving the mask later from
+            // backend-populated rd_locs made bridgeopt deserialize dead Ref
+            // holes on the latter backends, shifting the known-class
+            // bitfield into the heap-knowledge stream.
+            fd.set_rd_locs(logical_rd_locs);
             fd.set_rd_numb(Some(rd_numb));
-            fd.set_rd_consts(Some(rd_consts));
+            fd.set_rd_consts_arc(Some(rd_consts));
             fd.set_rd_virtuals(descr_rd_virtuals);
             fd.set_rd_pendingfields(descr_pending);
             // The back-edge poll of the eval-breaker word reaches this

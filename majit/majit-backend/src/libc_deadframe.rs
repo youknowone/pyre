@@ -129,16 +129,18 @@ impl LibcJitFrameDeadFrame {
     /// `index` lives in, or `None` when the descr maps it nowhere.
     ///
     /// Indices past `rd_locs` fall through to identity slot indexing, which is
-    /// what the synthetic and out-of-range descrs the runner mints rely on.
+    /// what the synthetic descrs the runner mints rely on. The logical index
+    /// is deliberately decoded before the physical frame bound is checked:
+    /// sparse resume data can have more failarg positions than this fallback
+    /// bound, while a late failarg still maps to a valid live frame slot.
     fn slot_of(&self, index: usize) -> Option<usize> {
-        if index >= self.num_slots {
-            return None;
-        }
         let descr = self.fail_descr.as_fail_descr()?;
         if index < descr.rd_locs().len() {
             crate::llmodel::decode_rd_loc_slot(descr, index)
-        } else {
+        } else if index < self.num_slots {
             Some(index)
+        } else {
+            None
         }
     }
 
@@ -250,5 +252,36 @@ fn unregister_live_deadframe(addr: usize) {
 pub fn walk_live_deadframes(visit: &mut dyn FnMut(usize)) {
     for &addr in live_deadframes().read().iter() {
         visit(addr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_ir::Type;
+
+    #[test]
+    fn sparse_logical_index_is_decoded_before_physical_frame_bound() {
+        let descr = crate::make_resume_guard_descr_typed(vec![Type::Int; 45]);
+        let fail_descr = descr.as_fail_descr().expect("resume guard descr");
+        let mut rd_locs = vec![0xFFFF; 45];
+        rd_locs[40] = 15;
+        rd_locs[41] = 13;
+        rd_locs[42] = 27;
+        rd_locs[44] = 28;
+        fail_descr.set_rd_locs(rd_locs);
+
+        // No frame access is performed: this test isolates `_decode_pos`'s
+        // logical-to-physical ordering. The borrowed null owner is therefore
+        // safe for the lifetime of the deadframe.
+        let frame =
+            unsafe { LibcJitFrameDeadFrame::borrowing(std::ptr::null_mut(), 36, descr, None) };
+
+        assert_eq!(frame.slot_of(40), Some(15));
+        assert_eq!(frame.slot_of(41), Some(13));
+        assert_eq!(frame.slot_of(42), Some(27));
+        assert_eq!(frame.slot_of(43), None);
+        assert_eq!(frame.slot_of(44), Some(28));
+        assert_eq!(frame.slot_of(45), None);
     }
 }

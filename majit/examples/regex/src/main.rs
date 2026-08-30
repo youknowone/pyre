@@ -183,7 +183,7 @@ fn bench(
     root: *mut NodeRec,
     s: &[u8],
     counter: Option<&AtomicUsize>,
-    run: impl Fn(*mut NodeRec, &[u8]) -> bool,
+    mut run: impl FnMut(*mut NodeRec, &[u8]) -> bool,
 ) -> Row {
     assert!(
         !run(root, s),
@@ -289,6 +289,10 @@ fn main() {
         lower(&bench_regex(N)),
         lower(&bench_regex(N)),
     ];
+    // warmspot.py owns one JitDriver for a portal. Keep each portal instance
+    // across the whole sweep so compiled loops are reused between matches.
+    let mut masking_matcher = jit_interp::Matcher::new(roots[1], THRESHOLD);
+    let mut branching_matcher = shortcircuit::Matcher::new(roots[2], THRESHOLD);
 
     println!();
     println!("timed rows: {REPEATS} runs each, median (min - max).");
@@ -309,14 +313,14 @@ fn main() {
             roots[1],
             &s,
             Some(&jit_interp::COMPILES),
-            |r, s| jit_interp::matches(r, s, THRESHOLD),
+            |_r, s| masking_matcher.matches(s),
         );
         let branching_row = bench(
             NAMES[2],
             roots[2],
             &s,
             Some(&shortcircuit::COMPILES),
-            |r, s| shortcircuit::matches(r, s, THRESHOLD),
+            |_r, s| branching_matcher.matches(s),
         );
         let rows = [interp_row, masking_row, branching_row];
 
@@ -391,12 +395,10 @@ fn main() {
         }
         println!("    A row fastest at the LONGEST input is amortizing a cost that is fixed per");
         println!(
-            "    `matches` call. `loops compiled per run` above is the candidate: each portal"
+            "    `matches` call. The JitDriver now follows warmspot.py ownership and survives"
         );
-        println!("    builds its `JitDriver` inside `mainloop`, so the compiled-loop cache dies");
-        println!("    with the call and the next call records and compiles the loop again. Read");
-        println!("    such a row at the shortest length as a matcher-plus-compiler rate, and at");
-        println!("    the longest as the compiled loop's own.");
+        println!("    the whole sweep, so `loops compiled per run` distinguishes a real new");
+        println!("    specialization from fixed per-call setup.");
         println!("    A row fastest at the SHORTEST input has two candidates and this sweep does");
         println!("    not separate them. The tree is 93 nodes at every length, but the input");
         println!("    buffer grows from 4 KiB to 1 MiB, so the longest length is not reading out");

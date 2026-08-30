@@ -3234,13 +3234,8 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 // loop_reentry: use raw fail_args (same as run_compiled_code
                 // bridge dispatch). rebuild_state_after_failure transforms
                 // outputs for blackhole resume which may change Vec length.
-                let raw_outputs = outputs[..bridge.num_inputs].to_vec();
-                let bridge_frame = CraneliftBackend::execute_bridge(
-                    &bridge,
-                    &raw_outputs,
-                    fail_descr_fd.fail_arg_types(),
-                    attachments,
-                );
+                let bridge_frame =
+                    CraneliftBackend::execute_bridge(&bridge, &outputs, fail_descr_fd, attachments);
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                     .expect("bridge deadframe must have descriptor");
                 // llgraph/runner.py Jump exception on external JUMP:
@@ -3292,7 +3287,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             return CraneliftBackend::execute_bridge(
                 &bridge,
                 &mat_outputs,
-                fail_arg_types,
+                fail_descr_fd,
                 attachments,
             );
         }
@@ -3715,12 +3710,8 @@ fn call_assembler_guard_failure_inner(
     if let Some(bridge) = fail_descr_bridge_ref(fail_descr_ref) {
         let raw_num = fail_descr_ref.fail_arg_types().len();
         let parent_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, raw_num) };
-        let frame = CraneliftBackend::execute_bridge(
-            &bridge,
-            parent_outputs,
-            fail_descr_ref.fail_arg_types(),
-            attachments,
-        );
+        let frame =
+            CraneliftBackend::execute_bridge(&bridge, parent_outputs, fail_descr_ref, attachments);
         if let Some(result) = call_assembler_finish_or_blackhole_deadframe(frame) {
             return result;
         }
@@ -6853,6 +6844,7 @@ fn emit_attached_bridge_dispatch(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
     bridge_cache_addrs: (usize, usize),
+    fail_arg_refs: &[OpRef],
     ptr_type: cranelift_codegen::ir::Type,
 ) {
     // dynasm/x86 patches the failing guard's jump to the attached bridge.
@@ -6905,6 +6897,47 @@ fn emit_attached_bridge_dispatch(
 
     builder.switch_to_block(bridge_block);
     builder.seal_block(bridge_block);
+    // `compile_bridge` receives only the live fail arguments: resume holes
+    // stay in the source guard's logical list but are absent from the bridge
+    // inputargs (`compile.py ResumeGuardDescr.compile_and_attach`).  The
+    // parent recovery stub above stores values at those logical positions,
+    // while the bridge entry loader reads its compact inputargs from slots
+    // `0..N`.  Dynasm's regalloc makes the same transfer through the bridge's
+    // fail locations.  Cranelift shares the JITFRAME across this tail jump, so
+    // compact it here before entering the bridge.
+    //
+    // Load every source before writing any destination.  A late logical slot
+    // can be copied onto an earlier slot that is itself still a source.
+    let live_slots: Vec<usize> = fail_arg_refs
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, arg)| (!arg.is_none()).then_some(slot))
+        .collect();
+    if live_slots
+        .iter()
+        .enumerate()
+        .any(|(dense, source)| dense != *source)
+    {
+        let values: Vec<CValue> = live_slots
+            .iter()
+            .map(|source| {
+                builder.ins().load(
+                    cl_types::I64,
+                    MemFlagsData::trusted(),
+                    jf_ptr,
+                    JF_FRAME_ITEM0_OFS + (*source as i32) * 8,
+                )
+            })
+            .collect();
+        for (dense, value) in values.into_iter().enumerate() {
+            builder.ins().store(
+                MemFlagsData::trusted(),
+                value,
+                jf_ptr,
+                JF_FRAME_ITEM0_OFS + (dense as i32) * 8,
+            );
+        }
+    }
     // assembler.py:987 `patch_jump_for_descr`: the failing guard's JMP is
     // rewritten to jump straight into the bridge — a tail transfer, not a
     // call.  The cranelift analogue is `return_call_indirect` into the
@@ -7379,6 +7412,7 @@ fn emit_guard_exit(
             jf_ptr,
             info.bridge_cache_addrs
                 .expect("can_have_bridge=true GuardInfo must carry bridge_cache_addrs"),
+            &info.fail_arg_refs,
             ptr_type,
         );
     }
@@ -9321,18 +9355,39 @@ impl CraneliftBackend {
     fn execute_bridge(
         bridge: &BridgeData,
         parent_outputs: &[i64],
-        parent_types: &[Type],
+        parent_descr: &dyn FailDescr,
         attachments: &'static CpuDescrAttachments,
     ) -> DeadFrame {
-        // The bridge's inputs are the parent guard's fail args.
-        let num_bridge_inputs = bridge.num_inputs.min(parent_types.len());
-        let bridge_inputs = &parent_outputs[..num_bridge_inputs];
+        // `compile.py ResumeGuardDescr.compile_and_attach` passes only live
+        // boxes to the bridge.  `rd_locs` still has one entry per logical
+        // resume position, including `0xFFFF` holes, and maps each live entry
+        // to the physical word in `parent_outputs`.  Decode that table just as
+        // `llmodel.py _decode_pos` does instead of slicing the first N logical
+        // positions (which shifts every value after the first hole).
+        let rd_locs = parent_descr.rd_locs();
+        let mut bridge_inputs = Vec::with_capacity(bridge.num_inputs);
+        if rd_locs.is_empty() {
+            bridge_inputs.extend(parent_outputs.iter().copied().take(bridge.num_inputs));
+        } else {
+            for &loc in rd_locs {
+                if loc == 0xFFFF {
+                    continue;
+                }
+                let Some(&value) = parent_outputs.get(loc as usize) else {
+                    break;
+                };
+                bridge_inputs.push(value);
+                if bridge_inputs.len() == bridge.num_inputs {
+                    break;
+                }
+            }
+        }
         let exec = run_compiled_code(
             bridge.code_ptr,
             &bridge.fail_descrs,
             bridge.num_ref_roots,
             bridge.max_output_slots,
-            &FrameInputs::Ints(bridge_inputs),
+            &FrameInputs::Ints(&bridge_inputs),
             attachments,
             0, // bridge entry (br_table preamble slot)
         );
@@ -9341,7 +9396,7 @@ impl CraneliftBackend {
 
         if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
             let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
-                CallAssemblerCallerContext::from_bridge_data(bridge, bridge_inputs),
+                CallAssemblerCallerContext::from_bridge_data(bridge, &bridge_inputs),
             );
             return wrap_call_assembler_deadframe_with_caller_prefix(frame);
         }
@@ -9364,12 +9419,7 @@ impl CraneliftBackend {
             // Extracted on the one arm that feeds it forward; the FINISH and
             // no-bridge exits above and below return the frame itself.
             let outputs = exec.extract_outputs(bridge.max_output_slots.max(1));
-            return Self::execute_bridge(
-                &next_bridge,
-                &outputs,
-                fail_descr_fd.fail_arg_types(),
-                attachments,
-            );
+            return Self::execute_bridge(&next_bridge, &outputs, fail_descr_fd, attachments);
         }
 
         // jf_guard_exc already written by emit_guard_exit.

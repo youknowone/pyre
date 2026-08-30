@@ -307,7 +307,7 @@ pub struct AssemblerARM64<'a> {
     input_types: Vec<Type>,
     /// assembler.py rebuild_faillocs_from_descr parity:
     /// bridge input locations recovered from the source guard descr.
-    bridge_input_locs: Option<Vec<Option<Loc>>>,
+    bridge_input_locs: Option<Vec<Loc>>,
 
     // ── State tracking for code generation ──
     /// Maps OpRef → jitframe slot index. `IndexMap` (O(1) get/insert), not the
@@ -1084,7 +1084,7 @@ impl<'a> AssemblerARM64<'a> {
         if let Some(ref input_locs) = self.bridge_input_locs {
             let mut max_abs_slot = JITFRAME_FIXED_SIZE;
             for (ia, loc) in inputargs.iter().zip(input_locs.iter()) {
-                if let Some(Loc::Frame(floc)) = loc {
+                if let Loc::Frame(floc) = loc {
                     let abs_slot = JITFRAME_FIXED_SIZE + floc.position;
                     self.opref_to_slot.insert(ia.opref(), abs_slot);
                     if abs_slot + 1 > max_abs_slot {
@@ -1738,37 +1738,34 @@ impl<'a> AssemblerARM64<'a> {
     pub fn rebuild_faillocs_from_descr(
         descr: &dyn majit_ir::FailDescr,
         inputargs: &[InputArg],
-    ) -> Vec<Option<Loc>> {
-        let mut locs = Vec::with_capacity(descr.rd_locs().len());
+    ) -> Vec<Loc> {
+        let mut locs = Vec::new();
         let gpr_regs = all_gen_regs();
         let float_regs = all_float_regs();
         let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
-        for (input_i, &pos) in descr.rd_locs().iter().enumerate() {
+        let mut input_i = 0usize;
+        for &pos in descr.rd_locs() {
             if pos == 0xFFFF {
-                // resume.py / llsupport/assembler.py represent a dead failarg
-                // as None / 0xFFFF.  Pyre's bridge InputArg vector preserves
-                // those resume positions, so preserve the hole here too; a
-                // compact location vector would shift every later binding.
-                locs.push(None);
                 continue;
             }
             let pos = pos as usize;
             if pos < gpr_regs.len() {
                 // llsupport/assembler.py:211 — GPR: return register location
-                locs.push(Some(Loc::Reg(gpr_regs[pos])));
+                locs.push(Loc::Reg(gpr_regs[pos]));
             } else if pos < gpr_regs.len() + float_regs.len() {
                 // llsupport/assembler.py:213 — FPR: return float register
-                locs.push(Some(Loc::Reg(float_regs[pos - gpr_regs.len()])));
+                locs.push(Loc::Reg(float_regs[pos - gpr_regs.len()]));
             } else {
                 // llsupport/assembler.py:217 — frame slot
                 let slot = pos - JITFRAME_FIXED_SIZE;
                 let tp = inputargs.get(input_i).map(|ia| ia.tp).unwrap_or(Type::Int);
-                locs.push(Some(Loc::Frame(crate::regloc::FrameLoc::new(
+                locs.push(Loc::Frame(crate::regloc::FrameLoc::new(
                     slot,
                     crate::regalloc::get_ebp_ofs(base_ofs, slot),
                     tp == Type::Float,
-                ))));
+                )));
             }
+            input_i += 1;
         }
         locs
     }
@@ -1777,7 +1774,7 @@ impl<'a> AssemblerARM64<'a> {
     pub fn assemble_bridge(
         mut self,
         fail_descr: &dyn FailDescr,
-        arglocs: &[Option<Loc>],
+        arglocs: &[Loc],
     ) -> Result<CompiledCode, BackendError> {
         if crate::majit_log_enabled() {
             eprintln!(

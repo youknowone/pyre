@@ -264,6 +264,61 @@ impl<'a> TraceIterator<'a> {
         inputarg_types: &[majit_ir::Type],
         start_fresh: u32,
     ) -> Self {
+        let dense_positions: Vec<OpRef> = inputarg_types
+            .iter()
+            .enumerate()
+            .map(|(position, &tp)| OpRef::input_arg_typed(position as u32, tp))
+            .collect();
+        Self::new_with_input_layout(
+            trace,
+            start,
+            end,
+            force_inputargs,
+            inputarg_types,
+            &dense_positions,
+            start_fresh,
+        )
+    }
+
+    /// `TraceIterator.__init__` with the recorded trace's actual input boxes.
+    ///
+    /// RPython seeds `_cache[trace.inputargs[i].get_position()]`, not
+    /// `_cache[i]`.  Most majit traces have dense input positions, so `new`
+    /// retains the compact type-only surface for those callers.  Guard-failure
+    /// histories can contain holes, however: `Trace(max_num_inputargs)` keeps
+    /// the original coordinate space while `History.set_inputargs` filters
+    /// dead boxes.  This entry point preserves those sparse positions.
+    pub fn new_with_inputargs(
+        trace: &'a [majit_ir::OpRc],
+        start: usize,
+        end: usize,
+        force_inputargs: Option<&[OpRef]>,
+        inputargs: &[InputArg],
+        start_fresh: u32,
+    ) -> Self {
+        let inputarg_types: Vec<majit_ir::Type> = inputargs.iter().map(|arg| arg.tp).collect();
+        let inputarg_positions: Vec<OpRef> = inputargs.iter().map(InputArg::opref).collect();
+        Self::new_with_input_layout(
+            trace,
+            start,
+            end,
+            force_inputargs,
+            &inputarg_types,
+            &inputarg_positions,
+            start_fresh,
+        )
+    }
+
+    fn new_with_input_layout(
+        trace: &'a [majit_ir::OpRc],
+        start: usize,
+        end: usize,
+        force_inputargs: Option<&[OpRef]>,
+        inputarg_types: &[majit_ir::Type],
+        inputarg_positions: &[OpRef],
+        start_fresh: u32,
+    ) -> Self {
+        debug_assert_eq!(inputarg_types.len(), inputarg_positions.len());
         // self._cache = [None] * trace._index
         // The iterator's cache must be large enough to hold any raw trace
         // position we may encounter. RPython sizes it from `trace._index`
@@ -328,8 +383,12 @@ impl<'a> TraceIterator<'a> {
                     r
                 })
                 .collect();
-            for i in 0..num_inputargs {
-                _cache[i] = Some(Operand::from_bound_inputarg(&inputargs[i]));
+            for (i, position) in inputarg_positions.iter().enumerate() {
+                let p = position.raw() as usize;
+                if p >= _cache.len() {
+                    _cache.resize(p + 1, None);
+                }
+                _cache[p] = Some(Operand::from_bound_inputarg(&inputargs[i]));
             }
         }
         TraceIterator {
@@ -3027,6 +3086,33 @@ mod tests {
         let finish = iter.next().unwrap();
         assert_eq!(finish.arg(0).to_opref(), iop(3));
         assert!(iter.done());
+    }
+
+    #[test]
+    fn trace_iterator_seeds_sparse_guard_history_positions() {
+        // `Trace(max_num_inputargs=3)` reserved position 1, but
+        // `History.set_inputargs([box0, box2])` filtered that dead box.
+        // `TraceIterator.__init__` must seed `_cache` by each surviving
+        // box's recorded position, not by its compact vector index.
+        let ops = vec![std::rc::Rc::new(op_at(
+            3,
+            majit_ir::OpCode::IntAdd,
+            &[iarg(0), iarg(2)],
+        ))];
+        let inputargs = vec![
+            majit_ir::InputArg::new_int(0),
+            majit_ir::InputArg::new_int(2),
+        ];
+
+        let mut iter = TraceIterator::new_with_inputargs(&ops, 0, ops.len(), None, &inputargs, 10);
+        assert_eq!(cache_opref(&iter, 0), Some(iarg(10)));
+        assert_eq!(cache_opref(&iter, 1), None);
+        assert_eq!(cache_opref(&iter, 2), Some(iarg(11)));
+
+        let add = iter.next().unwrap();
+        assert_eq!(add.arg(0).to_opref(), iarg(10));
+        assert_eq!(add.arg(1).to_opref(), iarg(11));
+        assert_eq!(add.pos.get(), iop(12));
     }
 
     #[test]

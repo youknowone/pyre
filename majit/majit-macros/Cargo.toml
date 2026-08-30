@@ -17,6 +17,7 @@ dynasm = ["majit-metainterp/dynasm"]
 syn = { workspace = true, features = ["visit-mut", "extra-traits"] }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
+majit-translate = { workspace = true }
 
 [dev-dependencies]
 majit-ir = { workspace = true }

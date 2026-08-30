@@ -3775,6 +3775,42 @@ pub(crate) fn lower_dispatch_body(
             struct_type: None,
         },
     );
+    // RPython `MIFrame.setup_call(original_boxes)` distributes every portal
+    // argument by kind.  Function-parameter greens are therefore inputs too,
+    // not values recovered later from a red state object.  Keep independent
+    // per-bank cursors so their register numbers match the argument seeding in
+    // `codegen_trace`.
+    let mut next_input_i = 1u16;
+    let mut next_input_r = 1u16;
+    let mut next_input_f = 0u16;
+    for (name, kind) in &config.portal_green_params {
+        let (reg, binding_kind) = match kind {
+            ValueKind::Int => {
+                let reg = next_input_i;
+                next_input_i += 1;
+                (reg, BindingKind::Int)
+            }
+            ValueKind::Ref => {
+                let reg = next_input_r;
+                next_input_r += 1;
+                (reg, BindingKind::Ref)
+            }
+            ValueKind::Float => {
+                let reg = next_input_f;
+                next_input_f += 1;
+                (reg, BindingKind::Float)
+            }
+        };
+        lowerer.bindings.insert(
+            name.clone(),
+            Binding {
+                reg,
+                kind: binding_kind,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+    }
     // State-field scalars occupy reserved identity-slot prefixes:
     // int scalars at `int_regs[base..base+num_scalars)` where base =
     // `int_identity_base()` skips the dispatch JitCode's int argument
@@ -3818,6 +3854,9 @@ pub(crate) fn lower_dispatch_body(
     // `b`'s slot).
     lowerer.next_reg = lowerer
         .next_reg
+        .max(next_input_i)
+        .max(next_input_r)
+        .max(next_input_f)
         .max(int_identity_end)
         .max(ref_identity_end)
         .max(config.float_identity_end());
@@ -3930,6 +3969,7 @@ pub(crate) fn lower_dispatch_body(
     lowerer.emit_aux(quote::quote! {
         __builder.ensure_r_regs(2u16);
         __builder.ensure_i_regs(1u16);
+        __builder.ensure_f_regs(0u16);
     });
 
     // interp_jit.py:91-93: lower stmts that appear between jit_merge_point
@@ -3983,11 +4023,18 @@ pub(crate) fn lower_dispatch_body(
     // the snapshot. `ref_identity_end` is 0 when there are no ref scalars,
     // so the no-ref-scalar case keeps the original count of 2.
     {
-        let final_i_regs = lowerer.next_reg;
-        let final_r_regs = 2u16.max(ref_identity_end);
+        let (portal_i_regs, portal_r_regs, portal_f_regs) = config.portal_input_kind_counts();
+        let portal_r_regs = portal_r_regs + u16::from(config.vable_var.is_some());
+        let final_i_regs = lowerer.next_reg.max(portal_i_regs);
+        let final_r_regs = 2u16.max(portal_r_regs).max(ref_identity_end);
+        let final_f_regs = lowerer
+            .next_reg
+            .max(portal_f_regs)
+            .max(config.float_identity_end());
         lowerer.statements[ensure_regs_stmt_idx] = quote::quote! {
             __builder.ensure_r_regs(#final_r_regs);
             __builder.ensure_i_regs(#final_i_regs);
+            __builder.ensure_f_regs(#final_f_regs);
         };
     }
 

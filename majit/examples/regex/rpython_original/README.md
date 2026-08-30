@@ -139,7 +139,7 @@ not measuring the tree:
 | `setfield_gc` | 93 | 93 | 93 |
 | `int_eq` | 2 | 2 | 2 |
 | guards | 27 | 26 | 1 |
-| total | 153 | 176 | 194 |
+| total | 153 | 150 | 194 |
 
 | `n = 2`, 21 nodes | RPython JIT | majit `shortcircuit` | majit `jit_interp` |
 |---|---:|---:|---:|
@@ -148,7 +148,7 @@ not measuring the tree:
 | `setfield_gc` | 21 | 21 | 21 |
 | `int_eq` | 2 | 2 | 2 |
 | guards | 9 | **9** | 1 |
-| total | 45 | 51 | 50 |
+| total | 45 | 43 | 50 |
 
 Every structural count is exact. Not one pointer read survives on either side —
 the 92 edges of the tree walk are gone, folded against the green regex. 93
@@ -263,9 +263,9 @@ each applied and then reverted:
 
 | break | what the gate did |
 |---|---|
-| the portal's `promote(root)` removed, so the tree stops being constant to the tracer | `getfield_gc_r` 0 → **84**; the structural assertion fired |
+| the portal's `root` ref green removed, so the tree stops being constant to the tracer | `getfield_gc_r` 0 → **84**; the structural assertion fired |
 | `Sequence` reads `left.marked` *after* the recursive shift instead of before | `getfield_gc_i` 24 → **1**; caught here and by six other tests, since it also changes the answer |
-| the `Char` arm masks (`mark & (ch == c)`) instead of branching — **same answers, same specialization, same node count** | guards 26 → **28**, total 176 → **180** |
+| the `Char` arm masks (`mark & (ch == c)`) instead of branching — **same answers, same specialization, same node count** | guards 26 → **28**, total 150 → **154** |
 
 The third is why the guard assertion is not a band. Written first as "within
 one of RPython's 27", it admitted 26, 27 *and* 28 — so the entire suite passed
@@ -286,39 +286,21 @@ crate's `shortcircuit.rs` carries 26; `jit_interp.rs` carries 1. So
 `jit_interp.rs` is the adapted variant the remark asks for — an A/B of the
 remark rather than a second copy of the post. Both module docs now say so.
 
-## Where the 23 remaining ops come from
+## Why the totals differ by three
 
-153 against 176 is the port's integer typing, and it accounts for every one of
-the 23.
+153 against 150 is fully accounted for: RPython's listing contains two
+zero-cost `debug_merge_point` operations that majit's IR does not represent,
+and RPython records one additional guard.
 
 RPython carries the marks as `Bool`. A `Bool` local *is* a branch condition, so
 `flatten.py` emits a plain `goto_if_not` and `pyjitpl.py opimpl_goto_if_not`
 hands that box straight to `generate_guard` — no truth test — and a `Bool` field
 is stored as it stands, with no mask.
 
-Our `NodeRec.marked` is a `u8` and `shift` carries marks as `i64`, so both
-conversions become real operations:
-
-* `if mark != 0` is an `IntIsTrue` — **24**, exactly one per guard whose
-  condition is not already a comparison (26 guards, less the loop exit's
-  `IntLt` and one `SetfieldGc`-fed guard); and
-* `n.marked = m as u8` is an `IntAnd(m, 255)` — **2** survive, on the two live
-  `Char` marks.
-
-24 + 2, less RPython's one extra `guard_false` and its two zero-cost
-`debug_merge_point`s, is 23.
-
-This is not a place majit falls short of RPython. `rewrite.py
-optimize_INT_IS_TRUE` folds the test only when the argument's bounds are
-`is_bool()`, and a one-byte unsigned field read is [0, 255] — upstream's own
-`FieldDescr.get_integer_min` / `get_integer_max` answer the same for
-`lltype.Bool`, which is `FLAG_UNSIGNED` at size 1. The fold arm is ported and
-fires elsewhere; it has nothing to fire on here. The two `IntAnd` are the same
-story from the other end: `autogenintrules.py`'s `and_x_c_in_range` would remove
-`int_and(x, 255)` for an `x` bounded by [0, 1], but the `IntEq` producing that
-`x` is a postponed pure op forced out *after* its consumer was optimized, so
-`make_bool` had not run on it yet. Upstream never meets the pattern, because it
-never masks a `Bool`.
+`NodeRec.empty`, `NodeRec.marked`, and the traced `shift` now preserve that
+Bool source type. They still travel through majit's integer register bank and
+one-byte integer field descriptors, exactly as `lltype.Bool` does, but the
+former 24 `IntIsTrue` and two narrowing `IntAnd` operations are gone.
 
 To read the two bodies side by side:
 
@@ -415,14 +397,15 @@ The native callee call is at parity. `[bh-setpos]` and `[bh-frame]` are both
 33,222, so not one `inline_call` seats an interpreted frame — every one takes
 the native arm. The blackhole is 1.5x, not 55x, and 1.5x cannot produce 4.1x.
 
-The register-copy row is a real deviation —
-`majit-macros/.../jitcode_lower/lowerer.rs` `alloc_reg` is a bump counter, where
-upstream runs `rpython/tool/algo/regalloc.py` before flatten (`codewriter.py
-:45-47`) and coalesces variables joined by Goto link args, so `insert_renamings`'
-`if v == w: continue` (`flatten.py:314`) fires. majit has that allocator ported
-at `majit-translate/src/tool/algo/regalloc.rs`, wired into the flowspace
-codewriter path and not into the proc-macro path. But it is worth ~33 ops inside
-the 15% below, so it is not this gap either.
+The register-copy row was a real deviation. The proc-macro lowerer allocated
+every temporary monotonically, while upstream runs
+`rpython/tool/algo/regalloc.py` before `CodeWriter.make_jitcode` flattens the
+graph. The proc-macro path now builds the same per-bank interference graph and
+uses the ported `tool/algo/color.py::DependencyGraph` before liveness encoding.
+On this exact `shift` JitCode the working-register footprint falls from **36
+int / 26 ref** to **4 int / 3 ref**; the blackhole therefore has fewer slots to
+initialize and fewer renamings to execute. The native-entry test pins those
+counts so monotonic allocation cannot return unnoticed.
 
 **It is bridge compilation, and allocation traffic inside it.** `/usr/bin/sample`
 over a 262,144-character run, counting only the `shortcircuit::mainloop`
@@ -443,23 +426,31 @@ cost is roughly 3x upstream's.
 
 What that time is made of, from the same profile's flat histogram and from
 `--features alloc-census`: `malloc`/`free` symbols are the largest single bucket
-(~2,800 of 17,146 samples), `majit_ir::resoperation::Op::clone` is the fifth
-hottest leaf, and the row allocates **67 times per input character** across more
-than 400 distinct size classes. RPython builds its trace in the opencoder's flat
-buffer and its resume data in a nursery; majit builds both out of `Rc<Op>` and
-per-guard `Vec`s. That is the gap, it is architectural rather than a single
-defect, and closing it is not a change this file can carry.
+(~2,800 of 17,146 samples), and `majit_ir::resoperation::Op::clone` was the
+fifth hottest leaf. RPython builds its trace in the opencoder's flat buffer and
+its resume data in a nursery; majit still builds both out of `Rc<Op>` and
+per-guard vectors. This pass removes one common-case tax: upstream stores
+`GuardResOp._fail_args` only on guards, so the unified Rust `Op` no longer
+embeds three inline `Operand` slots in every ordinary operation. `Op` allocations
+fall from 296 to 256 bytes. The remaining allocation traffic is still the
+largest majit-only cost; it is now smaller, not gone.
 
-### One caveat about the majit column
+### Driver ownership is now the same on both sides
 
-`matches()` builds a fresh `JitDriver` per call, so each of majit's five timed
-runs re-records and re-compiles; `target_masking.py` calls a module-level
-`jitdriver` and pays that once, in the warm-up. It shows: across the three
-rounds RPython's four rows move by 8% and majit's masking row moves by 2.5x
-(42.5M, 16.9M, 45.2M), which is compile-time variance rather than scan-time
-variance. The median is the row above; the low round is what a contended
-compile does to it. Every majit portal in the tree builds its driver per call,
-so this is a majit convention rather than something this example chose.
+`marked.py` owns one module-level `JitDriver`; the old Rust wrapper built a new
+driver inside every `matches()` call and discarded its compiled cell on return.
+Each Rust portal now owns a persistent `Matcher { root, driver }`, with `root`
+passed as a ref green instead of kept red and manually promoted. The benchmark
+constructs both matchers once before the length sweep, so the untimed warm-up
+pays for the loop and later calls reuse it, exactly like `target.py`.
+
+Keeping two portals alive exposed another ownership defect: canonical liveness
+was stored in one thread-local publication slot, so whichever matcher was
+constructed last could make the other decode a same-numbered pc against the
+wrong JitCode. The payload already lived on each driver; the ordinary
+hot-counter trace entry simply failed to republish it (the force and bridge
+entries did). It now does, and the two-live-portal regression test exercises
+branching → masking → branching in one thread.
 
 ### Grading a change when the machine will not hold still
 
@@ -491,14 +482,20 @@ What it says about the three rows, at 1,048,576 characters:
 |---|---:|---:|---:|
 | Rust interp, no JIT | 0.0 | 0 | 0 |
 | majit `&`/`\|` — `jit_interp.rs` | 0.0 | 4 | 0.1 |
-| majit `and`/`or` — `shortcircuit.rs` | **52.1** | **6,520** | 319.1 |
+| majit `and`/`or` — `shortcircuit.rs` | **19.9** | **1,900** | 7.8 |
 
-The masking row allocates four bytes per character and the plain matcher none.
-The branching row calls `malloc` **fifty-two times per input character**. That
-is the 4.1x against RPython's own `--opt=jit`, in a unit that can be measured
-while the machine is doing something else — every character deopts, and majit's
-deopt round trip is built out of allocations that upstream takes from a nursery
-bump pointer.
+The masking row and plain matcher round to zero allocations per character. The
+branching row still calls the process allocator about **twenty times per input
+character**. That is the remaining 4.1x against RPython's own `--opt=jit`, in a
+unit that can be measured while the machine is doing something else — every
+character deopts, and majit's deopt round trip still owns vectors and `Rc<Op>`s
+that upstream takes from a nursery or encodes into flat storage.
+
+The current 1 MiB row is the combined result of persistent driver ownership,
+pre-flatten helper coloring and the smaller ordinary `Op`: 19.9 allocations and
+1,900 bytes per character, versus the previously recorded 52.1 and 6,520. At
+4 KiB it reads 44.8 / 4,766 because fixed tracing and initial bridge compilation
+are divided by far fewer characters; that slope is now expected and explicit.
 
 #### The first one it caught
 
@@ -592,9 +589,12 @@ nursery bump again and the dead ones are reclaimed.
 | off-GC frame, no collector | 54.0 | 6,948 |
 | collector installed, no-collect frame | 54.0 | 7,000 |
 | collector installed, collecting frame | **52.1** | **6,520** |
+| current: persistent driver + compact helper/Op | **19.9** | **1,900** |
 
 The middle row is why the census is worth having: it is the fix applied and not
-working, and nothing else in the run says so.
+working, and nothing else in the run says so. The final row combines the later
+structural changes described above and uses the RPython-orthodox persistent
+driver across the warm-up and five timed matches.
 
 ### The majit-only ratio
 
@@ -607,21 +607,19 @@ cargo test -p regex --release --no-default-features --features dynasm \
 ```
 
 ```text
-[perf] 1048576 chars, majit JIT : 36530817 chars/s (min 28390215, max 37312110)
-[perf] 1048576 chars, no JIT    :  6700337 chars/s (min  5680768, max  7246276)
-[perf] majit JIT / no JIT = 5.5x   (the post's own: 16,500,000 / 720,000 = 22.9x)
+[perf] 1048576 chars, majit JIT : 39773276 chars/s (min 34615751, max 40783960)
+[perf] 1048576 chars, no JIT    :  6302331 chars/s (min  5512454, max  6937078)
+[perf] majit JIT / no JIT = 6.3x   (the post's own: 16,500,000 / 720,000 = 22.9x)
 ```
 
-That ratio is smaller than the table's 9.4x, and the whole difference is in
-the denominators: this one is `interp.rs` at 6,700,337 chars/s in the block
-above, the table's is `target.py` — RPython translated to C — at 4,514,372, so
-`interp.rs` is the FASTER denominator by 1.48x. The numerators are the same
-quantity measured under different load (36,530,817 here against the table's
-42,548,721), and 1.16 x 1.48 = 1.72 is exactly the 9.4 / 5.5 between the two
-ratios. `--release` matters: a debug run reads about 9.0x because the
+That ratio is smaller than the table's 9.4x, and most of the difference is in
+the denominators: this one is `interp.rs` through `rustc -O`, while the table's
+is `target.py` through RPython's C backend. The numerators are the same
+quantity measured under different machine load. `--release` matters: a debug
+run inflates the ratio because the
 denominator is unoptimized, and the test prints a banner saying so rather than
 letting that number be quoted.
 
-Cranelift reads 2.6x in the same conditions. The two backends agree op for op
-on every census above and differ only here — this row includes the one
-recording each call pays for, and cranelift compiles slower than dynasm.
+Cranelift and dynasm agree op for op on every census above. Their remaining
+wall-clock difference is backend work — especially bridge compilation — not a
+different traced program or repeated reconstruction of the portal driver.

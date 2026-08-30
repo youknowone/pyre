@@ -18,16 +18,11 @@ pub const KIND_REPETITION: u8 = 4;
 /// `left` and `right` are all fixed once lowered; `marked` is the single
 /// mutable bit the algorithm shifts around.
 ///
-/// `empty` and `marked` are `u8` where `marked.py` writes Python bools, and
-/// the traced `shift` carries the mark as `i64`.  That is not a deviation at
-/// the layer this experiment measures: RPython's `lltype.Bool` is an
-/// int-typed field to the JIT — a read of one is `getfield_gc_i` against a
-/// size-1 fielddescr, and it travels in the int box channel — so the
-/// translated original's trace carries the same quantity in the same bank.
-/// The `u8` is what makes that visible in Rust, which has no bank narrower
-/// than the int one either.  The masking A/B is unaffected in both
-/// directions: Rust's `&`/`|` on `bool` are already non-short-circuiting, so
-/// the operators, not the width, are what `shortcircuit.rs` varies.
+/// `empty` and `marked` remain booleans exactly as in `marked.py`. RPython's
+/// `lltype.Bool` still travels through the integer box/register bank and uses
+/// a one-byte field descriptor; preserving the source type is what lets
+/// `flatten.py` feed a Bool directly to `goto_if_not` without inserting an
+/// `int_is_true`, and avoids integer narrowing on every mark store.
 ///
 /// The declaration names every fixed field and stops there.  `marked` is the
 /// one omission and the whole experiment turns on it: with the others declared,
@@ -40,8 +35,8 @@ pub const KIND_REPETITION: u8 = 4;
 pub struct NodeRec {
     pub kind: u8,
     pub ch: u8,
-    pub empty: u8,
-    pub marked: u8,
+    pub empty: bool,
+    pub marked: bool,
     pub left: *mut NodeRec,
     pub right: *mut NodeRec,
 }
@@ -84,16 +79,16 @@ pub fn lower(n: &Node) -> *mut NodeRec {
         Node::Char(c) => NodeRec {
             kind: KIND_CHAR,
             ch: *c,
-            empty: 0,
-            marked: 0,
+            empty: false,
+            marked: false,
             left: null,
             right: null,
         },
         Node::Epsilon => NodeRec {
             kind: KIND_EPSILON,
             ch: 0,
-            empty: 1,
-            marked: 0,
+            empty: true,
+            marked: false,
             left: null,
             right: null,
         },
@@ -104,7 +99,7 @@ pub fn lower(n: &Node) -> *mut NodeRec {
                 kind: KIND_ALTERNATIVE,
                 ch: 0,
                 empty,
-                marked: 0,
+                marked: false,
                 left: lp,
                 right: rp,
             }
@@ -116,7 +111,7 @@ pub fn lower(n: &Node) -> *mut NodeRec {
                 kind: KIND_SEQUENCE,
                 ch: 0,
                 empty,
-                marked: 0,
+                marked: false,
                 left: lp,
                 right: rp,
             }
@@ -126,8 +121,8 @@ pub fn lower(n: &Node) -> *mut NodeRec {
             NodeRec {
                 kind: KIND_REPETITION,
                 ch: 0,
-                empty: 1,
-                marked: 0,
+                empty: true,
+                marked: false,
                 left: ip,
                 right: null,
             }
@@ -357,9 +352,9 @@ mod tests {
     fn test_lower_computes_empty_bottom_up() {
         let root = lower(&seq(rep(ch(b'a')), epsilon()));
         unsafe {
-            assert_eq!((*root).empty, 1);
-            assert_eq!((*(*root).left).empty, 1);
-            assert_eq!((*(*(*root).left).left).empty, 0);
+            assert!((*root).empty);
+            assert!((*(*root).left).empty);
+            assert!(!(*(*(*root).left).left).empty);
         }
     }
 

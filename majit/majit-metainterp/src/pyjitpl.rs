@@ -1048,13 +1048,12 @@ fn prepare_bridge_trace_for_optimizer(
     // RPython allocates fresh InputArg / ResOperation objects before
     // optimize_bridge() consumes the trace; majit's analogue is a fresh
     // TraceIterator walk with `start_fresh = bridge_inputarg_base`.
-    let bridge_inputarg_types: Vec<Type> = bridge_inputargs.iter().map(|ia| ia.tp).collect();
-    let mut iter = crate::opencoder::TraceIterator::new(
+    let mut iter = crate::opencoder::TraceIterator::new_with_inputargs(
         bridge_ops,
         0,
         bridge_ops.len(),
         None,
-        &bridge_inputarg_types,
+        bridge_inputargs,
         bridge_inputarg_base,
     );
     let mut ops = Vec::with_capacity(bridge_ops.len());
@@ -8288,8 +8287,8 @@ impl<M: Clone> MetaInterp<M> {
                 cloned
             })
             .collect();
-        // Mint the bridge's input args from types alone, WITHOUT carrying the
-        // values the recorder's own inputargs hold.
+        // Carry the history's live input boxes, WITHOUT carrying the values
+        // the recorder's own inputargs hold.
         //
         // The channel that put those values there is not resume-walked:
         // pyre's bridge setup (`state.rs seed_virtualizable_boxes` follow-up
@@ -8305,17 +8304,12 @@ impl<M: Clone> MetaInterp<M> {
         // `bridges_compiled` unchanged (21 vs 20) so compile volume is not
         // what moved.
         //
-        // `compile_bridge`'s `PendingBridgeRd` zip is likewise positional over
-        // every bridge inputarg rather than a resume-walked subset. See
-        // the live-filtered channel for the live-filtered channel this site needs before the
-        // values can be carried again.
-        let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
-            .recorder
-            .inputarg_types()
-            .iter()
-            .enumerate()
-            .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
-            .collect();
+        // `initialize_state_from_guard_failure` has already filtered resume
+        // holes from `History.inputargs`; retain those live boxes' original
+        // sparse positions here, exactly as `TraceIterator.__init__` reads
+        // `trace.inputargs[i].get_position()` upstream.  Concrete values are
+        // restored separately from `pending_frontend_boxes` below.
+        let bridge_inputargs = ctx.recorder.live_inputargs_cloned();
         // compile.py `ResumeFromInterpDescr.compile_and_attach`
         // passes `orig_inputargs` through to `send_loop_to_backend`, which
         // reads the concrete virtualizable before patching the expanded loop
@@ -13775,13 +13769,35 @@ impl<M: Clone> MetaInterp<M> {
                 // parent guard's saved types instead so the deserializer
                 // matches the types the serializer used at memo.finish()
                 // time.
-                let livebox_types: Vec<Type> = exit_layout
+                let positional_livebox_types: Vec<Type> = exit_layout
                     .descr
                     .as_ref()
                     .and_then(|descr| descr.as_fail_descr())
                     .map(|fd| fd.fail_arg_types().to_vec())
                     .filter(|types| !types.is_empty())
                     .unwrap_or_else(|| bridge_inputargs.iter().map(|ia| ia.tp).collect());
+                // pyjitpl.py `initialize_state_from_guard_failure` removes
+                // None entries before bridgeopt.py receives `liveboxes`.
+                // `fail_arg_types` retains the resume numbering's positional
+                // holes, so apply the same rd_locs filter here; otherwise the
+                // type at the first hole is paired with the next live box and
+                // the known-class bitfield is decoded out of phase.
+                let livebox_types: Vec<Type> = if fail_descr.rd_locs().len()
+                    == positional_livebox_types.len()
+                {
+                    positional_livebox_types
+                        .into_iter()
+                        .zip(fail_descr.rd_locs().iter())
+                        .filter_map(|(tp, &loc)| (loc != 0xFFFF).then_some(tp))
+                        .collect()
+                } else {
+                    positional_livebox_types
+                };
+                assert_eq!(
+                    livebox_types.len(),
+                    liveboxes.len(),
+                    "bridgeopt.py liveboxes and intrinsic Box.type layout must be compacted together"
+                );
                 // unroll.py:183-188: frontend_inputargs = trace.inputargs
                 // bridgeopt.py:126 asserts len(frontend_boxes) == len(liveboxes).
                 // Cluster 2 (c1): `compile_bridge` is invoked twice for the
@@ -14405,12 +14421,6 @@ impl<M: Clone> MetaInterp<M> {
         crate::mc_diag_bump(6); // start_retrace_from_guard entered
         self.enter_profiler_tracing();
         self.try_to_free_some_loops();
-        // bridgeopt.py:124 frontend_boxes come directly from the guard
-        // failure values in fail_arg_types order.
-        self.pending_frontend_boxes = Some(fail_values.to_vec());
-        self.pending_frontend_box_types = descr_arc
-            .as_fail_descr()
-            .map(|fd| fd.fail_arg_types().to_vec());
         let _compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => {
@@ -14446,10 +14456,46 @@ impl<M: Clone> MetaInterp<M> {
         // ResumeGuardDescr Arc carries the post-`store_final_boxes_in_guard`
         // type vector (compile.py `_attrs_`).
         let bridge_input_types = fail_descr.fail_arg_types();
-        self.warm_state.start_retrace(bridge_input_types);
+        debug_assert_eq!(
+            fail_values.len(),
+            bridge_input_types.len(),
+            "deadframe values and fail_arg_types must share the guard's positional layout"
+        );
+        // pyjitpl.py `initialize_state_from_guard_failure` returns
+        // `[box for box in inputargs_and_holes if box]`: the resume numbering
+        // and deadframe keep None positions, but the bridge history exposes
+        // only live boxes. `fail_arg_types` cannot identify a hole because
+        // pyre retains the parallel type snapshot, so use the canonical
+        // `store_info_on_descr` encoding instead.
+        let live_input_mask: Vec<bool> = if fail_descr.rd_locs().len() == bridge_input_types.len() {
+            fail_descr
+                .rd_locs()
+                .iter()
+                .map(|&pos| pos != 0xFFFF)
+                .collect()
+        } else {
+            // Synthetic descriptors that have not reached codegen carry no
+            // encoded holes; every declared test input remains live.
+            vec![true; bridge_input_types.len()]
+        };
+        let live_input_types: Vec<Type> = bridge_input_types
+            .iter()
+            .zip(live_input_mask.iter())
+            .filter_map(|(&tp, &live)| live.then_some(tp))
+            .collect();
+        self.pending_frontend_boxes = Some(
+            fail_values
+                .iter()
+                .zip(live_input_mask.iter())
+                .filter_map(|(&value, &live)| live.then_some(value))
+                .collect(),
+        );
+        self.pending_frontend_box_types = Some(live_input_types.clone());
+        self.warm_state.start_retrace(&live_input_types);
         // RPython pyjitpl.py `create_history(max_num_inputargs)` — the
         // MetaInterp owns the history factory on the bridge path too.
-        let recorder = crate::recorder::Trace::with_input_types(bridge_input_types);
+        let recorder =
+            crate::recorder::Trace::with_input_layout(bridge_input_types, &live_input_mask);
         // No deadframe stamping here. `resume.py load_box_from_cpu`
         // runs once per LIVE box while `rebuild_from_resumedata` walks the
         // resume data, not once per `fail_arg_types` slot, and `compile_bridge`

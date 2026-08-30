@@ -7105,6 +7105,13 @@ impl<S: JitState> JitDriver<S> {
             HotResult::StartTracing => {}
         }
 
+        // The liveness decoder's thread-local payload is only a publication
+        // mechanism; ownership stays with this driver. Another live portal may
+        // have published after this one was constructed, so re-aim the slot on
+        // the ordinary hot-counter trace entry too. `force_start_tracing` and
+        // `start_bridge_tracing` already do the same at their entry doors.
+        self.republish_state_field_fvc();
+
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
         // Resolved here with the descriptor and carried to both ends of
@@ -9011,14 +9018,15 @@ impl<S: JitState> JitDriver<S> {
             // `fail_args` image). `extract_live` returns the virtualizable
             // array in vable layout order — a different stream with a
             // different length. Pass the raw deadframe values that the
-            // caller stashed via `set_pending_frontend_boxes` so
+            // caller supplied to this guard-failure entry so
             // `decode_concrete(Box(n, tp))` reads `raw_values[n]` and
             // `fail_types[n]` (length-aligned with `fail_descr.fail_arg_types`).
-            let raw_values: Vec<i64> = self
-                .meta
-                .pending_frontend_boxes_ref()
-                .map(|s| s.to_vec())
-                .unwrap_or_default();
+            // `pending_frontend_boxes` is deliberately compacted to the live
+            // history InputArgs, as pyjitpl.py
+            // `initialize_state_from_guard_failure` filters its holes. Resume
+            // decoding still needs the uncompressed deadframe coordinate
+            // space, so use the positional slice retained above.
+            let raw_values = frontend_fail_values.to_vec();
             // resume.py consume_boxes parity: decode the guard frame's
             // per-bank live register indices here, where the dispatch JitCode
             // + `liveness_info` are reachable, and stash them on the trace ctx.
