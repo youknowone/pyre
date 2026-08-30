@@ -94,7 +94,7 @@ def _expects_failure(script: Path) -> bool:
     return script.name.startswith("xfail_")
 
 
-def _run(cmd: list[str], script: Path, timeout: int) -> tuple[bool, str]:
+def _run(cmd: list[str], script: Path, timeout: int) -> tuple[bool, str, str]:
     try:
         proc = subprocess.run(
             cmd + [str(script)],
@@ -105,17 +105,20 @@ def _run(cmd: list[str], script: Path, timeout: int) -> tuple[bool, str]:
             errors="replace",
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
-        return False, "timeout"
+    except subprocess.TimeoutExpired as expired:
+        captured = expired.stderr or ""
+        if isinstance(captured, bytes):
+            captured = captured.decode("utf-8", "replace")
+        return False, f"timeout after {timeout}s", captured
     if _expects_failure(script):
         if proc.returncode != 0:
-            return True, ""
-        return False, "rc=0 but the snippet is expected to fail"
+            return True, "", ""
+        return False, "rc=0 but the snippet is expected to fail", proc.stdout
     if proc.returncode == 0:
-        return True, ""
+        return True, "", ""
     err = proc.stderr.strip().splitlines()
     last_err = err[-1] if err else ""
-    return False, f"rc={proc.returncode} {last_err}"
+    return False, f"rc={proc.returncode} {last_err}", proc.stderr
 
 
 def _runners(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
@@ -174,20 +177,20 @@ def main() -> int:
         print(f"filter:  {args.filter!r}")
     print()
 
-    fails_per_runner: dict[str, list[tuple[str, str]]] = {n: [] for n, _ in runners}
+    fails_per_runner: dict[str, list[tuple[str, str, str]]] = {n: [] for n, _ in runners}
     passes_per_runner: dict[str, int] = {n: 0 for n, _ in runners}
 
     for script in scripts:
         name = script.name
         row = [f"  {name:<38s}"]
         for backend, cmd in runners:
-            ok, detail = _run(cmd, script, args.timeout)
+            ok, detail, captured = _run(cmd, script, args.timeout)
             mark = "OK" if ok else "FAIL"
             row.append(f"{backend}={mark}")
             if ok:
                 passes_per_runner[backend] += 1
             else:
-                fails_per_runner[backend].append((name, detail))
+                fails_per_runner[backend].append((name, detail, captured))
         if args.verbose or any(part.endswith("=FAIL") for part in row[1:]):
             print(" ".join(row))
 
@@ -200,8 +203,28 @@ def main() -> int:
 
     total_fails = sum(len(v) for v in fails_per_runner.values())
     if total_fails:
+        _report_failures(fails_per_runner)
         return 1
     return 0
+
+
+def _report_failures(fails_per_runner: dict[str, list[tuple[str, str, str]]]) -> None:
+    """Print every failure's reason and captured output after the summary.
+
+    A `FAIL` mark on its own names no cause, so a CI log that ends in one
+    leaves rerunning the job as the only way to learn what happened.  Last and
+    on stdout, the same shape `parity_tests/run.py` reports: a reader reaches
+    the reason without scrolling back through the table.
+    """
+    print()
+    print("=" * 72)
+    for backend, failures in fails_per_runner.items():
+        for name, reason, captured in failures:
+            print()
+            print(f"  {name} [{backend}]: {reason}")
+            for line in captured.strip().splitlines():
+                print(f"      {line}")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
