@@ -504,7 +504,14 @@ pub unsafe fn exception_is_valid_class_w(w_cls: PyObjectRef) -> bool {
 ///   def exception_getclass(self, w_obj):
 ///       return self.type(w_obj)
 pub fn exception_getclass(w_obj: PyObjectRef) -> PyObjectRef {
-    crate::typedef::r#type(w_obj).map_or(pyre_object::PY_NULL, |p| p.as_ptr())
+    // Spelled as a `match` rather than `map_or`: the closure operand reaches
+    // the codewriter as a synthetic transparent constructor with no lowering,
+    // which stands as an un-lowered helper blocker in every body that calls
+    // this — `exc_info_direct` among them.
+    match crate::typedef::r#type(w_obj) {
+        Some(p) => p.as_ptr(),
+        None => pyre_object::PY_NULL,
+    }
 }
 
 /// True when `obj` is a `BlockingIOError` whose constructor took the numeric

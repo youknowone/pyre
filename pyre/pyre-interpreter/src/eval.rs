@@ -1594,7 +1594,16 @@ pub fn get_current_exception() -> PyObjectRef {
 /// The bytecode PUSH_EXC_INFO machinery deliberately continues to use
 /// [`get_current_exception`] for the direct EC slot; app-level `sys.exception`
 /// and bare raise use this logical view instead.
-#[majit_macros::dont_look_inside]
+///
+/// No `dont_look_inside`: the thread-local read this reaches is already
+/// isolated behind [`crate::call::take_last_exec_ctx`]'s own residual, so the
+/// rest of the body — the `sys_exc_value` slot read and the generator-chain
+/// walk — is an ordinary graph the write analyzer can see.  That visibility is
+/// load-bearing, not cosmetic: a graph-less callee contributes an EMPTY
+/// read/write set (`collect_readwrite_effects`), and an empty set lets the
+/// heap optimizer dead-store-eliminate the balanced `sys_exc_value`
+/// save/restore this read sits between, which returns the pre-handler slot
+/// instead of the handled exception.
 pub fn get_sys_exception() -> PyObjectRef {
     let ec = crate::call::getexecutioncontext();
     if ec.is_null() {
