@@ -643,19 +643,45 @@ impl JitFrameDeadFrame {
         self.jf_root.get()
     }
 
+    /// `llmodel.py _decode_pos` — translate a logical fail-argument index
+    /// through the exit descriptor's recovery locations.
+    ///
+    /// Cranelift currently publishes a dense identity layout, while dynasm
+    /// keeps register spills in their architecture slots. The deadframe is
+    /// backend-neutral, so the mapping belongs at this common accessor just
+    /// as it does for [`crate::libc_deadframe::LibcJitFrameDeadFrame`].
+    #[inline]
+    fn slot_of(&self, index: usize) -> Option<usize> {
+        let descr = self.fail_descr.as_fail_descr();
+        if index < descr.rd_locs().len() {
+            crate::llmodel::decode_rd_loc_slot(descr, index)
+        } else {
+            Some(index)
+        }
+    }
+
     #[inline]
     pub fn get_int(&self, index: usize) -> i64 {
+        let Some(slot) = self.slot_of(index) else {
+            return 0;
+        };
+        self.get_int_at_slot(slot)
+    }
+
+    /// `llmodel.py get_value_direct` — read an already decoded frame slot.
+    #[inline]
+    pub fn get_int_at_slot(&self, slot: usize) -> i64 {
         // A safe function that dereferences an index the caller chose, so the
         // only thing between an index error and an out-of-bounds read is this
         // check. The frame carries its own slot count in the length word ahead
         // of `jf_frame`, which is the bound. `get_float` and `get_ref` read
         // through here, so one check covers all three.
-        debug_assert!(
-            (index as isize)
-                < unsafe { JitFrame::frame_length(self.jf_gcref().0 as *const JitFrame) },
-            "jf_frame index {index} is past the frame's own length",
-        );
-        unsafe { *((self.jf_gcref().0 + FIRST_ITEM_OFFSET + index * 8) as *const i64) }
+        let frame = self.jf_gcref();
+        let frame_len = unsafe { JitFrame::frame_length(frame.0 as *const JitFrame) };
+        if slot >= frame_len as usize {
+            return 0;
+        }
+        unsafe { *((frame.0 + FIRST_ITEM_OFFSET + slot * 8) as *const i64) }
     }
 
     #[inline]
@@ -722,10 +748,14 @@ impl Drop for JitFrameDeadFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FailDescr;
+    use crate::finish_descrs::DoneWithThisFrameDescrMulti;
     use crate::jitframe::{alloc_off_gc_jitframe, free_off_gc_jitframe};
+    use majit_ir::Type;
+    use std::sync::Arc;
 
     fn a_descr() -> DescrRef {
-        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 8, 0))
+        Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 8, 0))
     }
 
     /// The deadframe a compiled run returns owns the map its exit established;
@@ -760,6 +790,34 @@ mod tests {
             "an owning deadframe releases the map once its values are read out"
         );
 
+        unsafe { free_off_gc_jitframe(frame) };
+    }
+
+    #[test]
+    fn managed_deadframe_decodes_nonidentity_recovery_locations() {
+        let frame = alloc_off_gc_jitframe(JitFrame::alloc_size(32));
+        assert!(!frame.is_null());
+        unsafe {
+            JitFrame::init(frame, std::ptr::null(), 32);
+            crate::llmodel::set_int_value(frame, 2, 22);
+            crate::llmodel::set_int_value(frame, 24, 240);
+        }
+
+        let descr = Arc::new(DoneWithThisFrameDescrMulti::new(vec![Type::Int, Type::Int]));
+        descr.set_rd_locs(vec![24, 2]);
+        let descr_ref: DescrRef = descr;
+        let deadframe = JitFrameDeadFrame::new(
+            GcRef(frame as usize),
+            ExitDescr::owned(descr_ref),
+            None,
+            None,
+        );
+
+        assert_eq!(deadframe.get_int(0), 240);
+        assert_eq!(deadframe.get_int(1), 22);
+        assert_eq!(deadframe.get_int_at_slot(2), 22);
+
+        drop(deadframe);
         unsafe { free_off_gc_jitframe(frame) };
     }
 }

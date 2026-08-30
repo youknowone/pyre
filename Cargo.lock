@@ -2164,6 +2164,7 @@ dependencies = [
  "majit-translate",
  "parking_lot",
  "rustc-hash",
+ "smallvec",
 ]
 
 [[package]]
