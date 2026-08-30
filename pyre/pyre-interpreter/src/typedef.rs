@@ -8543,7 +8543,7 @@ fn init_frame_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "clear",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "clear",
                 |args| {
                     let f = frame_ptr(args[0]);
@@ -8553,6 +8553,7 @@ fn init_frame_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_none())
                 },
                 1,
+                "Clear all references held by the frame.",
             ),
         )
     };
@@ -8562,7 +8563,7 @@ fn init_frame_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__repr__",
                 |args| {
                     let f = frame_ptr(args[0]);
@@ -8574,9 +8575,19 @@ fn init_frame_type(ns: PyObjectRef) {
                     ))
                 },
                 1,
+                "Return repr(self).",
             ),
         )
     };
+
+    // PyPy `PyFrame.typedef` owns both callables above.  CPython 3.14's
+    // `PyFrame_Type` supplies their method/slot metadata, which the Rust
+    // gateway cannot infer from the upstream Python function objects.
+    for name in ["clear", "__repr__"] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("frame TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new("($self, /)")) };
+    }
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:1605-1623`

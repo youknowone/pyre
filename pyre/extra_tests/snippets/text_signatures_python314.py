@@ -1103,6 +1103,21 @@ for name, doc in EXPECTED_CODE_DOCS.items():
 assert str(inspect.signature(types.CodeType.replace)) == "(self, /, **changes)"
 assert str(inspect.signature(types.CodeType.co_positions)) == "(self, /)"
 
+
+# frame_text_signatures_python314
+
+EXPECTED_FRAME_METHODS = {
+    "clear": "($self, /)",
+    "__repr__": "($self, /)",
+}
+check_descriptors(types.FrameType, EXPECTED_FRAME_METHODS)
+
+assert types.FrameType.clear.__doc__ == "Clear all references held by the frame."
+assert types.FrameType.__repr__.__doc__ == "Return repr(self)."
+assert str(inspect.signature(types.FrameType.clear)) == "(self, /)"
+assert str(inspect.signature(types.FrameType.__repr__)) == "(self, /)"
+
+
 assert str(inspect.signature(types.MethodType)) == "(function, instance, /)"
 assert str(inspect.signature(types.ModuleType)) == "(name, doc=None)"
 
