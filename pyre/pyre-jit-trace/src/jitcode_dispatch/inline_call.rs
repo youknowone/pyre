@@ -9290,7 +9290,7 @@ pub(crate) struct GeneratorResumeCensus {
     /// coordinate a resume walk would stop at, and its presence is what says
     /// the marker the yield bakes is reachable from the resume side.
     yield_marker_offset: Option<usize>,
-    /// `(ops, merge_points, residual_calls)` between the two coordinates.
+    /// `(ops, merge_points, residual_calls)` over the whole body.
     ops_to_yield: (usize, usize, usize),
 }
 
@@ -9369,32 +9369,30 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
     let Some(marker) = census.marker_offset else {
         decline!(V::NoResumeEntry)
     };
-    census.ops_to_yield = generator_resume_op_scan(body.code, marker, census.yield_marker_offset);
+    let _ = marker;
+    census.ops_to_yield = generator_resume_op_scan(body.code);
     census.verdict = V::Admissible;
     census
 }
 
-/// Linear op-stream reconnaissance between a resume marker and the yield's
-/// `abort_permanent`, reported as `(ops, merge_points, residual_calls)`.
+/// Whole-body op reconnaissance, reported as
+/// `(ops, merge_points, residual_calls)`.
 ///
-/// It answers three questions a resume has to price before any IR is emitted,
-/// and answers them without emitting any: how much body sits between the two
-/// coordinates, whether the walk meets the generator's own `jit_merge_point`
-/// (upstream crosses one exactly once, via `should_unroll_one_iteration`), and
-/// whether it meets a residual call (which would commit an effect the caller's
-/// `FOR_ITER` cannot re-run).
+/// It prices two questions a resume has to answer before any IR is emitted,
+/// without emitting any: whether the body carries the generator's own
+/// `jit_merge_point` (upstream crosses one exactly once, via
+/// `should_unroll_one_iteration`), and whether it carries a residual call,
+/// which would commit an effect the caller's `FOR_ITER` cannot re-run.
 ///
-/// The scan is linear over the byte stream rather than a control-flow walk, so
-/// it OVERCOUNTS a body whose blocks are drained out of source order.  That is
-/// the safe direction for a feasibility read: it can say "this is bigger than
-/// it looks", never "this is smaller".
-fn generator_resume_op_scan(
-    body_code: &[u8],
-    marker: usize,
-    yield_marker: Option<usize>,
-) -> (usize, usize, usize) {
-    let end = yield_marker.unwrap_or(body_code.len()).min(body_code.len());
-    let mut pc = marker;
+/// The whole body, not the resume-to-yield span: the resume coordinate is one
+/// byte PAST the yield's `abort_permanent` in every case the corpus produces,
+/// because the resume block head follows the suspension it resumes from.  The
+/// path between them therefore runs FORWARD off the end of the resume block
+/// and back through the body's own backward jump, which no linear scan
+/// describes — so scan everything and let the totals be an upper bound.
+fn generator_resume_op_scan(body_code: &[u8]) -> (usize, usize, usize) {
+    let end = body_code.len();
+    let mut pc = 0usize;
     let (mut ops, mut merge_points, mut residual_calls) = (0usize, 0usize, 0usize);
     while pc < end {
         let Some(op) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
@@ -9488,6 +9486,14 @@ pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
         return Ok(None);
     }
+    // Behind the census switch, not merely printing behind it: asking the
+    // verdict is not free.  `sub_jitcode_body_for_code` BUILDS and installs the
+    // per-fn jitcode on demand, which a default run must not do for a code
+    // object nothing inlines — it is exactly the kind of shift a `.jitstats`
+    // baseline records.
+    if !gen_census_enabled() {
+        return Ok(None);
+    }
     let Some(iter_obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
         return Ok(None);
     };
@@ -9495,7 +9501,7 @@ pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
         return Ok(None);
     }
     let census = generator_resume_verdict(iter_obj);
-    if gen_census_enabled() {
+    {
         let (ops, merge_points, residual_calls) = census.ops_to_yield;
         eprintln!(
             "[gen-census] pc={} {} resume_py={} n_py={} tables={:?} marker={:?} \
