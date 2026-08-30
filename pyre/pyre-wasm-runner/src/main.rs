@@ -800,7 +800,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "inline_decl_label_resume_layout",
                 "inline_decl_call_assembler",
                 "inline_decl_owner_invalidated",
-                "inline_decl_foreign_label",
+                "inline_foreign_jump",
                 "inline_ok_outside_loop",
                 "inline_decl_no_trip_helper",
                 "inline_deferred",
@@ -813,6 +813,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "ca_decl_materialize",
                 "ca_decl_geometry",
                 "ca_decl_terminal",
+                "inline_decl_foreign_eager",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

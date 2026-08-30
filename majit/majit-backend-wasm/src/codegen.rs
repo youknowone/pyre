@@ -2527,9 +2527,31 @@ pub struct ModuleBuildInputs {
     pub ca: CaParams,
 }
 
+/// The cross-module target of a region's closing JUMP, as `compile_bridge`
+/// resolved it for the bridge the region stands in for.
+///
+/// The target's fixed-arity parameter entry is deliberately absent. Calling it
+/// needs its wasm type declared in the calling module, and a module declares
+/// that type from its OWN `external_jump_wide_slot` — which the owner of a
+/// merged region does not have. The narrow entry a region tail-calls instead
+/// reads the same values back out of the frame slots stored here, so the merge
+/// costs that round trip and nothing else.
+#[derive(Clone, Debug)]
+pub struct ExternalJump {
+    /// `__indirect_function_table` slot of the target loop's entry.
+    pub slot: u32,
+    /// Resume-at-LABEL dispatch key: `target label ordinal + 1`, or `0` when
+    /// the target is not peeled.
+    pub key: u32,
+}
+
 pub struct InlinedBridge {
     /// Per-trace fail index of the guard that enters this region.
     pub source_fail_index: u32,
+    /// Where this region's closing JUMP goes when it names a LABEL published
+    /// by ANOTHER module. `None` is the in-module case: the JUMP rebinds the
+    /// owner's own loop args and lowers to a `br`.
+    pub external_jump: Option<ExternalJump>,
     /// Emit this region's block outside the header `loop` and its body past
     /// that loop's `end`, rather than inside it.
     ///
@@ -2604,6 +2626,7 @@ impl Clone for InlinedBridge {
     fn clone(&self) -> Self {
         Self {
             source_fail_index: self.source_fail_index,
+            external_jump: self.external_jump.clone(),
             outside_loop: self.outside_loop,
             trace_id: self.trace_id,
             inputargs: self
@@ -2762,6 +2785,7 @@ fn rebase_region_value_ids(
     Ok((
         InlinedBridge {
             source_fail_index: bridge.source_fail_index,
+            external_jump: bridge.external_jump.clone(),
             outside_loop: bridge.outside_loop,
             trace_id: bridge.trace_id,
             inputargs,
@@ -2893,7 +2917,11 @@ pub fn build_wasm_module(
         // `resolve_cross_loop_jump_target` refuses an arity mismatch before a
         // region is ever retained; this asserts the same invariant where the
         // move is emitted, rather than trusting a check in another file.
-        if let Some(jump) = bridge.ops.last().filter(|op| op.opcode == OpCode::Jump) {
+        if let Some(jump) = bridge
+            .ops
+            .last()
+            .filter(|op| op.opcode == OpCode::Jump && bridge.external_jump.is_none())
+        {
             let label_args = find_label_args(analysis_ops, jump);
             let jump_arity = jump.getarglist().len();
             if jump_arity < label_args.len() {
@@ -3574,6 +3602,12 @@ fn build_function(
                     "wasm backend: inlined bridge source guard is outside the owner stream".into(),
                 )
             })?;
+            if bridge.external_jump.is_some() {
+                // A region that leaves by a cross-module tail call re-enters
+                // no LABEL of this function, so it crosses none of them.
+                start += bridge.ops.len();
+                continue;
+            }
             for op in &ops[start..start + bridge.ops.len()] {
                 if op.opcode != OpCode::Jump {
                     continue;
@@ -3929,6 +3963,26 @@ fn build_function(
     let mut wb_applied = indexmap::IndexSet::<OpRef>::new();
     let same_as_forwardings = same_as_forwardings(ops, num_vars);
 
+    // A merged region whose closing JUMP names a LABEL published by another
+    // module leaves this function the way its out-of-line bridge did — by
+    // tail-calling that module — because `br` cannot cross one. Its ops are in
+    // this stream, so the transfer has to be selected per operation rather
+    // than per function.
+    let external_jump_by_op: Vec<Option<&ExternalJump>> =
+        if inlined_bridges.iter().any(|b| b.external_jump.is_some()) {
+            let mut by_op = vec![None; ops.len()];
+            let mut start = bridge_start;
+            for bridge in inlined_bridges {
+                for slot in &mut by_op[start..start + bridge.ops.len()] {
+                    *slot = bridge.external_jump.as_ref();
+                }
+                start += bridge.ops.len();
+            }
+            by_op
+        } else {
+            Vec::new()
+        };
+
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label || op.opcode.can_malloc() {
             wb_applied.clear();
@@ -4130,10 +4184,25 @@ fn build_function(
             // nothing to do for it.
             continue;
         }
+        // The whole-function target is the one a label-less bridge module
+        // carries; a region brings its own.
+        let jump_external: Option<(u32, u32, Option<(u32, u32)>)> = if op.opcode == OpCode::Jump {
+            match external_jump_by_op.get(op_idx).copied().flatten() {
+                Some(ext) => Some((ext.slot, ext.key, None)),
+                None if !has_loop => {
+                    Some((external_jump_slot, external_jump_key, external_jump_wide))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         match op.opcode {
             OpCode::Label => {}
 
-            OpCode::Jump if !has_loop => {
+            OpCode::Jump if jump_external.is_some() => {
+                let (external_jump_slot, external_jump_key, external_jump_wide) = jump_external
+                    .expect("the arm guard just established this JUMP has a cross-module target");
                 // A JUMP in a trace with no local LABEL closes back into a
                 // *separate* loop module (a loop-closing bridge). There is no
                 // enclosing `loop` to `br` to, so hand the jump args — the

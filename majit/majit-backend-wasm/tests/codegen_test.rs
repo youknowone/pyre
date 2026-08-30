@@ -1564,6 +1564,7 @@ fn inlined_bridge_without_owner_loop_label_declines() {
         &inputargs,
         vec![guard, finish],
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
@@ -1687,6 +1688,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             ops: owner_ops,
             inlined_bridges: vec![codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 0,
                 outside_loop: false,
                 trace_id: 7,
@@ -1900,6 +1902,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             ops: owner_ops(),
             inlined_bridges: vec![codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 1,
                 outside_loop: false,
                 trace_id: 7,
@@ -3623,6 +3626,7 @@ fn build_owner_with_region_closing_at(
         &inputargs,
         ops,
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
@@ -3798,6 +3802,7 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
         &inputargs,
         ops,
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
@@ -4230,6 +4235,7 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
         &inputargs,
         ops,
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
@@ -4347,6 +4353,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
         ops,
         vec![
             codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 0,
                 outside_loop: false,
                 trace_id: 1,
@@ -4356,6 +4363,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
                 constants: indexmap::IndexMap::new(),
             },
             codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 1,
                 outside_loop: false,
                 trace_id: 2,
@@ -4454,6 +4462,7 @@ fn run_preamble_region_repro() -> (i64, i64, i64) {
         &inputargs,
         ops,
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: true,
             trace_id: 1,
@@ -4636,6 +4645,7 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
         ops,
         vec![
             codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 1,
                 outside_loop: false,
                 trace_id: 2,
@@ -4645,6 +4655,7 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
                 constants: indexmap::IndexMap::new(),
             },
             codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 0,
                 outside_loop: true,
                 trace_id: 1,
@@ -4717,6 +4728,7 @@ fn a_preamble_region_closing_at_a_label_past_its_guard_declines() {
         &vec![InputArg::from_type(Type::Int, 0)],
         ops,
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: true,
             trace_id: 1,
@@ -4901,6 +4913,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
         inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
         ops,
         inlined_bridges: vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
@@ -5098,6 +5111,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
         ops,
         inlined_bridges: vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,

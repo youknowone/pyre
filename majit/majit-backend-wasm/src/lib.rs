@@ -93,8 +93,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 /// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
 /// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
 /// the owner is already invalidated, so a merged region would inherit its set
-/// flag instead of starting valid; 51 = the region's closing JUMP names a LABEL
-/// published by another module, which no in-module `br` can reach; 52 = the
+/// flag instead of starting valid; 51 = a region retained for a deferred merge
+/// whose closing JUMP names a LABEL published by another module, so it keeps
+/// the cross-module tail call and merges only its entry side; 52 = the
 /// region's source guard is in the peeled preamble, outside the `loop` its
 /// block is opened in; 53 = eligible but no trip callback is published to
 /// defer to; 54 = eligible, merge deferred until the bridge standing in for it
@@ -115,6 +116,11 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 /// the target compiled once and has since declined terminally. A decline that
 /// falls in 60-63 names a target that exists, which is the half of slot 1 a
 /// retrace could plausibly resolve; 57-59 name the operation itself.
+///
+/// 64 = a cross-module region declined the EAGER merge arm. That arm forgoes
+/// the trip threshold to keep a quasi-immutable dependency attached to the
+/// owner's flag, and pays an owner re-emission whether or not the region ever
+/// runs hot; a region that saves only its entry crossing does not earn it.
 pub static BRIDGE_DIAG: [AtomicU64; BRIDGE_DIAG_LABELS.len()] =
     [const { AtomicU64::new(0) }; BRIDGE_DIAG_LABELS.len()];
 
@@ -182,7 +188,7 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "inline_decl_label_resume_layout",
     "inline_decl_call_assembler",
     "inline_decl_owner_invalidated",
-    "inline_decl_foreign_label",
+    "inline_foreign_jump",
     "inline_ok_outside_loop",
     "inline_decl_no_trip_helper",
     "inline_deferred",
@@ -195,6 +201,7 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "ca_decl_materialize",
     "ca_decl_geometry",
     "ca_decl_terminal",
+    "inline_decl_foreign_eager",
 ];
 
 #[repr(u8)]
@@ -4230,6 +4237,16 @@ impl majit_backend::Backend for WasmBackend {
             }
         }
 
+        // A closing JUMP that names a LABEL of ANOTHER module cannot become a
+        // `br`, so a region carrying one keeps the cross-module tail call its
+        // out-of-line bridge made and only the ENTRY side is merged: the source
+        // guard branches to the region's block with its values in locals
+        // instead of storing them for a bridge call to read back.
+        let region_external =
+            (external_jump_slot != source_func_handle).then_some(codegen::ExternalJump {
+                slot: external_jump_slot,
+                key: external_jump_key,
+            });
         // Set by the inline block below to the owner of a merge candidate whose
         // merge waits on `INLINE_TRIP_THRESHOLD` entries into this bridge.
         let mut defer_inline: Option<(Arc<JitCellToken>, u32)> = None;
@@ -4287,15 +4304,6 @@ impl majit_backend::Backend for WasmBackend {
             } else if !bridge_is_loop_closing {
                 diag_bump(34);
                 decline("not_loop_closing");
-            } else if external_jump_slot != source_func_handle {
-                // The emitter turns a region's closing JUMP into a `br`, and a
-                // `br` cannot leave the module, so the JUMP must name a LABEL of
-                // the loop the region merges into. A JUMP naming another
-                // module's published label resolves to no LABEL in the merged
-                // stream, and the in-module arm would then branch to the
-                // owner's loop instead of the loop the bridge meant.
-                diag_bump(51);
-                decline("foreign_label");
             } else if let Some(candidate) = original_token
                 .compiled
                 .get()
@@ -4320,7 +4328,8 @@ impl majit_backend::Backend for WasmBackend {
                 } else if !codegen::merged_stream_has_loop_label(&candidate) {
                     diag_bump(39);
                     decline("no_loop_label");
-                } else if !resumes_at_loop_header
+                } else if region_external.is_none()
+                    && !resumes_at_loop_header
                     && !source_in_preamble
                     && !inline_nonheader_enabled()
                 {
@@ -4388,6 +4397,20 @@ impl majit_backend::Backend for WasmBackend {
                         defer_inline = Some((owner, merged_fail_index));
                         diag_bump(54);
                         decline("deferred");
+                    } else if region_external.is_some() {
+                        // The eager arm below forgoes the trip threshold to
+                        // keep a quasi-immutable dependency attached to the
+                        // owner's flag, and pays an owner re-emission for it
+                        // whether or not the region is ever hot. A cross-module
+                        // region saves only its entry crossing — the closing
+                        // tail call it keeps is the same one the out-of-line
+                        // bridge made — so that trade goes the other way:
+                        // taking it unmeasured cost `synth/gc_iterator_source_
+                        // drop` 10% of its wall clock and `guard_failures`
+                        // 1816 -> 5280, four eager merges' worth of restarted
+                        // warmup on a workload too short to amortize one.
+                        diag_bump(64);
+                        decline("foreign_eager");
                     } else {
                         // Deferral would register this region's dependencies
                         // against its temporary bridge flag. A header region
@@ -4396,6 +4419,7 @@ impl majit_backend::Backend for WasmBackend {
                         // outset. The outside-loop case was declined above.
                         let region = codegen::InlinedBridge {
                             source_fail_index: merged_fail_index,
+                            external_jump: region_external.clone(),
                             outside_loop,
                             trace_id: self.trace_counter,
                             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
@@ -4480,8 +4504,12 @@ impl majit_backend::Backend for WasmBackend {
         // (`chained_bridge_slots`, keyed by that id) are replayed into the
         // merged region's cells when the owner is finally rebuilt.
         let inline_trip = defer_inline.map(|(owner, merged_fail_index)| {
+            if region_external.is_some() {
+                diag_bump(51);
+            }
             let region = codegen::InlinedBridge {
                 source_fail_index: merged_fail_index,
+                external_jump: region_external.clone(),
                 // Decided against the candidate as it stands when the merge
                 // actually runs, which may have taken more regions by then.
                 outside_loop: false,
