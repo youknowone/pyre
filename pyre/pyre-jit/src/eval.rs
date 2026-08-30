@@ -6234,7 +6234,7 @@ impl PyPyJitDriver {
                 >= portal_metatrace_skip()
             && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            drive_portal_metatrace(driver, green_key_hash, next_instr);
+            drive_portal_metatrace(driver, info, &env, green_key_hash, next_instr);
         }
         // The Stage-0 drive records IR and executes residuals concretely, so it
         // is a collection point; reload the same shadow-stack root before the
@@ -7175,6 +7175,8 @@ impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
 /// num_recorded_ops=…` alongside this summary.
 fn drive_portal_metatrace(
     driver: &mut JitDriver<PyreJitState>,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    env: &PyreEnv,
     green_key: u64,
     loop_header_pc: usize,
 ) {
@@ -7263,24 +7265,22 @@ fn drive_portal_metatrace(
             live_frame as usize, ec as usize,
         );
 
-        let live_values = [
-            majit_ir::Value::Ref(majit_ir::GcRef(live_frame as usize)),
-            majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)),
-        ];
-        let action = meta.force_start_tracing(
-            green_key,
-            (pycode as usize, loop_header_pc),
-            None,
-            &live_values,
+        // Start the trace through `JitDriver::force_start_tracing`, the entry
+        // the production function-entry path uses: it publishes the
+        // virtualizable heap pointer (`set_vable_ptr`) and the expanded live
+        // values through the jit state, so `initialize_virtualizable` binds
+        // the frame's `VirtualizableInfo` to the trace.  Starting on the
+        // `MetaInterp` alone leaves the trace without that info and the
+        // first `setfield_vable` aborts the walk.
+        let mut jit_state = build_jit_state(unsafe { &*live_frame }, info);
+        driver.force_start_tracing(green_key, loop_header_pc, &mut jit_state, env);
+        let meta = driver.meta_interp_mut();
+        let started = meta.is_tracing();
+        eprintln!(
+            "[jd0-mt] force_start_tracing -> {}",
+            if started { "StartedTracing" } else { "NotTracing" }
         );
-        let action_name = match &action {
-            majit_metainterp::BackEdgeAction::Interpret => "Interpret",
-            majit_metainterp::BackEdgeAction::StartedTracing => "StartedTracing",
-            majit_metainterp::BackEdgeAction::AlreadyTracing => "AlreadyTracing",
-            majit_metainterp::BackEdgeAction::RunCompiled => "RunCompiled",
-        };
-        eprintln!("[jd0-mt] force_start_tracing -> {action_name}");
-        if !matches!(action, majit_metainterp::BackEdgeAction::StartedTracing) {
+        if !started {
             return;
         }
 
@@ -10168,7 +10168,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // field is a valid repr(u8) `Instruction` discriminant.
         let instruction =
             unsafe { std::mem::transmute::<u8, pyre_interpreter::Instruction>(opcode) };
-        let op_arg = pyre_interpreter::OpArg::new((packed_instruction >> 8) as u32);
+        let op_arg = pyre_interpreter::oparg_from_u32((packed_instruction >> 8) as u32);
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
         unsafe { &mut *f }.last_instr = pc as isize;

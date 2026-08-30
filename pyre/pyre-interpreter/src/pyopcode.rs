@@ -2178,6 +2178,17 @@ pub fn code_unit_at(code: &CodeObject, i: usize) -> u16 {
     u16::from(u8::from(unit.op)) | (u16::from(u8::from(unit.arg)) << 8)
 }
 
+/// Build an `OpArg` from its 32-bit value without calling into the
+/// bytecode crate: `OpArg` is `#[repr(transparent)]` over `u32`, so the
+/// same-layout transmute lowers to a register copy, where `OpArg::new` is a
+/// call into a crate outside the extracted LLBC.
+#[inline]
+pub fn oparg_from_u32(value: u32) -> OpArg {
+    // SAFETY: `OpArg` is `#[repr(transparent)] struct OpArg(u32)`; every
+    // `u32` is a valid `OpArg`.
+    unsafe { std::mem::transmute::<u32, OpArg>(value) }
+}
+
 #[inline]
 fn instruction_from_code_unit_word(word: u16) -> Instruction {
     // SAFETY: `code_unit_at` obtains this byte from a live `Instruction` in a
