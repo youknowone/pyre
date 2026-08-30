@@ -181,7 +181,7 @@ fn repr_codepoint_is_printable(code: u32) -> bool {
 /// `_repr_function` `@jit.elidable`; preserve that call policy and keep the
 /// loop in interpreter source so source translation sees its real semantics.
 #[majit_macros::elidable]
-pub(crate) fn format_wtf8_repr(s: &Wtf8) -> String {
+pub fn format_wtf8_repr(s: &Wtf8) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let quote = if s.as_bytes().contains(&b'\'') && !s.as_bytes().contains(&b'"') {
         b'"'

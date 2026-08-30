@@ -2611,6 +2611,28 @@ fn eval_program_in_main(
     finish_or_inspect(inspect, session_context, canonical, main_module)
 }
 
+/// Report a script that could not be opened and end the run.
+///
+/// `pymain_run_file_obj` writes `"%S: can't open file %R: [Errno %d] %s"` --
+/// the path's `repr`, then the C `errno` and `strerror` for the failure rather
+/// than the message the error itself displays, which on Windows names the
+/// Win32 failure in the language the OS is localised to.  It answers
+/// `EXIT_STATUS_ERROR`, which is 2 -- the status a shell reads as "the program
+/// was never run", distinct from the 1 a program that ran and failed exits
+/// with.
+fn end_on_unopenable_script(
+    binary_name: &str,
+    path: &str,
+    error: &std::io::Error,
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+) -> ! {
+    let path = pyre_interpreter::display::format_wtf8_repr(rustpython_wtf8::Wtf8::new(path));
+    let (errno, strerror) = pyre_interpreter::PyError::io_errno_strerror(error);
+    eprintln!("{binary_name}: can't open file {path}: [Errno {errno}] {strerror}");
+    end_after_startup_failure(canonical, ec_ptr, 2);
+}
+
 fn read_script_source(
     path: &str,
     binary_name: &str,
@@ -2633,14 +2655,7 @@ fn read_script_source(
                 end_after_startup_failure(canonical, ec_ptr, 1);
             }
         },
-        // `pymain_run_file` reports an unopenable script with
-        // `EXIT_STATUS_ERROR`, which is 2 -- the status a shell reads as "the
-        // program was never run", distinct from the 1 a program that ran and
-        // failed exits with.
-        Err(e) => {
-            eprintln!("{binary_name}: cannot open '{path}': {e}");
-            end_after_startup_failure(canonical, ec_ptr, 2);
-        }
+        Err(e) => end_on_unopenable_script(binary_name, path, &e, canonical, ec_ptr),
     }
 }
 
@@ -2715,8 +2730,7 @@ fn run_script_path(
                     let bytes = match importing::read_source_bytes(Path::new(filename)) {
                         Ok(bytes) => bytes,
                         Err(e) => {
-                            eprintln!("{binary_name}: cannot open '{filename}': {e}");
-                            end_after_startup_failure(canonical, ec_ptr, 2);
+                            end_on_unopenable_script(binary_name, filename, &e, canonical, ec_ptr)
                         }
                     };
                     importing::load_pyc_script(&bytes)
