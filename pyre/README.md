@@ -1,6 +1,7 @@
 # pyre
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20Chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/2fAUZ49JX3)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/youknowone/pyre?utm_source=badge)
 
 **Experimental** - This project is still in development, and not ready for prime time.
 
