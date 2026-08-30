@@ -12,6 +12,7 @@ type does not duplicate the test machinery or interpreter startup.
 import array
 import builtins
 import inspect
+import itertools
 import sys
 import types
 
@@ -120,6 +121,7 @@ TYPE_EXPECTED = {
     map: "(function, iterable, /, *iterables, strict=False)",
     filter: "(function, iterable, /)",
     zip: "(*iterables, strict=False)",
+    itertools.count: "(start=0, step=1)",
 }
 
 for cls, signature in TYPE_EXPECTED.items():
@@ -127,6 +129,44 @@ for cls, signature in TYPE_EXPECTED.items():
 
 for cls in (int, str, bytes, bytearray, dict, range, slice, super, type):
     assert cls.__text_signature__ is None, cls
+
+
+# itertools_count_metadata_python314
+
+COUNT_EXPECTED = {
+    "__new__": (
+        "Create and return a new object.  See help(type) for accurate signature.",
+        "($type, *args, **kwargs)",
+    ),
+    "__repr__": ("Return repr(self).", "($self, /)"),
+    "__getattribute__": ("Return getattr(self, name).", "($self, name, /)"),
+    "__iter__": ("Implement iter(self).", "($self, /)"),
+    "__next__": ("Implement next(self).", "($self, /)"),
+}
+
+for name, (doc, signature) in COUNT_EXPECTED.items():
+    descriptor = itertools.count.__dict__[name]
+    assert descriptor.__doc__ == doc, name
+    assert descriptor.__text_signature__ == signature, name
+
+assert str(inspect.signature(itertools.count)) == "(start=0, step=1)"
+assert "__reduce__" not in itertools.count.__dict__
+
+for name, args in {
+    "__repr__": ({},),
+    "__getattribute__": ({}, "x"),
+    "__iter__": ({},),
+    "__next__": ({},),
+}.items():
+    try:
+        itertools.count.__dict__[name](*args)
+    except TypeError as exc:
+        assert str(exc) == (
+            f"descriptor '{name}' requires a 'itertools.count' object "
+            "but received a 'dict'"
+        )
+    else:
+        raise AssertionError(name)
 
 
 # bytearray_text_signatures_python314
