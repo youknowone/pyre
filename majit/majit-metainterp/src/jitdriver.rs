@@ -5215,6 +5215,39 @@ impl<S: JitState> JitDriver<S> {
         ))
     }
 
+    /// Whether this guard's resume stream carries deferred heap writes over
+    /// more than one virtual.
+    ///
+    /// Read straight off the guard's own exit layout — the same lookup
+    /// `start_retrace_from_guard` makes for `retrace.storage`, but reachable
+    /// before a trace session exists, so a decline that turns on it does not
+    /// have to open one and tear it down.
+    ///
+    /// The virtual count is the whole question: a guard carrying deferred
+    /// writes over one virtual is served correctly and one carrying two is
+    /// not. See the caller for what separates them.
+    fn guard_carries_pending_fields(
+        &self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) -> bool {
+        let Some(descr_fd) = descr_arc.as_fail_descr() else {
+            return false;
+        };
+        let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
+            return false;
+        };
+        self.meta
+            .get_compiled_exit_layout_in_trace(
+                jct.green_key(),
+                descr_fd.trace_id(),
+                descr_fd.fail_index_per_trace(),
+            )
+            .and_then(|layout| layout.storage)
+            .is_some_and(|storage| {
+                !storage.rd_pendingfields.is_empty() && storage.rd_virtuals.len() > 1
+            })
+    }
+
     /// `compile.py handle_fail`'s bridging arm.
     ///
     /// Upstream's `handle_fail` is an if/else: a guard that `must_compile()`
@@ -5236,32 +5269,6 @@ impl<S: JitState> JitDriver<S> {
     /// therefore sited BEFORE the walk: once the walk has run, the tail has
     /// happened, and handing the same guard to the blackhole would apply it a
     /// second time.
-    /// Whether this guard's resume stream carries deferred heap writes.
-    ///
-    /// Read straight off the guard's own exit layout — the same lookup
-    /// `start_retrace_from_guard` makes for `retrace.storage`, but reachable
-    /// before a trace session exists, so a decline that turns on it does not
-    /// have to open one and tear it down.
-    fn guard_carries_pending_fields(
-        &self,
-        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
-    ) -> bool {
-        let Some(descr_fd) = descr_arc.as_fail_descr() else {
-            return false;
-        };
-        let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
-            return false;
-        };
-        self.meta
-            .get_compiled_exit_layout_in_trace(
-                jct.green_key(),
-                descr_fd.trace_id(),
-                descr_fd.fail_index_per_trace(),
-            )
-            .and_then(|layout| layout.storage)
-            .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
-    }
-
     fn bridge_from_guard_resume_position(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -5275,16 +5282,32 @@ impl<S: JitState> JitDriver<S> {
         // position to re-enter at; every other JitState resumes through its
         // own frontend.
         let dispatch = self.dispatch_jitcode().cloned()?;
-        // OPEN, and narrower than it was. The reader applies these guards'
-        // writes op-for-op as the blackhole does, and the virtualizable
-        // arrays are now written back from the resume stream, but a
-        // self-interpreting workload still reads one operand twice when these
-        // guards are served — and stops doing so when the virtualizable's
-        // banded arms are put out of reach, so what the walk resumes on is
-        // still described somewhere this entry does not restore. The scalars
-        // are the remaining candidate: they are carried by the state-field
-        // resume mechanism, disjoint from the array restore, and nothing
-        // writes them into the live state before the walk reads through them.
+        // OPEN, and narrower than it was: it turns on the number of virtuals
+        // the guard's deferred writes span, because one is served correctly
+        // and two is not. A self-interpreting workload still reads one operand
+        // twice when the two-virtual ones are served.
+        //
+        // Where that is NOT is measured, on the self-interpreter running the
+        // quine, by three discriminators over the same guards:
+        //
+        //   * declining after the entry has replayed but before the walk runs
+        //     — so the replay's allocations and stores happened and the
+        //     blackhole arm then redid them — restores the correct output. The
+        //     replay is not what corrupts, and neither is applying it twice.
+        //   * letting the walk run and throwing the trace away, so no bridge
+        //     is ever compiled from it, still gives the wrong output. What the
+        //     compiled bridge does is not it either.
+        //   * stamping each materialized virtual's address onto its recorded
+        //     NEW, which `execute_and_record` does for every other allocation
+        //     the walk performs and this reader did not, leaves the output
+        //     byte-for-byte the same wrong bytes. An OpRef that names the
+        //     object without carrying its address is not it either.
+        //
+        // So the defect is in the walk's own resumed execution, on a heap the
+        // replay left correct. The chained-virtual shape is what separates the
+        // two cases: with two virtuals one of them is reachable only as the
+        // other's field, and the walk resumes with nothing of its own naming
+        // it.
         //
         // Sited here rather than in the ladder below because
         // `compile.py ResumeGuardDescr.handle_fail` runs ONE of resume.py's
