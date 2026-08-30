@@ -102,6 +102,19 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 /// merge was attempted; 56 = eligible but not deferrable, because the region
 /// carries a `GUARD_NOT_INVALIDATED` whose dependencies would outlive the flag
 /// it reads.
+///
+/// 57-63 split slot 1, which says only that some CALL_ASSEMBLER target did not
+/// resolve and leaves the trace unsupported. Each answers one of the questions
+/// `general_int_call_assembler_target` asks before it admits a target: 57 = the
+/// operation is a CALL_ASSEMBLER whose result is neither Int nor Ref; 58 = it
+/// carries no call descr, or no target token; 59 = an argument or result type
+/// is outside Int/Ref; 60 = the target token is not in the registry at all;
+/// 61 = a registered target's deferred module failed to materialize a func
+/// handle; 62 = the registered geometry disagrees with the operation (input
+/// types, zero callee frame bytes, absent gcmap, absent compiled loop); 63 =
+/// the target compiled once and has since declined terminally. A decline that
+/// falls in 60-63 names a target that exists, which is the half of slot 1 a
+/// retrace could plausibly resolve; 57-59 name the operation itself.
 pub static BRIDGE_DIAG: [AtomicU64; BRIDGE_DIAG_LABELS.len()] =
     [const { AtomicU64::new(0) }; BRIDGE_DIAG_LABELS.len()];
 
@@ -175,6 +188,13 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "inline_deferred",
     "inline_trip_fired",
     "inline_decl_defer_invalidation_guard",
+    "ca_decl_opcode",
+    "ca_decl_descr",
+    "ca_decl_types",
+    "ca_decl_unregistered",
+    "ca_decl_materialize",
+    "ca_decl_geometry",
+    "ca_decl_terminal",
 ];
 
 #[repr(u8)]
@@ -2947,12 +2967,15 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
             op.opcode,
             majit_ir::OpCode::CallAssemblerI | majit_ir::OpCode::CallAssemblerR
         ) {
+            diag_bump(57);
             return None;
         }
         let Some(descr_ref) = op.getdescr() else {
+            diag_bump(58);
             return None;
         };
         let Some(descr) = descr_ref.as_call_descr() else {
+            diag_bump(58);
             return None;
         };
         let arg_types = descr.arg_types();
@@ -2964,23 +2987,33 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
                 majit_ir::Type::Int | majit_ir::Type::Ref
             )
         {
+            diag_bump(59);
             return None;
         }
         let Some(target_token) = descr.call_target_token() else {
+            diag_bump(58);
             return None;
         };
         let Some(mut registered) = call_assembler_target(target_token) else {
+            diag_bump(60);
             return None;
         };
         // A straight-line function trace may have deferred host module
         // compilation. CALL_ASSEMBLER is its first real consumer, so
         // materialize it before publishing the stable dispatch entry.
         if registered.func_handle == 0 && registered.compiled_ptr != 0 {
-            let loop_ = unsafe { (registered.compiled_ptr as *const CompiledWasmLoop).as_ref() }?;
+            let Some(loop_) =
+                (unsafe { (registered.compiled_ptr as *const CompiledWasmLoop).as_ref() })
+            else {
+                diag_bump(61);
+                return None;
+            };
             let Ok(handle) = loop_.materialize_func_handle() else {
+                diag_bump(61);
                 return None;
             };
             if handle == 0 {
+                diag_bump(61);
                 return None;
             }
             registered.func_handle = handle;
@@ -2995,15 +3028,19 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
             publish_call_assembler_target(target_token, registered.clone());
         }
         if registered.input_types.as_slice() != arg_types {
+            diag_bump(62);
             return None;
         }
         if registered.callee_frame_bytes == 0 {
+            diag_bump(62);
             return None;
         }
         if registered.callee_gcmap_ptr == 0 {
+            diag_bump(62);
             return None;
         }
         if registered.compiled_ptr == 0 {
+            diag_bump(62);
             return None;
         }
         // A successfully compiled loop is retained by its token while it is
@@ -3015,6 +3052,7 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
                 .is_some_and(|loop_| !loop_.ca_terminal_declined.get())
         };
         if !live {
+            diag_bump(63);
             return None;
         }
         // The same target may occur in several operations; each operation was

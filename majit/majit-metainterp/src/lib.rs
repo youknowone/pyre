@@ -372,6 +372,19 @@ pub mod loop_census {
         KEYS.with(|keys| keys.borrow_mut().insert(green_key, green_key_raw));
     }
 
+    /// The printable location for *green_key*, or `None` when the key was
+    /// never seeded or no printer is registered.
+    ///
+    /// The guard census is keyed by the same green key this map is, so a
+    /// consumer that has one has the other -- see `guard_census_summary`,
+    /// which spells a guard as `<name>/<fail_index>` when both censuses are
+    /// armed and as the bare hash when only the guard one is.
+    pub fn name_for(green_key: u64) -> Option<String> {
+        let raw = KEYS.with(|keys| keys.borrow().get(&green_key).copied())?;
+        let printer = PRINTER.get()?;
+        Some(printer(raw.1, false, raw.0))
+    }
+
     /// Emit one census line for a trace that just compiled.
     ///
     /// *kind* is which compile arm minted it, because `loops_compiled` counts
@@ -1956,7 +1969,16 @@ pub fn guard_census_summary(top: usize) -> String {
     let heaviest = rows
         .iter()
         .take(top)
-        .map(|((key, fail_index), count)| format!("{key}/{fail_index}:{count}"))
+        .map(|((key, fail_index), count)| {
+            // `<code name> #<pc>` only: `get_printable_location` continues with
+            // the decoded instruction, whose `{ .. }` debug spelling carries
+            // spaces and would run two entries of this space-separated list
+            // together.
+            let name = loop_census::name_for(*key)
+                .map(|line| line.split_whitespace().take(2).collect::<Vec<_>>().join(""))
+                .unwrap_or_else(|| key.to_string());
+            format!("{name}/{fail_index}:{count}")
+        })
         .collect::<Vec<_>>()
         .join(" ");
     format!(

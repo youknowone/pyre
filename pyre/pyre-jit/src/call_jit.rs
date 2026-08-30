@@ -4727,13 +4727,27 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // Inert today (wasm host allocations never collect) but keeps the
             // carrier rooted at parity with dynasm if that invariant changes.
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
-            let attempt =
-                try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand);
+            let attempt = try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand);
             if attempt.terminal_declined {
                 // This target cannot reach compiled steady state: each CA
                 // invocation would blackhole.  Invalidate callers so the next
                 // trace refuses this target and returns to the baseline path.
                 majit_backend_wasm::mark_call_assembler_terminal_decline(compiled_ptr as usize);
+                // "the next trace refuses this target" is a question asked at
+                // TRACE time, and until the token carries the answer nothing
+                // asks it: the tracer records the CALL_ASSEMBLER again and the
+                // backend declines the whole trace, which for a bridge means
+                // the guard it was traced from is recorded in
+                // `declined_bridge_guards` and blackholes for the rest of the
+                // run. The guard's owning token is the callee loop this
+                // decline is about, and it is what a CALL_ASSEMBLER descr
+                // names, so the refusal is recorded on it.
+                if let Some(jct) = descr_arc
+                    .as_fail_descr()
+                    .and_then(majit_backend::descr_owning_jct)
+                {
+                    jct.refuse_call_assembler();
+                }
             }
             // The walk above may have carried the callee past the guard —
             // running the resumed region to the callee's return, or committing

@@ -806,6 +806,13 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "inline_deferred",
                 "inline_trip_fired",
                 "inline_decl_defer_invalidation_guard",
+                "ca_decl_opcode",
+                "ca_decl_descr",
+                "ca_decl_types",
+                "ca_decl_unregistered",
+                "ca_decl_materialize",
+                "ca_decl_geometry",
+                "ca_decl_terminal",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
