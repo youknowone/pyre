@@ -1,4 +1,12 @@
 use majit_macros::{dont_look_inside, dont_look_inside_cannot_raise, jit_inline};
+
+// `cargo test` builds these binaries once per backend feature, so name whichever
+// CPU this build actually links.  Naming the dynasm one unconditionally does not
+// compile in the cranelift job, where `majit-backend-dynasm` is not a dependency.
+#[cfg(all(feature = "cranelift", not(feature = "dynasm")))]
+use majit_backend_cranelift::CraneliftBackend as TestBackend;
+#[cfg(feature = "dynasm")]
+use majit_backend_dynasm::runner::DynasmBackend as TestBackend;
 use majit_metainterp::jitcode::JitCodeRuntimeExt;
 
 fn assert_single_return_opcode(jitcode: &majit_metainterp::JitCode, key: &str) {
@@ -309,7 +317,7 @@ fn jit_inline_ref_param_field_access_lowers_to_native_field_ops() {
             .iter()
             .map(|(key, value)| ((*key).to_string(), *value)),
     );
-    let cpu = majit_backend_dynasm::runner::DynasmBackend::new();
+    let cpu = TestBackend::new();
     let mut bh_builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder();
     bh_builder.set_cpu(&cpu);
     bh_builder.setup_insns(&bh_insns);
@@ -434,7 +442,7 @@ fn jit_inline_void_ref_param_field_swap_lowers_to_native_field_ops() {
             .iter()
             .map(|(key, value)| ((*key).to_string(), *value)),
     );
-    let cpu = majit_backend_dynasm::runner::DynasmBackend::new();
+    let cpu = TestBackend::new();
     let mut bh_builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder();
     bh_builder.set_cpu(&cpu);
     bh_builder.setup_insns(&bh_insns);
@@ -689,7 +697,7 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
     // Route through `handler_inline_call_nested_ext`
     // (the production builder shape) instead of the legacy
     // `dispatch_one::BC_INLINE_CALL` fallback.
-    let cpu = majit_backend_dynasm::runner::DynasmBackend::new();
+    let cpu = TestBackend::new();
     let mut bh_builder = build_inline_call_only_bh_builder();
     bh_builder.set_cpu(&cpu);
     let mut bh = bh_builder.acquire_interp();
