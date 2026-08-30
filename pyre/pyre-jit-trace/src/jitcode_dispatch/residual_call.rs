@@ -3848,11 +3848,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // walked.  The loop-var store is recognised by the FOR_ITER body's own
     // relation `body_pc + 1 == vstack_cur_pypc`, i.e. the walk has advanced one
     // opcode past the recorded body pc — not by a next-instr convention.
-    let is_loop_var_binding_store = matches!(
-        helper,
-        majit_ir::RuntimeHelperKind::StoreName | majit_ir::RuntimeHelperKind::StoreGlobal
-    ) && fbw_foriter_inflight_top_body_pc()
-        .is_some_and(|body_pc| body_pc + 1 == ctx.vstack_cur_pypc as usize);
+    let is_loop_var_binding_store = is_loop_var_binding_store(ctx, helper);
     // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
     // alone counts it.  The slot it writes exists only to keep a propagating
     // exception rooted for the collector — nothing reads it back as a value —
@@ -5419,6 +5415,20 @@ pub(crate) fn residual_call_is_proven_truth(
     numeric_ref_regs[arg_reg as usize] || bool_ref_regs[arg_reg as usize]
 }
 
+/// Whether this residual is the binding store immediately following the live
+/// in-flight `FOR_ITER`.  Both effect accounting and namespace rollback must
+/// use this one predicate so their loop-variable classifications cannot drift.
+fn is_loop_var_binding_store<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    helper: majit_ir::RuntimeHelperKind,
+) -> bool {
+    matches!(
+        helper,
+        majit_ir::RuntimeHelperKind::StoreName | majit_ir::RuntimeHelperKind::StoreGlobal
+    ) && fbw_foriter_inflight_top_body_pc()
+        .is_some_and(|body_pc| body_pc + 1 == ctx.vstack_cur_pypc as usize)
+}
+
 /// Journal the namespace binding a `STORE_NAME` / `STORE_GLOBAL` /
 /// `DELETE_NAME` / `DELETE_GLOBAL` residual is about to overwrite, so a walk
 /// that does not commit can put it back before the replay re-runs the region
@@ -5483,9 +5493,7 @@ fn journal_walker_namespace_write<Sym: WalkSym>(
     // `body_pc`, recognised the way the R1 in-flight accounting recognises it.
     // An in-flight delivery re-runs the body from that pc, so this one binding
     // is re-applied by the delivery itself and its rollback closes no road.
-    let loop_var = matches!(helper, K::StoreName | K::StoreGlobal)
-        && fbw_foriter_inflight_top_body_pc()
-            .is_some_and(|body_pc| body_pc + 1 == ctx.vstack_cur_pypc as usize);
+    let loop_var = is_loop_var_binding_store(ctx, helper);
     fbw_namespace_store_journal_push(namespace, name, displaced, loop_var);
     Some(())
 }
@@ -7699,7 +7707,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // A namespace write reaches the executor as an ordinary residual and
         // mutates the frame's dict in place; record what it displaces while the
         // write is still entirely ahead of the walk.
-        journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
+        let _ = journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
@@ -9082,7 +9090,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // A namespace write reaches the executor as an ordinary residual and
         // mutates the frame's dict in place; record what it displaces while the
         // write is still entirely ahead of the walk.
-        journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
+        let _ = journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
@@ -9338,7 +9346,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // A namespace write reaches the executor as an ordinary residual and
         // mutates the frame's dict in place; record what it displaces while the
         // write is still entirely ahead of the walk.
-        journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
+        let _ = journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,

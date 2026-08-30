@@ -6209,6 +6209,10 @@ impl PyPyJitDriver {
         frame: &mut PyFrame,
         ec: *const PyExecutionContext,
     ) -> bool {
+        // The translated marker signature must retain the red `frame` name,
+        // although the untranslated warm-state path reloads it through the
+        // shadow-stack root below after possible collection points.
+        let _ = frame;
         let env = PyreEnv;
         let (driver, info) = driver_pair();
         let loop_pycode = pycode as *const ();
@@ -6221,7 +6225,7 @@ impl PyPyJitDriver {
                 >= portal_metatrace_skip()
             && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            drive_portal_metatrace(frame as *mut PyFrame, green_key_hash, next_instr);
+            drive_portal_metatrace(driver, green_key_hash, next_instr);
         }
         // The Stage-0 drive records IR and executes residuals concretely, so it
         // is a collection point; reload the same shadow-stack root before the
@@ -7160,7 +7164,11 @@ impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
 /// `MAJIT_OPTRACE=1` for `[optrace] depth=… cursor=… pc=… opcode=… jitcode=…`
 /// per step, and `MAJIT_TLDBG=1` for `run_to_end end action=… step_count=…
 /// num_recorded_ops=…` alongside this summary.
-fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize) {
+fn drive_portal_metatrace(
+    driver: &mut JitDriver<PyreJitState>,
+    green_key: u64,
+    loop_header_pc: usize,
+) {
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7222,10 +7230,20 @@ fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize
             slot_regs[5],
         );
 
+        let meta = driver.meta_interp_mut();
+        if meta.is_tracing() {
+            eprintln!("[jd0-mt] bail: already tracing");
+            return;
+        }
+
+        // Everything above can allocate.  Reload the caller-owned shadow-stack
+        // root only after those calls, immediately before the concrete portal
+        // inputs are captured; never trust a raw frame pointer supplied by the
+        // caller across a collection point.
+        let live_frame = FrameView::top_frame();
         let next_instr = loop_header_pc as i64;
-        let is_being_profiled = i64::from(unsafe { &*f }.get_is_being_profiled());
-        let pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
-        let live_frame = f;
+        let is_being_profiled = i64::from(unsafe { &*live_frame }.get_is_being_profiled());
+        let pycode = unsafe { &*live_frame }.pycode as pyre_object::PyObjectRef;
         let ec = pyre_interpreter::call::getexecutioncontext();
         eprintln!(
             "[jd0-mt] greens next_instr={} is_being_profiled={} pycode=0x{:x}",
@@ -7236,20 +7254,13 @@ fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize
             live_frame as usize, ec as usize,
         );
 
-        let (driver, _) = driver_pair();
-        let meta = driver.meta_interp_mut();
-        if meta.is_tracing() {
-            eprintln!("[jd0-mt] bail: already tracing");
-            return;
-        }
-
         let live_values = [
             majit_ir::Value::Ref(majit_ir::GcRef(live_frame as usize)),
             majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)),
         ];
         let action = meta.force_start_tracing(
             green_key,
-            (unsafe { &*f }.pycode as usize, loop_header_pc),
+            (pycode as usize, loop_header_pc),
             None,
             &live_values,
         );
@@ -7475,7 +7486,6 @@ fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize
     }));
 
     if let Err(payload) = result {
-        let (driver, _) = driver_pair();
         let meta = driver.meta_interp_mut();
         if meta.is_tracing() {
             meta.abort_trace(false);
@@ -10126,9 +10136,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // value reaches both the marker and the dispatch, so the
         // `ref_guard_value` the marker emits promotes the operand the dispatch
         // actually consumes.
-        let code = unsafe {
-            &*pyre_interpreter::w_code_get_ptr(marker_pycode).cast::<pyre_interpreter::CodeObject>()
-        };
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(marker_pycode) };
+        if code_ptr.is_null() {
+            return LoopResult::Done(Err(pyre_interpreter::pycode::BytecodeCorruption.into()));
+        }
+        let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
 
         // Bounds net for a frame resumed past its last instruction. Upstream
         // has no counterpart — its loop leaves through `Return` / `Yield` —
@@ -10327,6 +10339,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
                 let marker_ec = pyre_interpreter::call::getexecutioncontext();
+                if marker_ec.is_null() {
+                    // No execution context means there is nowhere to publish a
+                    // compiled-loop exit.  Keep interpreting instead of
+                    // entering `set_pending_loop_exit` with a null pointer.
+                    continue;
+                }
                 let marker_pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
                 let marker_profiled = unsafe { &*f }.get_is_being_profiled();
                 if pypyjitdriver.can_enter_jit(

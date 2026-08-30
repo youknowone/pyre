@@ -4152,8 +4152,8 @@ impl<'a> Transformer<'a> {
             }]);
         }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
-        if let Some(cc) = self.callcontrol.as_mut() {
-            let kind = cc.guess_call_kind(op);
+        if self.callcontrol.is_some() {
+            let kind = self.callcontrol.as_mut().unwrap().guess_call_kind(op);
             return match kind {
                 crate::call::CallKind::Regular => {
                     // RPython call.py:230: the call result must have the same
@@ -4165,10 +4165,15 @@ impl<'a> Transformer<'a> {
                     // residual-call arm below.
                     let effective_result_ty =
                         self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
+                    let non_void_args = self
+                        .callcontrol
+                        .as_deref()
+                        .unwrap()
+                        .non_void_actual_args_for_target(target, args);
                     self.handle_regular_call(
                         op,
                         target,
-                        args,
+                        &non_void_args,
                         &effective_result_ty,
                         graph_name,
                         graph,
@@ -4185,7 +4190,12 @@ impl<'a> Transformer<'a> {
                     // RPython call.py:220-222: NON_VOID_ARGS + RESULT. Even
                     // for a configured effect override, keep the signature from
                     // getcalldescr() instead of accepting an effect-only descr.
-                    let non_void_args = resolve_non_void_arg_types_from_vars(args);
+                    let call_args = self
+                        .callcontrol
+                        .as_deref()
+                        .unwrap()
+                        .non_void_actual_args_for_target(target, args);
+                    let non_void_args = resolve_non_void_arg_types_from_vars(&call_args);
                     // Reconcile a `Result<(), PyError>` scoped callee's
                     // declared void `RESULT` against the `Ref` the front
                     // typed the unit `()` shell (see `effective_call_result_ty`).
@@ -4216,7 +4226,7 @@ impl<'a> Transformer<'a> {
                         op,
                         target,
                         descriptor,
-                        args,
+                        &call_args,
                         &effective_result_ty,
                         graph_name,
                     )

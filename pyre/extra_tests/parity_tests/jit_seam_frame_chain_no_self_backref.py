@@ -51,6 +51,7 @@ assert total > 0, total
 # The same walk from a cold frame must agree with itself across repeats.
 first = recurse(3)
 for _ in range(5):
-    assert recurse(3) == first, (recurse(3), first)
+    again = recurse(3)
+    assert again == first, (again, first)
 
 print("OK")

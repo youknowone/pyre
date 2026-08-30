@@ -4373,6 +4373,33 @@ impl CallControl {
         Some(return_type_string_to_value_type(Some(&effective)))
     }
 
+    /// RPython `CallControl.getcalldescr` / `Transformer.rewrite_call`:
+    /// `Void` arguments remain in the flow graph but are absent from the
+    /// low-level call's `NON_VOID_ARGS`. Charon can leave a zero-sized closure
+    /// receiver as `Ref` at its construction site even though the callee's
+    /// declared parameter is `Void`; use the authoritative `FUNC.ARGS`
+    /// positions at this ABI boundary instead of erasing that SSA value
+    /// globally.
+    pub(crate) fn non_void_actual_args_for_target(
+        &self,
+        target: &CallTarget,
+        args: &[crate::flowspace::model::Variable],
+    ) -> Vec<crate::flowspace::model::Variable> {
+        let Some((_, graph)) = self.target_to_path_and_graph(target) else {
+            return args.to_vec();
+        };
+        let declared = graph_arg_types(graph);
+        if declared.len() != args.len() {
+            // Leave malformed arity untouched so `getcalldescr` reports the
+            // orthodox hard error instead of silently hiding an argument.
+            return args.to_vec();
+        }
+        args.iter()
+            .zip(declared)
+            .filter_map(|(arg, ty)| (ty != crate::model::ValueType::Void).then(|| arg.clone()))
+            .collect()
+    }
+
     /// The shared low-level result type of an indirect-call family.
     ///
     /// RPython's `FunctionReprBase.call` gets this from the selected
@@ -4421,14 +4448,13 @@ fn return_type_string_to_kind(s: &str) -> char {
     }
 }
 
-/// RPython parity for `call.py:220-221` `FUNC.ARGS` — collect the non-void
-/// argument types of a graph.  Parameters live on `startblock.inputargs`
-/// (RPython `flowspace/model.py` Block), populated by `front::mir`'s
-/// parameter registration.  The `OpKind::Input`
-/// ops co-emitted with each parameter carry the declared type which we
-/// recover by chasing each inputarg Variable back to its defining op.
-/// Unknown/ambiguous slots default to `Ref`, matching
-/// `resolve_non_void_arg_types`' fallback.
+/// RPython `CallControl.getcalldescr` parity: recover the graph's complete
+/// declared `FUNC.ARGS` sequence before the caller filters `Void`. Parameters
+/// live on `Block.inputargs`, populated by `front::mir`'s parameter
+/// registration. The `OpKind::Input` operations co-emitted with each parameter
+/// carry the declared type, recovered by chasing each input variable back to
+/// its defining operation. An unresolved slot remains `Unknown`; consumers
+/// decide whether that conservative value belongs in their ABI view.
 ///
 /// TODO: when `inputargs` is empty we fall back to
 /// scanning leading `OpKind::Input` ops in the startblock.  Unit tests
@@ -4436,37 +4462,25 @@ fn return_type_string_to_kind(s: &str) -> char {
 /// `FunctionGraph::new` + `push_op` without populating `inputargs`; the
 /// fallback keeps their "all-Input-ops-are-params" convention working
 /// until they are migrated.
-fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
+fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
     let start = graph.block(graph.startblock);
-    let map_ty = |ty: &crate::model::ValueType| match ty {
-        // RPython `getkind(BOOL_TYPE)` returns `'int'`
-        // (`lloperation.py:108`); BoolRepr's lowleveltype is `Bool`
-        // and `FUNC.ARGS` (`call.py:220-221`) records it under the
-        // same `'i'` register kind as `Signed`.  Bool aliases to Int
-        // so the wildcard does not silently re-classify it as Ref.
-        crate::model::ValueType::Int | crate::model::ValueType::Bool => Some(Type::Int),
-        crate::model::ValueType::Ref(_) => Some(Type::Ref),
-        crate::model::ValueType::Float => Some(Type::Float),
-        crate::model::ValueType::Void => None,
-        // Unknown / State — default to Ref.
-        _ => Some(Type::Ref),
-    };
     if !start.inputargs.is_empty() {
-        // Walk `inputargs` (`Vec<Variable>`) directly — orthodox per
-        // `flowspace/model.py:Block.inputargs`.  Treat unresolved
-        // slots conservatively as `Type::Ref` (the same default the
-        // wildcard arm uses below).
         return start
             .inputargs
             .iter()
-            .filter_map(|arg| {
-                let ty = start.operations.iter().find_map(|op| match &op.kind {
-                    crate::model::OpKind::Input { ty, .. } if op.result.as_ref() == Some(arg) => {
-                        Some(ty)
-                    }
-                    _ => None,
-                });
-                ty.map(map_ty).unwrap_or(Some(Type::Ref))
+            .map(|arg| {
+                start
+                    .operations
+                    .iter()
+                    .find_map(|op| match &op.kind {
+                        crate::model::OpKind::Input { ty, .. }
+                            if op.result.as_ref() == Some(arg) =>
+                        {
+                            Some(ty.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(crate::model::ValueType::Unknown)
             })
             .collect();
     }
@@ -4475,8 +4489,26 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
         .iter()
         .take_while(|op| matches!(op.kind, crate::model::OpKind::Input { .. }))
         .filter_map(|op| match &op.kind {
-            crate::model::OpKind::Input { ty, .. } => map_ty(ty),
+            crate::model::OpKind::Input { ty, .. } => Some(ty.clone()),
             _ => None,
+        })
+        .collect()
+}
+
+fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
+    graph_arg_types(graph)
+        .iter()
+        .filter_map(|ty| match ty {
+            // RPython `history.getkind(BOOL_TYPE)` returns `'int'`;
+            // `CallControl.getcalldescr` records Bool in `FUNC.ARGS` under the
+            // same `'i'` register kind as `Signed`. Bool aliases to Int so the
+            // wildcard does not silently re-classify it as Ref.
+            crate::model::ValueType::Int | crate::model::ValueType::Bool => Some(Type::Int),
+            crate::model::ValueType::Ref(_) => Some(Type::Ref),
+            crate::model::ValueType::Float => Some(Type::Float),
+            crate::model::ValueType::Void => None,
+            // Unknown / State — default to Ref.
+            _ => Some(Type::Ref),
         })
         .collect()
 }
@@ -9511,6 +9543,39 @@ mod tests {
             cc.guess_call_kind(&direct_call_op(unknown)),
             CallKind::Residual
         );
+    }
+
+    #[test]
+    fn direct_call_omits_actual_for_declared_void_parameter() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["closure_call_once"]);
+        let mut callee = FunctionGraph::new("closure_call_once");
+        let receiver = callee.alloc_value_var();
+        let value = callee.alloc_value_var();
+        for (var, name, ty) in [
+            (receiver, "self", ValueType::Void),
+            (value, "value", ValueType::Ref(None)),
+        ] {
+            callee.push_inputarg_var(callee.startblock, var.clone());
+            callee.push_op_with_result_var(
+                callee.startblock,
+                OpKind::Input {
+                    name: name.to_string(),
+                    ty,
+                    class_root: None,
+                },
+                var,
+            );
+        }
+        cc.register_function_graph(path, callee);
+
+        let actual_receiver = crate::flowspace::model::Variable::new();
+        let actual_value = crate::flowspace::model::Variable::new();
+        let filtered = cc.non_void_actual_args_for_target(
+            &CallTarget::function_path(["closure_call_once"]),
+            &[actual_receiver, actual_value.clone()],
+        );
+        assert_eq!(filtered, vec![actual_value]);
     }
 
     /// The `@jit.dont_look_inside` builder residual helpers residualize only

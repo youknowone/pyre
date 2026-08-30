@@ -93,11 +93,24 @@ pub(crate) fn find_jit_merge_point(
 
 /// `jit/codewriter/support.py sort_vars`.
 pub(crate) fn sort_vars(args: &[Variable]) -> Vec<Variable> {
+    // The split runs before the rtyper publishes every concretetype.  An
+    // Unknown has no upstream `getkind()` ordering yet, so assigning it the
+    // Ref key can spuriously move a later-known Int in front of it and report
+    // a bogus JitDriver declaration-order error.  Keep the declaration order
+    // until the types are authoritative; the typed codewriter pass performs
+    // the real register-bank validation afterwards.
+    if args
+        .iter()
+        .any(|var| FunctionGraph::concretetype_of(var) == ConcreteType::Unknown)
+    {
+        return args.to_vec();
+    }
     let mut sorted = args.to_vec();
     sorted.sort_by_key(|var| match FunctionGraph::concretetype_of(var) {
         ConcreteType::Signed => 1,
-        ConcreteType::GcRef | ConcreteType::Unknown => 2,
+        ConcreteType::GcRef => 2,
         ConcreteType::Float => 3,
+        ConcreteType::Unknown => unreachable!("Unknown returned above"),
         ConcreteType::Void => panic!("support.py sort_vars: Void must be filtered first"),
     });
     sorted
@@ -954,6 +967,28 @@ pub fn builtin_func_for_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_vars_preserves_declaration_order_while_any_type_is_unknown() {
+        let mut graph = FunctionGraph::new("unknown_sort");
+        let unresolved = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let integer = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let reference = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let declared = vec![unresolved, integer, reference];
+        assert_eq!(sort_vars(&declared), declared);
+    }
+
+    #[test]
+    fn sort_vars_orders_fully_typed_register_banks() {
+        let mut graph = FunctionGraph::new("typed_sort");
+        let reference = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let float = graph.alloc_value_var_with_type(ConcreteType::Float);
+        let integer = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        assert_eq!(
+            sort_vars(&[reference.clone(), float.clone(), integer.clone()]),
+            vec![integer, reference, float]
+        );
+    }
 
     #[test]
     fn inline_calls_to_matches_upstream_four_entries() {

@@ -29800,6 +29800,126 @@ mod tests {
         Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
     }
 
+    #[test]
+    fn zero_sized_fields_are_payload_free_but_mixed_fields_are_not() {
+        let span = || {
+            serde_json::json!({"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }})
+        };
+        let item_meta = |name: &str| {
+            serde_json::json!({
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": [name, 0]}
+                ],
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let adt = |def_id: u64, hash: u64| {
+            serde_json::json!({"HashConsedValue": [hash, {
+                "Adt": {
+                    "id": {"Adt": def_id},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }]})
+        };
+        let field =
+            |ty: serde_json::Value| serde_json::json!({"name": null, "ty": ty, "attr_info": null});
+        let variant = |name: &str, fields: Vec<serde_json::Value>, discriminant: u64| {
+            serde_json::json!({
+                "name": name,
+                "fields": fields,
+                "discriminant": {"Scalar": {"Unsigned": ["U8", discriminant.to_string()]}}
+            })
+        };
+        let layout = |size: u64, field_offsets: Vec<u64>| {
+            serde_json::json!([{
+                "key": "fixture-target",
+                "value": {
+                    "size": size,
+                    "align": 1,
+                    "variant_layouts": [{"field_offsets": field_offsets}],
+                    "repr": {"transparent": false}
+                }
+            }])
+        };
+        let phantom = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta("Phantom"),
+            "kind": {"Struct": []},
+            "layout": layout(0, vec![])
+        });
+        let only_zst = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta("OnlyZst"),
+            "kind": {"Enum": [variant("Value", vec![field(adt(0, 10))], 0)]},
+            "layout": layout(1, vec![0])
+        });
+        let mixed = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta("Mixed"),
+            "kind": {"Enum": [variant(
+                "Value",
+                vec![
+                    field(adt(0, 11)),
+                    field(serde_json::json!({"Literal": {"Int": "I64"}}))
+                ],
+                0
+            )]},
+            "layout": layout(16, vec![0, 8])
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [phantom, only_zst, mixed],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let phantom_ty = serde_json::from_value::<TyRef>(adt(0, 20)).expect("phantom TyRef");
+        let only_zst_ty = serde_json::from_value::<TyRef>(adt(1, 21)).expect("ZST enum TyRef");
+        let mixed_ty = serde_json::from_value::<TyRef>(adt(2, 22)).expect("mixed enum TyRef");
+
+        assert!(super::tyref_is_zero_sized(&phantom_ty, &llbc));
+        assert!(super::type_decl_is_fieldless_enum(
+            llbc.type_by_id(1).expect("OnlyZst declaration"),
+            &llbc
+        ));
+        assert!(!super::type_decl_is_fieldless_enum(
+            llbc.type_by_id(2).expect("Mixed declaration"),
+            &llbc
+        ));
+        assert_eq!(
+            super::tyref_to_value_type(&only_zst_ty, &llbc),
+            ValueType::Int
+        );
+        assert!(matches!(
+            super::tyref_to_value_type(&mixed_ty, &llbc),
+            ValueType::Ref(_)
+        ));
+    }
+
     /// An `ArrayRead` element is addressable two ways: a scalar names its
     /// spelling so the descr computes the real width, or a thin pointer takes
     /// the identity-less mint's one-target-word assumption, which is already

@@ -3,12 +3,10 @@
 //! `Ref` before), excluding the ones the two existing fieldless-enum
 //! arms already catch.
 //!
-//! Mirrors `tyref_is_zero_sized` / `type_decl_is_fieldless_enum` from
-//! `majit-translate/src/front/mir.rs` against this crate's public API
-//! directly, rather than against a `TyRef` — for a `TyRef` pointing at
-//! `def_id`, `tyref_is_zero_sized` reduces exactly to
-//! `type_by_id(def_id).layout_for_target("").size == Some(0)`, so
-//! checking each `TypeDecl`'s own layout is equivalent and simpler.
+//! Mirrors the zero-sized and fieldless-enum classifications from
+//! `majit-translate/src/front/mir.rs` against this crate's public API directly.
+//! Checking each `TypeDecl`'s own layout is equivalent to resolving a `TyRef`
+//! to that declaration and is simpler for a whole-artefact census.
 //!
 //! Run with:
 //!
@@ -32,24 +30,14 @@ fn inline_adt_def_id(body: &Value) -> Option<u64> {
         .as_u64()
 }
 
-fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
-    let def_id = match ty {
-        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
-        TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
-    };
-    def_id
-        .and_then(|def_id| llbc.type_by_id(def_id))
-        .and_then(|td| td.layout_for_target(""))
-        .is_some_and(|layout| layout.size == Some(0))
-}
-
-fn type_decl_is_fieldless_enum(td: &TypeDecl, llbc: &Llbc) -> bool {
+fn type_decl_is_fieldless_enum(td: &TypeDecl) -> bool {
     match &td.kind {
+        // The census distinguishes syntactically fieldless variants from
+        // variants whose fields happen to be zero-sized.  The latter belong
+        // in `newly_void`; folding them into this exclusion undercounts the
+        // exact construction/parameter surface this diagnostic measures.
         TypeDeclKind::Enum(variants) => {
-            !variants.is_empty()
-                && variants
-                    .iter()
-                    .all(|v| v.fields.iter().all(|f| tyref_is_zero_sized(&f.ty, llbc)))
+            !variants.is_empty() && variants.iter().all(|v| v.fields.is_empty())
         }
         _ => false,
     }
@@ -81,7 +69,7 @@ fn main() {
             continue;
         }
         zero_sized += 1;
-        if type_decl_is_fieldless_enum(td, &llbc) {
+        if type_decl_is_fieldless_enum(td) {
             fieldless_enum_excluded += 1;
             continue;
         }
@@ -116,7 +104,7 @@ fn main() {
         .flatten()
         .filter(|td| {
             td.layout_for_target("").is_some_and(|l| l.size == Some(0))
-                && !type_decl_is_fieldless_enum(td, &llbc)
+                && !type_decl_is_fieldless_enum(td)
         })
         .map(|td| td.def_id)
         .collect();

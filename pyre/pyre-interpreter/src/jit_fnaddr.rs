@@ -62,6 +62,15 @@ impl<T> ResidualSlot for *mut T {}
 impl<T> ResidualRet for *const T {}
 impl<T> ResidualRet for *mut T {}
 
+/// Word-ABI bridge for the scalar bytecode read used by translated residual
+/// calls.  The backends call integer helpers uniformly as `(i64, ..) -> i64`;
+/// the raw Rust function is `(pointer, usize) -> u16`, which is a different
+/// `call_indirect` table type on wasm32.
+extern "C" fn bh_code_unit_at(code: i64, index: i64) -> i64 {
+    let code = unsafe { &*(code as usize as *const crate::CodeObject) };
+    i64::from(crate::pyopcode::code_unit_at(code, index as usize))
+}
+
 /// Publication helpers that check the signature instead of erasing it.
 ///
 /// Taking `*const ()` means every caller casts, and a cast accepts any
@@ -3154,12 +3163,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         code_instructions_len,
     );
 
-    let code_unit_at: fn(&crate::CodeObject, usize) -> u16 = crate::pyopcode::code_unit_at;
-    pa2(
+    cpa2(
         &mut entries,
         "pyre_interpreter::pyopcode::code_unit_at",
         "pyre_interpreter::code_unit_at",
-        code_unit_at,
+        bh_code_unit_at,
     );
 
     // Paired-local index decode helpers for the LoadFastLoadFast /
