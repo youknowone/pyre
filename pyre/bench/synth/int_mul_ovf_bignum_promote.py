@@ -1,4 +1,9 @@
-# pyre-check: max-pypy-ratio=4.2
+# pyre-check: max-pypy-ratio=2.6
+# Run 33300212586, dynasm and cranelift over all three hosts: 0.6-1.9x.  Twice
+# the slowest would be 3.8, but `PERF_GATE_FLOOR_DIVISOR` derives the floor
+# from this same number and 3.8/6 sits above the 0.6x windows reads, so the
+# ceiling is placed between the two bounds instead: 1.37x above the slowest
+# reading, and its derived 0.43x floor 1.39x below the fastest.
 # pyre-check: skip-cpython
 # cpython 1.08s vs pyre 0.32s (3.4x), and it is not gated on — only pypy is.
 

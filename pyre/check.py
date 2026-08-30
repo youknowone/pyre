@@ -5287,7 +5287,11 @@ def main():
         chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.5,     None,    1.5)
         chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       2,       3,       2,       3)
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.5,     None,    1.5)
-        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       6,       2,       8)
+        # fib_recursive's pypy ceilings of 6 and 8 both derive a floor capped at
+        # parity, and macos dynasm reads 0.9x.  Run 33300212586 measured dynasm
+        # 0.9-1.7x and cranelift 1.4-2.1x across the three hosts, so both are
+        # re-recorded at twice the slowest.  The cpython gates are untouched.
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       3.4,     2,       4.2)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
         # spectral_norm's hosts spread 0.5x-4.3x against pypy: pypy runs it in
