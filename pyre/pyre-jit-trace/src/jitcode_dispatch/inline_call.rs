@@ -9341,7 +9341,11 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
     let Some(pjc) = crate::state::pyjitcode_for_code(w_pycode) else {
         decline!(V::NoJitcode)
     };
-    census.owns_loop_header = pjc.metadata.merge_entry_by_green.iter().any(|&(py, _)| py != 0);
+    census.owns_loop_header = pjc
+        .metadata
+        .merge_entry_by_green
+        .iter()
+        .any(|&(py, _)| py != 0);
     census.n_py_instrs = pjc.metadata.n_py_instrs as usize;
     census.tables = (
         pjc.metadata.py_exact_by_jit_pc.len(),

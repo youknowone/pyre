@@ -19073,7 +19073,8 @@ pub unsafe fn generator_resume_fast_path(w_obj: PyObjectRef) -> Option<Generator
         {
             return None;
         }
-        let frame = pyre_object::generator::w_generator_get_frame(w_obj) as *mut crate::pyframe::PyFrame;
+        let frame =
+            pyre_object::generator::w_generator_get_frame(w_obj) as *mut crate::pyframe::PyFrame;
         if frame.is_null() {
             return None;
         }
