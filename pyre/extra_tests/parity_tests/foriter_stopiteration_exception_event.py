@@ -1,4 +1,3 @@
-# pyre-check: pypy-diverges: callable-iterator sentinel exhaustion reports a consuming-frame StopIteration event
 # CPython-suite gap: `test_sys_settrace` traces loops and it traces raising
 # code, but never a loop whose iterator ends by raising StopIteration from a
 # Python-level `__next__` while a tracer is installed.  A runtime that
