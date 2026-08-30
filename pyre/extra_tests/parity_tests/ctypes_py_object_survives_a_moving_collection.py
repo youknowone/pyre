@@ -1,0 +1,59 @@
+# CPython-suite gap: test_ctypes never reads a py_object back after a
+# collection, so nothing there reaches a relocated target.
+# parity-tests reason: this guards a pyre/PyPy moving-GC allocation invariant.
+# pyre-check: pypy-diverges: its container slot is zero-based, so `repr` of a
+# fresh py_object raises IndexError on an empty table and answers the first
+# stored object once one exists (measured on PyPy 7.3.20)
+
+"""``ctypes.py_object`` must survive the collector relocating its target.
+
+A ``_SimpleCData`` buffer is ``malloc_raw`` memory: the collector neither
+traces it nor rewrites it.  Storing the target's address there is therefore
+only correct while nothing moves, and a ``list`` header is an ordinary movable
+allocation.  ``GlobalPyobjContainer`` is upstream's answer -- the buffer holds
+a table slot, and the table is a real object the root walk forwards.
+"""
+
+import ctypes
+import gc
+
+payload = ["alpha", "beta"]
+box = ctypes.py_object(payload)
+
+# `gc.collect(0)` is the incminimark minor collection: it evacuates the
+# nursery, so the list header moves.  A buffer holding the old address would
+# now be pointing into reclaimed nursery memory.
+gc.collect(0)
+
+assert box.value is payload, box.value
+assert box.value == ["alpha", "beta"]
+assert repr(box) == "py_object(['alpha', 'beta'])", repr(box)
+
+# A fresh `py_object` still reads as NULL, which is the reason the stored word
+# is one-based rather than upstream's `num = len(self.objs)`: a zero-based slot
+# is indistinguishable from the zero an unset buffer holds, which is why
+# `repr(py_object())` on PyPy 7.3.20 answers the first stored object, or
+# raises IndexError when nothing has been stored yet.
+#
+# (Reading `.value` here is left out: pyre answers None where `O_get` raises
+# `ValueError: PyObject is NULL`, a divergence that predates this file and is
+# unchanged by it.)
+empty = ctypes.py_object()
+assert repr(empty) == "py_object(<NULL>)", repr(empty)
+
+# The `ctypes.util` shape: a POINTER(py_object) laid over the box's own
+# buffer, read through after the target moved.
+pointer = ctypes.cast(ctypes.addressof(box), ctypes.POINTER(ctypes.py_object))
+assert pointer.contents.value is payload
+for index in range(200):
+    filler = [[step] for step in range(200)]
+    assert len(filler) == 200
+    pointer.contents.value.append(index)
+assert payload[-1] == 199
+
+# An int is not weakrefable; upstream keeps the object itself for that case.
+number = ctypes.py_object(10**30)
+gc.collect(0)
+assert number.value == 10**30, number.value
+
+print("OK")

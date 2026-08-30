@@ -314,12 +314,10 @@ mod imp {
             && !funcptr::is_simple_subclass(at)
         {
             if tc == "O" {
-                let address = unsafe { *(p as *const usize) };
-                return Ok(if address == 0 {
-                    pyre_object::w_none()
-                } else {
-                    address as PyObjectRef
-                });
+                // The word is the container slot, not the object: an address
+                // parked in callback memory would dangle once its target moved.
+                let num = unsafe { *(p as *const usize) };
+                return Ok(cdata::pyobj_container_get(num).unwrap_or_else(pyre_object::w_none));
             }
             return Ok(cdata::decoded_to_pyobject(unsafe {
                 host_ctypes::callback_arg_value(Some(&tc), p)
