@@ -2650,8 +2650,16 @@ fn read_script_source(
             false,
         ) {
             Ok(source) => source,
-            Err(error) => {
-                pyre_interpreter::eprint_exception(&error, false);
+            Err(mut error) => {
+                // A decoded source file can fail before a frame exists (an
+                // embedded NUL or a bad encoding declaration), but its
+                // SyntaxError still carries filename/line/text. Route it
+                // through the same startup hook and syntax fallback as the
+                // compile failure below so that location is not collapsed
+                // into the generic one-line exception rendering.
+                if !pyre_interpreter::error::print_exception_via_excepthook(&mut error) {
+                    pyre_interpreter::eprint_syntax_error(&error);
+                }
                 end_after_startup_failure(canonical, ec_ptr, 1);
             }
         },
