@@ -425,6 +425,9 @@ pub struct UnrollOptimizer {
     /// because the unroll optimizer owns the inner phase optimizers while the
     /// registered GC walker enters through MetaInterp.
     pub compile_snapshot_root_slots: Option<usize>,
+    /// Address of `MetaInterp.compile_resume_memos`, forwarded to every
+    /// `Optimizer` this unroll builds so its memo is rooted while in flight.
+    pub compile_resume_memos_slot: Option<usize>,
     /// MetaInterp-owned slot that publishes the in-flight phase-2
     /// `Optimizer.short_preamble_producer` to the registered GC walker.
     pub compile_short_preamble_producer_slot: Option<usize>,
@@ -560,6 +563,7 @@ impl UnrollOptimizer {
             cpu: crate::cpu::default_cpu(),
             phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
+            compile_resume_memos_slot: None,
             compile_short_preamble_producer_slot: None,
             persistent_snapshot_root_slots: Vec::new(),
         }
@@ -633,6 +637,18 @@ impl UnrollOptimizer {
         }
         optimizer.published_short_preamble_producer_slot =
             self.compile_short_preamble_producer_slot;
+        optimizer.published_resume_memo_slot = self.compile_resume_memos_slot;
+        if let Some(addr) = self.compile_resume_memos_slot {
+            // SAFETY: pyjitpl installs this address from
+            // `MetaInterp.compile_resume_memos` for the duration of one
+            // compile, and `CompileSnapshotRootsGuard` empties the vector
+            // before the compile returns. Unroll phases run on the same thread
+            // as the registered root walker.
+            unsafe {
+                (*(addr as *mut Vec<crate::resume::LiveResumeMemo>))
+                    .push(std::rc::Rc::downgrade(&optimizer.resumedata_memo));
+            }
+        }
         PublishedShortPreambleProducer {
             slot: self.compile_short_preamble_producer_slot,
             previous,

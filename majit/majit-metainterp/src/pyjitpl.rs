@@ -755,13 +755,19 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
 pub(crate) struct CompileSnapshotRootsGuard {
     refs: *mut Vec<usize>,
     short_preamble_producer: *mut Option<usize>,
+    resume_memos: *mut Vec<crate::resume::LiveResumeMemo>,
 }
 
 impl CompileSnapshotRootsGuard {
-    pub(crate) fn new(refs: &mut Vec<usize>, short_preamble_producer: &mut Option<usize>) -> Self {
+    pub(crate) fn new(
+        refs: &mut Vec<usize>,
+        short_preamble_producer: &mut Option<usize>,
+        resume_memos: &mut Vec<crate::resume::LiveResumeMemo>,
+    ) -> Self {
         Self {
             refs: refs as *mut _,
             short_preamble_producer: short_preamble_producer as *mut _,
+            resume_memos: resume_memos as *mut _,
         }
     }
 }
@@ -777,6 +783,7 @@ impl Drop for CompileSnapshotRootsGuard {
         unsafe {
             (*self.refs).clear();
             *self.short_preamble_producer = None;
+            (*self.resume_memos).clear();
         }
     }
 }
@@ -1869,6 +1876,17 @@ pub struct MetaInterp<M: Clone> {
     /// producer. Installed only while that optimizer is alive so the
     /// registered root walker can forward its inline ConstPtr fields.
     pub(crate) compile_short_preamble_producer: Option<usize>,
+    /// Memos the in-flight optimizers own, for the window before their guards
+    /// reach a compiled trace.
+    ///
+    /// `resume.py finish` does `storage.rd_consts = self.memo.consts`, so each
+    /// guard is handed the memo's own list and one GC object roots the pool for
+    /// the whole optimizer. Pyre copies the pool into a per-guard
+    /// [`majit_ir::SharedConstPool`], which the loop below only reaches once the
+    /// guard is attached to a compiled trace; until then the memo's live
+    /// `consts` — and the raw-address keys of its `refs` cache — name nothing
+    /// the collector forwards. Emptied by [`CompileSnapshotRootsGuard`].
+    pub(crate) compile_resume_memos: Vec<crate::resume::LiveResumeMemo>,
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
@@ -2614,7 +2632,25 @@ impl<M: Clone> MetaInterp<M> {
         // `compiled_loops` once its trace is attached; the memo's own pool and
         // its address-keyed `refs` cache need this separate root for the window
         // an `Optimizer` holds them.
-        crate::resume::walk_live_memo_const_refs(&mut visitor);
+        // The memos the in-flight optimizers still own. Reached through
+        // `self`, which the registered root area derives from its `data`
+        // pointer — a foreign collecting thread runs this walk during STW, so
+        // it must not read the caller's TLS.
+        self.compile_resume_memos.retain(|weak| {
+            let Some(memo) = weak.upgrade() else {
+                return false;
+            };
+            // SAFETY: pyre is single-threaded and this walker runs from the
+            // allocation path, so the only other code that could hold the
+            // `RefCell` is the optimizer frame this walk interrupted. Going
+            // through `as_ptr` rather than `borrow_mut` is what lets the
+            // collector forward a pool the interrupted frame is mid-way
+            // through appending to — the same escape hatch
+            // `SharedConstPool::as_mut_vec_for_gc` exists for.
+            let memo = unsafe { &mut *memo.as_ptr() };
+            memo.walk_const_ptr_refs_mut(&mut visitor);
+            true
+        });
     }
 
     /// framework.py `root_walker.walk_roots` hook for the stashed
@@ -3472,6 +3508,7 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
             compile_short_preamble_producer: None,
+            compile_resume_memos: Vec::new(),
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
             declined_bridge_guards: std::collections::HashSet::new(),
@@ -6517,6 +6554,7 @@ impl<M: Clone> MetaInterp<M> {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
+            &mut self.compile_resume_memos,
         );
         // Only this call's own give-up decides the reason the caller accounts.
         self.pending_abort_reason = None;
@@ -6965,6 +7003,9 @@ impl<M: Clone> MetaInterp<M> {
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
+        unroll_opt.compile_resume_memos_slot = Some(
+            (&mut self.compile_resume_memos as *mut Vec<crate::resume::LiveResumeMemo>) as usize,
+        );
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         // Zero, not the previous entry's count — see the fresh-token note above.
@@ -8177,6 +8218,7 @@ impl<M: Clone> MetaInterp<M> {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
+            &mut self.compile_resume_memos,
         );
         let ends_with_jump = finish_descr.is_none();
         let ctx = match self.tracing.as_mut() {
@@ -8548,6 +8590,7 @@ impl<M: Clone> MetaInterp<M> {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
+            &mut self.compile_resume_memos,
         );
         // compile.py:355-359: resolve `loop_jitcell_token` before recording
         // the closing JUMP.  Keep this lookup before any state is consumed so
@@ -8803,6 +8846,9 @@ impl<M: Clone> MetaInterp<M> {
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
+        unroll_opt.compile_resume_memos_slot = Some(
+            (&mut self.compile_resume_memos as *mut Vec<crate::resume::LiveResumeMemo>) as usize,
+        );
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         // `AbstractResumeGuardDescr.compile_and_attach`, `compile.py`,
@@ -9732,6 +9778,7 @@ impl<M: Clone> MetaInterp<M> {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
+            &mut self.compile_resume_memos,
         );
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
@@ -10248,6 +10295,7 @@ impl<M: Clone> MetaInterp<M> {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
+            &mut self.compile_resume_memos,
         );
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;

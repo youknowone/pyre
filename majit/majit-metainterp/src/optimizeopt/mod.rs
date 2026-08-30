@@ -1814,13 +1814,9 @@ impl OptContext {
 
             in_final_emission: false,
             callinfocollection: None,
-            resumedata_memo: {
-                let memo = std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::resume::ResumeDataLoopMemo::new(),
-                ));
-                crate::resume::register_live_memo(&memo);
-                memo
-            },
+            resumedata_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::resume::ResumeDataLoopMemo::new(),
+            )),
             pending_for_guard: Vec::new(),
             pending_pure_from_args: Vec::new(),
             pending_pure_from_args2: Vec::new(),
@@ -2436,13 +2432,9 @@ impl OptContext {
 
             in_final_emission: false,
             callinfocollection: None,
-            resumedata_memo: {
-                let memo = std::rc::Rc::new(std::cell::RefCell::new(
-                    crate::resume::ResumeDataLoopMemo::new(),
-                ));
-                crate::resume::register_live_memo(&memo);
-                memo
-            },
+            resumedata_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::resume::ResumeDataLoopMemo::new(),
+            )),
             pending_for_guard: Vec::new(),
             pending_pure_from_args: Vec::new(),
             pending_pure_from_args2: Vec::new(),

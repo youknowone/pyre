@@ -3224,61 +3224,11 @@ impl Default for ResumeDataVirtualAdder {
     }
 }
 
-thread_local! {
-    /// Every `ResumeDataLoopMemo` an in-flight `Optimizer` still owns.
-    ///
-    /// `resume.py finish` does `storage.rd_consts = self.memo.consts`, so each
-    /// guard is handed the memo's own list and one GC object roots the pool for
-    /// the whole optimizer. Pyre copies the pool into a per-guard
-    /// [`majit_ir::SharedConstPool`], which `MetaInterp::walk_rd_consts_refs`
-    /// only reaches once the guard is attached to a compiled trace; until then
-    /// the memo's live `consts` — and the raw-address keys of its `refs` cache
-    /// — name nothing the collector forwards. One optimizer now emits every
-    /// guard through one memo (`optimizer.py Optimizer.__init__`), so that
-    /// window spans a whole trace optimization and can contain a collection.
-    /// Registering the handle here is the missing root for exactly that window.
-    ///
-    /// `Weak`, so a dropped `Optimizer` needs no unregister hook; the walk
-    /// drops the entries that no longer upgrade.
-    static LIVE_RESUME_MEMOS: std::cell::RefCell<
-        Vec<std::rc::Weak<std::cell::RefCell<ResumeDataLoopMemo>>>,
-    > = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Publish `memo` to [`walk_live_memo_const_refs`] for as long as some
-/// `Optimizer` holds it. Called from `Optimizer::new`, the one place that mints
-/// the handle `optimizer.py:732 self.resumedata_memo` stands for.
-pub fn register_live_memo(memo: &std::rc::Rc<std::cell::RefCell<ResumeDataLoopMemo>>) {
-    LIVE_RESUME_MEMOS.with(|memos| {
-        let mut memos = memos.borrow_mut();
-        memos.retain(|weak| weak.strong_count() > 0);
-        memos.push(std::rc::Rc::downgrade(memo));
-    });
-}
-
-/// `framework.py root_walker.walk_roots` hook for the constant pools of the
-/// memos an in-flight optimizer owns. Drops the handles that no longer upgrade
-/// on the way through.
-pub fn walk_live_memo_const_refs(visitor: &mut dyn FnMut(&mut GcRef)) {
-    LIVE_RESUME_MEMOS.with(|memos| {
-        let mut memos = memos.borrow_mut();
-        memos.retain(|weak| {
-            let Some(memo) = weak.upgrade() else {
-                return false;
-            };
-            // SAFETY: pyre is single-threaded and this walker runs from the
-            // allocation path, so the only other code that could hold the
-            // `RefCell` is the optimizer frame this walk interrupted. Going
-            // through `as_ptr` rather than `borrow_mut` is what lets the
-            // collector forward a pool the interrupted frame is mid-way
-            // through appending to — the same escape hatch
-            // `SharedConstPool::as_mut_vec_for_gc` exists for.
-            let memo = unsafe { &mut *memo.as_ptr() };
-            memo.walk_const_ptr_refs_mut(visitor);
-            true
-        });
-    });
-}
+/// A handle to a `ResumeDataLoopMemo` some in-flight `Optimizer` still owns.
+///
+/// `Weak`, so a dropped `Optimizer` needs no unregister hook; the root walk
+/// drops the handles that no longer upgrade.
+pub type LiveResumeMemo = std::rc::Weak<std::cell::RefCell<ResumeDataLoopMemo>>;
 
 /// Shared resume data storage that deduplicates common snapshot sections
 /// across multiple guards in the same trace.
