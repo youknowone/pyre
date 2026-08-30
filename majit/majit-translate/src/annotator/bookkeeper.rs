@@ -4749,7 +4749,7 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn real_merged_llbc_memoryview_closure_tuple_projects_pyobject_item() {
+    fn real_merged_llbc_memoryview_closure_tuple_projects_instance_item() {
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::rmodel::Repr;
         use majit_charon_reader::Llbc;
