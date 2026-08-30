@@ -123,16 +123,25 @@ pub mod frame_locals_proxy {
         /// - a `STORE_FAST` in the body lands in the shadow while a read
         ///   through the proxy answers from the array.
         ///
-        /// Only the write takes this.  **The read direction cannot, yet**, and
-        /// the reason is the missing injection rather than a preference:
-        /// `hook_access_field` runs in residual code, while inside a trace the
-        /// same accesses are *redirected* to the shadow, so upstream never
-        /// forces from a traced read -- `pyframe.py fast2locals` is
-        /// `@jit.unroll_safe` for exactly that reason.  Pyre cannot tell the two
-        /// apart at this call, so forcing on every read forces the traced ones
-        /// too; measured, that aborts the loop where a hot `len(fr.f_locals)` or
-        /// `fr.f_locals["x"]` sits in the traced body.  Telling them apart needs
-        /// the redirected-field injection itself.
+        /// This call site is the write direction, and it is the one that wants
+        /// an UNDELETED force: a store has to reach the shadow the compiled
+        /// loop answers from, so the force has to happen in the traced copy
+        /// too.  The read direction wants the opposite -- `hook_access_field`
+        /// runs in residual code, while inside a trace the same accesses are
+        /// *redirected* to the shadow, so upstream never forces from a traced
+        /// read; `pyframe.py fast2locals` is `@jit.unroll_safe` for exactly
+        /// that reason.  Forcing unconditionally on every read forces the
+        /// traced ones too, and measured, that aborts the loop where a hot
+        /// `len(fr.f_locals)` or `fr.f_locals["x"]` sits in the traced body.
+        /// What would tell the two apart is the marker, not the call site: a
+        /// read force spelled [`crate::executioncontext::jit_force_virtualizable`]
+        /// is deleted by `jtransform.py rewrite_op_jit_force_virtualizable` in
+        /// the copy the codewriter looks inside and kept in the residual one.
+        /// Putting one on [`PyFrame::fast2locals`] and
+        /// [`PyFrame::frame_locals_proxy_snapshot`] was measured and reverted:
+        /// it changed no output and lost five fixtures' compilations, because
+        /// `vable_and_vrefs_before_residual_call` already stores the boxes
+        /// back before the residual read.  See that function's own doc.
         ///
         /// [`Self::frame`] does not take it either: [`Self::fast_local_index`]
         /// goes through it only for `code`, which is not a redirected field.
@@ -168,7 +177,8 @@ pub mod frame_locals_proxy {
 
         #[inline]
         fn mapping(&self) -> Result<PyObjectRef, crate::PyError> {
-            // No force here; see [`Self::force_locals`] on the read direction.
+            // No force here or in the callee; see [`Self::force_locals`] on
+            // why the read direction takes none.
             self.frame().frame_locals_proxy_snapshot()
         }
 
@@ -305,6 +315,18 @@ pub mod frame_locals_proxy {
         /// cannot share [`Self::fast_local_index`]: a running comprehension's
         /// iteration variable is readable through the proxy even though
         /// assigning to that name goes to the extras dict instead.
+        ///
+        /// `@jit.unroll_safe` for the same reason as [`PyFrame::fast2locals`]
+        /// and [`PyFrame::frame_locals_proxy_snapshot`]: the scan is bounded by
+        /// `locals_plus_names`, i.e. the code object's varnames plus cellvars
+        /// plus freevars, which is green.  Without it `contains_loop` declines
+        /// the graph, and then a `fr.f_locals["x"]` in a traced body is one
+        /// residual call -- the array read behind it never reaches the
+        /// virtualizable lowering, so it answers from memory instead of from
+        /// the shadow the compiled loop is writing.  What the body does per
+        /// candidate is not what the hint is about: `hash_w_strict` and `eq_w`
+        /// can run application code, but they are calls, not the loop bound.
+        #[majit_macros::unroll_safe]
         fn locals_plus_value(
             &self,
             key: PyObjectRef,
