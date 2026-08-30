@@ -233,9 +233,12 @@ pub fn CreateJunction(src_path: PyObjectRef, dst_path: PyObjectRef) -> Result<()
     )?;
     let src = std::ffi::OsString::from_wide(src.as_slice());
     let dst = std::ffi::OsString::from_wide(dst.as_slice());
-    let _blocked = crate::module::thread::before_external_block();
-    host_winapi::create_junction(std::path::Path::new(&src), std::path::Path::new(&dst))
-        .map_err(super::win32_err)
+    // Scoped to the call alone, as `releasegil=True` is — see `CreateFile`.
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        host_winapi::create_junction(std::path::Path::new(&src), std::path::Path::new(&dst))
+    };
+    result.map_err(super::win32_err)
 }
 
 /// `_winapi.CopyFile2(existing_file_name, new_file_name, flags,
@@ -257,8 +260,11 @@ pub fn CopyFile2(
     let _ = progress_routine;
     let existing = wide(existing_file_name, WideArg::Unnamed)?;
     let new = wide(new_file_name, WideArg::Unnamed)?;
-    let _blocked = crate::module::thread::before_external_block();
-    host_winapi::copy_file2(&existing, &new, flags).map_err(super::win32_err)
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        host_winapi::copy_file2(&existing, &new, flags)
+    };
+    result.map_err(super::win32_err)
 }
 
 // ── processes ──
@@ -437,10 +443,11 @@ pub fn WaitForMultipleObjects(
             handles.len()
         )));
     }
-    let _blocked = crate::module::thread::before_external_block();
-    host_winapi::wait_for_multiple_objects(&handles, wait_flag != 0, milliseconds)
-        .map(i64::from)
-        .map_err(super::win32_err)
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        host_winapi::wait_for_multiple_objects(&handles, wait_flag != 0, milliseconds)
+    };
+    result.map(i64::from).map_err(super::win32_err)
 }
 
 /// `_winapi.BatchedWaitForMultipleObjects(handle_seq, wait_all, milliseconds)`
@@ -520,16 +527,25 @@ pub fn CreateFile(
         handle_w(template_file, at(7))?,
     );
     let file_name = wide(file_name, WideArg::Unnamed)?;
-    let _blocked = crate::module::thread::before_external_block();
-    host_winapi::create_file_w(
-        &file_name,
-        desired_access,
-        share_mode,
-        creation_disposition,
-        flags_and_attributes,
-    )
-    .map(w_handle)
-    .map_err(super::win32_err)
+    // `llexternal(..., releasegil=True)` releases around the C call alone and
+    // is back inside before the caller's next RPython instruction, so nothing
+    // that allocates or raises runs outside.  The guard has to be scoped the
+    // same way: `w_handle` allocates the answer, and a thread that allocates
+    // while it is out of the RUNNING census can have it collected under it —
+    // `_winapi.CreateFile` then answers 0, and the `SetNamedPipeHandleState`
+    // that `multiprocessing.connection.PipeClient` runs next reports
+    // `ERROR_INVALID_HANDLE`.
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        host_winapi::create_file_w(
+            &file_name,
+            desired_access,
+            share_mode,
+            creation_disposition,
+            flags_and_attributes,
+        )
+    };
+    result.map(w_handle).map_err(super::win32_err)
 }
 
 /// `_winapi.CreateNamedPipe(name, open_mode, pipe_mode, max_instances,
@@ -596,8 +612,11 @@ pub fn SetNamedPipeHandleState(
 #[crate::pyre_function]
 pub fn WaitNamedPipe(name: PyObjectRef, timeout: PyCUInt) -> Result<(), crate::PyError> {
     let name = wide(name, WideArg::Unnamed)?;
-    let _blocked = crate::module::thread::before_external_block();
-    host_winapi::wait_named_pipe_w(&name, timeout).map_err(super::win32_err)
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        host_winapi::wait_named_pipe_w(&name, timeout)
+    };
+    result.map_err(super::win32_err)
 }
 
 // ── the asynchronous half, which a sandbox build leaves out ──

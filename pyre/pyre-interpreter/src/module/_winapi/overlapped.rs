@@ -357,8 +357,14 @@ pub fn connect_named_pipe(
     use_overlapped: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     if !use_overlapped {
-        let _blocked = crate::module::thread::before_external_block();
-        host_winapi::connect_named_pipe(handle).map_err(win32_err)?;
+        // Scoped to the call alone, as `releasegil=True` is: raising and
+        // building the answer both allocate, and an allocation made outside
+        // the RUNNING census can be collected under the thread that made it.
+        let result = {
+            let _blocked = crate::module::thread::before_external_block();
+            host_winapi::connect_named_pipe(handle)
+        };
+        result.map_err(win32_err)?;
         return Ok(pyre_object::w_none());
     }
     let backend = new_native(handle)?;
@@ -398,8 +404,9 @@ pub fn read_file(
     if !use_overlapped {
         let result = {
             let _blocked = crate::module::thread::before_external_block();
-            host_winapi::read_file(handle, size).map_err(win32_err)?
-        };
+            host_winapi::read_file(handle, size)
+        }
+        .map_err(win32_err)?;
         return Ok(pyre_object::w_tuple_new(vec![
             pyre_object::bytesobject::w_bytes_from_bytes(&result.data),
             pyre_object::w_int_new(i64::from(result.error)),
@@ -452,8 +459,9 @@ pub fn write_file(
     if !use_overlapped {
         let result = {
             let _blocked = crate::module::thread::before_external_block();
-            host_winapi::write_file(handle, data).map_err(win32_err)?
-        };
+            host_winapi::write_file(handle, data)
+        }
+        .map_err(win32_err)?;
         return Ok(pyre_object::w_tuple_new(vec![
             pyre_object::w_int_new(i64::from(result.written)),
             pyre_object::w_int_new(i64::from(result.error)),

@@ -1247,12 +1247,17 @@ mod win_nt {
             return Ok(pyre_object::w_bool_from(false));
         };
         // Both arms open handles and query the volume, which blocks while a
-        // network name answers.
-        let _blocked = crate::module::thread::before_external_block();
-        let result = if path.as_fd != -1 {
-            host_nt::test_file_type_by_handle(host_nt::handle_from_fd(path.as_fd), tested, true)
-        } else {
-            tested_wide(&path).is_some_and(|wide| host_nt::test_file_type_by_name(&wide, tested))
+        // network name answers.  The guard covers the calls alone, the way
+        // `releasegil=True` does: building the answer allocates, and an
+        // allocation made outside the RUNNING census can be collected under
+        // the thread that made it.
+        let result = {
+            let _blocked = crate::module::thread::before_external_block();
+            if path.as_fd != -1 {
+                host_nt::test_file_type_by_handle(host_nt::handle_from_fd(path.as_fd), tested, true)
+            } else {
+                tested_wide(&path).is_some_and(|wide| host_nt::test_file_type_by_name(&wide, tested))
+            }
         };
         Ok(pyre_object::w_bool_from(result))
     }
@@ -1269,13 +1274,15 @@ mod win_nt {
         let Some(path) = path_or_fd_suppressing(obj, func)? else {
             return Ok(pyre_object::w_bool_from(false));
         };
-        let _blocked = crate::module::thread::before_external_block();
-        let result = if path.as_fd != -1 {
-            unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(path.as_fd) }
-                .is_ok_and(host_nt::fd_exists)
-        } else {
-            tested_wide(&path)
-                .is_some_and(|wide| host_nt::test_file_exists_by_name(&wide, follow_links))
+        let result = {
+            let _blocked = crate::module::thread::before_external_block();
+            if path.as_fd != -1 {
+                unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(path.as_fd) }
+                    .is_ok_and(host_nt::fd_exists)
+            } else {
+                tested_wide(&path)
+                    .is_some_and(|wide| host_nt::test_file_exists_by_name(&wide, follow_links))
+            }
         };
         Ok(pyre_object::w_bool_from(result))
     }
@@ -11783,9 +11790,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |args| {
                     let pid = crate::baseobjspace::c_int_w(args[0])?;
                     let sig = crate::baseobjspace::c_int_w(args[1])?;
-                    let _blocked = crate::module::thread::before_external_block();
-                    host_nt::kill(pid as u32, sig as u32)
-                        .map_err(|error| fs_err_with_filename(error, pyre_object::PY_NULL))?;
+                    let result = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        host_nt::kill(pid as u32, sig as u32)
+                    };
+                    result.map_err(|error| fs_err_with_filename(error, pyre_object::PY_NULL))?;
                     Ok(pyre_object::w_none())
                 },
                 2,

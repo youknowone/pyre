@@ -1994,17 +1994,19 @@ fn spawn_thread(
         })
         .map_err(|_| crate::PyError::runtime_error("can't start new thread"))?;
 
+    // The wait itself is what the guard covers; the error is raised after it,
+    // because raising allocates and an allocation made outside the RUNNING
+    // census can be collected under the thread that made it.
     let result = {
         let _blocked = before_external_block();
         loop {
             let value = started.word.load(Ordering::Acquire);
             if value == START_FAILED {
-                let message = started
+                break Err(started
                     .error
                     .get()
                     .cloned()
-                    .unwrap_or_else(|| "can't start new thread".to_string());
-                break Err(crate::PyError::runtime_error(message));
+                    .unwrap_or_else(|| "can't start new thread".to_string()));
             }
             if value != 0 {
                 break Ok(value as i64);
@@ -2013,7 +2015,7 @@ fn spawn_thread(
         }
     };
     drop(roots);
-    result
+    result.map_err(crate::PyError::runtime_error)
 }
 
 fn start_new_thread(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
