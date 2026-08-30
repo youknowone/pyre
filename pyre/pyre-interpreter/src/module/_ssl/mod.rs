@@ -1659,6 +1659,10 @@ mod ssl_socket_methods {
     /// Nothing here may touch a Python object.  The states that need one - a
     /// server context to choose, a signal to deliver, an error to raise - end
     /// the run and are answered by the caller.
+    /// A TLS record's header: the content type, the two protocol version
+    /// bytes, and the two that hold the body's length.
+    const TLS_RECORD_HEADER_LEN: usize = 5;
+
     fn pump(
         backend: *mut pyre_native::ssl::TlsConnection,
         fd: crate::module::_socket::rsocket_rffi::Socket,
@@ -1669,6 +1673,18 @@ mod ssl_socket_methods {
         use crate::module::_socket::rsocket_rffi::error_is_interrupted;
 
         let _blocked = crate::module::thread::before_external_block();
+        // The shutdown exchange stops at a record boundary.  What follows the
+        // peer's close_notify is the plaintext `unwrap()` hands back with the
+        // socket, so a read that crossed the boundary would lift those bytes
+        // out of the kernel and drop them into the TLS stream, where nothing
+        // can return them.  OpenSSL's record layer reads a header and then the
+        // body its length names, which is why a socket-backed `SSL_shutdown`
+        // leaves the caller's bytes alone; track the same two-step here.  A
+        // short read is fed on as it arrives -- the receiver buffers a partial
+        // record -- and only the byte count is carried across.
+        let mut header = [0u8; TLS_RECORD_HEADER_LEN];
+        let mut header_read = 0usize;
+        let mut body_left = 0usize;
         loop {
             loop {
                 let data = match unsafe { pyre_native::ssl::connection_peek_tls(backend) } {
@@ -1715,9 +1731,28 @@ mod ssl_socket_methods {
                     }
                 }
             }
-            match socket_recv_raw(fd, buf, 0) {
+            let want = match goal {
+                PumpGoal::Shutdown if body_left > 0 => body_left.min(buf.len()),
+                PumpGoal::Shutdown => TLS_RECORD_HEADER_LEN - header_read,
+                _ => buf.len(),
+            };
+            match socket_recv_raw(fd, &mut buf[..want], 0) {
                 Ok(0) => return PumpExit::Eof,
                 Ok(read) => {
+                    if matches!(goal, PumpGoal::Shutdown) {
+                        if body_left > 0 {
+                            body_left -= read;
+                        } else {
+                            header[header_read..header_read + read].copy_from_slice(&buf[..read]);
+                            header_read += read;
+                            if header_read == TLS_RECORD_HEADER_LEN {
+                                // The record's length is the header's last two
+                                // bytes, big-endian.
+                                body_left = u16::from_be_bytes([header[3], header[4]]) as usize;
+                                header_read = 0;
+                            }
+                        }
+                    }
                     if let Err(error) =
                         unsafe { pyre_native::ssl::connection_receive_tls(backend, &buf[..read]) }
                     {
