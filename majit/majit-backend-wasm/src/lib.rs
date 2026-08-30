@@ -5257,7 +5257,7 @@ mod tests {
         ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
         ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
 
-        let table = failguard::WASM_CA_DISPATCH.lock().unwrap();
+        let table = failguard::WASM_CA_DISPATCH.lock();
         let entry = table
             .as_ref()
             .and_then(|table| table.get(&token_number))
