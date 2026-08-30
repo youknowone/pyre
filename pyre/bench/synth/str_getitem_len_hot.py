@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=builtin_len
+# pyre-check: spec-folds=builtin_len_descent
 # Hot-loop str/unicode subscript and length over every string kind: ASCII /
 # latin1 (1-byte code units), BMP (2-byte), and non-BMP astral (4-byte). The
 # subscripts emit residual STRGETITEM/UNICODEGETITEM and the lengths STRLEN/
@@ -12,8 +12,8 @@
 # `bytesobject.py` takes off `_value` — and the `bytearray` arm reads
 # `W_BytearrayObject.length`, which is what `bytearrayobject.py`'s `_len`
 # reaches through `self._data` as `rlist.py`'s `("length", Signed)`. Without
-# those arms the call stays an opaque forcing residual; `spec-folds` catches
-# that regression directly.
+# those paths the call stays an opaque forcing residual; `spec-folds` catches
+# a regression in the generated builtin descent directly.
 #
 # `hot_mutating_len` is a correctness leg, not a speed one. `bytearray`'s
 # length is MUTABLE, so the compiled loop re-reads the field instead of
@@ -71,8 +71,8 @@ def main():
     print("bmp", hot_checksum(n, bmp_s))
     print("astral", hot_checksum(n, astral_s))
     print("len", hot_len(n, ascii_s), hot_len(n, bmp_s), hot_len(n, astral_s))
-    # The fold census verifies the immutable bytes and mutable bytearray length
-    # arms directly; each leg only needs to stay hot enough to compile.
+    # The descent census verifies the immutable bytes and mutable bytearray
+    # length bodies directly; each leg only needs to stay hot enough to compile.
     bn = 5000
     print("blen", hot_len(bn, ascii_b), hot_len(bn, short_b))
     ban = 5000

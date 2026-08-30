@@ -382,7 +382,7 @@ spec_folds! {
     Newtuple             => ("newtuple",                 "residual_call", "-"),
     NewtupleObject       => ("newtuple_object",          "residual_call", "-"),
     Newlist              => ("newlist",                  "residual_call", "-"),
-    BuiltinLen           => ("builtin_len",              "residual_call", "-"),
+    BuiltinLenDescent    => ("builtin_len_descent",      "inline_call",   "-"),
     BuiltinIsinstance    => ("builtin_isinstance",       "residual_call", "-"),
     BuiltinDictGet       => ("builtin_dict_get",         "residual_call", "-"),
     BuiltinTypeGetattr   => ("builtin_type_getattr",     "residual_call", "-"),
