@@ -218,14 +218,24 @@ crate::py_module! {
             Ok(())
         }
         fn MessageBeep(#[default(0i32)] type_: PyIndexCInt) -> Result<(), crate::PyError> {
-            let beeped = {
+            // Read inside the released region, as
+            // `save_err=rffi.RFFI_SAVE_LASTERROR` does: reacquiring goes
+            // through `mutex2_lock_timeout`, whose timed wait leaves
+            // `ERROR_TIMEOUT` behind on a poll that expired.
+            let (beeped, error) = {
                 let _blocked = crate::module::thread::before_external_block();
-                unsafe { windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(type_ as u32) }
+                let beeped = unsafe {
+                    windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(type_ as u32)
+                };
+                let error = if beeped == 0 {
+                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                } else {
+                    0
+                };
+                (beeped, error)
             };
             if beeped == 0 {
-                return Err(win32_runtime_error(unsafe {
-                    windows_sys::Win32::Foundation::GetLastError()
-                }));
+                return Err(win32_runtime_error(error));
             }
             Ok(())
         }

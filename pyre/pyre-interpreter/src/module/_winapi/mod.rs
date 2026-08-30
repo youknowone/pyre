@@ -632,17 +632,27 @@ crate::py_module! {
             // whose default `releasegil='auto'` runs the native call between
             // the rffi around-handlers.  In particular, an infinite wait must
             // let the Python thread which will signal the handle run.
-            let result = {
+            // The failure code is read inside the released region, which is
+            // what `save_err=rffi.RFFI_SAVE_LASTERROR` does — reacquiring goes
+            // through `mutex2_lock_timeout`, whose timed wait leaves
+            // `ERROR_TIMEOUT` behind on a poll that expired.
+            let (result, error) = {
                 let _blocked = crate::module::thread::before_external_block();
-                unsafe {
+                let result = unsafe {
                     windows_sys::Win32::System::Threading::WaitForSingleObject(
                         handle,
                         milliseconds,
                     )
-                }
+                };
+                let error = if result == windows_sys::Win32::Foundation::WAIT_FAILED {
+                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                } else {
+                    0
+                };
+                (result, error)
             };
             if result == windows_sys::Win32::Foundation::WAIT_FAILED {
-                return Err(last_os_error());
+                return Err(win32_code(error));
             }
             Ok(i64::from(result))
         }

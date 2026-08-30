@@ -146,21 +146,28 @@ fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
         (state.handle, std::ptr::addr_of!(state.overlapped))
     };
     let mut transferred: u32 = 0;
-    let completed = {
+    // Read inside the released region, which is what
+    // `llexternal(..., save_err=rffi.RFFI_SAVE_LASTERROR)` does: it saves
+    // `GetLastError()` between the call and the reacquire, and callers read
+    // the saved copy through `rwin32.GetLastError_saved`.  Taking the GIL back
+    // goes through `mutex2_lock_timeout`, whose timed condition wait leaves
+    // `ERROR_TIMEOUT` behind on every poll that expires, so a value read after
+    // the guard names that wait rather than this call.
+    let error = {
         let _blocked = crate::module::thread::before_external_block();
-        unsafe {
+        let completed = unsafe {
             windows_sys::Win32::System::IO::GetOverlappedResult(
                 handle,
                 overlapped,
                 &mut transferred,
                 i32::from(wait),
             )
+        };
+        if completed == 0 {
+            unsafe { windows_sys::Win32::Foundation::GetLastError() }
+        } else {
+            0
         }
-    };
-    let error = if completed == 0 {
-        unsafe { windows_sys::Win32::Foundation::GetLastError() }
-    } else {
-        0
     };
     let mut state = record.lock();
     match error {
@@ -212,15 +219,25 @@ fn overlapped_cancel(args: &[PyObjectRef]) -> crate::PyResult {
     if !state.pending {
         return Ok(pyre_object::w_none());
     }
-    let cancelled = {
+    // Read inside the released region — see `overlapped_get_result` for the
+    // `save_err=rffi.RFFI_SAVE_LASTERROR` ordering this follows.  `CancelIoEx`
+    // has one documented failure, `ERROR_NOT_FOUND`; a value read after the
+    // guard reports `ERROR_TIMEOUT` from the reacquire's timed wait instead,
+    // and `multiprocessing.connection.wait`'s `finally` turns that into an
+    // `OSError` that kills the pool's `_handle_workers` thread.
+    let (cancelled, error) = {
         let _blocked = crate::module::thread::before_external_block();
-        unsafe { windows_sys::Win32::System::IO::CancelIoEx(state.handle, &state.overlapped) }
+        let cancelled =
+            unsafe { windows_sys::Win32::System::IO::CancelIoEx(state.handle, &state.overlapped) };
+        let error = if cancelled == 0 {
+            unsafe { windows_sys::Win32::Foundation::GetLastError() }
+        } else {
+            0
+        };
+        (cancelled, error)
     };
-    if cancelled == 0 {
-        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        if error != ERROR_NOT_FOUND {
-            return Err(super::win32_code(error));
-        }
+    if cancelled == 0 && error != ERROR_NOT_FOUND {
+        return Err(super::win32_code(error));
     }
     Ok(pyre_object::w_none())
 }

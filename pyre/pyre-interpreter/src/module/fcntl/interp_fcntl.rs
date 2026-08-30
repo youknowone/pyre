@@ -428,18 +428,22 @@ fn arg_readbuf(
 /// failure.
 #[cfg(all(unix, feature = "host_env"))]
 fn ioctl_ptr(fd: i32, request: libc::c_ulong, ptr: *mut u8) -> Result<i32, crate::PyError> {
-    let ret = {
+    // The errno is read inside the released region, as
+    // `llexternal(..., save_err=rffi.RFFI_SAVE_ERRNO)` does: retaking the GIL
+    // goes through `mutex2_lock_timeout`, whose timed wait is a syscall of its
+    // own and overwrites what this call left behind.
+    let result = {
         let _blocked = crate::module::thread::before_external_block();
-        unsafe { libc::ioctl(fd, request, ptr as *mut libc::c_void) }
+        let ret = unsafe { libc::ioctl(fd, request, ptr as *mut libc::c_void) };
+        if ret < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(ret)
+        }
     };
-    if ret < 0 {
-        let e = std::io::Error::last_os_error();
-        return Err(crate::PyError::os_error_with_errno(
-            e.raw_os_error().unwrap_or(0),
-            format!("ioctl: {e}"),
-        ));
-    }
-    Ok(ret)
+    result.map_err(|e| {
+        crate::PyError::os_error_with_errno(e.raw_os_error().unwrap_or(0), format!("ioctl: {e}"))
+    })
 }
 
 /// A staging buffer holding `arg` followed by the guard, or `None` when `arg`
