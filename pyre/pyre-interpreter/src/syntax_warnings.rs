@@ -507,10 +507,14 @@ fn is_interpolated_prefix(run: &[u8]) -> bool {
 /// The `}` closing a replacement field opened at `start`, or `limit`.
 fn replacement_field_end(bytes: &[u8], start: usize, limit: usize) -> usize {
     let mut depth = 0usize;
+    let mut in_expression = true;
     let mut index = start;
     while index < limit {
         match bytes[index] {
-            b'#' => {
+            // PEP 701 comments are expression syntax.  Once a top-level
+            // conversion or format spec begins, `#` is literal format text
+            // (`f"{1:#x}"`) and must not hide the field terminator.
+            b'#' if in_expression => {
                 while index < limit && bytes[index] != b'\n' {
                     index += 1;
                 }
@@ -528,6 +532,10 @@ fn replacement_field_end(bytes: &[u8], start: usize, limit: usize) -> usize {
                 }
                 depth -= 1;
             }
+            // `!=` remains part of the expression; an actual conversion and
+            // a format spec both end the region in which comments are legal.
+            b'!' if depth == 0 && bytes.get(index + 1) != Some(&b'=') => in_expression = false,
+            b':' if depth == 0 => in_expression = false,
             _ => {}
         }
         index += 1;
@@ -595,7 +603,7 @@ fn scan_interpolated_string(
     source: &str,
     filename: &str,
     quote_index: usize,
-    raw: bool,
+    _raw: bool,
 ) -> Result<usize, PyError> {
     let bytes = source.as_bytes();
     let quote = bytes[quote_index];
@@ -603,7 +611,11 @@ fn scan_interpolated_string(
         bytes.get(quote_index + 1) == Some(&quote) && bytes.get(quote_index + 2) == Some(&quote);
     let mut index = quote_index + if triple { 3 } else { 1 };
     while index < bytes.len() {
-        if bytes[index] == b'\\' && (!raw || !matches!(bytes.get(index + 1), Some(b'{' | b'}'))) {
+        // A backslash is not an escape for an f-string field delimiter,
+        // including in a non-raw literal (`f'\\{expr}'`).  It can still
+        // protect a quote or any other following literal character while we
+        // locate the end of the interpolated string.
+        if bytes[index] == b'\\' && !matches!(bytes.get(index + 1), Some(b'{' | b'}')) {
             index = (index + 2).min(bytes.len());
         } else if triple && bytes[index..].starts_with(&[quote, quote, quote]) {
             return Ok(index + 3);

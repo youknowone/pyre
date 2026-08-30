@@ -25,4 +25,22 @@ for source in (
 for source in ('ff"{1or 0}"', 'ft"{1or 0}"'):
     assert warnings_for(source) == [], source
 
+# `#` in a format spec is literal text, not a PEP 701 expression comment; the
+# ordinary string after the field must therefore remain ordinary string text.
+assert warnings_for('f"{1:#x}" + "{2or 0}"') == []
+
+# A backslash does not stop `{` opening a replacement field.  The literal
+# still gets its independent invalid-escape warning, followed by the numeric
+# token warning from the field expression.
+backslash_field_warnings = warnings_for("f'\\{1or 0}'")
+assert len(backslash_field_warnings) == 2
+assert set(backslash_field_warnings) == {
+    (
+        SyntaxWarning,
+        '"\\{" is an invalid escape sequence. Such sequences will not work in '
+        'the future. Did you mean "\\\\{"? A raw string is also an option.',
+    ),
+    (SyntaxWarning, "invalid decimal literal"),
+}
+
 print("OK")

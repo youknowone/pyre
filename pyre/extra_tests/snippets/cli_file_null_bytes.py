@@ -32,4 +32,25 @@ with tempfile.TemporaryDirectory() as directory:
         ], stderr
         assert "\0" not in stderr, stderr
 
+    # `pymain_run_startup` enters the same tokenizer file boundary as the
+    # ordinary script path.  A startup error is reported and the forced prompt
+    # still runs, so feed it an explicit exit command.
+    startup = os.path.join(directory, "startup_nul.py")
+    with open(startup, "wb") as stream:
+        stream.write(b"x = '\0' trailing bytes\n")
+    env = os.environ.copy()
+    env["PYTHONSTARTUP"] = startup
+    result = subprocess.run(
+        [sys.executable, "-i"],
+        input=b"exit()\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    assert result.returncode == 0, result
+    stderr = result.stderr.decode("utf-8", "replace")
+    assert 'File "%s", line 1' % startup in stderr, stderr
+    assert "    x = '\nSyntaxError: source code cannot contain null bytes" in stderr
+    assert "\0" not in stderr, stderr
+
 print("OK")
