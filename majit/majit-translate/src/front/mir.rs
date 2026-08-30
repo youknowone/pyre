@@ -8195,51 +8195,53 @@ impl<'a> Lowering<'a> {
         let op_kind = match (class, call.func) {
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
-                // Rhai's boxed `Dynamic` keeps a Rust `Union` inline.  Its
-                // scalar op-assignment helpers expose the only mutations the
-                // hot loop needs as `(Dynamic*, scalar) -> ()` boundaries.
-                // Lower them to the exact variant payload field instead of
-                // descending into a Rust `&mut i64/f64` (RPython has no
-                // pointer-to-primitive repr) or allocating a replacement
-                // Union object (the concrete Rust field is inline, not a
-                // pointer).  The owner/id are the same variant-qualified keys
-                // `derive_program_metadata` installs from Charon's
-                // `Union::{Int,Float}` layouts.
+                // A boundary the consumer declared as one scalar field
+                // store ([`crate::ScalarFieldStore`]).  Emit the
+                // `setfield_gc_<bank>` its body performs instead of
+                // descending into the `&mut i64/f64` borrow the body takes
+                // into that field, which has no pointer-to-primitive repr
+                // here, or rebuilding the container around a field that is
+                // inline.  The owner/id are the same keys
+                // `derive_program_metadata` installs from Charon's layouts,
+                // so the write carries the descr an ordinary
+                // `target.field = value` assignment would.
                 if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
                     && let Some(fd) = self.llbc.fn_by_id(*id)
+                    && let Some(store) = self
+                        .static_addrs
+                        .scalar_field_stores
+                        .iter()
+                        .find(|store| fd.item_meta.name_path() == store.function_path)
                 {
-                    let variant = match fd.item_meta.name_path().as_str() {
-                        "rhai::grain::vm::jit::dynamic_store_int" => Some(("Int", ValueType::Int)),
-                        "rhai::grain::vm::jit::dynamic_store_float" => {
-                            Some(("Float", ValueType::Float))
-                        }
-                        _ => None,
-                    };
-                    if let Some((variant, field_ty)) = variant {
-                        if args.len() != 2 {
-                            return Err(LowerError::Schema(format!(
-                                "bb{mir_bb}: {} expects target and scalar",
-                                fd.item_meta.name_path()
-                            )));
-                        }
-                        let owner = format!("types::dynamic::Union::{variant}");
-                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                            result: None,
-                            kind: OpKind::FieldWrite {
-                                base: args[0].clone(),
-                                field: FieldDescriptor::new("__pos_0", Some(owner.clone()))
-                                    .with_owner_id(Some(
-                                        majit_ir::descr::StructId::from_canonical(&owner),
-                                    )),
-                                value: LinkArg::Value(args[1].clone()),
-                                ty: field_ty,
-                            },
-                        });
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
-                        return Ok(());
+                    if args.len() != 2 {
+                        return Err(LowerError::Schema(format!(
+                            "bb{mir_bb}: {} expects target and scalar",
+                            store.function_path
+                        )));
                     }
+                    let field_ty = match store.bank {
+                        crate::ScalarBank::Int => ValueType::Int,
+                        crate::ScalarBank::Float => ValueType::Float,
+                    };
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::FieldWrite {
+                            base: args[0].clone(),
+                            field: FieldDescriptor::new(
+                                store.field,
+                                Some(store.owner_root.to_string()),
+                            )
+                            .with_owner_id(Some(
+                                majit_ir::descr::StructId::from_canonical(store.owner_root),
+                            )),
+                            value: LinkArg::Value(args[1].clone()),
+                            ty: field_ty,
+                        },
+                    });
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
                 }
                 // Fold an inline `core::mem::size_of::<T>()` /
                 // `align_of::<T>()` call with a layout-resolvable ADT type
@@ -32774,39 +32776,6 @@ mod tests {
         assert_eq!(
             transparent_ctors, 0,
             "Some(Box<nominal>) must be the payload identity, with no Option aggregate"
-        );
-    }
-
-    /// Real-artefact anchor for Rhai's operation-progress boundary. Charon
-    /// serializes its `Option<Box<EvalAltResult>>` through dedup nodes and the
-    /// ordinary `alloc::boxed::Box` ADT, so the small synthetic constructor
-    /// test above cannot pin that spelling by itself.
-    #[test]
-    #[ignore]
-    fn rhai_track_operation_error_is_thin_box_option() {
-        let path = std::env::var("MAJIT_MIR_FRONTEND_LLBC")
-            .expect("set MAJIT_MIR_FRONTEND_LLBC to a Rhai grain-jit extraction");
-        let llbc = Llbc::load(path).expect("load Rhai LLBC");
-        let function = llbc
-            .iter_local_fns()
-            .find(|fd| {
-                fd.item_meta
-                    .name_path()
-                    .ends_with("grain::vm::jit::track_operation_error")
-            })
-            .expect("track_operation_error function in Rhai LLBC");
-        let output = super::tyref_node(&function.signature.output, &llbc)
-            .expect("track_operation_error output type node");
-        let payload = output
-            .get("Adt")
-            .and_then(|adt| adt.get("generics"))
-            .and_then(|generics| generics.get("types"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|types| types.first())
-            .expect("Option payload type");
-        assert!(
-            super::type_node_is_thin_box(payload, &llbc),
-            "Option<Box<EvalAltResult>> must use the one-word null niche"
         );
     }
 

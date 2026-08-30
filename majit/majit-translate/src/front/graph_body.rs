@@ -48,6 +48,7 @@ pub(crate) struct GraphBodyProvider {
     refs: Vec<(String, i64)>,
     int_values: Vec<(String, i64)>,
     error_carrier: OwnedErrorCarrierSpec,
+    scalar_field_stores: Vec<OwnedScalarFieldStore>,
 }
 
 /// Owned mirror of [`crate::ErrorCarrierSpec`], held for the same reason as
@@ -59,6 +60,38 @@ struct OwnedErrorCarrierSpec {
     carrier_wrappers: Vec<String>,
     to_exc_object: Option<Vec<String>>,
     from_exc_object: Option<(String, String)>,
+}
+
+/// Owned mirror of [`crate::ScalarFieldStore`], held for the reason the
+/// carrier spec above it is: a demanded body has to lower the declared
+/// boundaries the whole-program pass lowered, and the declaration borrows
+/// from the caller's frame.
+#[derive(Debug)]
+struct OwnedScalarFieldStore {
+    function_path: String,
+    owner_root: String,
+    field: String,
+    bank: crate::ScalarBank,
+}
+
+impl OwnedScalarFieldStore {
+    fn own(store: &crate::ScalarFieldStore<'_>) -> Self {
+        Self {
+            function_path: store.function_path.to_string(),
+            owner_root: store.owner_root.to_string(),
+            field: store.field.to_string(),
+            bank: store.bank,
+        }
+    }
+
+    fn borrowed(&self) -> crate::ScalarFieldStore<'_> {
+        crate::ScalarFieldStore {
+            function_path: &self.function_path,
+            owner_root: &self.owner_root,
+            field: &self.field,
+            bank: self.bank,
+        }
+    }
 }
 
 impl OwnedErrorCarrierSpec {
@@ -90,6 +123,11 @@ impl GraphBodyProvider {
             refs: own(static_addrs.refs),
             int_values: own(static_addrs.int_values),
             error_carrier: OwnedErrorCarrierSpec::own(static_addrs.error_carrier),
+            scalar_field_stores: static_addrs
+                .scalar_field_stores
+                .iter()
+                .map(OwnedScalarFieldStore::own)
+                .collect(),
         }
     }
 
@@ -143,6 +181,11 @@ impl GraphBodyProvider {
         let int_values = borrowed(&self.int_values);
         let carrier = &self.error_carrier;
         let carrier_wrappers = borrowed_segments(&carrier.carrier_wrappers);
+        let scalar_field_stores: Vec<crate::ScalarFieldStore<'_>> = self
+            .scalar_field_stores
+            .iter()
+            .map(OwnedScalarFieldStore::borrowed)
+            .collect();
         let to_exc_object = carrier.to_exc_object.as_deref().map(borrowed_segments);
         mir::lower_fun_decl_with_static_addrs_and_attrs(
             llbc,
@@ -160,6 +203,7 @@ impl GraphBodyProvider {
                         .as_ref()
                         .map(|(receiver, method)| (receiver.as_str(), method.as_str())),
                 },
+                scalar_field_stores: &scalar_field_stores,
             },
             attrs,
         )
