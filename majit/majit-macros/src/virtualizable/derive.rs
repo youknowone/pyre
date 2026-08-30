@@ -704,7 +704,10 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
     // All read/write goes through VirtualizableInfo which handles field types.
     quote! {
         impl #struct_name {
-            /// virtualizable.py read_boxes parity.
+            /// The STATIC half of `virtualizable.py read_boxes`.  Upstream's
+            /// `read_boxes` reads statics and then every array item;
+            /// `read_static_boxes` is the first half only, and
+            /// `VirtualizableInfo::read_all_boxes` is what answers for the whole.
             /// Reads ALL static fields from the heap via VirtualizableInfo.
             pub fn virt_export_static_boxes(
                 &self,
@@ -712,13 +715,16 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
             ) -> Vec<i64> {
                 let heap_ptr = self.#frame_ident as *const u8;
                 if !heap_ptr.is_null() {
-                    unsafe { info.read_boxes(heap_ptr) }
+                    unsafe { info.read_static_boxes(heap_ptr) }
                 } else {
                     vec![0i64; info.num_fields()]
                 }
             }
 
-            /// virtualizable.py write_from_resume_data_partial parity.
+            /// The STATIC half of `virtualizable.py write_boxes`.  Upstream writes
+            /// statics and array items and then asserts it consumed every box;
+            /// `write_static_boxes` writes the statics only, and
+            /// `VirtualizableInfo::write_boxes_to_heap` answers for the whole.
             /// Writes ALL static fields to the heap via VirtualizableInfo.
             pub fn virt_import_static_boxes(
                 &mut self,
@@ -732,7 +738,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 if heap_ptr.is_null() {
                     return false;
                 }
-                unsafe { info.write_boxes(heap_ptr, static_boxes); }
+                unsafe { info.write_static_boxes(heap_ptr, static_boxes); }
                 true
             }
 

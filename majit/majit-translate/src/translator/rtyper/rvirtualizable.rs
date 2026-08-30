@@ -46,16 +46,30 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
 /// `tests/test_make_jitcodes_produces_graph_keyed_output.rs` — so it
 /// diverges from the production config, not from upstream.
 ///
-/// What has no counterpart either way is the force injection.
-/// `hook_access_field` puts a `jit_force_virtualizable` in front of every
-/// redirected access while rtyping; pyre instead places the forces by hand
-/// at the consumers that need them (`pyre-interpreter` `sys.getframe`,
-/// `f_locals`, `f_back`). The marker
-/// `executioncontext::jit_force_virtualizable` is what lets
-/// `jtransform.rs rewrite_op_jit_force_virtualizable` delete such a call from
-/// a looked-inside graph, and it keys on the CALL TARGET's name rather than
-/// on `vable_fields`, so the two halves are armed independently of each
-/// other.
+/// What has no counterpart either way is the force injection, and it cannot
+/// get one from this crate. `hook_access_field` injects while rtyping, which
+/// puts the marker into every graph at once; `replace_force_virtualizable_with_call`
+/// then turns it into a real call across `translator.graphs` — the copy the
+/// INTERPRETER runs — and `jtransform.py rewrite_op_jit_force_virtualizable`
+/// deletes it again from the copy the codewriter looks inside. The two halves
+/// are what tell a residual access from a traced one.
+///
+/// Pyre has only one of those two copies. Its interpreter is native Rust that
+/// no majit stage emits, so an injected op can reach the jitcode and nothing
+/// else, and the jitcode is exactly where upstream deletes it: injecting here
+/// would be cancelled by the very stage it feeds. That holds wherever in this
+/// crate the injection is placed — rtyper or codewriter — so the missing
+/// generator is not a stage that has yet to be ported.
+///
+/// The discriminator survives the loss because it is the marker, not the
+/// injector. `executioncontext::jit_force_virtualizable` is placed by hand in
+/// the Rust that reads a redirected field, and `rewrite_op_jit_force_virtualizable`
+/// deletes that call from a looked-inside graph, so the residual copy forces
+/// and the traced copy does not. It keys on the CALL TARGET's name rather than
+/// on `vable_fields`, so the two halves are armed independently of each other.
+/// What a hand-placed marker cannot do is reach a graph the codewriter never
+/// looks inside — there it is an ordinary force, deleted from nothing — so
+/// each placement is only as good as that graph's jitcode.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VirtualizableInstanceRepr {
     pub top_of_virtualizable_hierarchy: bool,

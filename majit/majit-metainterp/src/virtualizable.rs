@@ -615,13 +615,11 @@ impl VirtualizableInfo {
         items_offset: usize,
         array_descr: DescrRef,
     ) {
+        let name = name.into();
         let item_size = array_descr_item_size(&array_descr, item_type);
-        let array_type_id = array_descr
-            .as_array_descr()
-            .map(|descr| descr.type_id())
-            .unwrap_or(0);
+        let array_type_id = array_field_type_id(&name, &array_descr);
         self.array_fields.push(VableArrayInfo {
-            name: name.into(),
+            name,
             item_type,
             item_size,
             field_offset,
@@ -653,13 +651,11 @@ impl VirtualizableInfo {
         items_offset: usize,
         array_descr: DescrRef,
     ) {
+        let name = name.into();
         let item_size = array_descr_item_size(&array_descr, item_type);
-        let array_type_id = array_descr
-            .as_array_descr()
-            .map(|descr| descr.type_id())
-            .unwrap_or(0);
+        let array_type_id = array_field_type_id(&name, &array_descr);
         self.array_fields.push(VableArrayInfo {
-            name: name.into(),
+            name,
             item_type,
             item_size,
             field_offset,
@@ -686,13 +682,11 @@ impl VirtualizableInfo {
         len_fn: fn(*const u8) -> usize,
         array_descr: DescrRef,
     ) {
+        let name = name.into();
         let item_size = array_descr_item_size(&array_descr, item_type);
-        let array_type_id = array_descr
-            .as_array_descr()
-            .map(|descr| descr.type_id())
-            .unwrap_or(0);
+        let array_type_id = array_field_type_id(&name, &array_descr);
         self.array_fields.push(VableArrayInfo {
-            name: name.into(),
+            name,
             item_type,
             item_size,
             field_offset,
@@ -1065,7 +1059,13 @@ impl VirtualizableInfo {
     }
 
     /// Check that box array has correct size for given array lengths.
-    pub fn check_boxes(&self, boxes: &[i64], array_lengths: &[usize]) -> bool {
+    /// The trailing `assert len(boxes) == i + 1` of `virtualizable.py
+    /// check_boxes`, and ONLY that.  Upstream's `check_boxes` also compares
+    /// every static field and every array item against the boxes; the port of
+    /// that comparison is `trace_ctx.rs check_synchronized_virtualizable`.
+    /// The name says which half this is, because a caller reaching for
+    /// `check_boxes` at a `check_boxes` call site wants the other one.
+    pub fn boxes_len_matches(&self, boxes: &[i64], array_lengths: &[usize]) -> bool {
         boxes.len() == self.get_total_size(array_lengths)
     }
 
@@ -1325,7 +1325,10 @@ impl VirtualizableInfo {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn read_boxes(&self, obj_ptr: *const u8) -> Vec<i64> {
+    /// The static half of `virtualizable.py read_boxes`.  Upstream reads the
+    /// statics and then every array item in one pass; [`Self::read_all_boxes`]
+    /// is the port of the whole.
+    pub unsafe fn read_static_boxes(&self, obj_ptr: *const u8) -> Vec<i64> {
         unsafe {
             self.static_fields
                 .iter()
@@ -1339,7 +1342,11 @@ impl VirtualizableInfo {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+    /// The static half of `virtualizable.py write_boxes`; the port of the whole
+    /// is [`Self::write_boxes_to_heap`].  Upstream closes with
+    /// `assert len(boxes) == i + 1`; this one stops at the end of the static
+    /// fields instead, because its callers hand it exactly that prefix.
+    pub unsafe fn write_static_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
         unsafe {
             for (index, &value) in boxes.iter().enumerate() {
                 if index >= self.static_fields.len() {
@@ -1360,7 +1367,7 @@ impl VirtualizableInfo {
         array_lengths: &[usize],
     ) -> (Vec<i64>, Vec<Vec<i64>>) {
         unsafe {
-            let static_boxes = self.read_boxes(obj_ptr);
+            let static_boxes = self.read_static_boxes(obj_ptr);
             let mut array_boxes = Vec::with_capacity(self.array_fields.len());
             for (index, _) in self.array_fields.iter().enumerate() {
                 let length = array_lengths.get(index).copied().unwrap_or(0);
@@ -1385,7 +1392,7 @@ impl VirtualizableInfo {
         array_boxes: &[Vec<i64>],
     ) {
         unsafe {
-            self.write_boxes(obj_ptr, static_boxes);
+            self.write_static_boxes(obj_ptr, static_boxes);
             for (array_index, values) in array_boxes.iter().enumerate() {
                 for (item_index, &value) in values.iter().enumerate() {
                     self.write_array_item(obj_ptr, array_index, item_index, value);
@@ -1679,6 +1686,38 @@ unsafe fn read_virtualizable_array(
 /// descriptor keeps the blackhole/heap array stride in lock-step with the
 /// explicit item size the JIT codegen records (e.g. a fixed `8` for `i64`
 /// payloads), instead of re-deriving a machine word on 32-bit targets.
+/// `virtualizable.py:44-56` — the array-field arrivals check.
+///
+/// ```text
+/// ARRAY = ARRAYPTR.TO
+/// if not isinstance(ARRAY, lltype.GcArray):
+///     raise Exception("The virtualizable field '%s' is not an array (found %r). ...")
+/// ```
+///
+/// Upstream refuses at translation time, so nothing downstream has to
+/// represent "this was not an array".  Answering `0` instead would not be a
+/// weaker diagnostic, it would be a WRONG ANSWER on the memory-safety path:
+/// `0` is the value `walk_vable_resume_ref_roots` reads as "no type is known
+/// for this array", and it uses that to SKIP the nursery type-id comparison
+/// before pushing the array-pointer slot as a resume ref root.  A
+/// mis-declared field would silently turn a live GC check off rather than
+/// fail.  Panicking keeps the two meanings apart by making the absent case
+/// unrepresentable.
+///
+/// The message carries upstream's remedy verbatim because it is the useful
+/// half: an array that fails this test is usually one that gets resized at
+/// run time, and `make_sure_not_resized()` is what pins it.
+fn array_field_type_id(name: &str, array_descr: &DescrRef) -> u32 {
+    let Some(descr) = array_descr.as_array_descr() else {
+        panic!(
+            "The virtualizable field '{name}' is not an array (found {array_descr:?}). \
+             It usually means that you must try harder to ensure that the list is not \
+             resized at run-time. You can do that by using make_sure_not_resized()."
+        );
+    };
+    descr.type_id()
+}
+
 fn array_descr_item_size(array_descr: &DescrRef, item_type: Type) -> usize {
     majit_ir::descr::unpack_arraydescr(array_descr)
         .map(|(_, item_size, _)| item_size)
@@ -1784,6 +1823,22 @@ mod tests {
             items_offset,
             descr,
         );
+    }
+
+    /// `virtualizable.py:47-56` — a redirected field that is not an array is a
+    /// translation-time refusal upstream, so it must be one here too.
+    ///
+    /// The regression this pins is not the diagnostic: answering `0` for the
+    /// type id would hand `walk_vable_resume_ref_roots` the same value it reads
+    /// as "no type is known", which switches OFF the nursery type-id compare
+    /// guarding the resume ref root push.
+    #[test]
+    #[should_panic(expected = "is not an array")]
+    fn a_non_array_descr_is_refused_at_declaration() {
+        let mut info = VirtualizableInfo::new(0);
+        let field_descr =
+            majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::descr::ArrayFlag::Pointer);
+        info.add_array_field("locals_w", Type::Ref, 16, 0, 0, field_descr);
     }
 
     /// Test helper: add an embedded array field with a fresh descriptor.
@@ -2010,9 +2065,9 @@ mod tests {
 
         let lens = &[3usize];
         // total = 2 + 3 = 5
-        assert!(info.check_boxes(&[1, 2, 3, 4, 5], lens));
-        assert!(!info.check_boxes(&[1, 2, 3], lens));
-        assert!(!info.check_boxes(&[1, 2, 3, 4, 5, 6], lens));
+        assert!(info.boxes_len_matches(&[1, 2, 3, 4, 5], lens));
+        assert!(!info.boxes_len_matches(&[1, 2, 3], lens));
+        assert!(!info.boxes_len_matches(&[1, 2, 3, 4, 5, 6], lens));
     }
 
     #[test]
