@@ -1305,7 +1305,7 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
     // the prebuilt family and the explicit root registry remains necessary.
     let obj = pyre_object::lltype::malloc_typed_managed(obj) as PyObjectRef;
     // PyPy's ast compiler has already wrapped every entry before PyCode.__init__
-    // (`assemble.py:479-492`). Pin the freshly allocated wrapper while
+    // (`assemble.py add_const`). Pin the freshly allocated wrapper while
     // recursive code constants and managed scalar constants allocate, then
     // publish one object in every co_consts_w slot before returning PyCode.
     let _roots = pyre_object::gc_roots::push_roots();

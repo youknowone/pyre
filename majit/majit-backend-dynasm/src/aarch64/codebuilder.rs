@@ -60,7 +60,7 @@ pub(super) fn emit_mov_imm64_to(mc: &mut Assembler, reg: u32, val: i64) {
 }
 
 impl<'a> AssemblerARM64<'a> {
-    /// codebuilder.py:509 `gen_load_int`.
+    /// codebuilder.py `gen_load_int`.
     ///
     /// Materialise a 64-bit immediate into `reg`. This is variable length:
     /// callers whose emitted block is rewritten in place afterwards (the
