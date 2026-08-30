@@ -16094,17 +16094,22 @@ fn init_code_type(ns: PyObjectRef) {
     // slots (`__replace__`, `co_branches`, adaptive bytes and ordering
     // wrappers) added from `PyCode_Type`. Every field descriptor reads the
     // single compiler CodeObject stored by `PyCode`.
+    let new_descr = make_new_descr_with_doc(
+        code_descr_new,
+        "Create and return a new object.  See help(type) for accurate signature.",
+    );
     unsafe {
+        // [3.14-spec] PyPy `PyCode.typedef` installs its app-level
+        // `descr_code__new__`; CPython 3.14's `add_tp_new_wrapper` exposes
+        // the equivalent carrier with this generic tp_new signature.  The
+        // detailed constructor signature remains on the `code` type itself.
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"));
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__doc__",
             pyre_object::w_str_new("Create a code object.  Not for the faint of heart."),
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(code_descr_new),
-        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr);
     }
     for (name, function) in [
         ("__eq__", code_descr_eq as crate::gateway::BuiltinCodeFn),

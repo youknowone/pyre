@@ -1055,6 +1055,12 @@ EXPECTED_TYPES = {
 for owner, signature in EXPECTED_TYPES.items():
     assert owner.__text_signature__ == signature, (owner, owner.__text_signature__)
 
+assert types.CodeType.__dict__["__new__"].__text_signature__ == "($type, *args, **kwargs)"
+assert str(inspect.signature(types.CodeType.__new__)) == "(*args, **kwargs)"
+assert types.CodeType.__new__.__doc__ == (
+    "Create and return a new object.  See help(type) for accurate signature."
+)
+
 assert str(inspect.signature(types.MethodType)) == "(function, instance, /)"
 assert str(inspect.signature(types.ModuleType)) == "(name, doc=None)"
 
