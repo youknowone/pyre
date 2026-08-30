@@ -1707,6 +1707,10 @@ pub fn init_typeobjects() {
                 "(mapping)",
             ),
             (
+                &crate::pytraceback::PYTRACEBACK_TYPE as *const PyType,
+                "(tb_next, tb_frame, tb_lasti, tb_lineno)",
+            ),
+            (
                 &pyre_object::nestedscope::CELL_TYPE as *const PyType,
                 "([contents])",
             ),
@@ -8110,11 +8114,97 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 fn init_pytraceback_type(ns: PyObjectRef) {
+    // CPython 3.14 `PyTraceBack_Type` public documentation. PyPy's
+    // `PyTraceback.typedef` is the structural owner below.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new("Create a new traceback object."),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(traceback_descr_new),
+            make_new_descr_with_doc(
+                traceback_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
+        )
+    };
+    // `PyTraceback.typedef` registers `__dir__` immediately after the
+    // 3.14-omitted pickle helpers; preserve that relative TypeDef order.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__dir__",
+            make_builtin_function_with_arity(
+                "__dir__",
+                |args| {
+                    dict_iterator_receiver(
+                        args,
+                        "__dir__",
+                        true,
+                        "traceback",
+                        &crate::pytraceback::PYTRACEBACK_TYPE,
+                        false,
+                    )?;
+                    crate::type_methods::arity_slot(args, 0)?;
+                    Ok(pyre_object::w_list_new(vec![
+                        pyre_object::w_str_new("tb_frame"),
+                        pyre_object::w_str_new("tb_next"),
+                        pyre_object::w_str_new("tb_lasti"),
+                        pyre_object::w_str_new("tb_lineno"),
+                    ]))
+                },
+                1,
+            ),
+        )
+    };
+
+    // `PyTraceback.typedef` wires `tb_frame` as a bare
+    // `interp_attrproperty_w('frame')` — return the live `PyFrame` itself
+    // (`FRAME_TYPE` typedef) as the user-visible `frame` object.  The
+    // traceback keeps that frame reachable through
+    // `pytraceback_object_custom_trace`, and the GC subsystem is installed
+    // at boot (`init_gc_subsystem`), so all frames — including under
+    // `PYRE_JIT=0` — are GC-owned oldgen blocks that stay alive as long as
+    // the traceback references them.
+    let frame_getter = make_builtin_function_with_arity(
+        "tb_frame",
+        |args| {
+            let tb = args[1];
+            if tb.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(tb) };
+            if frame.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            // Mark escaped so the JIT keeps the frame materialised for
+            // the exposed reference (pyframe.py `mark_as_escaped`), the
+            // way `sys/vm.py _getframe` does for the frame it hands out.
+            // This store has no counterpart on the upstream `tb_frame`,
+            // whose complete caller set is `executioncontext.py leave`,
+            // `error.py OperationError.get_traceback`,
+            // `interp_exceptions.py descr_gettraceback` and
+            // `sys/vm.py _getframe` — a deviation, not a port.
+            unsafe { (*frame).mark_as_escaped() };
+            Ok(frame as pyre_object::PyObjectRef)
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "tb_frame",
+            make_getset_property_named(
+                frame_getter,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                "tb_frame",
+            ),
         )
     };
     // pytraceback.py descr_get_tb_lasti — the slot is handed out as it is.
@@ -8248,70 +8338,16 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         )
     };
 
-    // `typedef.py PyTraceback.typedef` wires `tb_frame` as a bare
-    // `interp_attrproperty_w('frame')` — return the live `PyFrame` itself
-    // (`FRAME_TYPE` typedef) as the user-visible `frame` object.  The
-    // traceback keeps that frame reachable through
-    // `pytraceback_object_custom_trace`, and the GC subsystem is installed
-    // at boot (`init_gc_subsystem`), so all frames — including under
-    // `PYRE_JIT=0` — are GC-owned oldgen blocks that stay alive as long as
-    // the traceback references them.
-    let frame_getter = make_builtin_function_with_arity(
-        "tb_frame",
-        |args| {
-            let tb = args[1];
-            if tb.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(tb) };
-            if frame.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            // Mark escaped so the JIT keeps the frame materialised for
-            // the exposed reference (pyframe.py `mark_as_escaped`), the
-            // way `sys/vm.py _getframe` does for the frame it hands out.
-            // This store has no counterpart on the upstream `tb_frame`,
-            // whose complete caller set is `executioncontext.py leave`,
-            // `error.py OperationError.get_traceback`,
-            // `interp_exceptions.py descr_gettraceback` and
-            // `sys/vm.py _getframe` — a deviation, not a port.
-            unsafe { (*frame).mark_as_escaped() };
-            Ok(frame as pyre_object::PyObjectRef)
-        },
-        2,
-    );
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "tb_frame",
-            make_getset_property_named(
-                frame_getter,
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-                "tb_frame",
-            ),
-        )
-    };
-    // `pytraceback.py descr__dir__` — returns the list of
-    // public traceback attribute names.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__dir__",
-            make_builtin_function_with_arity(
-                "__dir__",
-                |_args| {
-                    Ok(pyre_object::w_list_new(vec![
-                        pyre_object::w_str_new("tb_frame"),
-                        pyre_object::w_str_new("tb_next"),
-                        pyre_object::w_str_new("tb_lasti"),
-                        pyre_object::w_str_new("tb_lineno"),
-                    ]))
-                },
-                1,
-            ),
-        )
-    };
+    // PyPy `PyTraceback.typedef` supplies the carriers/order; [3.14-spec]
+    // attach Argument Clinic metadata through Function.w_text_signature.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__dir__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("traceback TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 /// `pypy/interpreter/typedef.py:736-753 PyFrame.typedef` — the `frame`

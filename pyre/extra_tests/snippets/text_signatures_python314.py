@@ -1038,6 +1038,7 @@ EXPECTED_TYPES = {
     types.NotImplementedType: "()",
     types.ModuleType: "(name, doc=None)",
     types.MappingProxyType: "(mapping)",
+    types.TracebackType: "(tb_next, tb_frame, tb_lasti, tb_lineno)",
     types.CellType: "([contents])",
     types.MethodType: "(function, instance, /)",
     types.FunctionType: (
@@ -1152,6 +1153,23 @@ assert str(inspect.signature(types.MappingProxyType.get)) == (
 )
 assert str(inspect.signature(types.MappingProxyType.__reversed__)) == "(self, /)"
 assert str(inspect.signature(types.MappingProxyType.__class_getitem__)) == "(object, /)"
+
+
+# traceback_text_signatures_python314
+
+EXPECTED_TRACEBACK_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__dir__": "($self, /)",
+}
+check_descriptors(types.TracebackType, EXPECTED_TRACEBACK_METHODS)
+
+assert types.TracebackType.__doc__ == "Create a new traceback object."
+assert types.TracebackType.__new__.__doc__ == (
+    "Create and return a new object.  See help(type) for accurate signature."
+)
+assert types.TracebackType.__dir__.__doc__ is None
+assert str(inspect.signature(types.TracebackType.__new__)) == "(*args, **kwargs)"
+assert str(inspect.signature(types.TracebackType.__dir__)) == "(self, /)"
 
 
 assert types.CodeType.__dict__["__new__"].__text_signature__ == "($type, *args, **kwargs)"
