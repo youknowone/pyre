@@ -5878,14 +5878,16 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
     {
         let module_type = crate::typedef::gettypeobject(&pyre_object::MODULE_TYPE);
         let shadows_with_foreign_instance_dict = unsafe {
-            lookup_where(obj_type.as_ptr(), "__dict__").is_some_and(|(owner, _)| {
-                let layout = pyre_object::w_type_get_layout_ptr(owner);
-                !layout.is_null()
-                    && std::ptr::eq(
-                        (*(*layout).typedef).instance_type,
-                        &pyre_object::pyobject::INSTANCE_TYPE,
-                    )
-            })
+            lookup_where_with_method_cache(obj_type.as_ptr(), "__dict__").is_some_and(
+                |(owner, _)| {
+                    let layout = pyre_object::w_type_get_layout_ptr(owner);
+                    !layout.is_null()
+                        && std::ptr::eq(
+                            (*(*layout).typedef).instance_type,
+                            &pyre_object::pyobject::INSTANCE_TYPE,
+                        )
+                },
+            )
         };
         if !module_type.is_null()
             && unsafe { issubtype_w(obj_type.as_ptr(), module_type) }
@@ -6380,11 +6382,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 // protocol. A `W_ObjectObject` receiver reaches this arm only
                 // through its own class, so the check is skipped for it.
                 let owner_dispatches_getattribute = is_instance(obj)
-                    || lookup_where(w_type, "__getattribute__").is_some_and(|(owner, found)| {
-                        std::ptr::eq(found, slot)
-                            && (pyre_object::w_type_is_heaptype(owner)
-                                || pyre_object::w_type_dispatches_own_getattribute(owner))
-                    });
+                    || lookup_where_with_method_cache(w_type, "__getattribute__").is_some_and(
+                        |(owner, found)| {
+                            std::ptr::eq(found, slot)
+                                && (pyre_object::w_type_is_heaptype(owner)
+                                    || pyre_object::w_type_dispatches_own_getattribute(owner))
+                        },
+                    );
                 if !owner_dispatches_getattribute {
                     // descriptor.py `W_Super.getattribute`: a `super`
                     // subclass which inherits the builtin slot still runs the
@@ -6855,9 +6859,11 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
             && let Some(slot) = getattribute_if_not_from_object(w_type.as_ptr())
         {
             let owned_by_heap_type =
-                lookup_where(w_type.as_ptr(), "__getattribute__").is_some_and(|(owner, found)| {
-                    std::ptr::eq(found, slot) && pyre_object::w_type_is_heaptype(owner)
-                });
+                lookup_where_with_method_cache(w_type.as_ptr(), "__getattribute__").is_some_and(
+                    |(owner, found)| {
+                        std::ptr::eq(found, slot) && pyre_object::w_type_is_heaptype(owner)
+                    },
+                );
             if !owned_by_heap_type {
                 return match super_getattribute(obj, w_name) {
                     Ok(value) => Ok(value),
@@ -8274,7 +8280,8 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                     if !is_type(w_metaclass) {
                         continue;
                     }
-                    if let Some((owner, descr)) = lookup_where(w_metaclass, name) {
+                    if let Some((owner, descr)) = lookup_where_with_method_cache(w_metaclass, name)
+                    {
                         // A `__dict__` descriptor is a genuine metatype override
                         // only when its owner is a proper metaclass (a subclass
                         // of `type`).  A plain base mixed into the metaclass MRO
@@ -9934,8 +9941,21 @@ pub(crate) unsafe fn lookup_where_pair(
     w_type: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
-    let value = lookup_in_type_where_uncached(w_type, name)?;
-    let class = lookup_where_class_uncached(w_type, name)?;
+    if !majit_metainterp::jit::we_are_jitted() {
+        let value = lookup_in_type_where_uncached(w_type, name)?;
+        let class = lookup_where_class_uncached(w_type, name)?;
+        return Some((class, value));
+    }
+    // Traced code boxes the name so both residuals carry thin pointers only,
+    // the way `lookup_in_type_uncached_split` does for the value half: the
+    // `&str` projections above cannot be published as residual targets, and
+    // an unpublished callee blocks every descent whose body reaches this arm.
+    let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+    let value = _lookup_in_type_uncached(w_type, w_name);
+    if value.is_null() {
+        return None;
+    }
+    let class = _lookup_where_class_uncached(w_type, w_name);
     Some((class, value))
 }
 
@@ -10019,6 +10039,25 @@ pub(crate) unsafe fn _lookup_in_type_uncached(
 ) -> *mut PyObject {
     let name = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
     lookup_in_type_wtf8_uncached(w_type, name).unwrap_or(std::ptr::null_mut())
+}
+
+/// Class-half twin of [`_lookup_in_type_uncached`] for traced code: the
+/// same boxed-name, thin-pointer ABI over [`lookup_where_class_uncached`],
+/// null for `None`.
+///
+/// # Safety
+/// `w_type` may be null or a non-type; `w_name` must be a live str object.
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn _lookup_where_class_uncached(
+    w_type: *mut PyObject,
+    w_name: *mut PyObject,
+) -> *mut PyObject {
+    let name = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
+    match name.as_str() {
+        Ok(s) => lookup_where_class_uncached(w_type, s).unwrap_or(std::ptr::null_mut()),
+        Err(_) => lookup_where_pair_wtf8_uncached(w_type, name)
+            .map_or(std::ptr::null_mut(), |(src, _value)| src),
+    }
 }
 
 /// The uncached arms of [`lookup_in_type_where_wtf8`].  The ordinary

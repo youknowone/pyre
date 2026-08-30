@@ -1866,6 +1866,26 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::_pure_getdictvalue_no_unwrapping",
         pure_getdictvalue_no_unwrapping,
     );
+    // The uncached arm's thin-pointer twins (`lookup_where_pair` under the
+    // JIT): a boxed name in, a raw pointer (null for `None`) out.
+    let lookup_in_type_uncached: unsafe fn(
+        *mut pyre_object::PyObject,
+        *mut pyre_object::PyObject,
+    ) -> *mut pyre_object::PyObject = crate::baseobjspace::_lookup_in_type_uncached;
+    up2(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::_lookup_in_type_uncached",
+        lookup_in_type_uncached,
+    );
+    let lookup_where_class_uncached: unsafe fn(
+        *mut pyre_object::PyObject,
+        *mut pyre_object::PyObject,
+    ) -> *mut pyre_object::PyObject = crate::baseobjspace::_lookup_where_class_uncached;
+    up2(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::_lookup_where_class_uncached",
+        lookup_where_class_uncached,
+    );
     // #346: null-collapsing stable-alloc primitive residualised via
     // `#[dont_look_inside]`, keeping the thread-local GC hook dispatch out of
     // the trace.
