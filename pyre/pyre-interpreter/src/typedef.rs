@@ -29020,6 +29020,16 @@ fn generator_descr_sizeof(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_int_new(bytes as i64))
 }
 
+/// PyPy `Coroutine._finalize_` / CPython 3.14 `_PyGen_Finalize`.
+///
+/// Unlike `generator.close`, finalizing a never-awaited coroutine warns and
+/// leaves its frame available.  The GC and the public `__del__` wrapper must
+/// enter the same interpreter-owned finalizer path.
+fn coroutine_descr_finalize(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::arity_no_args(args, "__del__")?;
+    crate::baseobjspace::generator_finalize(args[0])
+}
+
 /// PyPy `generator.py GeneratorIterator.typedef`, augmented only by the
 /// concrete slots Python 3.14 exposes on `types.GeneratorType`.
 fn init_generator_type(ns: PyObjectRef) {
@@ -29211,64 +29221,118 @@ fn init_generator_type(ns: PyObjectRef) {
 
 /// PyPy `generator.py Coroutine.typedef`.
 fn init_coroutine_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
-    for (name, function, arity, doc) in [
-        ("__repr__", coroutine_descr_repr as DunderFn, 1, None),
-        (
+    // Preserve `Coroutine.typedef`'s shared order first.  The concrete
+    // finalizer/size/generic-alias entries from Python 3.14 follow its method
+    // block, before PyPy's descriptor block and terminal `__doc__`.
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__repr__",
+                coroutine_descr_repr,
+                1,
+                "Return repr(self).",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
             "send",
-            crate::baseobjspace::generator_send_method,
-            2,
-            Some(
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "send",
+                crate::baseobjspace::generator_send_method,
+                2,
                 "send(arg) -> send 'arg' into coroutine,\nreturn next iterated value or raise StopIteration.",
             ),
-        ),
-        (
-            "close",
-            crate::baseobjspace::generator_close_method,
-            1,
-            Some("close() -> raise GeneratorExit inside coroutine."),
-        ),
-        (
-            "__await__",
-            crate::baseobjspace::coroutine_await_method,
-            1,
-            None,
-        ),
-        (
-            "__del__",
-            crate::baseobjspace::generator_close_method,
-            1,
-            None,
-        ),
-    ] {
-        let function = match doc {
-            Some(doc) => {
-                crate::gateway::make_builtin_function_with_arity_and_doc(name, function, arity, doc)
-            }
-            None => make_builtin_function_with_arity(name, function, arity),
-        };
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, function) };
-    }
+        )
+    };
     unsafe {
-        pyre_object::w_dict_setitem_str(
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "throw",
-            crate::gateway::make_builtin_function_with_doc(
+            crate::gateway::make_method_descriptor_with_doc(
                 "throw",
                 crate::baseobjspace::generator_throw_method,
                 "throw(value)\nthrow(type[,value[,traceback]])\n\nRaise exception in coroutine, return next iterated value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
             ),
-        );
-        // CPython 3.14 Objects/genobject.c coro_methods — Py_GenericAlias
-        // with METH_CLASS.
-        pyre_object::w_dict_setitem_str(
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "close",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "close",
+                crate::baseobjspace::generator_close_method,
+                1,
+                "close() -> raise GeneratorExit inside coroutine.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__await__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__await__",
+                crate::baseobjspace::coroutine_await_method,
+                1,
+                "Return an iterator to be used in await expression.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__del__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__del__",
+                coroutine_descr_finalize,
+                1,
+                "Called when the instance is about to be destroyed.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "__sizeof__",
+                generator_descr_sizeof,
+                1,
+                "gen.__sizeof__() -> size of gen in memory, in bytes",
+            ),
+        )
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let function_slot = roots.base();
+    let _ = roots.pin_root(crate::gateway::make_builtin_function_with_arity_and_doc(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+        2,
+        "See PEP 585",
+    ));
+    let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_str_new("($type, object, /)"));
+    unsafe {
+        crate::function::fset_func_text_signature(
+            roots.get(function_slot),
+            roots.get(signature_slot),
+        )
+    };
+    let classmethod_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::function::w_classmethod_new(
+        roots.get(function_slot),
+    ));
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
-        );
+            roots.get(classmethod_slot),
+        )
     }
     for (name, getter) in [
         ("cr_running", coroutine_get_running as DunderFn),
@@ -29318,6 +29382,17 @@ fn init_coroutine_type(ns: PyObjectRef) {
                 make_getset_property_named_doc(get, set, delete, doc, name),
             )
         };
+    }
+    unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", w_none()) };
+    for (name, text_signature) in [
+        ("__repr__", "($self, /)"),
+        ("send", "($self, object, /)"),
+        ("close", "($self, /)"),
+        ("__await__", "($self, /)"),
+        ("__del__", "($self, /)"),
+        ("__sizeof__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
     }
 }
 

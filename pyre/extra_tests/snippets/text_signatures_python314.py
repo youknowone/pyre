@@ -1154,6 +1154,39 @@ for name, doc in EXPECTED_GENERATOR_DOCS.items():
     assert getattr(types.GeneratorType, name).__doc__ == doc, name
 
 
+# coroutine_type_text_signatures_python314
+
+EXPECTED_COROUTINE_METHODS = {
+    "__repr__": "($self, /)",
+    "__del__": "($self, /)",
+    "__await__": "($self, /)",
+    "send": "($self, object, /)",
+    "close": "($self, /)",
+    "__sizeof__": "($self, /)",
+    "__class_getitem__": "($type, object, /)",
+}
+check_descriptors(types.CoroutineType, EXPECTED_COROUTINE_METHODS)
+assert types.CoroutineType.throw.__text_signature__ is None
+
+EXPECTED_COROUTINE_DOCS = {
+    "__repr__": "Return repr(self).",
+    "__del__": "Called when the instance is about to be destroyed.",
+    "__await__": "Return an iterator to be used in await expression.",
+    "send": "send(arg) -> send 'arg' into coroutine,\nreturn next iterated value or raise StopIteration.",
+    "throw": (
+        "throw(value)\nthrow(type[,value[,traceback]])\n\n"
+        "Raise exception in coroutine, return next iterated value or raise\n"
+        "StopIteration.\nthe (type, val, tb) signature is deprecated, \n"
+        "and may be removed in a future version of Python."
+    ),
+    "close": "close() -> raise GeneratorExit inside coroutine.",
+    "__sizeof__": "gen.__sizeof__() -> size of gen in memory, in bytes",
+    "__class_getitem__": "See PEP 585",
+}
+for name, doc in EXPECTED_COROUTINE_DOCS.items():
+    assert getattr(types.CoroutineType, name).__doc__ == doc, name
+
+
 # module_text_signatures_python314
 
 EXPECTED_MODULE_METHODS = {

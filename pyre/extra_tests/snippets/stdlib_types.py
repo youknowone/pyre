@@ -2,6 +2,7 @@ import _ast
 import platform
 import sys
 import types
+import warnings
 
 from testutils import assert_raises
 
@@ -152,6 +153,76 @@ def _generator_type_contract():
 
 
 _generator_type_contract()
+
+
+def _coroutine_type_contract():
+    async def coroutine(value):
+        return value
+
+    shared_order = [
+        "__repr__",
+        "send",
+        "throw",
+        "close",
+        "__await__",
+        "cr_running",
+        "cr_suspended",
+        "cr_frame",
+        "cr_code",
+        "cr_await",
+        "cr_origin",
+        "__name__",
+        "__qualname__",
+        "__doc__",
+    ]
+    if sys.implementation.name == "pyre":
+        assert [
+            name for name in types.CoroutineType.__dict__ if name in shared_order
+        ] == shared_order
+    if hasattr(types, "ClassMethodDescriptorType"):
+        assert type(types.CoroutineType.__repr__) is types.WrapperDescriptorType
+        assert type(types.CoroutineType.send) is types.MethodDescriptorType
+        assert (
+            type(types.CoroutineType.__dict__["__class_getitem__"])
+            is types.ClassMethodDescriptorType
+        )
+
+    instance = coroutine(1)
+    if hasattr(instance, "__sizeof__"):
+        code = instance.cr_code
+        nlocalsplus = (
+            code.co_nlocals
+            + sum(name not in code.co_varnames for name in code.co_cellvars)
+            + len(code.co_freevars)
+        )
+        expected = types.CoroutineType.__basicsize__ + (
+            nlocalsplus + code.co_stacksize
+        ) * tuple.__itemsize__
+        assert instance.__sizeof__() == expected
+    instance.close()
+
+    unawaited = coroutine(2)
+    frame = unawaited.cr_frame
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        assert unawaited.__del__() is None
+    assert unawaited.cr_frame is frame
+    assert len(recorded) == 1
+    assert recorded[0].category is RuntimeWarning
+    assert str(recorded[0].message) == (
+        "coroutine '_coroutine_type_contract.<locals>.coroutine' was never awaited"
+    )
+    unawaited.close()
+
+    if sys.implementation.name != "pypy":
+        with assert_raises(TypeError) as raised:
+            types.CoroutineType.send({}, None)
+        assert str(raised.exception) == (
+            "descriptor 'send' for 'coroutine' objects doesn't apply to a 'dict' object"
+        )
+
+
+_coroutine_type_contract()
 
 
 def _function_type_kwdefaults():
