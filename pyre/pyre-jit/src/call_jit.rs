@@ -2624,7 +2624,7 @@ pub fn blackhole_resume_via_rd_numb(
                 pyre_jit_trace::state::blackhole_control_opcodes();
             builder.setup_cached_control_opcodes(op_live, op_catch_exception, op_rvmprof_code);
         };
-    let release_bh_rd = |bh: majit_metainterp::blackhole::BlackholeInterpreter| {
+    let release_bh_rd = |bh: Box<majit_metainterp::blackhole::BlackholeInterpreter>| {
         BH_BUILDER_RD.with(|cell| unsafe { (&mut *cell.get()).release_interp(bh) });
     };
 
@@ -2814,7 +2814,7 @@ pub fn blackhole_resume_via_rd_numb(
         }]);
     {
         let vinfo = bh.virtualizable_info;
-        let mut current = Some(&mut bh);
+        let mut current = Some(&mut *bh);
         while let Some(frame) = current {
             frame.virtualizable_info = vinfo;
             frame.record_caught_exception = Some(record_caught_blackhole_traceback);
@@ -2841,7 +2841,7 @@ pub fn blackhole_resume_via_rd_numb(
     // so bind that Pyre-only cache from EACH frame's own red register.
     {
         let multi_frame = bh.nextblackholeinterp.is_some();
-        let mut current = Some(&mut bh);
+        let mut current = Some(&mut *bh);
         let mut frame_index = 0usize;
         while let Some(frame) = current {
             if majit_metainterp::bh_debug_enabled() {
@@ -2976,7 +2976,7 @@ pub fn blackhole_resume_via_rd_numb(
                             },
                         }
                     }
-                    bh = *caller;
+                    bh = caller;
                 }
                 None => {
                     // blackhole.py:1629 bottommost frame, unhandled →
@@ -3187,7 +3187,7 @@ pub fn blackhole_resume_via_rd_numb(
             // points, so the pinned slot — not the stale local — is the live
             // value from here on.
             let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
-            let Some(mut caller_bh) = next.map(|b| *b) else {
+            let Some(mut caller_bh) = next else {
                 let err =
                     exit_frame_exception_ref(exc_value, "blackhole exception propagation", || {
                         format!(
@@ -3267,7 +3267,7 @@ pub fn blackhole_resume_via_rd_numb(
         use majit_metainterp::blackhole::BhReturnType;
         let rt = bh.return_type;
         let next = bh.nextblackholeinterp.take();
-        let caller = next.map(|b| *b);
+        let caller = next;
         if caller.is_none() {
             // blackhole.py _done_with_this_frame
             let result = match rt {

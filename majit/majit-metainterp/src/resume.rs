@@ -7904,7 +7904,7 @@ pub fn blackhole_from_resumedata<'a>(
     // the already-forced virtualizable alone.
     all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
     allocator: &'a dyn BlackholeAllocator,
-) -> (BlackholeInterpreter, i64) {
+) -> (Box<BlackholeInterpreter>, i64) {
     // resume.py:1315-1327 The initialization is stack-critical code: it
     // must not be interrupted by StackOverflow, otherwise the
     // jit_virtual_refs are left in a dangling state.
@@ -7975,8 +7975,8 @@ pub fn blackhole_from_resumedata<'a>(
         // `setposition` sized this frame's register files; root the ref
         // bank before filling it so a materialization collection during
         // `consume_one_section` forwards the refs already written here (the
-        // Vec buffer is stable — `setarg_r` only indexes — and survives the
-        // move into the chained `Box`).
+        // Vec buffer is stable — `setarg_r` only indexes — and the frame
+        // itself is already boxed, so chaining it moves a pointer).
         unsafe {
             majit_gc::shadow_stack::push_resume_ref_roots(&mut nextbh.registers_r);
         }
@@ -7987,7 +7987,7 @@ pub fn blackhole_from_resumedata<'a>(
         // resume.py:1342
         nextbh.handle_rvmprof_enter();
 
-        curbh = Some(Box::new(nextbh));
+        curbh = Some(nextbh);
     }
 
     // Read the (possibly forwarded) virtualizable pointer back from the rooted
@@ -7996,7 +7996,7 @@ pub fn blackhole_from_resumedata<'a>(
     let virtualizable_ptr = resumereader.virtualizable_ptr;
 
     let curbh = curbh.expect("blackhole_from_resumedata: resume data contains no frame");
-    (*curbh, virtualizable_ptr)
+    (curbh, virtualizable_ptr)
 }
 
 /// resume.py force_from_resumedata

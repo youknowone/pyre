@@ -6493,7 +6493,7 @@ impl<S: JitState> JitDriver<S> {
                     // whenever `virtualizable_info` is non-null.
                     let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
                     {
-                        let mut current = Some(&mut bh);
+                        let mut current = Some(&mut *bh);
                         while let Some(frame) = current {
                             frame.state_field_layout = sf_layout.clone();
                             if !seed_vinfo_ptr.is_null() {
@@ -6554,7 +6554,7 @@ impl<S: JitState> JitDriver<S> {
                                     // Layout + vinfo were seeded across the
                                     // whole chain before the loop started.
                                     bh_builder.release_interp(bh);
-                                    bh = *caller;
+                                    bh = caller;
                                     cur_exc = next_exc;
                                 }
                                 // The bottommost frame always raises
