@@ -3843,9 +3843,19 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // latter, exactly like RPython `_do_getarrayitem_gc_any(arraydescr)`;
     // seeding under the arraylen descriptor makes the later getitem miss and
     // manufactures a Box without its recording-time `.value`.
-    let Some(wrapper_args_descr_index) = wrapper_args_item_descr_index(body.code) else {
-        builtin_inline_decline!("wrapper args item descriptor unresolved", fnaddr);
-        return Ok(None);
+    //
+    // A zero-argument gateway reads no element out of the slice, so its body
+    // holds no `getarrayitem_gc_r` to name the item descriptor and the seeding
+    // loop below has nothing to seed.  Require the descriptor only when an
+    // element is actually published.
+    let wrapper_item_count = usize::from(receiver.is_some()) + (r_args.len() - 2);
+    let wrapper_args_descr_index = match wrapper_args_item_descr_index(body.code) {
+        Some(index) => Some(index),
+        None if wrapper_item_count == 0 => None,
+        None => {
+            builtin_inline_decline!("wrapper args item descriptor unresolved", fnaddr);
+            return Ok(None);
+        }
     };
 
     let mut callable_guard_op = r_args[0];
@@ -3929,8 +3939,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             &[args_array, index, item],
             array_descr.clone(),
         );
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, wrapper_args_descr_index, item);
+        if let Some(wrapper_args_descr_index) = wrapper_args_descr_index {
+            ctx.trace_ctx
+                .heapcache_setarrayitem(args_array, index, wrapper_args_descr_index, item);
+        }
     }
 
     if !nested_helper && sym.owns_virtualizable_shadow() {

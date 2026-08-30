@@ -17210,6 +17210,20 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 /// so a non-escaping exception virtualizes and DCEs (no per-raise
 /// `CallMallocNursery`).  Declines (`None` → generic residual) when the EC
 /// cannot be recovered or the operand shape does not match (SAFE).
+///
+/// "No intervening read" is a precondition this lowering cannot check, and
+/// there is a second way to spell the same word: `ec_sys_exc_value_descr` is a
+/// hand-minted `EC_DESCR_GROUP` field, while a translated body that reaches
+/// `ExecutionContext::sys_exc_info` reads the slot through the LLBC layout
+/// descr (`executioncontext::ExecutionContext.sys_exc_value`).  The heap
+/// optimizer keys its field cache on `descr_identity`, which is the `Arc`
+/// pointer, so those two Arcs do not alias: a read through the translated
+/// descr does NOT force the store pending under this one, the pair is
+/// eliminated, and the read answers with the pre-handler slot.  Inlining a
+/// builtin whose body reaches `get_sys_exception` therefore returns `None`
+/// inside an `except` block (measured: `sys.exception()` counted 1840 of
+/// 30000).  Until the two identities are one Arc, an inlined builtin body must
+/// not reach that field.
 pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
