@@ -3224,6 +3224,62 @@ impl Default for ResumeDataVirtualAdder {
     }
 }
 
+thread_local! {
+    /// Every `ResumeDataLoopMemo` an in-flight `Optimizer` still owns.
+    ///
+    /// `resume.py finish` does `storage.rd_consts = self.memo.consts`, so each
+    /// guard is handed the memo's own list and one GC object roots the pool for
+    /// the whole optimizer. Pyre copies the pool into a per-guard
+    /// [`majit_ir::SharedConstPool`], which `MetaInterp::walk_rd_consts_refs`
+    /// only reaches once the guard is attached to a compiled trace; until then
+    /// the memo's live `consts` — and the raw-address keys of its `refs` cache
+    /// — name nothing the collector forwards. One optimizer now emits every
+    /// guard through one memo (`optimizer.py Optimizer.__init__`), so that
+    /// window spans a whole trace optimization and can contain a collection.
+    /// Registering the handle here is the missing root for exactly that window.
+    ///
+    /// `Weak`, so a dropped `Optimizer` needs no unregister hook; the walk
+    /// drops the entries that no longer upgrade.
+    static LIVE_RESUME_MEMOS: std::cell::RefCell<
+        Vec<std::rc::Weak<std::cell::RefCell<ResumeDataLoopMemo>>>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Publish `memo` to [`walk_live_memo_const_refs`] for as long as some
+/// `Optimizer` holds it. Called from `Optimizer::new`, the one place that mints
+/// the handle `optimizer.py:732 self.resumedata_memo` stands for.
+pub fn register_live_memo(memo: &std::rc::Rc<std::cell::RefCell<ResumeDataLoopMemo>>) {
+    LIVE_RESUME_MEMOS.with(|memos| {
+        let mut memos = memos.borrow_mut();
+        memos.retain(|weak| weak.strong_count() > 0);
+        memos.push(std::rc::Rc::downgrade(memo));
+    });
+}
+
+/// `framework.py root_walker.walk_roots` hook for the constant pools of the
+/// memos an in-flight optimizer owns. Drops the handles that no longer upgrade
+/// on the way through.
+pub fn walk_live_memo_const_refs(visitor: &mut dyn FnMut(&mut GcRef)) {
+    LIVE_RESUME_MEMOS.with(|memos| {
+        let mut memos = memos.borrow_mut();
+        memos.retain(|weak| {
+            let Some(memo) = weak.upgrade() else {
+                return false;
+            };
+            // SAFETY: pyre is single-threaded and this walker runs from the
+            // allocation path, so the only other code that could hold the
+            // `RefCell` is the optimizer frame this walk interrupted. Going
+            // through `as_ptr` rather than `borrow_mut` is what lets the
+            // collector forward a pool the interrupted frame is mid-way
+            // through appending to — the same escape hatch
+            // `SharedConstPool::as_mut_vec_for_gc` exists for.
+            let memo = unsafe { &mut *memo.as_ptr() };
+            memo.walk_const_ptr_refs_mut(visitor);
+            true
+        });
+    });
+}
+
 /// Shared resume data storage that deduplicates common snapshot sections
 /// across multiple guards in the same trace.
 ///
@@ -3318,6 +3374,43 @@ impl ResumeDataLoopMemo {
     /// signed field; RPython lets `tag`'s exception out of `getconst` the same
     /// way, up to `optimizer.py`'s `except resume.TagOverflow: raise
     /// compile.giveup()`.
+    /// Forward every `Const::Ref` the pool holds, then re-key the `refs`
+    /// cache from the forwarded pool.
+    ///
+    /// `resume.py ResumeDataLoopMemo.__init__` keys `self.refs` with
+    /// `new_ref_dict()`, whose hash is the object's identity hash and therefore
+    /// survives a move. Pyre keys the same cache by the raw address, so a
+    /// collection between two guards of one optimizer leaves every key naming
+    /// the pre-move address: `getconst_ref` would answer a later guard with a
+    /// tag whose pool slot now holds a different object. Rebuilding the keys
+    /// here is what makes the raw-address encoding equivalent to the identity
+    /// dict.
+    ///
+    /// `large_ints` needs no such pass — an integer key does not move.
+    pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        for c in self.consts.iter_mut() {
+            if let majit_ir::Const::Ref(slot) = c {
+                visitor(slot);
+            }
+        }
+        if self.refs.is_empty() {
+            return;
+        }
+        // `_newconst` mints `tag(len(consts) + TAG_CONST_OFFSET, TAGCONST)`
+        // before pushing, so the tag names the pool slot that holds this
+        // entry's forwarded address. Rebuild in iteration order: `refs` is a
+        // dict upstream and the numbering reads it as one.
+        let mut rebuilt: IndexMap<i64, i16> = IndexMap::with_capacity(self.refs.len());
+        for (_, &tagged) in self.refs.iter() {
+            let (num, _) = untag(tagged);
+            let idx = (num - TAG_CONST_OFFSET) as usize;
+            if let Some(majit_ir::Const::Ref(gcref)) = self.consts.get(idx) {
+                rebuilt.insert(gcref.0 as i64, tagged);
+            }
+        }
+        self.refs = rebuilt;
+    }
+
     pub fn getconst(&mut self, val: i64, tp: majit_ir::Type) -> Result<i16, TagOverflow> {
         match tp {
             majit_ir::Type::Int => self.getconst_int(val),
@@ -4734,6 +4827,42 @@ pub fn decode_box(
 
 #[cfg(test)]
 mod tests {
+    /// A collection between two guards of one optimizer moves a `ConstPtr`
+    /// the memo already pooled. The walk must forward the pool entry and
+    /// re-key `refs`, so the next guard's `getconst_ref` answers the moved
+    /// address with the tag that already names it — and answers the vacated
+    /// address with a fresh one.
+    #[test]
+    fn walking_the_memo_forwards_its_ref_consts_and_rekeys_the_cache() {
+        let mut memo = super::ResumeDataLoopMemo::new();
+        let before = 0x1000i64;
+        let after = 0x2000i64;
+        let tagged = memo.getconst_ref(before).expect("pool the ref const");
+        assert_eq!(
+            memo.getconst_ref(before).unwrap(),
+            tagged,
+            "cached before the move"
+        );
+
+        memo.walk_const_ptr_refs_mut(&mut |slot: &mut majit_ir::GcRef| {
+            if slot.0 as i64 == before {
+                *slot = majit_ir::GcRef(after as usize);
+            }
+        });
+
+        assert_eq!(
+            memo.getconst_ref(after).unwrap(),
+            tagged,
+            "the moved object keeps the tag its pool slot already holds"
+        );
+        let vacated = memo.getconst_ref(before).unwrap();
+        assert_ne!(
+            vacated, tagged,
+            "the pre-move address names nothing; a later object there must not \
+             inherit the moved object's pool slot"
+        );
+    }
+
     use super::*;
     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
 

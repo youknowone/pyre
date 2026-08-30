@@ -2609,6 +2609,13 @@ impl<M: Clone> MetaInterp<M> {
                 builder.walk_const_ptr_refs_mut(&mut visitor);
             }
         }
+        // `resume.py finish` hands each guard `self.memo.consts` itself, so
+        // upstream roots the pool through the optimizer that owns it. Pyre
+        // copies the pool per guard, and a guard's copy is only reachable from
+        // `compiled_loops` once its trace is attached; the memo's own pool and
+        // its address-keyed `refs` cache need this separate root for the window
+        // an `Optimizer` holds them.
+        crate::resume::walk_live_memo_const_refs(&mut visitor);
     }
 
     /// framework.py `root_walker.walk_roots` hook for the stashed

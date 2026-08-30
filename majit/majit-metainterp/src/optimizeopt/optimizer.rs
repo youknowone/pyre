@@ -1526,9 +1526,17 @@ impl Optimizer {
             string_content_resolver: None,
             string_constant_alloc: None,
             callinfocollection: None,
-            resumedata_memo: std::rc::Rc::new(std::cell::RefCell::new(
-                crate::resume::ResumeDataLoopMemo::new(),
-            )),
+            resumedata_memo: {
+                // `optimizer.py:732` owns the memo for the whole trace
+                // optimization, so its constant pool outlives any single
+                // guard and a collection can land between two of them.
+                // Publish it to the root walker for that window.
+                let memo = std::rc::Rc::new(std::cell::RefCell::new(
+                    crate::resume::ResumeDataLoopMemo::new(),
+                ));
+                crate::resume::register_live_memo(&memo);
+                memo
+            },
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
