@@ -5599,10 +5599,23 @@ fn run_perfn_walk<Sym: WalkSym>(
     // SAME complete-image allow-list as the adoption leg above; otherwise a
     // `DoneWithThisFrame` result is discarded and interpreter replay resumes
     // one opcode past RETURN_VALUE.
-    let blackhole_terminal_no_replay = matches!(
+    // A successful segment cut is the one adopting leg that arrives as `Ok`
+    // (`create_segmented_trace` returns `DispatchOutcome::SegmentTrace`); the
+    // `Err` half of that pair, `SegmentTraceSnapshotUnavailable`, is already in
+    // `leaves_complete_image`.  Its blackhole ends on `DoneWithThisFrame*`
+    // whenever the cut lands in a frame that then runs to its RETURN_VALUE, and
+    // resetting that concrete below drops the frame's result: the caller adopts
+    // a resume pc instead and the call evaluates to `None`.
+    let blackhole_terminal_no_replay = (matches!(
         &walk_result,
         Err(error) if blackhole_terminal_error(error)
-    ) && WALK_END_FLUSH_COMMITTED.with(|slot| slot.get())
+    ) || matches!(
+        &walk_result,
+        Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. },
+            _
+        ))
+    )) && WALK_END_FLUSH_COMMITTED.with(|slot| slot.get())
         && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some();
     if !terminate_no_replay && !blackhole_terminal_no_replay {
         crate::jitcode_dispatch::fbw_finish_concrete_reset();
