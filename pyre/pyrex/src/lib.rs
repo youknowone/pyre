@@ -715,6 +715,18 @@ fn configure_root_only_jit_stats() {
         // can concurrently read or mutate the process environment.
         unsafe { std::env::set_var("PYRE_MAJIT_STATS_ANCESTOR", "1") };
     }
+    if !print_here {
+        // `majit_trace::Logger` prints its own `=== JIT Statistics ===` block
+        // from `Drop`, and it reads the environment rather than this policy.
+        // Clearing what turns it on is how the policy reaches it: a descendant
+        // then writes nothing of pyre's own to stderr, which is what
+        // `test_large_pool` asserts of the script it runs through
+        // `assert_python_ok`.
+        unsafe {
+            std::env::remove_var("MAJIT_STATS");
+            std::env::remove_var("MAJIT_LOG");
+        }
+    }
 }
 
 /// Diagnostics that have to read the descr universe *after* it has finished
@@ -2402,7 +2414,7 @@ fn report_or_end_on_main_error(
 
 enum MainProgram<'a> {
     Source(Box<dyn FnOnce() -> String + 'a>, Mode),
-    Bytecode(pyre_object::PyObjectRef),
+    Bytecode(Box<dyn FnOnce() -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> + 'a>),
 }
 
 fn eval_program_in_main(
@@ -2494,7 +2506,15 @@ fn eval_program_in_main(
     // replaced, and the failure still finalizes on its way out.
     let mut source = None;
     let frame = match program {
-        MainProgram::Bytecode(code) => {
+        MainProgram::Bytecode(load_bytecode) => {
+            let code = match load_bytecode() {
+                Ok(code) => code,
+                Err(error) => {
+                    let inspect = prompt_requested(run_code);
+                    report_or_end_on_main_error(error, inspect, canonical, ec_ptr);
+                    return finish_or_inspect(inspect, session_context, canonical, main_module);
+                }
+            };
             PyFrame::new_with_context_and_globals_obj(code, execution_context, canonical)
         }
         MainProgram::Source(read_source, mode) => {
@@ -2591,6 +2611,28 @@ fn eval_program_in_main(
     finish_or_inspect(inspect, session_context, canonical, main_module)
 }
 
+/// Report a script that could not be opened and end the run.
+///
+/// `pymain_run_file_obj` writes `"%S: can't open file %R: [Errno %d] %s"` --
+/// the path's `repr`, then the C `errno` and `strerror` for the failure rather
+/// than the message the error itself displays, which on Windows names the
+/// Win32 failure in the language the OS is localised to.  It answers
+/// `EXIT_STATUS_ERROR`, which is 2 -- the status a shell reads as "the program
+/// was never run", distinct from the 1 a program that ran and failed exits
+/// with.
+fn end_on_unopenable_script(
+    binary_name: &str,
+    path: &str,
+    error: &std::io::Error,
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+) -> ! {
+    let path = pyre_interpreter::display::format_wtf8_repr(rustpython_wtf8::Wtf8::new(path));
+    let (errno, strerror) = pyre_interpreter::PyError::io_errno_strerror(error);
+    eprintln!("{binary_name}: can't open file {path}: [Errno {errno}] {strerror}");
+    end_after_startup_failure(canonical, ec_ptr, 2);
+}
+
 fn read_script_source(
     path: &str,
     binary_name: &str,
@@ -2613,14 +2655,7 @@ fn read_script_source(
                 end_after_startup_failure(canonical, ec_ptr, 1);
             }
         },
-        // `pymain_run_file` reports an unopenable script with
-        // `EXIT_STATUS_ERROR`, which is 2 -- the status a shell reads as "the
-        // program was never run", distinct from the 1 a program that ran and
-        // failed exits with.
-        Err(e) => {
-            eprintln!("{binary_name}: cannot open '{path}': {e}");
-            end_after_startup_failure(canonical, ec_ptr, 2);
-        }
+        Err(e) => end_on_unopenable_script(binary_name, path, &e, canonical, ec_ptr),
     }
 }
 
@@ -2685,27 +2720,21 @@ fn run_script_path(
             let main_file = absolute_script_path(filename);
             let filename = main_file.as_deref().unwrap_or(filename);
             let program = if script_path_is_pyc(filename) {
-                let bytes = match importing::read_source_bytes(Path::new(filename)) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        eprintln!("{binary_name}: cannot open '{filename}': {e}");
-                        end_after_startup_failure(canonical, ec_ptr, 2);
-                    }
-                };
-                let code = match importing::load_pyc_script(&bytes) {
-                    Ok(code) => code,
-                    Err(e) => {
-                        let inspect = prompt_requested(run_code);
-                        report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
-                        return finish_or_inspect(
-                            inspect,
-                            execution_context,
-                            canonical,
-                            main_module,
-                        );
-                    }
-                };
-                MainProgram::Bytecode(code)
+                // Deferred for the reason the source read below is, and for one
+                // more that is this arm's alone: the unmarshalled code object is
+                // a GC object living in a Rust local, and `import_site` runs
+                // Python between here and the frame that roots it.  A collection
+                // in that window reclaims the code, and the module the script
+                // then builds carries references into freed storage.
+                MainProgram::Bytecode(Box::new(move || {
+                    let bytes = match importing::read_source_bytes(Path::new(filename)) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            end_on_unopenable_script(binary_name, filename, &e, canonical, ec_ptr)
+                        }
+                    };
+                    importing::load_pyc_script(&bytes)
+                }))
             } else {
                 MainProgram::Source(
                     // The resolved path rather than the argv spelling: the read is

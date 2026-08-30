@@ -182,11 +182,6 @@ pub(crate) struct LatchedMultiFrameBlackhole {
     pub(crate) last_exc_value: i64,
     pub(crate) raising_exception: bool,
     pub(crate) mirror_stack: Option<MirrorStackImage>,
-    /// `ABORT_TOO_LONG` stops at an arbitrary post-step coordinate, so frame
-    /// 0's active operand stack must cross from the detached tracing snapshot
-    /// to the live red frame before the blackhole runs.  The vable-force path
-    /// stops at a call resume marker and retains its existing handoff.
-    pub(crate) publish_root_stack: bool,
     /// Which latch published this image — see the single-frame counterpart.
     pub(crate) origin: &'static str,
 }
@@ -585,7 +580,6 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
                 framestack,
                 last_exc_value,
                 raising_exception: false,
-                publish_root_stack: true,
                 // `ctx` is the innermost callee, so its ordinary vstack mirror
                 // names the wrong frame.  Reconstruct frame 0 from the paused
                 // caller image captured at the outermost inline push, exactly
@@ -4334,7 +4328,6 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                             framestack,
                             last_exc_value,
                             raising_exception,
-                            publish_root_stack: true,
                             mirror_stack: capture_root_parent_resume_stack(ctx),
                             origin: "escape-flush",
                         });

@@ -1132,6 +1132,16 @@ impl PyError {
         }
     }
 
+    /// The `errno` and `strerror` a failed `std::io` call reports as, the pair
+    /// `pymain_run_file_obj` names an unopenable script with.  The error's own
+    /// `Display` gives the Win32 failure in the language the OS is localised
+    /// to; `strerror` answers from the C runtime's table instead, so the text
+    /// is the same on every host.
+    pub fn io_errno_strerror(e: &std::io::Error) -> (i32, String) {
+        let errno = crate::builtins::io_error_posix_errno(e, 0);
+        (errno, Self::clean_strerror(errno))
+    }
+
     /// `error.py:_wrap_oserror2` — build the OSError a failed syscall raises:
     /// `args = (errno, strerror)`, the errno-specific subclass (`ERRNO_MAP`),
     /// the clean strerror, and the `.errno` / `.strerror` / `.filename` slots.

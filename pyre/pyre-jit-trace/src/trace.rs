@@ -3558,38 +3558,29 @@ fn try_adopt_multi_frame_blackhole(
         restore_links(&saved_links);
         return false;
     };
-    let mut root_stack = if latched.publish_root_stack {
-        // Same split as the single-frame arm: `WalkAbort` and `VableEscape`
-        // stop INSIDE an opcode, and for a root walk the snapshot array was
-        // never written there — it still holds the pre-walk stack (see
-        // `capture_frame_stack_from_mirror`).  Both multi-frame latches
-        // reconstruct frame 0 from the paused caller image
-        // (`capture_root_parent_resume_stack`) because their `ctx` is the
-        // innermost callee; a latch that could not build one leaves no mirror
-        // here, which declines the adopt and keeps the legacy replay.
-        // `ABORT_TOO_LONG` stops at an opcode boundary, where the snapshot
-        // array is the image RPython would copy.
-        let captured = if commit_leg == WalkEndCommitLeg::WalkAbort
-            || commit_leg == WalkEndCommitLeg::VableEscape
-        {
-            latched.mirror_stack.as_ref().and_then(|mirror| {
-                crate::state::capture_frame_stack_from_mirror(
-                    root_addr,
-                    mirror.py_pc,
-                    &mirror.slots,
-                )
-            })
-        } else {
-            crate::state::capture_frame_stack_for_publish(cf_addr, root_addr)
-        };
-        let Some(stack) = captured else {
-            mfdbg!("frame 0: active stack not capturable (leg={commit_leg:?})");
-            restore_links(&saved_links);
-            return false;
-        };
-        Some(stack)
+    // Same split as the single-frame arm: `WalkAbort` and `VableEscape`
+    // stop INSIDE an opcode, and for a root walk the snapshot array was
+    // never written there — it still holds the pre-walk stack (see
+    // `capture_frame_stack_from_mirror`).  Both multi-frame latches
+    // reconstruct frame 0 from the paused caller image
+    // (`capture_root_parent_resume_stack`) because their `ctx` is the
+    // innermost callee; a latch that could not build one leaves no mirror
+    // here, which declines the adopt and keeps the legacy replay.
+    // `ABORT_TOO_LONG` stops at an opcode boundary, where the snapshot
+    // array is the image RPython would copy.
+    let captured = if commit_leg == WalkEndCommitLeg::WalkAbort
+        || commit_leg == WalkEndCommitLeg::VableEscape
+    {
+        latched.mirror_stack.as_ref().and_then(|mirror| {
+            crate::state::capture_frame_stack_from_mirror(root_addr, mirror.py_pc, &mirror.slots)
+        })
     } else {
-        None
+        crate::state::capture_frame_stack_for_publish(cf_addr, root_addr)
+    };
+    let Some(mut root_stack) = captured else {
+        mfdbg!("frame 0: active stack not capturable (leg={commit_leg:?})");
+        restore_links(&saved_links);
+        return false;
     };
     // Taking the latch removes it from the TLS extra-root walker.  Root every
     // MIFrame Ref bank and the pending exception across root-locals boxing,
@@ -3625,9 +3616,7 @@ fn try_adopt_multi_frame_blackhole(
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(image_ref_roots.as_mut_slice());
         majit_gc::shadow_stack::push_resume_ref_roots(locals_undo.as_mut_slice());
-        if let Some(stack) = root_stack.as_mut() {
-            majit_gc::shadow_stack::push_resume_ref_roots(stack.roots_mut());
-        }
+        majit_gc::shadow_stack::push_resume_ref_roots(root_stack.roots_mut());
     }
     if !crate::state::write_back_outer_locals(ctx, root_addr) {
         crate::state::restore_frame_locals(root_addr, &locals_undo);
@@ -3643,9 +3632,7 @@ fn try_adopt_multi_frame_blackhole(
     if let Some(index) = image_exception_root {
         latched.last_exc_value = image_ref_roots[index];
     }
-    if let Some(stack) = root_stack.as_ref()
-        && !crate::state::publish_captured_frame_stack(root_addr, stack)
-    {
+    if !crate::state::publish_captured_frame_stack(root_addr, &root_stack) {
         crate::state::restore_frame_locals(root_addr, &locals_undo);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
         restore_links(&saved_links);
