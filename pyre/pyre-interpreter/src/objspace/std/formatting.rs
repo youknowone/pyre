@@ -381,7 +381,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     let mut saw_specifier = false;
 
     let mut parts = format.into_iter().peekable();
-    while let Some((idx, part)) = parts.next() {
+    while let Some((_, part)) = parts.next() {
         match part {
             CFormatPart::Literal(literal) => result.push_wtf8(&literal),
             CFormatPart::Spec(CFormatSpecKeyed {
@@ -437,7 +437,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                 if let Some(error) = current_deferred.and_then(DeferredPercentError::unsupported) {
                     return Err(PyError::value_error(error.to_string()));
                 }
-                result.push_wtf8(&spec_format_string(&spec, value, idx)?);
+                result.push_wtf8(&spec_format_string(&spec, value)?);
             }
         }
     }
@@ -759,34 +759,33 @@ fn check_min_field_width(spec: &CFormatSpec) -> Result<(), PyError> {
 unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
     check_min_field_width(spec)?;
     match &spec.format_type {
-        CFormatType::String(conversion) => match conversion {
-            CFormatConversion::Repr | CFormatConversion::Ascii => {
-                Ok(spec.format_bytes(crate::builtins::py_ascii(obj)?.as_bytes()))
+        CFormatType::String(CFormatConversion::Repr | CFormatConversion::Ascii) => {
+            Ok(spec.format_bytes(crate::builtins::py_ascii(obj)?.as_bytes()))
+        }
+        // `format_obj` reads `%b` and `%s` as the same conversion for bytes.
+        CFormatType::Bytes | CFormatType::String(CFormatConversion::Str) => {
+            if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
+                return Ok(spec.format_bytes(pyre_object::bytesobject::bytes_like_data(src)));
             }
-            CFormatConversion::Str | CFormatConversion::Bytes => {
-                if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
-                    return Ok(spec.format_bytes(pyre_object::bytesobject::bytes_like_data(src)));
-                }
-                let Some(method) = crate::baseobjspace::lookup(obj, "__bytes__") else {
-                    return Err(PyError::type_error(format!(
-                        "%b requires a bytes-like object, or an object that implements __bytes__, not '{}'",
-                        crate::baseobjspace::object_functionstr_type_name(obj)
-                    )));
-                };
-                // bytesobject.py `invoke_bytes_method`:
-                // `space.get_and_call_function(w_bytes_method, w_source)`.
-                let w_type = crate::typedef::r#type(obj)
-                    .map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
-                let bytes = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])?;
-                if !pyre_object::is_bytes(bytes) {
-                    return Err(PyError::type_error(format!(
-                        "__bytes__ returned non-bytes (type {})",
-                        crate::baseobjspace::object_functionstr_type_name(bytes)
-                    )));
-                }
-                Ok(spec.format_bytes(pyre_object::bytesobject::bytes_like_data(bytes)))
+            let Some(method) = crate::baseobjspace::lookup(obj, "__bytes__") else {
+                return Err(PyError::type_error(format!(
+                    "%b requires a bytes-like object, or an object that implements __bytes__, not '{}'",
+                    crate::baseobjspace::object_functionstr_type_name(obj)
+                )));
+            };
+            // bytesobject.py `invoke_bytes_method`:
+            // `space.get_and_call_function(w_bytes_method, w_source)`.
+            let w_type =
+                crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
+            let bytes = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])?;
+            if !pyre_object::is_bytes(bytes) {
+                return Err(PyError::type_error(format!(
+                    "__bytes__ returned non-bytes (type {})",
+                    crate::baseobjspace::object_functionstr_type_name(bytes)
+                )));
             }
-        },
+            Ok(spec.format_bytes(pyre_object::bytesobject::bytes_like_data(bytes)))
+        }
         CFormatType::Number(number_type) => {
             let value = match number_type {
                 CNumberType::DecimalD | CNumberType::DecimalI | CNumberType::DecimalU => {
@@ -868,11 +867,7 @@ unsafe fn has_getitem(obj: PyObjectRef) -> bool {
 /// Apply a parsed spec to one argument, producing the formatted fragment.
 /// `formatting.py fmt_s / fmt_d / fmt_f / ...` — the per-conversion value
 /// coercion and formatting.
-unsafe fn spec_format_string(
-    spec: &CFormatSpec,
-    obj: PyObjectRef,
-    idx: usize,
-) -> Result<Wtf8Buf, PyError> {
+unsafe fn spec_format_string(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Wtf8Buf, PyError> {
     check_min_field_width(spec)?;
     match &spec.format_type {
         CFormatType::String(conversion) => {
@@ -880,18 +875,13 @@ unsafe fn spec_format_string(
                 CFormatConversion::Str => crate::py_str_wtf8(obj)?,
                 CFormatConversion::Repr => crate::py_repr_wtf8(obj)?,
                 CFormatConversion::Ascii => Wtf8Buf::from_string(crate::builtins::py_ascii(obj)?),
-                // `%b` is a bytes-only conversion; the unicode formatter
-                // rejects it (`fmt_b` → `unknown_fmtchar`). `idx` is the
-                // position of the `%`, the message reports the `b`.
-                CFormatConversion::Bytes => {
-                    return Err(PyError::value_error(format!(
-                        "unsupported format character 'b' (0x62) at index {}",
-                        idx + 1
-                    )));
-                }
             };
             Ok(spec.format_string(result))
         }
+        // `%b` is a bytes-only conversion; a `CFormatContext::Str` parse
+        // rejects the `b` as an unsupported format character, so the unicode
+        // formatter never sees a spec carrying it.
+        CFormatType::Bytes => unreachable!("`%b` does not parse in a str format string"),
         CFormatType::Number(number_type) => {
             let value = match number_type {
                 CNumberType::DecimalD | CNumberType::DecimalI | CNumberType::DecimalU => {

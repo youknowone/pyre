@@ -2919,6 +2919,12 @@ fn format_spec_err(
         )),
         E::UnableToConvert => crate::PyError::value_error("Unable to convert int to float"),
         E::CodeNotInRange => crate::PyError::overflow_error("%c arg not in range(0x110000)"),
+        // A `c` code is read through `PyLong_AsLong`, so a value outside the C
+        // long range is reported as that conversion failing rather than as the
+        // code point range check.
+        E::IntTooLargeForCLong => {
+            crate::PyError::overflow_error("Python int too large to convert to C long")
+        }
         E::ZeroPadding => {
             crate::PyError::value_error("Zero padding is not allowed in complex format specifier")
         }
