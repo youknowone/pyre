@@ -9261,11 +9261,37 @@ impl GeneratorResumeVerdict {
 /// them.  An entry written for an actual `try` around the body either omits
 /// `lasti` at depth zero or carries a non-zero unwind depth — the same
 /// discriminator `code_yields_inside_try` reads.
-fn generator_table_is_only_the_stopiteration_wrapper(
-    code: &pyre_interpreter::CodeObject,
-) -> bool {
+fn generator_table_is_only_the_stopiteration_wrapper(code: &pyre_interpreter::CodeObject) -> bool {
     pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
         .all(|entry| entry.depth == 0 && entry.lasti)
+}
+
+/// What the census reports about one `FOR_ITER` over a generator.
+pub(crate) struct GeneratorResumeCensus {
+    verdict: GeneratorResumeVerdict,
+    /// `last_instr + 1`, the coordinate a resume walk would enter at.
+    resume_py_pc: usize,
+    /// The JitCode byte offset that coordinate resolves to, once it does.
+    marker_offset: Option<usize>,
+    /// Whether the body's jitcode carries a `jit_merge_point`.  This is the
+    /// one gate a resume cannot simply refuse: a `while` generator's own loop
+    /// header sits between the resume and the yield, and upstream crosses it
+    /// exactly once because `should_unroll_one_iteration` answers True for a
+    /// generator code object.  Counting the bodies that have one prices that
+    /// hook against the ones a straight-line resume would already serve.
+    owns_loop_header: bool,
+    /// `n_py_instrs`, so a `NoResumeEntry` naming an out-of-range coordinate is
+    /// distinguishable from one whose tables simply do not resolve it.
+    n_py_instrs: usize,
+    /// `(py_exact_by_jit_pc.len(), block_head_py_by_jit_pc.len())` — an empty
+    /// pair means skeleton metadata, not an unresolvable coordinate.
+    tables: (usize, usize),
+    /// The `abort_permanent` offset the yield itself lowered to.  It is the
+    /// coordinate a resume walk would stop at, and its presence is what says
+    /// the marker the yield bakes is reachable from the resume side.
+    yield_marker_offset: Option<usize>,
+    /// `(ops, merge_points, residual_calls)` between the two coordinates.
+    ops_to_yield: (usize, usize, usize),
 }
 
 /// Decide whether a `FOR_ITER` over `iter_obj` names a generator resume the
@@ -9273,42 +9299,160 @@ fn generator_table_is_only_the_stopiteration_wrapper(
 ///
 /// This is the admission half of the route, split out so the corpus census
 /// can ask the question without emitting anything.
-fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResumeVerdict {
+fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResumeCensus {
     use GeneratorResumeVerdict as V;
-    let Some(shape) = (unsafe { pyre_interpreter::baseobjspace::generator_resume_fast_path(iter_obj) })
+    let mut census = GeneratorResumeCensus {
+        verdict: V::NotResumable,
+        resume_py_pc: usize::MAX,
+        marker_offset: None,
+        owns_loop_header: false,
+        n_py_instrs: 0,
+        tables: (0, 0),
+        yield_marker_offset: None,
+        ops_to_yield: (0, 0, 0),
+    };
+    macro_rules! decline {
+        ($v:expr) => {{
+            census.verdict = $v;
+            return census;
+        }};
+    }
+    let Some(shape) =
+        (unsafe { pyre_interpreter::baseobjspace::generator_resume_fast_path(iter_obj) })
     else {
-        return V::NotResumable;
+        decline!(V::NotResumable)
     };
-    let raw = unsafe { pyre_interpreter::w_code_get_ptr(shape.w_pycode) }
-        as *const pyre_interpreter::CodeObject;
-    if raw.is_null() {
-        return V::NoJitcode;
-    }
-    let code = unsafe { &*raw };
-    if pyre_interpreter::baseobjspace::should_not_inline(code) {
-        return V::SeveralYields;
-    }
-    if !code.cellvars.is_empty() || !code.freevars.is_empty() {
-        return V::CellsOrFreevars;
-    }
-    if !generator_table_is_only_the_stopiteration_wrapper(code) {
-        return V::RealExceptionTable;
-    }
-    let w_pycode = shape.w_pycode as *const ();
-    let Some(pjc) = crate::state::pyjitcode_for_code(w_pycode) else {
-        return V::NoJitcode;
-    };
-    if crate::state::sub_jitcode_body_for_code(w_pycode).is_none() {
-        return V::NoJitcode;
-    }
     // `execute_frame` documents execution as starting just after `last_instr`,
     // and `resume_execute_frame` returns exactly `last_instr + 1` after
     // pushing the sent value.
-    let resume_py_pc = shape.last_instr as usize + 1;
-    if pjc.merge_entry_for(resume_py_pc).is_none() {
-        return V::NoResumeEntry;
+    census.resume_py_pc = shape.last_instr as usize + 1;
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(shape.w_pycode) }
+        as *const pyre_interpreter::CodeObject;
+    if raw.is_null() {
+        decline!(V::NoJitcode)
     }
-    V::Admissible
+    let code = unsafe { &*raw };
+    if pyre_interpreter::baseobjspace::should_not_inline(code) {
+        decline!(V::SeveralYields)
+    }
+    if !code.cellvars.is_empty() || !code.freevars.is_empty() {
+        decline!(V::CellsOrFreevars)
+    }
+    if !generator_table_is_only_the_stopiteration_wrapper(code) {
+        decline!(V::RealExceptionTable)
+    }
+    let w_pycode = shape.w_pycode as *const ();
+    // `sub_jitcode_body_for_code` first: it is the one that BUILDS the per-fn
+    // jitcode on demand (`jitcode_for`).  Asking `pyjitcode_for_code` ahead of
+    // it reads the store before anything has installed a payload for a code
+    // object nothing has ever inlined — which every generator is — so the
+    // route answered `NoJitcode` for a body that was merely unbuilt.
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_pycode) else {
+        decline!(V::NoJitcode)
+    };
+    let Some(pjc) = crate::state::pyjitcode_for_code(w_pycode) else {
+        decline!(V::NoJitcode)
+    };
+    census.owns_loop_header = callee_body_owns_loop_header(body.code);
+    census.n_py_instrs = pjc.metadata.n_py_instrs as usize;
+    census.tables = (
+        pjc.metadata.py_exact_by_jit_pc.len(),
+        pjc.metadata.block_head_py_by_jit_pc.len(),
+    );
+    census.yield_marker_offset = pjc
+        .metadata
+        .abort_permanent_py_pc_by_jit_pc
+        .iter()
+        .find(|&&(_, py)| py as usize == shape.last_instr as usize)
+        .map(|&(off, _)| off as usize);
+    census.marker_offset = generator_resume_marker_offset(&pjc, census.resume_py_pc);
+    let Some(marker) = census.marker_offset else {
+        decline!(V::NoResumeEntry)
+    };
+    census.ops_to_yield = generator_resume_op_scan(body.code, marker, census.yield_marker_offset);
+    census.verdict = V::Admissible;
+    census
+}
+
+/// Linear op-stream reconnaissance between a resume marker and the yield's
+/// `abort_permanent`, reported as `(ops, merge_points, residual_calls)`.
+///
+/// It answers three questions a resume has to price before any IR is emitted,
+/// and answers them without emitting any: how much body sits between the two
+/// coordinates, whether the walk meets the generator's own `jit_merge_point`
+/// (upstream crosses one exactly once, via `should_unroll_one_iteration`), and
+/// whether it meets a residual call (which would commit an effect the caller's
+/// `FOR_ITER` cannot re-run).
+///
+/// The scan is linear over the byte stream rather than a control-flow walk, so
+/// it OVERCOUNTS a body whose blocks are drained out of source order.  That is
+/// the safe direction for a feasibility read: it can say "this is bigger than
+/// it looks", never "this is smaller".
+fn generator_resume_op_scan(
+    body_code: &[u8],
+    marker: usize,
+    yield_marker: Option<usize>,
+) -> (usize, usize, usize) {
+    let end = yield_marker.unwrap_or(body_code.len()).min(body_code.len());
+    let mut pc = marker;
+    let (mut ops, mut merge_points, mut residual_calls) = (0usize, 0usize, 0usize);
+    while pc < end {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            break;
+        };
+        ops += 1;
+        if op.opname == "jit_merge_point" {
+            merge_points += 1;
+        } else if op.opname.starts_with("residual_call") {
+            residual_calls += 1;
+        }
+        if op.next_pc <= pc {
+            break;
+        }
+        pc = op.next_pc;
+    }
+    (ops, merge_points, residual_calls)
+}
+
+/// The JitCode byte offset a walk of this body enters at to resume at
+/// `resume_py_pc`.
+///
+/// `merge_entry_for` cannot answer it: `merge_entry_by_green` is built from
+/// `find_loop_header_pcs` plus function entry, and a generator's resume
+/// coordinate is neither.  Widening THAT table is not the fix — the portal
+/// reads it, so publishing resume coordinates there would start portal traces
+/// that walk straight into the `abort_permanent` the yield bakes.
+///
+/// The shipped per-Python-PC tables already carry what the codewriter's own
+/// `derive_resume_marker` reads.  `py_exact_by_jit_pc` records one entry per
+/// contiguous emission run, so the smallest offset a Python PC owns is that
+/// PC's first emitted op — the `first_op_by_py_pc` value — and
+/// `block_head_py_by_jit_pc` is the table it resolves against.  Rebuilding the
+/// first-op column here and calling the same derivation keeps one definition
+/// of the resolution rather than a second spelling of it.
+fn generator_resume_marker_offset(
+    pjc: &crate::pyjitcode::PyJitCode,
+    resume_py_pc: usize,
+) -> Option<usize> {
+    let metadata = &pjc.metadata;
+    let n_py = metadata.n_py_instrs as usize;
+    if metadata.py_exact_by_jit_pc.is_empty()
+        || metadata.block_head_py_by_jit_pc.is_empty()
+        || resume_py_pc >= n_py
+    {
+        return None;
+    }
+    let mut first_op_by_py_pc = vec![usize::MAX; n_py];
+    for &(off, py) in &metadata.py_exact_by_jit_pc {
+        if let Some(slot) = first_op_by_py_pc.get_mut(py as usize) {
+            *slot = (*slot).min(off as usize);
+        }
+    }
+    crate::pyjitcode::derive_resume_marker(
+        &first_op_by_py_pc,
+        &metadata.block_head_py_by_jit_pc,
+        resume_py_pc,
+    )
 }
 
 /// `PYRE_GEN_CENSUS=1`: print one line per `FOR_ITER` whose operand is a
@@ -9350,9 +9494,24 @@ pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
     if !unsafe { pyre_object::generator::is_generator(iter_obj) } {
         return Ok(None);
     }
-    let verdict = generator_resume_verdict(iter_obj);
+    let census = generator_resume_verdict(iter_obj);
     if gen_census_enabled() {
-        eprintln!("[gen-census] pc={} {}", op.pc, verdict.label());
+        let (ops, merge_points, residual_calls) = census.ops_to_yield;
+        eprintln!(
+            "[gen-census] pc={} {} resume_py={} n_py={} tables={:?} marker={:?} \
+             yield_marker={:?} loop_header={} ops={} mp={} residual={}",
+            op.pc,
+            census.verdict.label(),
+            census.resume_py_pc as isize,
+            census.n_py_instrs,
+            census.tables,
+            census.marker_offset,
+            census.yield_marker_offset,
+            census.owns_loop_header,
+            ops,
+            merge_points,
+            residual_calls,
+        );
     }
     Ok(None)
 }
