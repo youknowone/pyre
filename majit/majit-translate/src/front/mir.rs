@@ -10793,20 +10793,31 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // Rust spells `&str != &str` through
-                // `core::cmp::impls::<Impl>::ne`; RPython's
-                // `AbstractStringRepr.rtype_ne` lowers the same operation to
-                // `ll_streq` followed by `bool_not`.  The flow graph's string
-                // `BinOp("ne")` is that decomposition's canonical spelling.
-                // Gate both operands on the builtin `str` pointee because the
-                // generic core path is shared by non-string reference impls.
-                // This is the comparison in PyPy's `W_Super.getattribute`
-                // (`name != '__class__').
+                // `&a == &b` / `&a != &b` on two string-family references
+                // (`&Wtf8`, `&str`, `&String`) resolves to the blanket
+                // `impl PartialEq<&B> for &A` (`core::cmp::impls`), whose body
+                // forwards to the pointee's own `eq`.  Both operands already
+                // carry the single `SomeString` value the reference projects
+                // to, so this is the same `BinOp("eq")` / `BinOp("ne")`
+                // (`ll_streq`) the `<str as PartialEq>::eq` arm above emits;
+                // `ne` is the same lowering: `AbstractStringRepr.rtype_ne`
+                // is `ll_streq` followed by `bool_not`, and the flow graph's
+                // string `BinOp("ne")` is that decomposition's canonical
+                // spelling.  Left residual,
+                // every `w_str_get_wtf8(a) == w_str_get_wtf8(b)`
+                // and `name == "__doc__"` is an unlowered helper that blocks
+                // the descent into its caller (`is_w`, `getattr_str_impl`).
+                // The operand-type gate keeps the integer and float impls
+                // that share this owner (`<i64 as PartialEq>::eq`) out.
                 if args.len() == 2
-                    && fmt_path_ends_with(&segments, &["cmp", "impls", "<Impl>", "ne"])
+                    && let [.., owner_a, owner_b, owner_c, leaf] = segments.as_slice()
+                    && owner_a == "cmp"
+                    && owner_b == "impls"
+                    && owner_c == "<Impl>"
+                    && matches!(leaf.as_str(), "eq" | "ne")
                     && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
                         .iter()
-                        .all(|ty| ty.is_some_and(|ty| tyref_strips_to_str(ty, self.llbc)))
+                        .all(|t| t.is_some_and(|t| tyref_is_string_value(t, self.llbc)))
                 {
                     let res = self
                         .graph
@@ -10814,7 +10825,7 @@ impl<'a> Lowering<'a> {
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::BinOp {
-                            op: "ne".to_string(),
+                            op: leaf.clone(),
                             lhs: args[0].clone(),
                             rhs: args[1].clone(),
                             result_ty: ValueType::Int,
@@ -35065,6 +35076,40 @@ mod tests {
                 .count(),
             1,
             "the `__class__` comparison lowers to one string `BinOp(ne)`"
+        );
+    }
+
+    /// Anchor the string-reference `PartialEq` fold to the real lowered IR of
+    /// `is_w` — `w_str_get_wtf8(w_one) == w_str_get_wtf8(w_two)` over two
+    /// `&Wtf8`.  The comparison resolves to the blanket `&A == &B` impl in
+    /// `core::cmp::impls`, which must fold to `BinOp("eq")` like the direct
+    /// `<str as PartialEq>::eq` spelling; left residual it is the unlowered
+    /// helper every descent through `is_w` (`len(x)` via `len_w`) stops at.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn string_ref_eq_fold_real_is_w() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::baseobjspace::is_w")
+            .expect("lower is_w");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["cmp", "impls", "<Impl>", "eq"])
+                ))
+                .count(),
+            0,
+            "no residual `core::cmp::impls::<Impl>::eq` call survives the fold"
+        );
+        assert!(
+            ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq")),
+            "the `&Wtf8` comparison lowers to a `BinOp(eq)`"
         );
     }
 

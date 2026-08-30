@@ -2099,8 +2099,12 @@ pub fn w_type() -> PyObjectRef {
 }
 
 pub fn gettypeobject(tp: &PyType) -> PyObjectRef {
+    // Spelled as a `match` rather than `map_or(PY_NULL, |p| p.as_ptr())`:
+    // the closure's environment lowers to a synthetic aggregate constructor
+    // with no host symbol, which every descent reaching this call stopped
+    // at.  The niche `Option<NonNull<_>>` itself is one pointer word.
     match gettypefor(tp as *const PyType) {
-        Some(w_type) => w_type.as_ptr(),
+        Some(p) => p.as_ptr(),
         None => PY_NULL,
     }
 }

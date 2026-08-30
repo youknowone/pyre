@@ -9526,25 +9526,33 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
     dst_bank: char,
     descent: &HelperDescent,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
-    // Resolve every possible decline before recording anything.
+    // Resolve every possible decline before recording anything.  Each
+    // decline names itself under `PYRE_FBW_DEBUG_ABORT` so a `consulted=1
+    // fired=0` census line can be attributed without a rebuild.
+    let decline = |why: &str| {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[decline-why] {}-{why} pc={op_pc}", descent.decline_tag);
+        }
+        Ok(None)
+    };
     let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(descent.path) else {
-        return Ok(None);
+        return decline("NO-JITCODE");
     };
     let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
+        return decline("NO-SUB-BODY");
     };
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
-        return Ok(None);
+        return decline("NO-SYM");
     }
     // SAFETY: set for the lifetime of the enclosing full-body walk.
     if unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
+        return decline("SYM-NO-JITCODE");
     }
     let sym = unsafe { &*sym_ptr };
 
     let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
+        return decline("NESTED-ENTRY");
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
@@ -9593,7 +9601,16 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
             return Ok(None);
         }
         Ok(pair) => pair,
-        Err(error) => return Err(error),
+        Err(error) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[decline-why] {}-ERR pc={op_pc} error={}",
+                    descent.decline_tag,
+                    error.variant_name()
+                );
+            }
+            return Err(error);
+        }
     };
     let result = match walk_outcome {
         DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
@@ -9677,11 +9694,6 @@ pub(crate) fn try_walker_orthodox_unary_negative<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
-    if let Some((x, _)) = walker_unary_int_operand(ctx, operand)
-        && x == i64::MIN
-    {
-        return Ok(None);
-    }
     try_walker_orthodox_unary(ctx, op_pc, operand, dst, dst_bank, &UNARY_NEGATIVE_DESCENT)
 }
 
