@@ -2756,6 +2756,7 @@ impl WasmBackend {
                 old_handle,
                 target.compiled_ptr as u32,
                 target.callee_frame_bytes,
+                target.dispatch_key_ofs as u32,
                 target.callee_gcmap_ptr,
             );
             publish_call_assembler_target(token.number, target);
@@ -2958,6 +2959,7 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
                 handle,
                 registered.compiled_ptr as u32,
                 registered.callee_frame_bytes,
+                registered.dispatch_key_ofs as u32,
                 registered.callee_gcmap_ptr,
             );
             publish_call_assembler_target(target_token, registered.clone());
@@ -3739,6 +3741,7 @@ impl majit_backend::Backend for WasmBackend {
             compiled.eager_func_handle(),
             compiled as *const CompiledWasmLoop as usize as u32,
             compiled.frame.ca_frame_bytes,
+            compiled.frame.dispatch_key_ofs as u32,
             callee_gcmap_ptr,
         );
         publish_call_assembler_target(
@@ -3747,6 +3750,7 @@ impl majit_backend::Backend for WasmBackend {
                 token_number: token.number,
                 func_handle: compiled.eager_func_handle(),
                 input_types: compiled.input_types.clone(),
+                dispatch_key_ofs: compiled.frame.dispatch_key_ofs,
                 callee_frame_bytes: compiled.frame.ca_frame_bytes,
                 callee_gcmap_ptr,
                 compiled_ptr: compiled as *const CompiledWasmLoop as usize as u64,
@@ -5135,6 +5139,7 @@ impl majit_backend::Backend for WasmBackend {
                 handle,
                 new_target.compiled_ptr as u32,
                 new_target.callee_frame_bytes,
+                new_target.dispatch_key_ofs as u32,
                 new_target.callee_gcmap_ptr,
             );
             publish_call_assembler_target(new.number, new_target.clone());
@@ -5174,6 +5179,7 @@ impl majit_backend::Backend for WasmBackend {
             new_target.func_handle,
             new_target.compiled_ptr as u32,
             new_target.callee_frame_bytes,
+            new_target.dispatch_key_ofs as u32,
             new_target.callee_gcmap_ptr,
         );
         transfer_call_assembler_target_activity(&old_target, &new_target);
@@ -5245,6 +5251,23 @@ mod tests {
     }
 
     #[test]
+    fn identical_call_assembler_publication_reuses_the_runtime_snapshot() {
+        let _compile_guard = WASM_COMPILE_TEST_LOCK.lock().unwrap();
+        let token_number = 9_900_000;
+        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
+        ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
+
+        let table = failguard::WASM_CA_DISPATCH.lock().unwrap();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&token_number))
+            .expect("published dispatch entry");
+        assert_eq!(entry.targets.lock().unwrap().len(), 1);
+        drop(table);
+        failguard::ca_dispatch_remove(token_number);
+    }
+
+    #[test]
     fn redirect_call_assembler_grows_tmp_callback_frame_info() {
         let _compile_guard = WASM_COMPILE_TEST_LOCK.lock().unwrap();
         fn compile_with_depth(backend: &mut WasmBackend, token: &JitCellToken, value_count: u32) {
@@ -5292,6 +5315,9 @@ mod tests {
         let tmp_depth = tmp_clt.frame_info.lock().jfi_frame_depth;
         let real_depth = real_clt.frame_info.lock().jfi_frame_depth;
         assert!(tmp_depth < real_depth);
+        let tmp_target = call_assembler_target(tmp.number).expect("tmp callback metadata");
+        let real_target = call_assembler_target(real.number).expect("real loop metadata");
+        assert_ne!(tmp_target.dispatch_key_ofs, real_target.dispatch_key_ofs);
 
         backend
             .redirect_call_assembler(&tmp, &real)
@@ -5301,6 +5327,7 @@ mod tests {
         let redirected = call_assembler_target(tmp.number).expect("redirected target metadata");
         let installed = call_assembler_target(real.number).expect("real target metadata");
         assert_eq!(redirected.callee_frame_bytes, installed.callee_frame_bytes);
+        assert_eq!(redirected.dispatch_key_ofs, installed.dispatch_key_ofs);
         assert_eq!(redirected.callee_gcmap_ptr, installed.callee_gcmap_ptr);
 
         let table = failguard::WASM_CA_DISPATCH.lock();
@@ -5311,6 +5338,7 @@ mod tests {
         let targets = entry.targets.lock().unwrap();
         let target = targets.last().expect("published runtime target");
         assert_eq!(target.callee_frame_bytes, installed.callee_frame_bytes);
+        assert_eq!(target.dispatch_key_ofs as u64, installed.dispatch_key_ofs);
         assert_eq!(target.callee_gcmap_ptr, installed.callee_gcmap_ptr);
     }
 

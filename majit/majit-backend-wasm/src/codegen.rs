@@ -5667,8 +5667,11 @@ fn build_function(
                 // dispatch key = 0: run the loop from its entry (preamble), not a
                 // LABEL resume — this is a fresh call.
                 sink.local_get(ca_cfp_local);
+                sink.local_get(ca_target_local);
+                sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_DISPATCH_KEY_OFS_OFS));
+                sink.i32_add();
                 sink.i64_const(0);
-                sink.i64_store(mem64(frame.dispatch_key_ofs));
+                sink.i64_store(mem64(0));
                 // Marshal the descriptor's uniform i64 Int/Ref ABI inputs into
                 // the callee's positional frame slots.
                 for (arg_index, arg) in op.getarglist().iter().enumerate() {

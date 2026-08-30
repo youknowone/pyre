@@ -359,6 +359,10 @@ pub struct CallAssemblerTarget {
     pub token_number: u64,
     pub func_handle: u32,
     pub input_types: Vec<Type>,
+    /// Byte offset at which the target reads its fresh-entry dispatch key.
+    /// Redirects may replace a temporary callback with a differently laid-out
+    /// real loop, so this travels with the target's other runtime metadata.
+    pub dispatch_key_ofs: u64,
     pub callee_frame_bytes: u32,
     pub callee_gcmap_ptr: i64,
     pub compiled_ptr: u64,
@@ -387,6 +391,10 @@ pub struct WasmCaRuntimeTarget {
     /// `CompiledLoopToken.update_frame_info` permits the replacement loop to
     /// need a deeper frame than the temporary callback.
     pub callee_frame_bytes: u32,
+    /// Byte offset where this target reads its fresh-entry dispatch key.
+    /// Redirects may replace a temporary callback with a differently sized
+    /// real loop, so callers load this together with the frame allocation.
+    pub dispatch_key_ofs: u32,
     /// Current callee GC map.  It must change together with frame depth when
     /// `redirect_call_assembler` installs the real loop.
     pub callee_gcmap_ptr: i64,
@@ -411,6 +419,8 @@ pub const WASM_CA_TARGET_COMPILED_PTR_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, compiled_ptr) as u64;
 pub const WASM_CA_TARGET_FRAME_BYTES_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, callee_frame_bytes) as u64;
+pub const WASM_CA_TARGET_DISPATCH_KEY_OFS_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, dispatch_key_ofs) as u64;
 pub const WASM_CA_TARGET_GCMAP_PTR_OFS: u64 =
     std::mem::offset_of!(WasmCaRuntimeTarget, callee_gcmap_ptr) as u64;
 
@@ -548,6 +558,7 @@ pub fn ca_dispatch_publish(
     func_handle: u32,
     compiled_ptr: u32,
     callee_frame_bytes: u32,
+    dispatch_key_ofs: u32,
     callee_gcmap_ptr: i64,
 ) {
     let _ = ca_dispatch_slot(number);
@@ -556,14 +567,25 @@ pub fn ca_dispatch_publish(
         .as_ref()
         .and_then(|table| table.get(&number))
         .expect("CALL_ASSEMBLER dispatch entry disappeared while publishing");
+    let mut targets = entry.targets.lock().unwrap();
+    if targets.last().is_some_and(|current| {
+        current.func_handle == func_handle
+            && current.compiled_ptr == compiled_ptr
+            && current.callee_frame_bytes == callee_frame_bytes
+            && current.dispatch_key_ofs == dispatch_key_ofs
+            && current.callee_gcmap_ptr == callee_gcmap_ptr
+    }) {
+        return;
+    }
     let target = Box::new(WasmCaRuntimeTarget {
         func_handle,
         compiled_ptr,
         callee_frame_bytes,
+        dispatch_key_ofs,
         callee_gcmap_ptr,
     });
     let target_ptr = (&*target as *const WasmCaRuntimeTarget as usize) as u32;
-    entry.targets.lock().unwrap().push(target);
+    targets.push(target);
     entry.target_ptr.store(target_ptr, Ordering::Release);
 }
 
@@ -573,6 +595,7 @@ pub fn ca_dispatch_redirect(
     func_handle: u32,
     compiled_ptr: u32,
     callee_frame_bytes: u32,
+    dispatch_key_ofs: u32,
     callee_gcmap_ptr: i64,
 ) {
     ca_dispatch_publish(
@@ -580,6 +603,7 @@ pub fn ca_dispatch_redirect(
         func_handle,
         compiled_ptr,
         callee_frame_bytes,
+        dispatch_key_ofs,
         callee_gcmap_ptr,
     );
 }

@@ -691,7 +691,11 @@ fn w_memoryview_new_with_flags_impl(
             // keeps its zero-copy window and derived geometry.
             return Ok(w_memoryview_new_derived(w_obj, |v| v.clone()));
         }
-        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        #[cfg(all(
+            feature = "host_env",
+            not(feature = "sandbox"),
+            not(target_arch = "wasm32")
+        ))]
         if let Some((address, length)) =
             crate::module::_cffi_backend::cbuffer::mini_buffer_params(w_obj)
         {
@@ -19098,7 +19102,11 @@ impl Drop for WritableBuffer {
 /// `array.array`'s element bytes, and a contiguous memoryview's window.
 pub(crate) unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
     unsafe {
-        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        #[cfg(all(
+            feature = "host_env",
+            not(feature = "sandbox"),
+            not(target_arch = "wasm32")
+        ))]
         if let Some((address, length)) =
             crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
         {
@@ -19150,7 +19158,11 @@ pub(crate) unsafe fn fileio_writebuf(
     }
 
     unsafe {
-        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        #[cfg(all(
+            feature = "host_env",
+            not(feature = "sandbox"),
+            not(target_arch = "wasm32")
+        ))]
         if let Some((address, length)) =
             crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
         {
