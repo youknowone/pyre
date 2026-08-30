@@ -37,6 +37,18 @@
       },
       "reason": "multiprocessing.get_all_start_methods() is ['spawn'] here, so MultiProcessingCmdLineMixin.setUp skipTests every ForkCmdLineTest and ForkServerCmdLineTest case -- 26 of the 39 -- and the 13 SpawnCmdLineTest cases pass. A POSIX host runs all three classes and the shared FAIL is what it records"
     },
+    "test.test_multiprocessing_spawn": {
+      "dynasm": "FAIL",
+      "provenance": {
+        "dynasm": {
+          "binary": "pyre-dynasm.exe",
+          "jit": true,
+          "mode": "script",
+          "stdlib_version": "3.14.6"
+        }
+      },
+      "reason": "the package completes here in about 170s rather than reaching the shared TIMEOUT, and reports four cases. All four are the GC model, and PyPy 3.11 on this host answers the same way for the first three: test_heap asserts 0 != 5000 over a released Heap, test_queue_get and test_dispatch weakref an exception after gc.disable() and read a live object where a refcounted runtime reads None, and test_shared_memory_across_processes raises BufferError from mmap.close() over a memoryview only a major collection releases"
+    },
     "test.test_site": {
       "dynasm": "PASS",
       "provenance": {
