@@ -19833,9 +19833,15 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
         if is_async_generator(gen_obj) && !w_generator_is_exhausted(gen_obj) {
             let finalizer = w_async_generator_get_finalizer(gen_obj);
             if !finalizer.is_null() {
-                return match crate::call::call_function_impl_result(finalizer, &[gen_obj]) {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let base = pyre_object::gc_roots::pin_roots(&[gen_obj, finalizer]);
+                return match crate::call::call_function_impl_result(
+                    pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    &[pyre_object::gc_roots::shadow_stack_get(base)],
+                ) {
                     Ok(_) => Ok(w_none()),
                     Err(mut err) => {
+                        let gen_obj = pyre_object::gc_roots::shadow_stack_get(base);
                         err.write_unraisable(
                             w_none(),
                             Wtf8::new("async generator finalizer"),

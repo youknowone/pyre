@@ -46,6 +46,17 @@ def _codec_of(obj):
     return codec
 
 
+def _bufferstr_bytes(object, _memoryview=memoryview):
+    # PyPy's `bufferstr_w` acquires one C-contiguous read-only byte view.  A
+    # multi-byte-element exporter is accepted and its consumed position is
+    # still measured in bytes, but a strided view must not be flattened into a
+    # different byte sequence by `memoryview.tobytes()`.
+    view = _memoryview(object)
+    if not view.c_contiguous:
+        raise BufferError("memoryview: underlying buffer is not C-contiguous")
+    return view.tobytes()
+
+
 class MultibyteCodec:
     def __init__(self, name):
         self.name = name
@@ -106,7 +117,7 @@ class MultibyteIncrementalDecoder:
         # string.  `consumed` is consequently a byte offset even when the
         # caller supplied a multi-byte-element buffer such as array('H').
         # Materialize before both dispatch and the pending suffix slice.
-        data = self.pending + memoryview(object).tobytes()
+        data = self.pending + _bufferstr_bytes(object)
         output, consumed = _decode_stateful(
             self.codec.name, data, self.errors, (final, self.state)
         )

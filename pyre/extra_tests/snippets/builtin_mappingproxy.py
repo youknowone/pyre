@@ -63,3 +63,4 @@ assert or_calls == []
 right = {"right": 2}
 assert MappingProxyType(right).__ror__(CustomOrDict(left=1)) == "custom-or"
 assert or_calls == [right]
+assert type(or_calls[0]) is dict

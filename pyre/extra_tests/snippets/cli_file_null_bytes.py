@@ -46,6 +46,7 @@ with tempfile.TemporaryDirectory() as directory:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
+        timeout=60,
     )
     assert result.returncode == 0, result
     stderr = result.stderr.decode("utf-8", "replace")

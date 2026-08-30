@@ -55,6 +55,17 @@ word_buffer.frombytes(b"A\x82")
 assert decoder.decode(word_buffer, False) == "A"
 assert decoder.getstate()[0] == b"\x82"
 
+# The same `bufferstr` acquisition rejects a view whose logical bytes are not
+# C-contiguous; materializing the accepted multi-byte formats must not flatten
+# a strided input first.
+decoder = codecs.getincrementaldecoder("shift_jis")()
+try:
+    decoder.decode(memoryview(b"abcdef")[::2], False)
+except BufferError as error:
+    assert str(error) == "memoryview: underlying buffer is not C-contiguous"
+else:
+    raise AssertionError("a strided incremental-decoder input must be rejected")
+
 
 for name in ("shift_jis_2004", "shift_jisx0213"):
     assert b"\x81\x5f".decode(name) == "\\"

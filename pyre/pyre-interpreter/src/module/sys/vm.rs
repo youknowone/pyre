@@ -621,18 +621,15 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
                         "($self, /)",
                     )
                 );
-                let replace = crate::gateway::make_builtin_function_with_doc(
+                install!(
                     "__replace__",
-                    simple_namespace_replace,
-                    "Return a copy of the namespace object with new values for the specified attributes.",
+                    simple_namespace_variadic_method(
+                        "__replace__",
+                        simple_namespace_replace,
+                        "Return a copy of the namespace object with new values for the specified attributes.",
+                        "($self, /, **changes)",
+                    )
                 );
-                let _ = pyre_object::gc_roots::pin_root(replace);
-                let signature = w_str_new("($self, /, **changes)");
-                let replace = pyre_object::gc_roots::shadow_stack_get(
-                    pyre_object::gc_roots::shadow_stack_len() - 1,
-                );
-                unsafe { crate::function::fset_func_text_signature(replace, signature) };
-                install!("__replace__", replace);
                 install!("__dict__", crate::typedef::dict_descr());
             },
             object,
