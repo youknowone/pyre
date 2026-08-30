@@ -44,10 +44,15 @@ pub fn force_frame(frame: *mut PyFrame) {
 /// fast2locals` always finds a materialized `locals_cells_stack_w` with no
 /// hand-placed hook anywhere.
 ///
-/// Pyre's rtyper declines to build a virtualizable `InstanceRepr` at all
-/// (`rclass.rs buildinstancerepr`, blocked on `FieldListAccessor` /
-/// `_parse_field_list` parity), so that injection does not exist here and
-/// explicit calls like this one stand in for it — load-bearing, not redundant.
+/// That injection does not exist here, and not because a piece of the rtyper
+/// is unported — `FieldListAccessor` and `_parse_field_list` both are.
+/// Upstream discovers the redirected set from `classdesc.get_param('_virtualizable_')`,
+/// and no `ClassDesc` in this tree ever carries that key: pyre's virtualizable
+/// is the hand-written Rust `PyFrame`, and its field set is declared out of
+/// band in `pyre-jit-trace/src/virtualizable_spec.rs`.  So `rclass.rs
+/// buildinstancerepr`'s virtualizable arm is unreachable rather than blocked,
+/// and it is kept fail-closed for the day a producer appears.  Explicit calls
+/// like this one stand in for the injection — load-bearing, not redundant.
 /// Deleting them was measured: `f_lineno` starts reporting the `def` line,
 /// `f_locals` grows an entry, and the two read together segfault, with the
 /// whole synthetic corpus green throughout.
@@ -77,22 +82,35 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// `#[inline(never)]` keeps the callee name on the Call so the rewrite can
 /// see it.
 ///
-/// # Reach: none, today
+/// # Reach, and why the readers do not carry it
 ///
-/// Measured against the prepass artefacts in
-/// `target/*/build/pyre-jit-trace-*/out/jit_metadata.json`: no
-/// `symbolic_fnaddr_paths` entry names this function and no jitcode carries
-/// its name, and the same holds for its one caller,
-/// `pyframe.rs descr_typecheck_fget_getdictscope`. The codewriter never sees
-/// the call, so `rewrite_op_jit_force_virtualizable` deletes nothing. To
-/// re-derive, read those two lists out of that file and filter them for
-/// `force_virtualizable` and for `getdictscope`.
-///
-/// That is downstream of the missing injection rather than a gap of its own.
 /// Upstream reaches the rewrite because `hook_access_field` puts the marker
 /// at every redirected FIELD access, which lands it inside graphs the
-/// codewriter does look into; a hand-placed marker at one consumer only
-/// reaches it if that consumer happens to be one of those graphs.
+/// codewriter does look into.  A hand-placed marker only reaches it if the
+/// function holding it is one of those graphs, so the candidates are the
+/// functions that READ the redirected array and that the codewriter looks
+/// inside.  Measured against `jit_metadata.json`, that is two of them:
+/// `pyframe.rs` `PyFrame::fast2locals` and `PyFrame::frame_locals_proxy_snapshot`,
+/// both `@jit.unroll_safe` so that `contains_loop` does not keep the
+/// codewriter out.  `FrameLocalsProxy::locals_plus_value` reads the same
+/// array and became a third candidate when it took the same hint.
+///
+/// Placing it at those two was tried and does not pay.  The forces are
+/// deleted in the traced copies, but the fixtures that reach `f_locals`
+/// reach it through a residual call chain, and the residual copy escapes:
+/// five gate rows lose compilations (`getframe_bridge_force_*_declined`
+/// `loops_aborted 0 -> 20` with `bridges_compiled 1 -> 0`,
+/// `getframe_root_loop_force_blackhole_crn*` `loops_compiled 1 -> 0`,
+/// `raise_reg_unbound_jitstress` `9 -> 7`) and NOT ONE output changes.
+/// Nothing changes because pyre already materializes the array for a
+/// residual read by another route — `pyjitpl.py
+/// vable_and_vrefs_before_residual_call` stores the boxes back before the
+/// call — which is why `flocals_read_through_bound_proxy` passes without any
+/// force.  The `f_locals` path is also already forced one frame up, by the
+/// `descr_typecheck_fget_getdictscope` gateway, so a marker at the readers
+/// is redundant where it would matter and new only where it costs.
+///
+/// So the readers carry no force.
 ///
 /// The other force sites call [`force_frame`] or
 /// [`force_frame_before_locals_read`] directly, and only two of them sit in
@@ -103,6 +121,25 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// red frame so the collector reads a current `valuestackdepth`. In the rest
 /// the codewriter never looks inside, so a direct call and a deleted marker
 /// come to the same thing.
+///
+/// # No `vable_token` test here
+///
+/// `virtualizable.py force_virtualizable_if_necessary` opens with
+/// `if virtualizable.vable_token:`, and this function deliberately does not.
+/// The test is not missing — it is downstream, inside the backend hook
+/// [`force_frame`] reaches (`pyre-jit` `force_pyframe`, which calls
+/// `force_virtualizable_if_necessary` with the token read). What runs BEFORE
+/// that hook tests anything is `flush_active_frame_escape`, and that ordering
+/// is pyre's escape signal rather than an oversight.
+///
+/// Repeating the test at this call site was measured and is wrong: it gates
+/// the escape flush too, so a walk that must abort no longer does.  Eight
+/// gate rows moved on it — seven `getframe_*_declined` fixtures lost the
+/// decline they exist to pin (`loops_aborted 5 -> 0` with
+/// `guard_failures 0 -> 14480`), and
+/// `exception_reused_object_tb_not_doubled` started reporting a second
+/// traceback shape whose `f_locals` is missing the `except`-bound name,
+/// because the uncommitted walk kept the node it had already attached.
 #[inline(never)]
 pub fn jit_force_virtualizable(frame: *mut PyFrame) {
     force_frame_before_locals_read(frame);

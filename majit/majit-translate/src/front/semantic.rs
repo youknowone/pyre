@@ -585,18 +585,36 @@ impl<'a> MirGraphLookup<'a> {
 /// finish_for_call_..._obj    AccessDirectly     <- SyntheticTransparentCtor{name:"PyFrame", is_struct}
 /// eval::dispatch             AccessDirectly     <- Input{name:"frame", class_root:Some("PyFrame")}
 /// app_profile_call           NoAccessDirectly   <- Input{name:"frame", class_root:Some("PyFrame")}
-/// createframe_obj            FreshVirtualizable <- (no producing op in the graph)
-/// finish_for_call_..._obj    FreshVirtualizable <- (no producing op in the graph)
+/// createframe_obj            FreshVirtualizable <- (no op's result: a block inputarg)
+/// finish_for_call_..._obj    FreshVirtualizable <- (no op's result: a block inputarg)
 /// ```
 ///
-/// So the first under-approximation is NOT the eraser for `access_directly`:
-/// every one of those four resolves to the bare leaf `PyFrame`, which is the
-/// spelling the declared set holds. What it does erase is `fresh_virtualizable`
-/// — both sites spell `hint_fresh_virtualizable(hint_access_directly(frame))`
-/// and the outer hint's operand is produced by no op in the graph, so it can
-/// carry no root and is never seeded.
+/// So the first under-approximation is NOT the eraser: every one of those four
+/// resolves to the bare leaf `PyFrame`, which is the spelling the declared set
+/// holds.
 ///
-/// That leaves the second as the eraser for `access_directly`. The flag is set
+/// Nor does it erase `fresh_virtualizable`, though an earlier reading of that
+/// table said so. Both sites spell
+/// `hint_fresh_virtualizable(hint_access_directly(frame))`, and the outer
+/// hint's operand is not any op's `result` — but that is a property of the
+/// census, not of the graph. Every call here is a block terminator, so the
+/// inner hint's result crosses a link and the outer operand arrives as the
+/// successor's `inputarg`; a census matching operands against op results
+/// cannot see one. The hint conversion does emit a result (`front::mir`), and
+/// `class_roots`'s fixpoint carries a root across BOTH hops — the `Hint`
+/// result and the `Link` into `inputargs`. The value is rooted and does seed.
+/// It is also redundant while it does: `hint_seed_sets` treats
+/// `FreshVirtualizable` and `AccessDirectly` identically and files operand and
+/// result alike, so the two hints on one frame seed the same set.
+///
+/// (The chained spelling is still a deviation, for reasons that have nothing
+/// to do with this pass: `rlib/jit.py` asserts `"lone fresh_virtualizable
+/// hint"` on the outer call, upstream spelling both kwargs on one `hint()`
+/// (`pyframe.py PyFrame.__init__`); and `jtransform.rs rewrite_op_hint` files
+/// `vable_flags` against the operand while clearing the map per block, so a
+/// chained hint files it one block away from the stores it covers.)
+///
+/// That leaves the second as the eraser, and as the only one. The flag is set
 /// only through `reaching`: a `(callee, pos)` pair needs `flagged > 0 &&
 /// unflagged == 0`, so one unhinted caller passing a frame at that position is
 /// enough to erase it, and `PyFrame` has many. Seeding the roots registry
