@@ -5282,56 +5282,63 @@ impl<S: JitState> JitDriver<S> {
         // position to re-enter at; every other JitState resumes through its
         // own frontend.
         let dispatch = self.dispatch_jitcode().cloned()?;
-        // OPEN, and narrower than it was: it turns on the number of virtuals
-        // the guard's deferred writes span, because one is served correctly
-        // and two is not. A self-interpreting workload still reads one operand
-        // twice when the two-virtual ones are served.
+        // OPEN, and the cut below is a MASK rather than the boundary. It
+        // refuses a guard whose deferred writes span more than one virtual,
+        // and at the parameter table's `trace_eagerness` a self-interpreting
+        // workload is byte-exact with it in place. Lowering that parameter —
+        // nothing else — reproduces the same class of wrong answer WITH the
+        // cut in place, deterministically, from one setting downwards.
         //
-        // What is measured, on a self-interpreting workload, is where the
-        // wrong answer enters and what does NOT explain it:
+        // What that reproduction settles, and what it overturns:
         //
-        //   * `MAJIT_MAX_BRIDGES` bisects to one entry — the first that
-        //     produces a wrong value — and it is exactly a two-virtual
-        //     guard-resume entry. Every entry before it is sound.
-        //   * declining after the entry has replayed but before the walk runs
-        //     restores the correct output, and stamping each materialized
-        //     virtual's address onto its recorded NEW — which
-        //     `execute_and_record` does for every other allocation the walk
-        //     performs and this reader did not — leaves the output
-        //     byte-for-byte the same wrong bytes. Neither the replay nor an
-        //     address-less OpRef is what corrupts.
+        //   * declining EVERY guard-resume entry restores the correct output
+        //     at every `trace_eagerness` tried, and also with the cut widened
+        //     to serve every deferred-write guard. This entry is the necessary
+        //     component; the virtual count is not.
+        //   * `MAJIT_MAX_BRIDGES` bisects the reproduction to one entry, and
+        //     that entry carries NO deferred writes and NO virtuals at all.
+        //     Seventy-one guard-resume entries precede it and are sound. The
+        //     shape this comment used to blame — a two-node push chain whose
+        //     outer virtual names the inner and whose one deferred write is
+        //     the list head — is what the cut refuses, not what corrupts.
         //
-        // Whether the walk or the bridge it records is what corrupts is NOT
-        // settled: a bridge whose compile is refused after the walk has run
-        // faults, because the walk publishes a handoff that assumes one, so
-        // "run the walk and compile nothing" is not available as a
-        // discriminator.
+        // What the corrupting entry records is a bridge that closes with a
+        // JUMP into an already-compiled loop, and it passes a VARIABLE in the
+        // argument position that every other close in the same run fills with
+        // a literal — one of a handful of literals, each the value the loop
+        // behind that target token was specialized on. The bridge's own
+        // guards prove only that the variable is not one OTHER literal.
         //
-        // What IS settled is that the resume stream is not the difference. A
-        // census of every entry this decline refuses reads the same shape: a
-        // two-node push chain whose inner virtual holds a `value` the trace
-        // really does carry as a literal and a `next` naming a failarg, whose
-        // outer holds a literal `value` and a `next` naming the inner, and
-        // whose single deferred write is the list head. Different guards carry
-        // different literals, so the "const where an unchained one is boxed"
-        // this comment used to blame was a comparison between two DIFFERENT
-        // guards — and the blackhole arm decodes those same fieldnums to the
-        // right answer.
+        // Nothing in this frontend's close path proves the incoming state
+        // satisfies the target label: `unroll.py jump_to_existing_trace` is
+        // where upstream generates the guards that make a specialized label
+        // safe to enter, and its per-target-token log is EMPTY for this
+        // workload — with the unroll pass enabled as well as without it.
+        // Enabling that pass changes which bytes come out wrong and not that
+        // they are wrong, so the missing pass is not by itself the account.
         //
-        // Four more candidates are measured out:
+        // Also measured out, in the same reproduction:
         //
+        //   * a `GuardRequirement` whose box is not reachable from the jump
+        //     arguments emits nothing and is skipped rather than declined —
+        //     a real hole, but declining on it fires on no target token here
+        //     and leaves every wrong byte unchanged,
         //   * `rd_locs.len()` equals `num_failargs` on every guard in the
-        //     census (64 through 71), so no failarg resolves through the
-        //     deadframe's out-of-range identity-slot fallback,
+        //     refused census, so no failarg resolves through the deadframe's
+        //     out-of-range identity-slot fallback,
         //   * the bridge's inputargs are contiguous and cover every failarg,
-        //     the two the virtual numbering appended included,
-        //   * the rewrite lowers the resumed `New` to the headerless nursery
-        //     opcode, so the materialized objects come from the interpreter's
-        //     own pool at the offsets their descrs carry, and
+        //   * the rewrite lowers a resumed `New` to the headerless nursery
+        //     opcode, so materialized objects come from the frontend's own
+        //     pool at the offsets their descrs carry, and
         //   * the collector is not involved: the wrong bytes are identical
         //     with collection disabled, the run performs none, and the
-        //     interpreter's own chain/size invariant stays silent. What the
+        //     frontend's own structural invariant stays silent. What the
         //     served entry produces is a wrong VALUE on an intact structure.
+        //
+        // The cut stays because it is measured to halve this frontend's
+        // guard failures and because widening it is measured to produce a
+        // wrong answer at the shipped parameter; it is NOT a soundness
+        // argument, and the entry above it is where the account is still owed.
         //
         // Sited here rather than in the ladder below because
         // `compile.py ResumeGuardDescr.handle_fail` runs ONE of resume.py's
