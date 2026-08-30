@@ -331,14 +331,14 @@ macro_rules! py_module {
             // exceptions: module-local exception classes — PyPy
             // `new_exception_class("<mod>.Name", base)` (error.py).
             // The class name is auto-qualified as `"<$name>.<key>"` and
-            // built via `make_exc_type` (which also records it in the
+            // built via `new_exception_class` (which also records it in the
             // exc-class registry); the short `key` is the attribute name
             // stored in the module dict.  The RHS is the base class
             // expression, e.g. `lookup_exc_class("OSError").unwrap()`.
             $($(
                 $crate::module_ns_store(
                     ns, $exc_key,
-                    $crate::builtins::make_exc_type(
+                    $crate::builtins::new_exception_class(
                         ::std::concat!($name, ".", $exc_key),
                         $crate::builtins::exc_exception_new,
                         $exc_base,

@@ -2129,8 +2129,8 @@ mod tests {
         );
 
         let mut cache = gc_cache().lock();
-        cache._cache_size.remove(&LLType::Struct(key));
-        cache._cache_array.remove(&LLType::Array(key));
+        cache._cache_size.shift_remove(&LLType::Struct(key));
+        cache._cache_array.shift_remove(&LLType::Array(key));
     }
 
     #[test]

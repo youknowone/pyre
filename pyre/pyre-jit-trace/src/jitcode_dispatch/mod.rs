@@ -6749,6 +6749,32 @@ thread_local! {
     static FBW_CELL_STORE_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
+    /// Undo log for the walked region's eagerly executed namespace bindings.
+    /// `STORE_NAME` / `STORE_GLOBAL` / `DELETE_NAME` / `DELETE_GLOBAL` reach the
+    /// walker as residuals that write the frame's namespace dict in place, and
+    /// no other journal records what they displaced.  A walk that does not
+    /// commit hands its region to a replay that re-executes it FROM THE WALK
+    /// ENTRY, so every statement between the entry and the store reads the
+    /// walk's binding while the rest of the frame still holds its pre-walk
+    /// value: a bridge walk that runs off the tail of one `for` iteration into
+    /// the head of the next leaves the loop variable — and everything derived
+    /// from it — advanced, and the replayed tail reports the previous
+    /// iteration's data against the next iteration's counters.  Entries restore
+    /// the displaced value (or unbind a name the walk created) in reverse push
+    /// order, the way [`FBW_STORE_JOURNAL`] restores list elements.  The
+    /// displaced value can have lost its only other reference to the store, so
+    /// entries are GC roots via [`fbw_store_journal_root_walker`].
+    static FBW_NAMESPACE_STORE_JOURNAL: std::cell::RefCell<Vec<FbwNamespaceStore>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Set when the rollback above undid a binding that is NOT the in-flight
+    /// FOR_ITER's loop-variable store.  An in-flight delivery repositions the
+    /// frame to the FOR_ITER body instead of replaying from the walk entry, so
+    /// a binding written before that FOR_ITER would never be re-applied; the
+    /// delivery refuses while this stands and keeps the conservative drop.
+    static FBW_NAMESPACE_STORE_ROLLED_BACK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     /// Undo log for the walked region's eagerly executed
     /// `set_current_exception` stores against the LIVE per-thread
     /// `ExecutionContext.sys_exc_value`.  The authoritative walk lowers
@@ -7055,12 +7081,26 @@ pub(crate) struct EntryFallback {
     pub entry_executed_effects: usize,
 }
 
+/// One [`FBW_NAMESPACE_STORE_JOURNAL`] entry: the namespace dict a `*_NAME` /
+/// `*_GLOBAL` residual wrote, the name it bound, and the value that name held
+/// before the write — null when the name was unbound, which the rollback undoes
+/// with a delete.  `loop_var` marks the FOR_ITER body's own loop-variable
+/// store, the one binding an in-flight delivery re-executes for itself.
+#[derive(Clone, Copy)]
+struct FbwNamespaceStore {
+    namespace: pyre_object::PyObjectRef,
+    name: pyre_object::PyObjectRef,
+    displaced: pyre_object::PyObjectRef,
+    loop_var: bool,
+}
+
 struct FbwStoreJournalRootArea {
     stores: *const std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>>,
     list_effects: *const std::cell::RefCell<Vec<FbwListEffect>>,
     append_promote: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
     cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
+    namespace_stores: *const std::cell::RefCell<Vec<FbwNamespaceStore>>,
     sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     traceback_store:
         *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>>,
@@ -7081,6 +7121,7 @@ thread_local! {
         append_promote: FBW_APPEND_PROMOTE_JOURNAL.with(|value| value as *const _),
         abort_overrides: FBW_ABORT_OUTER_STACK_OVERRIDES.with(|value| value as *const _),
         cell_stores: FBW_CELL_STORE_JOURNAL.with(|value| value as *const _),
+        namespace_stores: FBW_NAMESPACE_STORE_JOURNAL.with(|value| value as *const _),
         sys_exc: FBW_SYS_EXC_JOURNAL.with(|value| value as *const _),
         traceback_store: FBW_TRACEBACK_STORE_JOURNAL.with(|value| value as *const _),
         foriter: FBW_FORITER_INFLIGHT.with(|value| value as *const _),
@@ -7428,6 +7469,23 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     let cell_stores = unsafe { &mut *(*area.cell_stores).as_ptr() };
     for (cell, _intvalue) in cell_stores.iter_mut() {
         visitor(unsafe { &mut *(cell as *mut pyre_object::PyObjectRef).cast() });
+    }
+    // Namespace-store journal: the store replaced the displaced binding in its
+    // dict slot, so the entry can be that value's only remaining owner, and the
+    // rollback reads the dict and the name back to put it there — forward all
+    // three.  A null `displaced` is the unbound case and names no object.
+    let namespace_stores = unsafe { &mut *(*area.namespace_stores).as_ptr() };
+    for entry in namespace_stores.iter_mut() {
+        for slot in [
+            &mut entry.namespace as *mut pyre_object::PyObjectRef,
+            &mut entry.name as *mut pyre_object::PyObjectRef,
+            &mut entry.displaced as *mut pyre_object::PyObjectRef,
+        ] {
+            if unsafe { *slot }.is_null() {
+                continue;
+            }
+            visitor(unsafe { &mut *slot.cast() });
+        }
     }
     // The displaced `sys_exc_value` entries are exception objects that may be
     // nursery-resident and no longer referenced elsewhere once the eager store

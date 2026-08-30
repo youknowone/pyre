@@ -100,6 +100,16 @@ use crate::model::{
     LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
+/// Opaque non-null value for a prebuilt JIT-driver `NamedConst`.
+///
+/// The driver instance is only the receiver constant of its marker methods;
+/// rtyping erases that receiver to `Void`, and `jtransform` discards operand
+/// zero while rewriting the marker.  It therefore has no runtime address to
+/// preserve, but the front-end graph still needs one constant-producing
+/// operation until that rewrite.  Non-null keeps it distinct from the null
+/// reference representation on every backend.
+const JITDRIVER_NAMEDCONST_SENTINEL_ADDR: i64 = 8;
+
 /// Top-level entry — load `function_name` out of `llbc`, lower it,
 /// return the constructed [`FunctionGraph`].
 ///
@@ -141,7 +151,15 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
     llbcs: &[Llbc],
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    build_semantic_program_from_llbcs_with_static_addrs_filtered(llbcs, static_addrs, None, None)
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    build_semantic_program_from_llbcs_with_static_addrs_filtered(
+        llbcs,
+        static_addrs,
+        &jitdriver_receiver_roots,
+        None,
+        None,
+    )
 }
 
 pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
@@ -149,10 +167,27 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
     static_addrs: crate::HostStaticAddrs<'_>,
     module_paths: &[&str],
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    build_semantic_program_from_llbcs_with_static_addrs_module_paths_and_jitdriver_roots(
+        llbcs,
+        static_addrs,
+        module_paths,
+        &jitdriver_receiver_roots,
+    )
+}
+
+pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_and_jitdriver_roots(
+    llbcs: &[Llbc],
+    static_addrs: crate::HostStaticAddrs<'_>,
+    module_paths: &[&str],
+    jitdriver_receiver_roots: &[String],
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let module_filter = normalize_module_filter(module_paths);
     build_semantic_program_from_llbcs_with_static_addrs_filtered(
         llbcs,
         static_addrs,
+        jitdriver_receiver_roots,
         module_filter.as_ref(),
         None,
     )
@@ -180,9 +215,12 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let module_filter = normalize_module_filter(module_paths);
     let function_filter = normalize_function_filter(function_names);
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
     build_semantic_program_from_llbcs_with_static_addrs_filtered(
         llbcs,
         static_addrs,
+        &jitdriver_receiver_roots,
         module_filter.as_ref(),
         function_filter.as_ref(),
     )
@@ -191,6 +229,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
 fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     llbcs: &[Llbc],
     static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
@@ -223,6 +262,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
         let prog = build_semantic_program_from_llbc_with_static_addrs_filtered(
             llbc,
             static_addrs,
+            jitdriver_receiver_roots,
             module_filter,
             function_filter,
         )?;
@@ -721,7 +761,15 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
     // per-artefact builder below does not repeat it. A caller handing over a
     // single artefact has named its whole input here, so link it here.
     link_transparent_scalar_types(std::slice::from_ref(llbc));
-    build_semantic_program_from_llbc_with_static_addrs_filtered(llbc, static_addrs, None, None)
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    build_semantic_program_from_llbc_with_static_addrs_filtered(
+        llbc,
+        static_addrs,
+        &jitdriver_receiver_roots,
+        None,
+        None,
+    )
 }
 
 /// One block's slot-indexed `Option<Variable>` row, stored by bound slot.
@@ -824,6 +872,7 @@ impl PackedFrameState {
 fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     llbc: &Llbc,
     static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
@@ -993,6 +1042,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             fd,
             &body,
             static_addrs,
+            jitdriver_receiver_roots,
             &struct_field_attrs,
             &dont_look_inside,
             builder_mode,
@@ -1656,7 +1706,7 @@ fn derive_program_metadata(
                 // `enum_variant_by_discriminant` (kept below) supplies the
                 // switch-arm discr→name mapping — both independent of the
                 // base ClassDef.
-                let fieldless = variants.iter().all(|v| v.fields.is_empty());
+                let fieldless = type_decl_is_fieldless_enum(td, llbc);
                 let base_sid = majit_ir::descr::StructId::from_canonical(&canon_base);
                 if !fieldless {
                     let rows: Vec<(String, String)> =
@@ -2197,7 +2247,15 @@ pub fn lower_fun_decl_with_static_addrs(
     // stand-alone entry (used by the reader / tests) derives it per call from
     // the same source of truth so the fusion fires identically.
     let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
-    lower_fun_decl_with_static_addrs_and_attrs(llbc, fd, static_addrs, &struct_field_attrs)
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
+        llbc,
+        fd,
+        static_addrs,
+        &jitdriver_receiver_roots,
+        &struct_field_attrs,
+    )
 }
 
 /// The `struct_field_attrs` projection of [`derive_program_metadata`] —
@@ -2224,10 +2282,29 @@ pub(crate) fn dont_look_inside_set_of(llbc: &Llbc) -> std::collections::HashSet<
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Result<FunctionGraph, LowerError> {
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
+        llbc,
+        fd,
+        static_addrs,
+        &jitdriver_receiver_roots,
+        struct_field_attrs,
+    )
+}
+
+fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> Result<FunctionGraph, LowerError> {
     let u = fd.unstructured().ok_or_else(|| {
@@ -2249,6 +2326,7 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
         fd,
         &u,
         static_addrs,
+        jitdriver_receiver_roots,
         struct_field_attrs,
         &dont_look_inside,
         builder_mode,
@@ -2302,6 +2380,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     fd: &FunDecl,
     u: &Unstructured,
     static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     dont_look_inside: &std::collections::HashSet<String>,
     // When set, each strategy's `Lowering` is switched to builder form
@@ -2792,6 +2871,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             name.clone(),
             u,
             static_addrs,
+            jitdriver_receiver_roots,
             fd.generics.as_ref(),
             dont_look_inside,
         )?;
@@ -2834,6 +2914,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         name.clone(),
         u,
         static_addrs,
+        jitdriver_receiver_roots,
         fd.generics.as_ref(),
         dont_look_inside,
     )?;
@@ -2862,6 +2943,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 name,
                 u,
                 static_addrs,
+                jitdriver_receiver_roots,
                 fd.generics.as_ref(),
                 dont_look_inside,
             )?;
@@ -3137,6 +3219,12 @@ struct Lowering<'a> {
     dont_look_inside: &'a std::collections::HashSet<String>,
     body: &'a Unstructured,
     static_addrs: crate::HostStaticAddrs<'a>,
+    /// Configured receiver-type paths whose marker methods identify a
+    /// `JitDriver`.  The same roots feed `jit_marker_key_from_target` in the
+    /// codewriter; carrying them into the front end lets a read of the
+    /// corresponding prebuilt driver const become a value constant before
+    /// the nullary residual-call fallback.
+    jitdriver_receiver_roots: &'a [String],
     arg_count: usize,
     /// `local_var[i] = Some(var)` once MIR local `i` has been bound to
     /// a flowspace Variable. Slot 0 is the return value, 1..arg_count
@@ -3424,6 +3512,7 @@ impl<'a> Lowering<'a> {
         name: String,
         body: &'a Unstructured,
         static_addrs: crate::HostStaticAddrs<'a>,
+        jitdriver_receiver_roots: &'a [String],
         generics: Option<&serde_json::Value>,
         dont_look_inside: &'a std::collections::HashSet<String>,
     ) -> Result<Self, LowerError> {
@@ -3466,6 +3555,30 @@ impl<'a> Lowering<'a> {
             graph.name_value_var(&var, name.clone());
             *slot = Some(var.clone());
             let ty = tyref_to_value_type(&local.ty, llbc);
+            // A parameter with no runtime representation (`Arg<T>`'s
+            // `PhantomData` marker is the case in point — rustc gives it no
+            // ABI slot) has to read as `Void` here, matching upstream's
+            // `getkind(lltype.Void)`: `NON_VOID_ARGS` (the caller's actual
+            // arguments) and `FUNC.ARGS` filtered the same way (this
+            // graph's declared parameters via `graph_non_void_arg_types`)
+            // both filter by the identical is-not-Void test, so a param the
+            // caller's own concretetype tracking already treats as
+            // void-carrying must agree here or `getcalldescr` sees a
+            // caller/callee arity mismatch and hard fails. Scoped to the
+            // declared-parameter fallback only — not
+            // `tyref_to_value_type` itself, which construction sites
+            // (`AggregateKind` lowering et al.) also call, and which must
+            // keep minting a real value for a zero-sized type until they
+            // erase it the way rtyper does everywhere. Guarded on the
+            // generic `Ref(None)` fallback so a real (non-zero-sized) Ref
+            // param is never touched, and a fieldless enum — already
+            // resolved to `Int` above regardless of its own zero-sized
+            // layout — never reaches this arm.
+            let ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_zero_sized(&local.ty, llbc) {
+                ValueType::Void
+            } else {
+                ty
+            };
             // `class_root` carries the param's named-ADT leaf so
             // `derive_subject_inputcells` can seed the receiver's
             // `ClassDef`; only `Ref`-typed params consume it there.  A
@@ -3598,6 +3711,7 @@ impl<'a> Lowering<'a> {
             dont_look_inside,
             body,
             static_addrs,
+            jitdriver_receiver_roots,
             arg_count,
             local_var,
             block_id,
@@ -6222,6 +6336,31 @@ impl<'a> Lowering<'a> {
                     if field_name == "__pos_0" && self.tyref_is_niche_option_ptr(&inner.ty) {
                         return self.resolve_place(mir_bb, *inner);
                     }
+                    // A zero-sized field has no runtime representation, so a
+                    // projection from a payload-free enum reads no bytes.
+                    // Give the projected value the `Void` kind rather than
+                    // materialising it in a value bank.  `getkind(lltype.Void)`
+                    // is `'void'`, and both `call.py NON_VOID_ARGS` and
+                    // `jtransform.py add_in_correct_list` drop a void argument, so the value
+                    // takes neither a calldescr `arg_classes` slot nor an
+                    // argument-bank entry.  That is what the callee's machine
+                    // ABI expects: a zero-sized parameter occupies no argument
+                    // register, so declaring a slot for it would shift every
+                    // later argument by one register at the residual-call
+                    // boundary.  A bank-classified value would take that slot —
+                    // `Ref` is what an opaque zero-sized ADT falls back to.
+                    // No defining operation, matching the bare
+                    // `Constant(None, lltype.Void)` the argument lists skip.
+                    // Keep this collapse scoped to a fieldless-enum base: a
+                    // zero-sized field in any other aggregate retains that
+                    // aggregate's ordinary field model.
+                    if self.tyref_is_fieldless_enum(&inner.ty)
+                        || self.tyref_is_borrowed_fieldless_enum(&inner.ty)
+                    {
+                        return Ok(self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void));
+                    }
                     // Narrow a classdef-less raw-pointer-deref base to
                     // `SomeInstance(<pointee root>)` before the field read.
                     // A `(*p).field` where `p: *mut/*const <Struct>` deref's to
@@ -6688,36 +6827,24 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
-                // A zero-field unit-struct `const` (the `unpackiterable_driver`
-                // JitDriver, baseobjspace.py:29) is inlined and has no
-                // registered address, so `static_addr_op` returned `None` and
-                // the addressed-singleton arm above declined.  The driver
-                // receiver of a `jit_merge_point` marker is erased to a `Void`
-                // constant at rtyping and to a `Signed` jitdriver index before
-                // the trace runs (`jtransform.py:1704`); `OpKind::Call` operands
-                // are Variables, so the receiver still materialises as a
-                // Variable the marker rewrite strips (autoreds redvar
-                // subtraction + `args.split_first()`).  Emit a single non-null
-                // sentinel `ConstRefAddr` — the same one-ref-result shape a
-                // 0-arg accessor call would have, but without the residual call
-                // whose funcptr constant degrades to a `symbolic_fnaddr_for_path`
-                // hash that SIGBUSes at trace time.  Deliberately NOT the
-                // `__cast_instance_intrinsic` narrowing the addressed siblings use:
-                // its extra cast Variable shifts the loop's ref-register
-                // allocation so a merge-point red lands past `num_regs_r`
-                // (seed-time out-of-bounds in `trace_jitcode_from_merge_point`).
-                // The receiver is stripped, so its `SomePtr` typing is never
-                // unioned downstream; the sentinel is non-null so it never
-                // trips the offset-0 null-Ref wasm silent-miscompile class.
-                if self.refs_static_zerofield_struct_root(&place_ty).is_some() {
-                    const ZEROFIELD_NAMEDCONST_SENTINEL_ADDR: i64 = 8;
+                // A prebuilt JitDriver `const` has no registered address. Its
+                // value exists in the flow graph only as operand zero of a
+                // marker method: `ExtEnterLeaveMarker.specialize_call` makes
+                // it a receiver Constant, rtyping erases it to `Void`, and
+                // `Transformer.try_handle_jit_marker` discards the receiver.
+                // Keep the producer constant-shaped so `split_block` can
+                // rematerialise it, without turning the const path into a
+                // nullary residual call. The declared ADT is matched against
+                // the same configured receiver roots the codewriter uses; the
+                // global's own name is deliberately irrelevant.
+                if self.is_jitdriver_named_const(id, &place_ty) {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     let bb_id = self.block_id[mir_bb];
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: OpKind::ConstRefAddr(ZEROFIELD_NAMEDCONST_SENTINEL_ADDR),
+                        kind: OpKind::ConstRefAddr(JITDRIVER_NAMEDCONST_SENTINEL_ADDR),
                     });
                     return Ok(res);
                 }
@@ -6872,7 +6999,7 @@ impl<'a> Lowering<'a> {
         let TypeDeclKind::Enum(variants) = &td.kind else {
             return None;
         };
-        if variants.is_empty() || variants.iter().any(|v| !v.fields.is_empty()) {
+        if !type_decl_is_fieldless_enum(td, self.llbc) {
             return None;
         }
         variants.get(variant_idx)?.discriminant_i64()
@@ -7422,6 +7549,40 @@ impl<'a> Lowering<'a> {
             }
         }
         None
+    }
+
+    /// Whether `def_id` is an immutable prebuilt instance of a configured
+    /// JIT-driver receiver type.
+    ///
+    /// `GraphTransformConfig::jitdriver_receiver_roots` is the front-to-
+    /// codewriter registration of the types whose marker methods are handled
+    /// by `jit_marker_key_from_target`.  Match that set against the global's
+    /// declared ADT path, not against any particular global binding, so every
+    /// driver instance gets the same constant treatment.
+    fn is_jitdriver_named_const(&self, def_id: u64, ty: &TyRef) -> bool {
+        let Some(global) = self.llbc.global_by_id(def_id) else {
+            return false;
+        };
+        if global
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("NamedConst")
+        {
+            return false;
+        }
+        let Some(type_path) = tyref_node(ty, self.llbc)
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+            .and_then(adt_node_def_id)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .map(|decl| decl.item_meta.name_path())
+        else {
+            return false;
+        };
+        let stripped = strip_crate_prefix(&type_path);
+        self.jitdriver_receiver_roots
+            .iter()
+            .any(|root| static_key_matches(&type_path, &stripped, root))
     }
 
     /// Value of an immutable size `const` baked at build time
@@ -7981,6 +8142,43 @@ impl<'a> Lowering<'a> {
                         .as_variable()
                         .expect("a materialized GC root stays a Variable")
                         .clone();
+                }
+                // `core::intrinsics::transmute::<A, B>(x)` is a bitwise
+                // move.  When both Rust types lower to the same JIT register
+                // bank and Charon's type/layout data proves their byte sizes
+                // equal, the move is the bank's ordinary copy (`same_as`).
+                // This includes `u8 -> #[repr(u8)]` fieldless enums: the enum
+                // is already modelled as its integer tag by
+                // `tyref_to_value_type`, and its `TypeDecl` layout supplies
+                // the matching one-byte size.  A bank crossing or an unknown
+                // / unequal size keeps the existing residual call.
+                if args.len() == 1
+                    && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                    && matches!(
+                        fd.item_meta.name_path().as_str(),
+                        "core::intrinsics::transmute" | "core::mem::transmute"
+                    )
+                    && first_arg_ty.as_ref().is_some_and(|src_ty| {
+                        transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
+                    })
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::UnaryOp {
+                            op: "same_as".to_string(),
+                            operand: args[0].clone(),
+                            result_ty: result_ty.clone(),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
                 }
                 // `we_are_jitted()` is true during tracing and blackholing
                 // (rlib/jit.py:355-358); the rtyper folds the surviving
@@ -10165,10 +10363,7 @@ impl<'a> Lowering<'a> {
                         .as_ref()
                         .and_then(|t| self.tyref_ref_adt_def_id(t))
                         .and_then(|id| self.llbc.type_by_id(id))
-                        .is_some_and(|td| {
-                            matches!(&td.kind, TypeDeclKind::Enum(vs)
-                                if !vs.is_empty() && vs.iter().all(|v| v.fields.is_empty()))
-                        });
+                        .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc));
                     if pointee_fieldless {
                         self.local_var[dest_local] = Some(args[0].clone());
                         let target_bb = self.block_id[target];
@@ -14753,7 +14948,7 @@ impl<'a> Lowering<'a> {
     fn tyref_is_fieldless_enum(&self, ty: &TyRef) -> bool {
         self.tyref_adt_def_id(ty)
             .and_then(|def_id| self.llbc.type_by_id(def_id))
-            .is_some_and(type_decl_is_fieldless_enum)
+            .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
     }
 
     /// [`Self::tyref_is_fieldless_enum`] through a `&` borrow — the shape a
@@ -14764,7 +14959,7 @@ impl<'a> Lowering<'a> {
     fn tyref_is_borrowed_fieldless_enum(&self, ty: &TyRef) -> bool {
         self.tyref_ref_adt_def_id(ty)
             .and_then(|def_id| self.llbc.type_by_id(def_id))
-            .is_some_and(type_decl_is_fieldless_enum)
+            .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
     }
 
     /// `true` when `ty` is represented as a one-word nullable `Option`:
@@ -16431,15 +16626,12 @@ impl<'a> Lowering<'a> {
         let Some(td) = self.llbc.type_by_id(def_id) else {
             return false;
         };
-        let TypeDeclKind::Enum(variants) = &td.kind else {
-            return false;
-        };
-        variants.iter().all(|variant| variant.fields.is_empty())
+        let target = std::env::var("TARGET").unwrap_or_default();
+        type_decl_is_fieldless_enum(td, self.llbc)
             && td
-                .layout_for_target("")
+                .layout_for_target(&target)
                 .and_then(|l| l.discriminant_offset())
-                .unwrap_or(0)
-                == 0
+                == Some(0)
     }
 
     /// The resolved JSON body of a [`TyRef`], following the dedup
@@ -19662,6 +19854,87 @@ fn value_type_bank(ty: &ValueType) -> u8 {
     }
 }
 
+/// Whether `transmute::<A, B>` is an ordinary copy in the lowered graph.
+///
+/// The predicate is deliberately the conjunction of two independent facts:
+///
+/// * `A` and `B` occupy the same real JIT register bank (`Int`/`Unsigned`/
+///   `Bool`, `Ref`/`Str`/`StringBuilder`, or `Float`); and
+/// * the exact sizes recovered from Charon's serialized scalar type or the
+///   target-selected `TypeDecl` layout are both known and equal.
+///
+/// Unknown layouts decline.  In particular, matching `ValueType`s alone is
+/// insufficient because that projection intentionally erases scalar widths
+/// and aggregate sizes.
+fn transmute_is_same_layout_bank(src: &TyRef, dst: &TyRef, llbc: &Llbc) -> bool {
+    let src_bank = value_type_bank(&tyref_to_value_type(src, llbc));
+    let dst_bank = value_type_bank(&tyref_to_value_type(dst, llbc));
+    matches!((src_bank, dst_bank), (0, 0) | (1, 1) | (2, 2))
+        && matches!(
+            (tyref_exact_layout_size(src, llbc), tyref_exact_layout_size(dst, llbc)),
+            (Some(src_size), Some(dst_size)) if src_size == dst_size
+        )
+}
+
+/// Exact byte size encoded by a Charon [`TyRef`].
+///
+/// Named ADTs use the target-selected LLBC layout.  Primitive widths are part
+/// of the serialized LLBC type itself; references/raw pointers/function
+/// pointers have the target word size when their representation is known to
+/// be thin.  Every other shape returns `None`, keeping the transmute residual.
+fn tyref_exact_layout_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let obj = node.as_object()?;
+
+    if let Some(lit) = obj.get("Literal") {
+        if let Some(atom) = lit.as_str() {
+            return match atom {
+                "Bool" => Some(1),
+                "Char" => Some(4),
+                _ => None,
+            };
+        }
+        let lit = lit.as_object()?;
+        let scalar_size = |kind: &str| match kind {
+            "I8" | "U8" => Some(1),
+            "I16" | "U16" | "F16" => Some(2),
+            "I32" | "U32" | "F32" => Some(4),
+            "I64" | "U64" | "F64" => Some(8),
+            "I128" | "U128" | "F128" => Some(16),
+            "Isize" | "Usize" => Some(crate::layout::target_word_size() as u64),
+            _ => None,
+        };
+        for key in ["Int", "UInt", "Integer", "Float"] {
+            if let Some(kind) = lit.get(key).and_then(serde_json::Value::as_str) {
+                return scalar_size(kind);
+            }
+        }
+        return None;
+    }
+
+    if let Some(def_id) = adt_node_def_id(node) {
+        let target = std::env::var("TARGET").unwrap_or_default();
+        return llbc.type_by_id(def_id)?.layout_for_target(&target)?.size;
+    }
+
+    let pointee = obj
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| parts.get(1))
+        .or_else(|| {
+            obj.get("RawPtr")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|parts| parts.first())
+        });
+    if pointee.is_some_and(|pointee| json_ty_is_statically_sized(pointee, llbc))
+        || obj.contains_key("FnPtr")
+    {
+        return Some(crate::layout::target_word_size() as u64);
+    }
+
+    None
+}
+
 /// The fully-qualified host-callable path for a bank-crossing cast, or
 /// `None` when `src` and `dst` share a bank (a JIT no-op aliased to the
 /// operand) or the bank pair has no host cast callable.  A bank crossing
@@ -19963,6 +20236,23 @@ fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|td| matches!(td.kind, TypeDeclKind::Enum(_)))
 }
 
+/// Whether `ty` resolves to a type Charon's resolved layout reports as
+/// zero-sized on every target it emitted.  A zero-sized field occupies no
+/// bytes of its owner, so an enum whose every variant field is zero-sized
+/// has no payload at all and is the same by-value tag integer a
+/// syntactically fieldless enum is.
+fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
+    let def_id = match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
+        TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
+    };
+    let target = std::env::var("TARGET").unwrap_or_default();
+    def_id
+        .and_then(|def_id| llbc.type_by_id(def_id))
+        .and_then(|td| td.layout_for_target(&target))
+        .is_some_and(|layout| layout.size == Some(0))
+}
+
 /// Free-function form of [`Lowering::tyref_is_fieldless_enum`] for the
 /// standalone [`tyref_to_value_type`] helper (which holds no `Lowering`):
 /// `true` when `ty` resolves to an enum with at least one variant and
@@ -20026,7 +20316,7 @@ fn tyref_is_borrowed_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
         return peeled_a_ref
             && inline_adt_def_id(v)
                 .and_then(|def_id| llbc.type_by_id(def_id))
-                .is_some_and(type_decl_is_fieldless_enum);
+                .is_some_and(|td| type_decl_is_fieldless_enum(td, llbc));
     }
 }
 
@@ -20121,7 +20411,7 @@ fn tyref_fieldless_enum_def<'l>(ty: &TyRef, llbc: &'l Llbc) -> Option<&'l TypeDe
         TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
     }?;
     llbc.type_by_id(def_id)
-        .filter(|td| type_decl_is_fieldless_enum(td))
+        .filter(|td| type_decl_is_fieldless_enum(td, llbc))
 }
 
 /// The integer-comparison `BinOp` opname a derived `PartialEq` method on
@@ -20138,13 +20428,17 @@ fn fieldless_enum_cmp_binop(method: &str) -> Option<&'static str> {
 }
 
 /// Whether a `TypeDecl` is a fieldless (C-like) enum: at least one
-/// variant, every variant carrying zero payload fields.  Such an enum is
-/// modelled by-value as its discriminant integer, so it has no
-/// `SomeInstance` at all.
-fn type_decl_is_fieldless_enum(td: &TypeDecl) -> bool {
+/// variant, every variant carrying zero payload bytes (no fields, or only
+/// zero-sized ones).  A zero-sized field occupies no bytes in the enum, so
+/// it is not a payload.  Such an enum is modelled by-value as its
+/// discriminant integer, so it has no `SomeInstance` at all.
+fn type_decl_is_fieldless_enum(td: &TypeDecl, llbc: &Llbc) -> bool {
     match &td.kind {
         TypeDeclKind::Enum(variants) => {
-            !variants.is_empty() && variants.iter().all(|v| v.fields.is_empty())
+            !variants.is_empty()
+                && variants
+                    .iter()
+                    .all(|v| v.fields.iter().all(|f| tyref_is_zero_sized(&f.ty, llbc)))
         }
         _ => false,
     }
@@ -25987,7 +26281,7 @@ fn debug_enum_variants_by_discr(llbc: &Llbc, owner_root: &str) -> Option<Vec<(i6
     let TypeDeclKind::Enum(variants) = &td.kind else {
         return None;
     };
-    if variants.is_empty() || variants.iter().any(|v| !v.fields.is_empty()) {
+    if !type_decl_is_fieldless_enum(td, llbc) {
         return None; // not fieldless
     }
     let by_discr: Vec<(i64, String)> = variants
@@ -29203,6 +29497,85 @@ mod tests {
         );
     }
 
+    /// The field-bearing primary driver const must lower exactly like the
+    /// zero-field unpack driver: one opaque constant receiver for each marker,
+    /// never a residual call to the const item's symbolic path.  Ignored by
+    /// default because it loads the extracted pyre-jit artefact; run with
+    /// `cargo test -p majit-translate --lib
+    /// pypyjitdriver_named_const_is_a_marker_receiver_constant -- --ignored`.
+    #[test]
+    #[ignore]
+    fn pypyjitdriver_named_const_is_a_marker_receiver_constant() {
+        use crate::model::{CallTarget, OpKind};
+
+        let llbc =
+            Llbc::load(crate::runtime_names::artifacts::JIT_ULLBC).expect("load pyre-jit LLBC");
+        let graph = super::lower_function(&llbc, "eval_loop_jit").expect("lower eval_loop_jit");
+        let driver_path = ["pyre_jit", "eval", "pypyjitdriver"];
+
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        ..
+                    } if args.is_empty()
+                        && super::fmt_path_ends_with(segments, &driver_path)
+                )),
+            "the driver const path must not survive as a nullary call"
+        );
+
+        let marker_receivers: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::Method {
+                            name,
+                            receiver_root: Some(root),
+                            ..
+                        },
+                    args,
+                    ..
+                } if root == "PyPyJitDriver"
+                    && matches!(name.as_str(), "jit_merge_point" | "can_enter_jit") =>
+                {
+                    args.first()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            marker_receivers.len(),
+            2,
+            "eval_loop_jit must retain both source marker calls after MIR lowering"
+        );
+        for receiver in marker_receivers {
+            let (block_id, op_index) = super::resolve_to_producer_op(&graph, receiver)
+                .expect("marker receiver has one producer");
+            let producer = &graph
+                .blocks
+                .iter()
+                .find(|block| block.id == block_id)
+                .expect("producer block")
+                .operations[op_index];
+            assert!(
+                matches!(
+                    producer.kind,
+                    OpKind::ConstRefAddr(super::JITDRIVER_NAMEDCONST_SENTINEL_ADDR)
+                ),
+                "marker receiver producer must be the driver sentinel: {producer:?}"
+            );
+        }
+    }
+
     /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
     /// its int census callers — `setitem_bytearray` / `byte_w`
     /// (`(0..=255)`, constant bounds) and `c_int_w` (`(i32::MIN as
@@ -29425,6 +29798,126 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    #[test]
+    fn zero_sized_fields_are_payload_free_but_mixed_fields_are_not() {
+        let span = || {
+            serde_json::json!({"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }})
+        };
+        let item_meta = |name: &str| {
+            serde_json::json!({
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": [name, 0]}
+                ],
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let adt = |def_id: u64, hash: u64| {
+            serde_json::json!({"HashConsedValue": [hash, {
+                "Adt": {
+                    "id": {"Adt": def_id},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }]})
+        };
+        let field =
+            |ty: serde_json::Value| serde_json::json!({"name": null, "ty": ty, "attr_info": null});
+        let variant = |name: &str, fields: Vec<serde_json::Value>, discriminant: u64| {
+            serde_json::json!({
+                "name": name,
+                "fields": fields,
+                "discriminant": {"Scalar": {"Unsigned": ["U8", discriminant.to_string()]}}
+            })
+        };
+        let layout = |size: u64, field_offsets: Vec<u64>| {
+            serde_json::json!([{
+                "key": "fixture-target",
+                "value": {
+                    "size": size,
+                    "align": 1,
+                    "variant_layouts": [{"field_offsets": field_offsets}],
+                    "repr": {"transparent": false}
+                }
+            }])
+        };
+        let phantom = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta("Phantom"),
+            "kind": {"Struct": []},
+            "layout": layout(0, vec![])
+        });
+        let only_zst = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta("OnlyZst"),
+            "kind": {"Enum": [variant("Value", vec![field(adt(0, 10))], 0)]},
+            "layout": layout(1, vec![0])
+        });
+        let mixed = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta("Mixed"),
+            "kind": {"Enum": [variant(
+                "Value",
+                vec![
+                    field(adt(0, 11)),
+                    field(serde_json::json!({"Literal": {"Int": "I64"}}))
+                ],
+                0
+            )]},
+            "layout": layout(16, vec![0, 8])
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [phantom, only_zst, mixed],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let phantom_ty = serde_json::from_value::<TyRef>(adt(0, 20)).expect("phantom TyRef");
+        let only_zst_ty = serde_json::from_value::<TyRef>(adt(1, 21)).expect("ZST enum TyRef");
+        let mixed_ty = serde_json::from_value::<TyRef>(adt(2, 22)).expect("mixed enum TyRef");
+
+        assert!(super::tyref_is_zero_sized(&phantom_ty, &llbc));
+        assert!(super::type_decl_is_fieldless_enum(
+            llbc.type_by_id(1).expect("OnlyZst declaration"),
+            &llbc
+        ));
+        assert!(!super::type_decl_is_fieldless_enum(
+            llbc.type_by_id(2).expect("Mixed declaration"),
+            &llbc
+        ));
+        assert_eq!(
+            super::tyref_to_value_type(&only_zst_ty, &llbc),
+            ValueType::Int
+        );
+        assert!(matches!(
+            super::tyref_to_value_type(&mixed_ty, &llbc),
+            ValueType::Ref(_)
+        ));
     }
 
     /// An `ArrayRead` element is addressable two ways: a scalar names its
@@ -29781,6 +30274,233 @@ mod tests {
         assert_eq!(super::abstract_trait_call_target(&call, &llbc), None);
     }
 
+    /// Two one-call graphs sharing a synthetic `core::intrinsics::transmute`
+    /// declaration.  The first has the portal's scalar-to-fieldless-enum
+    /// shape; the second is an equal-size register-bank crossing.
+    fn transmute_lowering_fixture() -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let u8_ty = serde_json::json!({"Literal": {"UInt": "U8"}});
+        let u64_ty = serde_json::json!({"Literal": {"UInt": "U64"}});
+        let f64_ty = serde_json::json!({"Literal": {"Float": "F64"}});
+        let instruction_ty = serde_json::json!({
+            "Adt": {
+                "id": {"Adt": 0},
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let caller = |def_id: u64,
+                      name: &str,
+                      src_ty: serde_json::Value,
+                      dst_ty: serde_json::Value| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(&["fixture", name], true),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [src_ty.clone()],
+                    "output": dst_ty.clone()
+                },
+                "body": {
+                    "Unstructured": {
+                        "span": span(),
+                        "locals": {
+                            "arg_count": 1,
+                            "locals": [
+                                {"index": 0, "name": null, "span": span(), "ty": dst_ty.clone()},
+                                {"index": 1, "name": "value", "span": span(), "ty": src_ty.clone()}
+                            ]
+                        },
+                        "body": [
+                            {
+                                "statements": [],
+                                "terminator": {
+                                    "span": span(),
+                                    "kind": {
+                                        "Call": {
+                                            "call": {
+                                                "func": {
+                                                    "Regular": {
+                                                        "kind": {"Fun": {"Regular": 2}},
+                                                        "generics": {
+                                                            "regions": [],
+                                                            "types": [src_ty.clone(), dst_ty.clone()],
+                                                            "const_generics": [],
+                                                            "trait_refs": []
+                                                        }
+                                                    }
+                                                },
+                                                "args": [{
+                                                    "Copy": {"kind": {"Local": 1}, "ty": src_ty.clone()}
+                                                }],
+                                                "dest": {"kind": {"Local": 0}, "ty": dst_ty.clone()}
+                                            },
+                                            "target": 2,
+                                            "on_unwind": 1
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "statements": [],
+                                "terminator": {"span": span(), "kind": "UnwindResume"}
+                            },
+                            {
+                                "statements": [],
+                                "terminator": {"span": span(), "kind": "Return"}
+                            }
+                        ]
+                    }
+                }
+            })
+        };
+        let instruction = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "Instruction"], true),
+            "kind": {
+                "Enum": [
+                    {"name": "LoadConst", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}},
+                    {"name": "ReturnValue", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}}
+                ]
+            },
+            "layout": [{
+                "key": "fixture-target",
+                "value": {
+                    "size": 1,
+                    "align": 1,
+                    "variant_layouts": [
+                        {"field_offsets": []},
+                        {"field_offsets": []}
+                    ],
+                    "repr": {"transparent": false}
+                }
+            }]
+        });
+        let transmute = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["core", "intrinsics", "transmute"], false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [{"TypeVar": {"Free": 0}}],
+                "output": {"TypeVar": {"Free": 1}}
+            },
+            "body": {"Intrinsic": {"name": "transmute", "arg_names": ["src"]}}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [instruction],
+                "fun_decls": [
+                    caller(0, "transmute_u8_to_instruction", u8_ty, instruction_ty),
+                    caller(1, "transmute_u64_to_f64", u64_ty, f64_ty),
+                    transmute
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("transmute fixture Llbc parses")
+    }
+
+    #[test]
+    fn same_size_int_bank_transmute_lowers_to_same_as() {
+        let llbc = transmute_lowering_fixture();
+        let graph = super::lower_function(&llbc, "transmute_u8_to_instruction")
+            .expect("lower u8-to-Instruction transmute");
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+
+        assert!(!ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })));
+        let copies: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::UnaryOp {
+                    op,
+                    operand,
+                    result_ty,
+                } if op == "same_as" => Some((operand, result_ty)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies.len(), 1, "transmute must become one scalar copy");
+        assert_eq!(*copies[0].1, ValueType::Int);
+        let input = ops
+            .iter()
+            .find_map(|op| match (&op.result, &op.kind) {
+                (Some(result), OpKind::Input { name, .. }) if name == "value" => Some(result),
+                _ => None,
+            })
+            .expect("value input");
+        assert_eq!(copies[0].0.id(), input.id());
+    }
+
+    #[test]
+    fn equal_size_int_to_float_transmute_stays_residual() {
+        let llbc = transmute_lowering_fixture();
+        let graph = super::lower_function(&llbc, "transmute_u64_to_f64")
+            .expect("lower u64-to-f64 transmute");
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+
+        assert!(
+            !ops.iter()
+                .any(|op| { matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") })
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &["core", "intrinsics", "transmute"]
+                    )
+                })
+                .count(),
+            1,
+            "bank-crossing transmute must retain the residual intrinsic call"
+        );
+    }
+
     #[test]
     fn transparent_scalar_struct_uses_inner_register_bank() {
         let type_decl = serde_json::json!({
@@ -29979,9 +30699,12 @@ mod tests {
             Llbc::from_slice(artifact(serde_json::json!("Opaque")).to_string().as_bytes()).unwrap();
         let llbcs = vec![defining, opaque];
         super::link_transparent_scalar_types(&llbcs);
+        let jitdriver_receiver_roots =
+            crate::codewriter::jtransform::default_jitdriver_receiver_roots();
         super::build_semantic_program_from_llbc_with_static_addrs_filtered(
             &llbcs[1],
             crate::HostStaticAddrs::default(),
+            &jitdriver_receiver_roots,
             None,
             None,
         )

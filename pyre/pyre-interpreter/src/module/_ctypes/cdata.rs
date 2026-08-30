@@ -444,6 +444,11 @@ fn init_simplecdata_type(ns: PyObjectRef) {
         "__new__",
         crate::typedef::make_new_descr(simplecdata_new),
     );
+    type_ns_store(
+        ns,
+        "__init__",
+        crate::make_builtin_function("__init__", simplecdata_init),
+    );
     // A scalar `out` parameter hands back the value rather than the box; one
     // whose type is a user subclass hands back the instance, because the
     // subclass is the thing the caller asked for.
@@ -555,7 +560,10 @@ pub(super) fn simple_from_param(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     Ok(super::interp_ctypes::make_carg(addr, converted))
 }
 
-/// `_SimpleCData.__new__(cls, value=None)`.
+/// `GenericPyCData_new` — allocate the instance and leave the buffer zeroed.
+///
+/// The value the caller passed is read by `Simple_init` instead, so it is
+/// accepted and ignored here.
 fn simplecdata_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() || !unsafe { pyre_object::is_type(args[0]) } {
         return Err(crate::PyError::type_error(
@@ -564,9 +572,35 @@ fn simplecdata_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
     let cls = args[0];
     let tc = type_code_of(cls).ok_or_else(|| crate::PyError::type_error("abstract class"))?;
+    new_simplecdata_obj(cls, &tc, None)
+}
+
+/// `Simple_init(self, value=...)`.
+///
+/// Storing the value here rather than in `__new__` is what makes `__init__` on
+/// a live instance write through the buffer that instance is a view of —
+/// `ctypes.c_int.from_buffer(buf).__init__(7)` fills `buf`, which is how
+/// `multiprocessing.sharedctypes.RawValue` initialises shared memory — and
+/// what leaves the buffer zeroed for a subclass whose own `__init__` does not
+/// delegate.
+///
+/// `PyArg_UnpackTuple` takes one optional positional and no keyword at all, so
+/// `c_int(value=3)` stores nothing and `c_int(1, 2)` is a `TypeError`.
+fn simplecdata_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&obj) = args.first() else {
+        return Err(crate::PyError::type_error("__init__ requires self"));
+    };
     let (pos, _kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    let value = pos.first().copied();
-    new_simplecdata_obj(cls, &tc, value)
+    if pos.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "__init__ expected at most 1 argument, got {}",
+            pos.len()
+        )));
+    }
+    if let Some(&value) = pos.first() {
+        set_simple_value(obj, value)?;
+    }
+    Ok(pyre_object::w_none())
 }
 
 /// Build a fresh `_SimpleCData` instance of `cls` with type code `tc`,
@@ -675,8 +709,13 @@ fn value_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `_SimpleCData.value` setter — `(descr, instance, value)`.
 fn value_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let obj = args[1];
-    let value = args[2];
+    set_simple_value(args[1], args[2])?;
+    Ok(pyre_object::w_none())
+}
+
+/// `Simple_set_value` — encode `value` under the instance's own type code and
+/// write it through the instance's buffer view.
+fn set_simple_value(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate::PyError> {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let tc = type_code_of(cls).ok_or_else(|| crate::PyError::type_error("abstract class"))?;
     // `value` is an arbitrary object, so under `"O"` it can be a `list` or a
@@ -698,7 +737,7 @@ fn value_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
         unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, value) };
     }
-    Ok(pyre_object::w_none())
+    Ok(())
 }
 
 // ── buffer helpers (b_ptr / b_size / b_base equivalents) ───────────────

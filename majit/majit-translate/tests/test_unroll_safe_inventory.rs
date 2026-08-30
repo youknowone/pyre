@@ -86,6 +86,31 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "frame_locals_proxy_snapshot",
         "fast2locals' scan of the same locals-plus array",
     ),
+    // `pyopcode.py` `dispatch_bytecode` is `@jit.unroll_safe`; its
+    // EXTENDED_ARG loop is split here into the interpreter decoder and the
+    // two scalar projections consumed by `eval_loop_jit`.  The projections
+    // exist because the generated JIT's residual ABI cannot publish the
+    // decoder's Result<(usize, Instruction, OpArg)> as one value.  Each loop
+    // is bounded by the bytecode format's at-most-three EXTENDED_ARG units.
+    //
+    // Evidence for all three descent-scope changes: the complete cranelift
+    // `pyre/check.py` corpus passed in PR #1580's CI with every committed
+    // per-fixture jitstats baseline unchanged, including the corpus-wide
+    // `fbw_rolled_back_with_effects == 0` gate.  The public decoder has no
+    // jitcode in the generated metadata; both scalar projections do, so the
+    // evidence covers the reached pair as well as the unreachable graph.
+    (
+        "decode_instruction_forward",
+        "pyopcode.py dispatch_bytecode EXTENDED_ARG loop",
+    ),
+    (
+        "decode_instruction_forward_pc",
+        "pyopcode.py dispatch_bytecode EXTENDED_ARG loop (PC projection)",
+    ),
+    (
+        "decode_instruction_forward_packed",
+        "pyopcode.py dispatch_bytecode EXTENDED_ARG loop (opcode/oparg projection)",
+    ),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`

@@ -772,11 +772,21 @@ fn sem_unlink(name: &str) -> Result<(), crate::PyError> {
 /// arguments on Windows, where a `Connection` is a socket rather than a
 /// descriptor.  A failure is reported by `WSAGetLastError`, so it carries a
 /// Win32 code rather than an errno.
+///
+/// All three release the interpreter around the call, as
+/// `_multiprocessing_recv_impl` and its two neighbours do.  A `Connection` is
+/// what a manager server and its proxies talk over, so a `recv` that waits for
+/// the peer's next request otherwise holds the interpreter for as long as the
+/// peer takes to send one — which, when the peer is itself waiting on this
+/// process, is forever.
 #[cfg(all(windows, feature = "host_env"))]
 #[crate::pyre_function]
 fn closesocket(handle: i64) -> Result<(), crate::PyError> {
-    host_mp::close_socket(handle as usize as host_mp::RawSocket)
-        .map_err(|error| windows_error(error.raw_os_error().unwrap_or(0)))
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        host_mp::close_socket(handle as usize as host_mp::RawSocket)
+    };
+    result.map_err(|error| windows_error(error.raw_os_error().unwrap_or(0)))
 }
 
 #[cfg(all(windows, feature = "host_env"))]
@@ -784,15 +794,26 @@ fn closesocket(handle: i64) -> Result<(), crate::PyError> {
 fn recv(handle: i64, size: i64) -> Result<PyObjectRef, crate::PyError> {
     let size =
         usize::try_from(size).map_err(|_| crate::PyError::value_error("negative buffer size"))?;
-    let data = host_mp::recv_socket(handle as usize as host_mp::RawSocket, size)
-        .map_err(|error| windows_error(error.raw_os_error().unwrap_or(0)))?;
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        host_mp::recv_socket(handle as usize as host_mp::RawSocket, size)
+    };
+    let data = result.map_err(|error| windows_error(error.raw_os_error().unwrap_or(0)))?;
     Ok(pyre_object::w_bytes_from_bytes(&data))
 }
 
 #[cfg(all(windows, feature = "host_env"))]
 #[crate::pyre_function]
 fn send(handle: i64, buf: &[u8]) -> Result<i64, crate::PyError> {
-    host_mp::send_socket(handle as usize as host_mp::RawSocket, buf)
+    // Copied out before the interpreter is released: the borrow reaches into
+    // the argument object, and a collection running in another thread can move
+    // it.  `Py_buffer` holds the original still for the same span.
+    let buf = buf.to_vec();
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        host_mp::send_socket(handle as usize as host_mp::RawSocket, &buf)
+    };
+    result
         .map(i64::from)
         .map_err(|error| windows_error(error.raw_os_error().unwrap_or(0)))
 }

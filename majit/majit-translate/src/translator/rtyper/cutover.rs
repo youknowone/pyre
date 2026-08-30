@@ -2383,6 +2383,7 @@ pub(crate) fn lift_callee_to_pygraph(
     } else {
         AlwaysInline::Absent
     };
+    func._dont_inline_ = callee_graph.func.dont_inline;
     graph.borrow_mut().func = Some(func.clone());
     let pygraph = Rc::new(PyGraph {
         graph,
@@ -6115,6 +6116,7 @@ mod tests {
         };
         callee_graph.blocks = vec![foo_start, foo_return];
         callee_graph.hints.push("always_inline".to_string());
+        callee_graph.func.dont_inline = true;
         let leaf_registry = crate::translator::rtyper::call_registry::CallRegistry::new(
             std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
         );
@@ -6136,6 +6138,10 @@ mod tests {
             "legacy always_inline hint must land on graph.func"
         );
         assert!(
+            pygraph.func._dont_inline_,
+            "legacy dont_inline carrier must land on graph.func"
+        );
+        assert!(
             pygraph
                 .graph
                 .borrow()
@@ -6143,6 +6149,15 @@ mod tests {
                 .as_ref()
                 .is_some_and(|func| func._always_inline_ == AlwaysInline::True),
             "legacy always_inline hint must land on the registered FunctionGraph.func"
+        );
+        assert!(
+            pygraph
+                .graph
+                .borrow()
+                .func
+                .as_ref()
+                .is_some_and(|func| func._dont_inline_),
+            "legacy dont_inline carrier must land on the registered FunctionGraph.func"
         );
         // Capture the callee's flowspace graph `Rc` before the pygraph
         // is moved into `register_callee`; this is the identity that

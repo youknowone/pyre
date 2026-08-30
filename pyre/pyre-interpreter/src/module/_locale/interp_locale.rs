@@ -376,7 +376,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `interp_locale.py W_Error = _new_exception('Error', W_Exception, 'locale error')`
     let exception_base = crate::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _locale init");
-    let w_error = crate::builtins::make_exc_type(
+    let w_error = crate::builtins::new_exception_class(
         "locale.Error",
         crate::builtins::exc_exception_new,
         exception_base,

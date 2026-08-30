@@ -1589,7 +1589,7 @@ crate::py_module! {
         // `space.new_exception_class("struct.error", space.w_Exception)`.
         let base = crate::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before _struct init");
-        let error = crate::builtins::make_exc_type(
+        let error = crate::builtins::new_exception_class(
             "struct.error",
             crate::builtins::exc_exception_new,
             base,

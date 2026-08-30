@@ -14,7 +14,8 @@ use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::executioncontext::ActionFlagOps;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{
-    PyError, PyResult, StepResult, decode_instruction_forward, execute_opcode_step,
+    PyError, PyResult, StepResult, decode_instruction_forward_packed,
+    decode_instruction_forward_pc, execute_opcode_step,
 };
 use pyre_interpreter::{locals_w, locals_w_mut};
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -264,6 +265,16 @@ impl FrameRoot {
 impl Drop for FrameRoot {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+/// Access to the caller's top shadow-stack frame root for the portal loop.
+struct FrameView;
+
+impl FrameView {
+    #[inline]
+    fn top_frame() -> *mut PyFrame {
+        majit_gc::shadow_stack::top_ref().0 as *mut PyFrame
     }
 }
 
@@ -1632,6 +1643,41 @@ pub(crate) enum LoopResult {
     /// pyre delivers it to `handle_exception` at the eval loop for the same
     /// effect.
     ExitFrameWithException(pyre_interpreter::PyError),
+}
+
+fn set_pending_loop_exit(ec: *const PyExecutionContext, loop_result: LoopResult) {
+    let pending = match loop_result {
+        LoopResult::Done(result) => {
+            pyre_interpreter::executioncontext::PendingLoopExit::Done(result)
+        }
+        LoopResult::ContinueRunningNormally => {
+            pyre_interpreter::executioncontext::PendingLoopExit::ContinueRunningNormally
+        }
+        LoopResult::ExitFrameWithException(err) => {
+            pyre_interpreter::executioncontext::PendingLoopExit::ExitFrameWithException(err)
+        }
+    };
+    // The EC carrier is included in the interpreter root walk because its
+    // PyResult/PyError payload can hold moving GC references.  This store and
+    // the caller's take are also adjacent with no collection point in between:
+    // the marker returns only its boolean before the read.
+    unsafe { (&mut *(ec as *mut PyExecutionContext)).set_pending_loop_exit(pending) };
+}
+
+fn take_pending_loop_exit(ec: *const PyExecutionContext) -> LoopResult {
+    match unsafe { (&mut *(ec as *mut PyExecutionContext)).take_pending_loop_exit() }
+        .expect("true can_enter_jit result must carry a pending loop exit")
+    {
+        pyre_interpreter::executioncontext::PendingLoopExit::Done(result) => {
+            LoopResult::Done(result)
+        }
+        pyre_interpreter::executioncontext::PendingLoopExit::ContinueRunningNormally => {
+            LoopResult::ContinueRunningNormally
+        }
+        pyre_interpreter::executioncontext::PendingLoopExit::ExitFrameWithException(err) => {
+            LoopResult::ExitFrameWithException(err)
+        }
+    }
 }
 
 /// Action from handle_jit_outcome for eval_loop_jit dispatch.
@@ -6162,10 +6208,10 @@ impl PyPyJitDriver {
     }
 
     /// interp_jit.py:114-117 — can_enter_jit at back-edge.
-    /// The untranslated body is intentionally a runtime no-op.  The translator
-    /// lowers it to `jit_marker('can_enter_jit', ...)`, which jtransform aliases
-    /// to the JitCode `loop_header` operation.  The live runtime warmstate call
-    /// remains alongside it until generic `warmspot.apply_jit` is wired.
+    /// The translator lowers the call to the JitCode `loop_header` operation
+    /// and defines its result as false.  The untranslated interpreter body is
+    /// the `rewrite_can_enter_jits` side: it drives warmstate outside the portal
+    /// jitcode and reports a compiled-loop exit through the execution context.
     ///
     /// The argument order mirrors `jit_merge_point` so both markers carry one
     /// shape, but this marker's operands are discarded: it lowers to
@@ -6179,8 +6225,41 @@ impl PyPyJitDriver {
         pycode: pyre_object::PyObjectRef,
         frame: &mut PyFrame,
         ec: *const PyExecutionContext,
-    ) {
-        let _ = (frame, ec, next_instr, pycode, is_being_profiled);
+    ) -> bool {
+        // The translated marker signature must retain the red `frame` name,
+        // although the untranslated warm-state path reloads it through the
+        // shadow-stack root below after possible collection points.
+        let _ = frame;
+        let env = PyreEnv;
+        let (driver, info) = driver_pair();
+        let loop_pycode = pycode as *const ();
+        let green_key_hash = make_green_key(loop_pycode, next_instr, is_being_profiled);
+        let green_key = driver.resolve_cell_key(green_key_hash, || {
+            pyre_jit_trace::driver::make_green_key_typed(loop_pycode, next_instr, is_being_profiled)
+        });
+        if portal_metatrace_enabled()
+            && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                >= portal_metatrace_skip()
+            && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            drive_portal_metatrace(driver, green_key_hash, next_instr);
+        }
+        // The Stage-0 drive records IR and executes residuals concretely, so it
+        // is a collection point; reload the same shadow-stack root before the
+        // compile path reads the frame.
+        let f: *mut PyFrame = FrameView::top_frame();
+        let Some(loop_result) = maybe_compile_and_run(
+            unsafe { &mut *f },
+            green_key,
+            next_instr,
+            driver,
+            info,
+            &env,
+        ) else {
+            return false;
+        };
+        set_pending_loop_exit(ec, loop_result);
+        true
     }
 }
 
@@ -6529,7 +6608,11 @@ pub fn should_unroll_one_iteration(
         ptr if ptr.is_null() => false,
         code_ptr => {
             let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
-            code.flags.contains(pyre_interpreter::CodeFlags::GENERATOR)
+            // ITERABLE_COROUTINE and ASYNC_GENERATOR are deliberately not
+            // tested: the hook selects only the two bits upstream selects.
+            code.flags.intersects(
+                pyre_interpreter::CodeFlags::COROUTINE | pyre_interpreter::CodeFlags::GENERATOR,
+            )
         }
     }
 }
@@ -7035,6 +7118,404 @@ fn jd1_experiment_enabled() -> bool {
         }
         std::env::var("PYRE_JD1").as_deref() == Ok("1")
     })
+}
+
+fn portal_metatrace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE").as_deref() == Ok("1"))
+}
+
+/// Where the Stage-0 probe enters the portal jitcode.
+///
+/// `merge` (default) starts the walk AT the `jit_merge_point`, seeding only
+/// the registers that op declares. `start` is the faithful shape:
+/// `initialize_state_from_start` is `f = self.newframe(mainjitcode);
+/// f.setup_call(original_boxes)` — entry at pc 0 with the portal's own
+/// arguments, so the prologue runs and the walk reaches the merge point on its
+/// own. A split portal declares greens followed by reds; an unsplit portal
+/// keeps `eval_loop_jit`'s single `frame` argument.
+fn portal_metatrace_entry_at_start() -> bool {
+    static AT_START: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AT_START.get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE_ENTRY").as_deref() == Ok("start"))
+}
+
+static PORTAL_METATRACE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Back-edges to let pass before the one-shot probe fires. The first
+/// back-edge in the process belongs to interpreter bootstrap (a class body
+/// under `build_class_inner`), not to the user's loop; `PYRE_PORTAL_METATRACE_SKIP`
+/// walks the probe forward to the back-edge worth measuring. Default 0 keeps
+/// the first back-edge.
+fn portal_metatrace_skip() -> u64 {
+    static SKIP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var("PYRE_PORTAL_METATRACE_SKIP")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+static PORTAL_METATRACE_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct PortalMetatraceSym {
+    header_pc: usize,
+}
+
+impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
+    fn total_slots(&self) -> usize {
+        0
+    }
+
+    fn loop_header_pc(&self) -> usize {
+        self.header_pc
+    }
+
+    fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
+        None
+    }
+}
+
+/// Stage-0 diagnostic drive of the build-time jd0 portal jitcode. Set
+/// `MAJIT_OPTRACE=1` for `[optrace] depth=… cursor=… pc=… opcode=… jitcode=…`
+/// per step, and `MAJIT_TLDBG=1` for `run_to_end end action=… step_count=…
+/// num_recorded_ops=…` alongside this summary.
+fn drive_portal_metatrace(
+    driver: &mut JitDriver<PyreJitState>,
+    green_key: u64,
+    loop_header_pc: usize,
+) {
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode() {
+            Some(jitcode) => jitcode,
+            None => {
+                eprintln!("[jd0-mt] portal jitcode unresolved");
+                return;
+            }
+        };
+        let portal_index = canonical
+            .try_index()
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        eprintln!(
+            "[jd0-mt] portal jitcode name={} index={} code_len={}",
+            canonical.name,
+            portal_index,
+            canonical.code.len(),
+        );
+        let portal_arg_classes = canonical.calldescr().arg_classes.clone();
+        let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+
+        let header_pc = match pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
+            .find(|op| op.opname == "jit_merge_point")
+            .map(|op| op.pc)
+        {
+            Some(pc) => pc,
+            None => {
+                eprintln!("[jd0-mt] jit_merge_point not found");
+                return;
+            }
+        };
+
+        // Decode the six register lists of the `jit_merge_point` op:
+        // opcode(1) + jdindex(1), then `[len:u8][reg:u8 * len]` in green
+        // I/R/F, red I/R/F order, matching `trace_jitcode_from_merge_point`.
+        let mut slot_regs: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
+        {
+            let code = &canonical.code;
+            let mut cur = header_pc + 2;
+            for regs in slot_regs.iter_mut() {
+                let len = code[cur] as usize;
+                cur += 1;
+                for _ in 0..len {
+                    regs.push(code[cur] as usize);
+                    cur += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[jd0-mt] header_pc={} merge-point regs greenI={:?} greenR={:?} greenF={:?} redI={:?} redR={:?} redF={:?}",
+            header_pc,
+            slot_regs[0],
+            slot_regs[1],
+            slot_regs[2],
+            slot_regs[3],
+            slot_regs[4],
+            slot_regs[5],
+        );
+
+        let meta = driver.meta_interp_mut();
+        if meta.is_tracing() {
+            eprintln!("[jd0-mt] bail: already tracing");
+            return;
+        }
+
+        // Everything above can allocate.  Reload the caller-owned shadow-stack
+        // root only after those calls, immediately before the concrete portal
+        // inputs are captured; never trust a raw frame pointer supplied by the
+        // caller across a collection point.
+        let live_frame = FrameView::top_frame();
+        let next_instr = loop_header_pc as i64;
+        let is_being_profiled = i64::from(unsafe { &*live_frame }.get_is_being_profiled());
+        let pycode = unsafe { &*live_frame }.pycode as pyre_object::PyObjectRef;
+        let ec = pyre_interpreter::call::getexecutioncontext();
+        eprintln!(
+            "[jd0-mt] greens next_instr={} is_being_profiled={} pycode=0x{:x}",
+            next_instr, is_being_profiled, pycode as usize,
+        );
+        eprintln!(
+            "[jd0-mt] reds frame=0x{:x} ec=0x{:x}",
+            live_frame as usize, ec as usize,
+        );
+
+        let live_values = [
+            majit_ir::Value::Ref(majit_ir::GcRef(live_frame as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)),
+        ];
+        let action = meta.force_start_tracing(
+            green_key,
+            (pycode as usize, loop_header_pc),
+            None,
+            &live_values,
+        );
+        let action_name = match &action {
+            majit_metainterp::BackEdgeAction::Interpret => "Interpret",
+            majit_metainterp::BackEdgeAction::StartedTracing => "StartedTracing",
+            majit_metainterp::BackEdgeAction::AlreadyTracing => "AlreadyTracing",
+            majit_metainterp::BackEdgeAction::RunCompiled => "RunCompiled",
+        };
+        eprintln!("[jd0-mt] force_start_tracing -> {action_name}");
+        if !matches!(action, majit_metainterp::BackEdgeAction::StartedTracing) {
+            return;
+        }
+
+        let mut sym = PortalMetatraceSym { header_pc };
+        let walked = meta.with_trace_ctx_and_token_resolver(
+            |ctx,
+             resolve_token,
+             recursive_target,
+             recursive_decision,
+             recursive_exec,
+             recursive_exec_ref,
+             recursive_exec_float,
+             recursive_exec_void| {
+                let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
+                    |_pc: usize| 0usize,
+                    resolve_token,
+                    recursive_target,
+                    recursive_decision,
+                    recursive_exec,
+                    recursive_exec_ref,
+                    recursive_exec_float,
+                    recursive_exec_void,
+                );
+
+                let jitcode_arc = std::sync::Arc::new(jitcode.clone());
+                let mut frame =
+                    majit_metainterp::MIFrame::setup(jitcode_arc, header_pc, None, Some(ctx));
+
+                let next_instr_opref = ctx.const_int(next_instr);
+                let is_being_profiled_opref = ctx.const_int(is_being_profiled);
+                let pycode_opref = ctx.const_ref(pycode as usize as i64);
+                let frame_opref = majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref);
+                let ec_opref = majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref);
+
+                let green_int_values = [
+                    (next_instr_opref, next_instr),
+                    (is_being_profiled_opref, is_being_profiled),
+                ];
+                for (&reg, &(opref, value)) in slot_regs[0].iter().zip(green_int_values.iter()) {
+                    if reg < frame.int_regs.len() && reg < frame.int_values.len() {
+                        frame.int_regs[reg] = Some(opref);
+                        frame.int_values[reg] = Some(value);
+                    } else {
+                        eprintln!(
+                            "[jd0-mt] skipped seed greenI reg={} regs_len={} values_len={}",
+                            reg,
+                            frame.int_regs.len(),
+                            frame.int_values.len(),
+                        );
+                    }
+                }
+                let green_ref_values = [(pycode_opref, pycode as usize as i64)];
+                for (&reg, &(opref, value)) in slot_regs[1].iter().zip(green_ref_values.iter()) {
+                    if reg < frame.ref_regs.len() && reg < frame.ref_values.len() {
+                        frame.ref_regs[reg] = Some(opref);
+                        frame.ref_values[reg] = Some(value);
+                    } else {
+                        eprintln!(
+                            "[jd0-mt] skipped seed greenR reg={} regs_len={} values_len={}",
+                            reg,
+                            frame.ref_regs.len(),
+                            frame.ref_values.len(),
+                        );
+                    }
+                }
+                let red_ref_values = [
+                    (frame_opref, live_frame as usize as i64),
+                    (ec_opref, ec as usize as i64),
+                ];
+                for (&reg, &(opref, value)) in slot_regs[4].iter().zip(red_ref_values.iter()) {
+                    if reg < frame.ref_regs.len() && reg < frame.ref_values.len() {
+                        frame.ref_regs[reg] = Some(opref);
+                        frame.ref_values[reg] = Some(value);
+                    } else {
+                        eprintln!(
+                            "[jd0-mt] skipped seed redR reg={} regs_len={} values_len={}",
+                            reg,
+                            frame.ref_regs.len(),
+                            frame.ref_values.len(),
+                        );
+                    }
+                }
+                frame.code_cursor = header_pc;
+                frame.pc = header_pc;
+
+                // `pyjitpl.py initialize_state_from_start`:
+                //   f = self.newframe(self.jitdriver_sd.mainjitcode)
+                //   f.setup_call(original_boxes)
+                // `setup_call` packs argboxes into the typed banks in
+                // declaration order. The split portal takes its greens then
+                // reds; the unsplit portal takes the live `PyFrame` at r0.
+                //
+                // The merge-point seeds above are left standing: every
+                // register they write is re-written by the prologue before the
+                // marker, and `setup_call` overwrites r0 at entry.
+                let entry_pc = if portal_metatrace_entry_at_start() {
+                    let declared_kinds = portal_arg_classes
+                        .chars()
+                        .map(|class| match class {
+                            'i' | 'S' => majit_metainterp::JitArgKind::Int,
+                            'r' => majit_metainterp::JitArgKind::Ref,
+                            'f' | 'L' => majit_metainterp::JitArgKind::Float,
+                            other => panic!("unsupported portal argument class {other:?}"),
+                        })
+                        .collect::<Vec<_>>();
+                    let start_args = match declared_kinds.as_slice() {
+                        [frame_kind] => {
+                            assert_eq!(*frame_kind, majit_metainterp::JitArgKind::Ref);
+                            vec![(*frame_kind, frame_opref, live_frame as usize as i64)]
+                        }
+                        [
+                            next_instr_kind,
+                            profiled_kind,
+                            pycode_kind,
+                            frame_kind,
+                            ec_kind,
+                        ] => vec![
+                            (*next_instr_kind, next_instr_opref, next_instr),
+                            (*profiled_kind, is_being_profiled_opref, is_being_profiled),
+                            (*pycode_kind, pycode_opref, pycode as usize as i64),
+                            (*frame_kind, frame_opref, live_frame as usize as i64),
+                            (*ec_kind, ec_opref, ec as usize as i64),
+                        ],
+                        _ => panic!(
+                            "portal start expected one or five arguments, got {:?}",
+                            portal_arg_classes
+                        ),
+                    };
+                    let seeded_arg_classes = start_args
+                        .iter()
+                        .map(|(kind, _, _)| match kind {
+                            majit_metainterp::JitArgKind::Int => 'i',
+                            majit_metainterp::JitArgKind::Ref => 'r',
+                            majit_metainterp::JitArgKind::Float => 'f',
+                        })
+                        .collect::<String>();
+                    let seeded_values = start_args
+                        .iter()
+                        .map(|(_, _, value)| *value)
+                        .collect::<Vec<_>>();
+                    frame.setup_call(&start_args);
+                    // `setup_call` sets `pc = 0`; the walker reads
+                    // `code_cursor`, which it does not touch.
+                    frame.code_cursor = 0;
+                    eprintln!(
+                        "[jd0-mt] entry=start pc=0 setup_call arg_classes=\"{}\" args={:?}",
+                        seeded_arg_classes, seeded_values,
+                    );
+                    0
+                } else {
+                    header_pc
+                };
+
+                let mut standalone = majit_metainterp::StandaloneFrameStack::new();
+                standalone.frames.push(frame);
+                let before = ctx.num_recorded_ops();
+                let mut machine =
+                    majit_metainterp::JitCodeMachine::<PortalMetatraceSym, _>::with_framestack(
+                        &mut standalone.frames,
+                        &[],
+                        &[],
+                    );
+                machine.set_outer_program_pc(entry_pc);
+                let action = machine.run_to_end(ctx, &mut sym, &runtime);
+                drop(machine);
+                let after = ctx.num_recorded_ops();
+                let depth = standalone.frames.len();
+                let (stop_jitcode, stop_cursor, stop_pc) = if standalone.frames.is_empty() {
+                    ("<empty>".to_owned(), 0, 0)
+                } else {
+                    let stopped = standalone.frames.current_mut();
+                    (
+                        stopped.jitcode.name().to_owned(),
+                        stopped.code_cursor,
+                        stopped.pc,
+                    )
+                };
+                (
+                    action,
+                    before,
+                    after,
+                    depth,
+                    stop_jitcode,
+                    stop_cursor,
+                    stop_pc,
+                )
+            },
+        );
+
+        if meta.is_tracing() {
+            meta.abort_trace(false);
+        }
+
+        match walked {
+            Some((action, before, after, depth, stop_jitcode, stop_cursor, stop_pc)) => {
+                eprintln!(
+                    "[jd0-mt] walk action={:?} recorded_ops={} depth={} stop_jitcode={} stop_cursor={} stop_pc={}",
+                    action,
+                    after.saturating_sub(before),
+                    depth,
+                    stop_jitcode,
+                    stop_cursor,
+                    stop_pc,
+                );
+            }
+            None => {
+                eprintln!(
+                    "[jd0-mt] walk action=unavailable recorded_ops=0 depth=0 stop_jitcode=<none> stop_cursor=0 stop_pc=0"
+                );
+            }
+        }
+    }));
+
+    if let Err(payload) = result {
+        let meta = driver.meta_interp_mut();
+        if meta.is_tracing() {
+            meta.abort_trace(false);
+        }
+        let message = if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_owned()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "<non-string panic payload>".to_owned()
+        };
+        eprintln!("[jd0-mt] walk panicked: {message}");
+    }
 }
 
 /// Whether jd1 enters the compiled drain loop live on `RunCompiled` (the JIT
@@ -9476,13 +9957,6 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     }
 }
 
-/// pyre-local debug instrumentation (no PyPy counterpart).
-/// `@not_in_trace` so that compiled code does not include this call.
-#[majit_macros::not_in_trace]
-fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
-    // Debug logging disabled — per-bytecode eprintln causes O(n) slowdown.
-}
-
 /// Loop-header PC set for `code`, from the `CallControl` that owns the
 /// per-graph codewriter caches (call.py `self.jitcodes = {}`).
 ///
@@ -9532,7 +10006,15 @@ fn cached_function_entry_trace_is_jit_safe(code: &pyre_interpreter::CodeObject) 
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
-    let mut frame_root = FrameRoot::new(frame);
+    // The caller's root is the top of the shadow stack and names this frame;
+    // every reload below goes through that root (`FrameView::top_frame`).
+    debug_assert!(
+        std::ptr::eq(
+            FrameView::top_frame() as *const PyFrame,
+            frame as *const PyFrame,
+        ),
+        "eval_loop_jit entered without its frame as the top shadow-stack root"
+    );
     // Bump the monotonic frame eval-loop entry odometer (mirrors the plain
     // `eval_loop` entry): a user Python frame is about to run bytecode.  The
     // FBW FOR_ITER Option-C guard snapshots this around a residual call to
@@ -9540,9 +10022,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     pyre_interpreter::call::bump_frame_entry_count();
     // Recursion accounting belongs to the activation seams
     // (`eval_with_jit_inner` and `portal_activation_result`), not this re-entrant
-    // dispatch loop.  In particular, `FrameRoot` may have forwarded a moving
-    // frame since the seam; keying the same activation again by its new
-    // address would spend a second recursion unit.
+    // dispatch loop.  In particular, the caller's root may have forwarded a
+    // moving frame since the seam; keying the same activation again by its
+    // new address would spend a second recursion unit.
     // Count this eval-loop activation for the GC safepoint's
     // at_outermost_activation gate (gh#393). The gate allows collection
     // at depth ≤ 2 (module + one called function) where the CALL opcode
@@ -9556,7 +10038,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // breaker load; the compiled back-edge mask deliberately excludes it.
         majit_ir::eval_breaker_word::set_gc_interp();
     }
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+    // The code object is NOT read here. `interp_jit.py` `PyFrame.dispatch`
+    // takes `pycode` as a parameter and reads `co_code = pycode.co_code`
+    // inside the loop, *after* `jit_merge_point` — so the value the dispatch
+    // consumes is the very value the marker declares green. A read hoisted
+    // above the loop is a second, independent read: the marker's green is then
+    // promoted by `ref_guard_value` and never used, while the dispatch runs on
+    // an unpromoted copy that no guard makes constant. See the loop body.
     // `semantic_loop_headers` is consumed only on the `CloseLoop` arm below (a
     // back-edge event).  Loopless frames — the overwhelming majority during
     // cold startup, where every called helper / class body / module top level
@@ -9564,8 +10052,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // eagerly here scanned the whole bytecode and built a successor map for
     // every frame entry to produce a set no one read.  Compute it lazily at
     // the first back-edge instead (kept per graph on `CallControl`).
-    let env = PyreEnv;
-    let (driver, info) = driver_pair();
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
@@ -9604,8 +10090,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // it instead of re-resolving the shadow-stack slot each time. Re-seeded
         // after every collection-point call in this loop (bytecode_trace,
         // perform_actions, execute_opcode_step, handle_exception, can_enter_jit /
-        // maybe_compile_and_run, jit_merge_point).
-        let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+        // maybe_compile_and_run).
+        let f: *mut PyFrame = FrameView::top_frame();
 
         // The plain evaluator's twin: a bounded major collection that reached
         // `max_heap_size` owes a `MemoryError`, and the safepoint above — which
@@ -9637,15 +10123,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 &mut next_instr,
             ) {
                 // handle_exception allocates → re-seed before the write.
-                let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                let f: *mut PyFrame = FrameView::top_frame();
                 unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                 continue;
             }
             return LoopResult::Done(Err(err));
-        }
-
-        if unsafe { &*f }.next_instr() >= code.instructions.len() {
-            return LoopResult::Done(Ok(w_none()));
         }
 
         let pc = unsafe { &*f }.next_instr();
@@ -9664,17 +10146,41 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             unsafe { &mut *f },
             marker_ec,
         );
-        // jit_merge_point is a lowered no-op / merge point and does not itself
-        // collect, but is treated as a collection boundary conservatively.
-        let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+        // `f` is the marker's red `frame` and stays valid across it; the marker does not collect.
 
-        let (opcode_pc, instruction, op_arg) = match decode_instruction_forward(code, pc) {
-            Ok(decoded) => decoded,
-            Err(err) => return LoopResult::Done(Err(err.into())),
-        };
+        // `interp_jit.py` `PyFrame.dispatch`: `co_code = pycode.co_code`,
+        // read from the green the marker just declared and nowhere else. One
+        // value reaches both the marker and the dispatch, so the
+        // `ref_guard_value` the marker emits promotes the operand the dispatch
+        // actually consumes.
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(marker_pycode) };
+        if code_ptr.is_null() {
+            return LoopResult::Done(Err(pyre_interpreter::pycode::BytecodeCorruption.into()));
+        }
+        let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
+
+        // Bounds net for a frame resumed past its last instruction. Upstream
+        // has no counterpart — its loop leaves through `Return` / `Yield` —
+        // and it sits *after* the marker here because any pre-marker read of
+        // the code object is precisely the second, unpromoted read this
+        // ordering exists to remove.
+        if pc >= pyre_interpreter::code_instructions_len(code) {
+            return LoopResult::Done(Ok(w_none()));
+        }
+
+        let opcode_pc = decode_instruction_forward_pc(code, pc);
+        let packed_instruction = decode_instruction_forward_packed(code, pc);
+        if opcode_pc == usize::MAX || packed_instruction == u64::MAX {
+            return LoopResult::Done(Err(pyre_interpreter::pycode::BytecodeCorruption.into()));
+        }
+        let opcode = (packed_instruction & 0xff) as u8;
+        // SAFETY: the packed opcode came from a live `CodeUnit`, whose opcode
+        // field is a valid repr(u8) `Instruction` discriminant.
+        let instruction =
+            unsafe { std::mem::transmute::<u8, pyre_interpreter::Instruction>(opcode) };
+        let op_arg = pyre_interpreter::OpArg::new((packed_instruction >> 8) as u32);
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
-        trace_jit_bytecode(pc, "");
         unsafe { &mut *f }.last_instr = pc as isize;
         unsafe { &mut *f }.set_last_instr_from_next_instr(opcode_pc + 1);
         // pyopcode.py dispatch_bytecode parity: fire
@@ -9723,7 +10229,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             if unsafe { &mut *f }.take_failed_attr_before_opcode() {
                 unsafe { (*ec_ptr).run_failed_attr_finalizers() };
             }
-            let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+            let f: *mut PyFrame = FrameView::top_frame();
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             // A compiled back-edge deopts when the process breaker is armed.
             // On resume, run the live frame's ordinary bytecode_trace so its
@@ -9743,14 +10249,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     // bytecode_trace at this opcode.  In particular, an
                     // asynchronously injected exception must be catchable by
                     // the target frame's surrounding try/except.
-                    let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                    let f: *mut PyFrame = FrameView::top_frame();
                     let mut next_instr = unsafe { &*f }.next_instr();
                     if pyre_interpreter::eval::handle_exception(
                         unsafe { &mut *f },
                         &mut err,
                         &mut next_instr,
                     ) {
-                        let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                        let f: *mut PyFrame = FrameView::top_frame();
                         unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                         continue;
                     }
@@ -9758,7 +10264,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 }
                 // bytecode_trace may allocate (tracer callback) → the frame may
                 // have moved; re-seed before reading it again.
-                let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                let f: *mut PyFrame = FrameView::top_frame();
                 // A trace callback may perform a debugger line-jump by
                 // setting `frame.f_lineno` (`fset_f_lineno` → `last_instr
                 // = best_addr`).  The opcode for this iteration was
@@ -9799,7 +10305,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                         // the current opcode so the frame's try/except can catch
                         // it. `frame.last_instr` was set to `pc` above, so
                         // `handle_exception` finds the covering handler.
-                        let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                        let f: *mut PyFrame = FrameView::top_frame();
                         let mut next_instr = unsafe { &*f }.next_instr();
                         if pyre_interpreter::eval::handle_exception(
                             unsafe { &mut *f },
@@ -9808,7 +10314,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                         ) {
                             // handle_exception may allocate; re-seed before the
                             // final frame write.
-                            let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                            let f: *mut PyFrame = FrameView::top_frame();
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
@@ -9820,7 +10326,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // The ec block above may have run bytecode_trace / perform_actions
         // (collection points) on a fall-through path; re-seed before the
         // opcode dispatch.
-        let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+        let f: *mut PyFrame = FrameView::top_frame();
         let mut next_instr = unsafe { &*f }.next_instr();
         let step_result =
             execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, next_instr);
@@ -9846,54 +10352,29 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 }
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer for the compile path.
-                let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                let f: *mut PyFrame = FrameView::top_frame();
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
                 let marker_ec = pyre_interpreter::call::getexecutioncontext();
+                if marker_ec.is_null() {
+                    // No execution context means there is nowhere to publish a
+                    // compiled-loop exit.  Keep interpreting instead of
+                    // entering `set_pending_loop_exit` with a null pointer.
+                    continue;
+                }
                 let marker_pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
                 let marker_profiled = unsafe { &*f }.get_is_being_profiled();
-                pypyjitdriver.can_enter_jit(
+                if pypyjitdriver.can_enter_jit(
                     loop_header_pc,
                     marker_profiled,
                     marker_pycode,
                     unsafe { &mut *f },
                     marker_ec,
-                );
-                // can_enter_jit is a lowered no-op / merge point; re-seed
-                // conservatively before the next frame reads.
-                let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
-                let loop_pycode = unsafe { &*f }.pycode;
-                let loop_profiled = unsafe { &*f }.get_is_being_profiled();
-                let green_key_hash = make_green_key(loop_pycode, loop_header_pc, loop_profiled);
-                // The same resolve the function-entry door takes, for the same
-                // reason: `maybe_compile_and_run` and everything it reads
-                // (`has_runnable_compiled_loop`, `runnable_procedure_token`,
-                // `maybe_compile_decision`) answer for whichever cell HEADS a
-                // chained bucket, so a bare hash decides about one cell while
-                // `force_start_tracing_for_key` — which walks the chain — acts
-                // on another.  A loop-header key gets a chained bucket from the
-                // hash-form installers (`disable_noninlinable_function`,
-                // `prepare_trace_segmenting`) and from the inlined-callee
-                // merge point in `jitcode_dispatch`, which mints its callee's
-                // loop header as a raw `make_green_key`.
-                let green_key = driver.resolve_cell_key(green_key_hash, || {
-                    pyre_jit_trace::driver::make_green_key_typed(
-                        loop_pycode,
-                        loop_header_pc,
-                        loop_profiled,
-                    )
-                });
-                if let Some(loop_result) = maybe_compile_and_run(
-                    unsafe { &mut *f },
-                    green_key,
-                    loop_header_pc,
-                    driver,
-                    info,
-                    &env,
                 ) {
                     // maybe_compile_and_run compiles and may allocate → re-seed
                     // before handle_exception reads the frame.
-                    let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                    let f: *mut PyFrame = FrameView::top_frame();
+                    let loop_result = take_pending_loop_exit(marker_ec);
                     // warmspot.py handle_jitexception: an
                     // `ExitFrameWithExceptionRef` from a direct compiled-code
                     // exit is re-raised into the interpreter loop.  Offer it to
@@ -9914,7 +10395,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                             &mut next_instr,
                         ) {
                             // handle_exception may allocate → re-seed.
-                            let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                            let f: *mut PyFrame = FrameView::top_frame();
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
@@ -9928,14 +10409,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Err(mut err) => {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer.
-                let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                let f: *mut PyFrame = FrameView::top_frame();
                 if pyre_interpreter::eval::handle_exception(
                     unsafe { &mut *f },
                     &mut err,
                     &mut next_instr,
                 ) {
                     // handle_exception may allocate → re-seed before the write.
-                    let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                    let f: *mut PyFrame = FrameView::top_frame();
                     unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                     continue;
                 }

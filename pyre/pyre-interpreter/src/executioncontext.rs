@@ -375,6 +375,13 @@ pub fn may_ignore_finalizer(obj: PyObjectRef) {
 /// Shared execution context for all frames in one interpreter run.
 ///
 /// Holds the builtin module dict used by module-level frames.
+#[derive(Debug, Clone)]
+pub enum PendingLoopExit {
+    Done(crate::PyResult),
+    ContinueRunningNormally,
+    ExitFrameWithException(crate::PyError),
+}
+
 #[derive(Clone)]
 pub struct ExecutionContext {
     pub space: PyObjectRef,
@@ -435,6 +442,10 @@ pub struct ExecutionContext {
     /// per-thread EC pointer and the optimizer can dead-store-eliminate a
     /// balanced save/restore.  GC-rooted via `walk_pyframe_roots`.
     pub sys_exc_value: PyObjectRef,
+    /// `warmspot.py rewrite_can_enter_jits` leaves compiled-loop exits outside
+    /// the portal's jitcode and propagates them out of band.  This is pyre's
+    /// execution-context-owned carrier for that pending exit.
+    pending_loop_exit: Option<PendingLoopExit>,
     /// Per-execution-context coroutine origin tracking depth. CPython keeps
     /// the corresponding setting in the thread state; pyre keeps all such
     /// execution state on the PyPy-style ExecutionContext.
@@ -524,6 +535,7 @@ impl ExecutionContext {
             builtin_dict_cache: std::cell::Cell::new(pyre_object::PY_NULL),
             check_signal_action: None,
             sys_exc_value: pyre_object::PY_NULL,
+            pending_loop_exit: None,
             coroutine_origin_tracking_depth: 0,
             current_gen_or_coroutine: pyre_object::PY_NULL,
             w_asyncgen_firstiter_fn: pyre_object::PY_NULL,
@@ -560,6 +572,7 @@ impl ExecutionContext {
         // builtins_module, matching a fresh PyPy ExecutionContext.
         ec.builtin_dict_cache = std::cell::Cell::new(pyre_object::PY_NULL);
         ec.sys_exc_value = pyre_object::PY_NULL;
+        ec.pending_loop_exit = None;
         // executioncontext.py — a fresh ExecutionContext starts at 0.
         ec.coroutine_origin_tracking_depth = 0;
         ec.current_gen_or_coroutine = pyre_object::PY_NULL;
@@ -587,6 +600,25 @@ impl ExecutionContext {
             &mut *(&mut self.contextvar_context as *mut PyObjectRef as *mut majit_ir::GcRef)
         });
         visitor(unsafe { &mut *(&mut self.py_repr as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        if let Some(pending) = self.pending_loop_exit.as_mut() {
+            match pending {
+                PendingLoopExit::Done(Ok(value)) => {
+                    visitor(unsafe { &mut *(value as *mut PyObjectRef as *mut majit_ir::GcRef) })
+                }
+                PendingLoopExit::Done(Err(err)) | PendingLoopExit::ExitFrameWithException(err) => {
+                    err.walk_gc_refs(visitor)
+                }
+                PendingLoopExit::ContinueRunningNormally => {}
+            }
+        }
+    }
+
+    pub fn set_pending_loop_exit(&mut self, exit: PendingLoopExit) {
+        self.pending_loop_exit = Some(exit);
+    }
+
+    pub fn take_pending_loop_exit(&mut self) -> Option<PendingLoopExit> {
+        self.pending_loop_exit.take()
     }
 
     pub fn __init__(&mut self, space: PyObjectRef) {

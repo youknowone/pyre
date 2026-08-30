@@ -283,7 +283,9 @@ pub fn decode_instruction_for_dispatch(
 ///
 /// Shares `decode_instruction_for_dispatch`'s `u8 < 44` malformed-chain guard
 /// and returns `BytecodeCorruption` on out of bounds.
+/// Both loops are bounded by the `ExtendedArg` prefix chain, which is at most three units.
 #[inline]
+#[majit_macros::unroll_safe]
 pub fn decode_instruction_forward(
     code: &CodeObject,
     pc: usize,
@@ -297,19 +299,23 @@ pub fn decode_instruction_forward(
     let mut start = pc;
     while start > 0
         && start - 1 < code_instructions_len(code)
-        && matches!(code.instructions[start - 1].op, Instruction::ExtendedArg)
+        && matches!(
+            instruction_from_code_unit_word(code_unit_at(code, start - 1)),
+            Instruction::ExtendedArg
+        )
     {
         start -= 1;
     }
 
     let mut opcode_pc = start;
-    let mut state = OpArgState::default();
+    let mut op_arg = 0u32;
     loop {
         if opcode_pc >= code_instructions_len(code) {
             return Err(crate::pycode::BytecodeCorruption);
         }
-        let unit = code.instructions[opcode_pc];
-        let (instruction, op_arg) = state.get(unit);
+        let word = code_unit_at(code, opcode_pc);
+        let instruction = instruction_from_code_unit_word(word);
+        op_arg = (op_arg << 8) | u32::from(word >> 8);
         if matches!(instruction, Instruction::ExtendedArg) {
             opcode_pc += 1;
             continue;
@@ -320,7 +326,83 @@ pub fn decode_instruction_forward(
         {
             return Err(crate::pycode::BytecodeCorruption);
         }
-        return Ok((opcode_pc, instruction, op_arg));
+        return Ok((opcode_pc, instruction, OpArg::new(op_arg)));
+    }
+}
+
+/// Scalar-PC half of [`decode_instruction_forward`] for the JIT dispatch loop.
+/// `usize::MAX` represents the same bytecode-corruption cases as the public decoder.
+#[inline]
+#[majit_macros::unroll_safe]
+pub fn decode_instruction_forward_pc(code: &CodeObject, pc: usize) -> usize {
+    let mut start = pc;
+    while start > 0
+        && start - 1 < code_instructions_len(code)
+        && matches!(
+            instruction_from_code_unit_word(code_unit_at(code, start - 1)),
+            Instruction::ExtendedArg
+        )
+    {
+        start -= 1;
+    }
+
+    let mut opcode_pc = start;
+    loop {
+        if opcode_pc >= code_instructions_len(code) {
+            return usize::MAX;
+        }
+        let instruction = instruction_from_code_unit_word(code_unit_at(code, opcode_pc));
+        if matches!(instruction, Instruction::ExtendedArg) {
+            opcode_pc += 1;
+            continue;
+        }
+        if opcode_pc != start
+            && u8::from(instruction) < 44
+            && !matches!(instruction, Instruction::Reserved)
+        {
+            return usize::MAX;
+        }
+        return opcode_pc;
+    }
+}
+
+/// Scalar opcode/oparg half of [`decode_instruction_forward`] for JIT dispatch.
+/// `u64::MAX` is the corruption sentinel; valid results use bits 0..8 for the
+/// opcode and bits 8..40 for the accumulated oparg.
+#[inline]
+#[majit_macros::unroll_safe]
+pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
+    let mut start = pc;
+    while start > 0
+        && start - 1 < code_instructions_len(code)
+        && matches!(
+            instruction_from_code_unit_word(code_unit_at(code, start - 1)),
+            Instruction::ExtendedArg
+        )
+    {
+        start -= 1;
+    }
+
+    let mut opcode_pc = start;
+    let mut op_arg = 0u32;
+    loop {
+        if opcode_pc >= code_instructions_len(code) {
+            return u64::MAX;
+        }
+        let word = code_unit_at(code, opcode_pc);
+        let instruction = instruction_from_code_unit_word(word);
+        op_arg = (op_arg << 8) | u32::from(word >> 8);
+        if matches!(instruction, Instruction::ExtendedArg) {
+            opcode_pc += 1;
+            continue;
+        }
+        if opcode_pc != start
+            && u8::from(instruction) < 44
+            && !matches!(instruction, Instruction::Reserved)
+        {
+            return u64::MAX;
+        }
+        return u64::from(word & 0xff) | (u64::from(op_arg) << 8);
     }
 }
 
@@ -2084,6 +2166,23 @@ pub fn code_varnames_len(code: &CodeObject) -> usize {
 #[majit_macros::elidable_cannot_raise]
 pub fn code_instructions_len(code: &CodeObject) -> usize {
     code.instructions.len()
+}
+
+/// Read one packed two-byte code unit through a scalar residual call. The
+/// `CodeUnits::deref` slice stays inside the helper body and never crosses the
+/// two-phase residual ABI.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn code_unit_at(code: &CodeObject, i: usize) -> u16 {
+    let unit = code.instructions[i];
+    u16::from(u8::from(unit.op)) | (u16::from(u8::from(unit.arg)) << 8)
+}
+
+#[inline]
+fn instruction_from_code_unit_word(word: u16) -> Instruction {
+    // SAFETY: `code_unit_at` obtains this byte from a live `Instruction` in a
+    // `CodeUnit`, so its discriminant is valid and `Instruction` is repr(u8).
+    unsafe { std::mem::transmute::<u8, Instruction>(word as u8) }
 }
 
 /// Extract a [`RaiseKind`]'s discriminant as `usize`. Same parity
@@ -3926,8 +4025,9 @@ pub fn skip_caches(instructions: &[CodeUnit], mut pos: usize) -> usize {
 mod tests {
     use super::{
         decode_instruction_at, decode_instruction_for_dispatch, decode_instruction_forward,
+        decode_instruction_forward_packed, decode_instruction_forward_pc,
     };
-    use crate::bytecode::Instruction;
+    use crate::bytecode::{CodeUnit, CodeUnits, Instruction, OpArgByte};
     use crate::{OpArgState, compile_exec};
 
     #[test]
@@ -4146,6 +4246,22 @@ mod tests {
             code.instructions.replace_op(1, Instruction::GetIter);
         }
         assert!(decode_instruction_forward(&code, 0).is_err());
+    }
+
+    #[test]
+    fn scalar_forward_decode_handles_two_extended_arg_prefixes() {
+        let mut code = compile_exec("x = 1").expect("compile failed");
+        code.instructions = CodeUnits::from([
+            CodeUnit::new(Instruction::ExtendedArg, OpArgByte::new(0x01)),
+            CodeUnit::new(Instruction::ExtendedArg, OpArgByte::new(0x02)),
+            CodeUnit::new(Instruction::Reserved, OpArgByte::new(0x03)),
+        ]);
+
+        assert_eq!(decode_instruction_forward_pc(&code, 0), 2);
+        assert_eq!(decode_instruction_forward_pc(&code, 2), 2);
+        let expected = u64::from(u8::from(Instruction::Reserved)) | (0x01_02_03u64 << 8);
+        assert_eq!(decode_instruction_forward_packed(&code, 0), expected);
+        assert_eq!(decode_instruction_forward_packed(&code, 2), expected);
     }
 
     // A JIT jump/loop-header/resume coordinate points at the real opcode past

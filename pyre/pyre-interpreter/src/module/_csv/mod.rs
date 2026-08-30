@@ -1210,10 +1210,6 @@ crate::py_module! {
         "QUOTE_STRINGS" => QUOTE_STRINGS,
         "QUOTE_NOTNULL" => QUOTE_NOTNULL,
     },
-    exceptions: {
-        "Error" => crate::builtins::lookup_exc_class("Exception")
-            .expect("Exception must be installed before _csv init"),
-    },
     inline_functions: {
         // `csv_reader` — build the reader over an iterable of lines.
         fn reader(
@@ -1332,6 +1328,21 @@ crate::py_module! {
         "field_size_limit" / * = field_size_limit_fn,
     },
     extra_init: |ns| {
+        // `_csv.Error` — built here rather than in the `exceptions:` arm
+        // because `_csvstate_init` builds it from a type spec that names its
+        // own `basicsize`, and a spec that does gets no managed weakref.  It
+        // is therefore the one module exception class that is not
+        // weak-referenceable, together with `ssl.SSLError`.
+        crate::module_ns_store(
+            ns,
+            "Error",
+            crate::builtins::make_exc_type(
+                "_csv.Error",
+                crate::builtins::exc_exception_new,
+                crate::builtins::lookup_exc_class("Exception")
+                    .expect("Exception must be installed before _csv init"),
+            ),
+        );
         // `app_csv._dialects = {}` — the registry mapping.  It is stored in
         // the module namespace under the name PyPy gives it and published to
         // the state the accelerator reads, which is what keeps it reachable

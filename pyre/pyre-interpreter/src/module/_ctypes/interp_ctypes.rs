@@ -362,7 +362,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     // ── ArgumentError — a real Exception subclass ──
     let w_exception = crate::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _ctypes init");
-    let argument_error = crate::builtins::make_exc_type(
+    let argument_error = crate::builtins::new_exception_class(
         "ArgumentError",
         crate::builtins::exc_exception_new,
         w_exception,

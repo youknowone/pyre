@@ -552,6 +552,13 @@ pub struct JitDriverStaticData {
     pub red_types: Vec<String>,
     /// Portal graph path.
     pub portal_graph: CallPath,
+    /// `warmspot.py jd.portal_runner_ptr`: the synthetic helper that owns
+    /// recursive portal entry.  It is deliberately distinct from both the
+    /// split portal graph and the graph containing the original merge point.
+    pub portal_runner: Option<CallPath>,
+    /// `warmspot.py split_graph_and_record_jitdriver`: graph containing the
+    /// marker before the split portal copy was made.
+    pub jit_merge_point_in: CallPath,
     /// RPython: `jd.mainjitcode` (call.py:147) — `Arc<JitCode>` shell for
     /// the portal. Set by `grab_initial_jitcodes()`. Matches the
     /// metainterp-side `JitDriverStaticData.mainjitcode` shape so the
@@ -3270,8 +3277,9 @@ impl CallControl {
     /// with no green/red layout. Used by tests that need a portal without a
     /// full driver registration; production seeds via `setup_jitdriver`.
     pub fn mark_portal(&mut self, path: CallPath) {
+        let index = self.jitdrivers_sd.len();
         self.setup_jitdriver(
-            path,
+            path.clone(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -3279,7 +3287,12 @@ impl CallControl {
             false,
             Vec::new(),
             Vec::new(),
+            path.clone(),
         );
+        // Test-only shorthand: production warmspot attaches a distinct
+        // synthetic runner after splitting, but callers of `mark_portal`
+        // explicitly provide the target they want classified recursive.
+        self.set_jitdriver_portal_runner(index, Some(path));
     }
 
     /// `codewriter.py CodeWriter.setup_vrefinfo(self, vrefinfo)`.
@@ -3328,6 +3341,7 @@ impl CallControl {
         autoreds: bool,
         virtualizables: Vec<String>,
         red_types: Vec<String>,
+        jit_merge_point_in: CallPath,
     ) {
         let index = self.jitdrivers_sd.len();
         debug_assert!(
@@ -3358,6 +3372,8 @@ impl CallControl {
             virtualizables,
             red_types,
             portal_graph,
+            portal_runner: None,
+            jit_merge_point_in,
             mainjitcode: None,
             index_of_virtualizable: -1,
             virtualizable_info: None,
@@ -3373,6 +3389,15 @@ impl CallControl {
         if let Some(jd) = self.jitdrivers_sd.get_mut(index) {
             jd.active = active;
         }
+    }
+
+    /// Attach `warmspot.py jd.portal_runner_ptr` after driver creation.
+    ///
+    /// Warmspot creates this helper after the portal graph has been split;
+    /// keeping the assignment separate mirrors that construction order and
+    /// prevents graph identity from standing in for runner identity.
+    pub fn set_jitdriver_portal_runner(&mut self, index: usize, runner: Option<CallPath>) {
+        self.jitdrivers_sd[index].portal_runner = runner;
     }
 
     /// warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`.
@@ -3621,14 +3646,18 @@ impl CallControl {
 
     /// call.py `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
     ///
-    /// Pyre has no separate `portal_runner_ptr` (the runner is the
-    /// portal graph itself), so we reuse the path lookup.  Future
-    /// phases that need the distinction can split the field.
     pub fn jitdriver_sd_from_portal_runner_ptr(
         &self,
         path: &CallPath,
     ) -> Option<&JitDriverStaticData> {
-        self.jitdriver_sd_from_portal_graph(path)
+        self.jitdrivers_sd
+            .iter()
+            .find(|sd| sd.portal_runner.as_ref() == Some(path))
+    }
+
+    /// `call.py jitdriver_sd_from_portal_runner_ptr(funcptr) is not None`.
+    fn is_portal_recursive_call(&self, path: &CallPath) -> bool {
+        self.jitdriver_sd_from_portal_runner_ptr(path).is_some()
     }
 
     /// call.py `jitdriver_sd_from_jitdriver(jitdriver)`.
@@ -4018,11 +4047,7 @@ impl CallControl {
                             };
                             // `call.py:119-120`
                             // jitdriver_sd_from_portal_runner_ptr → recursive.
-                            if self
-                                .jitdrivers_sd
-                                .iter()
-                                .any(|jd| jd.portal_graph == callee_path)
-                            {
+                            if self.is_portal_recursive_call(&callee_path) {
                                 // Not a refusal — the portal is already a
                                 // candidate and re-walking it would loop —
                                 // but recorded so the BFS's skip rows add up
@@ -4346,6 +4371,33 @@ impl CallControl {
         Some(return_type_string_to_value_type(Some(&effective)))
     }
 
+    /// RPython `CallControl.getcalldescr` / `Transformer.rewrite_call`:
+    /// `Void` arguments remain in the flow graph but are absent from the
+    /// low-level call's `NON_VOID_ARGS`. Charon can leave a zero-sized closure
+    /// receiver as `Ref` at its construction site even though the callee's
+    /// declared parameter is `Void`; use the authoritative `FUNC.ARGS`
+    /// positions at this ABI boundary instead of erasing that SSA value
+    /// globally.
+    pub(crate) fn non_void_actual_args_for_target(
+        &self,
+        target: &CallTarget,
+        args: &[crate::flowspace::model::Variable],
+    ) -> Vec<crate::flowspace::model::Variable> {
+        let Some((_, graph)) = self.target_to_path_and_graph(target) else {
+            return args.to_vec();
+        };
+        let declared = graph_arg_types(graph);
+        if declared.len() != args.len() {
+            // Leave malformed arity untouched so `getcalldescr` reports the
+            // orthodox hard error instead of silently hiding an argument.
+            return args.to_vec();
+        }
+        args.iter()
+            .zip(declared)
+            .filter_map(|(arg, ty)| (ty != crate::model::ValueType::Void).then(|| arg.clone()))
+            .collect()
+    }
+
     /// The shared low-level result type of an indirect-call family.
     ///
     /// RPython's `FunctionReprBase.call` gets this from the selected
@@ -4394,14 +4446,13 @@ fn return_type_string_to_kind(s: &str) -> char {
     }
 }
 
-/// RPython parity for `call.py:220-221` `FUNC.ARGS` — collect the non-void
-/// argument types of a graph.  Parameters live on `startblock.inputargs`
-/// (RPython `flowspace/model.py` Block), populated by `front::mir`'s
-/// parameter registration.  The `OpKind::Input`
-/// ops co-emitted with each parameter carry the declared type which we
-/// recover by chasing each inputarg Variable back to its defining op.
-/// Unknown/ambiguous slots default to `Ref`, matching
-/// `resolve_non_void_arg_types`' fallback.
+/// RPython `CallControl.getcalldescr` parity: recover the graph's complete
+/// declared `FUNC.ARGS` sequence before the caller filters `Void`. Parameters
+/// live on `Block.inputargs`, populated by `front::mir`'s parameter
+/// registration. The `OpKind::Input` operations co-emitted with each parameter
+/// carry the declared type, recovered by chasing each input variable back to
+/// its defining operation. An unresolved slot remains `Unknown`; consumers
+/// decide whether that conservative value belongs in their ABI view.
 ///
 /// TODO: when `inputargs` is empty we fall back to
 /// scanning leading `OpKind::Input` ops in the startblock.  Unit tests
@@ -4409,37 +4460,25 @@ fn return_type_string_to_kind(s: &str) -> char {
 /// `FunctionGraph::new` + `push_op` without populating `inputargs`; the
 /// fallback keeps their "all-Input-ops-are-params" convention working
 /// until they are migrated.
-fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
+fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
     let start = graph.block(graph.startblock);
-    let map_ty = |ty: &crate::model::ValueType| match ty {
-        // RPython `getkind(BOOL_TYPE)` returns `'int'`
-        // (`lloperation.py:108`); BoolRepr's lowleveltype is `Bool`
-        // and `FUNC.ARGS` (`call.py:220-221`) records it under the
-        // same `'i'` register kind as `Signed`.  Bool aliases to Int
-        // so the wildcard does not silently re-classify it as Ref.
-        crate::model::ValueType::Int | crate::model::ValueType::Bool => Some(Type::Int),
-        crate::model::ValueType::Ref(_) => Some(Type::Ref),
-        crate::model::ValueType::Float => Some(Type::Float),
-        crate::model::ValueType::Void => None,
-        // Unknown / State — default to Ref.
-        _ => Some(Type::Ref),
-    };
     if !start.inputargs.is_empty() {
-        // Walk `inputargs` (`Vec<Variable>`) directly — orthodox per
-        // `flowspace/model.py:Block.inputargs`.  Treat unresolved
-        // slots conservatively as `Type::Ref` (the same default the
-        // wildcard arm uses below).
         return start
             .inputargs
             .iter()
-            .filter_map(|arg| {
-                let ty = start.operations.iter().find_map(|op| match &op.kind {
-                    crate::model::OpKind::Input { ty, .. } if op.result.as_ref() == Some(arg) => {
-                        Some(ty)
-                    }
-                    _ => None,
-                });
-                ty.map(map_ty).unwrap_or(Some(Type::Ref))
+            .map(|arg| {
+                start
+                    .operations
+                    .iter()
+                    .find_map(|op| match &op.kind {
+                        crate::model::OpKind::Input { ty, .. }
+                            if op.result.as_ref() == Some(arg) =>
+                        {
+                            Some(ty.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(crate::model::ValueType::Unknown)
             })
             .collect();
     }
@@ -4448,8 +4487,26 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
         .iter()
         .take_while(|op| matches!(op.kind, crate::model::OpKind::Input { .. }))
         .filter_map(|op| match &op.kind {
-            crate::model::OpKind::Input { ty, .. } => map_ty(ty),
+            crate::model::OpKind::Input { ty, .. } => Some(ty.clone()),
             _ => None,
+        })
+        .collect()
+}
+
+fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
+    graph_arg_types(graph)
+        .iter()
+        .filter_map(|ty| match ty {
+            // RPython `history.getkind(BOOL_TYPE)` returns `'int'`;
+            // `CallControl.getcalldescr` records Bool in `FUNC.ARGS` under the
+            // same `'i'` register kind as `Signed`. Bool aliases to Int so the
+            // wildcard does not silently re-classify it as Ref.
+            crate::model::ValueType::Int | crate::model::ValueType::Bool => Some(Type::Int),
+            crate::model::ValueType::Ref(_) => Some(Type::Ref),
+            crate::model::ValueType::Float => Some(Type::Float),
+            crate::model::ValueType::Void => None,
+            // Unknown / State — default to Ref.
+            _ => Some(Type::Ref),
         })
         .collect()
 }
@@ -4571,7 +4628,7 @@ impl CallControl {
             let path = self.target_to_path(target);
             if let Some(ref p) = path {
                 // call.py jitdriver_sd_from_portal_runner_ptr(funcptr)
-                if self.jitdrivers_sd.iter().any(|jd| &jd.portal_graph == p) {
+                if self.is_portal_recursive_call(p) {
                     return CallKind::Recursive;
                 }
                 // call.py:129-134 _gctransformer_hint_close_stack_ → 'residual'
@@ -9482,6 +9539,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_call_omits_actual_for_declared_void_parameter() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["closure_call_once"]);
+        let mut callee = FunctionGraph::new("closure_call_once");
+        let receiver = callee.alloc_value_var();
+        let value = callee.alloc_value_var();
+        for (var, name, ty) in [
+            (receiver, "self", ValueType::Void),
+            (value, "value", ValueType::Ref(None)),
+        ] {
+            callee.push_inputarg_var(callee.startblock, var.clone());
+            callee.push_op_with_result_var(
+                callee.startblock,
+                OpKind::Input {
+                    name: name.to_string(),
+                    ty,
+                    class_root: None,
+                },
+                var,
+            );
+        }
+        cc.register_function_graph(path, callee);
+
+        let actual_receiver = crate::flowspace::model::Variable::new();
+        let actual_value = crate::flowspace::model::Variable::new();
+        let filtered = cc.non_void_actual_args_for_target(
+            &CallTarget::function_path(["closure_call_once"]),
+            &[actual_receiver, actual_value.clone()],
+        );
+        assert_eq!(filtered, vec![actual_value]);
+    }
+
     /// The `@jit.dont_look_inside` builder residual helpers residualize only
     /// once a native runtime helper address is bound. Without one, a candidate
     /// `ll_append_res_slice` call stays `Regular` (it executes the generated
@@ -9785,6 +9875,42 @@ mod tests {
             cc.guess_call_kind(&direct_call_op(target)),
             CallKind::Recursive
         );
+    }
+
+    #[test]
+    fn only_portal_runner_identity_is_recursive() {
+        let mut cc = CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        let original = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let runner = CallPath::from_segments(["call_jit", "ll_portal_runner_shim"]);
+        cc.setup_jitdriver(
+            portal.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            original.clone(),
+        );
+        cc.set_jitdriver_portal_runner(0, Some(runner.clone()));
+
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
+                runner.segments.clone()
+            ))),
+            CallKind::Recursive
+        );
+        for non_runner in [portal, original] {
+            assert_ne!(
+                cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
+                    non_runner.segments
+                ))),
+                CallKind::Recursive,
+                "portal graph identities must not stand in for portal_runner_ptr"
+            );
+        }
     }
 
     #[test]
@@ -11270,6 +11396,7 @@ mod tests {
             false,
             vec![],
             vec![],
+            CallPath::from_segments(["portal_runner"]),
         );
         cc
     }
@@ -11306,6 +11433,7 @@ mod tests {
             false,
             vec![],
             vec![],
+            CallPath::from_segments(["portal_runner_b"]),
         );
         cc.jitdrivers_sd[0].virtualizable_info = Some(std::sync::Arc::new(StubVInfo {
             vtypeptr_id: 0xabcd,
@@ -11377,6 +11505,7 @@ mod tests {
             false,
             vec!["frame".into()],
             vec!["PyFrame".into(), "ExecutionContext".into()],
+            CallPath::from_segments(["execute_opcode_step"]),
         );
         cc.make_virtualizable_infos(|_, _| None);
         // warmspot.py:534-538 — `index_of_virtualizable = reds.index('frame')`
@@ -11404,6 +11533,7 @@ mod tests {
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
+            CallPath::from_segments(["portal"]),
         );
         cc.make_virtualizable_infos(|_, _| None);
     }
@@ -11421,6 +11551,7 @@ mod tests {
             false,
             vec![],
             vec![],
+            CallPath::from_segments(["portal"]),
         );
         cc.jitdrivers_sd[0].virtualizable_info = Some(std::sync::Arc::new(StubVInfo {
             vtypeptr_id: 0xfeed,
@@ -11446,6 +11577,7 @@ mod tests {
             false,
             vec![],
             vec!["PyFrame".into()],
+            CallPath::from_segments(["portal_with_greenfield"]),
         );
         cc.make_virtualizable_infos(|_, _| None);
         let gfinfo = cc.jitdrivers_sd[0]
@@ -11474,6 +11606,7 @@ mod tests {
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
+            CallPath::from_segments(["portal_a"]),
         );
         cc.setup_jitdriver(
             CallPath::from_segments(["portal_b"]),
@@ -11484,6 +11617,7 @@ mod tests {
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
+            CallPath::from_segments(["portal_b"]),
         );
         let mut factory_calls: Vec<String> = Vec::new();
         cc.make_virtualizable_infos(|_jd_idx, vtypeptr_token| {
@@ -11523,6 +11657,7 @@ mod tests {
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
+            CallPath::from_segments(["portal"]),
         );
         cc.make_virtualizable_infos(|_, _| None);
         assert!(cc.jitdrivers_sd[0].virtualizable_info.is_none());
