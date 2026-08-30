@@ -62,6 +62,13 @@ impl<T> ResidualSlot for *mut T {}
 impl<T> ResidualRet for *const T {}
 impl<T> ResidualRet for *mut T {}
 
+// `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`: the native
+// spelling of RPython's one-word `llmemory.GCREF`.  FrameAnchor's external
+// shadow-stack declarations therefore occupy one residual argument/result
+// slot without an ABI bridge.
+impl ResidualSlot for majit_ir::GcRef {}
+impl ResidualRet for majit_ir::GcRef {}
+
 /// Word-ABI bridge for the scalar bytecode read used by translated residual
 /// calls.  The backends call integer helpers uniformly as `(i64, ..) -> i64`;
 /// the raw Rust function is `(pointer, usize) -> u16`, which is a different
@@ -835,6 +842,26 @@ pub fn is_abi_unsound_argument_residual(addr: usize) -> bool {
 fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     let mut entries = Vec::new();
     let mut abi_unsound_arguments = Vec::new();
+
+    // `eval::FrameAnchor` is interpreter runtime rooting, outside the LLBC
+    // module set.  `majit-translate` declares these three functions through
+    // its annotator-only `register_external` carrier; publish the exact Rust
+    // symbols here so a residual call never falls back to a symbolic hash.
+    p1(
+        &mut entries,
+        "majit_gc::shadow_stack::push",
+        majit_gc::shadow_stack::push,
+    );
+    p1(
+        &mut entries,
+        "majit_gc::shadow_stack::get",
+        majit_gc::shadow_stack::get,
+    );
+    p1(
+        &mut entries,
+        "majit_gc::shadow_stack::try_pop_to",
+        majit_gc::shadow_stack::try_pop_to,
+    );
 
     pa1(
         &mut entries,
@@ -4757,6 +4784,27 @@ mod tests {
             list_append
         );
         assert_eq!(bindings["pyre_object::jit_list_append"], list_append);
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_frame_anchor_shadow_stack_externals() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for (path, expected) in [
+            (
+                "majit_gc::shadow_stack::push",
+                majit_gc::shadow_stack::push as *const () as usize as i64,
+            ),
+            (
+                "majit_gc::shadow_stack::get",
+                majit_gc::shadow_stack::get as *const () as usize as i64,
+            ),
+            (
+                "majit_gc::shadow_stack::try_pop_to",
+                majit_gc::shadow_stack::try_pop_to as *const () as usize as i64,
+            ),
+        ] {
+            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+        }
     }
 
     /// Two registered functions must never share an address.
