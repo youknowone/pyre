@@ -5287,16 +5287,12 @@ impl<S: JitState> JitDriver<S> {
         // and two is not. A self-interpreting workload still reads one operand
         // twice when the two-virtual ones are served.
         //
-        // What is wrong is the BRIDGE these entries compile, not the walk that
-        // records it. Measured on the self-interpreter running the quine:
+        // What is measured, on a self-interpreting workload, is where the
+        // wrong answer enters and what does NOT explain it:
         //
-        //   * `MAJIT_MAX_BRIDGES` bisects to one bridge — the first that
+        //   * `MAJIT_MAX_BRIDGES` bisects to one entry — the first that
         //     produces a wrong value — and it is exactly a two-virtual
-        //     guard-resume entry. Every bridge before it is sound.
-        //   * that entry's own resumed walk is sound too: the run still agrees
-        //     with the declining one three output bytes later, and the
-        //     divergence arrives at a LATER entry into the same compiled
-        //     bridge.
+        //     guard-resume entry. Every entry before it is sound.
         //   * declining after the entry has replayed but before the walk runs
         //     restores the correct output, and stamping each materialized
         //     virtual's address onto its recorded NEW — which
@@ -5305,16 +5301,37 @@ impl<S: JitState> JitDriver<S> {
         //     byte-for-byte the same wrong bytes. Neither the replay nor an
         //     address-less OpRef is what corrupts.
         //
-        // The difference is visible in the two entries' recorded prologues.
-        // With ONE virtual, `setfields` writes its `value` field from an input
-        // arg, so every entry stores that failure's own value. With TWO it
-        // writes BOTH `value` fields from a decoded CONSTANT and only the
-        // innermost `next` from an input arg — so the second and every later
-        // entry restores the value the FIRST failure carried. That constant
-        // comes from the fieldnum the resume stream holds, so the question is
-        // why the encoder tags a chained virtual's field const where it tags
-        // an unchained one's boxed; it is not answerable from this end of the
-        // pipe.
+        // Whether the walk or the bridge it records is what corrupts is NOT
+        // settled: a bridge whose compile is refused after the walk has run
+        // faults, because the walk publishes a handoff that assumes one, so
+        // "run the walk and compile nothing" is not available as a
+        // discriminator.
+        //
+        // What IS settled is that the resume stream is not the difference. A
+        // census of every entry this decline refuses reads the same shape: a
+        // two-node push chain whose inner virtual holds a `value` the trace
+        // really does carry as a literal and a `next` naming a failarg, whose
+        // outer holds a literal `value` and a `next` naming the inner, and
+        // whose single deferred write is the list head. Different guards carry
+        // different literals, so the "const where an unchained one is boxed"
+        // this comment used to blame was a comparison between two DIFFERENT
+        // guards — and the blackhole arm decodes those same fieldnums to the
+        // right answer.
+        //
+        // Four more candidates are measured out:
+        //
+        //   * `rd_locs.len()` equals `num_failargs` on every guard in the
+        //     census (64 through 71), so no failarg resolves through the
+        //     deadframe's out-of-range identity-slot fallback,
+        //   * the bridge's inputargs are contiguous and cover every failarg,
+        //     the two the virtual numbering appended included,
+        //   * the rewrite lowers the resumed `New` to the headerless nursery
+        //     opcode, so the materialized objects come from the interpreter's
+        //     own pool at the offsets their descrs carry, and
+        //   * the collector is not involved: the wrong bytes are identical
+        //     with collection disabled, the run performs none, and the
+        //     interpreter's own chain/size invariant stays silent. What the
+        //     served entry produces is a wrong VALUE on an intact structure.
         //
         // Sited here rather than in the ladder below because
         // `compile.py ResumeGuardDescr.handle_fail` runs ONE of resume.py's
