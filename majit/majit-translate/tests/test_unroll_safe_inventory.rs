@@ -86,6 +86,34 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "frame_locals_proxy_snapshot",
         "fast2locals' scan of the same locals-plus array",
     ),
+    // No upstream counterpart either: this is the mapping read behind a
+    // `fr.f_locals["x"]`, and its scan is bounded by the same
+    // `locals_plus_names` array — varnames plus cellvars plus freevars — that
+    // `fast2locals` walks.  It cannot share `fast_local_index`, because a
+    // running comprehension's iteration variable is readable through the proxy
+    // even though assigning to that name goes to the extras dict.  What the
+    // body does per candidate is not what the hint is about: `hash_w_strict`
+    // and `eq_w` can run application code, but they are calls, not the loop
+    // bound.
+    //
+    // Same class of evidence as `frame_locals_proxy_snapshot`, and for the
+    // same reason it is NOT the `*_nohidden` argument: the body is REACHED.
+    // `locals_plus_value` holds a jitcode in the generated metadata artefact,
+    // so admitting it and its callee closure is a real descent-scope change
+    // and unreachability proves nothing here.
+    //
+    // Measured in PR #1599's CI, on the tree that carries this attribute:
+    // `pyre/check.py` passed in four jobs across all three runner OSes —
+    // dynasm and cranelift on ubuntu-24.04, dynasm on windows-latest, and
+    // dynasm+cranelift on macos-latest — with every committed per-fixture
+    // jitstats baseline unchanged.  That covers `fbw_rolled_back_with_effects`
+    // corpus-wide rather than per fixture, because it is a
+    // `JITSTATS_BADNESS_FIELDS` member in `check.py`, so a rise anywhere would
+    // have been a red rather than a statistic.
+    (
+        "locals_plus_value",
+        "fast2locals' scan of the same locals-plus array, read through the proxy",
+    ),
     // `pyopcode.py` `dispatch_bytecode` is `@jit.unroll_safe`; its
     // EXTENDED_ARG loop is split here into the interpreter decoder and the
     // two scalar projections consumed by `eval_loop_jit`.  The projections
