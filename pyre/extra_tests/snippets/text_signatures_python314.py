@@ -1061,6 +1061,48 @@ assert types.CodeType.__new__.__doc__ == (
     "Create and return a new object.  See help(type) for accurate signature."
 )
 
+EXPECTED_CODE_METHODS = {
+    "__eq__": "($self, value, /)",
+    "__ne__": "($self, value, /)",
+    "__lt__": "($self, value, /)",
+    "__le__": "($self, value, /)",
+    "__gt__": "($self, value, /)",
+    "__ge__": "($self, value, /)",
+    "__hash__": "($self, /)",
+    "__repr__": "($self, /)",
+    "replace": "($self, /, **changes)",
+    "__replace__": "($self, /, **changes)",
+    "_varname_from_oparg": "($self, /, oparg)",
+    "co_positions": "($self, /)",
+    "co_lines": "($self, /)",
+    "co_branches": "($self, /)",
+}
+check_descriptors(types.CodeType, EXPECTED_CODE_METHODS)
+
+EXPECTED_CODE_DOCS = {
+    "__eq__": "Return self==value.",
+    "__ne__": "Return self!=value.",
+    "__lt__": "Return self<value.",
+    "__le__": "Return self<=value.",
+    "__gt__": "Return self>value.",
+    "__ge__": "Return self>=value.",
+    "__hash__": "Return hash(self).",
+    "__repr__": "Return repr(self).",
+    "replace": (
+        "Return a copy of the code object with new values for the specified fields."
+    ),
+    "__replace__": "The same as replace().",
+    "_varname_from_oparg": (
+        "(internal-only) Return the local variable name for the given oparg.\n\n"
+        "WARNING: this method is for internal use only and may change or go away."
+    ),
+}
+for name, doc in EXPECTED_CODE_DOCS.items():
+    assert getattr(types.CodeType, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.CodeType.replace)) == "(self, /, **changes)"
+assert str(inspect.signature(types.CodeType.co_positions)) == "(self, /)"
+
 assert str(inspect.signature(types.MethodType)) == "(function, instance, /)"
 assert str(inspect.signature(types.ModuleType)) == "(name, doc=None)"
 

@@ -16115,23 +16115,34 @@ fn init_code_type(ns: PyObjectRef) {
         ("__eq__", code_descr_eq as crate::gateway::BuiltinCodeFn),
         ("__ne__", code_descr_ne as crate::gateway::BuiltinCodeFn),
     ] {
+        let doc = if name == "__eq__" {
+            "Return self==value."
+        } else {
+            "Return self!=value."
+        };
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, 2),
+                crate::gateway::make_builtin_function_with_arity_and_doc(name, function, 2, doc),
             );
         }
     }
-    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+    for (name, doc) in [
+        ("__lt__", "Return self<value."),
+        ("__le__", "Return self<=value."),
+        ("__gt__", "Return self>value."),
+        ("__ge__", "Return self>=value."),
+    ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(
+                crate::gateway::make_builtin_function_with_arity_and_doc(
                     name,
                     |_args| Ok(pyre_object::special::w_not_implemented()),
                     2,
+                    doc,
                 ),
             );
         }
@@ -16140,29 +16151,41 @@ fn init_code_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__hash__",
                 |args| unsafe { Ok(pyre_object::w_int_new(crate::pycode::code_hash(args[0])?)) },
                 1,
+                "Return hash(self).",
             ),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__repr__",
                 |args| unsafe { crate::pycode::code_repr(args[0]) },
                 1,
+                "Return repr(self).",
             ),
         );
     }
 
-    for name in ["replace", "__replace__"] {
+    for (name, doc) in [
+        (
+            "replace",
+            "Return a copy of the code object with new values for the specified fields.",
+        ),
+        ("__replace__", "The same as replace()."),
+    ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function(name, |args| unsafe { crate::pycode::code_replace(args) }),
+                crate::gateway::make_builtin_function_with_doc(
+                    name,
+                    |args| unsafe { crate::pycode::code_replace(args) },
+                    doc,
+                ),
             );
         }
     }
@@ -16170,10 +16193,11 @@ fn init_code_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "_varname_from_oparg",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "_varname_from_oparg",
                 |args| unsafe { crate::pycode::code_varname_from_oparg(args[0], args[1]) },
                 2,
+                "(internal-only) Return the local variable name for the given oparg.\n\nWARNING: this method is for internal use only and may change or go away.",
             ),
         );
     }
@@ -16198,6 +16222,31 @@ fn init_code_type(ns: PyObjectRef) {
                 make_builtin_function_with_arity(name, function, 1),
             );
         }
+    }
+
+    // PyPy's `PyCode.typedef` supplies the callable entries and CPython
+    // 3.14's `PyCode_Type` method table supplies their Argument Clinic / slot
+    // wrapper metadata.  Attach that metadata to the same carriers after the
+    // TypeDef-shaped registration above.
+    for (name, text_signature) in [
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__hash__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("replace", "($self, /, **changes)"),
+        ("__replace__", "($self, /, **changes)"),
+        ("_varname_from_oparg", "($self, /, oparg)"),
+        ("co_positions", "($self, /)"),
+        ("co_lines", "($self, /)"),
+        ("co_branches", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("code TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 
     for name in [
