@@ -1681,7 +1681,7 @@ impl WarmEnterState {
     /// `compiled_loops` metadata cannot answer the same question.
     pub(crate) fn procedure_token_is_temporary(&self, cell_key: u64) -> bool {
         self.cell_by_key(cell_key)
-            .is_some_and(|cell| cell.flags & jc_flags::JC_TEMPORARY != 0)
+            .is_some_and(|cell| cell.flags.contains(JcFlags::JC_TEMPORARY))
     }
 
     /// [`Self::get_procedure_token`] with the two flag reads taken OUT: the
@@ -2359,7 +2359,7 @@ impl WarmEnterState {
             // presence nor `has_compiled_meta()` identifies this flag. Count
             // it normally exactly as upstream does; never mix the callback
             // token with that displaced loop metadata and enter it as a loop.
-            if cell.flags & jc_flags::JC_TEMPORARY != 0 {
+            if cell.flags.contains(JcFlags::JC_TEMPORARY) {
                 if engine_is_tracing {
                     return FunctionEntryStep::Proceed;
                 }
