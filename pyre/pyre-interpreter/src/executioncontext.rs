@@ -191,7 +191,27 @@ pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
 /// `virtualref.py force_virtual_if_necessary`: `if inst.typeptr !=
 /// jit_virtual_ref_vtable: return inst` (the pointer already *is* the frame)
 /// else materialize via `force_virtual`.
+///
+/// `#[dont_look_inside]` because the typeptr test may not be walked.  Reading
+/// a vref's `virtual` is exactly what `jtransform.py rewrite_op_jit_is_virtual`
+/// refuses — "'vref.virtual' should not be used from jit-visible code" — and
+/// `virtualref.py replace_force_virtual_with_call` supplies the test only to
+/// the interpreter copy.  The jitcode copy gets `jit_force_virtual`, which
+/// `rewrite_op_jit_force_virtual` lowers to `-live-` plus one
+/// `_do_builtin_call` residual: the deref is a single opaque call, never a
+/// body the walk descends into.  This attribute is how pyre spells that,
+/// because `ptr_is_virtual_ref` lives in `majit-metainterp`, which is not
+/// lowered to LLBC — so a descent that walked this body reached a residual
+/// call whose funcbox is only a symbolic hash and aborted with
+/// `OrthodoxSubWalkTraceUnsupported`.  Every caller of a `locals()` /
+/// `f_locals` chain hop inherits that abort: `builtin_locals` declined with
+/// `un-lowered helper call in body` naming
+/// `majit_metainterp::virtualref::ptr_is_virtual_ref`.
+///
+/// The `FORCE_VREF_HOOK` arm is an indirect call through a `OnceLock` fn
+/// pointer, so that half is unwalkable in any case.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
     if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as *const u8) } {
         // Only the tracer stores a `JitVirtualRef` here, and it registers the
