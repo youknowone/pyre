@@ -2271,10 +2271,9 @@ unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_valu
     }
     {
         let strategy = w_module_dict_module_strategy_mut(obj);
-        let storage = w_module_dict_module_storage_mut(obj);
-        let old_len = storage.len();
-        strategy.setitem_str(storage, key, w_value);
-        if storage.len() != old_len {
+        let old_len = w_module_dict_module_storage(obj).len();
+        strategy.setitem_str(obj, key, w_value);
+        if w_module_dict_module_storage(obj).len() != old_len {
             w_dict_bump_keys_version(obj);
         }
     }
@@ -2298,8 +2297,7 @@ pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<P
     }
     {
         let strategy = &*w_module_dict_get_strategy(obj);
-        let storage = w_module_dict_module_storage(obj);
-        if let Some(v) = strategy.getitem_str(storage, key) {
+        if let Some(v) = strategy.getitem_str(obj, key) {
             return Some(v);
         }
     }
@@ -2390,8 +2388,7 @@ unsafe fn w_module_dict_delitem_str_internal(obj: PyObjectRef, key: &str) -> Opt
     }
     let removed = {
         let strategy = w_module_dict_module_strategy_mut(obj);
-        let storage = w_module_dict_module_storage_mut(obj);
-        strategy.delitem_str(storage, key)
+        strategy.delitem_str(obj, key)
     };
     if removed.is_some() {
         w_dict_bump_keys_version(obj);
@@ -2410,8 +2407,7 @@ pub unsafe fn w_module_dict_length(obj: PyObjectRef) -> usize {
         entries.len()
     } else {
         let strategy = &*w_module_dict_get_strategy(obj);
-        let storage = w_module_dict_module_storage(obj);
-        strategy.length(storage)
+        strategy.length(obj)
     }
 }
 
@@ -4519,9 +4515,8 @@ pub unsafe fn w_module_dict_clear_inner(obj: PyObjectRef) {
         }
     } else {
         let strategy = w_module_dict_module_strategy_mut(obj);
-        let storage = w_module_dict_module_storage_mut(obj);
-        let changed = !storage.is_empty();
-        strategy.clear(storage);
+        let changed = !w_module_dict_module_storage(obj).is_empty();
+        strategy.clear(obj);
         if changed {
             w_dict_bump_keys_version(obj);
         }

@@ -979,14 +979,9 @@ impl ModuleDictStrategy {
     ///     cell = self.getdictvalue_no_unwrapping(w_dict, key)
     ///     return self._setitem_str_cell_known(cell, w_dict, key, w_value)
     /// ```
-    pub fn setitem_str(
-        &mut self,
-        storage: &mut ModuleDictStorage,
-        key: &str,
-        w_value: PyObjectRef,
-    ) {
-        let cell = storage.get(key);
-        self._setitem_str_cell_known(cell, storage, key, w_value);
+    pub fn setitem_str(&mut self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
+        let cell = self.getdictvalue_no_unwrapping(w_dict, key);
+        self._setitem_str_cell_known(cell, w_dict, key, w_value);
     }
 
     /// `celldict.py _setitem_str_cell_known`:
@@ -1019,7 +1014,7 @@ impl ModuleDictStrategy {
     pub fn _setitem_str_cell_known(
         &mut self,
         cell: Option<PyObjectRef>,
-        storage: &mut ModuleDictStorage,
+        w_dict: PyObjectRef,
         key: &str,
         w_value: PyObjectRef,
     ) {
@@ -1029,7 +1024,9 @@ impl ModuleDictStrategy {
             return;
         };
         self.mutated();
-        storage.set(key, w_to_store);
+        unsafe {
+            crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict).set(key, w_to_store);
+        }
         // `celldict.py:88-90`: keep any live cache for `key` in step
         // with the new stored value so subsequent LOAD_GLOBAL through
         // the cache reads the fresh entry without an invalidation
@@ -1047,8 +1044,8 @@ impl ModuleDictStrategy {
     /// def length(self, w_dict):
     ///     return len(self.unerase(w_dict.dstorage))
     /// ```
-    pub fn length(&self, storage: &ModuleDictStorage) -> usize {
-        storage.len()
+    pub fn length(&self, w_dict: PyObjectRef) -> usize {
+        unsafe { crate::dictmultiobject::w_module_dict_module_storage(w_dict).len() }
     }
 
     /// `celldict.py getitem_str`:
@@ -1058,8 +1055,8 @@ impl ModuleDictStrategy {
     ///     cell = self.getdictvalue_no_unwrapping(w_dict, key)
     ///     return unwrap_cell(self.space, cell)
     /// ```
-    pub fn getitem_str(&self, storage: &ModuleDictStorage, key: &str) -> Option<PyObjectRef> {
-        let raw = storage.get(key)?;
+    pub fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+        let raw = self.getdictvalue_no_unwrapping(w_dict, key)?;
         // `unwrap_cell` is null-tolerant and an `ObjectMutableCell` may hold a
         // null `w_value`; a null unwrap means the name has no live binding, so
         // report absence rather than `Some(null)`.
@@ -1071,12 +1068,10 @@ impl ModuleDictStrategy {
     /// (`celldict.py:110-121`); the object-fallback /
     /// `_never_equal_to_string` branches belong to the full strategy
     /// dispatch once `ObjectDictStrategy` is wired.
-    pub fn delitem_str(
-        &mut self,
-        storage: &mut ModuleDictStorage,
-        key: &str,
-    ) -> Option<PyObjectRef> {
-        let removed = storage.remove(key)?;
+    pub fn delitem_str(&mut self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+        let removed = unsafe {
+            crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict).remove(key)?
+        };
         if let Some(caches) = self.caches.lock().as_mut()
             && let Some(cache) = caches.get(key)
         {
@@ -1096,8 +1091,10 @@ impl ModuleDictStrategy {
     ///     self.unerase(w_dict.dstorage).clear()
     ///     self.mutated()
     /// ```
-    pub fn clear(&mut self, storage: &mut ModuleDictStorage) {
-        storage.clear();
+    pub fn clear(&mut self, w_dict: PyObjectRef) {
+        unsafe {
+            crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict).clear();
+        }
         self.mutated();
     }
 
@@ -1438,11 +1435,11 @@ pub unsafe fn remove_cell(w_dict: PyObjectRef, name: &str) {
         return;
     }
     let strategy = crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict);
-    let storage = crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict);
-    let Some(w_value) = strategy.getitem_str(storage, name) else {
+    let Some(w_value) = strategy.getitem_str(w_dict, name) else {
         return;
     };
     strategy.mutated();
+    let storage = crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict);
     storage.set(name, w_value);
 }
 
@@ -1490,33 +1487,33 @@ mod tests {
 
     #[test]
     fn setitem_getitem_roundtrip() {
-        let mut strat = ModuleDictStrategy::new();
-        let mut store = strat.get_empty_storage();
+        let w_dict = crate::dictmultiobject::w_module_dict_new();
+        let strat = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
         let v = crate::w_str_new("hello");
-        strat.setitem_str(&mut store, "x", v);
-        assert_eq!(strat.getitem_str(&store, "x"), Some(v));
-        assert_eq!(strat.length(&store), 1);
+        strat.setitem_str(w_dict, "x", v);
+        assert_eq!(strat.getitem_str(w_dict, "x"), Some(v));
+        assert_eq!(strat.length(w_dict), 1);
     }
 
     #[test]
     fn setitem_bumps_version() {
-        let mut strat = ModuleDictStrategy::new();
+        let w_dict = crate::dictmultiobject::w_module_dict_new();
+        let strat = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
         let before = strat.version;
-        let mut store = strat.get_empty_storage();
-        strat.setitem_str(&mut store, "k", crate::w_str_new("v"));
+        strat.setitem_str(w_dict, "k", crate::w_str_new("v"));
         assert_ne!(strat.version, before);
     }
 
     #[test]
     fn delitem_removes_and_bumps() {
-        let mut strat = ModuleDictStrategy::new();
-        let mut store = strat.get_empty_storage();
+        let w_dict = crate::dictmultiobject::w_module_dict_new();
+        let strat = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
         let v = crate::w_str_new("v");
-        strat.setitem_str(&mut store, "k", v);
+        strat.setitem_str(w_dict, "k", v);
         let v_before = strat.version;
-        let removed = strat.delitem_str(&mut store, "k");
+        let removed = strat.delitem_str(w_dict, "k");
         assert_eq!(removed, Some(v));
-        assert_eq!(strat.getitem_str(&store, "k"), None);
+        assert_eq!(strat.getitem_str(w_dict, "k"), None);
         assert_ne!(strat.version, v_before);
     }
 
@@ -1525,15 +1522,15 @@ mod tests {
         // After a second write with an int value, the strategy should
         // wrap the value in `IntMutableCell` and skip the version bump
         // (typeobject.py:61-63).
-        let mut strat = ModuleDictStrategy::new();
-        let mut store = strat.get_empty_storage();
+        let w_dict = crate::dictmultiobject::w_module_dict_new();
+        let strat = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
         unsafe {
             let v0 = crate::intobject::w_int_new(7);
-            strat.setitem_str(&mut store, "k", v0);
+            strat.setitem_str(w_dict, "k", v0);
             let v1 = crate::intobject::w_int_new(8);
-            strat.setitem_str(&mut store, "k", v1);
+            strat.setitem_str(w_dict, "k", v1);
             // getitem_str unwraps the cell back to the int value.
-            let got = strat.getitem_str(&store, "k").unwrap();
+            let got = strat.getitem_str(w_dict, "k").unwrap();
             assert_eq!(crate::intobject::w_int_get_value(got), 8);
         }
     }
