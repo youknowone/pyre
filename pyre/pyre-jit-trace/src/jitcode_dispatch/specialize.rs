@@ -4636,12 +4636,15 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
 /// shape is reached — as
 /// [`try_walker_specialize_load_bound_method_attr`] does for `LOAD_ATTR`.
 ///
-/// The stack operands are authoritative for BOTH oparg forms.  The
-/// zero-argument frame path they stand in for reads `locals_w[0]` and the
-/// `__class__` freevar cell (`super_operands_from_frame`), which are exactly
-/// what the `LOAD_FAST 0` / `LOAD_DEREF __class__` preceding this opcode
-/// pushed; `LOAD_SUPER_ATTR_ATTR` / `LOAD_SUPER_ATTR_METHOD` read the same
-/// two stack entries regardless of `oparg & 2`.
+/// Only the zero-argument oparg form reaches here: `codewriter.rs` lowers
+/// `super(C, self).name` to `simple_call` + `getattr`, which
+/// [`try_walker_specialize_two_arg_super_call`] and
+/// [`try_walker_specialize_load_attr_on_super`] answer between them.
+///
+/// The stack operands are authoritative for that form too.  The frame path
+/// they stand in for reads `locals_w[0]` and the `__class__` freevar cell
+/// (`super_operands_from_frame`), which are exactly what the `LOAD_FAST 0` /
+/// `LOAD_DEREF __class__` preceding this opcode pushed.
 ///
 /// This emits one runtime guard FEWER than the ordinary method load: there is
 /// no instance-map / exception-dict shadow guard, because

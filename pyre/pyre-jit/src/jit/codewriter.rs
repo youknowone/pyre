@@ -12548,16 +12548,29 @@ impl CodeWriter {
                         // self_or_null). Net: -1.  `oparg >> 2` is the co_names
                         // index, `oparg & 1` the is_method flag, and `oparg & 2`
                         // the two-argument-super flag (all compile-time
-                        // constants). `load_super_attr(global_super, self, cls,
+                        // constants).
+                        //
+                        // The two-argument form lowers to the two ops it is —
+                        // `simple_call(global_super, NULL, cls, self)` then
+                        // `getattr(proxy, name)` — and the zero-argument form to
+                        // the fused `load_super_attr(global_super, self, cls,
                         // frame, code, name_idx, is_two_arg)` HLOp →
                         // `residual_call_ir_r(load_super_attr_fn,
                         // ListI[name_idx, is_two_arg], ListR[global_super,
-                        // self, cls, frame, code])` calls the actual global value and
-                        // resolves the attribute (MayForce). The is_method form runs the
-                        // runtime bound-method unwrap through two pure
+                        // self, cls, frame, code])`, which calls the actual
+                        // global value and resolves the attribute (MayForce).
+                        // The split is written at the emit below.
+                        //
+                        // Either way the is_method form runs the runtime
+                        // bound-method unwrap through two pure
                         // `super_attr_unwrap(raw, which)` residuals (which 0 =
                         // func slot, 1 = self slot), mirroring the LOAD_ATTR
-                        // method form's two-residual push.
+                        // method form's two-residual push.  That rule is
+                        // `LOAD_SUPER_ATTR`'s own — a `Method` splits into
+                        // `(func, self)` and anything else pushes `(value,
+                        // NULL)` — and is not the `load_method_self` one, so the
+                        // two-argument form keeps these residuals rather than
+                        // borrowing LOAD_ATTR's method half.
                         Instruction::LoadSuperAttr { .. } => {
                             let name_idx = (u32::from(op_arg) >> 2) as usize;
                             let is_method = (u32::from(op_arg) & 1) != 0;
@@ -12577,18 +12590,61 @@ impl CodeWriter {
                             let cls_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let global_super = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let raw_value = emit_frontend_load_super_attr(
-                                &mut graph,
-                                &current_block.block(),
-                                global_super,
-                                self_value,
-                                cls_value,
-                                frame_var.into(),
-                                code_const,
-                                name_idx_const,
-                                is_two_arg_const,
-                                py_pc as i64,
-                            );
+                            let raw_value = if is_two_arg {
+                                // `super(C, self).name` is a call and an
+                                // attribute load, and spelling it as those two
+                                // ops is what the name-bound form
+                                // (`su = super(C, self); su.name`) already
+                                // reaches: the call folds to the four-word
+                                // proxy `NewWithVtable` + `SetfieldGc`
+                                // (`try_walker_specialize_two_arg_super_call`),
+                                // the load answers out of that emission
+                                // (`try_walker_specialize_load_attr_on_super`),
+                                // and the allocation dies.  A `super` global
+                                // that is not the builtin gets what the same
+                                // two ops give the name-bound spelling too --
+                                // the callee inlined and the read folded --
+                                // where one fused residual can only run it.
+                                //
+                                // The zero-argument form keeps that residual,
+                                // because the callable it reaches is
+                                // `builtin_super`'s frame-reading tail and the
+                                // frame has to travel as an operand: an inlined
+                                // callee's `gettopframe()` can name the outer
+                                // portal frame.
+                                let proxy_value = emit_frontend_simple_call(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    global_super,
+                                    super::flow::Constant::none().into(),
+                                    vec![cls_value, self_value],
+                                    py_pc as i64,
+                                );
+                                let attr_name =
+                                    super::flow::Constant::string(code.names[name_idx].as_str());
+                                emit_frontend_getattr(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    proxy_value.into(),
+                                    attr_name.into(),
+                                    code_const,
+                                    name_idx_const,
+                                    py_pc as i64,
+                                )
+                            } else {
+                                emit_frontend_load_super_attr(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    global_super,
+                                    self_value,
+                                    cls_value,
+                                    frame_var.into(),
+                                    code_const,
+                                    name_idx_const,
+                                    is_two_arg_const,
+                                    py_pc as i64,
+                                )
+                            };
                             if is_method {
                                 let func_value = emit_frontend_super_attr_unwrap(
                                     &mut graph,
