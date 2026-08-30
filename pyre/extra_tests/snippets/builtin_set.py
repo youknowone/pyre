@@ -457,15 +457,21 @@ assert 4 not in non_empty_set
 assert 1 in set_from_literal
 assert 4 not in set_from_literal
 
-# TODO: Assert that empty aruguments raises exception.
+with assert_raises(TypeError):
+    non_empty_set.add()
 non_empty_set.add("a")
 assert "a" in non_empty_set
 
-# TODO: Assert that empty arguments, or item not in set raises exception.
+with assert_raises(TypeError):
+    non_empty_set.remove()
+with assert_raises(KeyError):
+    non_empty_set.remove("missing")
 non_empty_set.remove(1)
 assert 1 not in non_empty_set
 
-# TODO: Assert that adding the same thing to a set once it's already there doesn't do anything.
+before_duplicate_add = non_empty_set.copy()
+non_empty_set.add("a")
+assert non_empty_set == before_duplicate_add
 
 assert repr(frozenset()) == "frozenset()"
 assert repr(frozenset([1, 2, 3])) == "frozenset({1, 2, 3})"

@@ -626,7 +626,7 @@
       "dynasm": "PASS"
     },
     "test.test_int": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_int_literal": {
       "cranelift": "PASS",
@@ -1355,7 +1355,7 @@
       "dynasm": "PASS"
     },
     "test.test_weakref": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_weakset": {
       "dynasm": "PASS"
