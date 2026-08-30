@@ -1266,7 +1266,7 @@ pub fn replay_pending_fields(
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     cache: &mut BridgeVirtualCache<'_>,
 ) -> bool {
-    let __diag = std::env::var_os("MAJIT_BRIDGE_DIAG").is_some();
+    let __diag = crate::bridge_diag_enabled();
     let Some(storage) = resume_data.storage.as_ref() else {
         if __diag {
             eprintln!("[replay] storage=None (no pendingfields replayed)");

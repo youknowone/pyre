@@ -523,6 +523,17 @@ pub fn log_opt_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_LOG_OPT").is_some())
 }
 
+/// `MAJIT_BRIDGE_DIAG` — narrate the pending-field replay a bridge entry runs.
+///
+/// Read once, like its `MAJIT_BRIDGE_DEBUG` sibling below: the gate opens
+/// `replay_pending_fields`, which every guard-resume bridge entry calls, and
+/// `std::env::var_os` takes the environment lock and scans it linearly whether
+/// or not the variable is set.
+pub fn bridge_diag_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_BRIDGE_DIAG").is_some())
+}
+
 pub fn bridge_debug_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some())
