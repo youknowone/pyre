@@ -33,6 +33,16 @@ for name in ("shift_jis_2004", "shift_jisx0213"):
 for name in ("euc_jis_2004", "euc_jisx0213", "shift_jis_2004", "shift_jisx0213"):
     assert ("フルーツ\0").encode(name).endswith(b"\0")
 
+# PyPy `_codecs_iso2022.c::jisx0213_encoder` rejects JIS X 0212-only entries;
+# their high bit is not a JIS X 0213 plane-2 marker on this path.
+for name in ("iso2022_jp_2004", "iso2022_jp_3"):
+    try:
+        "陒".encode(name)
+    except UnicodeEncodeError:
+        pass
+    else:
+        raise AssertionError(name)
+
 
 for name, encoded in (
     ("shift_jis", b"\x81\x00"),

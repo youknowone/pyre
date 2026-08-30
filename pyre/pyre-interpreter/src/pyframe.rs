@@ -3611,15 +3611,12 @@ impl PyFrame {
         w_globals: PyObjectRef,
     ) -> Result<FrameBox, crate::PyError> {
         // Root the globals across the code/object allocations and the frame
-        // construction; `createframe_obj` stores `w_globals` into the frame
-        // (and `w_code_set_w_globals` into the code), both of which root it
-        // once they return.
+        // construction; `createframe_obj` publishes `w_globals` to the code
+        // on its first use, or stores a later distinct dictionary on the
+        // frame's debug data, and both locations root it once they return.
         let _root = pyre_object::gc_roots::push_roots();
         let w_globals = pyre_object::gc_roots::pin_root(w_globals);
         let w_code = crate::box_code_object(code);
-        unsafe {
-            crate::w_code_set_w_globals(w_code, w_globals);
-        }
         let ctx_ptr = Rc::into_raw(execution_context);
         crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
     }
@@ -3637,13 +3634,13 @@ impl PyFrame {
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = _roots.publish(&[w_code, w_globals]);
         _roots.normalize(root_base, 2);
-        let w_code = _roots.get(root_base);
-        let w_globals = _roots.get(root_base + 1);
-        unsafe {
-            crate::w_code_set_w_globals(w_code, w_globals);
-        }
         let ctx_ptr = Rc::into_raw(execution_context);
-        crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
+        crate::createframe_obj(
+            _roots.get(root_base) as *const (),
+            _roots.get(root_base + 1),
+            ctx_ptr,
+            None,
+        )
     }
 
     /// RPython MetaInterp traces against its own MIFrame stack instead of

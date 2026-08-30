@@ -46,6 +46,11 @@ def _function_type_closure_contract():
     closed = outer()
     cell = closed.__closure__[0]
 
+    # PyPy `Function.descr_function__new__` validates argdefs before closure.
+    with assert_raises(TypeError) as raised:
+        types.FunctionType(plain.__code__, {}, None, 42, 42)
+    assert str(raised.exception) == "arg 4 (defaults) must be None or tuple"
+
     with assert_raises(TypeError) as raised:
         types.FunctionType(closed.__code__, globals())
     assert str(raised.exception) == "arg 5 (closure) must be tuple"

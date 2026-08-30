@@ -4357,11 +4357,7 @@ fn load_source_module(
             let code =
                 parse_source_module(&pathname_str, &source).map_err(|error| match error {
                     crate::syntax_warnings::SourceCompileError::Compile(error) => {
-                        let mut message =
-                            rustpython_wtf8::Wtf8Buf::from_string("cannot compile '".to_string());
-                        message.push_wtf8(&path_text);
-                        message.push_str(&format!("': {error}"));
-                        crate::PyError::new(crate::PyErrorKind::ImportError, message)
+                        crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
                     }
                     crate::syntax_warnings::SourceCompileError::Warning(error) => error,
                 })?;

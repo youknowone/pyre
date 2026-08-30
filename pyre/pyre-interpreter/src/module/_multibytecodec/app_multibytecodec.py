@@ -18,7 +18,7 @@ def _codec_errors_arg(name, errors):
             f"{name}() argument 'errors' must be str or None, "
             f"not {type(errors).__name__}"
         )
-    return errors
+    return str.__getitem__(errors, slice(None))
 
 
 def _errors_arg(name, position, errors):
@@ -30,7 +30,7 @@ def _errors_arg(name, position, errors):
         # `seterror` names `None` itself rather than its type.
         got = "None" if errors is None else type(errors).__name__
         raise TypeError(f"{name}() argument {position} must be str, not {got}")
-    return errors
+    return str.__getitem__(errors, slice(None))
 
 
 def _codec_of(obj):
@@ -61,7 +61,11 @@ def _get_errors(self):
 def _set_errors(self, value):
     if not isinstance(value, str):
         raise TypeError("errors must be a string")
-    self._errors = value
+    # PyPy `fset_errors` stores `space.text_w(w_errors)` and `fget_errors`
+    # mints a fresh text object, so a str subclass never becomes the stored
+    # observable value.  Call the base implementation directly to bypass a
+    # subclass's `__getitem__` override while normalizing it to exact `str`.
+    self._errors = str.__getitem__(value, slice(None))
 
 
 def _del_errors(self):
@@ -95,11 +99,14 @@ class MultibyteIncrementalDecoder:
         self.state = bytearray(_initial_state(self.codec.name, True))
 
     def decode(self, object, final=False):
-        data = self.pending + object
+        # PyPy `decode_w(object='bufferstr')` preserves the original buffer
+        # when no pending prefix has to be joined.  Materialize only for the
+        # concatenation case; the Rust boundary accepts every buffer provider.
+        data = self.pending + memoryview(object).tobytes() if self.pending else object
         output, consumed = _decode_stateful(
             self.codec.name, data, self.errors, (final, self.state)
         )
-        self.pending = data[consumed:]
+        self.pending = memoryview(data)[consumed:].tobytes()
         return output
 
     def reset(self):
@@ -136,7 +143,7 @@ class MultibyteIncrementalDecoder:
             raise UnicodeDecodeError(
                 self.codec.name, buffer, 0, len(buffer), "pending buffer too large"
             )
-        codec_state = flag.to_bytes(8, "little")
+        codec_state = int.to_bytes(flag, 8, "little")
         self.pending = buffer
         self.state = bytearray(codec_state)
 
@@ -189,7 +196,7 @@ class MultibyteIncrementalEncoder:
             raise TypeError(
                 f"setstate() argument must be int, not {type(state).__name__}"
             )
-        buffer = state.to_bytes(17, "little")
+        buffer = int.to_bytes(state, 17, "little")
         pending_len = buffer[0]
         if pending_len > 8:
             raise UnicodeError("pending buffer too large")

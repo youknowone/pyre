@@ -2936,6 +2936,16 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "arg 3 (name) must be None or string",
         ));
     };
+    // PyPy `Function.descr_function__new__` calls `space.fixedview(argdefs)`
+    // before it inspects `closure`; preserve which malformed argument wins.
+    if !w_argdefs.is_null()
+        && !unsafe { pyre_object::is_none(w_argdefs) }
+        && !unsafe { pyre_object::is_tuple(w_argdefs) }
+    {
+        return Err(crate::PyError::type_error(
+            "arg 4 (defaults) must be None or tuple",
+        ));
+    }
     // [3.14-spec] `function.py Function.descr_function__new__` derives the
     // closure contract from `PyCode.co_freevars`, then refuses anything but an
     // exact tuple (`TypeError("invalid closure")`) and refuses a closure at all
@@ -2992,11 +3002,6 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let qualname = pyre_object::w_str_new(unsafe { (*code_ptr).qualname.as_ref() });
     unsafe { function_set_qualname(func, qualname) };
     if !w_argdefs.is_null() && !unsafe { pyre_object::is_none(w_argdefs) } {
-        if !unsafe { pyre_object::is_tuple(w_argdefs) } {
-            return Err(crate::PyError::type_error(
-                "arg 4 (defaults) must be None or tuple",
-            ));
-        }
         unsafe { function_set_defaults(func, w_argdefs) };
     }
     if !w_kwdefaults.is_null() && !unsafe { pyre_object::is_none(w_kwdefaults) } {

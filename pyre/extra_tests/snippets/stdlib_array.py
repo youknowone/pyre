@@ -1284,3 +1284,28 @@ assert error.exception.encoding == "utf-32-" + (
 assert error.exception.object == opposite_bytes
 assert error.exception.start == 4
 assert error.exception.end == 8
+
+
+# PyPy `_fromiterable` keeps the iterator as a translated live variable across
+# both `next()` and per-item conversion.  Force collections at each boundary
+# so the Rust shadow-stack port must reload the forwarded iterator slot.
+class CollectingIterator:
+    def __init__(self):
+        self.value = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        import gc
+
+        gc.collect()
+        if self.value == 4:
+            raise StopIteration
+        self.value += 1
+        return self.value
+
+
+collected = array("i")
+collected.extend(CollectingIterator())
+assert collected.tolist() == [1, 2, 3, 4]

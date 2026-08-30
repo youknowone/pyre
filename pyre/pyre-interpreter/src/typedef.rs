@@ -3464,7 +3464,7 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // a circular importer sees the partial mapping, while the completed
     // module's next read must evaluate all annotations afresh.
     let is_initializing =
-        module_is_initializing(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+        module_is_initializing(pyre_object::gc_roots::shadow_stack_get(dict_slot))?;
     let annotations = match crate::baseobjspace::finditem_str(
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
         "__annotate__",
@@ -3502,25 +3502,19 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(pyre_object::gc_roots::shadow_stack_get(annotations_slot))
 }
 
-/// RustPython `PyModule::is_initializing`: inspect the importlib-owned spec
-/// without making failures in optional metadata observable through an
-/// otherwise valid `module.__annotations__` read.
-fn module_is_initializing(w_dict: PyObjectRef) -> bool {
+/// RustPython `PyModule::is_initializing`, through PyPy importing.py's
+/// `is_spec_initializing`: missing optional metadata reads false, while an
+/// actual lookup or truth-test failure remains observable.
+fn module_is_initializing(w_dict: PyObjectRef) -> Result<bool, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
     let _ = roots.pin_root(w_dict);
-    if let Ok(Some(spec)) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__spec__") {
-        let spec_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(spec);
-        if let Ok(initializing) =
-            crate::baseobjspace::getattr_str(roots.get(spec_slot), "_initializing")
-        {
-            let initializing_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = roots.pin_root(initializing);
-            return crate::baseobjspace::is_true(roots.get(initializing_slot)).unwrap_or(false);
-        }
-    }
-    false
+    let Some(spec) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__spec__")? else {
+        return Ok(false);
+    };
+    let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(spec);
+    crate::importing::is_spec_initializing(roots.get(spec_slot))
 }
 
 fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

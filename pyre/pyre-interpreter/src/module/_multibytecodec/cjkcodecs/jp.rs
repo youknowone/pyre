@@ -408,7 +408,13 @@ pub(super) fn encode_jisx0213_code(
             return Ok((code, 1));
         }
         if let Some(code) = try_map_encode(&JISXCOMMON_ENCMAP, &JISXCOMMON_ENCMAP_DATA, c) {
-            return Ok((code, 1));
+            // PyPy `_codecs_jp.c::jisx0213_encoder` and
+            // `_codecs_iso2022.c::jisx0213_encoder` both abandon the shared
+            // table's high-bit JIS X 0212 entries here.  They are not JIS X
+            // 0213 plane 2 codes.
+            if code & 0x8000 == 0 {
+                return Ok((code, 1));
+            }
         }
         Err(EncodeOne::Illegal(1))
     } else if c >> 16 == EMPBASE >> 16 {

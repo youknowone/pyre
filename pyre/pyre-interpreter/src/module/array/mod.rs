@@ -330,9 +330,10 @@ fn array_extend_iterable(
     // per-item resize check.
     let w_iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
-    let w_iter = pyre_object::gc_roots::pin_root(w_iter);
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_iter);
     loop {
-        match crate::baseobjspace::next(w_iter) {
+        match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
             Ok(w_item) => {
                 let obj = pyre_object::gc_roots::shadow_stack_get(base);
                 array_append_value(obj, w_item)?;
