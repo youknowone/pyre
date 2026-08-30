@@ -9345,6 +9345,18 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "raw_load_f/iid>f".to_string(),
         majit_translate::insns::BC_RAW_LOAD_F,
     );
+    // The two float<->int bitcasts, `majit_f64_to_bits` / `majit_bits_to_f64`.
+    // A `#[jit_interp]` arm carries a float across a branch as its bits (the
+    // lowerer expresses a float only as one float op's result), so a resume
+    // through such an arm dispatches these; their handlers are wired below.
+    insns.insert(
+        "convert_float_bytes_to_longlong/f>i".to_string(),
+        majit_translate::insns::BC_CONVERT_FLOAT_BYTES_TO_LONGLONG,
+    );
+    insns.insert(
+        "convert_longlong_bytes_to_float/i>f".to_string(),
+        majit_translate::insns::BC_CONVERT_LONGLONG_BYTES_TO_FLOAT,
+    );
     insns.insert(
         "setarrayitem_gc_i/riid".to_string(),
         majit_translate::insns::BC_SETARRAYITEM_GC_I,
