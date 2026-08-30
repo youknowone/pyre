@@ -8966,6 +8966,25 @@ pub(crate) fn mappingproxy_from_mapping(
 }
 
 fn init_mappingproxy_type(ns: PyObjectRef) {
+    // PyPy `interp2app` rejects an unbound receiver before entering every
+    // `W_DictProxyObject` method. CPython exposes the ordinary methods as
+    // method descriptors and the operator methods as slot wrappers, which
+    // accounts for their two measured error-message forms.
+    fn require_mappingproxy_receiver(
+        args: &[PyObjectRef],
+        name: &str,
+        method_descriptor: bool,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        dict_iterator_receiver(
+            args,
+            name,
+            method_descriptor,
+            "mappingproxy",
+            &pyre_object::MAPPING_PROXY_TYPE,
+            false,
+        )
+    }
+
     // Python 3.14 `PyDictProxy_Type`: "Read-only proxy of a mapping."
     // PyPy's module doc spells out the same contract, while its TypeDef
     // predates the explicit type-doc slot.
@@ -8981,19 +9000,10 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(mappingproxy_descr_new),
-        )
-    };
-    // dictproxyobject.py:117 __class_getitem__ = interp2app(
-    //     generic_alias_class_getitem, as_classmethod=True)
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            make_new_descr_with_doc(
+                mappingproxy_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     // dictproxyobject.py descr_len → space.len(self.w_mapping)
@@ -9001,13 +9011,15 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__len__",
-            make_builtin_function("__len__", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_int_new(0));
-                }
-                crate::type_methods::arity_slot(args, 0)?;
-                crate::baseobjspace::len_slot(args[0])
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__len__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__len__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
+                    crate::baseobjspace::len_slot(args[0])
+                },
+                "Return len(self).",
+            ),
         )
     };
     // dictproxyobject.py descr_getitem → space.getitem(self.w_mapping, w_key)
@@ -9015,10 +9027,15 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getitem__",
-            make_builtin_function("__getitem__", |args| {
-                crate::type_methods::arity_slot(args, 1)?;
-                crate::baseobjspace::getitem(args[0], args[1])
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__getitem__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__getitem__", false)?;
+                    crate::type_methods::arity_slot(args, 1)?;
+                    crate::baseobjspace::getitem(args[0], args[1])
+                },
+                "Return self[key].",
+            ),
         )
     };
     // dictproxyobject.py descr_contains → space.contains(self.w_mapping, w_key)
@@ -9026,12 +9043,17 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__contains__",
-            make_builtin_function("__contains__", |args| {
-                crate::type_methods::arity_slot(args, 1)?;
-                Ok(pyre_object::w_bool_from(crate::baseobjspace::contains(
-                    args[0], args[1],
-                )?))
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__contains__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__contains__", false)?;
+                    crate::type_methods::arity_slot(args, 1)?;
+                    Ok(pyre_object::w_bool_from(crate::baseobjspace::contains(
+                        args[0], args[1],
+                    )?))
+                },
+                "Return bool(key in self).",
+            ),
         )
     };
     // dictproxyobject.py descr_iter → space.iter(self.w_mapping)
@@ -9039,12 +9061,35 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__iter__",
-            make_builtin_function("__iter__", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_none());
-                }
-                crate::baseobjspace::iter(args[0])
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__iter__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__iter__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
+                    crate::baseobjspace::iter(args[0])
+                },
+                "Implement iter(self).",
+            ),
+        )
+    };
+    // dictproxyobject.py descr_str → space.str(self.w_mapping)
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__str__",
+            crate::gateway::make_builtin_function_with_doc(
+                "__str__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__str__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
+                    unsafe {
+                        Ok(pyre_object::w_str_from_wtf8_managed(
+                            crate::display::py_str_wtf8(args[0])?,
+                        ))
+                    }
+                },
+                "Return str(self).",
+            ),
         )
     };
     // dictproxyobject.py descr_repr →
@@ -9053,47 +9098,19 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function("__repr__", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_str_new("mappingproxy({})"));
-                }
-                unsafe {
-                    Ok(pyre_object::w_str_from_wtf8_managed(
-                        crate::display::py_repr_wtf8(args[0])?,
-                    ))
-                }
-            }),
-        )
-    };
-    // dictproxyobject.py descr_str → space.str(self.w_mapping)
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__str__",
-            make_builtin_function("__str__", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_str_new(""));
-                }
-                unsafe {
-                    Ok(pyre_object::w_str_from_wtf8_managed(
-                        crate::display::py_str_wtf8(args[0])?,
-                    ))
-                }
-            }),
-        )
-    };
-    // dictproxyobject.py descr_ior → unconditional TypeError; the
-    // proxy is read-only so in-place merge is rejected by name even
-    // when the rhs would otherwise be acceptable for `__or__`.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__ior__",
-            make_builtin_function("__ior__", |_args| {
-                Err(crate::PyError::type_error(
-                    "'|=' is not supported by mappingproxy; use '|' instead",
-                ))
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__repr__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__repr__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
+                    unsafe {
+                        Ok(pyre_object::w_str_from_wtf8_managed(
+                            crate::display::py_repr_wtf8(args[0])?,
+                        ))
+                    }
+                },
+                "Return repr(self).",
+            ),
         )
     };
     // Python 3.14 `mappingproxy_hash`: delegate to the wrapped mapping.
@@ -9104,22 +9121,18 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__hash__",
                 |args| {
-                    let proxy = args[0];
-                    if !unsafe { pyre_object::is_dict_proxy(proxy) } {
-                        let received = unsafe { (*(*proxy).ob_type).name };
-                        return Err(crate::PyError::type_error(format!(
-                            "descriptor '__hash__' requires a 'mappingproxy' object but received a '{received}'"
-                        )));
-                    }
+                    let proxy = require_mappingproxy_receiver(args, "__hash__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
                     let mapping = unsafe { pyre_object::w_dict_proxy_get_mapping(proxy) };
                     Ok(pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
                         mapping,
                     )?))
                 },
                 1,
+                "Return hash(self).",
             ),
         )
     };
@@ -9131,23 +9144,29 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__or__",
-            make_builtin_function("__or__", |args| {
-                crate::type_methods::arity_slot(args, 1)?;
-                let lhs = args[0];
-                let rhs = unsafe {
-                    if pyre_object::is_dict_proxy(args[1]) {
-                        pyre_object::w_dict_proxy_get_mapping(args[1])
-                    } else {
-                        args[1]
+            crate::gateway::make_builtin_function_with_doc(
+                "__or__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__or__", false)?;
+                    crate::type_methods::arity_slot(args, 1)?;
+                    let lhs = args[0];
+                    let rhs = unsafe {
+                        if pyre_object::is_dict_proxy(args[1]) {
+                            pyre_object::w_dict_proxy_get_mapping(args[1])
+                        } else {
+                            args[1]
+                        }
+                    };
+                    if !unsafe { crate::baseobjspace::isinstance_w(rhs, gettypeobject(&DICT_TYPE)) }
+                    {
+                        return Ok(pyre_object::w_not_implemented());
                     }
-                };
-                if !unsafe { pyre_object::is_dict(rhs) } {
-                    return Ok(pyre_object::w_not_implemented());
-                }
-                let new_dict = crate::type_methods::dict_method_copy(&[lhs])?;
-                crate::type_methods::dict_method_update(&[new_dict, rhs])?;
-                Ok(new_dict)
-            }),
+                    let new_dict = crate::type_methods::dict_method_copy(&[lhs])?;
+                    crate::type_methods::dict_method_update(&[new_dict, rhs])?;
+                    Ok(new_dict)
+                },
+                "Return self|value.",
+            ),
         )
     };
     // dictproxyobject.py descr_ror →
@@ -9156,23 +9175,53 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ror__",
-            make_builtin_function("__ror__", |args| {
-                crate::type_methods::arity_slot(args, 1)?;
-                let self_mapping = unsafe {
-                    if pyre_object::is_dict_proxy(args[0]) {
-                        pyre_object::w_dict_proxy_get_mapping(args[0])
-                    } else {
-                        args[0]
+            crate::gateway::make_builtin_function_with_doc(
+                "__ror__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__ror__", false)?;
+                    crate::type_methods::arity_slot(args, 1)?;
+                    let self_mapping = unsafe {
+                        if pyre_object::is_dict_proxy(args[0]) {
+                            pyre_object::w_dict_proxy_get_mapping(args[0])
+                        } else {
+                            args[0]
+                        }
+                    };
+                    let lhs = unsafe {
+                        if pyre_object::is_dict_proxy(args[1]) {
+                            pyre_object::w_dict_proxy_get_mapping(args[1])
+                        } else {
+                            args[1]
+                        }
+                    };
+                    if !unsafe { crate::baseobjspace::isinstance_w(lhs, gettypeobject(&DICT_TYPE)) }
+                    {
+                        return Ok(pyre_object::w_not_implemented());
                     }
-                };
-                let lhs = args[1];
-                if !unsafe { pyre_object::is_dict(lhs) } {
-                    return Ok(pyre_object::w_not_implemented());
-                }
-                let new_dict = crate::type_methods::dict_method_copy(&[lhs])?;
-                crate::type_methods::dict_method_update(&[new_dict, self_mapping])?;
-                Ok(new_dict)
-            }),
+                    crate::baseobjspace::call_method_result(lhs, "__or__", &[self_mapping])
+                },
+                "Return value|self.",
+            ),
+        )
+    };
+    // dictproxyobject.py descr_ior → unconditional TypeError; the
+    // proxy is read-only so in-place merge is rejected by name even
+    // when the rhs would otherwise be acceptable for `__or__`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ior__",
+            crate::gateway::make_builtin_function_with_doc(
+                "__ior__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__ior__", false)?;
+                    crate::type_methods::arity_slot(args, 1)?;
+                    Err(crate::PyError::type_error(
+                        "'|=' is not supported by mappingproxy; use '|' instead",
+                    ))
+                },
+                "Return self|=value.",
+            ),
         )
     };
     // dictproxyobject.py descr_reversed →
@@ -9181,23 +9230,33 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reversed__",
-            make_builtin_function("__reversed__", |args| {
-                dict_iterator_receiver(
-                    args,
-                    "__reversed__",
-                    true,
-                    "mappingproxy",
-                    &pyre_object::MAPPING_PROXY_TYPE,
-                    false,
-                )?;
-                let dict = crate::type_methods::resolve_dict_backing(args[0]);
-                Ok(
-                    pyre_object::dictmultiobject::w_dict_view_reverse_iterator_new(
-                        dict,
-                        pyre_object::dictmultiobject::DictViewKind::Keys,
-                    ),
-                )
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__reversed__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__reversed__", true)?;
+                    crate::type_methods::arity_no_args(args, "__reversed__")?;
+                    forward_mapping_method(args, "__reversed__")
+                },
+                "D.__reversed__() -> reverse iterator",
+            ),
+        )
+    };
+    // dictproxyobject.py __class_getitem__ = interp2app(
+    //     generic_alias_class_getitem, as_classmethod=True)
+    let class_getitem = crate::gateway::make_builtin_function_with_arity_and_doc(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+        2,
+        "See PEP 585",
+    );
+    unsafe {
+        crate::function::fset_func_text_signature(class_getitem, w_str_new("($type, object, /)"))
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(class_getitem),
         )
     };
     // dictproxyobject.py get_w / 75 keys_w / 78 values_w / 81 items_w /
@@ -9216,57 +9275,86 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                 proxy
             }
         };
-        let method = crate::baseobjspace::getattr_str(mapping, name)?;
-        crate::call::call_function_impl_result(method, &args[1..])
+        crate::baseobjspace::call_method_result(mapping, name, &args[1..])
     }
     fn proxy_get(args: &[PyObjectRef]) -> crate::PyResult {
+        require_mappingproxy_receiver(args, "get", true)?;
+        crate::type_methods::arity_between(args, "get", 1, 2)?;
         forward_mapping_method(args, "get")
     }
     fn proxy_keys(args: &[PyObjectRef]) -> crate::PyResult {
+        require_mappingproxy_receiver(args, "keys", true)?;
+        crate::type_methods::arity_no_args(args, "keys")?;
         forward_mapping_method(args, "keys")
     }
     fn proxy_values(args: &[PyObjectRef]) -> crate::PyResult {
+        require_mappingproxy_receiver(args, "values", true)?;
+        crate::type_methods::arity_no_args(args, "values")?;
         forward_mapping_method(args, "values")
     }
     fn proxy_items(args: &[PyObjectRef]) -> crate::PyResult {
+        require_mappingproxy_receiver(args, "items", true)?;
+        crate::type_methods::arity_no_args(args, "items")?;
         forward_mapping_method(args, "items")
     }
     fn proxy_copy(args: &[PyObjectRef]) -> crate::PyResult {
+        require_mappingproxy_receiver(args, "copy", true)?;
+        crate::type_methods::arity_no_args(args, "copy")?;
         forward_mapping_method(args, "copy")
     }
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "get",
-            make_builtin_function("get", proxy_get),
+            crate::gateway::make_builtin_function_with_doc(
+                "get",
+                proxy_get,
+                "Return the value for key if key is in the mapping, else default.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "keys",
-            make_builtin_function("keys", proxy_keys),
+            crate::gateway::make_builtin_function_with_doc(
+                "keys",
+                proxy_keys,
+                "D.keys() -> a set-like object providing a view on D's keys",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "values",
-            make_builtin_function("values", proxy_values),
+            crate::gateway::make_builtin_function_with_doc(
+                "values",
+                proxy_values,
+                "D.values() -> an object providing a view on D's values",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "items",
-            make_builtin_function("items", proxy_items),
+            crate::gateway::make_builtin_function_with_doc(
+                "items",
+                proxy_items,
+                "D.items() -> a set-like object providing a view on D's items",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "copy",
-            make_builtin_function("copy", proxy_copy),
+            crate::gateway::make_builtin_function_with_doc(
+                "copy",
+                proxy_copy,
+                "D.copy() -> a shallow copy of D",
+            ),
         )
     };
     // dictproxyobject.py:91-100 cmp methods (eq/ne/lt/le/gt/ge) →
@@ -9279,6 +9367,15 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         args: &[PyObjectRef],
         op: crate::baseobjspace::CompareOp,
     ) -> Result<PyObjectRef, crate::PyError> {
+        let name = match op {
+            crate::baseobjspace::CompareOp::Eq => "__eq__",
+            crate::baseobjspace::CompareOp::Ne => "__ne__",
+            crate::baseobjspace::CompareOp::Gt => "__gt__",
+            crate::baseobjspace::CompareOp::Ge => "__ge__",
+            crate::baseobjspace::CompareOp::Lt => "__lt__",
+            crate::baseobjspace::CompareOp::Le => "__le__",
+        };
+        require_mappingproxy_receiver(args, name, false)?;
         crate::type_methods::arity_slot(args, 1)?;
         // descr_op → getattr(space, op)(self.w_mapping, w_other): the
         // comparison runs on the wrapped mapping, not the proxy itself.
@@ -9316,44 +9413,101 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__eq__",
-            make_builtin_function("__eq__", proxy_eq),
+            crate::gateway::make_builtin_function_with_doc(
+                "__eq__",
+                proxy_eq,
+                "Return self==value.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ne__",
-            make_builtin_function("__ne__", proxy_ne),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__lt__",
-            make_builtin_function("__lt__", proxy_lt),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__le__",
-            make_builtin_function("__le__", proxy_le),
+            crate::gateway::make_builtin_function_with_doc(
+                "__ne__",
+                proxy_ne,
+                "Return self!=value.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__gt__",
-            make_builtin_function("__gt__", proxy_gt),
+            crate::gateway::make_builtin_function_with_doc(
+                "__gt__",
+                proxy_gt,
+                "Return self>value.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ge__",
-            make_builtin_function("__ge__", proxy_ge),
+            crate::gateway::make_builtin_function_with_doc(
+                "__ge__",
+                proxy_ge,
+                "Return self>=value.",
+            ),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__lt__",
+            crate::gateway::make_builtin_function_with_doc(
+                "__lt__",
+                proxy_lt,
+                "Return self<value.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__le__",
+            crate::gateway::make_builtin_function_with_doc(
+                "__le__",
+                proxy_le,
+                "Return self<=value.",
+            ),
+        )
+    };
+    // PyPy `W_DictProxyObject.typedef` supplies the callable carriers and
+    // their registration order above. [3.14-spec] Attach the measured
+    // Argument Clinic signatures through PyPy's own Function
+    // `w_text_signature` field; no operation or storage owner is replaced.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("__iter__", "($self, /)"),
+        ("__str__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("__ior__", "($self, value, /)"),
+        ("__reversed__", "($self, /)"),
+        ("get", "($self, key, default=None, /)"),
+        ("keys", "($self, /)"),
+        ("values", "($self, /)"),
+        ("items", "($self, /)"),
+        ("copy", "($self, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("mappingproxy TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 // ── Tuple TypeDef ────────────────────────────────────────────────────

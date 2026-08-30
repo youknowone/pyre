@@ -1088,6 +1088,72 @@ assert str(inspect.signature(types.CellType.__eq__)) == "(self, value, /)"
 assert str(inspect.signature(types.CellType.__repr__)) == "(self, /)"
 
 
+# mappingproxy_text_signatures_python314
+
+EXPECTED_MAPPINGPROXY_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__len__": "($self, /)",
+    "__getitem__": "($self, key, /)",
+    "__contains__": "($self, key, /)",
+    "__iter__": "($self, /)",
+    "__str__": "($self, /)",
+    "__repr__": "($self, /)",
+    "__hash__": "($self, /)",
+    "__or__": "($self, value, /)",
+    "__ror__": "($self, value, /)",
+    "__ior__": "($self, value, /)",
+    "__reversed__": "($self, /)",
+    "__class_getitem__": "($type, object, /)",
+    "get": "($self, key, default=None, /)",
+    "keys": "($self, /)",
+    "values": "($self, /)",
+    "items": "($self, /)",
+    "copy": "($self, /)",
+    "__eq__": "($self, value, /)",
+    "__ne__": "($self, value, /)",
+    "__gt__": "($self, value, /)",
+    "__ge__": "($self, value, /)",
+    "__lt__": "($self, value, /)",
+    "__le__": "($self, value, /)",
+}
+check_descriptors(types.MappingProxyType, EXPECTED_MAPPINGPROXY_METHODS)
+
+EXPECTED_MAPPINGPROXY_DOCS = {
+    "__new__": "Create and return a new object.  See help(type) for accurate signature.",
+    "__len__": "Return len(self).",
+    "__getitem__": "Return self[key].",
+    "__contains__": "Return bool(key in self).",
+    "__iter__": "Implement iter(self).",
+    "__str__": "Return str(self).",
+    "__repr__": "Return repr(self).",
+    "__hash__": "Return hash(self).",
+    "__or__": "Return self|value.",
+    "__ror__": "Return value|self.",
+    "__ior__": "Return self|=value.",
+    "__reversed__": "D.__reversed__() -> reverse iterator",
+    "__class_getitem__": "See PEP 585",
+    "get": "Return the value for key if key is in the mapping, else default.",
+    "keys": "D.keys() -> a set-like object providing a view on D's keys",
+    "values": "D.values() -> an object providing a view on D's values",
+    "items": "D.items() -> a set-like object providing a view on D's items",
+    "copy": "D.copy() -> a shallow copy of D",
+    "__eq__": "Return self==value.",
+    "__ne__": "Return self!=value.",
+    "__gt__": "Return self>value.",
+    "__ge__": "Return self>=value.",
+    "__lt__": "Return self<value.",
+    "__le__": "Return self<=value.",
+}
+for name, doc in EXPECTED_MAPPINGPROXY_DOCS.items():
+    assert getattr(types.MappingProxyType, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.MappingProxyType.get)) == (
+    "(self, key, default=None, /)"
+)
+assert str(inspect.signature(types.MappingProxyType.__reversed__)) == "(self, /)"
+assert str(inspect.signature(types.MappingProxyType.__class_getitem__)) == "(object, /)"
+
+
 assert types.CodeType.__dict__["__new__"].__text_signature__ == "($type, *args, **kwargs)"
 assert str(inspect.signature(types.CodeType.__new__)) == "(*args, **kwargs)"
 assert types.CodeType.__new__.__doc__ == (
