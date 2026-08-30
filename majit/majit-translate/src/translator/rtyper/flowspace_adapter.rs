@@ -1808,6 +1808,33 @@ pub fn translate_op(
                 // by the registry) and routes through
                 // `FunctionRepr::call(hop)` (`rpbc.py`).
                 CallTarget::FunctionPath { segments } => {
+                    // RPython `VirtualizableInstanceRepr.hook_access_field`
+                    // inserts the `jit_force_virtualizable` LLOp during
+                    // rtyping; it never asks the annotator to traverse a
+                    // runtime force-helper body.  Rust cannot attach the
+                    // hook to a field repr, so pyre-interpreter spells the
+                    // marker as an ordinary source call.  Reify that call as
+                    // an ExtRegistry builtin before CallRegistry lookup: its
+                    // `specialize_call` emits the identical LLOp and prevents
+                    // a failed lift of the runtime `FORCE_FRAME_HOOK` chain
+                    // from poisoning every descriptor gateway caller.
+                    if segments.as_slice()
+                        == [
+                            "pyre_interpreter",
+                            "executioncontext",
+                            "jit_force_virtualizable",
+                        ]
+                    {
+                        let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                            HostObject::new_builtin_callable(
+                                "pyre_interpreter.executioncontext.jit_force_virtualizable",
+                            ),
+                        )));
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                        call_args.push(callable);
+                        call_args.extend(arg_hls);
+                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                    }
                     // `core` method spellings of upstream operations:
                     // pyre source writes `a.min(b)` /
                     // `a != b`-via-`PartialEq::ne` / `v.len()` /
@@ -5354,6 +5381,50 @@ mod tests {
         // `__name__`, mirroring upstream `func.__name__` (the leaf
         // identifier, not the dotted module path).
         assert_eq!(host.qualname(), "b");
+    }
+
+    #[test]
+    fn translate_op_jit_force_virtualizable_bypasses_runtime_helper_graph() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_force_virtualizable_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_interpreter".into(),
+                        "executioncontext".into(),
+                        "jit_force_virtualizable".into(),
+                    ],
+                },
+                args: vec![vars[1].clone()],
+                result_ty: ValueType::Void,
+            },
+        };
+
+        // No CallRegistry entry is intentional: upstream rtyping emits this
+        // force as an LLOp and does not annotate its runtime implementation.
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("jit_force_virtualizable must lower through ExtRegistry");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "simple_call");
+        let Hlvalue::Constant(callable) = &lowered.args[0] else {
+            panic!("marker callable must be constant");
+        };
+        let ConstValue::HostObject(host) = &callable.value else {
+            panic!("marker callable must be a HostObject");
+        };
+        assert_eq!(
+            host.qualname(),
+            "pyre_interpreter.executioncontext.jit_force_virtualizable"
+        );
+        assert!(crate::translator::rtyper::extregistry::is_registered(
+            &callable.value
+        ));
     }
 
     #[test]

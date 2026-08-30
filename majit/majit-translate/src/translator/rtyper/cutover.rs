@@ -6547,6 +6547,11 @@ mod tests {
                 Signature::new(vec!["obj".to_string()], None, None),
                 Some("bool".to_string()),
             ),
+            (
+                vec!["majit_gc".to_string(), "shadow_push".to_string()],
+                Signature::new(vec!["obj".to_string()], None, None),
+                Some("u64".to_string()),
+            ),
             // A token `residual_return_shell` declines — 128-bit has no
             // `getkind` at the codewriter boundary — so
             // register_unsafe_fn_stubs must skip.
@@ -6559,7 +6564,7 @@ mod tests {
         register_unsafe_fn_stubs(&registry, &specs);
         assert_eq!(
             registry.len(),
-            2,
+            3,
             "undecodable-return spec must be skipped, others registered"
         );
         assert!(

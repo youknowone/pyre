@@ -1511,6 +1511,35 @@ pub(super) fn rtype_we_are_jitted(
     Ok(Some(Hlvalue::Constant(c)))
 }
 
+/// Rust source marker for RPython
+/// `VirtualizableInstanceRepr.hook_access_field`.
+///
+/// Upstream does not call a force helper here: the rtyper emits
+/// `jit_force_virtualizable(vinst, cname, flags)` directly.  Pyre's source
+/// marker carries only the live frame because the redirected field and flags
+/// are already fixed by the gateway.  Preserve that argument and emit the
+/// same Void LLOp; `jtransform.rewrite_op_jit_force_virtualizable` removes it
+/// from looked-inside JIT graphs, while the runtime source body remains the
+/// untranslated execution path.
+pub(super) fn rtype_jit_force_virtualizable(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_frame = hop
+        .args_r
+        .borrow()
+        .first()
+        .and_then(Clone::clone)
+        .ok_or_else(|| {
+            TyperError::message("rtype_jit_force_virtualizable: frame repr missing".to_string())
+        })?;
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_frame.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop("jit_force_virtualizable", vlist, GenopResult::Void))
+}
+
 /// `BigInt::from(i64) -> BigInt` residual lowering, reached through
 /// `BuiltinFunctionRepr.findbltintyper` →
 /// `extregistry.lookup(BigInt.from).specialize_call`

@@ -1364,7 +1364,14 @@ fn analyze_pipeline_from_module_paths(
         (
             vec!["majit_gc".into(), "shadow_stack".into(), "push".into()],
             Signature::new(vec!["gcref".into()], None, None),
-            Some("i64".into()),
+            // `shadow_stack::push` returns the native-word stack index
+            // (`usize`).  Stub results use the front end's canonical semantic
+            // tokens (`dont_look_inside_return_token` maps `Unsigned` to
+            // `u64`), not literal Rust type spellings.  RPython's
+            // shadow-stack top/depth is likewise a non-negative machine word;
+            // using the signed `i64` token makes `FrameAnchor.depth` merge
+            // `SomeInteger` with `r_uint` at its readers.
+            Some("u64".into()),
         ),
         (
             vec!["majit_gc".into(), "shadow_stack".into(), "get".into()],

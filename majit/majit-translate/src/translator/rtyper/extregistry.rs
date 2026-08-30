@@ -164,6 +164,14 @@ pub enum ExtRegistryEntry {
     /// path; its `compute_annotation` is unreachable in practice and
     /// fails closed to surface a bypassed early-return loudly.
     WeAreJitted,
+    /// Pyre's explicit source spelling of the force inserted by
+    /// `VirtualizableInstanceRepr.hook_access_field`
+    /// (`rpython/rtyper/rvirtualizable.py`).  Upstream inserts the
+    /// `jit_force_virtualizable` LLOp while rtyping and never annotates a
+    /// force-helper body.  Rust needs a callable marker in the source, so
+    /// its translation is registered here and specializes to that same
+    /// LLOp instead of recursively lifting `executioncontext::force_frame`.
+    JitForceVirtualizable,
     /// `BigInt::from(i64) -> BigInt` — the `From<i64>` impl that boxes a
     /// machine int into the foreign opaque `BigInt` (Python `long`) on the
     /// cold `int_add`/`int_sub`/… overflow→long arm.  Modeled as a
@@ -302,6 +310,7 @@ pub enum ExtRegistryEntryKey {
     /// (rlib/jit.py:396). No per-instance identity — the variant tag
     /// alone supplies `self.__class__` and there is no `self.instance`.
     WeAreJitted,
+    JitForceVirtualizable,
     /// Singleton key for the `BigInt.from` residual-external entry. No
     /// per-instance identity — the variant tag alone supplies
     /// `self.__class__` and there is no `self.instance`.
@@ -343,6 +352,7 @@ impl ExtRegistryEntry {
                 instance_identity: instance.identity_id(),
             },
             ExtRegistryEntry::WeAreJitted => ExtRegistryEntryKey::WeAreJitted,
+            ExtRegistryEntry::JitForceVirtualizable => ExtRegistryEntryKey::JitForceVirtualizable,
             ExtRegistryEntry::BigIntFrom => ExtRegistryEntryKey::BigIntFrom,
             ExtRegistryEntry::Float2LongLong => ExtRegistryEntryKey::Float2LongLong,
             ExtRegistryEntry::LongLong2Float => ExtRegistryEntryKey::LongLong2Float,
@@ -462,6 +472,15 @@ impl ExtRegistryEntry {
             // (bookkeeper.py:309-314).  Returning it here keeps the
             // entry a faithful port for any path that consults it.
             ExtRegistryEntry::WeAreJitted => Ok(SomeValue::Bool(Default::default())),
+            // `VirtualizableInstanceRepr.hook_access_field` emits a Void
+            // `jit_force_virtualizable` operation.  The explicit Rust marker
+            // therefore has the ordinary ExtRegistry callable annotation and
+            // returns None at the call site.
+            ExtRegistryEntry::JitForceVirtualizable => Ok(SomeValue::Builtin(SomeBuiltin::new(
+                "pyre_interpreter.executioncontext.jit_force_virtualizable",
+                None,
+                Some("jit_force_virtualizable".to_string()),
+            ))),
             // The annotation half is served by the `BigInt.from`
             // `BUILTIN_ANALYZERS` entry (`bigint_from`), which
             // `immutablevalue_hostobject` resolves before the
@@ -524,6 +543,7 @@ impl ExtRegistryEntry {
             // `annmodel.s_None` and ignores any kwds (loop_header
             // takes only `self` upstream).
             ExtRegistryEntry::LoopHeader { .. } => Ok(s_none()),
+            ExtRegistryEntry::JitForceVirtualizable => Ok(s_none()),
             // upstream rarithmetic.py — `ForTypeEntry.\
             // compute_result_annotation(self, *args_s, **kwds_s)` returns
             // `SomeInteger(knowntype=int_type)`.  The instance is the int
@@ -623,6 +643,9 @@ impl ExtRegistryEntry {
             // at the result repr's lltype.
             ExtRegistryEntry::WeAreJitted => {
                 Ok(super::rbuiltin::rtype_we_are_jitted as BuiltinTyperFn)
+            }
+            ExtRegistryEntry::JitForceVirtualizable => {
+                Ok(super::rbuiltin::rtype_jit_force_virtualizable as BuiltinTyperFn)
             }
             // `BigInt.from` lowers to a residual `direct_call` to the
             // external `bigint_from` (extfunc.py:55-64
@@ -878,6 +901,9 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     if host.qualname() == "majit_metainterp.jit.we_are_jitted" {
         return Some(ExtRegistryEntry::WeAreJitted);
     }
+    if host.qualname() == "pyre_interpreter.executioncontext.jit_force_virtualizable" {
+        return Some(ExtRegistryEntry::JitForceVirtualizable);
+    }
     // `BigInt.from` residual external — keyed by the qualname the
     // `BigInt.from` `BUILTIN_ANALYZERS` annotation entry uses, so the
     // rtyper's `findbltintyper` → `extregistry.lookup` resolves the same
@@ -1068,6 +1094,23 @@ mod tests {
         assert!(matches!(entry, ExtRegistryEntry::WeAreJitted));
         assert!(entry.specialize_call().is_ok());
         assert!(matches!(entry.compute_annotation(), Ok(SomeValue::Bool(_))));
+    }
+
+    #[test]
+    fn jit_force_virtualizable_resolves_to_llop_specializer() {
+        let host = HostObject::new_builtin_callable(
+            "pyre_interpreter.executioncontext.jit_force_virtualizable",
+        );
+        let cv = ConstValue::HostObject(host);
+        assert!(is_registered(&cv));
+        let entry = lookup(&cv).expect("force marker must surface an entry");
+        assert!(matches!(entry, ExtRegistryEntry::JitForceVirtualizable));
+        assert!(entry.specialize_call().is_ok());
+        let bookkeeper = Rc::new(Bookkeeper::new());
+        assert!(matches!(
+            entry.compute_annotation_with_kwds(&bookkeeper, &std::collections::HashMap::new()),
+            Ok(SomeValue::None_(_))
+        ));
     }
 
     /// `BigInt.from` — the foreign opaque `From<i64>` conversion surfaces
