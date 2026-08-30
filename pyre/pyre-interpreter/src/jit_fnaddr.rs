@@ -2804,6 +2804,35 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::disarm_async_eval_breaker",
         crate::executioncontext::disarm_async_eval_breaker,
     );
+
+    // Eval-breaker poll residuals: the dispatch-loop poll reads the breaker
+    // word, drains a pending memory-error bit, and services stop-the-world /
+    // finalization requests through these cross-crate helpers.
+    let eval_breaker_load: fn() -> usize = majit_ir::eval_breaker_word::load;
+    p0(
+        &mut entries,
+        "majit_ir::eval_breaker_word::load",
+        eval_breaker_load,
+    );
+    let eval_breaker_take_memory_error: fn() -> bool =
+        majit_ir::eval_breaker_word::take_memory_error;
+    p0(
+        &mut entries,
+        "majit_ir::eval_breaker_word::take_memory_error",
+        eval_breaker_take_memory_error,
+    );
+    let gc_safepoint_poll: fn() = majit_gc::gc_sync::safepoint_poll;
+    p0(
+        &mut entries,
+        "majit_gc::gc_sync::safepoint_poll",
+        gc_safepoint_poll,
+    );
+    let thread_park_if_finalizing: fn() = crate::module::thread::park_if_finalizing;
+    p0(
+        &mut entries,
+        "pyre_interpreter::module::thread::park_if_finalizing",
+        thread_park_if_finalizing,
+    );
     pa1(
         &mut entries,
         "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
@@ -4203,6 +4232,43 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
         (
             "typeobject::COMPARES_BY_IDENTITY_NO",
             pyre_object::typeobject::COMPARES_BY_IDENTITY_NO as i64,
+        ),
+        // Eval-breaker word bit masks read by the dispatch-loop poll in
+        // `executioncontext.rs`. Cross-crate `pub const usize` reads reach
+        // the front-end as opaque `Foreign` globals, so bake the build-time
+        // bit values.
+        (
+            "eval_breaker_word::EB_ASYNC",
+            majit_ir::eval_breaker_word::EB_ASYNC as i64,
+        ),
+        (
+            "eval_breaker_word::EB_STW",
+            majit_ir::eval_breaker_word::EB_STW as i64,
+        ),
+        (
+            "eval_breaker_word::EB_FINALIZING",
+            majit_ir::eval_breaker_word::EB_FINALIZING as i64,
+        ),
+        (
+            "eval_breaker_word::EB_GC_INTERP",
+            majit_ir::eval_breaker_word::EB_GC_INTERP as i64,
+        ),
+        (
+            "eval_breaker_word::EB_GC",
+            majit_ir::eval_breaker_word::EB_GC as i64,
+        ),
+        (
+            "eval_breaker_word::EB_MEMORY_ERROR",
+            majit_ir::eval_breaker_word::EB_MEMORY_ERROR as i64,
+        ),
+        (
+            "eval_breaker_word::JIT_BREAKER_MASK",
+            majit_ir::eval_breaker_word::JIT_BREAKER_MASK as i64,
+        ),
+        // Tick-counter decrement step read on the same poll path.
+        (
+            "executioncontext::TICK_COUNTER_STEP",
+            crate::executioncontext::TICK_COUNTER_STEP as i64,
         ),
     ]
 }
