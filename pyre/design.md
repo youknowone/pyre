@@ -589,19 +589,19 @@ compiled path is close to what it could be.
 
 ### 3.8 The fold layer: hand-written compensation for an opaque objspace
 
-pyre records traces through 72 `try_walker_specialize_*` functions — 70 in
+pyre records traces through 74 `try_walker_specialize_*` functions — 72 in
 `jitcode_dispatch/specialize.rs`, one each in `residual_call.rs`
-(`load_deref`) and `inline_call.rs` (`instance_next`) — 10,484 lines of body
-inside `specialize.rs`'s 18,765, described by the 83 rows of
+(`load_deref`) and `inline_call.rs` (`instance_next`) — described by the 87 rows of
 `SPEC_FOLD_ROWS` (one fold can back several rows, and row-less folds exist).
-Six of those rows are not folds at all: every label ending in `_descent` —
+Seven of those rows are not folds at all: every label ending in `_descent` —
 `subscr_tuple_descent`, `unary_positive_descent`, `unary_invert_descent`,
-`unary_negative_descent`, `binary_op_descent` and `compare_op_descent` — is
+`unary_negative_descent`, `binary_op_descent`, `compare_op_descent` and
+`builtin_len_descent` — is
 an orthodox sub-walk through a `try_walker_orthodox_*` entry (11 of those
 exist; the other five are `list_append`/`list_pop` shapes and the shared
 `descent`/`unary` drivers, which carry no row), carrying a row only so it can
 be suppressed and A/B'd like the fold it replaced.  Counting them as debt
-overstates it by six; the fold count is 77.
+overstates it by seven; the fold count is 80.
 Nothing in this charter named that layer before 2026-08-26, which is itself
 the finding: it is the largest single adaptation in the tree.
 
@@ -609,9 +609,11 @@ Re-derive every number here before citing it; this section has published
 two miscounts, and both survived because the recipe beside them did not run.
 Every command below is quoted as it must be typed.
 
-* Rows — `spec_folds!` opens at `diag.rs:367` and closes at `:452`:
-  `sed -n '367,452p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`
-  answers 83; `... | rg -cF '_descent"'` answers the 6 descent rows.
+* Rows — select the complete `spec_folds!` invocation by its symbol boundaries:
+  `sed -n '/^spec_folds! {/,/^}/p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`
+  answers 87; replacing the final matcher with `rg -cF '_descent"'` answers
+  the 7 descent rows. A fixed line range is invalid here: the previous range
+  ended before the macro did and published a stale count.
   `-F` is load-bearing: without it the `(` is an unclosed regex group and
   `rg` exits 2 rather than counting.
 * Definitions — `rg -c` reports one count *per file*, so it answers 70/1/1
@@ -619,11 +621,9 @@ Every command below is quoted as it must be typed.
   `rg -o 'fn try_walker_specialize_' pyre/ majit/ -g '*.rs' | wc -l`.
   The descent entries are a separate population:
   `rg -o 'fn try_walker_orthodox_' pyre/ majit/ -g '*.rs' | wc -l` answers 11.
-* Body lines — sum the brace-matched span of each `fn try_walker_specialize_*`
-  in `specialize.rs`; no one-liner does it.
 * Corpus — `ls pyre/bench/synth/*.py | wc -l`. Non-recursive **on purpose**:
-  a recursive walk sweeps `_pending`, `foriter57` and `iter57` and answers
-  533, over-counting by 46. Do not "fix" this to a `find`.
+  it answers 517. A recursive walk also sweeps archived subdirectories and
+  over-counts the active corpus. Do not "fix" this to a recursive `find`.
 
 `specialize.rs`'s own line count moved seven times in seven commits and is
 not a usable identifier for a tree.
@@ -635,34 +635,24 @@ job is to *recognise* that residual and answer in its place. Upstream has no
 equivalent job, which means the obvious convergence — "retire the folds in
 favour of the ported optimizer" — is not available as stated. Group by group:
 
-| group | n | nearest upstream |
-|---|---|---|
-| unbox → raw int/float/bigint arithmetic, compare, truth, cast | 21 | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
-| opaque builtin call → direct (mostly pure elidable) call | 14 | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
-| residual → `new_with_vtable` / `new_array` so it stays virtual | 11 | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
-| guarded heap field / array / mapdict read and write | 21 | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
-| type-identity shortcut | 0 | retired 2026-08-24; was `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
-| frame / execution-context introspection | 6 | none at any layer; PyPy forces the virtualizable instead |
-| function-object construction | 2 | none |
-| callee inlining (`instance_next`, `kwonly_defaults_inline`) | 2 | none as a pass; `MIFrame.opimpl_inline_call` reaches the callee by tracing into it |
-| orthodox descent rows — not folds | 6 | the descent itself; listed so the table sums to the row count |
+| group | nearest upstream |
+|---|---|
+| unbox → raw int/float/bigint arithmetic, compare, truth, cast | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
+| opaque builtin call → direct (mostly pure elidable) call | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
+| residual → `new_with_vtable` / `new_array` so it stays virtual | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
+| guarded heap field / array / mapdict read and write | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
+| type-identity shortcut | retired 2026-08-24; was `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
+| frame / execution-context introspection | none at any layer; PyPy forces the virtualizable instead |
+| function-object construction | none |
+| callee inlining (`instance_next`, `kwonly_defaults_inline`) | none as a pass; `MIFrame.opimpl_inline_call` reaches the callee by tracing into it |
+| orthodox descent rows — not folds | the descent itself; the exact count is the symbol-derived 7 above |
 
-The `n` column sums to 83, the row count above it: 77 folds plus the 6
-descent rows, re-derived on 2026-08-30 by classifying every row against its
-doc comment (`unary_negative_int` left the unbox group the same day, when
-the `neg` descent took `-INT_MIN` too).  The rows the earlier 73-row split did not know are the
-`_descent` rows, the `math_floor`/`math_ceil`/`math_trunc` trio, the `super`
-family and the two inlining rows, which is why a new group appears rather
-than a widened one.  Re-derive it by classifying every row, not by
-apportioning the difference — the two miscounts this section already
-published both came from adjusting a published number instead of
-recounting.  Two placements are judgement calls and are recorded so the next
-recount can disagree with them explicitly: `set_add_method` sits in the
-call group although the `set_add` it records is not pure, and the `super`
-rows split between the virtual group (`bare_super_virtual`,
-`two_arg_super_call`, `load_super_attr`, `super_attr_unwrap`,
-`load_bound_method_attr` — each keeps a `Method` or proxy virtual) and the
-frame group (`bare_super_call`, which reads the frame).
+The groups are explanatory, not a second manually maintained census. Their
+boundaries contain judgement calls (`set_add_method` may be read as a call or
+a heap mutation, and the `super` rows mix virtual construction with frame
+access), so attaching an independently edited `n` column made the table look
+exact while letting it disagree with `SPEC_FOLD_ROWS`. The reproducible split
+is 80 hand-written rows plus 7 orthodox descent rows, re-derived on 2026-08-31.
 
 Four groups have only downstream cleanup upstream, three have nothing at all,
 and exactly one has a counterpart that is a pass rather than a consumer. So
@@ -673,8 +663,8 @@ generation debt, but its stated repair is now the right one.
 
 **What was tried.** A gateway-wrapper pilot gave `math.sqrt` its own jitcode
 and a published `fnaddr`; the descent still declined on 433 transitive
-blockers and retired zero folds. A census over the whole corpus — 481
-synthetic plus the macro benches, every one of the 73 rows observed — found
+blockers and retired zero folds. A census over the whole corpus — 517
+synthetic fixtures, every row observed — found
 no fold with `consulted=0`, so the layer is not merely carrying dead arms.
 `load_deref` alone never fires, and naming each of its early returns shows
 why: all 38 declines across the 359 fixtures holding a nested function report
@@ -683,9 +673,9 @@ That is a missing capability rather than dead weight — closure-callee
 inlining needs the fold, the fold needs constant cells, and constant cells
 need the inlining.
 
-**What does not hold it in place.** 40 fixtures carry a `spec-folds=` header
-and they name 56 distinct rows between them (5 of those descent rows), so
-27 of the 83 rows have no fixture coupling at all
+**What does not hold it in place.** 48 fixtures carry a `spec-folds=` header
+and they name 60 distinct rows between them (6 of those descent rows), so
+27 of the 87 rows have no fixture coupling at all
 (`rg -o --no-filename --max-depth 1 'spec-folds=[^ ]+' pyre/bench/synth -g '*.py' | sed 's/spec-folds=//' | tr ',' '\n' | sort -u | wc -l`;
 `-o` must be spelled without `-h`, which is `rg`'s help flag).  Retirement
 is blocked by reach, not by headers.
@@ -697,11 +687,11 @@ question.** The type-identity group — `builtin_type`, `builtin_isinstance`,
 `[jit-stats]` counter and no wall clock. That is gate neutrality, not a
 descent: nothing in that change demonstrates the trace now carries the
 interpreter's own `abstract_isinstance_w` shape, and `isinstance` is still
-recognised outside the layer, at `residual_call.rs:3662`, where it gates
+recognised outside the layer by `try_specialize_isinstance_call`, where it gates
 replay-safety, carries no row, and the census cannot see it. Read that
 commit's message with care — it claims five retirements including
 `load_type_name_attr`, but its diff never touches that identifier and the
-fold is live at `specialize.rs:4197`.
+fold remains live in `try_walker_specialize_load_type_name_attr`.
 
 **Falsification.** A retirement counts against this entry only if the trace
 it leaves is the interpreter's own shape. `MAJIT_LOG=1`'s
