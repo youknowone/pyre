@@ -1966,7 +1966,7 @@ pub type CpuDescrHandle = Arc<CpuDescrCell>;
 pub struct CpuDescrCell {
     current: std::sync::atomic::AtomicPtr<CpuDescrAttachments>,
     /// Serializes writers; the copies themselves are leaked, see the type.
-    publish: std::sync::Mutex<()>,
+    publish: parking_lot::Mutex<()>,
 }
 
 impl CpuDescrCell {
@@ -1976,7 +1976,7 @@ impl CpuDescrCell {
             current: std::sync::atomic::AtomicPtr::new(
                 first as *const CpuDescrAttachments as *mut CpuDescrAttachments,
             ),
-            publish: std::sync::Mutex::new(()),
+            publish: parking_lot::Mutex::new(()),
         }
     }
 
@@ -1989,7 +1989,7 @@ impl CpuDescrCell {
 
     /// Publish a copy with `f` applied. Writers serialize on `publish`.
     pub fn update(&self, f: impl FnOnce(&mut CpuDescrAttachments)) {
-        let _writer = self.publish.lock().unwrap();
+        let _writer = self.publish.lock();
         let mut next = Box::new(self.read().clone());
         f(&mut next);
         let next: &'static CpuDescrAttachments = Box::leak(next);

@@ -26,7 +26,7 @@ const REDUCE_1: usize = 0;
 const REDUCE_2: usize = 1;
 const GET_SLOTVALUES: usize = 2;
 
-static HANDLES: std::sync::Mutex<[usize; 3]> = std::sync::Mutex::new([0; 3]);
+static HANDLES: parking_lot::Mutex<[usize; 3]> = parking_lot::Mutex::new([0; 3]);
 
 /// Resolve (and cache) the three app-level handles.
 ///
@@ -36,7 +36,7 @@ static HANDLES: std::sync::Mutex<[usize; 3]> = std::sync::Mutex::new([0; 3]);
 /// `slotnames` reachable from `get_slotvalues` even though only three names
 /// are surfaced.
 fn handle(which: usize) -> PyResult {
-    let cached = HANDLES.lock().unwrap()[which];
+    let cached = HANDLES.lock()[which];
     if cached != 0 {
         return Ok(cached as PyObjectRef);
     }
@@ -89,7 +89,7 @@ fn handle(which: usize) -> PyResult {
         get("reduce_2") as usize,
         get("get_slotvalues") as usize,
     ];
-    let mut handles = HANDLES.lock().unwrap();
+    let mut handles = HANDLES.lock();
     if handles[which] == 0 {
         *handles = initialized;
     }
@@ -101,7 +101,7 @@ fn handle(which: usize) -> PyResult {
 /// so expose each slot to the global root walker and write relocated pointers
 /// back in place.
 pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let mut handles = HANDLES.lock().unwrap();
+    let mut handles = HANDLES.lock();
     for slot in handles.iter_mut().filter(|slot| **slot != 0) {
         unsafe { visitor(&mut *(slot as *mut usize as *mut majit_ir::GcRef)) };
     }

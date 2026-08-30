@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 /// Basic test: compile and execute a simple int_add loop via dynasm backend.
 ///
 /// Trace: i0 = input
@@ -8,7 +9,7 @@
 ///   jump(i1)        → label
 ///   finish(i1)      [on guard failure]
 use std::rc::Rc;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 use majit_backend::{Backend, JitCellToken, STATUS_TYPE_MASK, make_resume_guard_descr_typed};
 use majit_ir::{
@@ -631,7 +632,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
 
 #[test]
 fn test_exception_guards_use_dynasm_emit() {
-    let _guard = EXCEPTION_TEST_LOCK.lock().unwrap();
+    let _guard = EXCEPTION_TEST_LOCK.lock();
     majit_backend_dynasm::jit_exc_clear();
 
     let mut backend = DynasmBackend::new();
@@ -673,7 +674,7 @@ fn test_exception_guards_use_dynasm_emit() {
 
 #[test]
 fn test_guard_no_exception_and_always_fails_emit_side_exits() {
-    let _guard = EXCEPTION_TEST_LOCK.lock().unwrap();
+    let _guard = EXCEPTION_TEST_LOCK.lock();
     majit_backend_dynasm::jit_exc_clear();
 
     let mut backend = DynasmBackend::new();

@@ -9,7 +9,8 @@
 //! ownership: these frames come from [`crate::jitframe::alloc_off_gc_jitframe`]
 //! instead of the nursery, so they never move, take no root slot, and this
 //! value's `Drop` frees the whole `jf_forward` chain it was handed.
-use std::sync::{OnceLock, RwLock};
+use parking_lot::RwLock;
+use std::sync::OnceLock;
 
 use majit_ir::DescrRef;
 use majit_ir::GcRef;
@@ -238,16 +239,16 @@ fn live_deadframes() -> &'static RwLock<indexmap::IndexSet<usize>> {
 }
 
 fn register_live_deadframe(addr: usize) {
-    live_deadframes().write().unwrap().insert(addr);
+    live_deadframes().write().insert(addr);
 }
 
 fn unregister_live_deadframe(addr: usize) {
-    live_deadframes().write().unwrap().swap_remove(&addr);
+    live_deadframes().write().swap_remove(&addr);
 }
 
 /// [`majit_gc::LiveDeadFrameWalkerFn`] for the off-GC frame registry.
 pub fn walk_live_deadframes(visit: &mut dyn FnMut(usize)) {
-    for &addr in live_deadframes().read().unwrap().iter() {
+    for &addr in live_deadframes().read().iter() {
         visit(addr);
     }
 }

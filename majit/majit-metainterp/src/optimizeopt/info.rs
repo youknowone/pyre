@@ -40,9 +40,6 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
 /// the cache's, and the guard then fails on every object. A descr for such a
 /// struct has to say so with `headerless`, which is checked before this is
 /// called, rather than by leaving its `type_id` at 0.
-///
-/// A poisoned cache lock degrades to "unresolved", which declines; it must not
-/// abort.
 pub(crate) fn resolve_gc_tid(
     stamped_tid: u32,
     cache_key: u64,
@@ -57,7 +54,7 @@ pub(crate) fn resolve_gc_tid(
     if cache_key == 0 {
         return None;
     }
-    let cache = majit_ir::descr::gc_cache().lock().ok()?;
+    let cache = majit_ir::descr::gc_cache().lock();
     resolve(&cache, cache_key).filter(|&tid| tid != 0)
 }
 
@@ -113,6 +110,30 @@ fn w_class_store_is_covered_by_alloc(
         ctx.resolve_operand_operand_opt(value)
             .and_then(|resolved| resolved.const_value()),
     )
+}
+
+/// Cache the Python-level class word that `NEW_WITH_VTABLE` initializes.
+///
+/// PyPy keeps the allocation-owned class fact on `InstancePtrInfo` as
+/// `_known_class` (`info.py` `InstancePtrInfo.__init__`).  Pyre additionally
+/// has the public `PyObject.w_class` header, so the same allocation fact must
+/// be visible through that field's disjoint heap slot as well.  Keeping it on
+/// the box's `PtrInfo` lets `OptHeap` fold a short-preamble GETFIELD after a
+/// virtual is forced, while a later explicit class-word SETFIELD still
+/// overwrites this entry normally (required for user-subclass instances).
+fn allocation_initialized_w_class(
+    size_descr: &DescrRef,
+) -> Option<(u32, majit_ir::field_entry::FieldEntry)> {
+    let size = size_descr.as_size_descr()?;
+    let w_class = size.w_class_obj().filter(|&w| w != 0)?;
+    let field = size.class_word_field()?;
+    let slot = crate::optimizeopt::heap::OptHeap::header_field_slot(field.as_ref());
+    Some((
+        slot,
+        majit_ir::field_entry::FieldEntry::Value(Operand::const_from_value(Value::Ref(GcRef(
+            w_class as usize,
+        )))),
+    ))
 }
 
 pub use majit_ir::field_entry::{FieldEntry, PreambleOp};
@@ -1296,10 +1317,17 @@ fn force_box_impl(
             // non-virtual replacement with no field cache so heap.py
             // do_setfield does not MUST_ALIAS-elide the materialization
             // SETFIELD_GC against the preserved value.
+            let allocation_fields = allocation_initialized_w_class(&vinfo.descr)
+                .into_iter()
+                .collect();
             let preserved = PtrInfo::Instance(InstancePtrInfo {
                 descr: Some(vinfo.descr.clone()),
                 known_class: vinfo.known_class,
-                fields: Vec::new(),
+                // info.py keeps `_fields` empty here so initializing payload
+                // SETFIELDs are not elided.  The sole pyre-only entry is the
+                // public class header written by NEW_WITH_VTABLE itself; its
+                // header-band slot cannot collide with any payload position.
+                fields: allocation_fields,
                 last_guard_pos: -1,
             });
             let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
@@ -2072,9 +2100,7 @@ mod tests {
         let cached_array: DescrRef =
             Arc::new(SimpleArrayDescr::new(0, 16, 8, array_tid, Type::Int));
         {
-            let mut cache = gc_cache()
-                .lock()
-                .expect("test GC cache must not be poisoned");
+            let mut cache = gc_cache().lock();
             cache._cache_size.insert(LLType::Struct(key), cached_struct);
             cache._cache_array.insert(LLType::Array(key), cached_array);
         }
@@ -2102,9 +2128,7 @@ mod tests {
             array_tid
         );
 
-        let mut cache = gc_cache()
-            .lock()
-            .expect("test GC cache must not be poisoned");
+        let mut cache = gc_cache().lock();
         cache._cache_size.shift_remove(&LLType::Struct(key));
         cache._cache_array.shift_remove(&LLType::Array(key));
     }
@@ -2143,6 +2167,26 @@ mod tests {
 
         assert_eq!(ops[0].opcode, OpCode::NewWithVtable);
         assert_eq!(setfield_offsets(&ops), vec![24, 16]);
+    }
+
+    #[test]
+    fn new_with_vtable_publishes_its_initialized_w_class_on_ptr_info() {
+        let init_field: Arc<dyn FieldDescr> = Arc::new(ForceFieldDescr {
+            offset: 8,
+            field_size: 8,
+            field_type: Type::Ref,
+            name: "PyObject.w_class",
+        });
+        let size_descr: DescrRef = Arc::new(ForceSizeDescr {
+            all_fields: vec![],
+            gc_fields: vec![init_field],
+            w_class: 0xCAFE,
+        });
+
+        let (_, entry) = allocation_initialized_w_class(&size_descr)
+            .expect("NEW_WITH_VTABLE should publish its class header value");
+
+        assert_eq!(entry.as_opref(), Some(OpRef::const_ptr(GcRef(0xCAFE))));
     }
 
     #[test]

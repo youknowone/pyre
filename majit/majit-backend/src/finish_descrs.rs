@@ -8,9 +8,10 @@
 //! `majit-metainterp`; the metainterp re-exports from here for caller
 //! compatibility.
 
+use parking_lot::Mutex;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use majit_ir::{Descr, FailDescr, Type};
 
@@ -319,9 +320,7 @@ fn done_multi_cache() -> &'static Mutex<Vec<(Vec<Type>, Arc<DoneWithThisFrameDes
 pub fn get_or_attach_done_with_this_frame_descr_multi(
     fail_arg_types: Vec<Type>,
 ) -> Arc<DoneWithThisFrameDescrMulti> {
-    let mut cache = done_multi_cache()
-        .lock()
-        .expect("done_multi_cache mutex poisoned");
+    let mut cache = done_multi_cache().lock();
     if let Some((_, descr)) = cache.iter().find(|(k, _)| k == &fail_arg_types) {
         return Arc::clone(descr);
     }

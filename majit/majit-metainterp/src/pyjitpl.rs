@@ -4008,7 +4008,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `compile_loop` then publishes.  Ignore those instead of invalidating
     /// every `descr_index` already serialized into a compiled bridge.
     pub(crate) fn take_back_all_descrs(&mut self, all_descrs: std::sync::Arc<Vec<DescrRef>>) {
-        let mut slot = self.staticdata.all_descrs().lock().unwrap();
+        let mut slot = self.staticdata.all_descrs().lock();
         if all_descrs.len() >= slot.len() {
             *slot = all_descrs;
         }
@@ -4968,9 +4968,8 @@ impl<M: Clone> MetaInterp<M> {
         // since the section is already open above.
         //
         // The rollback stays armed across `open_profiler_tracing_inner`:
-        // that call's `start_tracing()` can panic on a poisoned
-        // timing mutex, and the active flag is only set *after*
-        // `start_tracing()` returns.  If we dismissed earlier and
+        // that call's `start_tracing()` can panic, and the active flag is
+        // only set *after* `start_tracing()` returns.  If we dismissed earlier and
         // `start_tracing()` then panicked, `profiler_tracing_active`
         // would stay `false` so `leave_profiler_tracing` would skip
         // the close — leaking the debug section.  Dismissing only
@@ -7060,7 +7059,7 @@ impl<M: Clone> MetaInterp<M> {
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
-        unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
+        unroll_opt.all_descrs = self.staticdata.all_descrs().lock().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         // Zero, not the previous entry's count — see the fresh-token note above.
         // The field still has to be stored back after the unroll runs, because
@@ -8892,7 +8891,7 @@ impl<M: Clone> MetaInterp<M> {
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
-        unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
+        unroll_opt.all_descrs = self.staticdata.all_descrs().lock().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         // `AbstractResumeGuardDescr.compile_and_attach`, `compile.py`,
         // installs a retrace grown from a guard failure under
@@ -9902,7 +9901,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
-        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
@@ -10389,7 +10388,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         optimizer.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
-        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py/261/307 — `Const.type` / `InputArg.type` are
         // intrinsic on the box itself (recovered via `OpRef::ty()` from
@@ -13264,7 +13263,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
-        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
         // class identity.
@@ -13879,7 +13878,7 @@ impl<M: Clone> MetaInterp<M> {
                     frontend_boxes,
                     liveboxes,
                     livebox_types,
-                    all_descrs: self.staticdata.all_descrs().lock().unwrap().clone(),
+                    all_descrs: self.staticdata.all_descrs().lock().clone(),
                     cpu: self.cpu.clone(),
                 })
             });
@@ -13980,7 +13979,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
-        optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
+        optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = bridge_constants
@@ -18901,7 +18900,7 @@ pub struct MetaInterpStaticData {
     /// RPython's Python dicts are shared mutable references by
     /// default; Rust needs interior mutability for the same
     /// behavior.
-    pub globaldata: std::sync::Mutex<MetaInterpGlobalData>,
+    pub globaldata: parking_lot::Mutex<MetaInterpGlobalData>,
     /// `descr.py GcCache._cache_array` parity for the dispatch JitCode
     /// trace-side `BC_GETARRAYITEM_GC_I` recorder.
     ///
@@ -18971,7 +18970,7 @@ pub struct MetaInterpStaticData {
     /// across the metainterp / trace / bridge pipelines (mirroring
     /// `all_descrs` above).
     pub dispatch_array_descr_cache:
-        std::sync::Mutex<indexmap::IndexMap<DispatchArrayDescrKey, DescrRef>>,
+        parking_lot::Mutex<indexmap::IndexMap<DispatchArrayDescrKey, DescrRef>>,
     /// pyjitpl.py `self.profiler = ProfilerClass()` —
     /// `metainterp_sd.profiler` is the shared counter sink hit from
     /// every metainterp / optimizer / heapcache / tracer site
@@ -19093,7 +19092,7 @@ impl MetaInterpStaticData {
     /// backing store is `descr_registry::all_descrs()` because `descr_index`
     /// is stamped off the process-wide `GcCache` — see that static's docs for
     /// why the list cannot be per-instance.
-    pub fn all_descrs(&self) -> &'static std::sync::Mutex<std::sync::Arc<Vec<DescrRef>>> {
+    pub fn all_descrs(&self) -> &'static parking_lot::Mutex<std::sync::Arc<Vec<DescrRef>>> {
         majit_ir::descr_registry::all_descrs()
     }
 
@@ -19502,8 +19501,8 @@ impl MetaInterpStaticData {
         // other's just-installed bitstring `Vec`.  Serialise the publish so
         // the single-writer contract `EffectInfoCell::set_bitstrings`
         // documents holds for real.
-        static PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _publish = PUBLISH.lock().unwrap_or_else(|e| e.into_inner());
+        static PUBLISH: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _publish = PUBLISH.lock();
 
         // PyPy `backend/llsupport/descr.py setup_descrs` walks
         // `gc_cache` per-category in this fixed order: size, field,
@@ -19530,7 +19529,7 @@ impl MetaInterpStaticData {
 
         // Publish onto staticdata.all_descrs so opencoder / bridgeopt /
         // optimizer reads pick up the same length.
-        *self.all_descrs().lock().unwrap() = all_descrs.clone();
+        *self.all_descrs().lock() = all_descrs.clone();
 
         if frozen_bitstrings {
             majit_ir::effectinfo::mark_compute_bitstrings_ran();
@@ -19710,7 +19709,7 @@ impl MetaInterpStaticData {
     ) {
         self.indirectcalltargets = targets;
         // Force a rebuild of the lazy lookup on next access.
-        self.globaldata.lock().unwrap().indirectcall_dict = None;
+        self.globaldata.lock().indirectcall_dict = None;
     }
 
     /// warmspot.py `self.metainterp_sd.jitcodes = jitcodes` — install
@@ -19729,7 +19728,7 @@ impl MetaInterpStaticData {
     pub fn setup_list_of_addr2name(&mut self, list_of_addr2name: Vec<(usize, String)>) {
         self._addr2name_keys = list_of_addr2name.iter().map(|(k, _)| *k).collect();
         self._addr2name_values = list_of_addr2name.into_iter().map(|(_, v)| v).collect();
-        self.globaldata.lock().unwrap().addr2name = None;
+        self.globaldata.lock().addr2name = None;
     }
 
     /// `pyjitpl.py` — the tail of `finish_setup` that
@@ -19859,7 +19858,7 @@ impl MetaInterpStaticData {
     /// `MetaInterp::force_start_tracing` for the function-entry trace
     /// path.
     pub fn _setup_once(&self, backend: &mut BackendImpl) {
-        let mut gd = self.globaldata.lock().unwrap();
+        let mut gd = self.globaldata.lock();
         if gd.initialized {
             return;
         }
@@ -19926,7 +19925,7 @@ impl MetaInterpStaticData {
 
     /// pyjitpl.py `get_name_from_address(addr)`.
     pub fn get_name_from_address(&self, addr: usize) -> String {
-        let mut gd = self.globaldata.lock().unwrap();
+        let mut gd = self.globaldata.lock();
         let dict = gd.addr2name.get_or_insert_with(|| {
             let mut d: indexmap::IndexMap<usize, String> = indexmap::IndexMap::new();
             for (i, key) in self._addr2name_keys.iter().enumerate() {
@@ -19962,7 +19961,7 @@ impl MetaInterpStaticData {
         &self,
         fnaddress: usize,
     ) -> Option<std::sync::Arc<crate::jitcode::JitCode>> {
-        let mut gd = self.globaldata.lock().unwrap();
+        let mut gd = self.globaldata.lock();
         bytecode_for_address_in_targets(
             &self.indirectcalltargets,
             &mut gd.indirectcall_dict,
@@ -23411,7 +23410,8 @@ mod tests {
     };
     use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect};
     use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use parking_lot::Mutex;
+    use std::sync::{Arc, OnceLock};
 
     /// Producer-bound `Operand` for an op-arg / fail-arg `OpRef`, oparser-faithful
     /// (`rpython/jit/tool/oparser.py`): a position-only ResOp / InputArg ref
@@ -24701,9 +24701,7 @@ mod tests {
             return;
         }
         with_forced_deadframe(force_token, |mut deadframe| {
-            let mut values = may_force_void_values()
-                .lock()
-                .unwrap_or_else(|err| err.into_inner());
+            let mut values = may_force_void_values().lock();
             values.push(
                 get_latest_descr_from_deadframe(&deadframe)
                     .unwrap()
@@ -25104,10 +25102,7 @@ mod tests {
 
     #[cfg(feature = "cranelift")]
     fn install_may_force_void_entry(meta: &mut MetaInterp<()>, green_key: u64) {
-        may_force_void_values()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clear();
+        may_force_void_values().lock().clear();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
@@ -26251,10 +26246,7 @@ mod tests {
         let compile_events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let events = compile_events.clone();
         meta.set_on_compile_loop(move |green_key, ops_before, ops_after, _opcodes| {
-            events
-                .lock()
-                .unwrap()
-                .push((green_key, ops_before, ops_after));
+            events.lock().push((green_key, ops_before, ops_after));
         });
 
         let green_key = 42;
@@ -26275,7 +26267,7 @@ mod tests {
         }
         meta.compile_loop(&[OpRef::input_arg_int(0)], ());
 
-        let events = compile_events.lock().unwrap();
+        let events = compile_events.lock();
         assert_eq!(events.len(), 1, "on_compile_loop should fire exactly once");
         assert_eq!(events[0].0, green_key, "green_key should match");
         assert!(events[0].1 > 0, "num_ops_before should be positive");
@@ -26439,7 +26431,7 @@ mod tests {
         let error_events: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let events = error_events.clone();
         meta.set_on_compile_error(move |green_key, msg| {
-            events.lock().unwrap().push((green_key, msg.to_string()));
+            events.lock().push((green_key, msg.to_string()));
         });
 
         // There's no easy way to trigger a compilation failure through the public API
@@ -26448,7 +26440,7 @@ mod tests {
         if let Some(ref cb) = meta.hooks.on_compile_error {
             cb(99, "test error");
         }
-        let events = error_events.lock().unwrap();
+        let events = error_events.lock();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, 99);
         assert_eq!(events[0].1, "test error");
@@ -26514,17 +26506,17 @@ mod tests {
 
         let cc = compile_count.clone();
         meta.set_on_compile_loop(move |_, _, _, _opcodes| {
-            *cc.lock().unwrap() += 1;
+            *cc.lock() += 1;
         });
 
         let tsc = trace_start_count.clone();
         meta.set_on_trace_start(move |_| {
-            *tsc.lock().unwrap() += 1;
+            *tsc.lock() += 1;
         });
 
         let tac = trace_abort_count.clone();
         meta.set_on_trace_abort(move |_, _| {
-            *tac.lock().unwrap() += 1;
+            *tac.lock() += 1;
         });
 
         let green_key = 100;
@@ -26532,21 +26524,13 @@ mod tests {
         for _ in 0..2 {
             meta.on_back_edge(green_key, &[0]);
         }
-        assert_eq!(
-            *trace_start_count.lock().unwrap(),
-            1,
-            "on_trace_start should fire"
-        );
+        assert_eq!(*trace_start_count.lock(), 1, "on_trace_start should fire");
 
         // Abort the trace
         meta.abort_trace(false);
+        assert_eq!(*trace_abort_count.lock(), 1, "on_trace_abort should fire");
         assert_eq!(
-            *trace_abort_count.lock().unwrap(),
-            1,
-            "on_trace_abort should fire"
-        );
-        assert_eq!(
-            *compile_count.lock().unwrap(),
+            *compile_count.lock(),
             0,
             "on_compile_loop should NOT fire yet"
         );
@@ -26568,12 +26552,12 @@ mod tests {
         }
         meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert_eq!(
-            *compile_count.lock().unwrap(),
+            *compile_count.lock(),
             1,
             "on_compile_loop should fire after compile"
         );
         assert_eq!(
-            *trace_start_count.lock().unwrap(),
+            *trace_start_count.lock(),
             2,
             "on_trace_start should fire twice total"
         );
@@ -26588,7 +26572,7 @@ mod tests {
         let events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = events.clone();
         meta.set_on_compile_loop(move |gk, before, after, _opcodes| {
-            ev.lock().unwrap().push((gk, before, after));
+            ev.lock().push((gk, before, after));
         });
 
         // Compile two different loops with different green keys
@@ -26609,7 +26593,7 @@ mod tests {
             meta.compile_loop(&[OpRef::input_arg_int(0), OpRef::input_arg_int(1)], ());
         }
 
-        let events = events.lock().unwrap();
+        let events = events.lock();
         assert_eq!(events.len(), 2, "two compilation events should fire");
         assert_eq!(events[0].0, 10, "first event green_key=10");
         assert_eq!(events[1].0, 20, "second event green_key=20");
@@ -26630,7 +26614,7 @@ mod tests {
         let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = bridge_events.clone();
         meta.set_on_compile_bridge(move |gk, fi, nops| {
-            ev.lock().unwrap().push((gk, fi, nops));
+            ev.lock().push((gk, fi, nops));
         });
 
         // Install a simple compiled loop with a guard
@@ -26682,7 +26666,7 @@ mod tests {
         if let Some(ref hook) = meta.hooks.on_compile_bridge {
             hook(green_key, 3, 5);
         }
-        let events = bridge_events.lock().unwrap();
+        let events = bridge_events.lock();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, green_key);
         assert_eq!(events[0].1, 3);
@@ -26697,7 +26681,7 @@ mod tests {
         let failure_events: Arc<Mutex<Vec<(u64, u32, u32)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = failure_events.clone();
         meta.set_on_guard_failure(move |gk, fi, fc| {
-            ev.lock().unwrap().push((gk, fi, fc));
+            ev.lock().push((gk, fi, fc));
         });
 
         // Verify the hook is correctly installed and callable
@@ -26706,7 +26690,7 @@ mod tests {
             hook(42, 3, 2);
             hook(42, 5, 1);
         }
-        let events = failure_events.lock().unwrap();
+        let events = failure_events.lock();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0], (42, 3, 1));
         assert_eq!(events[1], (42, 3, 2));
@@ -26752,7 +26736,7 @@ mod tests {
         let abort_events: Arc<Mutex<Vec<(u64, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = abort_events.clone();
         meta.set_on_trace_abort(move |gk, permanent| {
-            ev.lock().unwrap().push((gk, permanent));
+            ev.lock().push((gk, permanent));
         });
 
         let green_key = 77;
@@ -26765,7 +26749,7 @@ mod tests {
         // Abort non-permanently
         meta.abort_trace(false);
         {
-            let events = abort_events.lock().unwrap();
+            let events = abort_events.lock();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0], (green_key, false));
         }
@@ -26776,7 +26760,7 @@ mod tests {
         }
         if meta.tracing.is_some() {
             meta.abort_trace(true);
-            let events = abort_events.lock().unwrap();
+            let events = abort_events.lock();
             assert_eq!(events.len(), 2);
             assert_eq!(events[1], (green_key, true));
         }

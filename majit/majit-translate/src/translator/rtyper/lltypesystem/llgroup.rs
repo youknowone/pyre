@@ -7,10 +7,11 @@
 
 #![allow(non_camel_case_types, non_upper_case_globals)]
 
+use parking_lot::Mutex;
 use std::fmt;
 use std::ops::{Add, BitAnd, BitOr, Shr, Sub};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 /// RPython `GroupType(lltype.ContainerType)`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,17 +109,10 @@ impl group {
     }
 
     pub fn add_member(&mut self, structptr: GroupMember) -> GroupMemberOffset {
-        let previous_group = membership()
-            .lock()
-            .expect("llgroup membership lock poisoned")
-            .get(&structptr.id)
-            .copied();
+        let previous_group = membership().lock().get(&structptr.id).copied();
         if let Some(previous_group) = previous_group {
             let message = format!("structure {:?} was inserted into another group", structptr);
-            outdated()
-                .lock()
-                .expect("llgroup outdated lock poisoned")
-                .insert(previous_group.id, message.clone());
+            outdated().lock().insert(previous_group.id, message.clone());
             if let Some(prevgroup) = group_by_ptr_mut(previous_group, self) {
                 prevgroup.outdated = Some(message);
             }
@@ -129,10 +123,7 @@ impl group {
         );
         let index = self.members.len();
         self.members.push(structptr.clone());
-        membership()
-            .lock()
-            .expect("llgroup membership lock poisoned")
-            .insert(structptr.id, self._as_ptr());
+        membership().lock().insert(structptr.id, self._as_ptr());
         GroupMemberOffset::new(self, index, structptr)
     }
 
@@ -141,13 +132,9 @@ impl group {
     }
 
     pub fn current_outdated(&self) -> Option<String> {
-        self.outdated.clone().or_else(|| {
-            outdated()
-                .lock()
-                .expect("llgroup outdated lock poisoned")
-                .get(&self.id)
-                .cloned()
-        })
+        self.outdated
+            .clone()
+            .or_else(|| outdated().lock().get(&self.id).cloned())
     }
 }
 
@@ -171,11 +158,7 @@ pub struct GroupPtr {
 /// the direct dict-shaped counterpart without introducing a separate
 /// Rust-native collection.
 pub fn member_of_group(structptr: &GroupMember) -> Option<GroupPtr> {
-    membership()
-        .lock()
-        .expect("llgroup membership lock poisoned")
-        .get(&structptr.id)
-        .copied()
+    membership().lock().get(&structptr.id).copied()
 }
 
 /// RPython `GroupMemberOffset(llmemory.Symbolic)`.

@@ -5719,9 +5719,9 @@ mod tests {
     /// two specialize-driving tests so one observes the other's
     /// `setupstate::InProgress` and panics with "recursive invocation
     /// of Repr setup()".  Holding this `Mutex` serialises the runs.
-    fn anchor_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn anchor_lock() -> parking_lot::MutexGuard<'static, ()> {
+        static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        LOCK.lock()
     }
 
     #[test]

@@ -507,6 +507,17 @@ pub fn execute_ptr_compare_const(opcode: OpCode, a: usize, b: usize) -> Option<i
     Some(result as i64)
 }
 
+/// The machine word a constant carries when it stands for a pointer: a GC
+/// reference holds it in `Value::Ref`, a pointer to non-moving memory in
+/// `Value::Int`.  A float or void constant is not a pointer.
+fn const_pointer_word(value: majit_ir::Value) -> Option<usize> {
+    match value {
+        majit_ir::Value::Ref(r) => Some(r.0),
+        majit_ir::Value::Int(i) => Some(i as usize),
+        majit_ir::Value::Float(_) | majit_ir::Value::Void => None,
+    }
+}
+
 /// Unary-int row of `executor.EXECUTE_BY_NUM_ARGS`. Mirrors the corresponding
 /// `blackhole.bhimpl_int_*` helpers.
 ///
@@ -718,8 +729,16 @@ pub fn execute_nonspec_const(
                 return Ok(Some(Value::Int(folded)));
             }
         }
-        if let (Value::Ref(a), Value::Ref(b)) = (argboxes[0], argboxes[1])
-            && let Some(folded) = execute_ptr_compare_const(opnum, a.0, b.0)
+        // PTR_EQ / PTR_NE and their instance forms compare two machine words.
+        // `do_ptr_eq` reads `getref_base()` off two boxes because every RPython
+        // pointer constant is a ref box; pyre models a pointer to non-moving
+        // memory -- a `&'static PyType` vtable, say -- as `Value::Int` holding
+        // the same address, so `py_type_check`'s `ob_type == &TYPE_TYPE` folds
+        // with one arg of each shape once the receiver itself is constant.
+        if let (Some(a), Some(b)) = (
+            const_pointer_word(argboxes[0]),
+            const_pointer_word(argboxes[1]),
+        ) && let Some(folded) = execute_ptr_compare_const(opnum, a, b)
         {
             return Ok(Some(Value::Int(folded)));
         }

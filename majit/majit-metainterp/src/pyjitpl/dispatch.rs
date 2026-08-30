@@ -298,7 +298,6 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
                     let cached = majit_ir::descr::gc_cache()
                         .lock()
-                        .unwrap()
                         ._cache_field
                         .get(&struct_key)
                         .and_then(|m| m.get(name.as_str()))
@@ -321,7 +320,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     // `descr.py get_field_descr` so the pool-side and
                     // walker-side resolutions land on one Arc instead of each
                     // minting a fresh one per resolution.
-                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    let mut gc = majit_ir::descr::gc_cache().lock();
                     if gc._cache_size.contains_key(&struct_key) {
                         let fd = gc.get_field_descr(
                             struct_key,
@@ -409,7 +408,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         return (*offset, fd as majit_ir::DescrRef);
                     }
                     let struct_key = majit_ir::descr::LLType::Struct(p.type_id);
-                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    let mut gc = majit_ir::descr::gc_cache().lock();
                     // `immutable_flag` is `descr.py:112
                     // heaptracker.is_immutable_struct(STRUCT)`, which reads the
                     // STRUCT's `immutable` hint.  A serialized parent spec
@@ -592,7 +591,6 @@ pub fn residual_write_effect_info(
         fds.extend(fields.iter().map(|(_, _, write_field, _, _)| {
             majit_ir::descr::gc_cache()
                 .lock()
-                .unwrap()
                 ._cache_field
                 .get(&struct_key)
                 .and_then(|m| m.get(*write_field))
@@ -2380,9 +2378,7 @@ where
             interior_fields,
         };
         let cache = &ctx.metainterp_sd().dispatch_array_descr_cache;
-        let mut guard = cache
-            .lock()
-            .expect("dispatch_array_descr_cache mutex poisoned");
+        let mut guard = cache.lock();
         if let Some(cached) = guard.get(&cache_key) {
             return Some(cached.clone());
         }

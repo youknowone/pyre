@@ -321,15 +321,15 @@ impl ObjSpace {
 /// thread holds, which no import path does.  The shape is still the blocking
 /// one so that the single-thread assumption is not baked into the callers.
 pub struct Lock {
-    acquired: std::sync::Mutex<bool>,
-    released: std::sync::Condvar,
+    acquired: parking_lot::Mutex<bool>,
+    released: parking_lot::Condvar,
 }
 
 impl Lock {
     fn new() -> Self {
         Self {
-            acquired: std::sync::Mutex::new(false),
-            released: std::sync::Condvar::new(),
+            acquired: parking_lot::Mutex::new(false),
+            released: parking_lot::Condvar::new(),
         }
     }
 
@@ -345,7 +345,7 @@ impl Lock {
         // same STW.  The non-blocking form must remain a poll and needs no
         // transition.
         let _blocked = flag.then(crate::module::thread::before_external_block);
-        let mut acquired = self.acquired.lock().unwrap_or_else(|e| e.into_inner());
+        let mut acquired = self.acquired.lock();
         if !flag {
             if *acquired {
                 return false;
@@ -354,10 +354,7 @@ impl Lock {
             return true;
         }
         while *acquired {
-            acquired = self
-                .released
-                .wait(acquired)
-                .unwrap_or_else(|e| e.into_inner());
+            self.released.wait(&mut acquired);
         }
         *acquired = true;
         true
@@ -370,7 +367,7 @@ impl Lock {
     /// owns, which makes this an invariant of this crate rather than a
     /// Python-visible error.
     pub fn release(&self) {
-        let mut acquired = self.acquired.lock().unwrap_or_else(|e| e.into_inner());
+        let mut acquired = self.acquired.lock();
         assert!(*acquired, "the lock was not previously acquired");
         *acquired = false;
         self.released.notify_one();
@@ -11802,11 +11799,12 @@ pub(crate) unsafe fn get(
     }
 
     // property: PyPy W_Property.get → call fget(obj).  Exact type only, for
-    // the reason `descroperation.py:169-176` gives its own shortcut: calling
-    // the accessor in place of `type(w_descr).__get__` is licensed only where
-    // the type cannot have overridden `__get__`.  A subclass falls through to
-    // the general MRO lookup at the end of this function, which finds either
-    // its override or `property`'s own typedef entry.
+    // the reason `descroperation.py get_and_call_function` gives its own
+    // shortcut: calling the accessor in place of `type(w_descr).__get__` is
+    // licensed only where the type cannot have overridden `__get__`.  A
+    // subclass falls through to the general MRO lookup at the end of this
+    // function, which finds either its override or `property`'s own typedef
+    // entry.
     if is_exact_property(descr) {
         // W_Property.get receives `space.w_None` for class access.  Internally
         // that state is a null pointer so the actual None singleton can still
@@ -11823,6 +11821,28 @@ pub(crate) unsafe fn get(
         // result is no binding, reported as absence rather than `Some(null)`.
         let r = crate::call::call_function_impl_result(fget, &[obj])?;
         return Ok(if r.is_null() { None } else { Some(r) });
+    }
+
+    // typedef.py GetSetProperty.descr_property_get reaches
+    // `self.fget(self, space, w_obj)` as an interp-level call, so a getset read
+    // costs one space-level call there.  The general `__get__` lookup at the end
+    // of this function reaches the same body through the
+    // `getset_descriptor.__get__` entry, which is itself a builtin function
+    // object, and so pays a second one on every `x.__class__`, `f.__name__`,
+    // `frame.f_lineno`, ... .  Run the body in place of the lookup, the licence
+    // the `property` arm above cites (`get_and_call_function`'s shortcut).
+    //
+    // `is_getset_property` compares `ob_type` against the static
+    // `GETSET_DESCRIPTOR_TYPE`, which only `w_getset_property_new` installs, and
+    // `getset_descriptor` is not an acceptable base type -- so unlike `property`
+    // it needs no separate exact-type test to exclude a subclass that could have
+    // overridden `__get__`.
+    if pyre_object::typedef::is_getset_property(descr) {
+        // The general path passes `space.w_None` for class access
+        // (`WrappedDefault(None)` at the entry) and the owner type as `w_cls`.
+        let visible_obj = if obj.is_null() { w_none() } else { obj };
+        let result = crate::typedef::getset_property_get(descr, visible_obj, w_type)?;
+        return Ok(if result.is_null() { None } else { Some(result) });
     }
 
     // typedef.py Member.descr_member_get:

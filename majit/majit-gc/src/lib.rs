@@ -246,7 +246,7 @@ struct DrainCensus {
     deciles: [u64; DRAIN_DECILES],
 }
 
-static DRAIN_CENSUS: std::sync::Mutex<Option<DrainCensus>> = std::sync::Mutex::new(None);
+static DRAIN_CENSUS: parking_lot::Mutex<Option<DrainCensus>> = parking_lot::Mutex::new(None);
 
 /// Record one minor collection: the nursery bytes it found (`used_before`),
 /// the bytes it copied out to the old generation (`promoted`), and how many
@@ -257,9 +257,7 @@ pub fn drain_census_record(
     pinned: usize,
     nursery_size: usize,
 ) {
-    let Ok(mut guard) = DRAIN_CENSUS.lock() else {
-        return;
-    };
+    let mut guard = DRAIN_CENSUS.lock();
     let census = guard.get_or_insert_with(DrainCensus::default);
     census.minors += 1;
     census.nursery_size = nursery_size;
@@ -313,9 +311,7 @@ impl DrainCensus {
 /// One-line summary of [`drain_census_record`], or a note that nothing was
 /// recorded.
 pub fn drain_census_summary() -> String {
-    let Ok(guard) = DRAIN_CENSUS.lock() else {
-        return "gc_drain <poisoned>".to_string();
-    };
+    let guard = DRAIN_CENSUS.lock();
     let Some(census) = guard.as_ref().filter(|census| census.minors > 0) else {
         return "gc_drain minors=0".to_string();
     };
@@ -1795,7 +1791,7 @@ fn current_gc_guard_hooks() -> ActiveGcGuardHooks {
     }
 }
 
-static GUARD_HOOKS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static GUARD_HOOKS_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Test-only: install `hooks` while holding a process-global lock, restoring
 /// the previous guard-hook values when the returned guard drops. Serializes
@@ -1803,7 +1799,7 @@ static GUARD_HOOKS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// the sole caller lives in the `majit-metainterp` crate's tests.
 pub struct GuardHooksTestGuard {
     prev: ActiveGcGuardHooks,
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _lock: parking_lot::MutexGuard<'static, ()>,
 }
 impl Drop for GuardHooksTestGuard {
     fn drop(&mut self) {
@@ -1811,9 +1807,7 @@ impl Drop for GuardHooksTestGuard {
     }
 }
 pub fn override_gc_guard_hooks_for_test(hooks: ActiveGcGuardHooks) -> GuardHooksTestGuard {
-    let lock = GUARD_HOOKS_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let lock = GUARD_HOOKS_TEST_LOCK.lock();
     let prev = current_gc_guard_hooks();
     set_active_gc_guard_hooks(hooks);
     GuardHooksTestGuard { prev, _lock: lock }
@@ -3651,7 +3645,7 @@ pub fn bh_probe_violation_report(minor: usize) -> String {
 }
 
 /// Type ids the post-minor scan must not read as a plain word array.
-static BH_PROBE_IGNORED_TIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+static BH_PROBE_IGNORED_TIDS: parking_lot::Mutex<Vec<u32>> = parking_lot::Mutex::new(Vec::new());
 
 /// Exempt a type from the post-minor nursery-reference scan.
 ///
@@ -3659,18 +3653,14 @@ static BH_PROBE_IGNORED_TIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new
 /// so a slot outside that map legitimately holds a stale scratch word that can
 /// fall inside the nursery range.
 pub fn bh_probe_ignore_tid(type_id: u32) {
-    if let Ok(mut v) = BH_PROBE_IGNORED_TIDS.lock()
-        && !v.contains(&type_id)
-    {
+    let mut v = BH_PROBE_IGNORED_TIDS.lock();
+    if !v.contains(&type_id) {
         v.push(type_id);
     }
 }
 
 pub fn bh_probe_tid_ignored(type_id: u32) -> bool {
-    BH_PROBE_IGNORED_TIDS
-        .lock()
-        .map(|v| v.contains(&type_id))
-        .unwrap_or(false)
+    BH_PROBE_IGNORED_TIDS.lock().contains(&type_id)
 }
 
 /// Origin tag for a block born straight into the old generation.
@@ -3853,25 +3843,20 @@ pub fn bh_probe_scan(reason: &str) {
 
 /// Offset -> field-name table for the probe's diagnostics, published by the
 /// crate that owns the layout so the probe does not have to guess.
-static BH_PROBE_FIELD_NAMES: std::sync::Mutex<Vec<(u32, usize, &'static str)>> =
-    std::sync::Mutex::new(Vec::new());
+static BH_PROBE_FIELD_NAMES: parking_lot::Mutex<Vec<(u32, usize, &'static str)>> =
+    parking_lot::Mutex::new(Vec::new());
 
 pub fn bh_probe_set_field_names(entries: &[(u32, usize, &'static str)]) {
-    if let Ok(mut v) = BH_PROBE_FIELD_NAMES.lock() {
-        v.extend_from_slice(entries);
-    }
+    BH_PROBE_FIELD_NAMES.lock().extend_from_slice(entries);
 }
 
 pub fn bh_probe_layout(type_id: u32) -> Vec<(usize, &'static str)> {
     let mut rows: Vec<(usize, &'static str)> = BH_PROBE_FIELD_NAMES
         .lock()
-        .map(|v| {
-            v.iter()
-                .filter(|&&(t, _, _)| t == type_id)
-                .map(|&(_, o, n)| (o, n))
-                .collect()
-        })
-        .unwrap_or_default();
+        .iter()
+        .filter(|&&(t, _, _)| t == type_id)
+        .map(|&(_, o, n)| (o, n))
+        .collect();
     rows.sort_unstable();
     rows
 }
@@ -3879,12 +3864,9 @@ pub fn bh_probe_layout(type_id: u32) -> Vec<(usize, &'static str)> {
 pub fn bh_probe_field_name(type_id: u32, offset: usize) -> &'static str {
     BH_PROBE_FIELD_NAMES
         .lock()
-        .ok()
-        .and_then(|v| {
-            v.iter()
-                .find(|&&(t, o, _)| t == type_id && o == offset)
-                .map(|&(_, _, n)| n)
-        })
+        .iter()
+        .find(|&&(t, o, _)| t == type_id && o == offset)
+        .map(|&(_, _, n)| n)
         .unwrap_or("?")
 }
 

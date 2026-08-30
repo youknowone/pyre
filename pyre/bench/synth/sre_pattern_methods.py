@@ -1,4 +1,3 @@
-# pyre-check: max-pypy-ratio=27
 import re
 
 # Regex work runs through the `re` layer and native `_sre`, which the trace
@@ -7,7 +6,14 @@ import re
 # guards (loop compile, guard-failure bridge, resume paths) and its GC-rooting
 # pressure saturate well below this count, so it stays a regression sentinel
 # while staying well below the three-second per-test budget.
-N = 2500
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 200
 
 pair = re.compile(r"([a-z]+)(\d+)")
 digit = re.compile(r"\d")

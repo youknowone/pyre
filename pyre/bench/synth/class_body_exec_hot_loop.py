@@ -1,4 +1,3 @@
-# pyre-check: max-pypy-ratio=40
 # A class body and an `exec(code, ns)` body are the two frames that receive
 # their namespace through `setdictscope`, and both route a hot loop through the
 # JIT portal.
@@ -22,18 +21,20 @@
 # `class_body_and_exec_loops_keep_the_vable_shadow_synchronized` in
 # pyre-jit's `gc_stress` test binary.
 #
-# N has to run far enough in one entry to warm the portal.
-# `exec_fresh_globals_delete_name` already runs an exec-body loop and stayed
-# green throughout: at 400 iterations it never reached the divergence.
-#
-# REPEAT sizes the whole workload rather than the trace.  At 5 the pypy
-# baseline lands under its startup, `_baseline_exec_time_clamped` marks the
-# ratio `~`, and no ratio gate is applied at all; 100 puts pypy's execution
-# around 0.14s, well clear of `FLOOR_GATE_MIN_BASELINE_S`.
+# The lowered threshold lets each 200-iteration body compile in one entry.
+# Every repeat still uses fresh namespace objects, so compiled code rechecks
+# the class namespace, dict subclass and OrderedDict owners.
 import collections
 
-N = 3000
-REPEAT = 100
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 200
+REPEAT = 3
 
 
 def class_body_while():

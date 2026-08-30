@@ -847,7 +847,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             let resolved = if descr_index == 0 || opcode.is_guard() {
                 None
             } else {
-                let all_descrs = self.trace.metainterp_sd.all_descrs().lock().unwrap();
+                let all_descrs = self.trace.metainterp_sd.all_descrs().lock();
                 let all_descr_len = all_descrs.len() as i64;
                 if descr_index < all_descr_len + 1 {
                     Some(all_descrs[(descr_index - 1) as usize].clone())
@@ -1494,7 +1494,7 @@ impl Trace {
     /// metainterp_sd.
     #[allow(dead_code)]
     fn all_descrs_len(&self) -> u32 {
-        self.metainterp_sd.all_descrs().lock().unwrap().len() as u32
+        self.metainterp_sd.all_descrs().lock().len() as u32
     }
 
     /// opencoder.py set_inputargs(inputargs).

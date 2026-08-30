@@ -2175,10 +2175,10 @@ fn leaked_method_owner(
     // Keyed by the layout test as well as the name: a type reached first
     // through the shared constructors takes an owner with no test, and a
     // later caller that does know the test must not be handed that one back.
-    static LEAKED: std::sync::Mutex<
+    static LEAKED: parking_lot::Mutex<
         Option<std::collections::HashMap<(String, bool), &'static crate::gateway::MethodOwner>>,
-    > = std::sync::Mutex::new(None);
-    let mut guard = LEAKED.lock().unwrap_or_else(|err| err.into_inner());
+    > = parking_lot::Mutex::new(None);
+    let mut guard = LEAKED.lock();
     let table = guard.get_or_insert_with(std::collections::HashMap::new);
     let key = (type_name.to_owned(), is_instance.is_some());
     if let Some(owner) = table.get(&key) {
@@ -7134,21 +7134,33 @@ fn init_dict_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "keys",
-            make_builtin_function_with_arity("keys", crate::type_methods::dict_method_keys, 1),
+            make_builtin_function_with_arity(
+                "keys",
+                crate::type_methods::__majit_wrap_dict_descr_keys,
+                1,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "values",
-            make_builtin_function_with_arity("values", crate::type_methods::dict_method_values, 1),
+            make_builtin_function_with_arity(
+                "values",
+                crate::type_methods::__majit_wrap_dict_descr_values,
+                1,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "items",
-            make_builtin_function_with_arity("items", crate::type_methods::dict_method_items, 1),
+            make_builtin_function_with_arity(
+                "items",
+                crate::type_methods::__majit_wrap_dict_descr_items,
+                1,
+            ),
         )
     };
     unsafe {
@@ -10691,6 +10703,99 @@ fn make_descr_get_builtin(func: crate::gateway::BuiltinCodeFn) -> PyObjectRef {
     )
 }
 
+/// `typedef.py GetSetProperty.descr_property_get`'s body, reachable without
+/// the `getset_descriptor.__get__` entry that publishes it below.
+///
+/// Upstream `descr_property_get` is the descriptor's own interp-level method,
+/// so it reaches `self.fget(self, space, w_obj)` after a single space-level
+/// call.  Here the `__get__` entry is itself a builtin function object, so a
+/// caller that resolves it through the type MRO and calls it pays a second
+/// generic call for every getset read.  Naming the body lets
+/// `baseobjspace::get` run it in place of that lookup, the way it already
+/// runs `W_Property.get`'s accessor in place of `property.__get__`.
+///
+/// `w_cls` carries `__get__`'s optional owner argument; `PY_NULL` is its
+/// absence, matching `WrappedDefault(None)` at the entry.
+pub(crate) fn getset_property_get(
+    w_self: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_cls: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let w_obj_is_none = !w_obj.is_null() && unsafe { pyre_object::is_none(w_obj) };
+    let none_type =
+        crate::typedef::r#type(pyre_object::w_none()).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+    let w_cls_is_none_type = !w_cls.is_null() && std::ptr::eq(w_cls, none_type);
+    // typedef.py if w_obj is None and w_cls is not type(None):
+    if w_obj_is_none && !w_cls_is_none_type {
+        // typedef.py if w_cls is None: raise TypeError
+        if w_cls.is_null() || unsafe { pyre_object::is_none(w_cls) } {
+            return Err(crate::PyError::type_error(
+                "__get__(None, None) is invalid".to_string(),
+            ));
+        }
+        // typedef.py return self
+        return Ok(w_self);
+    }
+    // typedef.py try: return self.fget(self, space, w_obj)
+    //                    except DescrMismatch: descr_call_mismatch(...)
+    let reqcls = read_reqcls(w_self);
+    // pyre's typecheck wrapper equivalent: descr_self_interp_w runs
+    // before the inner function so DescrMismatch is raised the same
+    // way PyPy's `_make_descr_typecheck_wrapper` does.
+    if !reqcls.is_null()
+        && let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj)
+    {
+        if e.kind == crate::PyErrorKind::DescrMismatch {
+            return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
+        }
+        return Err(e);
+    }
+    let fget = read_fget(w_self);
+    if fget.is_null() {
+        return Err(readonly_attribute(w_self));
+    }
+    // typedef.py calls the getter as `self.fget(self, space, w_obj)` — an
+    // interp-level call, not `space.call_function`.  Every `GetSetProperty`
+    // registration declares the getter with exactly this receiver/instance
+    // pair, so when the callee is the plain fixed-arity builtin that
+    // declaration builds, the dispatcher in between has nothing left to
+    // decide.  Anything else — a getter carrying a receiver owner, a bound
+    // signature, another arity — keeps the dispatcher.
+    let result = match unsafe { crate::gateway::builtin_fixed_arity_fn(fget, 2) } {
+        Some(func) => call_getset_fget_direct(func, w_self, w_obj),
+        None => crate::call::call_function_impl_result(fget, &[w_self, w_obj]),
+    };
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => {
+            Err(getset_descr_mismatch(w_self, w_obj, reqcls))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Invoke a getset getter's registered function with the two words
+/// `typedef.py` hands it, under the roots `call_builtin_code_positional`
+/// publishes for the same call: the getter may collect, and both words are
+/// live across it.  Pinned one at a time for the reason that function gives —
+/// the batched publish reorders the pending-callee queue around the
+/// `BuiltinCodeFn` indirect call.
+///
+/// `dont_look_inside` for the same reason `shadow_stack_len` carries it: the
+/// body reads the thread-local root stack, which the tracer cannot type.
+#[majit_macros::dont_look_inside]
+fn call_getset_fget_direct(
+    func: crate::gateway::BuiltinCodeFn,
+    w_self: PyObjectRef,
+    w_obj: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(w_self);
+    let _ = roots.pin_root(w_obj);
+    func(&[roots.get(base), roots.get(base + 1)])
+}
+
 /// typedef.py GetSetProperty.typedef = TypeDef("getset_descriptor", ...)
 fn init_getset_descriptor_type(ns: PyObjectRef) {
     // typedef.py GetSetProperty.descr_property_get
@@ -10723,49 +10828,11 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
             make_descr_get_builtin(|args| {
                 crate::type_methods::arity_at_least(args, "__get__", 1)?;
                 crate::type_methods::arity_at_most(args, "__get__", 2)?;
-                let w_self = args[0];
-                let w_obj = args[1];
-                let w_cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-                let w_obj_is_none = !w_obj.is_null() && unsafe { pyre_object::is_none(w_obj) };
-                let none_type = crate::typedef::r#type(pyre_object::w_none())
-                    .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-                let w_cls_is_none_type = !w_cls.is_null() && std::ptr::eq(w_cls, none_type);
-                // typedef.py:352-353 if w_obj is None and w_cls is not type(None):
-                if w_obj_is_none && !w_cls_is_none_type {
-                    // typedef.py:355 if w_cls is None: raise TypeError
-                    if w_cls.is_null() || unsafe { pyre_object::is_none(w_cls) } {
-                        return Err(crate::PyError::type_error(
-                            "__get__(None, None) is invalid".to_string(),
-                        ));
-                    }
-                    // typedef.py:357 return self
-                    return Ok(w_self);
-                }
-                // typedef.py try: return self.fget(self, space, w_obj)
-                //                    except DescrMismatch: descr_call_mismatch(...)
-                let reqcls = read_reqcls(w_self);
-                // pyre's typecheck wrapper equivalent: descr_self_interp_w runs
-                // before the inner function so DescrMismatch is raised the same
-                // way PyPy's `_make_descr_typecheck_wrapper` does.
-                if !reqcls.is_null()
-                    && let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj)
-                {
-                    if e.kind == crate::PyErrorKind::DescrMismatch {
-                        return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
-                    }
-                    return Err(e);
-                }
-                let fget = read_fget(w_self);
-                if fget.is_null() {
-                    return Err(readonly_attribute(w_self));
-                }
-                match crate::call::call_function_impl_result(fget, &[w_self, w_obj]) {
-                    Ok(v) => Ok(v),
-                    Err(e) if e.kind == crate::PyErrorKind::DescrMismatch => {
-                        Err(getset_descr_mismatch(w_self, w_obj, reqcls))
-                    }
-                    Err(e) => Err(e),
-                }
+                getset_property_get(
+                    args[0],
+                    args[1],
+                    args.get(2).copied().unwrap_or(pyre_object::PY_NULL),
+                )
             }),
         )
     };

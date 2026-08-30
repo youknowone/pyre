@@ -10,6 +10,7 @@ name = "pyre-wasm-runner"
 path = "src/main.rs"
 
 [dependencies]
+parking_lot = { workspace = true }
 # wasmtime vendors its own error type (`wasmtime::Error`) and re-exports a
 # `Context` trait, so the runner needs no separate `anyhow` dependency.
 wasmtime = { workspace = true }

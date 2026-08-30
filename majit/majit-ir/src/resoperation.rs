@@ -1466,6 +1466,20 @@ impl AsRef<Op> for Op {
     }
 }
 
+impl OpRef {
+    /// Visit this reference's inline `ConstPtr` `GcRef` slot, if it holds one.
+    ///
+    /// [`Operand::walk_const_ptr_refs`]'s counterpart for the flat `OpRef`
+    /// banks.  `ConstPtr` carries its `GcRef` by value, so a walker that has to
+    /// forward a moved object must reach the slot in the bank; a copy would be
+    /// visited and then thrown away.
+    pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        if let OpRef::ConstPtr(gcref) = self {
+            visitor(gcref);
+        }
+    }
+}
+
 impl Op {
     /// Visit every inline `ConstPtr.value` slot carried by this operation.
     ///

@@ -9,6 +9,7 @@ cranelift = ["majit-metainterp/cranelift"]
 dynasm = ["majit-metainterp/dynasm"]
 
 [dependencies]
+parking_lot = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }

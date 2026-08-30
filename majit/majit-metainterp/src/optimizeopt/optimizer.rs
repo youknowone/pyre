@@ -3461,20 +3461,20 @@ impl Optimizer {
                         let replay_result = if const_group {
                             None
                         } else {
-                            // A produced short box whose result forwards to an inline
-                            // Const after optimization is not a real short box: a pure
-                            // op (e.g. an IntLe on loop-constant args) folds to a Const,
-                            // whose value is reproduced by inlining at use sites. A
-                            // Const must never enter exported_short_boxes / used_boxes —
-                            // it has no box index, so the carried-slot `.raw()` in
-                            // unroll.rs panics. RPython folds such ops away before
-                            // short-box creation, so its short boxes are always genuine
-                            // value Boxes. The filter still backstops pure operations
-                            // that fold to a Const during optimization.
-                            if canonical_result.is_constant() {
-                                return None;
-                            }
-                            Some(canonical_result)
+                            // pure.py `produce_potential_short_preamble_ops` walks
+                            // `_newoperations`, not their replacements.  In particular,
+                            // `postprocess_GUARD_TRUE` can forward an already-emitted
+                            // pure comparison to CONST_1; PyPy still exports that
+                            // comparison Box and `PureOp.produce_op` installs it in the
+                            // next iteration's pure cache.  Keep the original result
+                            // identity for that case.  Using the inline Const as the
+                            // replay position would collapse distinct comparison Boxes
+                            // that happen to prove the same value.
+                            Some(exported_short_box_replay_result(
+                                result,
+                                canonical_result,
+                                &produced.kind,
+                            )?)
                         };
                         let preamble_op = produced.preamble_op.clone();
                         // For ShortInputArg, RPython keeps two identities:
@@ -5773,6 +5773,23 @@ impl Default for Optimizer {
     }
 }
 
+/// Select the replay identity for a non-const-channel short box.
+///
+/// PyPy keys `ShortBoxes.potential_ops` by the original result Box even when
+/// that Box was subsequently forwarded to a Const by guard postprocessing.
+/// Such an entry is useful only for `PureOp`: it seeds the next iteration's
+/// pure cache without becoming a carried constant slot.
+fn exported_short_box_replay_result(
+    result: OpRef,
+    canonical_result: OpRef,
+    kind: &crate::optimizeopt::shortpreamble::PreambleOpKind,
+) -> Option<OpRef> {
+    if !canonical_result.is_constant() {
+        return Some(canonical_result);
+    }
+    (*kind == crate::optimizeopt::shortpreamble::PreambleOpKind::Pure).then_some(result)
+}
+
 // OptimizerBoxEnv removed: was only used by store_final_boxes_in_guard.
 // store_final_boxes_in_guard in mod.rs defines InlineBoxEnv for the same purpose.
 
@@ -5788,6 +5805,30 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    #[test]
+    fn guarded_pure_constant_keeps_its_original_short_box_identity() {
+        use crate::optimizeopt::shortpreamble::PreambleOpKind;
+
+        let original = OpRef::int_op(17);
+        let proven_true = OpRef::const_int(1);
+        assert_eq!(
+            exported_short_box_replay_result(original, proven_true, &PreambleOpKind::Pure),
+            Some(original),
+            "pure.py produce_potential_short_preamble_ops exports the emitted \
+             comparison Box even after postprocess_GUARD_TRUE forwards it to CONST_1",
+        );
+        assert_eq!(
+            exported_short_box_replay_result(original, proven_true, &PreambleOpKind::Heap),
+            None,
+            "only PureOp can seed a cache without carrying a constant result slot",
+        );
+        let loop_value = OpRef::int_op(23);
+        assert_eq!(
+            exported_short_box_replay_result(original, loop_value, &PreambleOpKind::Pure),
+            Some(loop_value),
+        );
+    }
 
     /// `OpRc`-threading analogue of [`super::super::seed_empty_guard_snapshots`]
     /// for fixtures built with [`TraceBuilder`]: assigns each guard a fresh

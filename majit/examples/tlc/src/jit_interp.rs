@@ -387,12 +387,12 @@ mod tests {
     /// covers *every* call that can compile — [`run_jit`] and [`compile_probe`]
     /// are the only two ways a test may enter the JIT, and neither may call the
     /// other (a plain mutex re-entered on one thread deadlocks).
-    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PROBE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// For tests that assert only on the result. They still compile, so they
     /// must not run inside the probe's window. See [`PROBE_LOCK`].
     fn run_jit(bc: &[u8], arg: i64, pool: &ConstantPool) -> i64 {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         let mut jit = JitTlcInterp::new();
         jit.run(bc, arg, pool)
     }
@@ -411,7 +411,7 @@ mod tests {
         arg: i64,
         pool: &ConstantPool,
     ) -> (i64, usize, usize, majit_metainterp::LoopBodyShape) {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
         LAST_OPS_AFTER.store(0, Ordering::Relaxed);
         LAST_HAS_JUMP.store(false, Ordering::Relaxed);

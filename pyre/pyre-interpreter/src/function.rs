@@ -3477,8 +3477,8 @@ pub unsafe fn descr_method_getattribute(
 /// and `__qualname__` is writable on an ordinary function, so they have to be
 /// recognised by identity.  `Box` so a slot keeps one address for the
 /// collector's whole lifetime; the `Vec` only owns them.
-static OBJECT_CLASS_METHODS: std::sync::Mutex<Vec<(&'static str, Box<usize>)>> =
-    std::sync::Mutex::new(Vec::new());
+static OBJECT_CLASS_METHODS: parking_lot::Mutex<Vec<(&'static str, Box<usize>)>> =
+    parking_lot::Mutex::new(Vec::new());
 
 /// Publish `function` as `object.<name>` for [`method_class_bound_qualname`].
 ///
@@ -3489,10 +3489,7 @@ pub fn register_object_class_method(name: &'static str, function: PyObjectRef) {
     let mut slot = Box::new(function as usize);
     let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
     unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
-    OBJECT_CLASS_METHODS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((name, slot));
+    OBJECT_CLASS_METHODS.lock().push((name, slot));
 }
 
 /// The name `object` publishes `function` under, if it publishes it at all.
@@ -3507,7 +3504,6 @@ pub fn register_object_class_method(name: &'static str, function: PyObjectRef) {
 fn object_class_method_name(function: PyObjectRef) -> Option<&'static str> {
     OBJECT_CLASS_METHODS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .find(|(_, slot)| **slot == function as usize)
         .map(|(name, _)| *name)

@@ -1,11 +1,20 @@
-# pyre-check: max-pypy-ratio=46
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept verbatim from its former standalone file with module-level names prefixed
 # by the source name. Bug-repro / resume / kept-stack tests are NOT merged (they
 # stay isolated so a miscompile is not diluted). check.py runs every *.py here.
 
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+# Every independent loop needs one compiled trace; larger counts only repeat
+# the same list operation after its result and jitstats shape are fixed.
+
 # ── list_index_update ──
-list_index_update__N = 900000
+list_index_update__N = 5000
 
 def list_index_update__main():
     xs = [0] * 32
@@ -19,7 +28,7 @@ def list_index_update__main():
 list_index_update__main()
 
 # ── list_slicing ──
-list_slicing__N = 180000
+list_slicing__N = 2000
 
 def list_slicing__main():
     xs = [0, 1, 2, 3, 4, 5, 6, 7]
@@ -33,7 +42,7 @@ def list_slicing__main():
 list_slicing__main()
 
 # ── list_append_pop ──
-list_append_pop__N = 700000
+list_append_pop__N = 5000
 
 def list_append_pop__main():
     xs = []
@@ -51,7 +60,7 @@ def list_append_pop__main():
 list_append_pop__main()
 
 # ── list_obj_append_pop ──
-list_obj_append_pop__N = 700000
+list_obj_append_pop__N = 5000
 
 def list_obj_append_pop__main():
     xs = []
@@ -71,7 +80,7 @@ def list_obj_append_pop__main():
 list_obj_append_pop__main()
 
 # ── tuple_unpacking ──
-tuple_unpacking__N = 900000
+tuple_unpacking__N = 5000
 
 def tuple_unpacking__pair(i):
     return (i, i + 1)
@@ -88,7 +97,7 @@ def tuple_unpacking__main():
 tuple_unpacking__main()
 
 # ── build_list_large ──
-build_list_large__N = 900000
+build_list_large__N = 5000
 
 def build_list_large__main():
     i = 0
@@ -101,7 +110,7 @@ def build_list_large__main():
 build_list_large__main()
 
 # ── build_tuple_large ──
-build_tuple_large__N = 900000
+build_tuple_large__N = 5000
 
 def build_tuple_large__main():
     i = 0

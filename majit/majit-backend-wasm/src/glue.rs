@@ -15,7 +15,8 @@
 //! the rest of the backend stays binding-agnostic.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::OnceLock;
 
 static JIT_EXECUTE_COUNT: AtomicU64 = AtomicU64::new(0);
 static JIT_COMPILE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -100,14 +101,14 @@ pub fn compile_module(wasm_bytes: &[u8]) -> u32 {
 /// this cache later without weakening that invariant.
 pub fn compile_module_cached(wasm_bytes: &[u8]) -> u32 {
     let cache = MODULE_CACHE.get_or_init(|| Mutex::new(indexmap::IndexMap::new()));
-    if let Some(&handle) = cache.lock().unwrap().get(wasm_bytes) {
+    if let Some(&handle) = cache.lock().get(wasm_bytes) {
         JIT_COMPILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
         return handle;
     }
     let handle = compile_module(wasm_bytes);
     if handle != 0 {
         JIT_COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
-        cache.lock().unwrap().insert(wasm_bytes.into(), handle);
+        cache.lock().insert(wasm_bytes.into(), handle);
     }
     handle
 }

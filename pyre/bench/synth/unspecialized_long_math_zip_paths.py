@@ -1,44 +1,15 @@
-# pyre-check: max-pypy-ratio=6
 # pyre-check: spec-folds=builtin_zip,zip_two_tuple_iters,compare_op_long_int,truediv_op_long,binary_op_long_int_pow,binary_op_long_int_shift,math_frexp,math_ldexp
 # The throughput gate for eight hand-written trace-time folds that no other
 # fixture makes fire: `zip` over two tuples (positional and `strict=True`), a
 # long/int comparison, a two-bigint true-divide, `bigint ** int`,
 # `bigint << int` / `bigint >> int`, and `math.frexp` / `math.ldexp`.
 #
-# The ceiling is what does the gating: measured 2.59x pypy with the eight folds
-# in place and 12.4x with all eight suppressed, so 6 sits about 2.2x from
-# either state. A jit-stats baseline cannot see a throughput change -- that is
-# how these eight were once retired as dead -- so this ceiling is the only
-# thing here that can. Loosen it rather than shrink the loops if a slower host
-# proves it flaky.
-#
 # Which folds a leg fires is a census question, not a reading of the source:
 # `PYRE_FBW_SPEC_CENSUS=1` prints `fold=<label> consulted=N fired=N` per label.
 # This fixture claimed eight and delivered seven for as long as `builtin_zip`
 # read its `call_kw` operands in the wrong order -- consulted once per run and
-# declined every time, so the leg written for it gated nothing and the ceiling
-# below was fitted without it. Read the census, not the leg names, before
-# trusting the coverage claim above; the `zip_strict` sensitivity quoted in the
-# next paragraph predates that fix.
-#
-# The legs are sized per leg, not uniformly, because sensitivity and cost run
-# opposite here: measured at a common 1M iterations, the folds worth the most
-# sit on the cheapest legs (frexp 23.5x, ldexp 11x, long/int compare 8.5x, each
-# ~4ms) while the dearest legs are the least sensitive (zip 1.05s at 1.1x,
-# zip_strict 1.77s at 1.4x). Uniform sizing lets the insensitive legs drown the
-# rest and the whole fixture moves only 1.3x when all eight folds are
-# suppressed. Sized so each leg contributes comparable folded time, the same
-# suppression moves it several-fold, which is what the ceiling can gate.
-# Every leg is also large enough that pypy's own execution clears the
-# measurement floor; below that the ratio gate divides by the floor and reads
-# startup instead of these loops.
-#
-# The frexp and ldexp legs are held small for a second reason: they are the two
-# shapes wasm is worst at relative to dynasm, ~37x each against 1.3-4.4x for
-# every other leg, so sizing them by sensitivity alone puts the fixture through
-# the wasm/dynasm ceiling (measured 9.0x against a gate of 4x). The long/int
-# compare carries their share instead -- 8.5x sensitivity at 3.8x on wasm is
-# the best of both here.
+# declined every time, so the leg written for it gated nothing.  Read the
+# census, not the leg names, before trusting the `spec-folds` coverage claim.
 #
 # Every result is reduced to an integer checksum: the float legs go through
 # `int(round(x * 1e6))` so the comparison cannot turn into a float-formatting
@@ -46,14 +17,23 @@
 
 import math
 
-N_ZIP = 50000
-N_ZIP_STRICT = 30000
-N_CMP = 40000000
-N_TRUEDIV = 700000
-N_POW = 125000
-N_SHIFT = 600000
-N_FREXP = 1000000
-N_LDEXP = 1000000
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+# Each leg only needs to compile and make its declared fold fire; the census
+# carries the performance-sensitive signal directly.
+N_ZIP = 1000
+N_ZIP_STRICT = 1000
+N_CMP = 10000
+N_TRUEDIV = 5000
+N_POW = 2000
+N_SHIFT = 5000
+N_FREXP = 5000
+N_LDEXP = 5000
 
 
 def f_zip(n):

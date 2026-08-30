@@ -174,11 +174,11 @@ unsafe fn kwonly_defaults_for_inline(
     // The version lives on the strategy box, so that is what the pin names and
     // what has to exist.  An ordinary dict has none.
     let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict) };
-    // The strategy box and every cell under it are baked, and a freshly minted
-    // `ConstPtr` sits in the walker's `registers_r` until it is recorded, which
-    // no registered root area walks.  Take only addresses a collection cannot
-    // move -- a definition's mapping is young, unlike the module namespaces the
-    // same fold usually runs against.
+    // The strategy box is baked AND named by raw address outside the trace --
+    // the emit installs the mapping's version marker against that address
+    // (`record_quasiimmut_field`) -- so this one keeps its movability test
+    // even though the `active_sym_registers` root area covers the bank.  A
+    // `malloc_typed` strategy box answers it for free.
     if strategy.is_null() || majit_gc::can_move(majit_ir::GcRef(strategy as usize)) {
         return None;
     }
@@ -203,7 +203,7 @@ unsafe fn kwonly_defaults_for_inline(
         let Some(stored) = crate::state::module_dict_cell_value_direct(dict, cell_slot) else {
             return None;
         };
-        if stored.is_null() || majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
+        if stored.is_null() {
             return None;
         }
         let value = unsafe { pyre_object::celldict::unwrap_cell(stored) };
@@ -810,9 +810,9 @@ fn log_descent_unlowered_helper_blockers(jitcode_index: usize) {
     if !fbw_inline_diag_enabled() {
         return;
     }
-    static LOGGED: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
-        std::sync::Mutex::new(None);
-    let mut guard = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    static LOGGED: parking_lot::Mutex<Option<std::collections::HashSet<usize>>> =
+        parking_lot::Mutex::new(None);
+    let mut guard = LOGGED.lock();
     if !guard
         .get_or_insert_with(Default::default)
         .insert(jitcode_index)
@@ -3644,6 +3644,13 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // `builtin_wrapper_indirect_graphs` builds — i.e. one registered without a
     // `__majit_wrap_*` gateway.  The address is what identifies the missing
     // member, so print it.
+    //
+    // Every bail between here and the descent below names itself for the same
+    // reason.  With the tail of this function silent, a `PYRE_FBW_DESCENT_SCAN_OFF=1`
+    // run of `abc_instancecheck_weak_cache` printed no builtin-inline line at
+    // all and recorded the same 69 ops as the gated run, which reads as "the
+    // descent scan is the wall" when the scan had already been switched off and
+    // something downstream refused instead.
     macro_rules! builtin_inline_decline {
         ($why:expr, $addr:expr) => {
             if fbw_inline_diag_enabled() {
@@ -3687,9 +3694,11 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // MetaInterpStaticData registry.  The frozen table is lazy in pyre, so
     // publish this wrapper before any guard snapshot names its absolute index.
     if crate::state::ensure_build_time_jitcode_at(jitcode.index()).is_none() {
+        builtin_inline_decline!("wrapper jitcode absent from the build-time table", fnaddr);
         return Ok(None);
     }
     if body.num_regs_r < 1 {
+        builtin_inline_decline!("wrapper body has no ref register", fnaddr);
         return Ok(None);
     }
     if let Some(decline) = descent_decline(jitcode.index()) {
@@ -3723,7 +3732,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     let nested_helper_entry = if nested_helper {
         match compute_inline_helper_call_entry_frame(ctx, op.pc) {
             Ok(frame) => Some(frame),
-            Err(_) => return Ok(None),
+            Err(_) => {
+                builtin_inline_decline!("no entry frame for the nested helper call", fnaddr);
+                return Ok(None);
+            }
         }
     } else {
         None
@@ -3736,12 +3748,14 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // or synthetic allocations so a missing coordinate is a clean decline.
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
+        builtin_inline_decline!("walk carries no snapshot symbol", fnaddr);
         return Ok(None);
     }
     // SAFETY: snapshot_sym is installed for the lifetime of the enclosing
     // full-body walk and is read-only here.
     let sym = unsafe { &*sym_ptr };
     if sym.jitcode().is_null() {
+        builtin_inline_decline!("snapshot symbol names no jitcode", fnaddr);
         return Ok(None);
     }
     let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
@@ -3830,6 +3844,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // seeding under the arraylen descriptor makes the later getitem miss and
     // manufactures a Box without its recording-time `.value`.
     let Some(wrapper_args_descr_index) = wrapper_args_item_descr_index(body.code) else {
+        builtin_inline_decline!("wrapper args item descriptor unresolved", fnaddr);
         return Ok(None);
     };
 
@@ -6750,6 +6765,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // nested-residual decline, mirroring the native `CALL_ASSEMBLER`
             // fold's `SELFREC_CA_FOLD_ACTIVE` exemption.
             let _bridge_rec_selfrec_guard = bridge_rec_root_selfrec.then(SelfRecCaFoldGuard::enter);
+            // Root this sub-walk's own Ref bank: a callee fold mints its
+            // `ConstPtr` into `sub_wc.registers_r`, which is not the anchored
+            // `sym.registers_r`.
+            let _callee_bank_guard =
+                crate::trace::InlineRegisterBankGuard::enter(&raw mut *sub_wc.registers_r);
             walk(body.code, 0, &mut sub_wc)
         };
         if let Some(jd_no) = subwalk_jd_no {
@@ -9312,6 +9332,11 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     // Rewind point for the `NotImplemented` arm below.  Nothing above this
     // line records IR or touches the heap cache.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // `MetaInterp.virtualref_boxes` is state beside the history, not part of
+    // `History.cut`.  This speculative descent can run
+    // `opimpl_virtual_ref` before returning `NotImplemented`, so its rewind
+    // must restore the pair stack together with the recorded operations.
+    let pre_fold_virtualrefs = ctx.trace_ctx.snapshot_virtualref_boxes();
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
@@ -9370,6 +9395,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     drop(rewind_guard);
     if refused_a_commit {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx
+            .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
         ctx.trace_ctx.heap_cache_mut().reset();
         decline!(format_args!(
             "{}.{dunder} may commit before its result is known",
@@ -9414,6 +9441,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
                 && !fbw_has_unjournaled_effect()
             {
                 ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+                ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
                 ctx.trace_ctx.heap_cache_mut().reset();
                 return Ok(None);
             }
@@ -9554,6 +9582,10 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     // Rewind point for the `NotImplemented` arm below.  Nothing above this
     // line records IR or touches the heap cache.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // Keep the `MetaInterp.virtualref_boxes` side state at the same boundary
+    // as the history: the attempted compare dunder can open a virtual-ref
+    // scope before returning `NotImplemented` and being discarded.
+    let pre_fold_virtualrefs = ctx.trace_ctx.snapshot_virtualref_boxes();
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
@@ -9612,6 +9644,8 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     drop(rewind_guard);
     if refused_a_commit {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx
+            .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
     }
@@ -9643,6 +9677,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
                 && !fbw_has_unjournaled_effect()
             {
                 ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+                ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
                 ctx.trace_ctx.heap_cache_mut().reset();
                 return Ok(None);
             }
@@ -9929,7 +9964,13 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
                 seed_callee_vstack_mirror(&mut sub_wc, &frame);
             }
         }
-        let (outcome, end_pc) = match walk(sub_body.code, 0, &mut sub_wc) {
+        // As above: the callee bank is not `sym.registers_r`, so publish it for
+        // the length of the sub-walk.
+        let callee_bank_guard =
+            crate::trace::InlineRegisterBankGuard::enter(&raw mut *sub_wc.registers_r);
+        let walk_result = walk(sub_body.code, 0, &mut sub_wc);
+        drop(callee_bank_guard);
+        let (outcome, end_pc) = match walk_result {
             Ok(pair) => pair,
             Err(error) => {
                 // The error carries a pc in THIS sub-jitcode, and the enclosing

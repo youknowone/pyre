@@ -38,7 +38,17 @@
 # instead of silent drift.
 import sys
 
-N = 200000
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+# Recording aborts and blacklists this shape after five attempts.  This count
+# clears the lowered threshold and the blacklist sequence without spending the
+# rest of the fixture on an already-interpreted path.
+N = 200
 
 
 def hot(n):

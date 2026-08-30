@@ -45,9 +45,10 @@
 //! removes from, published to the collector as a root source. That test walks
 //! the registry to show the frame is in it and walks the JF shadow stack to
 //! show it is in nothing else, and only then collects.
+use parking_lot::Mutex;
 use std::cell::{Cell, UnsafeCell};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use majit_backend::{Backend, DeadFrame, JitCellToken};
 use majit_backend_dynasm::runner::DynasmBackend;
@@ -446,7 +447,7 @@ fn check_common(
 /// place rather than a copy — answers the forwarded values.
 #[test]
 fn borrowed_deadframe_reads_the_forwarded_refs_across_a_collection() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock();
     let fixture = Fixture::build(force_collect_then_read, 5001);
     let (frame, observed) = fixture.run();
 
@@ -466,7 +467,7 @@ fn borrowed_deadframe_reads_the_forwarded_refs_across_a_collection() {
 /// depends on the frame's `jf_gcmap` still being the map the call site stored.
 #[test]
 fn dropping_a_borrowed_deadframe_leaves_the_running_frame_traceable() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock();
     let fixture = Fixture::build(force_drop_then_collect, 5002);
     let (frame, observed) = fixture.run();
 
@@ -491,7 +492,7 @@ fn dropping_a_borrowed_deadframe_leaves_the_running_frame_traceable() {
 /// one with nothing left to forward.
 #[test]
 fn owned_deadframe_registry_roots_the_returned_frames_refs() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock();
     let fixture = Fixture::build(force_read_and_collect_nothing, 5003);
     let (frame, observed) = fixture.run();
     assert!(

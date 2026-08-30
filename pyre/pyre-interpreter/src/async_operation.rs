@@ -66,14 +66,14 @@ def anext(iterator, default=_NOT_PROVIDED):
 const AITER: usize = 0;
 const ANEXT: usize = 1;
 
-static HANDLES: std::sync::Mutex<[usize; 2]> = std::sync::Mutex::new([0; 2]);
+static HANDLES: parking_lot::Mutex<[usize; 2]> = parking_lot::Mutex::new([0; 2]);
 
 /// Resolve (and cache) the two app-level handles.  Executes `ASYNC_OP_SRC`
 /// into its own fresh module globals and stores the `aiter` / `anext`
 /// function objects; both retain that namespace as their `__globals__`,
 /// keeping the `_NOT_PROVIDED` sentinel reachable.
 fn handle(which: usize) -> PyResult {
-    let cached = HANDLES.lock().unwrap()[which];
+    let cached = HANDLES.lock()[which];
     if cached != 0 {
         return Ok(cached as PyObjectRef);
     }
@@ -111,7 +111,7 @@ fn handle(which: usize) -> PyResult {
             .unwrap_or_else(|| panic!("async_operation: `{name}` not bound"))
     };
     let initialized = [get("aiter") as usize, get("anext") as usize];
-    let mut handles = HANDLES.lock().unwrap();
+    let mut handles = HANDLES.lock();
     if handles[which] == 0 {
         *handles = initialized;
     }
@@ -123,7 +123,7 @@ fn handle(which: usize) -> PyResult {
 /// so expose each slot to the global root walker and write relocated pointers
 /// back in place.
 pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let mut handles = HANDLES.lock().unwrap();
+    let mut handles = HANDLES.lock();
     for slot in handles.iter_mut().filter(|slot| **slot != 0) {
         unsafe { visitor(&mut *(slot as *mut usize as *mut majit_ir::GcRef)) };
     }

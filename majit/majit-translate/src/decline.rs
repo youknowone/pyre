@@ -74,10 +74,11 @@
 //! operations that were never candidates.  Recording starts once a site
 //! has been identified as the kind of thing the gate exists to lower.
 
+use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Arguments;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{LazyLock, OnceLock};
 
 /// Every instrumented gate's census name, in one place.
 ///
@@ -181,11 +182,11 @@ struct Row {
 }
 
 fn bump(gate: &'static str, reason: Cow<'static, str>, subject: Option<&str>) {
-    // A poisoned map means some other thread panicked mid-record.  The
-    // census must never turn that into a second failure, so recover the
-    // guard: a lost count is strictly better than an instrument that
-    // aborts the run it is measuring.
-    let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    // `parking_lot` carries no poison flag, so a thread that panicked
+    // mid-record leaves the next caller an ordinary guard: the census cannot
+    // turn someone else's failure into a second one, which is what an
+    // instrument measuring a run must never do.
+    let mut counts = COUNTS.lock();
     let row = counts.entry((gate, reason)).or_default();
     row.events += 1;
     if let Some(subject) = subject {
@@ -275,7 +276,7 @@ pub fn observe_accept(gate: &'static str, class: &'static str, subject: &str) {
 /// `distinct_subjects` is 0 where the call site named no subject; it is
 /// NOT a claim that one subject was involved.
 pub fn snapshot() -> Vec<(&'static str, String, u64, usize)> {
-    let counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    let counts = COUNTS.lock();
     counts
         .iter()
         .map(|((gate, reason), row)| (*gate, reason.to_string(), row.events, row.subjects.len()))
@@ -287,7 +288,7 @@ pub fn snapshot() -> Vec<(&'static str, String, u64, usize)> {
 /// The list, not the count — for the reader who needs to know WHICH
 /// graphs, not how many. Empty for rows whose call site named none.
 pub fn subjects_of(gate: &str, reason: &str) -> Vec<String> {
-    let counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    let counts = COUNTS.lock();
     counts
         .iter()
         .filter(|((g, r), _)| *g == gate && r == reason)

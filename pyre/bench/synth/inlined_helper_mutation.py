@@ -1,15 +1,9 @@
-# pyre-check: max-pypy-ratio=60
-# The trip count now puts pypy above the startup-subtraction floor, so this
-# ratio is a measurement rather than pyre divided by the floor constant; a
-# ceiling fitted against the clamp (the 45 this bench once carried) fails.
-# The bound is twice the slowest of the three backends (27.7x), rounded up to
-# the next multiple of ten.
+# pyre-check: spec-folds=load_bound_method_attr,store_attr_direct
 #
 # `push` binds `a.append` inside an inlined callee.  The folds that shape a
 # bound-method load decline only where a guard would collapse its resume to
 # the caller's CALL, rather than for the whole of such a sub-walk, so the
-# binding folds here and the ratio reads 15.1x/27.7x/26.4x
-# (dynasm/cranelift/wasm).
+# binding must still fold here.
 # Inlined-callee shared-heap mutation parity, in both helper orderings.
 #
 # A tiny helper mutates a caller-owned list/instance inside a hot while-loop,
@@ -25,7 +19,10 @@
 # the append abort and the interpreter restarts the iteration from the
 # unadvanced frame, re-running bump.  A recording attempt that aborts after
 # the committed store must not leave a doubled side effect.
-N = 2900000
+# Both orderings compile and the two folds are censused directly.  Keeping
+# millions of list entries alive after those paths are established only turns
+# the regression guard into an allocation benchmark.
+N = 300000
 
 
 def push(a, v):

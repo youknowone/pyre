@@ -10,9 +10,9 @@
 //! belongs — a native blocking primitive is residual in RPython too — and
 //! not a claim of provenance for this type.
 
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use pyre_object::*;
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 // CPython 3.14 Modules/_queuemodule.c:_queue_exec uses
@@ -48,13 +48,11 @@ const _: () = assert!(
 fn queue_lock<'a>(
     mutex: &'a Mutex<VecDeque<PyObjectRef>>,
 ) -> MutexGuard<'a, VecDeque<PyObjectRef>> {
-    if let Ok(guard) = mutex.try_lock() {
+    if let Some(guard) = mutex.try_lock() {
         return guard;
     }
     let blocked = crate::module::thread::before_external_block();
-    let guard = mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = mutex.lock();
     drop(blocked);
     guard
 }
@@ -151,20 +149,13 @@ fn simplequeue_wait_for_item(
                 drop(blocked);
                 return Err(empty_error());
             }
-            let (next_guard, result) = queue
-                .not_empty
-                .wait_timeout(guard, deadline - now)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard = next_guard;
+            let result = queue.not_empty.wait_for(&mut guard, deadline - now);
             drop(blocked);
             if result.timed_out() && guard.is_empty() {
                 return Err(empty_error());
             }
         } else {
-            guard = queue
-                .not_empty
-                .wait(guard)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.not_empty.wait(&mut guard);
             drop(blocked);
         }
     }
@@ -274,10 +265,7 @@ pub unsafe fn w_simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     // `queue_lock` or `Condvar::wait` may hold the mutex, but it is not
     // touching the deque; it rejoins the RUNNING census before touching it
     // again.
-    let items = queue
-        .queue
-        .get_mut()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let items = queue.queue.get_mut();
     let (front, back) = items.as_mut_slices();
     for item in front.iter_mut().chain(back.iter_mut()) {
         f(item as *mut PyObjectRef as *mut majit_ir::GcRef);

@@ -447,11 +447,11 @@ fn resolve_dict_data_slot(layout: &Layout) -> i32 {
 /// Builtin types (`w_type_new_builtin`) are process-global, so their root
 /// registry must have the same owner.  A TLS registry loses types first made
 /// on a worker and makes a collection on another thread miss their children.
-static BUILTIN_TYPE_NAMESPACE_ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<usize>>> =
+static BUILTIN_TYPE_NAMESPACE_ROOTS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> =
     std::sync::OnceLock::new();
 
-fn builtin_type_namespace_roots() -> &'static std::sync::Mutex<Vec<usize>> {
-    BUILTIN_TYPE_NAMESPACE_ROOTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+fn builtin_type_namespace_roots() -> &'static parking_lot::Mutex<Vec<usize>> {
+    BUILTIN_TYPE_NAMESPACE_ROOTS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
 /// Record an immortal type for the collection-time namespace root walk.
@@ -460,20 +460,14 @@ fn register_builtin_type_roots(addr: usize) {
     // Record the prebuilt-family store so the next minor collection scans it
     // (gc_roots.rs prebuilt-root write tracking).
     crate::gc_roots::mark_prebuilt_roots_dirty();
-    builtin_type_namespace_roots()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(addr);
+    builtin_type_namespace_roots().lock().push(addr);
 }
 
 /// Snapshot the registered immortal-type addresses for the root walker
 /// (`pyre_interpreter::eval::walk_builtin_type_dicts_gc`).
 #[majit_macros::dont_look_inside]
 pub fn snapshot_builtin_type_roots() -> Vec<usize> {
-    builtin_type_namespace_roots()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+    builtin_type_namespace_roots().lock().clone()
 }
 
 /// Allocate a new W_TypeObject with `flag_heaptype = true`.

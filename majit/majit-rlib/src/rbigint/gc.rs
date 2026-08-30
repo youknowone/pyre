@@ -479,14 +479,9 @@ pub fn walk_rbigint_cache_digit_slots(mut visitor: impl FnMut(&mut *mut u8)) {
         }
     }
 
-    let all = PARTS_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let all = PARTS_CACHE.lock();
     for cache in all.iter().flatten() {
-        let parts = cache
-            .parts_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let parts = cache.parts_cache.lock();
         for value in parts.iter() {
             // Every published snapshot is a monotonic extension and shares
             // these exact Arc<RBigInt> objects with older reader snapshots.

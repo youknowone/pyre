@@ -370,7 +370,7 @@ mod tests {
 
     /// Both memory-error tests read the process-global bit and assert on its
     /// resting state, so they cannot run at the same time as each other.
-    static MEMORY_ERROR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static MEMORY_ERROR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// The owed `MemoryError` is one-shot: armed once by the collector, raised
     /// once by the dispatch loop of the thread it is owed to. A second take
@@ -381,9 +381,7 @@ mod tests {
     /// get there.
     #[test]
     fn the_owed_memory_error_is_taken_exactly_once() {
-        let _guard = MEMORY_ERROR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = MEMORY_ERROR_TEST_LOCK.lock();
         assert!(
             !take_memory_error(),
             "nothing has armed the bit, so it must not report one pending"
@@ -415,9 +413,7 @@ mod tests {
     /// heap would run on toward the fatal rung with nothing owed to it.
     #[test]
     fn the_owed_memory_error_goes_to_the_thread_that_armed_it() {
-        let _guard = MEMORY_ERROR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = MEMORY_ERROR_TEST_LOCK.lock();
         // The owner stays alive until it has delivered. A thread that exits
         // still owing hands the debt back — see the test below — so joining it
         // here would clear the very bit this test is watching.
@@ -465,9 +461,7 @@ mod tests {
     /// nothing can ever clear the bit again.
     #[test]
     fn a_thread_that_exits_still_owing_hands_the_debt_back() {
-        let _guard = MEMORY_ERROR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = MEMORY_ERROR_TEST_LOCK.lock();
         std::thread::spawn(|| {
             set_memory_error();
             assert!(
@@ -493,9 +487,7 @@ mod tests {
     /// debt is unpayable. The census has to be rebuilt around the survivor.
     #[test]
     fn the_fork_child_keeps_only_the_surviving_threads_debt() {
-        let _guard = MEMORY_ERROR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = MEMORY_ERROR_TEST_LOCK.lock();
         // A sibling's debt, modelled by hand: a thread that vanishes at
         // `fork()` runs no destructor, so an owner spawned here — which does —
         // cannot stand in for one.

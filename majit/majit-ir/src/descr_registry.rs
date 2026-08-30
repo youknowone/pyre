@@ -31,7 +31,7 @@ use crate::descr::{DescrRef, gc_cache};
 /// a freshly-minted size descr.  TODO: prefer
 /// `gc_cache.get_size_descr(LLType::Struct(...), ...)`.
 pub fn register_size(descr: DescrRef) {
-    gc_cache().lock().unwrap().register_external_size(descr);
+    gc_cache().lock().register_external_size(descr);
 }
 
 /// Keyed sibling: publishes the descr to `gc_cache._cache_size[key]`
@@ -41,14 +41,14 @@ pub fn register_size(descr: DescrRef) {
 /// `cache[STRUCT] = sizedescr` (the keyed half) for mint sites that
 /// bypass `get_size_descr` proper.
 pub fn register_keyed_size(key: crate::descr::LLType, descr: DescrRef) {
-    gc_cache().lock().unwrap().register_keyed_size(key, descr);
+    gc_cache().lock().register_keyed_size(key, descr);
 }
 
 /// `descr.py get_field_descr` cache-miss publication.
 /// TODO: prefer
 /// `gc_cache.get_field_descr(LLType::Struct(...), ...)`.
 pub fn register_field(descr: DescrRef) {
-    gc_cache().lock().unwrap().register_external_field(descr);
+    gc_cache().lock().register_external_field(descr);
 }
 
 /// Keyed sibling: publishes the descr to
@@ -63,7 +63,6 @@ pub fn register_keyed_field(
 ) {
     gc_cache()
         .lock()
-        .unwrap()
         .register_keyed_field(struct_key, field_name, descr);
 }
 
@@ -71,40 +70,34 @@ pub fn register_keyed_field(
 /// TODO: prefer
 /// `gc_cache.get_array_descr(LLType::Array(...), ...)`.
 pub fn register_array(descr: DescrRef) {
-    gc_cache().lock().unwrap().register_external_array(descr);
+    gc_cache().lock().register_external_array(descr);
 }
 
 /// Keyed sibling: publishes the descr to `gc_cache._cache_array[key]`.
 /// Mirrors `descr.py::get_array_descr`
 /// cache-miss `cache[ARRAY_OR_STRUCT] = arraydescr`.
 pub fn register_keyed_array(key: crate::descr::LLType, descr: DescrRef) {
-    gc_cache().lock().unwrap().register_keyed_array(key, descr);
+    gc_cache().lock().register_keyed_array(key, descr);
 }
 
 /// `descr.py:374-385 get_arraylen_descr` cache-miss publication.
 /// TODO: prefer
 /// `gc_cache.get_field_arraylen_descr(LLType::Array(...), ...)`.
 pub fn register_array_len(descr: DescrRef) {
-    gc_cache().lock().unwrap().register_external_arraylen(descr);
+    gc_cache().lock().register_external_arraylen(descr);
 }
 
 /// Keyed sibling: publishes the descr to
 /// `gc_cache._cache_arraylen[key]`.
 pub fn register_keyed_arraylen(key: crate::descr::LLType, descr: DescrRef) {
-    gc_cache()
-        .lock()
-        .unwrap()
-        .register_keyed_arraylen(key, descr);
+    gc_cache().lock().register_keyed_arraylen(key, descr);
 }
 
 /// `descr.py get_interiorfield_descr` cache-miss publication.
 /// TODO: prefer the keyed cache-or-mint path once
 /// `gc_cache.get_interiorfield_descr` lands.
 pub fn register_interior_field(descr: DescrRef) {
-    gc_cache()
-        .lock()
-        .unwrap()
-        .register_external_interiorfield(descr);
+    gc_cache().lock().register_external_interiorfield(descr);
 }
 
 /// Keyed sibling: publishes the descr to
@@ -123,7 +116,6 @@ pub fn register_keyed_interior_field(
 ) {
     gc_cache()
         .lock()
-        .unwrap()
         .register_keyed_interiorfield(array_key, name, arrayfieldname, descr);
 }
 
@@ -132,7 +124,7 @@ pub fn register_keyed_interior_field(
 /// owned by `GcCache._cache_call`, so the snapshot is the same six-group
 /// sequence as PyPy: size, field, array, arraylen, call, interiorfield.
 pub fn snapshot_all() -> Vec<DescrRef> {
-    let gc = gc_cache().lock().unwrap();
+    let gc = gc_cache().lock();
     let mut out = Vec::with_capacity(
         gc.snapshot_sizes().len()
             + gc.snapshot_fields().len()
@@ -165,45 +157,45 @@ pub fn snapshot_all() -> Vec<DescrRef> {
 ///
 /// `MetaInterpStaticData::all_descrs()` is the accessor; nothing else should
 /// reach in here directly.
-static ALL_DESCRS: std::sync::LazyLock<std::sync::Mutex<std::sync::Arc<Vec<DescrRef>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::sync::Arc::new(Vec::new())));
+static ALL_DESCRS: std::sync::LazyLock<parking_lot::Mutex<std::sync::Arc<Vec<DescrRef>>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::sync::Arc::new(Vec::new())));
 
 /// Handle to the process-wide `all_descrs` list documented on [`ALL_DESCRS`].
-pub fn all_descrs() -> &'static std::sync::Mutex<std::sync::Arc<Vec<DescrRef>>> {
+pub fn all_descrs() -> &'static parking_lot::Mutex<std::sync::Arc<Vec<DescrRef>>> {
     &ALL_DESCRS
 }
 
 /// `descr.py:28-29 _cache_size` snapshot.
 pub fn snapshot_sizes() -> Vec<DescrRef> {
-    gc_cache().lock().unwrap().snapshot_sizes()
+    gc_cache().lock().snapshot_sizes()
 }
 
 /// `descr.py:30-33 _cache_field` snapshot.
 pub fn snapshot_fields() -> Vec<DescrRef> {
-    gc_cache().lock().unwrap().snapshot_fields()
+    gc_cache().lock().snapshot_fields()
 }
 
 /// `descr.py:34-36 _cache_array` snapshot.
 pub fn snapshot_arrays() -> Vec<DescrRef> {
-    gc_cache().lock().unwrap().snapshot_arrays()
+    gc_cache().lock().snapshot_arrays()
 }
 
 /// `descr.py:37-39 _cache_arraylen` snapshot.
 pub fn snapshot_array_lens() -> Vec<DescrRef> {
-    gc_cache().lock().unwrap().snapshot_arraylens()
+    gc_cache().lock().snapshot_arraylens()
 }
 
 /// `descr.py:43-45 _cache_interiorfield` snapshot.
 pub fn snapshot_interior_fields() -> Vec<DescrRef> {
-    gc_cache().lock().unwrap().snapshot_interiorfields()
+    gc_cache().lock().snapshot_interiorfields()
 }
 
 /// Per-category counts for diagnostic asserts.
 /// Returns `(sizes, fields, arrays, array_lens, interior_fields)` —
 /// the call category lives outside this facade; use
-/// `gc_cache().lock().unwrap().category_counts()` for the full tuple.
+/// `gc_cache().lock().category_counts()` for the full tuple.
 pub fn category_counts() -> (usize, usize, usize, usize, usize) {
-    let (s, f, a, al, _c, ifs) = gc_cache().lock().unwrap().category_counts();
+    let (s, f, a, al, _c, ifs) = gc_cache().lock().category_counts();
     (s, f, a, al, ifs)
 }
 
@@ -233,7 +225,7 @@ mod tests {
         let f = fresh_field(42);
         register_field(f.clone());
         register_field(f.clone());
-        let fields = gc_cache().lock().unwrap().snapshot_fields();
+        let fields = gc_cache().lock().snapshot_fields();
         assert_eq!(
             count_arc(&fields, &f),
             1,
@@ -252,7 +244,7 @@ mod tests {
         let f_b = fresh_field(0);
         register_field(f_a.clone());
         register_field(f_b.clone());
-        let fields = gc_cache().lock().unwrap().snapshot_fields();
+        let fields = gc_cache().lock().snapshot_fields();
         assert_eq!(count_arc(&fields, &f_a), 1);
         assert_eq!(count_arc(&fields, &f_b), 1);
         assert!(

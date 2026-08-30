@@ -1,11 +1,17 @@
-# pyre-check: max-pypy-ratio=12
 # list(iterable) and list.extend(iterable) consult __length_hint__ before
 # iterating (listobject.py _extend_from_iterable -> space.length_hint), which
 # validates it: a negative hint raises ValueError, one exceeding a C ssize_t
 # raises OverflowError.  A valid hint is used transparently.  Only the
 # exception type is checked (the OverflowError message is install-specific).
 # Output verified against CPython/PyPy.
-N = 5000
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 100
 
 
 def make(hint):

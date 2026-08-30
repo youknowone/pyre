@@ -439,7 +439,7 @@ mod tests {
     /// The declaration cells are process-global, so the tests that write them
     /// take turns — and each starts from the undeclared state, which is the
     /// only state a fresh process ever presents to a host.
-    static DECLARATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static DECLARATION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// Serialize on [`DECLARATION`] and hand back the undeclared state a host
     /// starts from. A test that ends by panicking poisons the lock; the next
@@ -449,8 +449,8 @@ mod tests {
     /// run. Nothing here installs a GC allocator, and that is the gate
     /// `try_alloc_typed_items_block_nursery` takes its undeclared-id refusal
     /// from, so no sibling can observe the window.
-    fn declaration_lock() -> std::sync::MutexGuard<'static, ()> {
-        let guard = DECLARATION.lock().unwrap_or_else(|e| e.into_inner());
+    fn declaration_lock() -> parking_lot::MutexGuard<'static, ()> {
+        let guard = DECLARATION.lock();
         undeclare_array_gc_type_ids();
         guard
     }

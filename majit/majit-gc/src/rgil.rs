@@ -31,8 +31,8 @@
 //! bytecode, `GILReleaseAction` (gil.py) yields it from the periodic
 //! action; [`yield_thread`] is that yield.
 
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::gc_sync;
@@ -90,7 +90,7 @@ impl Mutex2 {
     /// thread_pthread.c:570-575 `mutex2_unlock`. The signal is sent after the
     /// mutex is dropped, as in the C.
     fn unlock(&self) {
-        *self.locked.lock().unwrap() = false;
+        *self.locked.lock() = false;
         self.cond.notify_one();
     }
 
@@ -107,7 +107,7 @@ impl Mutex2 {
     /// lock the stealer keeps for the whole steal loop, and is dropped in place
     /// of `mutex2_loop_stop` (:579-581).
     fn loop_start(&self) -> MutexGuard<'_, bool> {
-        self.locked.lock().unwrap()
+        self.locked.lock()
     }
 
     /// thread_pthread.c:582-595 `mutex2_lock_timeout`. Returns the guard along
@@ -118,11 +118,10 @@ impl Mutex2 {
         guard: MutexGuard<'a, bool>,
         delay: Duration,
     ) -> (MutexGuard<'a, bool>, bool) {
-        let mut guard = if *guard {
-            self.cond.wait_timeout(guard, delay).unwrap().0
-        } else {
-            guard
-        };
+        let mut guard = guard;
+        if *guard {
+            self.cond.wait_for(&mut guard, delay);
+        }
         let result = !*guard;
         *guard = true;
         (guard, result)
@@ -130,7 +129,7 @@ impl Mutex2 {
 }
 
 /// thread_gil.c:89-90. Held in one cell because `rpy_init_mutexes` re-creates
-/// both of them together, and a `std::sync::Mutex` can only be reset by
+/// both of them together, and a `parking_lot::Mutex` can only be reset by
 /// overwriting it.
 struct GilMutexes {
     stealer: Mutex<()>,
@@ -355,7 +354,7 @@ fn acquire_slow_path(ident: usize) {
     // first-in-first-out order, this gives the threads a round-robin chance.
     {
         let mutexes = mutexes();
-        let _stealer = mutexes.stealer.lock().unwrap();
+        let _stealer = mutexes.stealer.lock();
         let mut gil = mutexes.gil.loop_start();
 
         // We are now the stealer thread. Steals!
@@ -440,7 +439,7 @@ mod tests {
 
     #[test]
     fn fast_path_round_trip_leaves_the_word_free() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = TEST_SERIAL.lock();
         allocate();
         let guard = GilGuard::acquire();
         assert!(am_i_holding_the_gil());
@@ -452,7 +451,7 @@ mod tests {
 
     #[test]
     fn yield_thread_without_waiters_keeps_the_gil() {
-        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = TEST_SERIAL.lock();
         allocate();
         let _guard = GilGuard::acquire();
         assert!(!yield_thread());

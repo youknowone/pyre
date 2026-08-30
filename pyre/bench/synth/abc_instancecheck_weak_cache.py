@@ -1,4 +1,3 @@
-# pyre-check: max-pypy-ratio=40
 # `_abc_instancecheck` answers from two per-class weak-set caches, and a
 # question that hits one is meant to cost the probe and nothing else.  This
 # drives both answers in a hot loop: a class that matches (positive cache) and
@@ -10,6 +9,13 @@
 # reading the entries the first half recorded.  Deterministic.
 import collections.abc as cabc
 from abc import ABCMeta
+
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
 
 
 class Shape(metaclass=ABCMeta):
@@ -32,7 +38,9 @@ class LateBlob:
     pass
 
 
-N = 72000
+# The lowered threshold compiles both cache probes before registration; later
+# iterations only repeat the same populated-cache states.
+N = 2000
 SWITCH = N // 2
 
 

@@ -206,7 +206,7 @@ mod tests {
     /// compile, not just the gate. `run_locked` and the gate are the only ways
     /// a test may enter `JitDualInterp::run`; neither may call the other, since
     /// this is a plain mutex and re-entering it on one thread deadlocks.
-    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PROBE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// The armed side of the multi-frame bridge decline.
     ///
@@ -262,7 +262,7 @@ mod tests {
     fn the_reserved_identity_trim_and_its_decline_are_unreached() {
         let blanked = majit_metainterp::mc_diag_slot("inline_frame_trim_blanked_live_int");
         let declined = majit_metainterp::mc_diag_slot("guard_resume_decline_reserved_identity");
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         let before = (
             majit_metainterp::mc_diag(blanked),
             majit_metainterp::mc_diag(declined),
@@ -306,7 +306,7 @@ mod tests {
     }
 
     fn run_locked(code: &[u8]) -> i64 {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         JitDualInterp::new().run(code)
     }
 
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     #[ignore = "enable after `jit_tier_shape_gate` proves the compiled body closes a loop"]
     fn jit_tier_liveness_gate() {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
         LAST_OPS_AFTER.store(0, Ordering::Relaxed);
 
@@ -434,7 +434,7 @@ mod tests {
     /// a stub, so these readings survive a tier that compiles nothing at all.
     #[test]
     fn jit_tier_degraded_arm_gate() {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
 
         let mut program = vec![b'+'; 1001];
         program.extend_from_slice(b"[-*}*{]");
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     #[ignore = "enable when the back-edge arm lowers and trace inputs use separate namespaces"]
     fn jit_tier_shape_gate() {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
         LAST_OPS_AFTER.store(0, Ordering::Relaxed);
         LAST_HAS_JUMP.store(false, Ordering::Relaxed);

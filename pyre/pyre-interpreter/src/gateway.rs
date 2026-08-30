@@ -547,6 +547,27 @@ pub fn method_noarg_failure(
     }
 }
 
+/// Cold `_PyArg_CheckPositional` exact-count failure.
+///
+/// The wording [`arity_mismatch`] gives a fixed-arity builtin of two or more
+/// arguments.  A hand-written `__majit_wrap_builtin_*` gateway never reaches
+/// `arity_mismatch`: the walker enters the wrapper directly, so the wrapper's
+/// own length test is what rejects the call, and the fallback it routes to has
+/// to report the same wording.  `dont_look_inside` for the reason
+/// [`method_arity_failure`] carries -- the rejected branch is cold, and its
+/// message names a runtime count, so building it in walked code drags
+/// formatting machinery into the JitCode.
+#[majit_macros::dont_look_inside]
+pub fn method_exact_arity_failure(
+    name: &str,
+    expected: usize,
+    given: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::type_error(format!(
+        "{name} expected {expected} arguments, got {given}"
+    )))
+}
+
 /// Cold gateway failure for a missing required argument.
 ///
 /// A wrapper whose optional trailing parameters turn the accepted count into a
@@ -921,6 +942,45 @@ pub unsafe fn builtin_code_call(
     }
     let wrapper = unsafe { &*wrapper };
     (wrapper.call)(wrapper.slot, args)
+}
+
+/// The `BuiltinCodeFn` a builtin function object was registered with, when
+/// calling it *is* invoking that function and nothing else: no receiver
+/// `owner` to typecheck, no slot `wrapper` standing in for the body, and a
+/// declared arity of exactly `arity`.  For that shape
+/// [`builtin_code_call`] reduces to `((*code).func)(args)`, and
+/// `builtin_code_call_positional` binds nothing because the arity is not
+/// `HOPELESS`.
+///
+/// The gateway's receiver / arity / keyword checks stand in front of a body
+/// for a caller that could get any of them wrong, which a Python caller can.
+/// An interp-level caller that already holds the arguments in the order the
+/// body declares them is the case `typedef.py` spells as a direct RPython
+/// call — `self.fget(self, space, w_obj)` — where pyre would otherwise route
+/// through `space.call_function`.  Everything else answers `None` and stays on
+/// the dispatcher.
+///
+/// # Safety
+/// `callable` must be a live object.
+pub unsafe fn builtin_fixed_arity_fn(callable: PyObjectRef, arity: u16) -> Option<BuiltinCodeFn> {
+    if !unsafe { crate::is_function(callable) } {
+        return None;
+    }
+    let code = unsafe { crate::function_get_code(callable) } as PyObjectRef;
+    if !unsafe { is_builtin_code(code) } {
+        return None;
+    }
+    let code = code as *const BuiltinCode;
+    // SAFETY: `is_builtin_code` proved the layout.
+    unsafe {
+        if (*code).fast_natural_arity != arity
+            || !(*code).owner.is_null()
+            || !(*code).wrapper.is_null()
+        {
+            return None;
+        }
+        Some((*code).func)
+    }
 }
 
 /// Wording for a keyword passed to a positional-only builtin.  A slot wrapper

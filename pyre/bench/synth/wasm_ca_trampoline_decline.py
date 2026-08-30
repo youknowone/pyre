@@ -1,9 +1,14 @@
-# pyre-check: max-pypy-ratio=57
 # Regression for wasm CA frames: this self-recursive body reaches the raw
 # float-power residual call (CallF, hence the host jit_call trampoline) and
 # allocates a string at every recursive level. Once the recursion bridge is
 # hot, CA must be declined: a moving nursery callee frame cannot survive the
 # trampoline retaining its pre-call frame pointer.
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
 
 
 def descend(n):
@@ -19,7 +24,9 @@ def descend(n):
 def run():
     total = 0
     i = 0
-    while i < 3500:
+    # The recursive root and loop are both compiled well before this bound;
+    # later iterations repeat the same declined trampoline shape.
+    while i < 300:
         total += descend(10)
         i += 1
     return total

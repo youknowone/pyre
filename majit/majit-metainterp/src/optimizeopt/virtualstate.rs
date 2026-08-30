@@ -750,11 +750,11 @@ impl VirtualState {
     ///     return boxes
     /// ```
     ///
-    /// Returns `Err(VirtualStatesCantMatch::default())` to mirror RPython's `raise VirtualStatesCantMatch`
-    /// thrown from `enum_forced_boxes`. The `optimizer.optearlyforce`
-    /// redirection is implicit in majit: `Optimizer::force_box` already
-    /// dispatches through `OptEarlyForce` via `optearlyforce_idx`, so the
-    /// caller never needs to swap the optimizer object.
+    /// Returns `Err(VirtualStatesCantMatch::default())` to mirror RPython's
+    /// `raise VirtualStatesCantMatch` thrown from `enum_forced_boxes`.
+    /// `enum_forced_boxes_for_entry` performs the
+    /// `optimizer = optimizer.optearlyforce` redirection around each forced
+    /// leaf by temporarily selecting `optearlyforce_idx` as the emitting pass.
     pub fn make_inputargs(
         &self,
         concrete_refs: &[OpRef],
@@ -1143,7 +1143,23 @@ impl VirtualState {
                         if !force_boxes {
                             return Err(VirtualStatesCantMatch::default());
                         }
-                        optimizer.force_box(resolved, ctx)
+                        // virtualstate.py `VirtualState.make_inputargs`:
+                        // `if optimizer.optearlyforce: optimizer =
+                        // optimizer.optearlyforce`.  The selected
+                        // `NotVirtualStateInfo.enum_forced_boxes` therefore
+                        // calls `info.force_box(box, OptEarlyForce)`, and the
+                        // allocation/initializing stores enter at
+                        // `OptEarlyForce.next_optimization` (OptHeap).  Merely
+                        // calling `Optimizer::force_box` does not perform that
+                        // redirection: it routes from `ctx.current_pass_idx`,
+                        // which is normally OptHeap after the preceding flush.
+                        // Preserve the caller's pass cursor around the exact
+                        // upstream owner switch.
+                        let saved_pass_idx = ctx.current_pass_idx;
+                        ctx.current_pass_idx = ctx.optearlyforce_idx;
+                        let forced = optimizer.force_box(resolved, ctx);
+                        ctx.current_pass_idx = saved_pass_idx;
+                        forced
                     }
                     _ => resolved,
                 };
@@ -3825,5 +3841,44 @@ mod tests {
         assert_eq!(inputargs.len(), 1);
         assert_eq!(inputargs[0], ctx.get_replacement_opref(virtual_ref));
         assert!(virtuals.is_empty());
+    }
+
+    #[test]
+    fn test_make_inputargs_forces_through_earlyforce_next() {
+        // virtualstate.py `VirtualState.make_inputargs` replaces `optimizer`
+        // with `optimizer.optearlyforce` before enum_forced_boxes.  A force
+        // requested after heap.flush() must consequently enqueue the
+        // allocation at earlyforce.next (= heap), not after the stale heap
+        // cursor.  Otherwise OptHeap misses the initializing stores and the
+        // imported short preamble re-emits redundant GETFIELD_GC operations.
+        let descr = test_descr(13);
+        let virtual_ref = OpRef::ref_op(20);
+        let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
+        let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
+        let virtual_box = ctx.materialize_operand_at(virtual_ref);
+        ctx.set_ptr_info(
+            &virtual_box,
+            PtrInfo::VirtualStruct(VirtualStructInfo {
+                descr,
+                fields: vec![],
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        ctx.optearlyforce_idx = 5;
+        ctx.current_pass_idx = 6;
+
+        state
+            .make_inputargs(&[virtual_ref], &mut optimizer, &mut ctx, true)
+            .expect("force_boxes=True should materialize the virtual");
+
+        assert_eq!(ctx.current_pass_idx, 6, "restore the caller's pass cursor");
+        assert_eq!(ctx.extra_operations_after.len(), 1);
+        assert_eq!(
+            ctx.extra_operations_after.front().map(|(start, _)| *start),
+            Some(6),
+            "forced operations must enter at OptEarlyForce.next"
+        );
     }
 }

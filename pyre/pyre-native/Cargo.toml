@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Native library backends for pyre, kept outside the LLBC extraction"
 
 [dependencies]
+parking_lot = { workspace = true }
 md-5 = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }

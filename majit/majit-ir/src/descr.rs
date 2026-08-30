@@ -1,4 +1,6 @@
 use indexmap::IndexMap;
+use parking_lot::Mutex;
+use parking_lot::RwLock;
 /// Descriptor traits for the JIT IR.
 ///
 /// Translated from rpython/jit/metainterp/history.py (AbstractDescr)
@@ -109,9 +111,7 @@ use indexmap::IndexMap;
 ///   cached Arcs, so `OptVirtualize` emits SETFIELD_GC ops with the
 ///   same identities carried by `MetaInterp.virtualref_info`.
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::RwLock;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 
@@ -424,15 +424,15 @@ impl StructId {
 /// the string-keyed "last-writer-wins" collision made structurally
 /// unrepresentable.
 static STRUCT_ID_BY_NAME: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, Option<StructId>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    parking_lot::Mutex<std::collections::HashMap<String, Option<StructId>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 /// Populate / replace the global name → [`StructId`] resolution table.
 /// The front-end builds it once at populate, inserting every
 /// spelling-variant of each type that maps unambiguously, and `None` for
 /// any bare leaf two distinct modules share.
 pub fn register_struct_ids(table: std::collections::HashMap<String, Option<StructId>>) {
-    let mut guard = STRUCT_ID_BY_NAME.lock().unwrap();
+    let mut guard = STRUCT_ID_BY_NAME.lock();
     *guard = table;
 }
 
@@ -447,7 +447,7 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
         .trim_start_matches("&mut ")
         .trim_start_matches('&')
         .trim();
-    let guard = STRUCT_ID_BY_NAME.lock().unwrap();
+    let guard = STRUCT_ID_BY_NAME.lock();
     if let Some(id) = guard.get(s).copied().flatten() {
         return Some(id);
     }
@@ -482,7 +482,6 @@ pub fn struct_template_id_for_name(raw: &str) -> Option<StructId> {
     };
     STRUCT_ID_BY_NAME
         .lock()
-        .unwrap()
         .get(template.as_ref())
         .copied()
         .flatten()
@@ -528,15 +527,15 @@ fn generic_args_span(name: &str) -> Option<&str> {
 /// bare name, which still resolves through the runtime dual-publish's
 /// simple-name slot.
 static STRUCT_ORIGIN_REGISTRY: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, String>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    parking_lot::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 /// Populate / replace the global `STRUCT_ORIGIN_REGISTRY` with a fresh
 /// `(bare_name, defining_module_path)` table.  Analyzer calls this
 /// once after `collect_program_metadata_pub` so subsequent
 /// `canonical_struct_name` lookups see the resolver output.
 pub fn register_struct_origins(origins: std::collections::HashMap<String, String>) {
-    let mut guard = STRUCT_ORIGIN_REGISTRY.lock().unwrap();
+    let mut guard = STRUCT_ORIGIN_REGISTRY.lock();
     *guard = origins;
 }
 
@@ -564,7 +563,7 @@ pub fn canonical_struct_name(name: &str) -> String {
     if name.contains("::") {
         return name.to_string();
     }
-    let guard = STRUCT_ORIGIN_REGISTRY.lock().unwrap();
+    let guard = STRUCT_ORIGIN_REGISTRY.lock();
     match guard.get(name) {
         Some(module_path) if !module_path.is_empty() => {
             format!("{}::{}", module_path, name)
@@ -885,9 +884,9 @@ pub fn record_field_owner_id_registry_miss() {
 /// `BTreeMap`, not `HashMap`: the whole point of the table is to be printed,
 /// and a hash-ordered print makes two runs of the same program produce
 /// different bytes for the same finding.
-static FIELD_UNRESOLVED_NAMES: std::sync::Mutex<
+static FIELD_UNRESOLVED_NAMES: parking_lot::Mutex<
     std::collections::BTreeMap<UnresolvedFieldMint, usize>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+> = parking_lot::Mutex::new(std::collections::BTreeMap::new());
 
 /// Whether to build [`FIELD_UNRESOLVED_NAMES`] at all, read once.
 ///
@@ -1507,9 +1506,7 @@ impl GcCache {
     pub fn field_position_unresolved_sample(all_descrs: usize) -> Vec<String> {
         let limit = field_position_unresolved_limit().unwrap_or(0);
         let [parent_absent, parent_empty, rederived, unresolved] = Self::field_position_census();
-        let table = FIELD_UNRESOLVED_NAMES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let table = FIELD_UNRESOLVED_NAMES.lock();
         let recorded: usize = table.values().sum();
         // Frequency first, then the key's own order, so the ranking is total
         // and two runs of one program print the same bytes.
@@ -1963,11 +1960,7 @@ impl GcCache {
                             .collect::<Vec<_>>()
                             .join("|"),
                     };
-                    *FIELD_UNRESOLVED_NAMES
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .entry(mint)
-                        .or_insert(0) += 1;
+                    *FIELD_UNRESOLVED_NAMES.lock().entry(mint).or_insert(0) += 1;
                 }
                 None
             }
@@ -3081,7 +3074,7 @@ pub fn record_ei_descr_mint(member: DescrSetMember, spec: DescrMintSpec) {
         }
     }
 
-    let mut guard = ei_descr_mints().lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = ei_descr_mints().lock();
     match guard.entry(member) {
         indexmap::map::Entry::Vacant(entry) => {
             entry.insert(spec);
@@ -3112,7 +3105,6 @@ pub fn record_ei_descr_mint(member: DescrSetMember, spec: DescrMintSpec) {
 pub fn ei_descr_mints_snapshot() -> Vec<DescrMintEntry> {
     ei_descr_mints()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .iter()
         .map(|(member, spec)| DescrMintEntry {
             member: member.clone(),
@@ -3392,19 +3384,19 @@ impl LoopTargetDescr for BasicLoopTargetDescr {
     }
 
     fn target_arglocs(&self) -> Vec<TargetArgLoc> {
-        self.state.lock().unwrap().target_arglocs.clone()
+        self.state.lock().target_arglocs.clone()
     }
 
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>) {
-        self.state.lock().unwrap().target_arglocs = arglocs;
+        self.state.lock().target_arglocs = arglocs;
     }
 
     fn original_jitcell_token_number(&self) -> Option<u64> {
-        self.state.lock().unwrap().original_jitcell_token_number
+        self.state.lock().original_jitcell_token_number
     }
 
     fn set_original_jitcell_token_number(&self, num: u64) {
-        self.state.lock().unwrap().original_jitcell_token_number = Some(num);
+        self.state.lock().original_jitcell_token_number = Some(num);
     }
 }
 
@@ -5740,7 +5732,7 @@ impl Clone for SimpleFieldDescr {
             virtualizable: self.virtualizable,
             class_word: AtomicU8::new(self.class_word.load(Ordering::Relaxed)),
             index_in_parent: self.index_in_parent,
-            parent_descr: RwLock::new(self.parent_descr.read().unwrap().clone()),
+            parent_descr: RwLock::new(self.parent_descr.read().clone()),
             vinfo: self.vinfo.clone(),
         }
     }
@@ -5985,7 +5977,7 @@ impl SimpleFieldDescr {
 
     /// descr.py:238 — update this field's single parent backreference.
     pub fn set_parent_descr(&self, parent: &DescrRef) {
-        *self.parent_descr.write().unwrap() = Some(Arc::downgrade(parent));
+        *self.parent_descr.write() = Some(Arc::downgrade(parent));
     }
 
     /// Builder: attach the owning `VirtualizableInfo` backreference that
@@ -6093,11 +6085,7 @@ impl FieldDescr for SimpleFieldDescr {
         self.index_in_parent
     }
     fn get_parent_descr(&self) -> Option<DescrRef> {
-        self.parent_descr
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|p| p.upgrade())
+        self.parent_descr.read().as_ref().and_then(|p| p.upgrade())
     }
     fn get_vinfo(&self) -> Option<Arc<dyn VinfoMarker>> {
         self.vinfo.as_ref().and_then(|w| w.upgrade())
@@ -6441,7 +6429,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     // Before `get_field_descr` below can normalise anything: the producer's own
     // `index_in_parent` against the position it hands the field in.
     census_spec_positions(field_specs);
-    let mut gc = gc_cache().lock().unwrap();
+    let mut gc = gc_cache().lock();
     // descr.py — cache-or-mint each FieldDescr by
     // `(STRUCT, fieldname)` before freezing this producer's positional list.
     let field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
@@ -8115,7 +8103,7 @@ mod tests {
         // Distinct key per test: `gc_cache()` is a process-global singleton
         // shared by every test in this binary.
         let struct_key = LLType::struct_key(0xc1a5_c0de_0000_0001);
-        let mut gc = gc_cache().lock().unwrap();
+        let mut gc = gc_cache().lock();
 
         // The name-only producer arrives first and the fallback claims the
         // payload field.

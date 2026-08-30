@@ -17,9 +17,10 @@
 //! (`feedback_single_jitcodes_store`). Driver metadata only identifies indices
 //! in that store; it does not duplicate JitCode bodies.
 
+use parking_lot::Mutex;
 use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, Once, OnceLock};
+use std::sync::{Arc, LazyLock, Once, OnceLock};
 
 use majit_ir::DescrRef;
 use majit_translate::CompiledJitDriver;
@@ -1389,7 +1390,7 @@ pub fn field_position_jit_stats() -> String {
         sample,
     ) = {
         let gc = majit_ir::descr::gc_cache();
-        let guard = gc.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = gc.lock();
         let sample = if std::env::var_os("MAJIT_SIZE_SHELL_OWNERS").is_some() {
             let lines = guard.size_shell_owner_sample(24);
             format!("\n[jit-stats] {}", lines.join("\n[jit-stats] "))
@@ -1711,7 +1712,7 @@ fn field_descr_identity_census() {
         keyed += 1;
         let key = majit_ir::descr::LLType::Struct(parent.type_id);
         let (parent_size, cached, field_keys) = {
-            let gc = majit_ir::descr::gc_cache().lock().unwrap();
+            let gc = majit_ir::descr::gc_cache().lock();
             let inner = gc._cache_field.get(&key);
             (
                 gc._cache_size.get(&key).cloned(),
@@ -1817,16 +1818,14 @@ fn descr_demand_enabled() -> bool {
 }
 
 pub fn record_descr_demand(index: usize) {
-    if descr_demand_enabled()
-        && let Ok(mut set) = DESCR_DEMAND.lock()
-    {
-        set.insert(index);
+    if descr_demand_enabled() {
+        DESCR_DEMAND.lock().insert(index);
     }
 }
 
 /// `(distinct indices resolved, pool size)`; `(0, _)` when the probe is off.
 pub fn descr_demand_summary() -> (usize, usize) {
-    let touched = DESCR_DEMAND.lock().map(|s| s.len()).unwrap_or(0);
+    let touched = DESCR_DEMAND.lock().len();
     (touched, descr_count())
 }
 
@@ -2711,7 +2710,7 @@ mod tests {
         let after_noncall = rss_kb();
         let heap_after_noncall = crate::allocation_counter::live_bytes();
         let (category_counts, cache_lens, cache_caps, field_inner_cap, field_key_bytes) = {
-            let gc = majit_ir::descr::gc_cache().lock().unwrap();
+            let gc = majit_ir::descr::gc_cache().lock();
             (
                 gc.category_counts(),
                 (

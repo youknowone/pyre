@@ -417,7 +417,7 @@ pub struct Cpu {
     /// no upstream analog.  These fields retire once pyre's
     /// walker stops emitting pre-rtype HLOps in favour of post-rtype
     /// residual_call SpaceOperations on the graph.
-    pub lowering_ctx: std::sync::RwLock<Option<super::flatten::LoweringContext>>,
+    pub lowering_ctx: parking_lot::RwLock<Option<super::flatten::LoweringContext>>,
 }
 
 impl Cpu {
@@ -568,7 +568,7 @@ impl Cpu {
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
             clear_in_flight_exception_fn: crate::call_jit::bh_clear_in_flight_exception,
             rtyper,
-            lowering_ctx: std::sync::RwLock::new(None),
+            lowering_ctx: parking_lot::RwLock::new(None),
         }
     }
 }

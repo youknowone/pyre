@@ -338,7 +338,7 @@ mod tests {
     /// Plain mutex: the helpers below and the gate must never call one
     /// another, or a single thread takes it twice and deadlocks. The gate holds
     /// the guard itself and calls `mainloop` directly for exactly that reason.
-    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PROBE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// [`mainloop`] under [`PROBE_LOCK`].
     fn mainloop_locked(
@@ -347,7 +347,7 @@ mod tests {
         args_out: &mut [i64],
         threshold: u32,
     ) -> i64 {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         mainloop(program, num_args, args_out, threshold)
     }
 
@@ -357,7 +357,7 @@ mod tests {
     /// point. A test that enters the JIT without it never READS the counters,
     /// but it does MOVE them, which is what makes it the hazard.
     fn run_locked(jit: &mut JitTiny2Interp, prog: &[&str], args: &mut Vec<i64>) -> i64 {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         jit.run(prog, args)
     }
 
@@ -372,7 +372,7 @@ mod tests {
         // Bare `mainloop`, not `mainloop_locked`: the guard is taken here so the
         // store/run/load is a single critical section. Going through the helper
         // would take the plain mutex twice on one thread and deadlock.
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
         let got = mainloop(&compile(&words), 0, &mut args_out, 3);
         let compiles = COMPILES.load(Ordering::Relaxed);

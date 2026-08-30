@@ -393,8 +393,8 @@ impl AutoFlusher {
 }
 
 /// `interp_iobase.py get_autoflusher` — `space.fromcache(AutoFlusher)`.
-static AUTOFLUSHER: std::sync::LazyLock<std::sync::Mutex<AutoFlusher>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(AutoFlusher::default()));
+static AUTOFLUSHER: std::sync::LazyLock<parking_lot::Mutex<AutoFlusher>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(AutoFlusher::default()));
 
 /// Visit each stored `GcWeakrefBox` as a strong root.
 ///
@@ -408,7 +408,7 @@ static AUTOFLUSHER: std::sync::LazyLock<std::sync::Mutex<AutoFlusher>> =
 /// itself dies, which is what turns the slot into `rweaklist.py`'s `dead_ref`.
 ///
 pub fn walk_autoflusher_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    let mut flusher = AUTOFLUSHER.lock().unwrap();
+    let mut flusher = AUTOFLUSHER.lock();
     for slot in flusher.handles.iter_mut() {
         if *slot == 0 {
             continue;
@@ -439,7 +439,7 @@ pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
     let _ = pyre_object::gc_roots::pin_root(w_iobase);
     loop {
         let (index, generation, handle) = {
-            let mut flusher = AUTOFLUSHER.lock().unwrap();
+            let mut flusher = AUTOFLUSHER.lock();
             let index = flusher.reserve_next_handle_index();
             (index, flusher.generation, flusher.handles[index])
         };
@@ -457,7 +457,7 @@ pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
                 target_root,
             ))
         };
-        let mut flusher = AUTOFLUSHER.lock().unwrap();
+        let mut flusher = AUTOFLUSHER.lock();
         // `rweaklist.py initialize` replaces the table, invalidating an
         // index reserved from the previous generation.
         if flusher.generation != generation {
@@ -477,7 +477,7 @@ pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
 pub fn flush_all_streams() {
     loop {
         let handles = {
-            let mut flusher = AUTOFLUSHER.lock().unwrap();
+            let mut flusher = AUTOFLUSHER.lock();
             flusher.free_list.clear();
             // `rweaklist.py initialize` resets the state here, so a
             // stream created while flushing is picked up by the next round

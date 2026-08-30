@@ -17,7 +17,7 @@
 //! grow with it.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use majit_ir::OpCode;
 use majit_metainterp::virt_array::VirtArray;
@@ -98,7 +98,7 @@ macro_rules! stack_machine {
                 driver.set_on_compile_loop(|_green_key, before, _after, opcodes| {
                     COMPILES.fetch_add(1, Ordering::Relaxed);
                     RECORDED.store(before, Ordering::Relaxed);
-                    *COMPILED.lock().unwrap() = opcodes.to_vec();
+                    *COMPILED.lock() = opcodes.to_vec();
                 });
                 let mut pc: usize = 0;
                 let mut state = StackMachine {
@@ -197,7 +197,7 @@ fn a_vable_stack_indexed_by_a_runtime_depth_lowers_to_no_memory_ops() {
         "the fixture must compile a loop for the census to mean anything"
     );
 
-    let vable = eight_slots::COMPILED.lock().unwrap().clone();
+    let vable = eight_slots::COMPILED.lock().clone();
     eprintln!(
         "vable stack loop: {} recorded -> {} ops, {} of them memory",
         eight_slots::RECORDED.load(Ordering::Relaxed),
@@ -227,8 +227,8 @@ fn the_compiled_loop_does_not_grow_with_the_declared_array_length() {
     let program = balanced_program();
     assert_eq!(eight_slots::mainloop(&program, 400, 3), 1200);
     assert_eq!(five_hundred_slots::mainloop(&program, 400, 3), 1200);
-    let small = eight_slots::COMPILED.lock().unwrap().len();
-    let large = five_hundred_slots::COMPILED.lock().unwrap().len();
+    let small = eight_slots::COMPILED.lock().len();
+    let large = five_hundred_slots::COMPILED.lock().len();
     assert_eq!(
         small, large,
         "a 512-slot declaration compiled {large} ops against the 8-slot {small}"

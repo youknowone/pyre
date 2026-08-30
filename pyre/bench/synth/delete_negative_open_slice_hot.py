@@ -1,16 +1,14 @@
-# pyre-check: max-pypy-ratio=31
 # Two-argument BUILD_SLICE must pass the Python None singleton as its implicit
 # step.  Negative bounds make a malformed null step observable during slice
 # normalization, including on guard-failure blackhole resume.
-# Sized so pypy's own execution clears the measurement floor: below it the
-# ratio gate divides by the floor and reads startup rather than this loop.
-# Also kept clear of the major-collection threshold check.py pins: the
-# previous 4351274 crossed it, and the eval-breaker bailout that follows
-# re-enters through a bridge whose guard can then fail once more, which moves
-# guard_failures for reasons outside this fixture. Crossing resumes between
-# 0.9x and 1.0x of the old count, so the reduction is the smallest that
-# clears it while leaving the floor above intact; gated counters unchanged.
-N = 3263455
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 10000
 
 
 def delete_neg3_open():

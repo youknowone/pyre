@@ -27,7 +27,7 @@
 //! non-zero values so that comparison stays spelled `IntEq`: against zero the
 //! optimizer rewrites it to `IntIsZero` and the census would have to name both.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::OpCode;
@@ -92,7 +92,7 @@ fn dispatch_tags(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
     let mut driver: JitDriver<TagState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
-        *COMPILED.lock().unwrap() = opcodes.to_vec();
+        *COMPILED.lock() = opcodes.to_vec();
     });
     let mut pc: usize = 0;
     let mut state = TagState {
@@ -170,7 +170,7 @@ fn the_traced_match_sends_each_tag_to_its_own_arm() {
 #[test]
 fn the_constant_arms_are_guarded_in_the_trace() {
     let _ = dispatch_tags(&PROGRAM, 8, TICKS);
-    let body = COMPILED.lock().unwrap().clone();
+    let body = COMPILED.lock().clone();
     assert!(
         !body.is_empty(),
         "no compiled loop was recorded, so this census is vacuous",

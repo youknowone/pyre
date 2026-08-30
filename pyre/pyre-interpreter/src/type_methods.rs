@@ -6700,7 +6700,17 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// through the source dict (see baseobjspace getattr arm) so
 /// mutations on the dict are visible through the view, matching
 /// `W_DictViewKeysObject`'s behaviour.
-pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+///
+/// Named `__majit_wrap_*` and published below because `BuiltinCode.func` is a
+/// PBC whose family `builtin_wrapper_indirect_graphs` builds out of exactly the
+/// wrapper paths that carry a registered graph. A method registered under any
+/// other name has no member in it, so `bytecode_for_address` finds no jitcode
+/// for its address and a traced `d.keys()` declines
+/// `try_walker_inline_builtin_call` with `no jitcode for address` — it stays a
+/// `bh_call_fn` blackhole residual, and the dict-view allocation and the
+/// `w_dict_len` behind it never reach the trace. Upstream has no such split:
+/// `interp2app` turns every builtin method into one of these graphs.
+pub fn __majit_wrap_dict_descr_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "keys", 0)?;
     require_receiver(args, "keys")?;
     let dict = resolve_dict_backing(args[0]);
@@ -6721,8 +6731,8 @@ pub fn dict_method_keys(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:descr_values` parity — same
-/// shape as `descr_keys`, kind tag `Values`.
-pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// shape as `__majit_wrap_dict_descr_keys`, kind tag `Values`.
+pub fn __majit_wrap_dict_descr_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "values", 0)?;
     require_receiver(args, "values")?;
     let dict = resolve_dict_backing(args[0]);
@@ -6739,8 +6749,8 @@ pub fn dict_method_values(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:descr_items` parity — same
-/// shape as `descr_keys`, kind tag `Items`.
-pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// shape as `__majit_wrap_dict_descr_keys`, kind tag `Items`.
+pub fn __majit_wrap_dict_descr_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "items", 0)?;
     require_receiver(args, "items")?;
     let dict = resolve_dict_backing(args[0]);
@@ -6755,6 +6765,45 @@ pub fn dict_method_items(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         pyre_object::dictmultiobject::DictViewKind::Items,
     ))
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_dict_descr_keys: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_dict_descr_keys)
+        ),
+        func: __majit_wrap_dict_descr_keys,
+    };
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_dict_descr_values: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_dict_descr_values)
+        ),
+        func: __majit_wrap_dict_descr_values,
+    };
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_dict_descr_items: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_dict_descr_items)
+        ),
+        func: __majit_wrap_dict_descr_items,
+    };
 
 /// Materialise a dict_keys / values / items view's current snapshot
 /// as a list of items.  Mirrors the view iteration bodies on

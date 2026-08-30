@@ -42,22 +42,19 @@ use crate::PyObjectRef;
 /// descriptor's `&'static [usize]`, so a lookup copies a fat pointer with no
 /// allocation.
 static PYRE_CLASS_GC_OFFSETS: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::HashMap<usize, &'static [usize]>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    parking_lot::RwLock<std::collections::HashMap<usize, &'static [usize]>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 
 /// Register a type's inline `gc_ptr_offsets` under its `PyType` pointer.
-/// Called only at single-threaded init; a poisoned lock silently drops the
-/// insert (init is the sole writer, so this cannot happen in practice).
+/// Called only at single-threaded init, which is the sole writer.
 pub fn register_pyre_class_offsets(pytype_ptr: usize, offsets: &'static [usize]) {
-    if let Ok(mut map) = PYRE_CLASS_GC_OFFSETS.write() {
-        map.insert(pytype_ptr, offsets);
-    }
+    PYRE_CLASS_GC_OFFSETS.write().insert(pytype_ptr, offsets);
 }
 
 /// Look up the registered inline `PyObjectRef` field offsets for `ob_type`.
 /// Returns `None` for a null `ob_type` or an unregistered type.  Takes a
 /// process-global read lock — cheap and alloc-free, safe while the collector
-/// is marking; a poisoned lock reads as `None`.
+/// is marking.
 ///
 /// The hash map is not the `AddressDict`/`AddressMap` an upstream reader might
 /// expect to see here.  Those are the collector's own address-to-address
@@ -84,7 +81,6 @@ pub unsafe fn offsets_for_pytype(
     }
     PYRE_CLASS_GC_OFFSETS
         .read()
-        .ok()?
         .get(&(ob_type as usize))
         .copied()
 }
@@ -202,6 +198,44 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8>
 #[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
     GcAllocOutcome::from_hook(try_gc_alloc_stable(type_id, payload_size))
+        .allocated_or_abort(payload_size)
+        .unwrap_or(core::ptr::null_mut())
+}
+
+/// [`try_gc_alloc_stable_raw`]'s nursery twin — `malloc_fixedsize`
+/// (`framework.py`), the allocation every RPython constructor takes.
+///
+/// The two answer the same `null`-means-no-hook contract and neither collects,
+/// so a caller of either may read its field values before the call and store
+/// them after without rooting them across it.  They differ in what the address
+/// is worth afterwards.  This one is a nursery bump while the nursery has room,
+/// so the block is reclaimed by a minor collection instead of waiting for the
+/// major cycle — and it moves, so a caller holding the raw address across a
+/// collection owes it a root.  The stable twin buys the opposite: the old
+/// generation is mark-sweep and non-moving, which is what a caller needs when
+/// it publishes the address somewhere the collector does not walk — a host
+/// container box ([`crate::gc_storage`]), a blackhole register file — or when
+/// an `#[allow]`ed "never moves" reader downstream depends on it.
+///
+/// A nursery-full request spills to the old generation rather than collecting,
+/// so the block this hands back is never worse placed than the stable twin's.
+///
+/// Not for a constructor a compiled trace calls directly.  One bound in
+/// `jit_fnaddr` hands its block back in a machine register the gcmap does not
+/// describe as a reference, so a minor collection between the return and the
+/// store leaves the caller naming moved bytes, and the non-moving old
+/// generation is what stands in for that missing root today.
+/// `PYPY_GC_NURSERY=64K` tells the two apart in one run: routing
+/// `w_int_gc_alloc` here puts recycled nursery bytes in an old-gen
+/// `W_BaseException.w_start` (`type_name_surrogate_reject`,
+/// `site=minor_fixed_field_target`).
+///
+/// Residualised (`@dont_look_inside`, `rlib/jit.py`) for the same reason as its
+/// twin: the hook dispatch is process-global state the trace carries nothing by
+/// recording.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_alloc_nursery_raw(type_id: u32, payload_size: usize) -> *mut u8 {
+    GcAllocOutcome::from_hook(try_gc_alloc(type_id, payload_size))
         .allocated_or_abort(payload_size)
         .unwrap_or(core::ptr::null_mut())
 }
@@ -798,9 +832,9 @@ mod tests {
     //
     // The lock below only serializes the installers against each other; that is
     // what keeps the "unregistered/cleared -> None/false" assertions sound.
-    static HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn hook_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    fn hook_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        HOOK_TEST_LOCK.lock()
     }
 
     /// What the mock allocator was last asked for on this thread, and what it

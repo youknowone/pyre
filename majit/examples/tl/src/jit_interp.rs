@@ -443,12 +443,12 @@ mod tests {
     /// probe's own — [`run_jit`] and [`compile_probe`] are the only two ways a
     /// test may enter the JIT, and neither may call the other (a plain mutex
     /// re-entered on one thread deadlocks).
-    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PROBE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// For tests that assert only on the result. They still compile, so they
     /// must not run inside the probe's window. See [`PROBE_LOCK`].
     fn run_jit(bc: &[u8], inputarg: i64) -> i64 {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         JitTlInterp::new().run(bc, inputarg)
     }
 
@@ -465,7 +465,7 @@ mod tests {
         bc: &[u8],
         inputarg: i64,
     ) -> (i64, usize, usize, majit_metainterp::LoopBodyShape) {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
         LAST_OPS_AFTER.store(0, Ordering::Relaxed);
         LAST_HAS_JUMP.store(false, Ordering::Relaxed);
@@ -488,7 +488,7 @@ mod tests {
     /// any concurrently running test whose program issues `ROLL` adds to it. It
     /// therefore needs [`PROBE_LOCK`] over its own store/run/load window too.
     fn run_jit_counting_rolls(bc: &[u8], inputarg: i64) -> (i64, u32) {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         ROLL_CALLS.store(0, Ordering::Relaxed);
         let got = JitTlInterp::new().run(bc, inputarg);
         (got, ROLL_CALLS.load(Ordering::Relaxed))

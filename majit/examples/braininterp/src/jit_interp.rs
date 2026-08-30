@@ -292,7 +292,7 @@ mod tests {
     use crate::interp;
     use majit_metainterp::{RefusalKind, refusal_kind};
 
-    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PROBE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// Run `prog` and return only its output.
     ///
@@ -300,7 +300,7 @@ mod tests {
     /// Neither this nor [`compile_probe`] may call the other — the mutex is
     /// plain, and re-entering it on one thread deadlocks.
     fn run_jit(prog: &[u8]) -> String {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         JitBrainInterp::new().run(prog)
     }
 
@@ -309,7 +309,7 @@ mod tests {
     fn compile_probe(
         prog: &[u8],
     ) -> (String, usize, usize, usize, majit_metainterp::LoopBodyShape) {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
         LAST_OPS_BEFORE.store(0, Ordering::Relaxed);
         LAST_OPS_AFTER.store(0, Ordering::Relaxed);

@@ -1454,6 +1454,19 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_alloc_stable_raw",
         pyre_object::gc_hook::try_gc_alloc_stable_raw,
     );
+    // Its nursery twin, same signature and the same reason.  The stable arm has
+    // had an entry since #346 and the nursery arm never did, so a body that
+    // allocates through it resolves to no address and keeps a symbolic
+    // residual, which `descent_decline` counts as an un-lowered helper.  No
+    // body reaches it on a walked path today — this is the entry every
+    // constructor moved onto the nursery would otherwise need, paid before it
+    // is owed rather than after.
+    pa2(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_alloc_nursery_raw",
+        "pyre_object::try_gc_alloc_nursery_raw",
+        pyre_object::gc_hook::try_gc_alloc_nursery_raw,
+    );
     // `w_int_gc_alloc` is the collector-heap arm of `w_int_new`, reached from
     // inside a descended body whenever a fold boxes an int. Bind the
     // macro-emitted trampoline rather than the raw fn, for the reason

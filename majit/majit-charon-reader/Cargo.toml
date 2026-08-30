@@ -7,5 +7,6 @@ repository.workspace = true
 description = "Stable-Rust parser for Charon .llbc / .ullbc JSON; consumed by majit-translate's MIR-driven flowspace driver"
 
 [dependencies]
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

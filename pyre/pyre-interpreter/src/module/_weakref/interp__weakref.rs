@@ -2401,13 +2401,13 @@ fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
 /// under cargo's parallel test threads two proxy tests otherwise borrow it at
 /// once and panic. Both this module's and `builtins`'s proxy tests take it.
 #[cfg(test)]
-pub(crate) static PROXY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static PROXY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-/// Acquire [`PROXY_TEST_LOCK`], tolerating poisoning so one test's panic does
-/// not cascade into every follow-up.
+/// Acquire [`PROXY_TEST_LOCK`].  `parking_lot` does not poison, so one test's
+/// panic does not cascade into every follow-up.
 #[cfg(test)]
-pub(crate) fn lock_proxy_tests() -> std::sync::MutexGuard<'static, ()> {
-    PROXY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+pub(crate) fn lock_proxy_tests() -> parking_lot::MutexGuard<'static, ()> {
+    PROXY_TEST_LOCK.lock()
 }
 
 #[cfg(test)]

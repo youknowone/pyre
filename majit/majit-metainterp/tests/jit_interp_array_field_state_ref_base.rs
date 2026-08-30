@@ -32,7 +32,7 @@
 //! index instead, which is also the only arrangement under which the base read
 //! has to be redone rather than folded.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::OpCode;
@@ -91,7 +91,7 @@ fn dispatch_walk(program: &Bytecode, threshold: u32, stack: usize, ticks: i64) -
     let mut driver: JitDriver<WalkState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
-        *COMPILED.lock().unwrap() = opcodes.to_vec();
+        *COMPILED.lock() = opcodes.to_vec();
     });
     let mut pc: usize = 0;
     let mut state = WalkState {
@@ -239,7 +239,7 @@ fn the_compiled_trace_lowers_both_element_accesses_to_array_ops() {
         "no trace compiled, so the census below would read zero vacuously",
     );
 
-    let loop_ops = COMPILED.lock().unwrap().clone();
+    let loop_ops = COMPILED.lock().clone();
     let count = |wanted: OpCode| loop_ops.iter().filter(|op| **op == wanted).count();
     let sets = count(OpCode::SetarrayitemGc);
     let gets = count(OpCode::GetarrayitemGcI);

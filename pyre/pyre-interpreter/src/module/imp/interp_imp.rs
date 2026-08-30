@@ -801,7 +801,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // `interp_imp.py is_builtin` instead answers -1 for *any*
                 // builtin already in `sys.modules`, which makes an ordinary
                 // imported builtin such as `time` report -1.
-                let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(name);
+                let is_builtin = BUILTIN_MODULES.lock().contains_key(name);
                 let result = if !is_builtin {
                     0
                 } else if matches!(name, "sys" | "builtins") {

@@ -38,6 +38,7 @@ bh_probe = []
 gc_box = []
 
 [dependencies]
+parking_lot = { workspace = true }
 indexmap = { workspace = true }
 libc = { workspace = true }
 majit-ir = { workspace = true }

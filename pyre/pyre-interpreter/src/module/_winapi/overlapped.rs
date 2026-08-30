@@ -12,9 +12,10 @@
 //! particular is a plain `Vec`, not the `bytes` upstream reads straight into;
 //! `getbuffer` makes the `bytes` out of it once the read has completed.
 
+use parking_lot::Mutex;
 use pyre_object::{PY_NULL, PyObject, PyObjectRef};
 use rustpython_host_env::winapi as host_winapi;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -141,7 +142,7 @@ fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
     // object and never moves, so its address stays good while the guard is
     // gone; the kernel is writing into it over the same period either way.
     let (handle, overlapped) = {
-        let state = record.lock().unwrap();
+        let state = record.lock();
         (state.handle, std::ptr::addr_of!(state.overlapped))
     };
     let mut transferred: u32 = 0;
@@ -161,7 +162,7 @@ fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
     } else {
         0
     };
-    let mut state = record.lock().unwrap();
+    let mut state = record.lock();
     match error {
         0 | ERROR_MORE_DATA | ERROR_OPERATION_ABORTED => {
             state.completed = true;
@@ -188,7 +189,7 @@ fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
 /// the operation moved no bytes into one.
 fn overlapped_getbuffer(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = arg(args, 0, "getbuffer")?;
-    let state = native(obj)?.lock().unwrap();
+    let state = native(obj)?.lock();
     if !state.completed {
         return Err(crate::PyError::value_error(
             "can't get read buffer before GetOverlappedResult() signals the operation completed",
@@ -207,7 +208,7 @@ fn overlapped_getbuffer(args: &[PyObjectRef]) -> crate::PyResult {
 /// simply nothing left to cancel.
 fn overlapped_cancel(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = arg(args, 0, "cancel")?;
-    let state = native(obj)?.lock().unwrap();
+    let state = native(obj)?.lock();
     if !state.pending {
         return Ok(pyre_object::w_none());
     }
@@ -265,7 +266,7 @@ fn init_overlapped_type(ns: PyObjectRef) {
                 crate::make_builtin_function_with_arity(
                     "event",
                     |args: &[PyObjectRef]| -> crate::PyResult {
-                        let state = native(arg(args, 1, "event")?)?.lock().unwrap();
+                        let state = native(arg(args, 1, "event")?)?.lock();
                         Ok(super::w_handle(state.overlapped.hEvent))
                     },
                     2,
@@ -312,7 +313,7 @@ pub unsafe fn w_overlapped_dealloc(obj: PyObjectRef) {
     this.backend = std::ptr::null_mut();
     let old_error = host_winapi::get_last_error();
     {
-        let mut state = backend.lock().unwrap();
+        let mut state = backend.lock();
         if state.pending {
             let mut transferred: u32 = 0;
             unsafe {
@@ -345,7 +346,7 @@ pub fn connect_named_pipe(
     }
     let backend = new_native(handle)?;
     let error = {
-        let mut state = backend.lock().unwrap();
+        let mut state = backend.lock();
         // An overlapped `ConnectNamedPipe` never reports success directly; it
         // reports either the pending connection or one already made.
         let _blocked = crate::module::thread::before_external_block();
@@ -355,11 +356,11 @@ pub fn connect_named_pipe(
         }
     };
     match error {
-        ERROR_IO_PENDING => backend.lock().unwrap().pending = true,
+        ERROR_IO_PENDING => backend.lock().pending = true,
         // Nothing is left to wait for, so the event is signalled by hand and
         // the caller's wait returns at once.
         ERROR_PIPE_CONNECTED => {
-            let state = backend.lock().unwrap();
+            let state = backend.lock();
             host_winapi::set_event(state.overlapped.hEvent).map_err(win32_err)?;
         }
         _ => return Err(super::win32_code(error)),
@@ -389,7 +390,7 @@ pub fn read_file(
     }
     let backend = new_native(handle)?;
     let error = {
-        let mut state = backend.lock().unwrap();
+        let mut state = backend.lock();
         state.transfer = Transfer::Read;
         state.buffer = vec![0u8; size as usize];
         let mut read: u32 = 0;
@@ -411,7 +412,7 @@ pub fn read_file(
     };
     match error {
         0 | ERROR_MORE_DATA => {}
-        ERROR_IO_PENDING => backend.lock().unwrap().pending = true,
+        ERROR_IO_PENDING => backend.lock().pending = true,
         _ => return Err(super::win32_code(error)),
     }
     Ok(pyre_object::w_tuple_new(vec![
@@ -443,7 +444,7 @@ pub fn write_file(
     }
     let backend = new_native(handle)?;
     let error = {
-        let mut state = backend.lock().unwrap();
+        let mut state = backend.lock();
         state.transfer = Transfer::Write;
         state.buffer = data.to_vec();
         let length = state.buffer.len().min(u32::MAX as usize) as u32;
@@ -466,7 +467,7 @@ pub fn write_file(
     };
     match error {
         0 => {}
-        ERROR_IO_PENDING => backend.lock().unwrap().pending = true,
+        ERROR_IO_PENDING => backend.lock().pending = true,
         _ => return Err(super::win32_code(error)),
     }
     Ok(pyre_object::w_tuple_new(vec![

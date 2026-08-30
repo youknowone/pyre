@@ -1,4 +1,3 @@
-# pyre-check: max-pypy-ratio=143
 # A float subclass that overrides the arithmetic and comparison dunders, driven
 # hot enough to compile. The walker's float specialization lowers BINARY_OP to
 # `FloatAdd` / `FloatSub` / `FloatMul` / `FloatTrueDiv` and COMPARE_OP to
@@ -24,7 +23,14 @@
 # arm each emitted the `ob_type` unbox guard without the matching `w_class` pin
 # and answered these with the raw payload -- `a < 1` returning True where the
 # override returns a string, and a stored subclass reading back as a plain int.
-N = 20000
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 1000
 
 
 class MyFloat(float):

@@ -9,8 +9,8 @@
 //! - ArrayRead on virtualizable arrays → VableArrayRead marker
 //! - Call classification → elidable/residual/may_force tagging
 
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -8094,14 +8094,12 @@ fn record_classify_seen(target: &CallTarget) {
         } => {
             *CLASSIFY_SEEN_METHODS
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .entry(format!("name={name:?} receiver_root={receiver_root:?}"))
                 .or_insert(0) += 1;
         }
         CallTarget::FunctionPath { segments, .. } => {
             *CLASSIFY_SEEN_PATHS
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .entry(format!("{segments:?}"))
                 .or_insert(0) += 1;
         }
@@ -8112,7 +8110,6 @@ fn record_classify_seen(target: &CallTarget) {
 fn record_override_match(pattern: &CallTarget) {
     *OVERRIDE_MATCHES
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entry(override_key(pattern))
         .or_insert(0) += 1;
 }
@@ -8129,9 +8126,7 @@ fn record_override_match(pattern: &CallTarget) {
 /// read as a clean table when it is really a run where no override table was
 /// installed at all.
 pub fn call_effect_override_census(overrides: &[CallEffectOverride]) -> Vec<String> {
-    let matches = OVERRIDE_MATCHES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let matches = OVERRIDE_MATCHES.lock();
     let mut rows: Vec<(String, usize)> = overrides
         .iter()
         .map(|override_| {
@@ -8146,9 +8141,7 @@ pub fn call_effect_override_census(overrides: &[CallEffectOverride]) -> Vec<Stri
     // partial figure, so it is reported rather than dropped.
     let listed: std::collections::BTreeSet<&String> = rows.iter().map(|(key, _)| key).collect();
     let unlisted: Vec<&String> = matches.keys().filter(|key| !listed.contains(key)).collect();
-    let seen_methods = CLASSIFY_SEEN_METHODS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let seen_methods = CLASSIFY_SEEN_METHODS.lock();
     let mut lines = vec![
         format!(
             "call_effect_overrides entries={} matched={} inert={} sites={} unlisted={}",
@@ -8170,9 +8163,7 @@ pub fn call_effect_override_census(overrides: &[CallEffectOverride]) -> Vec<Stri
     for (key, hits) in seen_methods.iter() {
         lines.push(format!("classify_call_method {hits:>6}  {key}"));
     }
-    let seen_paths = CLASSIFY_SEEN_PATHS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let seen_paths = CLASSIFY_SEEN_PATHS.lock();
     lines.push(format!(
         "classify_call_seen_paths sites={} shapes={}",
         seen_paths.values().sum::<usize>(),

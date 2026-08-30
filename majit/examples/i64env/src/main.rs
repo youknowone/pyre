@@ -229,12 +229,12 @@ fn loop_header_at_three(n: i64) -> Vec<i64> {
 mod tests {
     use super::*;
 
-    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PROBE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// Run `program` with the counter reset, returning `(result, compiles)`
     /// observed under [`PROBE_LOCK`].
     fn probe(label: &str, program: &Code, num_regs: usize, threshold: u32) -> (i64, usize) {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
         let r = run(program, num_regs, threshold);
         let compiles = COMPILES.load(Ordering::Relaxed);
@@ -265,7 +265,7 @@ mod tests {
         num_regs: usize,
         threshold: u32,
     ) -> (i64, usize, usize, u64, majit_metainterp::LoopBodyShape) {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
         LAST_OPS_AFTER.store(0, Ordering::Relaxed);
         LAST_HAS_JUMP.store(false, Ordering::Relaxed);
@@ -298,7 +298,7 @@ mod tests {
     /// For tests that assert only on the result: they still compile, so they
     /// must not run inside a probe's window. See [`PROBE_LOCK`].
     fn run_locked(program: &Code, num_regs: usize, threshold: u32) -> i64 {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         run(program, num_regs, threshold)
     }
 

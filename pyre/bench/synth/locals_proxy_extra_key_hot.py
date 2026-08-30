@@ -28,7 +28,9 @@
 # unless it fired at least once, which only `probe_plain` can supply.
 import sys
 
-N = 200000
+# Stay above the production trace threshold; `selfcheck-compiles` and the
+# `builtin_locals` fold census independently reject a vacuously cold run.
+N = 3000
 KEY = "extra_key"
 
 

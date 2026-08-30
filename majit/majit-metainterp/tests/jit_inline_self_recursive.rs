@@ -27,7 +27,7 @@
 //!       IntAdd IntAdd IntAdd IntAdd IntSub IntIsTrue GuardTrue Jump
 //! ```
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::OpCode;
@@ -94,7 +94,7 @@ fn dispatch_sum(program: &Bytecode, threshold: u32, head: usize, ticks: i64) -> 
     let mut driver: JitDriver<SumState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
-        *COMPILED.lock().unwrap() = opcodes.to_vec();
+        *COMPILED.lock() = opcodes.to_vec();
     });
     let mut pc: usize = 0;
     let mut state = SumState {
@@ -174,7 +174,7 @@ fn a_self_recursive_inline_helper_builds_and_runs() {
 #[test]
 fn the_recursive_walk_is_traced_rather_than_called_out_to() {
     let _ = dispatch_sum(&PROGRAM, 8, chain(), TICKS);
-    let body = COMPILED.lock().unwrap().clone();
+    let body = COMPILED.lock().clone();
     assert!(
         !body.is_empty(),
         "no compiled loop was recorded, so this census is vacuous",

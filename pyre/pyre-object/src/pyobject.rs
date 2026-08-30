@@ -4,7 +4,7 @@
 //! Concrete types (W_IntObject, W_BoolObject, etc.) embed this header as their
 //! first field, enabling safe pointer casts between `*mut PyObject` and typed pointers.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU64, Ordering};
 
@@ -413,15 +413,13 @@ static SUBCLASS_RANGE_WRITER_LOCK: Mutex<()> = Mutex::new(());
 /// for the whole batch: entering makes the sequence odd (optimistic readers
 /// retry), dropping publishes the writes and makes it even again.
 pub struct SubclassRangeWriteGuard {
-    _writers: std::sync::MutexGuard<'static, ()>,
+    _writers: parking_lot::MutexGuard<'static, ()>,
     seq: u64,
 }
 
 /// Enter a subclass-range write section (see [`SubclassRangeWriteGuard`]).
 pub fn subclass_range_write_guard() -> SubclassRangeWriteGuard {
-    let writers = SUBCLASS_RANGE_WRITER_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let writers = SUBCLASS_RANGE_WRITER_LOCK.lock();
     // Serialized by the writer lock, so this load/store pair is race-free.
     let seq = SUBCLASS_RANGE_SEQ.load(Ordering::Relaxed).wrapping_add(1);
     SUBCLASS_RANGE_SEQ.store(seq, Ordering::Relaxed);

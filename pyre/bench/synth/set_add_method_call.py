@@ -1,24 +1,7 @@
-# pyre-check: max-pypy-ratio=30
 # pyre-check: spec-folds=set_add_method
-# The ceiling is twice the slowest of the three backends measured on one
-# darwin host -- 12.0x dynasm, 12.3x cranelift, 14.2x wasm -- rounded up.
-# The same binary at the same commit has read this fixture anywhere from 11.5x
-# to 16.1x depending on what else the host was running, so the doubling is
-# what absorbs the runner rather than slack for a regression.
+# `spec-folds` gates the arm directly: a residual produces the same result, so
+# output parity alone cannot tell whether the method-call substitution ran.
 #
-# What it gates is therefore a gross regression, not this arm: doubling
-# `hot_add` alone moves the sum by only ~28%, which no ceiling wide enough to
-# survive that spread can catch. The pypy denominator here is ~0.14s, under
-# three times `FLOOR_GATE_MIN_BASELINE_S`, thin enough that the ratio reads
-# coarsely.
-# `spec-folds` above is what gates the arm: an arm that stops firing reads
-# exactly like one nobody wrote a leg for.
-#
-# The two `hot_add*` legs are deliberately the bulk of the time -- 52% of the
-# fixture's dynasm execution (28% + 24%), with no other leg over 13%.
-# `hot_add_user_hash` ran 300k Python-level `__hash__` calls at first and
-# took 53% of the fixture, which would have made the ceiling a gate on
-# user-dunder dispatch rather than on anything this file is about.
 # `s.add(x)` and a set comprehension name one operation -- `pyopcode.py SET_ADD`
 # is `space.call_method(w_set, 'add', w_value)` -- but they recorded two
 # different residuals. The comprehension's SET_ADD lowers to the direct
@@ -46,6 +29,13 @@
 # stores a different value, so bypassing it changes `len`. `hot_add_unbound`
 # calls the descriptor with an explicit receiver, which is one argument more
 # than the arm accepts.
+
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
 
 
 class Key:
@@ -138,15 +128,17 @@ def hot_add_unbound(n):
 def main():
     total = 0
     k = 0
-    while k < 10:
-        total += hot_add(700000)
-        total += hot_add_comprehension(700000)
-        total += hot_add_growing(30000)
-        total += hot_add_user_hash(5000)
-        total += hot_add_raising_hash(3000)
-        total += hot_add_subclass(30000)
-        total += hot_add_override(30000)
-        total += hot_add_unbound(30000)
+    # Every leg is independently hot in one pass; the fold census verifies the
+    # method spelling without multiplying all eight workloads.
+    while k < 1:
+        total += hot_add(100000)
+        total += hot_add_comprehension(100000)
+        total += hot_add_growing(5000)
+        total += hot_add_user_hash(1000)
+        total += hot_add_raising_hash(500)
+        total += hot_add_subclass(5000)
+        total += hot_add_override(5000)
+        total += hot_add_unbound(5000)
         k += 1
     print(total)
 

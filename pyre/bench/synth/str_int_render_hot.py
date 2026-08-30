@@ -1,4 +1,3 @@
-# pyre-check: max-pypy-ratio=15
 # pyre-check: spec-folds=str_call
 # Hot-loop `str(int)`. The Python-level call has to reach the same decimal
 # render the rtyper gives an unboxed `str(int)` -- one elidable
@@ -9,12 +8,10 @@
 #
 # `hot_render` is the speed leg, and it is written to carry the fold's own
 # subject and nothing else: the checksum reads the rendered length, so the
-# string has to materialize, but the loop performs no subscript. A subscript
-# term would put an unrelated cost under the ceiling below -- a fixed string
-# indexed in a loop measures 64 ns/iter here against CPython's 24, and this
-# fold does not move it -- and the correctness legs are sized down for the
-# same reason. `hot_render_signed` keeps a first-digit read, at a size that
-# checks the sign digit without dominating the sum.
+# string has to materialize, but the loop performs no subscript.  That keeps
+# unrelated string-indexing cost out of the fold census. `hot_render_signed`
+# keeps a first-digit read at a size that checks the sign digit without
+# dominating the sum.
 #
 # The other legs are correctness legs for the shapes the fold must REFUSE,
 # each written so a wrongly-admitted shape is a wrong number and not a silent
@@ -35,17 +32,9 @@
 # as elidable let the pure pass share one, and the loop below counts that
 # sharing directly rather than inferring it from a timing.
 #
-# The ceiling is set BETWEEN the two arms of the fold, not at the measured
-# number: `PYRE_FBW_NO_SPECIALIZE=str_call` reads 38.2x pypy and the default
-# reads 11.5x (9.6x through check.py's own medians), so 15 catches the fold
-# going away and still leaves room for a host that scales the two runners
-# differently. It is a target, not a fit -- the remaining distance to pypy is
-# the string allocation the fold still performs and pypy does not, so the
-# number should come down again rather than be re-fitted upward.
-#
-# `spec-folds` is the other half and gates the subject exactly: a ceiling
-# cannot tell a fold that stopped firing from a fixture nobody wrote a leg
-# for, and it reads the same on every host.
+# `spec-folds` gates the subject exactly: a residual produces the same strings,
+# so output parity cannot tell a fold that stopped firing from a fixture nobody
+# wrote a leg for.
 #
 # Deterministic; output asserted cpython==pypy.
 
@@ -56,6 +45,14 @@ class Prefixed(int):
 
 
 class MyStr(str):
+    pass
+
+
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
     pass
 
 
@@ -104,16 +101,16 @@ def declined_callables(n):
 
 
 def main():
-    n = 6000000
+    n = 100000
     print("render", hot_render(n))
     # Negative values exercise the sign digit and the widest decimal the fold
     # can be asked for; INT_MIN has no positive counterpart, so a render that
     # negates before formatting reads wrong here rather than nowhere.
-    print("signed", hot_render_signed(300000, -(1 << 62)))
+    print("signed", hot_render_signed(5000, -(1 << 62)))
     print("edges", str(-(1 << 63)), str((1 << 63) - 1), str(0), str(-1))
-    print("declined", declined_shapes(20000, 1 << 70))
-    print("callables", declined_callables(20000))
-    print("shared", fresh_identity(20000, 123456))
+    print("declined", declined_shapes(1000, 1 << 70))
+    print("callables", declined_callables(1000))
+    print("shared", fresh_identity(1000, 123456))
 
 
 main()

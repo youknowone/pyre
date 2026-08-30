@@ -427,6 +427,127 @@ pub fn walk_active_sym_exc_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
     }
 }
 
+/// Capture this mutator's [`ACTIVE_SYM_EXC`] cell for STW root walking.
+pub fn capture_active_sym_root_area() -> *const () {
+    ACTIVE_SYM_EXC.with(|c| c as *const _ as *const ())
+}
+
+/// Root the inline `ConstPtr` GcRefs a fold has parked in the active walk's
+/// reference register banks.
+///
+/// `MIFrame.registers_r` is an ordinary RPython list of `GCREF` upstream, so
+/// the collector traces and forwards it with every other field and a fold never
+/// has to ask where its result is going to sit.  Pyre mirrors that bank as a
+/// `Vec<OpRef>` on `PyreSym`, which nothing else reaches: `TraceCtx::const_ref`
+/// mints an `OpRef::ConstPtr` carrying an inline `GcRef`, and
+/// `write_residual_call_result_to_dst` parks it in the bank until an operation
+/// consumes it into the recorder — from there `walk_active_trace_refs` and the
+/// emit-time `LoadFromGcTable` rewrite take over.  A collection landing in that
+/// window used to move the object and leave the bank naming the old address,
+/// which is the hazard the `can_move` tests on the walker folds stood in for.
+///
+/// Only the innermost `PyreSym` is anchored, and that covers the window: a mint
+/// and the operation recording it sit inside one opcode's dispatch, while a
+/// re-entrant `trace_bytecode` can only open between opcodes.
+///
+/// An inline sub-walk is the one bank that is not `sym.registers_r`:
+/// `inline_call.rs` gives the callee `WalkContext` a local `Vec<OpRef>` and
+/// calls `walk` on it directly, leaving `ACTIVE_SYM_EXC` on the caller's sym.
+/// [`InlineRegisterBankGuard`] publishes each such bank on
+/// `PyreSym::inline_register_banks` for the length of that sub-walk, so a
+/// callee fold's mint is rooted on the same terms as the outer one.
+///
+/// `MIFrame.pre_opcode_registers_r`, the opcode-start rollback clone, hangs off
+/// the per-instruction wrapper rather than the anchor, and so would be out of
+/// this area's reach.  Nothing writes it: every constructor leaves it `None`,
+/// the sole assignment clears it, and each read is an `is_some()` fallback, so
+/// no clone exists to be read forward stale.  A writer restored there carries
+/// the same defect this area closes, one level down, and would need an anchor
+/// of its own.
+///
+/// # Safety
+/// `data` must come from [`capture_active_sym_root_area`], and the owning
+/// mutator must be quiesced when a foreign collector thread calls this.  Unlike
+/// [`walk_active_sym_exc_roots`] this walk writes forwarded pointers back, so it
+/// reaches the banks through `addr_of_mut!` on the raw anchor rather than
+/// re-forming a whole `&mut PyreSym` alongside the tracer's.
+pub unsafe fn walk_active_sym_register_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let cell = unsafe { &*(data as *const std::cell::Cell<*mut PyreSym>) };
+    let sym_ptr = cell.get();
+    if sym_ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let bank = &mut *std::ptr::addr_of_mut!((*sym_ptr).registers_r);
+        for slot in bank.iter_mut() {
+            slot.walk_const_ptr_refs_mut(visitor);
+        }
+        // The bridge-setup overrides of the same bank, each of which a resume
+        // fills from `rd_consts` and can therefore carry an inline `ConstPtr`.
+        for bank in [
+            &mut *std::ptr::addr_of_mut!((*sym_ptr).bridge_registers_r),
+            &mut *std::ptr::addr_of_mut!((*sym_ptr).bridge_local_oprefs),
+            &mut *std::ptr::addr_of_mut!((*sym_ptr).bridge_stack_oprefs),
+        ] {
+            let Some(bank) = bank.as_mut() else { continue };
+            for slot in bank.iter_mut() {
+                slot.walk_const_ptr_refs_mut(visitor);
+            }
+        }
+        // The open sub-walks' own banks: each entry is the `(address, length)`
+        // of the Ref bank of a frame suspended below this one, published for
+        // the length of its `walk` call. A shared borrow of the list is enough
+        // -- every bank it names is a separate allocation, so the `&mut`
+        // slices below do not alias it.
+        let inline = &*std::ptr::addr_of!((*sym_ptr).inline_register_banks);
+        for index in 0..inline.len() {
+            let (addr, len) = inline[index];
+            let bank = std::slice::from_raw_parts_mut(addr as *mut majit_ir::OpRef, len);
+            for slot in bank.iter_mut() {
+                slot.walk_const_ptr_refs_mut(visitor);
+            }
+        }
+    }
+}
+
+/// Publish an inline sub-walk's reference register bank on the active
+/// [`PyreSym`] for the length of the sub-walk, and take it back down on the way
+/// out — including an unwind, so an aborted callee body leaves no address the
+/// next collection would walk into a dead frame.
+///
+/// A null anchor (no trace in flight) makes this inert: nothing walks the bank
+/// then either.
+pub(crate) struct InlineRegisterBankGuard {
+    sym: *mut PyreSym,
+}
+
+impl InlineRegisterBankGuard {
+    pub(crate) fn enter(bank: *mut [majit_ir::OpRef]) -> Self {
+        let sym = ACTIVE_SYM_EXC.with(|c| c.get());
+        if !sym.is_null() {
+            let entry = (bank as *mut majit_ir::OpRef as usize, bank.len());
+            unsafe {
+                (*std::ptr::addr_of_mut!((*sym).inline_register_banks)).push(entry);
+            }
+        }
+        Self { sym }
+    }
+}
+
+impl Drop for InlineRegisterBankGuard {
+    fn drop(&mut self) {
+        if self.sym.is_null() {
+            return;
+        }
+        unsafe {
+            (*std::ptr::addr_of_mut!((*self.sym).inline_register_banks)).pop();
+        }
+    }
+}
+
 pub fn take_walk_end_restart_pc() -> Option<usize> {
     WALK_END_RESTART_PC.with(|c| c.replace(None))
 }
@@ -3918,9 +4039,29 @@ fn run_perfn_walk<Sym: WalkSym>(
         // to itself, and a genuine trivia carry lands on a LATER py.  Anything
         // else is a body that does not encode `start_pc`, which is exactly the
         // decline below.
+        //
+        // The back-translation names the FIRST Python instruction whose
+        // lowering region owns the offset, and Python trivia -- `Nop`
+        // (a bare `pass`), `Cache`, `ExtendedArg`, `Resume`, `NotTaken` --
+        // lowers to nothing, so a trivia run immediately before a loop header
+        // owns the header's own offset and back-translates to the trivia.
+        // Comparing that raw coordinate rejected every loop preceded by a
+        // `pass`: the whole function then ran interpreted.  Normalize the
+        // landing forward past trivia first; an unported instruction is not
+        // trivia, so the carry-across-truncation case above still fails the
+        // test.
         sidecar_entry.filter(|&off| {
-            crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize
-                >= start_pc
+            let landed =
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize;
+            let landed = if pjc.code_ptr.is_null() {
+                landed
+            } else {
+                crate::jitcode_dispatch::skip_python_trivia_forward(
+                    unsafe { &*pjc.code_ptr },
+                    landed,
+                )
+            };
+            landed >= start_pc
         })
     } else {
         // Every non-entry resume carries its own JitCode coordinate. Without

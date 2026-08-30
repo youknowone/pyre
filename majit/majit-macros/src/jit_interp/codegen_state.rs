@@ -2485,8 +2485,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 let __shared_asm = driver.shared_asm();
                 {
                     let mut __asm = __shared_asm
-                        .lock()
-                        .expect("shared_asm poisoned at install_canonical_liveness");
+                        .lock();
                     let (__live_i, __live_r, __live_f) = self.canonical_liveness_slots();
                     // Stage the canonical "all-live" triple for lazy
                     // registration. The first leading-dummy `BC_LIVE`

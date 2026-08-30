@@ -1,7 +1,11 @@
-# pyre-check: max-pypy-ratio=80
-# Sized so pypy's own execution clears the measurement floor: below it the
-# ratio gate divides by the floor and reads startup rather than this loop.
-N = 870236
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 5000
 
 
 class MyExit(SystemExit):

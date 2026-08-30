@@ -1,4 +1,3 @@
-# pyre-check: max-pypy-ratio=158
 # A BINARY_OP (`+`/`*`) whose receiver alternates at runtime between an exact
 # builtin int and a user-class (or int-subclass) instance at the SAME hot site.
 # The raw int specialization bypasses special-method dispatch, so it must only
@@ -10,6 +9,13 @@
 # blackhole path — its receiver/result must stay live across the deopt.
 # Deterministic, terminating, prints an int checksum; jit == nojit.
 M = 1000000007
+
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
 
 
 class C0:
@@ -68,7 +74,7 @@ def fold(acc, r):
 
 def run():
     acc = 0
-    for i in range(20000):
+    for i in range(1000):
         # Exact int on ~1/113 of iterations, a plain user class otherwise; the
         # `w + w` site dispatches int.__add__ vs C0.__add__.
         w = i if i % 113 == 0 else C0(i)

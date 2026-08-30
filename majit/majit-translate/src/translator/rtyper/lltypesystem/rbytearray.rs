@@ -116,7 +116,7 @@ fn with_bytearray_chars<R>(
     else {
         return Err(format!("{context}: expected Struct container"));
     };
-    let fields = st._fields.lock().unwrap();
+    let fields = st._fields.lock();
     let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
         return Err(format!("{context}: rpy_bytearray lacks chars"));
     };

@@ -4963,7 +4963,8 @@ impl OptContext {
     /// `&self` (no context-local counter). When the flag is unset, only a
     /// cached bool is read and the sink is never opened.
     fn s9_probe_fire(&self, opref: OpRef) {
-        use std::sync::{LazyLock, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::LazyLock;
         static ENABLED: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("MAJIT_S9_PROBE").is_some());
         if !*ENABLED {
@@ -4987,7 +4988,8 @@ impl OptContext {
                 .map(|v| v == "bt")
                 .unwrap_or(false)
         });
-        if let Ok(mut f) = SINK.lock() {
+        {
+            let mut f = SINK.lock();
             use std::io::Write;
             let _ = writeln!(f, "cat={} opref={:?} raw={}", cat, opref, opref.raw());
             if *BT {
@@ -7022,8 +7024,8 @@ impl OptContext {
             Ok(folded) => folded,
             Err(crate::executor::NoConstExecutor) => panic!(
                 "execute_nonspec_const: no helper registered for opcode {:?} \
-                 (executor.py:610 NotImplementedError)",
-                op.opcode
+                 (executor.py:610 NotImplementedError) args={:?}",
+                op.opcode, argboxes
             ),
         }
     }

@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=122
 # A single hot function whose int register + constant-pool slot count exceeds the
-# 256-entry ceiling of the single-byte JitCode operand encoding (assembler.py chr()).
+# 256-entry ceiling of `Assembler`'s single-byte JitCode operand encoding.
 # Such a trace cannot be encoded as single-byte slot operands, so it must be
 # DECLINED (trace compilation aborted, the interpreter keeps running) rather than
 # asserting mid-encode and panicking the process. The trace-jitcode builder now
@@ -17,7 +16,18 @@ for k in range(300):
 _lines.append("    return (q + a) % M")
 exec("\n".join(_lines))
 
+try:
+    import pypyjit
+
+    # Install the low threshold after source generation so the bookkeeping
+    # loop does not become a second compiled subject.
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
 acc = 0
-for i in range(8000):
+# The graph is declined on its first recording attempts and then blacklisted;
+# this count clears both the tracing threshold and that decline sequence.
+for i in range(100):
     acc = (acc + f(i)) % M
 print(acc)

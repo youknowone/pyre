@@ -2423,10 +2423,7 @@ fn make_jitcodes(
         // C1: the mint universe, beside the pool, in the same generation.
         // `all_descrs` stable while the pool moves is a SELECTION defect;
         // both moving is a POOL defect.  No artefact diff can tell them apart.
-        let all_descrs = majit_ir::descr::gc_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .all_descrs_len();
+        let all_descrs = majit_ir::descr::gc_cache().lock().all_descrs_len();
         // C2: one cache slot answering for two different logical fields.
         let (field_hits, field_collisions) = majit_ir::descr::field_descr_cache_collisions();
         eprintln!(

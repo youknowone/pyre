@@ -6795,11 +6795,16 @@ pub(crate) fn type_of_object(obj: PyObjectRef) -> PyObjectRef {
 /// `isinstance(obj, cls)` — pypy/module/__builtin__/abstractinst.py
 /// `app_isinstance` → `abstract_isinstance_w(allow_override=True)`.
 fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `isinstance` is registered with a fixed arity, so `builtin_code_call`
+    // rejects a wrong positional count before this body runs and the branch is
+    // unreachable today.  It is what `__majit_wrap_builtin_isinstance` falls
+    // back to, though, and the walker enters that wrapper directly rather than
+    // through `builtin_code_call` -- so the wording has to be the one
+    // `arity_mismatch` gives a two-argument builtin, which the hand-rolled
+    // message it replaces did not match, and the report has to be cold and
+    // residual the way every reporter in `gateway.rs` is.
     if args.len() != 2 {
-        return Err(crate::PyError::type_error(format!(
-            "isinstance() takes exactly two arguments ({} given)",
-            args.len()
-        )));
+        return crate::gateway::method_exact_arity_failure("isinstance", 2, args.len());
     }
     Ok(w_bool_from(crate::baseobjspace::isinstance(
         args[0], args[1],
@@ -10571,8 +10576,8 @@ fn make_exception_group_type(
 /// `space.type(w_exc) == registered class` per `baseobjspace.py
 /// exception_getclass`.
 fn register_exc_class(name: &'static str, cls: PyObjectRef) -> PyObjectRef {
-    let registry =
-        EXC_CLASS_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let registry = EXC_CLASS_REGISTRY
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
     // The map lookup is all this lock covers.  Everything below reaches the
     // object heap, whose dict locks are striped -- two unrelated dictionaries
     // can share one -- so a thread holding a dict lock and waiting for this
@@ -10580,9 +10585,7 @@ fn register_exc_class(name: &'static str, cls: PyObjectRef) -> PyObjectRef {
     // wants a dict.  A plain mutex is invisible to the collector's
     // stop-the-world handshake as well, so nothing breaks that wait.
     let canonical = {
-        let mut registry = registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut registry = registry.lock();
         *registry.entry(name).or_insert(cls as usize) as PyObjectRef
     };
     // Both of these are first-writer-wins on their own, so a second thread
@@ -10611,9 +10614,7 @@ fn register_exc_class(name: &'static str, cls: PyObjectRef) -> PyObjectRef {
 #[majit_macros::dont_look_inside]
 pub fn lookup_exc_class(name: &str) -> Option<PyObjectRef> {
     let registry = EXC_CLASS_REGISTRY.get()?;
-    let registry = registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let registry = registry.lock();
     registry.get(name).copied().map(|cls| cls as PyObjectRef)
 }
 
@@ -10662,7 +10663,7 @@ pub fn lookup_exc_instance(name: &str) -> Option<PyObjectRef> {
 }
 
 static EXC_CLASS_REGISTRY: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<&'static str, usize>>,
+    parking_lot::Mutex<std::collections::HashMap<&'static str, usize>>,
 > = std::sync::OnceLock::new();
 
 /// `__build_class__(body, name, *bases)` — class creation.

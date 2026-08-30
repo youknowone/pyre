@@ -10,7 +10,7 @@
 use pyre_native::bz2 as backend;
 use pyre_object::*;
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// `interp_bz2.py W_BZ2Compressor`: the stream and its lock belong to
 /// the wrapper object; there is no process-global side table.
@@ -100,7 +100,7 @@ mod compressor_methods {
 
         /// `interp_bz2.py compress`.
         fn compress(&mut self, data: PyBufferStr) -> Result<Vec<u8>, crate::PyError> {
-            let mut compressor = self.compressor()?.lock().unwrap();
+            let mut compressor = self.compressor()?.lock();
             if compressor.is_flushed() {
                 return Err(crate::PyError::value_error("Compressor has been flushed"));
             }
@@ -109,7 +109,7 @@ mod compressor_methods {
 
         /// `interp_bz2.py flush` — the object may not be used afterwards.
         fn flush(&mut self) -> Result<Vec<u8>, crate::PyError> {
-            let mut compressor = self.compressor()?.lock().unwrap();
+            let mut compressor = self.compressor()?.lock();
             if compressor.is_flushed() {
                 return Err(crate::PyError::value_error("Repeated call to flush()"));
             }
@@ -147,7 +147,7 @@ mod decompressor_methods {
             data: PyBufferStr,
             #[default(-1i64)] max_length: PyIndexInt,
         ) -> Result<Vec<u8>, crate::PyError> {
-            let mut decompressor = self.decompressor()?.lock().unwrap();
+            let mut decompressor = self.decompressor()?.lock();
             if decompressor.eof() {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::EOFError,
@@ -179,21 +179,21 @@ mod decompressor_methods {
         /// has been reached.
         #[getter]
         fn eof(&self) -> Result<bool, crate::PyError> {
-            Ok(self.decompressor()?.lock().unwrap().eof())
+            Ok(self.decompressor()?.lock().eof())
         }
 
         /// `interp_bz2.py:541 unused_data` — data found after the end of the
         /// compressed stream.
         #[getter]
         fn unused_data(&self) -> Result<Vec<u8>, crate::PyError> {
-            Ok(self.decompressor()?.lock().unwrap().unused_data().to_vec())
+            Ok(self.decompressor()?.lock().unused_data().to_vec())
         }
 
         /// `interp_bz2.py needs_input_w` — true when more input is
         /// needed before more decompressed data can be produced.
         #[getter]
         fn needs_input(&self) -> Result<bool, crate::PyError> {
-            Ok(self.decompressor()?.lock().unwrap().needs_input())
+            Ok(self.decompressor()?.lock().needs_input())
         }
 
         /// `interp_bz2.py descr_getstate`.

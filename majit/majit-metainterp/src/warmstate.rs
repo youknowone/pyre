@@ -5497,15 +5497,15 @@ mod tests {
     // Everything is therefore asserted by SENTINEL VALUE rather than by call
     // count: any other fixture that installs a Ref green while this resolver is
     // live would move a count, but cannot forge these addresses.
-    static RETAIN_LOG: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
-    static RELEASE_LOG: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+    static RETAIN_LOG: parking_lot::Mutex<Vec<i64>> = parking_lot::Mutex::new(Vec::new());
+    static RELEASE_LOG: parking_lot::Mutex<Vec<i64>> = parking_lot::Mutex::new(Vec::new());
 
     fn test_retain(value: i64) {
-        RETAIN_LOG.lock().unwrap().push(value);
+        RETAIN_LOG.lock().push(value);
     }
 
     fn test_release(value: i64) {
-        RELEASE_LOG.lock().unwrap().push(value);
+        RELEASE_LOG.lock().push(value);
     }
 
     /// warmstate.py:568-573 — a cell's stored green key OWNS its `Ref`
@@ -5537,7 +5537,7 @@ mod tests {
             let mut ws = WarmEnterState::new(3);
             ws.ensure_cell_for_key(&key);
 
-            let retained = RETAIN_LOG.lock().unwrap().clone();
+            let retained = RETAIN_LOG.lock().clone();
             assert!(
                 retained.contains(&REF_GREEN),
                 "installing a cell must retain its Ref green; log={retained:x?}"
@@ -5561,12 +5561,12 @@ mod tests {
             );
 
             assert!(
-                !RELEASE_LOG.lock().unwrap().contains(&REF_GREEN),
+                !RELEASE_LOG.lock().contains(&REF_GREEN),
                 "nothing may be released while the cell that owns it is alive"
             );
         }
 
-        let released = RELEASE_LOG.lock().unwrap().clone();
+        let released = RELEASE_LOG.lock().clone();
         assert!(
             released.contains(&REF_GREEN),
             "dropping the cell must release its Ref green; log={released:x?}"

@@ -35,8 +35,18 @@
 # fails the fixture if the inner loop stops being entered at all.
 import sys
 
-OUTER = 3000
-INNER = 300
+try:
+    import pypyjit
+
+    # Compilation is a premise checked by `selfcheck-compiles`, so reach it
+    # directly instead of spending most of this correctness test warming three
+    # loops at the production threshold.
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+OUTER = 100
+INNER = 50
 
 
 def gen(holder):

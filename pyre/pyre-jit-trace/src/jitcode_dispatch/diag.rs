@@ -383,6 +383,7 @@ spec_folds! {
     NewtupleObject       => ("newtuple_object",          "residual_call", "-"),
     Newlist              => ("newlist",                  "residual_call", "-"),
     BuiltinLen           => ("builtin_len",              "residual_call", "-"),
+    BuiltinIsinstance    => ("builtin_isinstance",       "residual_call", "-"),
     BuiltinDictGet       => ("builtin_dict_get",         "residual_call", "-"),
     BuiltinTypeGetattr   => ("builtin_type_getattr",     "residual_call", "-"),
     BuiltinGetattr       => ("builtin_getattr",          "residual_call", "-"),
@@ -427,20 +428,24 @@ spec_folds! {
     BinaryOpLong         => ("binary_op_long",           "residual_call", "-"),
     TruedivOpLong        => ("truediv_op_long",          "residual_call", "-"),
     BinaryOpFloat        => ("binary_op_float",          "residual_call", "-"),
+    BinaryOpStr          => ("binary_op_str",            "residual_call", "-"),
     CompareOpInt         => ("compare_op_int",           "residual_call", "-"),
     CompareOpLongInt     => ("compare_op_long_int",      "residual_call", "-"),
     CompareOpLong        => ("compare_op_long",          "residual_call", "-"),
     CompareOpFloat       => ("compare_op_float",         "residual_call", "-"),
+    CompareOpStr         => ("compare_op_str",           "residual_call", "-"),
     Unpack               => ("unpack",                   "residual_call", "-"),
     SubscrTupleDescent   => ("subscr_tuple_descent",     "specialize",    "subscr"),
     SubscrTuple          => ("subscr_tuple",             "specialize",    "subscr"),
     SubscrStr            => ("subscr_str",               "specialize",    "subscr"),
     BuiltinDivmodLongInt => ("builtin_divmod_long_int",  "specialize",    "builtin_divmod"),
     ZipTwoTupleIters     => ("zip_two_tuple_iters",      "specialize",    "for_iter_next"),
+    ForIterList          => ("for_iter_list",            "specialize",    "for_iter_next"),
     InstanceNext         => ("instance_next",            "residual_call", "-"),
     FrameLasti           => ("frame_lasti",              "specialize",    "load_attr"),
     LoadDeref            => ("load_deref",               "residual_call", "-"),
     FrameLineno          => ("frame_lineno",             "specialize",    "load_attr"),
+    ObjectClassAttr      => ("object_class_attr",        "specialize",    "load_attr"),
     BareSuperCall        => ("bare_super_call",          "residual_call", "-"),
     BareSuperVirtual     => ("bare_super_virtual",       "residual_call", "-"),
     TwoArgSuperCall      => ("two_arg_super_call",       "residual_call", "-"),
@@ -526,7 +531,7 @@ static FBW_DEPTH_HIST: [std::sync::atomic::AtomicU64; FBW_DEPTH_HIST_BUCKETS] = 
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [Z; FBW_DEPTH_HIST_BUCKETS]
 };
-static FBW_DEPTH_DEEPEST: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static FBW_DEPTH_DEEPEST: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
 
 /// `PYRE_FBW_DEPTH_CENSUS`: process-wide inline-walker descent depths and the
 /// `w_code` chain for the deepest entry. Off by default; the cached test is the
@@ -547,9 +552,7 @@ pub(crate) fn fbw_depth_census_record(framestack: &[InlineFrame]) {
     FBW_DEPTH_HIST[depth.saturating_sub(1).min(FBW_DEPTH_HIST_BUCKETS - 1)].fetch_add(1, ordering);
 
     if depth > FBW_DEPTH_MAX.load(ordering) {
-        let mut deepest = FBW_DEPTH_DEEPEST
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut deepest = FBW_DEPTH_DEEPEST.lock();
         if depth > FBW_DEPTH_MAX.load(ordering) {
             deepest.clear();
             deepest.extend(framestack.iter().map(|frame| frame.w_code));
@@ -563,9 +566,7 @@ pub fn fbw_depth_census_summary() -> String {
     use std::fmt::Write;
 
     let ordering = std::sync::atomic::Ordering::Relaxed;
-    let deepest = FBW_DEPTH_DEEPEST
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let deepest = FBW_DEPTH_DEEPEST.lock();
     let mut hist = String::new();
     for (idx, count) in FBW_DEPTH_HIST.iter().enumerate() {
         if idx != 0 {

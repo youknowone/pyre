@@ -5745,7 +5745,7 @@ fn w_dict_view_iterator_new_direction(
         reverse,
         start_strategy_id,
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         dict_view_iterator_gc_type_id(),
         W_DICT_VIEW_ITERATOR_OBJECT_SIZE,
     );
@@ -5753,8 +5753,14 @@ fn w_dict_view_iterator_new_direction(
         crate::lltype::malloc_typed(value) as PyObjectRef
     } else {
         unsafe { std::ptr::write(raw as *mut W_BaseDictMultiIterObject, value) };
+        // The shell is a livevar across the barrier: that call is a `gc_op`,
+        // which leaves RUNNING before taking `gc_mutex` (`gc_sync.rs`) and
+        // roots only its own copy, so a foreign collector can move it there.
+        // Publish it first and return the address the slot carries afterwards.
+        let shell_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         crate::gc_hook::try_gc_write_barrier(raw);
-        raw as PyObjectRef
+        crate::gc_roots::shadow_stack_get(shell_slot)
     }
 }
 
@@ -5915,7 +5921,7 @@ pub fn w_dict_view_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
     let dict_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_dict);
     let raw =
-        crate::gc_hook::try_gc_alloc_stable_raw(W_DICT_VIEW_GC_TYPE_ID, W_DICT_VIEW_OBJECT_SIZE);
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_DICT_VIEW_GC_TYPE_ID, W_DICT_VIEW_OBJECT_SIZE);
     let value = W_DictViewObject {
         ob_header: PyObject {
             ob_type: tp as *const PyType,
@@ -5928,8 +5934,14 @@ pub fn w_dict_view_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
         crate::lltype::malloc_typed(value) as PyObjectRef
     } else {
         unsafe { std::ptr::write(raw as *mut W_DictViewObject, value) };
+        // The shell is a livevar across the barrier: that call is a `gc_op`,
+        // which leaves RUNNING before taking `gc_mutex` (`gc_sync.rs`) and
+        // roots only its own copy, so a foreign collector can move it there.
+        // Publish it first and return the address the slot carries afterwards.
+        let shell_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         crate::gc_hook::try_gc_write_barrier(raw);
-        raw as PyObjectRef
+        crate::gc_roots::shadow_stack_get(shell_slot)
     }
 }
 

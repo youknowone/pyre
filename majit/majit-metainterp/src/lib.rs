@@ -296,10 +296,11 @@ pub fn green_key_from_code_ptr(code_ptr: usize, pc: usize) -> u64 {
 /// Off by default and gated on a cached flag, so the production compile path
 /// pays one bool read and records nothing.
 pub mod loop_census {
+    use parking_lot::Mutex;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, OnceLock};
 
     /// `get_printable_location(next_instr, is_being_profiled, bytecode)`
     /// (interp_jit.py). `w_pycode` is that `bytecode` green as majit carries
@@ -338,7 +339,7 @@ pub mod loop_census {
     /// [`enable`] armed the census: a host that has a real stderr already has
     /// every line on it, so nothing is buffered for it to read twice.
     pub fn report() -> String {
-        std::mem::take(&mut *RECORDS.lock().unwrap())
+        std::mem::take(&mut *RECORDS.lock())
     }
 
     /// Whether `PYRE_LOOP_CENSUS` is set — cached like `majit_log_enabled` —
@@ -393,7 +394,7 @@ pub mod loop_census {
         };
         let record = format!("[loop-census] {kind} {line}\n");
         if ARMED.load(Ordering::Relaxed) {
-            RECORDS.lock().unwrap().push_str(&record);
+            RECORDS.lock().push_str(&record);
         }
         eprint!("{record}");
     }
@@ -731,8 +732,8 @@ fn refusal_kind_of_one(reason: &str) -> RefusalKind {
     }
 }
 
-static DEGRADED_DISPATCH_ARMS: std::sync::Mutex<Vec<DegradedDispatchArm>> =
-    std::sync::Mutex::new(Vec::new());
+static DEGRADED_DISPATCH_ARMS: parking_lot::Mutex<Vec<DegradedDispatchArm>> =
+    parking_lot::Mutex::new(Vec::new());
 
 /// Record that `arm` of `interp` was emitted as an abort stub.
 ///
@@ -746,9 +747,7 @@ pub fn record_degraded_dispatch_arm(interp: &'static str, arm: &'static str, rea
         arm,
         reason,
     };
-    let mut arms = DEGRADED_DISPATCH_ARMS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut arms = DEGRADED_DISPATCH_ARMS.lock();
     if arms.contains(&entry) {
         return;
     }
@@ -763,10 +762,7 @@ pub fn record_degraded_dispatch_arm(interp: &'static str, arm: &'static str, rea
 
 /// Snapshot of every dispatch arm recorded as degraded so far.
 pub fn degraded_dispatch_arms() -> Vec<DegradedDispatchArm> {
-    DEGRADED_DISPATCH_ARMS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+    DEGRADED_DISPATCH_ARMS.lock().clone()
 }
 
 /// How many dispatch arms one machine's portal emitted, recorded whether or
@@ -788,8 +784,8 @@ pub struct DispatchArmCensus {
     pub arms: usize,
 }
 
-static DISPATCH_ARM_CENSUS: std::sync::Mutex<Vec<DispatchArmCensus>> =
-    std::sync::Mutex::new(Vec::new());
+static DISPATCH_ARM_CENSUS: parking_lot::Mutex<Vec<DispatchArmCensus>> =
+    parking_lot::Mutex::new(Vec::new());
 
 /// Record that `interp`'s portal emitted `arms` dispatch arms.
 ///
@@ -800,9 +796,7 @@ static DISPATCH_ARM_CENSUS: std::sync::Mutex<Vec<DispatchArmCensus>> =
 /// machine, not per build.
 pub fn record_dispatch_arm_census(interp: &'static str, arms: usize) {
     let entry = DispatchArmCensus { interp, arms };
-    let mut census = DISPATCH_ARM_CENSUS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut census = DISPATCH_ARM_CENSUS.lock();
     if census.contains(&entry) {
         return;
     }
@@ -811,10 +805,7 @@ pub fn record_dispatch_arm_census(interp: &'static str, arms: usize) {
 
 /// Snapshot of every portal's arm count recorded so far.
 pub fn dispatch_arm_census() -> Vec<DispatchArmCensus> {
-    DISPATCH_ARM_CENSUS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+    DISPATCH_ARM_CENSUS.lock().clone()
 }
 
 /// Panic unless `interp`'s portal was installed AND none of its arms degraded.
@@ -852,8 +843,8 @@ pub struct UnconsultedFieldDeclaration {
     pub key: &'static str,
 }
 
-static UNCONSULTED_FIELD_DECLARATIONS: std::sync::Mutex<Vec<UnconsultedFieldDeclaration>> =
-    std::sync::Mutex::new(Vec::new());
+static UNCONSULTED_FIELD_DECLARATIONS: parking_lot::Mutex<Vec<UnconsultedFieldDeclaration>> =
+    parking_lot::Mutex::new(Vec::new());
 
 /// Record that `interp` declares `key` and no access site consulted it.
 ///
@@ -863,9 +854,7 @@ static UNCONSULTED_FIELD_DECLARATIONS: std::sync::Mutex<Vec<UnconsultedFieldDecl
 /// and the fact is per declaration, not per build.
 pub fn record_unconsulted_field_declaration(interp: &'static str, key: &'static str) {
     let entry = UnconsultedFieldDeclaration { interp, key };
-    let mut entries = UNCONSULTED_FIELD_DECLARATIONS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut entries = UNCONSULTED_FIELD_DECLARATIONS.lock();
     if entries.contains(&entry) {
         return;
     }
@@ -877,10 +866,7 @@ pub fn record_unconsulted_field_declaration(interp: &'static str, key: &'static 
 
 /// Snapshot of every unconsulted field declaration recorded so far.
 pub fn unconsulted_field_declarations() -> Vec<UnconsultedFieldDeclaration> {
-    UNCONSULTED_FIELD_DECLARATIONS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+    UNCONSULTED_FIELD_DECLARATIONS.lock().clone()
 }
 
 /// Panic unless `interp`'s portal was installed AND every field declaration it
@@ -988,8 +974,8 @@ pub struct StructLayoutConflict {
     pub dropped: StructLayoutField,
 }
 
-static STRUCT_LAYOUT_CONFLICTS: std::sync::Mutex<Vec<StructLayoutConflict>> =
-    std::sync::Mutex::new(Vec::new());
+static STRUCT_LAYOUT_CONFLICTS: parking_lot::Mutex<Vec<StructLayoutConflict>> =
+    parking_lot::Mutex::new(Vec::new());
 
 static STRUCT_LAYOUT_REGISTRATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -1002,9 +988,7 @@ static STRUCT_LAYOUT_COMPARISONS: std::sync::atomic::AtomicUsize =
 /// Deduplicated by content: a jitcode may be built many times per process and
 /// the fact reported is per-disagreement, not per-build.
 pub fn record_struct_layout_conflict(conflict: StructLayoutConflict) {
-    let mut conflicts = STRUCT_LAYOUT_CONFLICTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut conflicts = STRUCT_LAYOUT_CONFLICTS.lock();
     if conflicts.contains(&conflict) {
         return;
     }
@@ -1058,10 +1042,7 @@ pub fn note_struct_layout_comparison() {
 
 /// Snapshot of every layout disagreement recorded so far.
 pub fn struct_layout_conflicts() -> Vec<StructLayoutConflict> {
-    STRUCT_LAYOUT_CONFLICTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+    STRUCT_LAYOUT_CONFLICTS.lock().clone()
 }
 
 /// Field descriptions submitted to `register_struct_layout` so far.
@@ -1913,7 +1894,8 @@ pub fn mc_diag_summary() -> String {
 ///
 /// Off unless `MAJIT_GUARD_CENSUS` is set: the map write sits on the deopt
 /// path, which is exactly the path under study.
-static GUARD_CENSUS: std::sync::Mutex<Option<Vec<((u64, u32), u64)>>> = std::sync::Mutex::new(None);
+static GUARD_CENSUS: parking_lot::Mutex<Option<Vec<((u64, u32), u64)>>> =
+    parking_lot::Mutex::new(None);
 
 /// Turn the census on where `MAJIT_GUARD_CENSUS` cannot be read.
 ///
@@ -1942,9 +1924,7 @@ pub fn guard_census_record(green_key: u64, fail_index: u32) {
     if !guard_census_enabled() {
         return;
     }
-    let Ok(mut slot) = GUARD_CENSUS.lock() else {
-        return;
-    };
+    let mut slot = GUARD_CENSUS.lock();
     let rows = slot.get_or_insert_with(Vec::new);
     match rows.iter_mut().find(|(k, _)| *k == (green_key, fail_index)) {
         Some((_, count)) => *count += 1,
@@ -1954,9 +1934,7 @@ pub fn guard_census_record(green_key: u64, fail_index: u32) {
 
 /// Render the census as `distinct=N total=M` plus the heaviest guards.
 pub fn guard_census_summary(top: usize) -> String {
-    let Ok(slot) = GUARD_CENSUS.lock() else {
-        return "guard_census=lock-poisoned".to_string();
-    };
+    let slot = GUARD_CENSUS.lock();
     let Some(rows) = slot.as_ref() else {
         return "guard_census=off".to_string();
     };

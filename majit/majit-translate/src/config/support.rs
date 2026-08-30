@@ -174,10 +174,8 @@ pub fn detect_pax_with_path(path: &str) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    };
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Serialise every test that touches `MAKEFLAGS` so the
     /// remove-var/read-var window is not raced by another test
@@ -207,7 +205,7 @@ mod tests {
         //
         // Upstream `support.py:8-9` short-circuits on any truthy
         // MAKEFLAGS.
-        let _guard = MAKEFLAGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MAKEFLAGS_LOCK.lock();
         let prev = env::var_os("MAKEFLAGS");
         unsafe {
             env::set_var("MAKEFLAGS", "-j4");
@@ -229,7 +227,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn detect_number_of_processors_macos_freebsd_uses_raw_count() {
-        let _guard = MAKEFLAGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MAKEFLAGS_LOCK.lock();
         let prev = env::var_os("MAKEFLAGS");
         unsafe {
             env::remove_var("MAKEFLAGS");
@@ -261,7 +259,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn detect_number_of_processors_linux_applies_half_load_cap() {
-        let _guard = MAKEFLAGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MAKEFLAGS_LOCK.lock();
         let prev = env::var_os("MAKEFLAGS");
         unsafe {
             env::remove_var("MAKEFLAGS");

@@ -366,9 +366,9 @@ pub struct CallAssemblerTarget {
 
 /// Compiled loop targets keyed by their `JitCellToken` number. Unlike label
 /// targets, CALL_ASSEMBLER identifies its callee by that number directly.
-pub static CALL_ASSEMBLER_TARGETS: std::sync::Mutex<
+pub static CALL_ASSEMBLER_TARGETS: parking_lot::Mutex<
     Option<std::collections::HashMap<u64, CallAssemblerTarget>>,
-> = std::sync::Mutex::new(None);
+> = parking_lot::Mutex::new(None);
 
 // ── CALL_ASSEMBLER dispatch table ──
 //
@@ -466,7 +466,7 @@ fn thin_descr_ptr(descr: &DescrRef) -> usize {
 /// compile happened in.
 pub fn attached_finish_exit_index(descr: &Option<DescrRef>) -> Option<u32> {
     let ptr = thin_descr_ptr(descr.as_ref()?);
-    let mut reg = FAIL_DESCR_REGISTRY.lock().unwrap();
+    let mut reg = FAIL_DESCR_REGISTRY.lock();
     let vec = reg.get_or_insert_with(Default::default);
     reserve_finish_exit_block(vec);
     vec[..FINISH_EXIT_INDEX_COUNT as usize]
@@ -486,7 +486,7 @@ pub fn attached_finish_exit_index(descr: &Option<DescrRef>) -> Option<u32> {
 /// already-claimed entry keeps the fast path available to a process that
 /// compiled something before the attachment landed.
 pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
-    let mut reg = FAIL_DESCR_REGISTRY.lock().unwrap();
+    let mut reg = FAIL_DESCR_REGISTRY.lock();
     let vec = reg.get_or_insert_with(Default::default);
     reserve_finish_exit_block(vec);
     vec[exit_index as usize] = reserved_finish_descr(exit_index, Some(descr));
@@ -494,14 +494,14 @@ pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
 
 /// Stable, guest-memory dispatch entries, keyed by CALL_ASSEMBLER token.
 /// `Box` is intentional: an emitted module bakes the entry address.
-pub static WASM_CA_DISPATCH: std::sync::Mutex<
+pub static WASM_CA_DISPATCH: parking_lot::Mutex<
     Option<std::collections::HashMap<u64, Box<WasmCaDispatchEntry>>>,
-> = std::sync::Mutex::new(None);
+> = parking_lot::Mutex::new(None);
 
 /// Return the stable guest-memory address for `number`, creating a pending
 /// (zero-slot) entry when needed.
 pub fn ca_dispatch_slot(number: u64) -> u32 {
-    let mut table = WASM_CA_DISPATCH.lock().unwrap();
+    let mut table = WASM_CA_DISPATCH.lock();
     let entry = table
         .get_or_insert_with(Default::default)
         .entry(number)
@@ -517,7 +517,6 @@ pub fn ca_dispatch_slot(number: u64) -> u32 {
 pub fn ca_dispatch_exists(number: u64) -> bool {
     WASM_CA_DISPATCH
         .lock()
-        .unwrap()
         .as_ref()
         .is_some_and(|table| table.contains_key(&number))
 }
@@ -527,7 +526,7 @@ pub fn ca_dispatch_exists(number: u64) -> bool {
 /// wasm execution cannot begin until this compile call returns.
 pub fn ca_dispatch_publish(number: u64, func_handle: u32, compiled_ptr: u32) {
     let _ = ca_dispatch_slot(number);
-    let table = WASM_CA_DISPATCH.lock().unwrap();
+    let table = WASM_CA_DISPATCH.lock();
     let entry = table
         .as_ref()
         .and_then(|table| table.get(&number))
@@ -545,13 +544,13 @@ pub fn ca_dispatch_redirect(old_number: u64, func_handle: u32, compiled_ptr: u32
 /// also retracts redirects into a dropped replacement loop, while preserving
 /// an old token whose entry has already been redirected elsewhere.
 pub fn ca_dispatch_remove_compiled_ptr(compiled_ptr: u32) {
-    if let Some(table) = WASM_CA_DISPATCH.lock().unwrap().as_mut() {
+    if let Some(table) = WASM_CA_DISPATCH.lock().as_mut() {
         table.retain(|_, entry| entry.compiled_ptr.load(Ordering::Acquire) != compiled_ptr);
     }
 }
 
 pub fn ca_dispatch_remove(number: u64) {
-    if let Some(table) = WASM_CA_DISPATCH.lock().unwrap().as_mut() {
+    if let Some(table) = WASM_CA_DISPATCH.lock().as_mut() {
         table.remove(&number);
     }
 }
@@ -559,7 +558,6 @@ pub fn ca_dispatch_remove(number: u64) {
 pub fn call_assembler_target(number: u64) -> Option<CallAssemblerTarget> {
     CALL_ASSEMBLER_TARGETS
         .lock()
-        .unwrap()
         .as_ref()
         .and_then(|targets| targets.get(&number).cloned())
 }
@@ -567,7 +565,6 @@ pub fn call_assembler_target(number: u64) -> Option<CallAssemblerTarget> {
 pub fn publish_call_assembler_target(number: u64, target: CallAssemblerTarget) {
     CALL_ASSEMBLER_TARGETS
         .lock()
-        .unwrap()
         .get_or_insert_with(Default::default)
         .insert(number, target);
 }
@@ -594,7 +591,7 @@ pub fn register_pending_call_assembler_target(number: u64, input_types: Vec<Type
 
 /// Remove metadata and the dispatch entry for an invalidated token.
 pub fn remove_call_assembler_target(number: u64) {
-    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().unwrap().as_mut() {
+    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().as_mut() {
         targets.remove(&number);
     }
     ca_dispatch_remove(number);
@@ -602,7 +599,7 @@ pub fn remove_call_assembler_target(number: u64) {
 
 /// Retract all metadata aliases which point at a dropped compiled loop.
 pub fn remove_call_assembler_targets_for_compiled_ptr(compiled_ptr: u32) {
-    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().unwrap().as_mut() {
+    if let Some(targets) = CALL_ASSEMBLER_TARGETS.lock().as_mut() {
         targets.retain(|_, target| target.compiled_ptr as u32 != compiled_ptr);
     }
     ca_dispatch_remove_compiled_ptr(compiled_ptr);
@@ -627,15 +624,15 @@ pub fn remove_call_assembler_targets_for_compiled_ptr(compiled_ptr: u32) {
 /// Entries are never removed: a dropped loop's modules are unreachable (its
 /// label targets are retracted and its token is gone), so its entries are just
 /// retained memory, bounded by the total number of compiled exits.
-static FAIL_DESCR_REGISTRY: std::sync::Mutex<Option<Vec<Arc<WasmFailDescr>>>> =
-    std::sync::Mutex::new(None);
+static FAIL_DESCR_REGISTRY: parking_lot::Mutex<Option<Vec<Arc<WasmFailDescr>>>> =
+    parking_lot::Mutex::new(None);
 
 /// The next free global fail index — pass as `fail_index_base` to
 /// `codegen::build_wasm_module`, then register the built descrs with
 /// `register_fail_descrs`. The wasm host is single-threaded, so no other
 /// compile can interleave between the two calls.
 pub fn fail_descr_base() -> u32 {
-    let mut reg = FAIL_DESCR_REGISTRY.lock().unwrap();
+    let mut reg = FAIL_DESCR_REGISTRY.lock();
     let vec = reg.get_or_insert_with(Default::default);
     reserve_finish_exit_block(vec);
     vec.len() as u32
@@ -645,7 +642,7 @@ pub fn fail_descr_base() -> u32 {
 /// `fail_index` (already base-offset by `build_wasm_module`) must equal the
 /// registry position it lands at.
 pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
-    let mut reg = FAIL_DESCR_REGISTRY.lock().unwrap();
+    let mut reg = FAIL_DESCR_REGISTRY.lock();
     let vec = reg.get_or_insert_with(Default::default);
     reserve_finish_exit_block(vec);
     for d in descrs {
@@ -662,7 +659,6 @@ pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
 pub fn global_fail_descr(fail_index: u32) -> Option<Arc<WasmFailDescr>> {
     FAIL_DESCR_REGISTRY
         .lock()
-        .unwrap()
         .as_ref()
         .and_then(|v| v.get(fail_index as usize).cloned())
 }
@@ -673,14 +669,14 @@ pub fn global_fail_descr(fail_index: u32) -> Option<Arc<WasmFailDescr>> {
 /// `CompiledWasmLoop::drop` removes its own entries (guarded by
 /// `func_handle`, so a recompile that re-stamped the same descr keeps the
 /// replacement's entry).
-pub static LABEL_TARGETS: std::sync::Mutex<Option<std::collections::HashMap<usize, LabelTarget>>> =
-    std::sync::Mutex::new(None);
+pub static LABEL_TARGETS: parking_lot::Mutex<
+    Option<std::collections::HashMap<usize, LabelTarget>>,
+> = parking_lot::Mutex::new(None);
 
 /// Look up a label target by descr identity.
 pub fn label_target(descr_id: usize) -> Option<LabelTarget> {
     LABEL_TARGETS
         .lock()
-        .unwrap()
         .as_ref()
         .and_then(|m| m.get(&descr_id).copied())
 }
@@ -689,7 +685,6 @@ pub fn label_target(descr_id: usize) -> Option<LabelTarget> {
 pub fn publish_label_target(descr_id: usize, target: LabelTarget) {
     LABEL_TARGETS
         .lock()
-        .unwrap()
         .get_or_insert_with(Default::default)
         .insert(descr_id, target);
 }
@@ -907,7 +902,7 @@ impl Drop for CompiledWasmLoop {
         // `func_handle`: a recompile that re-stamped the same descr onto its
         // replacement loop has already overwritten the entry, which must
         // survive the old loop's drop.
-        let mut reg = LABEL_TARGETS.lock().unwrap();
+        let mut reg = LABEL_TARGETS.lock();
         if let Some(map) = reg.as_mut() {
             for (id, func_handle) in self
                 .label_descrs

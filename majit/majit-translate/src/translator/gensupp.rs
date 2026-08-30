@@ -1,9 +1,10 @@
 //! Port of `rpython/translator/gensupp.py`.
 
+use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 /// RPython `gensupp.uniquemodulename(name, SEEN=set())`
 /// (`gensupp.py:6-14`).
@@ -17,7 +18,7 @@ use std::sync::{Mutex, OnceLock};
 pub fn uniquemodulename(name: &str) -> String {
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut guard = seen.lock().expect("uniquemodulename: SEEN poisoned");
+    let mut guard = seen.lock();
     let mut i: usize = 0;
     loop {
         i += 1;

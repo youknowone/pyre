@@ -682,6 +682,15 @@ const RPY_LOCK_FAILURE: i64 = 0;
 const RPY_LOCK_ACQUIRED: i64 = 1;
 const RPY_LOCK_INTR: i64 = 2;
 
+/// A `pthread_mutex_t` has no poison state — `thread_pthread.c` inspects only
+/// the status code — so a panic taken while lock bookkeeping was held must not
+/// turn every later acquire into an error.
+fn lock_state<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// `os_lock.py parse_acquire_args`.  The result is the `microseconds`
 /// argument of the `RPyThreadAcquireLockTimed` ABI: negative blocks forever,
 /// zero polls once.

@@ -37,8 +37,8 @@
 # armed only a tracer would pass without testing anything.
 import sys
 
-WARM = 20000  # past the loop threshold (1039) many times over
-TAILS = (2500, 10000)
+WARM = 3000  # past the loop threshold (1039) without redundant warmup
+TAILS = (250, 1000)
 DEPTH = 3
 
 

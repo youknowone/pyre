@@ -56,7 +56,10 @@ def bool_arithmetic__main():
         acc = acc + flag * 2
         acc = acc - other
         acc = acc + -flag
-        acc = acc + ~other
+        # CPython 3.14 warns for every `~bool` evaluation.  Express the same
+        # integer contribution directly so this arithmetic benchmark does not
+        # measure 1.5 million warning-registry lookups.
+        acc = acc - other - 1
         if flag & other:
             acc = acc + 1
         if flag | other:

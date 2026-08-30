@@ -6,7 +6,14 @@
 # A decline that forgets the payload loses a sent value or swallows a thrown
 # exception, which is a wrong answer rather than a slow one, so drive every
 # resume shape through hot frames and check what came back.
-N = 50
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 3
 
 
 def echo():

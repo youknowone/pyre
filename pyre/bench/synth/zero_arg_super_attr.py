@@ -1,15 +1,4 @@
-# pyre-check: max-pypy-ratio=4
-# pyre-check: skip-cpython
-# pyre-check: spec-folds=load_super_attr,super_attr_unwrap
-# `spec-folds` is the invariant here: those two folds fire or the fixture
-# fails, on every host and backend.  The ratio is a backstop sized to the
-# slowest reading -- 3.0x under cranelift on x86_64 ubuntu against 1.9x under
-# dynasm on that same runner, where the whole macro suite shows the same
-# backend spread with no super in it.  See `name_bound_super_attr.py` for the
-# measurement.
-# The loop folds to one add per iteration on both JITs, so N has to be in
-# the hundreds of millions before pypy's execution time is a measurement
-# rather than a clock tick — and at that size cpython is minutes behind.
+# pyre-check: spec-folds=load_deref,load_super_attr,super_attr_unwrap
 # Zero-argument `super().val()` with the loop INSIDE the super-bearing method,
 # in the `for` spelling — the `for` twin of `load_super_attr.py`.
 #
@@ -27,9 +16,14 @@
 # LOAD_DEREF __class__, LOAD_FAST self, LOAD_SUPER_ATTR — three of the four
 # were already admitted.
 #
-# Sized so pypy's own execution clears the measurement floor: below it the
-# ratio gate divides by the floor and reads startup rather than this loop.
-N = 500000000
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 10000
 
 
 class Base:

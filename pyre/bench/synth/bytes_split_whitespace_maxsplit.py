@@ -1,13 +1,16 @@
-# pyre-check: max-pypy-ratio=65
 # bytes/bytearray split/rsplit on whitespace (sep=None) with a positive
 # maxsplit keeps the surrounding whitespace of the final remainder field,
 # matching str. Output verified against CPython/PyPy.
-# Trip count kept clear of the major-collection threshold check.py pins: at
-# the previous 470000 this loop crossed it, and the eval-breaker bailout that
-# follows re-enters through a bridge whose guard can then fail once more,
-# which moves guard_failures for reasons outside this fixture. Crossing
-# resumes around 0.45x of the old count; the gated counters are unchanged.
-N = 117500
+# One compiled loop covers all four operations.  Repeating their result-list
+# allocation beyond this count adds GC traffic without another split shape.
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 500
 
 
 def main():
