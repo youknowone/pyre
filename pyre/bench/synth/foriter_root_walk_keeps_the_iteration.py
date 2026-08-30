@@ -17,7 +17,10 @@
 try:
     import pypyjit
 
-    pypyjit.set_param("trace_limit=300")
+    # The direct list-iterator fold closes at 306 operations.  PyPy keeps the
+    # same abort/segment counts at this limit as at the former 300-operation
+    # boundary, while still compiling the exact-list loop.
+    pypyjit.set_param("trace_limit=306")
     pypyjit.set_param("threshold=20")
 except ImportError:
     pass

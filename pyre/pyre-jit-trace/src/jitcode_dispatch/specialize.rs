@@ -18139,8 +18139,8 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
 ///
 /// The emitted shape is the subscript fold's element load driven by the
 /// iterator's own cursor: `guard_class list_iterator` + `getfield(seq)` +
-/// `guard_class LIST` + exact-`w_class` guard + `guard_value(strategy)` +
-/// `getfield(index)`, a non-negative and an in-bounds guard, then the
+/// `guard_value(strategy)` + `getfield(index)`, a non-negative and an
+/// in-bounds guard, then the
 /// strategy-specific load -- the items-block `Ref` for object storage, a raw
 /// typed-array read plus `wrapint` / `wrapfloat` for int/float storage, or the
 /// items-block payload plus `AsciiListStrategy.wrap` for ascii storage -- and
@@ -18151,9 +18151,8 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
 /// answers with a bare `StopIteration` and NO sequence clear, so both arms
 /// establish the sign before acting on the cursor.
 ///
-/// A cleared sequence, that negative sentinel, a list subclass (which may
-/// override `__getitem__`), and an empty-strategy list all fall through to the
-/// generic residual.
+/// A cleared sequence, that negative sentinel, and an empty-strategy list all
+/// fall through to the generic residual.
 fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -18169,12 +18168,13 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
     if seq_obj.is_null() || index < 0 {
         return Ok(None);
     }
-    // Same operand gate as the subscript fold: an exact list whose storage has
-    // a concrete element shape.
+    // `eval.rs` mints `W_ListIterObject` only for an exact list.  This is the
+    // same static owner relation as PyPy's `W_FastListIterObject.descr_next`,
+    // whose `assert isinstance(w_seq, W_ListObject)` emits no source-list
+    // class guard.  Guarding the iterator above is therefore sufficient; the
+    // storage strategy is the only dynamic shape left to guard below.
     let (sid, concrete_len) = unsafe {
-        if !pyre_object::is_exact_list(seq_obj) {
-            return Ok(None);
-        }
+        debug_assert!(pyre_object::is_exact_list(seq_obj));
         let sid = if pyre_object::w_list_uses_int_storage(seq_obj) {
             pyre_object::listobject::ListStrategy::Integer as i64
         } else if pyre_object::w_list_uses_float_storage(seq_obj) {
@@ -18229,15 +18229,6 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
     // `GuardClass` would dereference.  Establish non-nullness first; the
     // optimizer fuses the pair into `GuardNonnullClass`.
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[seq_op])?;
-    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const pyre_object::PyType as i64;
-    walker_guard_class(ctx, op_pc, seq_op, list_type_addr)?;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        seq_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
-    )?;
-
     let strategy = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         seq_op,

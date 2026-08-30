@@ -750,7 +750,6 @@ pub fn intern_str_value(value: &str) -> PyObjectRef {
 pub fn get_interned_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
     STRING_INTERN_TABLE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(value)
         .map(|slot| **slot as PyObjectRef)
 }
