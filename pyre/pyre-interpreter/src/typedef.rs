@@ -1066,10 +1066,11 @@ pub fn init_typeobjects() {
             &pyre_object::generator::ASYNC_GENERATOR_TYPE as *const PyType as usize,
             async_generator_type as usize,
         );
-        let coroutine_wrapper_type = new_typeobject_with_base(
+        let coroutine_wrapper_type = new_typeobject_with_base_and_layout(
             "coroutine_wrapper",
             init_coroutine_wrapper_type,
             object_type,
+            &pyre_object::generator::COROUTINE_WRAPPER_TYPE as *const PyType,
         );
         unsafe {
             pyre_object::w_type_set_disallow_instantiation(coroutine_wrapper_type);
@@ -1096,7 +1097,12 @@ pub fn init_typeobjects() {
                 init_async_gen_athrow_type as fn(PyObjectRef),
             ),
         ] {
-            let ty = new_typeobject_with_base(name, init, object_type);
+            let ty = new_typeobject_with_base_and_layout(
+                name,
+                init,
+                object_type,
+                pytype as *const PyType,
+            );
             unsafe {
                 pyre_object::w_type_set_disallow_instantiation(ty);
                 pyre_object::w_type_set_acceptable_as_base_class(ty, false);
@@ -2180,6 +2186,9 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "generator" => pyre_object::generator::is_generator,
         "coroutine" => pyre_object::generator::is_coroutine,
         "async_generator" => pyre_object::generator::is_async_generator,
+        "coroutine_wrapper" => pyre_object::generator::is_coroutine_wrapper,
+        "async_generator_asend" => pyre_object::generator::is_async_gen_asend,
+        "async_generator_athrow" => pyre_object::generator::is_async_gen_athrow,
         "property" => pyre_object::descriptor::is_property,
         "super" => pyre_object::descriptor::is_super,
     }
@@ -11874,6 +11883,18 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
         // adds two words and `tlbc_index` fills the frame's existing padding.
         // The flexible locals/cells/value-stack slots are pointer-sized.
         (21 * word, word)
+    } else if is(&pyre_object::generator::COROUTINE_WRAPPER_TYPE)
+        || is(&pyre_object::generator::ASYNC_GEN_VALUE_WRAPPER_TYPE)
+    {
+        // CPython 3.14t `PyCoroWrapper` / `_PyAsyncGenWrappedValue`:
+        // the free-threaded object header followed by one owned reference.
+        (5 * word, 0)
+    } else if is(&pyre_object::generator::ASYNC_GEN_ASEND_TYPE)
+        || is(&pyre_object::generator::ASYNC_GEN_ATHROW_TYPE)
+    {
+        // CPython 3.14t `PyAsyncGenASend` / `PyAsyncGenAThrow`: the
+        // free-threaded header, two owned references and the padded state.
+        (7 * word, 0)
     } else if is(&pyre_object::weakref::WEAKREF_LAYOUT_TYPE) {
         // CPython 3.14 `PyWeakReference`: object header, doubly-linked
         // weakref list, callback, hash/cache word and vectorcall slot, plus
@@ -29608,8 +29629,15 @@ fn init_buffer_wrapper_type(ns: PyObjectRef) {
     unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
 }
 
+/// CPython 3.14 `async_gen_asend_finalize` / `async_gen_athrow_finalize`,
+/// using PyPy's registered finalizer path for the awaitable owner.
+fn async_gen_awaitable_descr_finalize(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::arity_no_args(args, "__del__")?;
+    crate::baseobjspace::async_gen_awaitable_finalize(args[0]);
+    Ok(w_none())
+}
+
 fn init_async_gen_awaitable_type(ns: PyObjectRef, athrow: bool) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
     let (next, send, throw, close) = if athrow {
         (
             crate::baseobjspace::async_gen_athrow_next_method as DunderFn,
@@ -29625,30 +29653,88 @@ fn init_async_gen_awaitable_type(ns: PyObjectRef, athrow: bool) {
             crate::baseobjspace::async_gen_asend_close_method as DunderFn,
         )
     };
-    for (name, function, arity) in [
+    // PyPy `AsyncGenABase.typedef`: await, iter, next, close, send, throw.
+    // Python 3.14's public finalizer wrapper follows the shared block and the
+    // terminal `__doc__` remains last.
+    for (name, function, doc) in [
         (
             "__await__",
             crate::baseobjspace::iter_self_method as DunderFn,
-            1,
+            "Return an iterator to be used in await expression.",
         ),
         (
             "__iter__",
             crate::baseobjspace::iter_self_method as DunderFn,
-            1,
+            "Implement iter(self).",
         ),
-        ("__next__", next, 1),
-        ("send", send, 2),
-        ("close", close, 1),
+        ("__next__", next, "Implement next(self)."),
     ] {
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, arity),
+                crate::gateway::make_slot_wrapper_with_arity_and_doc(name, function, 1, doc),
             )
         };
     }
-    unsafe { pyre_object::w_dict_setitem_str(ns, "throw", make_builtin_function("throw", throw)) };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "close",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "close",
+                close,
+                1,
+                "close() -> raise GeneratorExit inside generator.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "send",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "send",
+                send,
+                2,
+                "send(value) -> send 'value' into generator,\nreturn next yielded value or raise StopIteration.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "throw",
+            crate::gateway::make_method_descriptor_with_doc(
+                "throw",
+                throw,
+                "throw(value)\nthrow(type[,value[,tb]])\n\nRaise exception in generator, return next yielded value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__del__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__del__",
+                async_gen_awaitable_descr_finalize,
+                1,
+                "Called when the instance is about to be destroyed.",
+            ),
+        )
+    };
+    unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", w_none()) };
+    for (name, text_signature) in [
+        ("__await__", "($self, /)"),
+        ("__iter__", "($self, /)"),
+        ("__next__", "($self, /)"),
+        ("close", "($self, /)"),
+        ("send", "($self, object, /)"),
+        ("__del__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
+    }
 }
 
 fn init_async_gen_asend_type(ns: PyObjectRef) {
@@ -29661,43 +29747,77 @@ fn init_async_gen_athrow_type(ns: PyObjectRef) {
 
 /// PyPy `generator.py CoroutineWrapper.typedef`.
 fn init_coroutine_wrapper_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
-    for (name, function, arity) in [
+    // `CoroutineWrapper.typedef` and CPython's `_PyCoroWrapper_Type` share
+    // this exact method order.
+    for (name, function, doc) in [
         (
             "__iter__",
             crate::baseobjspace::iter_self_method as DunderFn,
-            1,
+            "Implement iter(self).",
         ),
         (
             "__next__",
             crate::baseobjspace::coroutine_wrapper_next_method,
-            1,
-        ),
-        (
-            "send",
-            crate::baseobjspace::coroutine_wrapper_send_method,
-            2,
-        ),
-        (
-            "close",
-            crate::baseobjspace::coroutine_wrapper_close_method,
-            1,
+            "Implement next(self).",
         ),
     ] {
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, arity),
+                crate::gateway::make_slot_wrapper_with_arity_and_doc(name, function, 1, doc),
             )
         };
     }
     unsafe {
-        pyre_object::w_dict_setitem_str(
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "send",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "send",
+                crate::baseobjspace::coroutine_wrapper_send_method,
+                2,
+                "send(arg) -> send 'arg' into coroutine,\nreturn next iterated value or raise StopIteration.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "throw",
-            make_builtin_function("throw", crate::baseobjspace::coroutine_wrapper_throw_method),
-        );
+            crate::gateway::make_method_descriptor_with_doc(
+                "throw",
+                crate::baseobjspace::coroutine_wrapper_throw_method,
+                "throw(value)\nthrow(type[,value[,traceback]])\n\nRaise exception in coroutine, return next iterated value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "close",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "close",
+                crate::baseobjspace::coroutine_wrapper_close_method,
+                1,
+                "close() -> raise GeneratorExit inside coroutine.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new("A wrapper object implementing __await__ for coroutines."),
+        )
+    };
+    for (name, text_signature) in [
+        ("__iter__", "($self, /)"),
+        ("__next__", "($self, /)"),
+        ("send", "($self, object, /)"),
+        ("close", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
     }
 }
 

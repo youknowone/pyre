@@ -1221,6 +1221,91 @@ for name, doc in EXPECTED_ASYNC_GENERATOR_DOCS.items():
     assert getattr(types.AsyncGeneratorType, name).__doc__ == doc, name
 
 
+# generator_awaitable_type_text_signatures_python314
+
+async def _metadata_coroutine():
+    return None
+
+
+async def _metadata_async_generator():
+    yield None
+
+
+_metadata_coroutine_object = _metadata_coroutine()
+_metadata_coroutine_wrapper = _metadata_coroutine_object.__await__()
+_metadata_coroutine_wrapper_type = type(_metadata_coroutine_wrapper)
+check_descriptors(
+    _metadata_coroutine_wrapper_type,
+    {
+        "__iter__": "($self, /)",
+        "__next__": "($self, /)",
+        "send": "($self, object, /)",
+        "close": "($self, /)",
+    },
+)
+assert _metadata_coroutine_wrapper_type.throw.__text_signature__ is None
+assert _metadata_coroutine_wrapper_type.__doc__ == (
+    "A wrapper object implementing __await__ for coroutines."
+)
+
+_metadata_asend_generator = _metadata_async_generator()
+_metadata_asend = _metadata_asend_generator.__anext__()
+_metadata_athrow_generator = _metadata_async_generator()
+_metadata_athrow = _metadata_athrow_generator.athrow(ValueError)
+_metadata_async_awaitable_types = (type(_metadata_asend), type(_metadata_athrow))
+
+EXPECTED_ASYNC_AWAITABLE_METHODS = {
+    "__iter__": "($self, /)",
+    "__next__": "($self, /)",
+    "__del__": "($self, /)",
+    "__await__": "($self, /)",
+    "send": "($self, object, /)",
+    "close": "($self, /)",
+}
+for owner in _metadata_async_awaitable_types:
+    check_descriptors(owner, EXPECTED_ASYNC_AWAITABLE_METHODS)
+    assert owner.throw.__text_signature__ is None
+
+EXPECTED_COROUTINE_WRAPPER_DOCS = {
+    "__iter__": "Implement iter(self).",
+    "__next__": "Implement next(self).",
+    "send": "send(arg) -> send 'arg' into coroutine,\nreturn next iterated value or raise StopIteration.",
+    "throw": (
+        "throw(value)\nthrow(type[,value[,traceback]])\n\n"
+        "Raise exception in coroutine, return next iterated value or raise\n"
+        "StopIteration.\nthe (type, val, tb) signature is deprecated, \n"
+        "and may be removed in a future version of Python."
+    ),
+    "close": "close() -> raise GeneratorExit inside coroutine.",
+}
+for name, doc in EXPECTED_COROUTINE_WRAPPER_DOCS.items():
+    assert getattr(_metadata_coroutine_wrapper_type, name).__doc__ == doc, name
+
+EXPECTED_ASYNC_AWAITABLE_DOCS = {
+    "__iter__": "Implement iter(self).",
+    "__next__": "Implement next(self).",
+    "__del__": "Called when the instance is about to be destroyed.",
+    "__await__": "Return an iterator to be used in await expression.",
+    "send": "send(value) -> send 'value' into generator,\nreturn next yielded value or raise StopIteration.",
+    "throw": (
+        "throw(value)\nthrow(type[,value[,tb]])\n\n"
+        "Raise exception in generator, return next yielded value or raise\n"
+        "StopIteration.\nthe (type, val, tb) signature is deprecated, \n"
+        "and may be removed in a future version of Python."
+    ),
+    "close": "close() -> raise GeneratorExit inside generator.",
+}
+for owner in _metadata_async_awaitable_types:
+    for name, doc in EXPECTED_ASYNC_AWAITABLE_DOCS.items():
+        assert getattr(owner, name).__doc__ == doc, (owner, name)
+
+_metadata_coroutine_wrapper.close()
+_metadata_asend.close()
+_metadata_athrow.close()
+_metadata_asend_generator.__del__()
+_metadata_athrow_generator.__del__()
+
+
 # module_text_signatures_python314
 
 EXPECTED_MODULE_METHODS = {

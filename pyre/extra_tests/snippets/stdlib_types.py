@@ -290,6 +290,109 @@ def _async_generator_type_contract():
 _async_generator_type_contract()
 
 
+def _generator_awaitable_type_contract():
+    async def coroutine():
+        return None
+
+    async def async_generator():
+        yield None
+
+    coroutine_object = coroutine()
+    coroutine_wrapper = coroutine_object.__await__()
+    coroutine_wrapper_type = type(coroutine_wrapper)
+
+    asend_generator = async_generator()
+    asend = asend_generator.__anext__()
+    asend_type = type(asend)
+
+    athrow_generator = async_generator()
+    athrow = athrow_generator.athrow(ValueError)
+    athrow_type = type(athrow)
+
+    if sys.implementation.name == "pyre":
+        assert list(coroutine_wrapper_type.__dict__) == [
+            "__iter__",
+            "__next__",
+            "send",
+            "throw",
+            "close",
+            "__doc__",
+        ]
+        shared_awaitable_order = [
+            "__await__",
+            "__iter__",
+            "__next__",
+            "close",
+            "send",
+            "throw",
+            "__doc__",
+        ]
+        for awaitable_type in (asend_type, athrow_type):
+            assert [
+                name
+                for name in awaitable_type.__dict__
+                if name in shared_awaitable_order
+            ] == shared_awaitable_order
+
+    if hasattr(types, "MethodDescriptorType"):
+        for awaitable_type in (coroutine_wrapper_type, asend_type, athrow_type):
+            assert type(awaitable_type.__iter__) is types.WrapperDescriptorType
+            assert type(awaitable_type.__next__) is types.WrapperDescriptorType
+            assert type(awaitable_type.send) is types.MethodDescriptorType
+            assert type(awaitable_type.throw) is types.MethodDescriptorType
+            assert type(awaitable_type.close) is types.MethodDescriptorType
+        for awaitable_type in (asend_type, athrow_type):
+            assert type(awaitable_type.__await__) is types.WrapperDescriptorType
+            if hasattr(awaitable_type, "__del__"):
+                assert type(awaitable_type.__del__) is types.WrapperDescriptorType
+
+    word = tuple.__itemsize__
+    assert coroutine_wrapper_type.__basicsize__ == object.__basicsize__ + word
+    assert asend_type.__basicsize__ == object.__basicsize__ + 3 * word
+    assert athrow_type.__basicsize__ == object.__basicsize__ + 3 * word
+
+    if hasattr(asend, "__del__"):
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            assert asend.__del__() is None
+        assert len(recorded) == 1
+        assert str(recorded[0].message) == (
+            "coroutine method 'asend' of "
+            "'_generator_awaitable_type_contract.<locals>.async_generator' "
+            "was never awaited"
+        )
+    asend.close()
+
+    if hasattr(athrow, "__del__"):
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            assert athrow.__del__() is None
+        assert len(recorded) == 1
+        assert str(recorded[0].message) == (
+            "coroutine method 'athrow' of "
+            "'_generator_awaitable_type_contract.<locals>.async_generator' "
+            "was never awaited"
+        )
+    athrow.close()
+
+    if sys.implementation.name != "pypy":
+        for awaitable_type in (coroutine_wrapper_type, asend_type, athrow_type):
+            with assert_raises(TypeError) as raised:
+                awaitable_type.send({}, None)
+            assert str(raised.exception) == (
+                f"descriptor 'send' for '{awaitable_type.__name__}' objects "
+                "doesn't apply to a 'dict' object"
+            )
+
+    coroutine_wrapper.close()
+    if hasattr(asend_generator, "__del__"):
+        asend_generator.__del__()
+        athrow_generator.__del__()
+
+
+_generator_awaitable_type_contract()
+
+
 def _function_type_kwdefaults():
     def source(a, /, b, *, c):
         return a + b + c
