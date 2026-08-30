@@ -6473,6 +6473,31 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // linear `catch_exception/L`.
     clear_walk_exception(ctx);
 
+    // `pyopcode.py IMPORT_NAME` traces `get_builtin`, `getdebug`, and
+    // `get_w_globals` as ordinary reads from the live red frame.  The
+    // bytecode frontend exposes those reads as one-Ref residual helpers; fold
+    // them before CallFn recognition so the `__import__` gateway becomes a
+    // constant callable and the importer body can descend normally.
+    if ctx.is_authoritative_executor
+        && matches!(
+            foldable_runtime_helper,
+            majit_ir::RuntimeHelperKind::LoadImport
+                | majit_ir::RuntimeHelperKind::LoadImportLocals
+                | majit_ir::RuntimeHelperKind::LoadImportGlobals
+        )
+        && let Some(&frame_op) = r_args.first()
+        && try_walker_import_frame_read_fold(
+            ctx,
+            op.pc,
+            foldable_runtime_helper,
+            frame_op,
+            dst,
+            dst_bank,
+        )?
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // Offer the specific pop fold before generic builtin inlining. Now that
     // `list.pop` has a `__majit_wrap_*` gateway, the generic path finds its
     // jitcode and otherwise descends into the wrapper until `w_list_len`'s
