@@ -2368,6 +2368,13 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // stopped AT the merge point, before the opcode that would have spilled
     // `last_instr` for it.
     unsafe { (*concrete_callee_frame).last_instr = target_pc as isize - 1 };
+    // `do_recursive_call` bakes `portal_runner_adr`.  That address is what the
+    // runtime CALL_ASSEMBLER calls when the callee has no compiled loop yet:
+    // `compile_tmp_callback` routes it through `ll_portal_runner`, which begins
+    // an activation.  `_portal_ptr` names the body below that entry and is
+    // reached only from inside `ll_portal_runner` itself, so baking it here
+    // resumes a body whose prologue never ran — the callee never enters the
+    // JIT and the frame is forced instead.
     let funcbox = ctx.trace_ctx.const_int(portal_runner_adr);
     let next_instr_box = ctx.trace_ctx.const_int(target_pc as i64);
     let profiled_box = ctx.trace_ctx.const_int(is_being_profiled as i64);
@@ -3418,31 +3425,25 @@ pub(crate) fn walker_ec_leave(
 ///
 /// [`walker_ec_enter`] is the seeded-callee form: it has a live callee frame
 /// at recording time, so it mirrors every store concretely and takes a real
-/// vref of the frame.  The CALL_ASSEMBLER folds build their callee frame out
-/// of recorded operations alone — `emit_new_pyframe_inline_with_params` never
-/// materializes one during the walk — so there is nothing to store into and
-/// nothing to take a vref of until the compiled loop runs.  What is recorded
-/// here is the interpreter-level reading of `jit.virtual_ref(frame)`, which
-/// is the frame pointer itself (`_jit_vref.py lowleveltype = OBJECTPTR`, no
-/// allocation) and is exactly what [`pyre_interpreter::PyExecutionContext::enter`]
-/// stores.
+/// vref of the frame.  This fold builds its callee out of recorded operations
+/// alone, so what is recorded here is the interpreter-level reading of
+/// `jit.virtual_ref(frame)`: the frame pointer itself (`_jit_vref.py
+/// lowleveltype = OBJECTPTR`, no allocation), which is exactly what
+/// [`pyre_interpreter::PyExecutionContext::enter`] stores.
 ///
-/// ⛔ Recording a `VIRTUAL_REF` here instead — the spelling
-/// [`walker_ec_enter`] uses — is not available to this fold, and the
-/// difference is the callee's exit, not the enter.  `optimize_VIRTUAL_REF`
-/// seeds the materialized `JitVirtualRef` with `forced = NULL`
-/// (`virtualize.py:129`), and pyre's two portal doors resolve `topframeref`
-/// through `executioncontext::vref_referent`, which reads `forced` WITHOUT
-/// forcing.  An unforced vref therefore answers NULL at both:
-/// `install_current_frame` (`pyre-interpreter/src/eval.rs`) reads that as
-/// "not yet entered" and re-links the callee onto its own vref, and
-/// `leave_compiled_frame_chain` (`pyre-jit/src/call_jit.rs`) reads it as
-/// "not my frame" and silently declines the restore.  [`walker_ec_enter`]'s
-/// callee is inlined and reaches neither door; this fold's callee reaches
-/// both — `compile_tmp_callback` routes its CALL_ASSEMBLER through
-/// `ll_portal_runner_shim`, and the force/deopt legs call
-/// `jit_force_callee_frame`.  Publishing a vref here needs a signal those
-/// doors can decide without forcing, which does not exist yet.
+/// ⛔ Recording a `VIRTUAL_REF` here instead is measurable and is a net loss.
+/// The callee this fold builds is read back through `gettopframe_nohidden`,
+/// which is `force_vref`: `locals()` in a self-recursive callee forces on
+/// every call, and an unwind that crosses suspended copies of the frame
+/// forces once per crossing.  Each force is a GUARD_NOT_FORCED failure, and
+/// `ResumeGuardForcedDescr.handle_fail` never compiles one — it blackholes.
+/// Measured over the synthetic corpus, publishing the vref moves eight
+/// fixtures by one to three guard failures and moves two by +273
+/// (`recursive_forced_frame_kept_stack`) and +169
+/// (`selfrec_tail_exception_unwind`): +430 net, all of it blackholed.  The
+/// portal doors no longer need it — [`crate::PortalEntry`]'s caller names the
+/// door — so the remaining question is what makes those forces unnecessary,
+/// not how to spell the enter.
 ///
 /// Upstream reaches `ec.enter` on this path too: `interp_jit.py` puts
 /// `jit_merge_point` on `PyFrame.dispatch`, so the CALL_ASSEMBLER that
@@ -3508,14 +3509,10 @@ mod portal_frame_chain_tests {
     /// The fold's recorded `enter` publishes the callee frame itself, and its
     /// recorded `leave` restores `f_backref` — neither takes a vref.
     ///
-    /// The op shape is the contract, because the two portal doors this fold's
-    /// callee reaches (`install_current_frame` and `leave_compiled_frame_chain`)
-    /// resolve `topframeref` through `vref_referent`, which reads
-    /// `JitVirtualRef.forced` without forcing.  `optimize_VIRTUAL_REF` seeds
-    /// that field with `CONST_NULL` (`virtualize.py:129`), so a `VIRTUAL_REF`
-    /// recorded here would answer NULL at both doors: the first re-links the
-    /// callee onto its own vref, the second declines the restore.  See
-    /// [`record_ec_enter_frame_chain`] for the full argument.
+    /// The op shape is the contract because publishing a `VIRTUAL_REF` here
+    /// is a measured net loss: the forces it admits are GUARD_NOT_FORCED
+    /// failures, which are blackholed rather than compiled. See
+    /// [`record_ec_enter_frame_chain`] for the census.
     #[test]
     fn the_recorded_enter_and_leave_take_no_virtual_ref() {
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
@@ -3539,8 +3536,7 @@ mod portal_frame_chain_tests {
                 // `frame.f_backref = self.topframeref`
                 OpCode::GetfieldGcR,
                 OpCode::SetfieldGc,
-                // `self.topframeref = jit.virtual_ref(frame)`, whose
-                // interpreter-level reading is the frame pointer itself
+                // `self.topframeref = frame`
                 OpCode::SetfieldGc,
                 // `self.topframeref = frame.f_backref`
                 OpCode::GetfieldGcR,

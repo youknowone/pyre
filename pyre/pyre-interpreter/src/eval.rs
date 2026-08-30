@@ -828,18 +828,45 @@ pub fn capture_pyframe_root_area() -> *const () {
     PYFRAME_ROOT_AREA.with(|area| area as *const _ as *const ())
 }
 
-/// Advance the root walk one link along the `f_backref` chain.
+/// Whether `frame` is a collector-owned `PyFrame` rather than one of the
+/// header-prefixed `std::alloc` frames used by interpreter snapshots.
 ///
-/// `f_backref` holds a `jit.virtual_ref`, which at interpreter level is the
-/// caller frame pointer itself; once the JIT virtualizes an inlined callee the
-/// slot instead holds a `JitVirtualRef`, and reading that as a `PyFrame` would
-/// interpret its `virtual_token` word as frame fields.  Hop through the vref
-/// instead.  A still-virtual vref ends the walk: the frames it stands for have
-/// no heap image to visit, and `virtualref.py force_virtual_if_necessary`
-/// cannot run here because materializing one allocates.
+/// PyPy's `PyFrame` is a GC object: the root callback exposes the frame and
+/// the collector traces its fields later.  It never walks through a freshly
+/// copied frame during `collect_roots_in_nursery`, when only direct roots have
+/// been forwarded (`IncrementalMiniMarkGC.collect_roots_in_nursery`).  Pyre's
+/// explicit frame walker is needed only for the non-GC fallback.  Reading the
+/// header is safe for both representations because the fallback deliberately
+/// carries a zeroed `GcHeader` too (`alloc_fixed_array_with_header`'s frame
+/// counterpart in `pyframe.rs`).
 #[inline]
-unsafe fn chain_next_frame(f_backref: *mut PyFrame) -> *mut PyFrame {
-    crate::executioncontext::vref_referent(f_backref)
+unsafe fn is_gc_managed_pyframe(frame: *mut PyFrame) -> bool {
+    if frame.is_null() {
+        return false;
+    }
+    unsafe {
+        (*majit_gc::header::header_of(frame as usize)).type_id()
+            == crate::pyframe::PYFRAME_GC_TYPE_ID
+    }
+}
+
+/// Continue only through the non-GC fallback frame chain.
+///
+/// A managed `PyFrame` or `JitVirtualRef` has already been exposed through the
+/// slot visitor.  Its own type tracer owns the next edge; dereferencing it in
+/// the root phase would run ahead of the collector's gray/remembered-set walk.
+#[inline]
+unsafe fn raw_chain_next_frame(f_backref: *mut PyFrame) -> *mut PyFrame {
+    if f_backref.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        if (*majit_gc::header::header_of(f_backref as usize)).type_id() == 0 {
+            f_backref
+        } else {
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Forward the frame named by a `JitVirtualRef` stored in a frame-shaped slot.
@@ -1066,6 +1093,16 @@ pub unsafe fn walk_pyframe_roots_area(
         };
         visit_ec_slots(ambient_ec);
         while !frame.is_null() {
+            // A GC-managed PyFrame was exposed by the CURRENT_FRAME slot (or
+            // by the preceding raw frame's f_backref slot).  Stop here and let
+            // `pyframe_object_custom_trace` follow its fields after the
+            // collector reaches the gray/remembered-set phase.  Walking those
+            // fields now is earlier than PyPy's root contract and can observe
+            // a callee PyFrame still named by a pre-forward CALL_ASSEMBLER
+            // jitframe slot.
+            if unsafe { is_gc_managed_pyframe(frame) } {
+                break;
+            }
             // SAFETY: PyFrame pointers on the f_backref chain are valid
             // for the duration of the enclosing `eval_with_jit` call. A
             // minor collection is always synchronous with respect to the
@@ -1078,35 +1115,15 @@ pub unsafe fn walk_pyframe_roots_area(
             // holding a non-object word is harmless for the bump-pointer
             // nursery.
             //
-            // The walk runs for every frame on the chain, including
-            // ones the GC owns. For nursery-allocated frames the
-            // standard tracer ALSO covers their gc_ptr_offsets when it
-            // reaches the survivor copy; visiting the locals array
-            // items here from the original nursery payload is safe
-            // because root visiting runs before any internal-slot
-            // forwarding (the original payload is still intact). We
-            // intentionally do NOT call `majit_gc::gc_owns_object`
-            // here to gate this branch — that hook re-enters
-            // `with_cranelift_gc` with a `borrow_mut`, which panics
-            // when invoked from inside `collect_nursery` (the GC's
-            // own cell is already borrowed by the active alloc shim).
+            // Only a header-prefixed stdalloc frame reaches this branch.
+            // Collector-owned frames stop above and are traced from the
+            // survivor/old object by `pyframe_object_custom_trace`.
             let (arr_ptr, depth, next_frame) = unsafe {
                 let f_back_slot = &mut (*(frame)).f_backref as *mut *mut PyFrame;
                 visitor(&mut *(f_back_slot as *mut majit_ir::GcRef));
-                // The visitor above forwarded the slot, which for a vref leaves
-                // the vref itself put — it is old-gen, so mark-sweep does not
-                // move it — while the frame its `forced` slot names may be
-                // young and relocating. `forced` is an interior slot the
-                // collector reaches later, off the gray stack, but
-                // `chain_next_frame` reads it during THIS scan, so forward it
-                // here as well; otherwise the walk steps into a frame copy the
-                // collector is about to abandon, and the roots only this walker
-                // knows about (caught exceptions, module-dict cells, the
-                // prebuilt families) get forwarded into dead memory. A direct
-                // `f_backref` needs no such hop — the visitor already left it
-                // naming the live copy.
-                let f_backref = *f_back_slot;
-                forward_virtual_ref_forced(f_backref as *mut u8, visitor);
+                // A direct raw-frame backref can continue the fallback chain.
+                // A managed PyFrame or JitVirtualRef stops it: the collector's
+                // type tracer follows that object's interior edges later.
 
                 // pyframe.py:102 `self.pycode` — the running code object.
                 // Visited as a root so a code object reachable only via
@@ -1219,7 +1236,7 @@ pub unsafe fn walk_pyframe_roots_area(
                     }
                 }
                 let f = &*frame;
-                let next_frame = chain_next_frame((*frame).f_backref);
+                let next_frame = raw_chain_next_frame((*frame).f_backref);
                 if f.locals_cells_stack_w.is_null() {
                     (std::ptr::null_mut::<PyObjectRef>(), 0, next_frame)
                 } else {

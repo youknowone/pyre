@@ -79,6 +79,41 @@ fn virtualizable_array_read(graph: &FunctionGraph) -> (Variable, usize) {
     found.expect("a read of the virtualizable array")
 }
 
+/// Every `Variable` carrying `seed`'s value, followed across link arguments
+/// into the target block's `inputargs`.
+///
+/// `flowcontext.py newstate = state.copy()` freshens a variable at every
+/// block boundary, so a value produced in one block and used after a branch
+/// is a different `Variable` at the use site.  A search that compares
+/// identity stops at the first branch without this closure.
+fn link_aliases(graph: &FunctionGraph, seed: &Variable) -> Vec<Variable> {
+    let mut carried = vec![seed.clone()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                for (position, arg) in link.args.iter().enumerate() {
+                    let LinkArg::Value(value) = arg else {
+                        continue;
+                    };
+                    if !carried.contains(value) {
+                        continue;
+                    }
+                    let Some(target) = graph.block(link.target).inputargs.get(position) else {
+                        continue;
+                    };
+                    if !carried.contains(target) {
+                        carried.push(target.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    carried
+}
+
 /// `PyFrame::_check_stack_index` is `index >= self.stack_base() && index <
 /// locals_w!(self).len()` — a read of the virtualizable array whose only
 /// consumer is `len`.
@@ -207,14 +242,18 @@ fn address_of_the_vable_array_slot_is_marked_not_a_read() {
                 let Some(result) = op.result.as_ref() else {
                     continue;
                 };
-                // Only the read whose consumer is the root registration.
+                // Only the read whose consumer is the root registration.  The
+                // registration sits behind a short-circuit test of the frame's
+                // mobility, so the call is in a later block and the slot
+                // reaches it under a freshened `Variable`.
+                let carried = link_aliases(graph, result);
                 let feeds_add_root = graph.blocks.iter().any(|b| {
                     b.operations.iter().any(|o| {
                         matches!(
                             &o.kind,
                             OpKind::Call { target: CallTarget::FunctionPath { segments }, args, .. }
                                 if segments.last().is_some_and(|s| s == "try_gc_add_root")
-                                    && args.contains(result)
+                                    && args.iter().any(|a| carried.contains(a))
                         )
                     })
                 });

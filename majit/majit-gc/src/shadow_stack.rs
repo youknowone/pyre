@@ -1227,7 +1227,27 @@ pub fn resume_ref_slice_registered(ptr: *const i64) -> bool {
 /// blackhole frame's `registers_r` are stable after allocation
 /// (`prepare_virtuals` / `setposition` size them once; later fills only
 /// index), so the captured pointer stays valid for the whole window.
+#[track_caller]
 pub unsafe fn push_resume_ref_roots(slice: &mut [i64]) {
+    if !slice.is_empty() && crate::gc_is_nursery_object(slice.as_ptr() as usize) {
+        panic!(
+            "GC BUG: resume root slice points inside the movable nursery: ptr={:#x} len={} caller={}",
+            slice.as_ptr() as usize,
+            slice.len(),
+            std::panic::Location::caller(),
+        );
+    }
+    if std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some() {
+        const NURSERY_POISON_WORD: i64 = ((usize::MAX / 0xff) * 0xaa) as i64;
+        if let Some(index) = slice.iter().position(|&value| value == NURSERY_POISON_WORD) {
+            panic!(
+                "GC BUG: resume root slice contains nursery poison before registration: index={} len={} caller={}",
+                index,
+                slice.len(),
+                std::panic::Location::caller(),
+            );
+        }
+    }
     RESUME_REF_ROOTS_STACK.with(|ss| {
         ss.borrow_mut().push((slice.as_mut_ptr(), slice.len()));
     });

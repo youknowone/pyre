@@ -8175,16 +8175,17 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py: has_compiled_targets — check if a green key has
     /// compiled target tokens that a bridge can jump to.
     pub fn has_compiled_targets(&self, green_key: u64) -> bool {
-        // Consistent with has_compiled_loop: direct key only, no alias, and
-        // the warmstate token must still be live. warmstate.py:483-500 removes
-        // invalidated/dead cells before retracing; pyre's compiled_loops
-        // side-table must not make such a dead token look jumpable.
-        if !self.has_compiled_loop(green_key) {
-            return false;
-        }
-        self.compiled_loops
-            .get(&green_key)
-            .is_some_and(|c| !c.front_target_tokens.is_empty())
+        // `pyjitpl.py has_compiled_targets(token)` is exactly
+        // `bool(token) and bool(token.target_tokens)`: both halves belong to
+        // the SAME token returned by `warmstate.py get_procedure_token`.
+        // In particular, `compile_tmp_callback` may replace a cell's old loop
+        // token with a live callback token whose target list is empty while
+        // pyre's optimizer-only `compiled_loops` side table still retains the
+        // old loop state.  Reading that side table here makes the gate admit a
+        // target that `compile_trace` cannot obtain from the current token,
+        // so a function-entry trace repeatedly aborts as `ABORT_BAD_LOOP`.
+        self.entry_procedure_token(green_key)
+            .is_some_and(|token| token.has_target_tokens())
     }
 
     /// pyjitpl.py: compile_trace — try to compile the current
@@ -15334,7 +15335,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         jitcode: std::sync::Arc<crate::jitcode::JitCode>,
         argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
-        greenkey: Option<u64>,
+        greenkey: Option<PortalGreenKey>,
     ) -> Result<(), ChangeFrame> {
         // pyjitpl.py: f = self.newframe(jitcode, greenkey)
         let _ = self.newframe(jitcode, greenkey);
@@ -16272,7 +16273,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn newframe(
         &mut self,
         jitcode: std::sync::Arc<crate::jitcode::JitCode>,
-        greenkey: Option<u64>,
+        greenkey: Option<PortalGreenKey>,
     ) -> usize {
         // pyjitpl.py:2433: if jitcode.jitdriver_sd: portal_call_depth += 1
         if let Some(jd_no) = jitcode.jitdriver_sd() {
@@ -16280,8 +16281,8 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py:2435: self.call_ids.append(self.current_call_id)
             self.call_ids.push(self.current_call_id);
             // pyjitpl.py: enter_portal_frame(jitdriver_sd.index, unique_id)
-            if let Some(unique_id) = greenkey {
-                self.enter_portal_frame(jd_no, unique_id);
+            if let Some((unique_id, _)) = greenkey.as_ref() {
+                self.enter_portal_frame(jd_no, *unique_id);
             }
             // pyjitpl.py:2442: self.current_call_id += 1
             self.current_call_id += 1;
@@ -16289,16 +16290,12 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2443-2445: `if greenkey is not None and
         // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
         //     (jitcode.jitdriver_sd, greenkey, self.history.get_trace_position()))`.
-        if let (Some(gk), Some(jd_no)) = (greenkey, jitcode.jitdriver_sd())
+        if let (Some(gk), Some(jd_no)) = (greenkey.as_ref(), jitcode.jitdriver_sd())
             && self.is_main_jitcode(&jitcode)
             && let (Some(positions), Some(ctx)) =
                 (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
         {
-            // This entry point is reached with a bare `u64` greenkey — it
-            // predates the raw `(code_ptr, pc)` key and operates on
-            // sub-jitcodes — so the typed half is unavailable here. A caller
-            // that holds the greens should use `push_portal_trace_position`.
-            positions.push((jd_no, Some((gk, None)), ctx.get_trace_position()));
+            positions.push((jd_no, Some(gk.clone()), ctx.get_trace_position()));
         }
         // Bump the existing TraceCtx inline-depth counter so trace
         // recorder bookkeeping (already wired through pyre's tracer)
@@ -16308,7 +16305,7 @@ impl<M: Clone> MetaInterp<M> {
         // project the u64 greenkey into the raw slot verbatim —
         // pyjitpl.py:1396-1401 element-wise parity still holds because
         // this caller doesn't feed the recursion-depth walk.
-        let raw = (greenkey.unwrap_or_default() as usize, 0);
+        let raw = (greenkey.as_ref().map_or(0, |(key, _)| *key) as usize, 0);
         let _ = self.enter_inline_frame(raw);
         // pyjitpl.py: reuse / allocate MIFrame, push onto framestack.
         let frame = crate::pyjitpl::MIFrame::setup(jitcode, 0, greenkey, self.tracing.as_mut());
@@ -16374,7 +16371,8 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py:2470-2472: `if frame.greenkey is not None and
             // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
             //     (jitcode.jitdriver_sd, None, self.history.get_trace_position()))`.
-            if let (Some(_gk), Some(jd_no)) = (frame.greenkey, frame.jitcode.jitdriver_sd())
+            if let (Some(_gk), Some(jd_no)) =
+                (frame.greenkey.as_ref(), frame.jitcode.jitdriver_sd())
                 && self.is_main_jitcode(&frame.jitcode)
                 && let (Some(positions), Some(ctx)) =
                     (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
@@ -22653,7 +22651,7 @@ mod metainterp_static_data_tests {
         jc.replace_jitdriver_sd(Some(5));
         let jc = std::sync::Arc::new(jc);
 
-        meta.newframe(jc, Some(0xfeed));
+        meta.newframe(jc, Some((0xfeed, None)));
         meta.popframe(true);
 
         let ctx = meta.trace_ctx().expect("tracing must be active");
@@ -22714,7 +22712,10 @@ mod metainterp_static_data_tests {
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-        meta.perform_call(jc, &[], Some(0xcafe)).unwrap_err();
+        let typed = majit_ir::GreenKey::new(vec![0xcafe, 0xbeef]);
+        let hash = typed.get_uhash();
+        meta.perform_call(jc, &[], Some((hash, Some(typed.clone()))))
+            .unwrap_err();
         assert_eq!(
             meta.portal_trace_positions
                 .as_ref()
@@ -22724,7 +22725,7 @@ mod metainterp_static_data_tests {
         );
         let entry = &meta.portal_trace_positions.as_ref().unwrap()[0];
         assert_eq!(entry.0, idx);
-        assert_eq!(entry.1, Some((0xcafe, None)));
+        assert_eq!(entry.1, Some((hash, Some(typed))));
 
         meta.popframe(true);
         let positions = meta
@@ -22765,7 +22766,8 @@ mod metainterp_static_data_tests {
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-        meta.perform_call(jc, &[], Some(0xbabe)).unwrap_err();
+        meta.perform_call(jc, &[], Some((0xbabe, None)))
+            .unwrap_err();
         assert!(
             meta.portal_trace_positions
                 .as_ref()
@@ -22860,11 +22862,12 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
 
-        meta.perform_call(jc.clone(), &[], Some(0xa11)).unwrap_err();
+        meta.perform_call(jc.clone(), &[], Some((0xa11, None)))
+            .unwrap_err();
         record_ops(&mut meta, 5);
         meta.popframe(true);
 
-        meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
+        meta.perform_call(jc, &[], Some((0xb22, None))).unwrap_err();
         record_ops(&mut meta, 1);
         meta.popframe(true);
 
@@ -22883,11 +22886,12 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
 
-        meta.perform_call(jc.clone(), &[], Some(0xa11)).unwrap_err();
+        meta.perform_call(jc.clone(), &[], Some((0xa11, None)))
+            .unwrap_err();
         record_ops(&mut meta, 1);
         meta.popframe(true);
 
-        meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
+        meta.perform_call(jc, &[], Some((0xb22, None))).unwrap_err();
         record_ops(&mut meta, 5);
 
         assert_eq!(meta.find_biggest_function(), Some((0, (0xb22, None))));
@@ -22902,11 +22906,12 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
 
-        meta.perform_call(jc.clone(), &[], Some(0xa11)).unwrap_err();
+        meta.perform_call(jc.clone(), &[], Some((0xa11, None)))
+            .unwrap_err();
         record_ops(&mut meta, 5);
         meta.popframe(true);
 
-        meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
+        meta.perform_call(jc, &[], Some((0xb22, None))).unwrap_err();
         record_ops(&mut meta, 1);
         // Left open, and the recorder retired under it.
         meta.tracing = None;
@@ -22951,7 +22956,8 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
         // One inlined callee, sized by the ops recorded between its entries.
-        meta.perform_call(jc, &[], Some(CALLEE)).unwrap_err();
+        meta.perform_call(jc, &[], Some((CALLEE, None)))
+            .unwrap_err();
         record_ops(&mut meta, 5);
         meta.popframe(true);
         meta.tracing
@@ -23011,7 +23017,7 @@ mod metainterp_static_data_tests {
             Some(0),
             "the next trace starts from an empty log, not from None"
         );
-        meta.perform_call(jc, &[], Some(0xa11)).unwrap_err();
+        meta.perform_call(jc, &[], Some((0xa11, None))).unwrap_err();
         assert_eq!(
             meta.portal_trace_positions.as_ref().expect("Some").len(),
             1,
@@ -26018,6 +26024,59 @@ mod tests {
         assert!(
             !std::sync::Arc::ptr_eq(&fresh, &stale),
             "and it is a new token, not the invalidated one"
+        );
+    }
+
+    /// `compile_tmp_callback` replaces the cell's procedure token, but it
+    /// does not erase pyre's optimizer-side metadata for the displaced loop.
+    /// `pyjitpl.py has_compiled_targets(token)` asks only about the current
+    /// cell token, so the stale side table must not make the callback token
+    /// look like a jump target.
+    #[test]
+    fn a_tmp_callback_token_does_not_inherit_displaced_loop_targets() {
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let green_key = 4242;
+
+        let old_token = std::sync::Arc::new(JitCellToken::new(1));
+        old_token.set_compiled(Box::new(()));
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: std::sync::Arc::downgrade(&old_token),
+                meta: std::sync::Arc::new(()),
+                front_target_tokens: vec![crate::history::TargetToken::new_loop(1)],
+                front_entry_index: Some(0),
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces: indexmap::IndexMap::new(),
+                previous_tokens: Vec::new(),
+                loop_header_pc: Some(0),
+                next_global_opref: 0,
+            },
+        );
+
+        let callback_token = std::sync::Arc::new(JitCellToken::new(2));
+        callback_token.set_compiled(Box::new(()));
+        meta.warm_state_mut()
+            .memory_manager
+            .keep_loop_alive(&callback_token);
+        meta.warm_state_mut()
+            .attach_tmp_callback_to_interp(green_key, callback_token);
+
+        assert!(meta.has_compiled_loop(green_key));
+        assert!(
+            matches!(
+                meta.function_entry_step(green_key, green_key, (0, 0)),
+                crate::warmstate::FunctionEntryStep::NotHot
+            ),
+            "warmstate.py checks JC_TEMPORARY before the procedure token, so retained loop \
+             metadata must not make the callback runnable at function entry"
+        );
+        assert!(
+            !meta.has_compiled_targets(green_key),
+            "the current callback token has no target_tokens; the displaced \
+             loop's side-table targets belong to a different object"
         );
     }
 

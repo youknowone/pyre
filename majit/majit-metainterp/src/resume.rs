@@ -7331,23 +7331,35 @@ impl<'a> ResumeDataDirectReader<'a> {
         if self.virtualizable_root_base_depth.is_none() {
             self.virtualizable_root_base_depth =
                 Some(majit_gc::shadow_stack::resume_ref_roots_depth());
+            // RPython's ResumeDataDirectReader holds the virtualizable as a
+            // GC-traced reference while consume_vable_info restores its
+            // fields.  Root that owner before exposing any of its fields or
+            // running write_from_resume_data_partial: both operations may
+            // allocate, and a nursery PyFrame can move during either one.
+            // Registering a field inside the frame is not a substitute — its
+            // address moves with the owner.
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
+                    &mut self.virtualizable_ptr,
+                ));
+            }
         }
-        vinfo.push_resume_ref_roots(virtualizable);
+        vinfo.push_resume_ref_roots(self.virtualizable_ptr);
         // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1
-        let expected = vinfo.get_total_size(virtualizable) as i32;
+        let expected = vinfo.get_total_size(self.virtualizable_ptr) as i32;
         assert!(
             expected == vable_size - 1,
             "consume_vable_info: vinfo.get_total_size(0x{:x}) = {} != vable_size - 1 = {}",
-            virtualizable,
+            self.virtualizable_ptr,
             expected,
             vable_size - 1
         );
         // resume.py:1407
-        vinfo.reset_token_gcref(virtualizable);
+        vinfo.reset_token_gcref(self.virtualizable_ptr);
         // resume.py:1408 write_from_resume_data_partial reads the field
         // payload from the remaining `vable_size - 1` items, leaving the reader
         // positioned just past the vable section for the vref/frame chain.
-        vinfo.write_from_resume_data_partial(virtualizable, self);
+        vinfo.write_from_resume_data_partial(self.virtualizable_ptr, self);
     }
 
     /// resume.py consume_vref_and_vable
@@ -7933,21 +7945,9 @@ pub fn blackhole_from_resumedata<'a>(
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo, virtualizable_identity_override);
     drop(_cc_guard);
 
-    // resume.py: virtualizable pointer read by consume_vable_info.
-    // The virtualizable is the frame being resumed; RPython keeps it live in
-    // the GC-traced resume reader across the frame-chain build.  pyre has no
-    // GC transform, so root the reader's `virtualizable_ptr` slot for the
-    // chain-build window below: a multi-frame resume runs `consume_one_section`
-    // per caller, which materializes virtuals (allocator) and can trigger a
-    // minor collection.  That relocates the young virtualizable frame; an
-    // unrooted bare copy would then point at from-space (a freed frame whose
-    // `locals_cells_stack_w` reads null).  Registering the slot makes the root
-    // walker forward it in place, mirroring `ResumeDeadframeRoots`.
-    unsafe {
-        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
-            &mut resumereader.virtualizable_ptr,
-        ));
-    }
+    // consume_vable_info rooted `virtualizable_ptr` before restoring any
+    // fields.  The reader owns that root through this chain build and drops it
+    // with its `virtualizable_root_base_depth` scope.
 
     // resume.py:1332-1343
     // Build chain bottom-up: first frame acquired is the outermost.

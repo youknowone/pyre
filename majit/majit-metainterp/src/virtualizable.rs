@@ -2863,6 +2863,15 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         if vable_ptr.is_null() {
             return;
         }
+        // A nursery virtualizable moves as one GC object.  Its owner reference
+        // is already rooted by the resume reader / Ref register bank, and the
+        // PyFrame custom tracer follows locals_cells_stack_w after copying.
+        // Registering this field's interior address would instead leave the
+        // root stack pointing into poisoned from-space after the move.  Keep
+        // the narrow field-root adaptation only for stationary frames.
+        if majit_gc::gc_is_nursery_object(vable_ptr as usize) {
+            return;
+        }
         for array in &self.array_fields {
             match array.storage {
                 VableArrayStorage::DirectPointer => {

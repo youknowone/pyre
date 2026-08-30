@@ -111,7 +111,7 @@ pub struct MIFrame {
     pub return_f: Option<usize>,
     /// pyjitpl.py `MIFrame.greenkey` — set when this frame is a
     /// recursive portal call (pyjitpl.py:80).
-    pub greenkey: Option<u64>,
+    pub greenkey: Option<super::PortalGreenKey>,
     /// pyjitpl.py:91 `self._result_argcode = 'v'`.
     ///
     /// Single-byte argcode of the *previous* opimpl's result type
@@ -208,7 +208,7 @@ impl MIFrame {
     pub fn setup(
         jitcode: Arc<JitCode>,
         pc: usize,
-        greenkey: Option<u64>,
+        greenkey: Option<super::PortalGreenKey>,
         ctx: Option<&mut crate::trace_ctx::TraceCtx>,
     ) -> Self {
         let mut frame = Self::new(jitcode, pc);
@@ -1759,10 +1759,10 @@ mod tests {
         let _ = recorder.record_input_arg(Type::Int);
         let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, 0, sd);
 
-        let frame = MIFrame::setup(jitcode, 7, Some(0xfeed), Some(&mut ctx));
+        let frame = MIFrame::setup(jitcode, 7, Some((0xfeed, None)), Some(&mut ctx));
 
         assert_eq!(frame.pc, 7);
-        assert_eq!(frame.greenkey, Some(0xfeed));
+        assert_eq!(frame.greenkey, Some((0xfeed, None)));
         assert_eq!(frame._result_argcode, b'v');
         assert_eq!(frame.parent_snapshot, -1);
         assert_eq!(frame.unroll_iterations, 1);

@@ -530,7 +530,9 @@ pub fn try_gc_major_threshold_reached() -> bool {
 /// pass (shadowstack save/restore around safepoints). pyre has no
 /// such pass, so root registration is explicit at the call site.
 /// TODO: this is a known deviation from RPython.
-pub type GcAddRootHookFn = unsafe fn(slot: *mut *mut u8);
+/// Answers `false` when the backend declined the slot, so a caller that
+/// brackets the registration knows not to unregister a root it never took.
+pub type GcAddRootHookFn = unsafe fn(slot: *mut *mut u8) -> bool;
 pub type GcRemoveRootHookFn = fn(slot: *mut *mut u8);
 
 majit_gc::global_hook!(static GC_ADD_ROOT_HOOK: GcAddRootHookFn);
@@ -549,7 +551,9 @@ pub fn clear_gc_root_hooks() {
 }
 
 /// Register `slot` as a live GC root via the installed callback.
-/// Returns `true` when the callback was invoked.
+/// Returns `true` when the slot was registered — the callback both ran and
+/// accepted it.  A backend declines a slot it cannot forward, and the caller's
+/// `Drop` must not answer a decline with a removal.
 ///
 /// # Safety
 /// Caller must keep `slot` valid until [`try_gc_remove_root`] is
@@ -563,10 +567,7 @@ pub fn clear_gc_root_hooks() {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn try_gc_add_root(slot: *mut *mut u8) -> bool {
     match GC_ADD_ROOT_HOOK.get() {
-        Some(f) => {
-            unsafe { f(slot) };
-            true
-        }
+        Some(f) => unsafe { f(slot) },
         None => false,
     }
 }
@@ -982,8 +983,9 @@ mod tests {
         static REMOVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    unsafe fn mock_add_root(slot: *mut *mut u8) {
+    unsafe fn mock_add_root(slot: *mut *mut u8) -> bool {
         LAST_ROOT_PTR.with(|cell| cell.set(slot as usize));
+        true
     }
     fn mock_remove_root(slot: *mut *mut u8) {
         let _ = slot;

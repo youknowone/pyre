@@ -3189,6 +3189,15 @@ pub fn set_active_root_hooks(add: Option<AddRootFn>, remove: Option<RemoveRootFn
 /// The caller must ensure the slot remains valid until
 /// [`gc_remove_root`] is called with the same pointer.
 pub unsafe fn gc_add_root(slot: *mut GcRef) -> bool {
+    // A shadow-stack/root-map entry names a stationary slot whose contents
+    // the collector rewrites after moving its referent.  An address inside
+    // the nursery moves with its owner and becomes from-space after the first
+    // minor collection; registering it would make the root map itself stale.
+    // RPython's shadow-stack transform only assigns roots to fixed frame
+    // slots, while fields of GC objects are reached by tracing their owner.
+    if gc_is_nursery_object(slot as usize) {
+        return false;
+    }
     match ACTIVE_ADD_ROOT.get() {
         Some(f) => {
             unsafe { f(slot) };

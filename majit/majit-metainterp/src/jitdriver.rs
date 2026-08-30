@@ -5812,14 +5812,14 @@ impl<S: JitState> JitDriver<S> {
         // `warmstate.py maybe_compile_and_run`: a cell whose token was
         // `attached by compile_tmp_callback()` is NOT entered — upstream falls
         // straight to `jitcounter.tick(hash, increment_threshold)` and, on
-        // overflow, `bound_reached`. The pyre reading of "attached by
-        // compile_tmp_callback" is the absence of a `compiled_loops` meta
-        // (`has_runnable_compiled_loop`, which documents why): the temporary
-        // token has a body, so `has_compiled_loop` says yes, but MetaInterp
-        // never filed frontend meta for it. Binding the meta here rather than
-        // testing a predicate and unwrapping afterwards keeps the two in step —
-        // the fall-through below IS the counter processing upstream continues
-        // with. `has_compiled_loop` stays as the first conjunct: it is the
+        // overflow, `bound_reached`. `runnable_procedure_token` reads the
+        // cell-owned `JC_TEMPORARY` flag explicitly: a callback token has a
+        // body, and pyre may retain frontend metadata for the loop it
+        // displaced, so neither token nor metadata presence identifies it.
+        // Binding the token here rather than testing a predicate and
+        // unwrapping afterwards keeps the decision and execution in step — the
+        // fall-through below IS the counter processing upstream continues
+        // with. Token presence stays one conjunct: it is the
         // `cell.get_procedure_token() is not None` half (code present and not
         // invalidated), which the meta lookup alone does not imply, since
         // `invalidate_loop` deliberately leaves the meta in place.
@@ -5855,7 +5855,7 @@ impl<S: JitState> JitDriver<S> {
         #[cfg(feature = "__back-edge-stage-probe")]
         let carried_token = carried_procedure_token.is_some();
         if let Some(procedure_token) =
-            carried_procedure_token.or_else(|| self.meta.entry_procedure_token(green_key))
+            carried_procedure_token.or_else(|| self.runnable_procedure_token(green_key))
             && let Some(compiled_meta) = self.meta.get_compiled_meta(green_key).cloned()
         {
             // warmstate.py `WarmEnterState.make_entry_point` /
@@ -8061,21 +8061,30 @@ impl<S: JitState> JitDriver<S> {
     /// predicate is keyed by it.
     ///
     /// The `compiled_loops` half is asked FIRST, as the gate the token read
-    /// sits behind. Both conjuncts are pure reads of the same key, so the order
-    /// does not change the answer, but their costs are not alike: the frontend
-    /// half is one hash probe, and the token read is a `Weak::upgrade` and the
-    /// `Arc` drop that answers it, one atomic each. A key with no compiled
-    /// entry — which is every key a door declines on — now stops at the probe.
+    /// sits behind. The resolved cell's `JC_TEMPORARY` flag is then the final
+    /// filter, matching `WarmEnterState.maybe_compile_and_run`; retained
+    /// frontend metadata must not make a callback executable as the displaced
+    /// loop. These are pure reads of the same resolved key. A key with no
+    /// compiled entry — which is every key a door declines on — still stops at
+    /// the cheap map probe before the token's `Weak::upgrade` / `Arc` drop.
     #[inline]
     pub fn resolved_runnable_procedure_token(
         &self,
         green_key_hash: u64,
         make_green_key: impl FnOnce() -> GreenKey,
     ) -> (u64, Option<std::sync::Arc<majit_backend::JitCellToken>>) {
-        self.meta
-            .resolved_entry_procedure_token(green_key_hash, make_green_key, |cell_key| {
-                self.meta.get_compiled_meta(cell_key).is_some()
-            })
+        let (cell_key, token) =
+            self.meta
+                .resolved_entry_procedure_token(green_key_hash, make_green_key, |cell_key| {
+                    self.meta.get_compiled_meta(cell_key).is_some()
+                });
+        let token = token.filter(|_| {
+            !self
+                .meta
+                .warm_state_ref()
+                .procedure_token_is_temporary(cell_key)
+        });
+        (cell_key, token)
     }
 
     /// The token [`Self::has_runnable_compiled_loop`] says yes about, handed
@@ -8093,9 +8102,11 @@ impl<S: JitState> JitDriver<S> {
     /// token being present, not merely as something equivalent to it — so
     /// binding the token subsumes the first conjunct exactly. It does NOT
     /// subsume the second: `get_compiled_meta` reads the frontend
-    /// `compiled_loops` table, which a `compile_tmp_callback` token is never
-    /// filed in, so that test stays here explicitly. Everything the comment
-    /// above says about why the second conjunct exists applies unchanged.
+    /// `compiled_loops` table. Nor does either read subsume the cell-owned
+    /// `JC_TEMPORARY` flag: `compile_tmp_callback` can displace a real loop
+    /// while that loop's frontend metadata remains. Both tests therefore stay
+    /// here explicitly, matching the flag-first branch in upstream
+    /// `WarmEnterState.maybe_compile_and_run`.
     ///
     /// `green_key` must already name one cell — see [`Self::resolve_cell_key`],
     /// whose result is what a door should ask this with. A raw bucket hash
@@ -8105,9 +8116,13 @@ impl<S: JitState> JitDriver<S> {
         &self,
         green_key: u64,
     ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        self.meta
-            .entry_procedure_token(green_key)
-            .filter(|_| self.meta.get_compiled_meta(green_key).is_some())
+        self.meta.entry_procedure_token(green_key).filter(|_| {
+            !self
+                .meta
+                .warm_state_ref()
+                .procedure_token_is_temporary(green_key)
+                && self.meta.get_compiled_meta(green_key).is_some()
+        })
     }
 
     /// The back-edge door's whole answer from the warm-state policy that owns

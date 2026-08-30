@@ -768,8 +768,13 @@ pub fn opcode_swap<H: StackOpcodeHandler + ?Sized>(
 
 pub fn opcode_get_iter<H: IterOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
     let iterable = handler.pop_value()?;
+    // `PyFrame` can be the nursery frame materialised by an inlined
+    // CALL_ASSEMBLER.  PyPy's GC transform keeps the `self` livevar rooted
+    // across `space.iter()` and reloads it before `pushvalue`; the Rust borrow
+    // alone still names the evacuated copy after `iter_value` collects.
+    let anchor = handler.anchor();
     let iterator = handler.iter_value(iterable)?;
-    handler.push_value(iterator)
+    H::push_anchored(&anchor, iterator)
 }
 
 pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>(
@@ -795,9 +800,12 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
 
 pub fn opcode_unary_not<H: TruthOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
     let value = handler.pop_value()?;
+    // `space.is_true()` may call application code.  This is the explicit
+    // counterpart of the translated live `self` around PyPy's unary opcode.
+    let anchor = handler.anchor();
     let truth = handler.truth_value(value)?;
     let result = handler.bool_value_from_truth(truth, true)?;
-    handler.push_value(result)
+    H::push_anchored(&anchor, result)
 }
 
 pub fn opcode_binary_op<H: ArithmeticOpcodeHandler + ?Sized>(
@@ -806,8 +814,14 @@ pub fn opcode_binary_op<H: ArithmeticOpcodeHandler + ?Sized>(
 ) -> Result<(), PyError> {
     let b = handler.pop_value()?;
     let a = handler.pop_value()?;
+    // `binaryoperation()` in `pyopcode.py` keeps `self` live across the
+    // allocating `space.<op>(w_1, w_2)` and then calls `self.pushvalue`.
+    // RPython's shadow-stack transform forwards that livevar.  Anchor it
+    // explicitly here so a materialised nursery PyFrame is reloaded before
+    // the result push.
+    let anchor = handler.anchor();
     let result = handler.binary_value(a, b, op)?;
-    handler.push_value(result)
+    H::push_anchored(&anchor, result)
 }
 
 pub fn opcode_compare_op<H: ArithmeticOpcodeHandler + ?Sized>(
@@ -816,24 +830,29 @@ pub fn opcode_compare_op<H: ArithmeticOpcodeHandler + ?Sized>(
 ) -> Result<(), PyError> {
     let b = handler.pop_value()?;
     let a = handler.pop_value()?;
+    // Same translated-livevar obligation as `opcode_binary_op`: rich
+    // comparison may allocate or invoke application code before the push.
+    let anchor = handler.anchor();
     let result = handler.compare_value(a, b, op)?;
-    handler.push_value(result)
+    H::push_anchored(&anchor, result)
 }
 
 pub fn opcode_unary_negative<H: ArithmeticOpcodeHandler + ?Sized>(
     handler: &mut H,
 ) -> Result<(), PyError> {
     let value = handler.pop_value()?;
+    let anchor = handler.anchor();
     let result = handler.unary_negative_value(value)?;
-    handler.push_value(result)
+    H::push_anchored(&anchor, result)
 }
 
 pub fn opcode_unary_invert<H: ArithmeticOpcodeHandler + ?Sized>(
     handler: &mut H,
 ) -> Result<(), PyError> {
     let value = handler.pop_value()?;
+    let anchor = handler.anchor();
     let result = handler.unary_invert_value(value)?;
-    handler.push_value(result)
+    H::push_anchored(&anchor, result)
 }
 
 fn opcode_pop_jump_if<H: BranchOpcodeHandler + ?Sized>(

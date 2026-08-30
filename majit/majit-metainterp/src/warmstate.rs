@@ -1665,6 +1665,18 @@ impl WarmEnterState {
             .and_then(|cell| cell.get_procedure_token())
     }
 
+    /// Whether the resolved cell's current procedure token is the temporary
+    /// interpreter callback installed by `compile_tmp_callback`.
+    ///
+    /// `warmstate.py maybe_compile_and_run` reads `JC_TEMPORARY` before it
+    /// considers the token executable at a warm entry. Keep this on the cell,
+    /// where upstream owns it; a token body or pyre's retained
+    /// `compiled_loops` metadata cannot answer the same question.
+    pub(crate) fn procedure_token_is_temporary(&self, cell_key: u64) -> bool {
+        self.cell_by_key(cell_key)
+            .is_some_and(|cell| cell.flags & jc_flags::JC_TEMPORARY != 0)
+    }
+
     /// [`Self::get_procedure_token`] with the two flag reads taken OUT: the
     /// cell lookup, the `Weak::upgrade`, and the drop of the `Arc` it
     /// produced, and nothing else.
@@ -2301,9 +2313,12 @@ impl WarmEnterState {
 
     /// The function-entry door's whole answer, from ONE walk of the cell chain.
     ///
-    /// `warmstate.py maybe_compile_and_run` matches the cell once and then
-    /// reads `procedure_token = cell.get_procedure_token()` off it, taking the
-    /// counter path only when that token is absent. The door used to ask three
+    /// `warmstate.py maybe_compile_and_run` matches the cell once and tests
+    /// `JC_TEMPORARY` before reading
+    /// `procedure_token = cell.get_procedure_token()`. A temporary cell takes
+    /// the counter path even though its callback token is live. Otherwise the
+    /// counter path is taken only when no runnable loop token is present. The
+    /// door used to ask three
     /// separate questions of the same chain — `has_runnable_compiled_loop`
     /// before the gate, `should_trace_function_entry` inside it, and
     /// `has_runnable_compiled_loop` again to decide the run — so a call that
@@ -2311,11 +2326,11 @@ impl WarmEnterState {
     ///
     /// `has_compiled_meta` is the frontend half of `has_runnable_compiled_loop`
     /// (`compiled_loops`, a map the warm state does not own); the cell half is
-    /// read here. Both together are what makes a token runnable, so a bare
-    /// `compile_tmp_callback` token falls through to the counter exactly as it
-    /// did. It is a closure because the cell half is the cheaper question and
-    /// answers no for most calls: `warmstate.py` likewise reaches
-    /// `procedure_token` first and consults nothing else until it is there.
+    /// read here. Both together make an ordinary token runnable; the
+    /// cell-owned `JC_TEMPORARY` flag precedes them and makes a callback fall
+    /// through to the counter even when retained frontend metadata also
+    /// exists. The metadata test is a closure because the cell/token half is
+    /// the cheaper question and answers no for most ordinary calls.
     ///
     /// `engine_is_tracing` is `MetaInterp::is_tracing` — one global Option, not
     /// a per-cell flag. The door consulted it to skip the counter gate entirely
@@ -2330,8 +2345,30 @@ impl WarmEnterState {
     ) -> FunctionEntryStep {
         let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cell_by_key(cell_key) {
-            // The token read `maybe_compile_and_run` performs before it asks
-            // the counter anything. Only a runnable one returns here; the
+            // `warmstate.py maybe_compile_and_run` tests
+            // `JC_TRACING | JC_TEMPORARY` before reading the procedure token.
+            // A temporary callback has real machine code, and pyre may still
+            // retain the displaced loop's frontend metadata, so neither code
+            // presence nor `has_compiled_meta()` identifies this flag. Count
+            // it normally exactly as upstream does; never mix the callback
+            // token with that displaced loop metadata and enter it as a loop.
+            if cell.flags & jc_flags::JC_TEMPORARY != 0 {
+                if engine_is_tracing {
+                    return FunctionEntryStep::Proceed;
+                }
+                crate::mc_diag_bump(25);
+                return if self
+                    .counter
+                    .tick(self.bucket_of(cell_key), self.increment_function_threshold)
+                {
+                    FunctionEntryStep::Proceed
+                } else {
+                    FunctionEntryStep::NotHot
+                };
+            }
+            // The token read `maybe_compile_and_run` performs for a
+            // non-temporary cell before it asks the counter anything. Only a
+            // runnable one returns here; the
             // `is_compiled` / `is_tracing` census below still sees every other
             // cell, which is what keeps slots 23/64/65 counting what they did.
             if let Some(token) = cell
@@ -2417,23 +2454,6 @@ impl WarmEnterState {
             if !dead_token && cell.abort_count >= MAX_TRACE_ABORT_COUNT {
                 crate::mc_diag_bump(81); // abort_ceiling_refused
                 return FunctionEntryStep::NotHot;
-            }
-            // `warmstate.py maybe_compile_and_run`: JC_TEMPORARY is tested alongside
-            // JC_TRACING and, unlike JC_TRACING, counts normally.  This branch
-            // must precede JC_DONT_TRACE_HERE below: the temporary token is the
-            // interpreter callback used until the non-inlinable callee gets
-            // its own real trace, not evidence that the callee was already
-            // compiled separately.
-            if cell.flags & jc_flags::JC_TEMPORARY != 0 {
-                crate::mc_diag_bump(25);
-                return if self
-                    .counter
-                    .tick(self.bucket_of(cell_key), self.increment_function_threshold)
-                {
-                    FunctionEntryStep::Proceed
-                } else {
-                    FunctionEntryStep::NotHot
-                };
             }
             if cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0 {
                 if cell.has_seen_a_procedure_token() {
