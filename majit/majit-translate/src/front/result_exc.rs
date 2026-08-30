@@ -3554,10 +3554,15 @@ pub(crate) fn collapse_pos0_read(
 /// The one-argument `PyError` constructors this pass fuses, and the published
 /// helper each fuses into.
 ///
-/// Measured over the 301 distinct gateway wrappers: `type_error` is the only
-/// constructor that reaches a raise site, 681 occurrences, all of them in the
-/// shape below. Extending the table is a one-line change plus its helper.
-const FUSED_KIND_CTORS: &[(&str, &str)] = &[("type_error", "pyerror_type_error_to_exc_object")];
+/// Gateway wrappers contribute the `type_error` sites; the exact-int
+/// `int_floordiv` / `int_mod` bodies contribute the literal-message
+/// `zero_division` sites.  Each entry removes the Rust carrier aggregate from
+/// the generated JitCode while preserving the interpreter's exception-object
+/// materialisation as one opaque call.
+const FUSED_KIND_CTORS: &[(&str, &str)] = &[
+    ("type_error", "pyerror_type_error_to_exc_object"),
+    ("zero_division", "pyerror_zero_division_to_exc_object"),
+];
 
 /// Fuse `PyError::<kind>(msg)` and the `pyerror_to_exc_object` that consumes
 /// it into a single published call.
