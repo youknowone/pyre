@@ -90,11 +90,13 @@ pub const F_WITH_PACKED_CHANGE: i64 = 1 << 15;
 /// `W_CTypePointer._array_types`).  Thus a derived ctype dies with its last
 /// user while a repeated constructor still returns the live memoized object.
 #[crate::pyre_class("_cffi_backend.CType")]
-// `W_CTypeFunc._immutable_fields_` names `cif_descr`: the block is built once,
-// when the function type is created, and every later reader only reads it.
-// The declaration is what lets a call through a promoted function type fold
-// `exchange_size` / `exchange_args[i]` / `exchange_result` to trace constants.
-#[majit_macros::jit_immutable_fields("cif_descr")]
+// `W_CTypePtrOrArray._immutable_fields_` names `ctitem`, and
+// `W_CTypeFunc._immutable_fields_` names `fargs[*]`, `abi` and `cif_descr`:
+// each is written once, when the type is created, and every later reader only
+// reads it.  The `cif_descr` declaration is what lets a call through a
+// constant function type fold `exchange_size` / `exchange_args[i]` /
+// `exchange_result` to trace constants.
+#[majit_macros::jit_immutable_fields("ctitem", "fargs", "abi", "cif_descr")]
 pub struct W_CType {
     /// `W_CType.size` — the size of an instance, or -1 when unknown.
     pub size: i64,

@@ -38,6 +38,13 @@ pub const FLAVOR_CALLBACK: i64 = 9;
 
 /// `cdataobj.py W_CData` and the RPython subclasses sharing its typedef.
 #[crate::pyre_class("_cffi_backend._CDataBase")]
+// `W_CData._immutable_fields_` names `_ptr` and `ctype`; only `ctype` is
+// declared here.  `_ptr` is `rffi.CCHARP`, an integer-kind pointer, while this
+// field is spelled `*mut u8`, which is the erased spelling of a reference a
+// collector traces — declaring it would fold a raw C address into a reference
+// constant.  Declaring `ctype` is what lets a call through a constant cdata
+// fold its function type, and with it the `cif_descr` behind it.
+#[majit_macros::jit_immutable_fields("ctype")]
 #[derive(Default)]
 pub struct W_CData {
     /// `W_CData.ctype`.
