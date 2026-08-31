@@ -2403,10 +2403,23 @@ impl GcCache {
     /// keys a `_cache_size` slot, so a miss reports the value was already a
     /// tid and the caller keeps it verbatim.
     pub fn resolve_struct_tid(&self, cache_key: u64) -> Option<u32> {
+        self.resolve_struct_layout(cache_key).map(|(tid, _)| tid)
+    }
+
+    /// Resolve both halves that make a typed struct allocation sound: the
+    /// collector `tid` and the payload size owned by the same cached
+    /// `SizeDescr`.  RPython's `GcCache._cache_size[STRUCT]` hands allocation
+    /// and header emission one descriptor object, so these values cannot come
+    /// from different structs.  Pyre's frozen `BhDescr` wire value carries a
+    /// structural key and a size separately; its runtime resolver
+    /// uses this pair to reject a key that lands on a differently-sized cache
+    /// entry instead of stamping the foreign entry's tid on the requested
+    /// block.
+    pub fn resolve_struct_layout(&self, cache_key: u64) -> Option<(u32, usize)> {
         self._cache_size
             .get(&LLType::Struct(cache_key))
             .and_then(|d| d.as_size_descr())
-            .map(|sd| sd.type_id())
+            .map(|sd| (sd.type_id(), sd.size()))
     }
 
     /// Array counterpart of [`resolve_struct_tid`] keyed on

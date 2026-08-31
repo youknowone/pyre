@@ -5167,6 +5167,11 @@ fn register_thread_root_areas() {
             "fbw_finish_concrete",
         );
         register(
+            fbw_finish_payload_root_walker_area,
+            pyre_jit_trace::jitcode_dispatch::capture_fbw_finish_payload_root_area(),
+            "fbw_finish_payload",
+        );
+        register(
             walk_end_root_walker_area,
             pyre_jit_trace::trace::capture_walk_end_root_area(),
             "walk_end",
@@ -6063,6 +6068,13 @@ unsafe fn fbw_finish_concrete_root_walker_area(
     unsafe {
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_root_walker_area(data, visitor)
     };
+}
+
+unsafe fn fbw_finish_payload_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe { pyre_jit_trace::jitcode_dispatch::fbw_finish_payload_root_walker_area(data, visitor) };
 }
 
 /// The recording walk's own reference register banks, whose inline `ConstPtr`
