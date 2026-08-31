@@ -5233,7 +5233,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                     base + 3,
                     w_tuple_getitem(roots.get(base + 1), i as i64).unwrap_or(PY_NULL),
                 );
-                // tupleobject.py:137 `if not space.eq_w(items1[p], items2[p]):
+                // `_compare_tuples`: `if not space.eq_w(items1[p], items2[p]):
                 //     return getattr(space, name)(items1[p], items2[p])`
                 if !crate::baseobjspace::eq_w(roots.get(base + 2), roots.get(base + 3))? {
                     return compare(roots.get(base + 2), roots.get(base + 3), op);
