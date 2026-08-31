@@ -40,17 +40,10 @@
 try:
     import pypyjit
 
-    import sys
-
-    # The 0.8x..1.0x band is a raw-op-count property, and the wasm build
-    # records more raw ops per iteration than the native backends for the
-    # same body: the sweep put dynasm/cranelift in-band at 220..260 and wasm
-    # at 290..300, with no overlap.  One limit per backend family keeps the
-    # segmenting mechanism exercised on all three instead of parking wasm
-    # behind an exemption.
-    pypyjit.set_param(
-        "trace_limit=300" if sys.platform == "wasi" else "trace_limit=250"
-    )
+    # The 0.8x..1.0x band is a raw-op-count property; every backend records
+    # the same raw op count for this body, and the sweep put the band at
+    # 220..260.
+    pypyjit.set_param("trace_limit=250")
     pypyjit.set_param("threshold=20")
 except ImportError:
     pass

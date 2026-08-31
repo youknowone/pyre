@@ -33,6 +33,11 @@ use majit_ir::{
 // (`info.py:203-206`). What the tags still buy is disjoint index ranges,
 // so two descr kinds cannot collide on one `HeapCache` key — a flat
 // counter would have to preserve that much and nothing else.
+/// `symbolic.py:12 WORD` — the target pointer width. Every `Type::Ref`
+/// field is one pointer, so its descr width derives from the target
+/// instead of spelling a 64-bit literal.
+const WORD: usize = core::mem::size_of::<usize>();
+
 const FIELD_DESCR_TAG: u32 = 0x1000_0000;
 const ARRAY_DESCR_TAG: u32 = 0x2000_0000;
 const SIZE_DESCR_TAG: u32 = 0x3000_0000;
@@ -968,6 +973,10 @@ fn build_object_descr_group_with_extra_gc_edges(
             },
         )
         .collect();
+    debug_assert!(
+        specs.iter().all(|s| s.field_type != Type::Ref || s.field_size == WORD),
+        "a Ref field is one pointer; size it WORD, not a literal"
+    );
     let mut gc_edges: Vec<Arc<dyn FieldDescr>> = vec![W_CLASS_FIELD_DESCR.clone()];
     gc_edges.extend(extra_gc_edges.iter().cloned());
     let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
@@ -1062,6 +1071,10 @@ fn build_bare_gcstruct_descr_group(
             },
         )
         .collect();
+    debug_assert!(
+        specs.iter().all(|s| s.field_type != Type::Ref || s.field_size == WORD),
+        "a Ref field is one pointer; size it WORD, not a literal"
+    );
     let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
         SIZE_DESCR_TAG | (obj_size as u32 & 0x0FFF_FFFF),
         obj_size,
@@ -1108,7 +1121,7 @@ static STRINGBUILDER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new
             (
                 "current_buf",
                 rb::STRINGBUILDER_CURRENT_BUF_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -1144,7 +1157,7 @@ static STRINGBUILDER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new
             (
                 "extra_pieces",
                 rb::STRINGBUILDER_EXTRA_PIECES_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -1178,7 +1191,7 @@ static STRINGPIECE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
             (
                 "buf",
                 rb::STRINGPIECE_BUF_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -1187,7 +1200,7 @@ static STRINGPIECE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
             (
                 "prev_piece",
                 rb::STRINGPIECE_PREV_PIECE_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -1242,7 +1255,7 @@ static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_dict",
                 FLOAT_W_DICT_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -1251,7 +1264,7 @@ static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_slots",
                 FLOAT_W_SLOTS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -1878,18 +1891,18 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "start",
                 RANGE_START_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 true,
                 false,
             ),
-            ("stop", RANGE_STOP_OFFSET, 8, Type::Ref, false, true, false),
-            ("step", RANGE_STEP_OFFSET, 8, Type::Ref, false, true, false),
+            ("stop", RANGE_STOP_OFFSET, WORD, Type::Ref, false, true, false),
+            ("step", RANGE_STEP_OFFSET, WORD, Type::Ref, false, true, false),
             (
                 "length",
                 RANGE_LENGTH_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 true,
@@ -2061,7 +2074,7 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2154,7 +2167,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_function",
                 METHOD_W_FUNCTION_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 true,
@@ -2163,7 +2176,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_self",
                 METHOD_W_SELF_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 true,
@@ -2172,7 +2185,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_class",
                 METHOD_W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2181,7 +2194,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_module",
                 METHOD_W_MODULE_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2194,7 +2207,7 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2297,7 +2310,7 @@ static W_OBJECT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyL
         &[(
             "w_value",
             W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS[0],
-            8,
+            WORD,
             Type::Ref,
             false,
             false,
@@ -2332,7 +2345,7 @@ static W_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "contents",
                 core::mem::offset_of!(Cell, contents),
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2381,7 +2394,7 @@ static W_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// inherited Python class has to be a proper virtual field of this group.
 static W_SUPER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::descriptor::{W_SUPER_GC_TYPE_ID, W_SUPER_OBJECT_SIZE, W_Super};
-    let field = |key, offset| (key, offset, 8, Type::Ref, false, false, false);
+    let field = |key, offset| (key, offset, WORD, Type::Ref, false, false, false);
     build_object_descr_group_with_def_path(
         W_SUPER_OBJECT_SIZE,
         W_SUPER_GC_TYPE_ID,
@@ -2433,7 +2446,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "items",
                 std::mem::offset_of!(W_ListObject, items),
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2493,7 +2506,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "int_items.block",
                 std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_BLOCK_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2502,7 +2515,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "float_items.block",
                 std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_BLOCK_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2515,7 +2528,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2616,7 +2629,7 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "wrappeditems",
                 std::mem::offset_of!(W_TupleObject, wrappeditems),
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 true,
@@ -2625,7 +2638,7 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2686,7 +2699,7 @@ static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2735,7 +2748,7 @@ static SPECIALISED_TUPLE_FF_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2766,7 +2779,7 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
             (
                 "value0",
                 SPECIALISED_TUPLE_OO_VALUE0_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 true,
@@ -2775,7 +2788,7 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
             (
                 "value1",
                 SPECIALISED_TUPLE_OO_VALUE1_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 true,
@@ -2784,7 +2797,7 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -2958,7 +2971,7 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_start",
                 SLICE_START_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 true,
@@ -2967,7 +2980,7 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_stop",
                 SLICE_STOP_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 true,
@@ -2976,7 +2989,7 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_step",
                 SLICE_STEP_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 true,
@@ -3025,7 +3038,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "locals_cells_stack_w",
                 crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -3059,7 +3072,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "pycode",
                 crate::frame_layout::PYFRAME_PYCODE_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 true,
                 false,
@@ -3068,7 +3081,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.debugdata",
                 crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -3077,7 +3090,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.lastblock",
                 crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -3086,7 +3099,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.f_generator_nowref",
                 crate::frame_layout::PYFRAME_F_GENERATOR_NOWREF_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -3095,7 +3108,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.w_yielding_from",
                 crate::frame_layout::PYFRAME_W_YIELDING_FROM_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -3104,7 +3117,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.f_backref",
                 crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -3113,7 +3126,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.w_builtin",
                 crate::frame_layout::PYFRAME_W_BUILTIN_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -3403,16 +3416,14 @@ fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
     // collide with the first value field, e.g. `W_IntObject.intval`).
     Arc::new(PyreFieldDescr {
         offset: pyre_object::pyobject::W_CLASS_OFFSET,
-        // `WORD` on paper — the field is a `*mut PyObject`, so 4 bytes on
-        // wasm32, and the build-time descr pool already sizes it that way
-        // (`call.rs get_type_flag` → `layout::target_word_size()`). Deriving it
-        // here to match makes `synth/exception_traceback_loop_forms` lose one
-        // iteration's `e.__traceback__` on the wasm backend, so the two
-        // universes stay deliberately out of step until that is understood.
-        // `state.rs materialize_virtual_object` keys its w_class branch off
-        // `field_size == size_of::<*mut PyObject>()`, a guard that therefore
-        // never fires on wasm32.
-        field_size: 8,
+        // One pointer, sized from the target: the build-time descr pool
+        // sizes this field by `layout::target_word_size()` (`call.rs
+        // get_type_flag`), and the two universes must agree for the
+        // canonical-descr bridge (`make_descr_from_bh`) and for
+        // `state.rs materialize_virtual_object`'s w_class branch, both of
+        // which compare widths. A fixed 8 would also overlap the first
+        // payload field on wasm32, where the header is 8 bytes.
+        field_size: WORD,
         field_type: Type::Ref,
         signed: false,
         immutable: false,
@@ -4074,13 +4085,11 @@ pub fn type_version_tag_descr() -> DescrRef {
 /// One object per run for the identity reason [`W_CLASS_FIELD_DESCR`]
 /// documents — `heap.rs` keys its field cache on the `Arc` pointer, so a
 /// per-call descriptor would miss its own cache on every read.  The size
-/// follows the same descriptor's: 8 for a `PyObjectRef` on every target, not
-/// the 4 bytes a wasm32 pointer occupies.  `synth/type_name_attr_fold` reads
-/// the same name under wasm as under both native backends.
+/// follows the same descriptor's: one pointer, from the target.
 static TYPE_NAME_OBJ_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
     make_field_descr(
         core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, w_name),
-        8,
+        WORD,
         Type::Ref,
         false,
     )
@@ -4391,7 +4400,7 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
             (
                 "W_ObjectObject.storage",
                 core::mem::offset_of!(pyre_object::W_ObjectObject, storage),
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -4400,7 +4409,7 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -4446,7 +4455,7 @@ fn build_native_user_mapdict_group(
                 false,
                 false,
             ),
-            ("storage", storage_offset, 8, Type::Ref, false, false, false),
+            ("storage", storage_offset, WORD, Type::Ref, false, false, false),
         ],
         simple_name,
         def_path,
@@ -5093,7 +5102,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_class",
                 W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5102,7 +5111,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.args_w",
                 EXC_ARGS_W_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5115,7 +5124,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_context",
                 EXC_W_CONTEXT_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5130,7 +5139,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_cause",
                 EXC_W_CAUSE_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5139,7 +5148,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_traceback",
                 EXC_W_TRACEBACK_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5148,7 +5157,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_object",
                 EXC_W_OBJECT_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5157,7 +5166,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_start",
                 EXC_W_START_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5166,7 +5175,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_end",
                 EXC_W_END_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5175,7 +5184,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_reason",
                 EXC_W_REASON_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5184,7 +5193,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_encoding",
                 EXC_W_ENCODING_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5193,7 +5202,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_errno",
                 EXC_W_ERRNO_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5202,7 +5211,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_winerror",
                 EXC_W_WINERROR_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5211,7 +5220,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_strerror",
                 EXC_W_STRERROR_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5220,7 +5229,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_filename",
                 EXC_W_FILENAME_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5229,7 +5238,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_filename2",
                 EXC_W_FILENAME2_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5238,7 +5247,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_code",
                 EXC_W_CODE_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5247,7 +5256,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_value",
                 EXC_W_VALUE_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5256,7 +5265,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_exc_name",
                 EXC_W_NAME_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5265,7 +5274,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_attr_obj",
                 EXC_W_ATTR_OBJ_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5274,7 +5283,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_import_path",
                 EXC_W_IMPORT_PATH_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5283,7 +5292,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_import_name_from",
                 EXC_W_IMPORT_NAME_FROM_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5292,7 +5301,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_import_msg",
                 EXC_W_IMPORT_MSG_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5301,7 +5310,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_dict",
                 EXC_W_DICT_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5310,7 +5319,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_weakreflifeline",
                 EXC_W_WEAKREF_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5319,7 +5328,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_syntax_msg",
                 EXC_W_SYNTAX_MSG_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5328,7 +5337,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_syntax_filename",
                 EXC_W_SYNTAX_FILENAME_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5337,7 +5346,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_syntax_lineno",
                 EXC_W_SYNTAX_LINENO_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5346,7 +5355,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_syntax_offset",
                 EXC_W_SYNTAX_OFFSET_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5355,7 +5364,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_syntax_text",
                 EXC_W_SYNTAX_TEXT_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5364,7 +5373,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_syntax_end_lineno",
                 EXC_W_SYNTAX_END_LINENO_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5373,7 +5382,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_syntax_end_offset",
                 EXC_W_SYNTAX_END_OFFSET_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5382,7 +5391,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_syntax_print_file_and_line",
                 EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5391,7 +5400,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_syntax_metadata",
                 EXC_W_SYNTAX_METADATA_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5400,7 +5409,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_group_message",
                 EXC_W_GROUP_MESSAGE_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5409,7 +5418,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_group_exceptions",
                 EXC_W_GROUP_EXCEPTIONS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5418,7 +5427,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_group_exceptions_repr",
                 EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5551,7 +5560,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
             (
                 "PyTraceback.w_class",
                 W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5560,7 +5569,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
             (
                 "PyTraceback.frame",
                 PYTRACEBACK_FRAME_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5578,7 +5587,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
             (
                 "PyTraceback.w_next",
                 PYTRACEBACK_W_NEXT_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -5596,7 +5605,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
             (
                 "PyTraceback.w_code",
                 PYTRACEBACK_W_CODE_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
@@ -8245,15 +8254,12 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // which would otherwise answer with the parent's own entry.
             //
             // Only when the two spellings describe the same memory access.
-            // `new_w_class_field_descr` hardcodes `field_size: 8` while the
-            // codewriter sizes a pointer field by `layout::target_word_size()`
-            // (`call.rs get_type_flag`), so on wasm32 the incoming descr is a
-            // 4-byte load and the canonical one an 8-byte load at the same
-            // offset. Merging them there would widen the read over four bytes
-            // of the adjacent payload. That size split is deliberate and
-            // documented at `new_w_class_field_descr`; until it is resolved the
-            // bridge declines rather than papering over it, leaving those
-            // targets exactly as they were before the bridge existed.
+            // Both universes size a pointer field from the target
+            // (`new_w_class_field_descr` uses `WORD`, the codewriter
+            // `layout::target_word_size()`), so the widths agree on every
+            // target; the check stays as the guard that keeps a
+            // differently-sized spelling from being widened onto the
+            // canonical descr.
             if name.as_str() == "w_class"
                 && matches!(
                     owner.as_str(),
