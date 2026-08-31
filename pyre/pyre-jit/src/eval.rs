@@ -5486,7 +5486,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // warmspot.py handle_jitexception_from_blackhole parity:
     // portal_runner is called when ContinueRunningNormally is raised
     // at a recursive portal level during blackhole execution.
-    d.register_portal_runner(pyre_portal_runner);
+    majit_metainterp::blackhole::register_portal_runner_hook(pyre_portal_runner);
     // pypy/module/pypyjit/interp_jit.py PyPyJitDriver(..., is_recursive=True).
     // Drives MetaInterp.is_main_jitcode() / is_portal_jitcode dispatch
     // — without this flag the recursive-portal bookkeeping stays
@@ -9549,9 +9549,11 @@ fn portal_activation_bracketed(
 /// itself raises a JitException (warmspot.py:979-980 loop back).
 pub(crate) fn pyre_portal_runner(
     exc: &majit_metainterp::jitexc::JitException,
-) -> Result<(majit_metainterp::blackhole::BhReturnType, i64), majit_metainterp::jitexc::JitException>
-{
-    use majit_metainterp::blackhole::BhReturnType;
+) -> Result<
+    (majit_metainterp::blackhole::BhReturnType, i64),
+    majit_metainterp::blackhole::PortalRunnerFailure,
+> {
+    use majit_metainterp::blackhole::{BhReturnType, PortalRunnerFailure};
     use majit_metainterp::jitexc::JitException;
 
     let JitException::ContinueRunningNormally(args) = exc else {
@@ -9578,7 +9580,9 @@ pub(crate) fn pyre_portal_runner(
     let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
     let ec = all_r.get(2).copied().unwrap_or(0) as *const pyre_interpreter::PyExecutionContext;
     if frame_ptr.is_null() {
-        return Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(0)));
+        return Err(PortalRunnerFailure::jit(
+            JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(0)),
+        ));
     }
     let frame = unsafe { &mut *frame_ptr };
     // warmspot.py:976 forwards the CRN values to `portal_ptr`; it does not
@@ -9602,9 +9606,11 @@ pub(crate) fn pyre_portal_runner(
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => Ok((BhReturnType::Ref, result as i64)),
-        Err(mut err) => Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
-            err.to_exc_object() as usize,
-        ))),
+        // Never a `BailToInterpreter`: the re-entered portal body either
+        // returns or raises, so no terminal blackhole image is in flight here.
+        Err(mut err) => Err(PortalRunnerFailure::jit(
+            JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(err.to_exc_object() as usize)),
+        )),
     }
 }
 

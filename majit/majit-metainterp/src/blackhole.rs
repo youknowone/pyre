@@ -3231,11 +3231,21 @@ pub fn convert_and_run_from_pyjitpl(
         0
     };
 
+    // `warmspot.py:1010-1013` hands `ll_portal_runner` to the blackhole so a
+    // recursive portal level can re-enter the portal function.  Without it
+    // `handle_jitexception_dispatch` has nothing to call and
+    // `ContinueRunningNormally` reaches its `expect`.
+    let hook = PORTAL_RUNNER_HOOK.get().copied();
+    let portal_runner = hook.as_ref().map(|hook| {
+        hook as &dyn Fn(
+            &crate::jitexc::JitException,
+        ) -> Result<(BhReturnType, i64), PortalRunnerFailure>
+    });
     let outcome = run_forever_with_portal(
         builder,
         first_bh,
         current_exc,
-        None,
+        portal_runner,
         on_enter_level,
         on_leave_level,
         terminal_out,
@@ -6909,6 +6919,25 @@ fn bhimpl_hint_force_virtualizable(_r: i64) {}
 /// colouring reusing that register almost immediately
 /// (`rpython/tool/algo/regalloc.py:28-75`); a codewriter whose colours are
 /// not reused that densely needs the same clear at marker granularity.
+/// The interpreter's `portal_runner`, re-entering the portal function when
+/// `ContinueRunningNormally` is raised at a recursive portal level
+/// (`warmspot.py handle_jitexception_from_blackhole`).
+///
+/// Registered as a module hook rather than held on `JitDriver`, because the two
+/// production entries into `convert_and_run_from_pyjitpl` reach it with
+/// `MetaInterpStaticData` only — neither can name the driver that owns the
+/// callback.  Same shape as [`LiveMarkerHook`] beside it.
+pub type PortalRunnerHook =
+    fn(&crate::jitexc::JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>;
+
+static PORTAL_RUNNER_HOOK: std::sync::OnceLock<PortalRunnerHook> = std::sync::OnceLock::new();
+
+/// Install the [`PortalRunnerHook`]. First registration wins; later calls are
+/// ignored, so a consumer may call it from every driver install path.
+pub fn register_portal_runner_hook(hook: PortalRunnerHook) {
+    let _ = PORTAL_RUNNER_HOOK.set(hook);
+}
+
 pub type LiveMarkerHook = fn(&mut BlackholeInterpreter, usize);
 
 static LIVE_MARKER_HOOK: std::sync::OnceLock<LiveMarkerHook> = std::sync::OnceLock::new();

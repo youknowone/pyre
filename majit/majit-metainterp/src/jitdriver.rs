@@ -1777,21 +1777,6 @@ pub struct JitDriver<S: JitState> {
     blackhole_allocator: Option<Box<dyn crate::resume::BlackholeAllocator + Send>>,
     /// warmspot.py handle_jitexception parity: portal runner callback.
     /// Called when ContinueRunningNormally is raised at a recursive portal
-    /// level during blackhole execution. Re-enters the portal function
-    /// with green/red args and returns the result.
-    #[expect(
-        clippy::type_complexity,
-        reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
-    )]
-    portal_runner: Option<
-        Box<
-            dyn Fn(
-                    &crate::jitexc::JitException,
-                )
-                    -> Result<(crate::blackhole::BhReturnType, i64), crate::jitexc::JitException>
-                + Send,
-        >,
-    >,
     /// jtransform.py `portal_jd.index` — the `jitdrivers_sd` slot this
     /// driver's portal occupies. `call.py:147 jd.mainjitcode` holds the portal
     /// JitCode itself, so this driver stores only the slot; `None` until
@@ -2039,7 +2024,6 @@ impl<S: JitState> JitDriver<S> {
             entry_points: Vec::new(),
             is_recursive: false,
             blackhole_allocator: None,
-            portal_runner: None,
             portal_jd_index: None,
             state_field_fvc: None,
             entry_scratch: Some(Box::default()),
@@ -2097,23 +2081,6 @@ impl<S: JitState> JitDriver<S> {
         asm: &majit_translate::codewriter::assembler::Assembler,
     ) {
         self.meta.install_canonical_liveness(asm);
-    }
-
-    /// Register a portal runner callback for blackhole ContinueRunningNormally.
-    ///
-    /// warmspot.py handle_jitexception_from_blackhole parity:
-    /// called when ContinueRunningNormally is raised at a recursive portal
-    /// level. The callback re-enters the portal function and returns the result.
-    pub fn register_portal_runner(
-        &mut self,
-        runner: impl Fn(
-            &crate::jitexc::JitException,
-        )
-            -> Result<(crate::blackhole::BhReturnType, i64), crate::jitexc::JitException>
-        + Send
-        + 'static,
-    ) {
-        self.portal_runner = Some(Box::new(runner));
     }
 
     /// Register the dispatch JitCode singleton. Called once at install time
