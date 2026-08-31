@@ -11,6 +11,7 @@
 
 use crate::{PyError, make_builtin_function, make_builtin_function_with_arity};
 use pyre_object::*;
+use rustpython_wtf8::Wtf8Buf;
 
 use std::sync::OnceLock;
 
@@ -889,7 +890,7 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // `weakref_repr` closes the state with the referent's own `__name__`;
     // `proxy_repr` has no such suffix.
     let name = if is_proxy {
-        String::new()
+        Wtf8Buf::new()
     } else {
         referent_name_suffix(pyre_object::gc_roots::shadow_stack_get(obj_slot))?
     };
@@ -904,11 +905,19 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     };
     // The state also carries the referent's own address, which `getrepr`
     // does not.
-    Ok(pyre_object::w_str_new_managed(&format!(
-        "<{type_name} at {}; to '{objtype_name}' at {}{name}>",
-        crate::display::repr_addr(pyre_object::gc_roots::shadow_stack_get(self_slot) as usize),
-        crate::display::repr_addr(w_obj as usize),
-    )))
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        crate::display::wtf8_format!(
+            format!(
+                "<{type_name} at {}; to '{objtype_name}' at {}",
+                crate::display::repr_addr(
+                    pyre_object::gc_roots::shadow_stack_get(self_slot) as usize
+                ),
+                crate::display::repr_addr(w_obj as usize),
+            ),
+            name,
+            ">",
+        ),
+    ))
 }
 
 /// `weakref_repr`'s trailing ` (<name>)`: the referent's `__name__` resolved
@@ -921,20 +930,22 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// error indicator set and returns a repr regardless, which `repr()` then
 /// reports as an unrelated `SystemError`; the exception the lookup actually
 /// raised is the useful one.
-fn referent_name_suffix(w_obj: PyObjectRef) -> Result<String, PyError> {
+fn referent_name_suffix(w_obj: PyObjectRef) -> Result<Wtf8Buf, PyError> {
     let looked_up = unsafe { crate::baseobjspace::lookup_special(w_obj, "__name__")? };
     let Some(w_name) = looked_up else {
-        return Ok(String::new());
+        return Ok(Wtf8Buf::new());
     };
     if !unsafe { pyre_object::is_str(w_name) } {
-        return Ok(String::new());
+        return Ok(Wtf8Buf::new());
     }
-    // The repr is assembled as a `&str`, which cannot spell a lone
-    // surrogate; such a name is dropped rather than panicking the buffer.
-    match unsafe { pyre_object::w_str_get_value_opt(w_name) } {
-        Some(name) => Ok(format!(" ({name})")),
-        None => Ok(String::new()),
-    }
+    // The name is written with `%U`, which spells it as it stands; copying it
+    // out through a `&str` dropped one holding a lone surrogate.  Owned rather
+    // than borrowed because the repr allocates after this returns.
+    let mut suffix = Wtf8Buf::new();
+    suffix.push_str(" (");
+    suffix.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_name) });
+    suffix.push_str(")");
+    Ok(suffix)
 }
 
 /// pypy/module/_weakref/interp__weakref.py descr__init__weakref
