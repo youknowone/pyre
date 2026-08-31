@@ -356,7 +356,11 @@ pub(crate) fn set_profile_all_execution_contexts(
 /// `_settraceallthreads` / `_setprofileallthreads` generations, but when
 /// neither changed it need not enter the updater (and its mutex-bearing slow
 /// arms) at every opcode.
+/// `dont_look_inside`: the generation counters are process-global statics the
+/// tracer cannot model as fields; the caller residualizes the gate and the
+/// slow hook-application path stays behind it.
 #[inline(always)]
+#[majit_macros::dont_look_inside]
 pub(crate) fn all_thread_hooks_current(ec: &crate::PyExecutionContext) -> bool {
     ec.trace_all_generation == TRACE_ALL_GENERATION.load(Ordering::Acquire)
         && ec.profile_all_generation == PROFILE_ALL_GENERATION.load(Ordering::Acquire)

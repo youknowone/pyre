@@ -2833,6 +2833,13 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::module::thread::park_if_finalizing",
         thread_park_if_finalizing,
     );
+    let thread_all_hooks_current: fn(&crate::PyExecutionContext) -> bool =
+        crate::module::thread::all_thread_hooks_current;
+    p1(
+        &mut entries,
+        "pyre_interpreter::module::thread::all_thread_hooks_current",
+        thread_all_hooks_current,
+    );
     pa1(
         &mut entries,
         "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
