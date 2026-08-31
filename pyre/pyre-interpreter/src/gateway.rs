@@ -889,18 +889,19 @@ pub unsafe fn builtin_code_call(
     // the positional slice: counting it as the receiver would report the
     // keyword dict as the object the descriptor was called on.
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let receiver = positional.first().copied();
+    // `bind_kwargs_to_signature` lays out every declared slot and leaves the
+    // ones the call did not fill as `PY_NULL`, so a descriptor invoked with no
+    // receiver at all arrives with its `self` slot present but empty.  Reading
+    // that slot as an argument reported a missing receiver as a foreign one,
+    // and let a receiverless call past an owner carrying no layout test.
+    let receiver = positional.first().copied().filter(|r| !r.is_null());
     let owner = unsafe { (*code).owner };
     if !owner.is_null() {
         let owner = unsafe { &*owner };
         let accepted = matches!(receiver, Some(receiver)
             if owner.is_instance.is_none_or(|is_instance| is_instance(receiver)));
         if !accepted {
-            return Err(receiver_mismatch(
-                owner,
-                unsafe { (*code).name },
-                positional,
-            ));
+            return Err(receiver_mismatch(owner, unsafe { (*code).name }, receiver));
         }
     }
     // eval.py:16-23 — a `fast_natural_arity` of 0..=4 is the exact positional
@@ -1214,16 +1215,20 @@ pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
 /// foreign receiver.  Cold: it runs only on the failing call.
 #[cold]
 #[inline(never)]
-fn receiver_mismatch(owner: &MethodOwner, name: &str, args: &[PyObjectRef]) -> crate::PyError {
+fn receiver_mismatch(
+    owner: &MethodOwner,
+    name: &str,
+    receiver: Option<PyObjectRef>,
+) -> crate::PyError {
     let ty = owner.type_name;
     let slot_wrapper = is_slot_wrapper(ty, name);
-    let message = match args.first() {
+    let message = match receiver {
         None if slot_wrapper => format!("descriptor '{name}' of '{ty}' object needs an argument"),
         None => format!(
             "unbound method {}.{name}() needs an argument",
             method_qualifier(ty)
         ),
-        Some(&receiver) => {
+        Some(receiver) => {
             let received = crate::baseobjspace::object_functionstr_type_name(receiver);
             if slot_wrapper {
                 format!("descriptor '{name}' requires a '{ty}' object but received a '{received}'")

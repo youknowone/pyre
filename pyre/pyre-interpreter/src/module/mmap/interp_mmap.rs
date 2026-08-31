@@ -235,6 +235,13 @@ static MMAP_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 /// Reads (and lazily installs) the runtime-assigned `mmap` type object, not a
 /// build-time constant, so the JIT residualizes the call instead of tracing
 /// into it (`@dont_look_inside`, the `gc_interp::enabled` shape). The
+/// Whether `obj` has the `W_MMap` layout, including a Python subclass, where
+/// [`is_mmap`] tests the Python class and so declines one.
+#[cfg(any(unix, windows))]
+pub(crate) fn has_mmap_layout(obj: pyre_object::PyObjectRef) -> bool {
+    W_MMap::from_obj(obj).is_some()
+}
+
 /// `-> PyObjectRef` return fits a single word and it cannot raise.
 #[cfg(any(unix, windows))]
 #[majit_macros::dont_look_inside]

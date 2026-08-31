@@ -30,6 +30,16 @@ pub fn text_io_wrapper_type() -> PyObjectRef {
     textio::type_object()
 }
 
+/// Whether `obj` has the `W_BytesIO` layout, including a Python subclass.
+pub(crate) fn is_bytesio(obj: PyObjectRef) -> bool {
+    W_BytesIO::from_obj(obj).is_some()
+}
+
+/// Whether `obj` has the `W_StringIO` layout, including a Python subclass.
+pub(crate) fn is_stringio(obj: PyObjectRef) -> bool {
+    W_StringIO::from_obj(obj).is_some()
+}
+
 // CPython 3.14 raised the public and constructor default from 8 KiB to
 // 128 KiB.  Keep one module-owned value shared by every buffered type.
 pub(crate) const DEFAULT_BUFFER_SIZE: i64 = 128 * 1024;

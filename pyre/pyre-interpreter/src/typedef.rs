@@ -2217,8 +2217,32 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "types.SimpleNamespace" => crate::module::sys::vm::is_simple_namespace,
         "property" => pyre_object::descriptor::is_property,
         "super" => pyre_object::descriptor::is_super,
+        // These four publish their methods through `#[pyre_methods]`, whose
+        // generated wrapper answers a foreign receiver with its own
+        // `got wrong receiver type` wording, or trips its arity guard first
+        // and never reaches the receiver test at all.  `mmap.mmap` raised
+        // nothing whatever: `mmap.mmap.close(1)` read an `int` as a mapping.
+        "_io.BytesIO" => crate::module::_io::is_bytesio,
+        "_io.StringIO" => crate::module::_io::is_stringio,
+        "collections.deque" => crate::module::_collections::is_deque,
+        "mmap.mmap" => mmap_layout,
     }
     Some(untested_method_owner(type_name))
+}
+
+/// `mmap.mmap`'s layout test.  The module is not built for wasm32 or under
+/// `sandbox`, where the type is never created either, so the row above is
+/// dead there rather than wrong.
+fn mmap_layout(obj: PyObjectRef) -> bool {
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    {
+        crate::module::mmap::interp_mmap::has_mmap_layout(obj)
+    }
+    #[cfg(any(target_arch = "wasm32", feature = "sandbox"))]
+    {
+        let _ = obj;
+        false
+    }
 }
 
 /// The `MethodOwner` for a builtin type with no entry in the table above.
