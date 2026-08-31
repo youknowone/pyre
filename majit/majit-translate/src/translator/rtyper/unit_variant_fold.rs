@@ -83,22 +83,25 @@ pub(crate) fn intern_unit_variant_prebuilt_instance(qualname: &str) -> Option<Ho
 /// `SomePBC([InstanceDesc(<unit-variant>)])` to a singleton constant
 /// before `jtransform`).  Read by [`fold_unit_variant_ctors`] here and
 /// by `flowspace_adapter::is_synthetic_unit_variant_call`.
+///
+/// An LLBC-derived graph spells the ctor with its full module path and
+/// generic instantiation (`resolve_aggregate_adt` pushes the
+/// per-instantiation leaf, e.g. `pyre_interpreter::pyopcode::
+/// StepResult<*mut PyObject>::Continue`), so the owner segment is
+/// compared instantiation-stripped, the same way `result_ctor_kind`
+/// strips `Result<T, E>` before comparing.
 pub(crate) fn is_synthetic_unit_variant_path(segments: &[String]) -> bool {
-    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
-    matches!(
-        path.as_slice(),
-        ["LoopResult", "Done"]
-            | ["LoopResult", "ContinueRunningNormally"]
-            | ["JitAction", "Return"]
-            | ["JitAction", "Continue"]
-            | ["StepResult", "Continue"]
-            | ["CompareOp", "Lt"]
-            | ["CompareOp", "Le"]
-            | ["CompareOp", "Gt"]
-            | ["CompareOp", "Ge"]
-            | ["CompareOp", "Eq"]
-            | ["CompareOp", "Ne"]
-    )
+    let [head @ .., owner, name] = segments else {
+        return false;
+    };
+    let owner_base = owner.split_once('<').map_or(owner.as_str(), |(b, _)| b);
+    match (owner_base, name.as_str()) {
+        ("LoopResult", "Done" | "ContinueRunningNormally")
+        | ("JitAction", "Return" | "Continue")
+        | ("CompareOp", "Lt" | "Le" | "Gt" | "Ge" | "Eq" | "Ne") => head.is_empty(),
+        ("StepResult", "Continue") => head.is_empty() || head == ["pyre_interpreter", "pyopcode"],
+        _ => false,
+    }
 }
 
 /// Whether `name` is a shaped positional aggregate carrying no items:
@@ -223,6 +226,41 @@ mod tests {
     fn a_length_ending_in_zero_is_not_zero() {
         assert!(!is_zero_length_shaped_aggregate("Array<u8;20>"));
         assert!(!is_zero_length_shaped_aggregate("Array<u8;100>"));
+    }
+
+    /// The qualified, generic-instantiated spelling an LLBC graph carries
+    /// must match alongside the bare two-segment form; unrelated paths
+    /// and other variants of the same enum must not.
+    #[test]
+    fn qualified_instantiated_unit_variant_paths_match() {
+        let q = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_synthetic_unit_variant_path(&q(&[
+            "StepResult",
+            "Continue"
+        ])));
+        assert!(is_synthetic_unit_variant_path(&q(&[
+            "pyre_interpreter",
+            "pyopcode",
+            "StepResult<*mut PyObject>",
+            "Continue",
+        ])));
+        assert!(!is_synthetic_unit_variant_path(&q(&[
+            "pyre_interpreter",
+            "pyopcode",
+            "StepResult<*mut PyObject>",
+            "Yield",
+        ])));
+        assert!(!is_synthetic_unit_variant_path(&q(&[
+            "other_crate",
+            "StepResult",
+            "Continue",
+        ])));
+        assert!(!is_synthetic_unit_variant_path(&q(&[
+            "JitAction",
+            "Continue",
+            "Extra"
+        ])));
+        assert!(!is_synthetic_unit_variant_path(&q(&["Continue"])));
     }
 
     /// One prebuilt instance per shape, shared across graphs, as
