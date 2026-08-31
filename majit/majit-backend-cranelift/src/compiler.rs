@@ -284,10 +284,11 @@ fn match_metainterp_finish_descr(
 // JitFrame layout constants (`jitframe.py:61-83`)
 // The canonical layout lives in `majit_backend::jitframe`; re-export the
 // byte offsets here so uses inside this file stay terse.
-use majit_backend::deadframe::{FrameHeapOwner, jitframe_pool_enabled};
+use majit_backend::deadframe::FrameHeapOwner;
 use majit_backend::jitframe::{
-    BASEITEMOFS, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS, JF_GCMAP_OFS,
-    JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS,
+    BASEITEMOFS, HostHeapGc, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS,
+    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, check_jitframe_descr, jitframe_is_gc_object,
+    jitframe_write_barrier, malloc_jitframe_no_collect,
 };
 /// Byte offset of `jf_frame_length` from JitFrame start
 /// (`jitframe.py:84` — `jf_frame`'s length word sits at the array base).
@@ -295,126 +296,6 @@ const JF_FRAME_LENGTH_OFS: i32 = JF_FRAME_OFS as i32;
 /// Byte offset of `jf_frame[0]` from JitFrame start
 /// (`jitframe.py` — `BASEITEMOFS`: first item follows the length word).
 const JF_FRAME_ITEM0_OFS: i32 = JF_FRAME_OFS as i32 + BASEITEMOFS as i32;
-/// GC type id for JitFrame objects, assigned at runtime by the frontend
-/// that owns the GC type registry (pyre-jit registers OBJECT / W_INT /
-/// W_FLOAT before JITFRAME, so the JITFRAME id depends on that ordering
-/// and cannot be hard-coded here).
-///
-/// `u32::MAX` means "the frontend has published no id". Publishing is a
-/// precondition of installing a collector on this backend, not a hint the
-/// backend may supply for itself — see [`resolve_jitframe_heap`].
-///
-/// Published twice, to one value. The atomic is what a thread that never
-/// called [`set_jitframe_gc_type_id`] reads: pyre publishes once from
-/// `build_gc`, under a `Once`, and every later thread installs the singleton
-/// against that id. The thread-local is what the publishing thread itself
-/// reads, and it exists for the test binaries, where each thread builds its
-/// own collector and registers a different number of types ahead of JITFRAME:
-/// there the atomic holds whichever thread stored last, and a thread that read
-/// it would install an id naming some other collector's type.
-static JITFRAME_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
-
-thread_local! {
-    /// This thread's own publication (see [`JITFRAME_GC_TYPE_ID`]).
-    static JITFRAME_GC_TYPE_ID_LOCAL: Cell<Option<u32>> = const { Cell::new(None) };
-}
-
-/// Publish the JITFRAME type id. Called from the frontend after it has
-/// registered `jitframe_type_info()` on its collector, so that our nursery
-/// allocations (gc.alloc_nursery_no_collect_typed) use the same id the
-/// frontend assigned to the JITFRAME TypeInfo (jitframe.py).
-///
-/// Must precede the collector's install on this backend.
-pub fn set_jitframe_gc_type_id(id: u32) {
-    assert_ne!(
-        id,
-        u32::MAX,
-        "u32::MAX is the unpublished sentinel, not a type id"
-    );
-    JITFRAME_GC_TYPE_ID_LOCAL.with(|c| c.set(Some(id)));
-    JITFRAME_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
-}
-
-fn published_jitframe_gc_type_id() -> Option<u32> {
-    if let Some(id) = JITFRAME_GC_TYPE_ID_LOCAL.with(|c| c.get()) {
-        return Some(id);
-    }
-    match JITFRAME_GC_TYPE_ID.load(std::sync::atomic::Ordering::Acquire) {
-        u32::MAX => None,
-        id => Some(id),
-    }
-}
-
-/// Unpublish, for the fixture that asks what an install does with no id.
-///
-/// Safe to run beside the other fixtures despite clearing process-global
-/// state: every fixture that publishes reads its own thread-local back, so
-/// the atomic has no reader but a thread that never published.
-#[cfg(test)]
-fn clear_published_jitframe_gc_type_id() {
-    JITFRAME_GC_TYPE_ID_LOCAL.with(|c| c.set(None));
-    JITFRAME_GC_TYPE_ID.store(u32::MAX, std::sync::atomic::Ordering::Release);
-}
-
-/// Where this thread's jitframes are allocated from, as decided once by
-/// `install_gc_box` / `install_gc_standalone`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum JitFrameHeap {
-    /// GC-managed under this type id — `jitframe.py:48`
-    /// `lltype.malloc(JITFRAME, ...)`, reached through
-    /// `llmodel.py malloc_jitframe`.
-    Nursery(u32),
-    /// The installed allocator has no type table, so there is no shape to
-    /// allocate a frame under and the frame is a plain `Vec<i64>` block
-    /// outside both generations. Test-double allocators only; upstream has
-    /// no counterpart, because a translated backend always has a
-    /// `TypeLayoutBuilder`.
-    OffGc,
-}
-
-/// Decide, at install time, where this thread's jitframes come from.
-///
-/// RPython: rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
-/// called from jitframe_allocate (jitframe.py) — upstream registers the
-/// shape as part of translating the frontend, so the id is settled before any
-/// compiled code exists. This is the same ordering, made a precondition: a
-/// collector with a type table must arrive with its JITFRAME id already
-/// published, and one that arrives without it is a configuration error rather
-/// than a case to be recovered from.
-///
-/// There is no backend-side lazy registration any more, and its absence is the
-/// decision. Registering here means minting an id in whichever registry
-/// happens to be installed on the calling thread, which the frontend does not
-/// know about; it also means calling `register_type` on a registry the
-/// frontend may already have frozen (`gctypelayout.py:393-398` — after
-/// `encode_type_shapes_now` there are no new types), where the only outcomes
-/// are a panic or a shape the frontend cannot name.
-fn resolve_jitframe_heap(gc: &dyn GcAllocator) -> JitFrameHeap {
-    if !gc.has_type_registry() {
-        return JitFrameHeap::OffGc;
-    }
-    let Some(id) = published_jitframe_gc_type_id() else {
-        panic!(
-            "installing a collector with a type registry on the cranelift \
-             backend requires the JITFRAME type id: register \
-             majit_backend::jitframe::jitframe_type_info() on that collector \
-             and pass the id to set_jitframe_gc_type_id() BEFORE the install"
-        );
-    };
-    // The id is published process-wide but resolved against this collector, so
-    // an id minted in a different registry is caught here rather than at the
-    // first frame allocation, where it would name whatever type happens to sit
-    // at that index and the collector would copy jitframes under the wrong
-    // shape.
-    assert_eq!(
-        gc.type_size(id),
-        Some(majit_backend::jitframe::jitframe_type_info().size),
-        "published JITFRAME type id {id} does not name a JITFRAME in the \
-         collector being installed"
-    );
-    JitFrameHeap::Nursery(id)
-}
 
 /// Store a GC allocator in the cranelift backend thread-local and
 /// register the `majit_gc::set_active_*` function-pointer hooks,
@@ -425,11 +306,10 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
-    let jitframe_heap = resolve_jitframe_heap(gc.as_ref());
+    check_jitframe_descr(gc.as_ref());
     gc.freeze_types();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     set_cranelift_active_gc(Some(gc));
-    set_cranelift_jitframe_heap(Some(jitframe_heap));
     register_active_hooks(supports_guard_gc_type);
 }
 
@@ -533,13 +413,11 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
 /// the process-global `gc_sync` singleton (the per-thread GC box is the
 /// free-threading gap R4 removes).
 pub fn install_gc_standalone() {
-    let jitframe_heap = majit_gc::gc_sync::gc_op(|gc| {
-        let heap = resolve_jitframe_heap(gc);
+    majit_gc::gc_sync::gc_op(|gc| {
+        check_jitframe_descr(gc);
         gc.freeze_types();
-        heap
     });
     let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
-    set_cranelift_jitframe_heap(Some(jitframe_heap));
     register_active_hooks(supports_guard_gc_type);
 }
 
@@ -1530,16 +1408,6 @@ fn cranelift_type_for(tp: &Type) -> cranelift_codegen::ir::Type {
     }
 }
 
-thread_local! {
-    /// What `install_gc_box` / `install_gc_standalone` decided about this
-    /// thread's jitframes, cleared when the active GC is torn down.
-    ///
-    /// `None` means no install ran ON THIS THREAD, which is not the same as
-    /// "no GC": the `gc_sync` singleton is process-global while this cell is
-    /// per-thread. [`cranelift_jitframe_type_id`] is what tells the two apart.
-    static CRANELIFT_JITFRAME_HEAP: Cell<Option<JitFrameHeap>> = const { Cell::new(None) };
-}
-
 /// The per-thread GC box, and the accessors every trampoline reaches it through.
 ///
 /// `gc.py:30` `GcLLDescription.__init__` holds `self.gcdescr` as a plain field
@@ -1688,39 +1556,25 @@ fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
     gc_box::store(gc);
 }
 
-/// The type id to allocate this thread's jitframes under, or `None` for the
-/// off-GC `Vec` frame.
-///
-/// Three configurations, and the third is why this is not a plain cell read:
-///
-/// - an install ran on this thread: it already resolved the question, and its
-///   answer stands even if some other thread has since published a different
-///   id for its own collector;
-/// - no install ran anywhere reachable from here (`cranelift_gc_active()` is
-///   false): there is no collector, and the `Vec` frame is the configuration,
-///   not a fallback;
-/// - a collector is active but was installed on ANOTHER thread — the
-///   `gc_sync` singleton is process-global while the cell is per-thread. The
-///   published id is process-global too, so it answers; and if nothing
-///   published one, this fails rather than quietly handing back a `Vec` frame
-///   whose interior refs the collector would never trace.
+/// The `JITFRAME` type id of the descr in force on this thread, or `None`
+/// when its frames are host blocks — no collector, or one with no type
+/// table. Read by the layout descrs and the tests; the allocation itself
+/// goes through [`with_gc_ll_descr`].
 fn cranelift_jitframe_type_id() -> Option<u32> {
-    match CRANELIFT_JITFRAME_HEAP.with(|c| c.get()) {
-        Some(JitFrameHeap::Nursery(id)) => Some(id),
-        Some(JitFrameHeap::OffGc) => None,
-        None if !cranelift_gc_active() => None,
-        None => Some(published_jitframe_gc_type_id().unwrap_or_else(|| {
-            panic!(
-                "reached compiled code with a collector installed but no \
-                 JITFRAME type id published; the frontend must call \
-                 set_jitframe_gc_type_id() before installing the collector"
-            )
-        })),
-    }
+    with_cranelift_gc(|gc| gc.jitframe_type_id()).flatten()
 }
 
-fn set_cranelift_jitframe_heap(heap: Option<JitFrameHeap>) {
-    CRANELIFT_JITFRAME_HEAP.with(|c| c.set(heap));
+/// `cpu.gc_ll_descr`: the installed collector, or [`HostHeapGc`] —
+/// `get_ll_description(None)` (gc.py:653) picks the Boehm descr when no
+/// framework GC is configured, and this is that descr.
+fn with_gc_ll_descr<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
+    if gc_box::present() {
+        return gc_box::with_mut(f).expect("gc box present");
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|gc| f(gc));
+    }
+    f(&mut HostHeapGc)
 }
 
 fn cranelift_gc_active() -> bool {
@@ -4264,46 +4118,17 @@ extern "C" fn gc_alloc_lowlevel_string_shim(
 /// - The caller (the JIT-emitted dispatch path) has already published
 ///   all live fail-args into `old_jf->jf_frame[...]` via `emit_guard_exit`
 ///   spills; this helper only needs to copy those words verbatim.
-/// - Must run on the JIT thread that owns `CRANELIFT_ACTIVE_GC` /
-///   `CRANELIFT_JITFRAME_HEAP` thread-locals.
+/// - Must run on the JIT thread that owns the `CRANELIFT_ACTIVE_GC`
+///   thread-local.
 #[inline(never)]
 pub unsafe extern "C" fn cranelift_realloc_frame(old_jf: *mut i64, new_depth: usize) -> *mut i64 {
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8;
     let new_total = header_words + new_depth;
     let new_bytes = new_total * 8;
 
-    // llmodel.py:140 `new_frame = jitframe.JITFRAME.allocate(...)` —
-    // allocate from the GC nursery so the new frame is reclaimed once
-    // it falls out of the shadow-stack roots (matches the initial
-    // allocation strategy in compiler.rs).  Without a JITFRAME
-    // type id (host-test path that runs without a configured GC),
-    // fall back to libc-zeroed to keep behaviour defined.
-    let new_jf = match cranelift_jitframe_type_id() {
-        Some(type_id) => {
-            let gcref = with_cranelift_gc_required(|gc| {
-                gc.alloc_nursery_no_collect_typed(type_id, new_bytes)
-            });
-            assert_ne!(gcref.0, 0, "cranelift_realloc_frame: nursery alloc failed");
-            unsafe {
-                // jitframe.py:48 parity (compiler.rs): zero the
-                // header so jf_descr / jf_forward / jf_gcmap start at
-                // NULL; nursery alloc may not zero.
-                std::ptr::write_bytes(gcref.0 as *mut u8, 0, JF_FRAME_ITEM0_OFS as usize);
-            }
-            gcref.0 as *mut i64
-        }
-        None => {
-            // Reserves the header word the emitted write-barrier fast path
-            // reads at a negative offset, so this frame answers that read the
-            // way the nursery-allocated one above does.
-            let p = majit_backend::jitframe::alloc_off_gc_jitframe(new_bytes) as *mut i64;
-            assert!(!p.is_null(), "cranelift_realloc_frame: alloc failed");
-            // Host-test fallback only — register with the libc-jitframe
-            // tracer so any interior Ref scan still works.
-            majit_gc::shadow_stack::register_libc_jitframe(p as usize);
-            p
-        }
-    };
+    // llmodel.py:140 `new_frame = jitframe.JITFRAME.allocate(...)` — the
+    // descr allocates the new frame the same way it allocated the old one.
+    let new_jf = with_gc_ll_descr(|gc| malloc_jitframe_no_collect(gc, new_bytes)) as *mut i64;
 
     let old_base = old_jf as usize;
     let new_base = new_jf as usize;
@@ -8229,66 +8054,27 @@ fn run_compiled_code_inner(
     let jf_total = header_words + frame_depth;
     let payload_bytes = jf_total * 8;
 
-    // RPython gc.py malloc_jitframe → jitframe_allocate:
-    //   rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
-    //   frame = lltype.malloc(JITFRAME, frame_depth)
-    //
-    // When GC has a type registry (MiniMarkGC), allocate from nursery with
-    // JITFRAME type_id so the GC can copy+trace it correctly. The shadow
-    // stack holds a GcRef that the GC updates in place when copying.
-    // With no collector at all, or one with no type table (TrackingGc), fall
-    // back to Vec<i64>. `cranelift_jitframe_type_id` is what draws that line;
-    // a collector that could trace a frame but has no shape to allocate it
-    // under fails there rather than reaching this branch.
-    // jitframe_allocate (jitframe.py) allocates from the nursery
-    // via rgc.malloc. Nursery::alloc syncs from NURSERY_FREE_ADDR
-    // (incminimark.py:676 gc_adr_of_nursery_free parity) so JIT
-    // inline bumps and GC allocations share the same free pointer.
-    // jitframe.py:48 parity: allocate jitframes from nursery when GC
-    // type registry is available. The gcmap marks ref_root_slots, which
-    // are spilled/reloaded around collecting calls. Input slots are read
-    // once at entry (before any GC point) and their values live in
-    // SSA/ref_root_slots afterward.
-    let runtime_jitframe_tid = cranelift_jitframe_type_id();
-    let use_gc_alloc = runtime_jitframe_tid.is_some();
-    let (jf_gcref, heap_owner): (GcRef, Option<FrameHeapOwner>) = if use_gc_alloc {
-        let type_id = runtime_jitframe_tid.unwrap();
-        let gcref = with_cranelift_gc_required(|gc| {
-            gc.alloc_nursery_no_collect_typed(type_id, payload_bytes)
-        });
-        unsafe {
-            // jitframe.py:48 parity: zero the header so jf_descr starts
-            // as NULL (GuardNotForced checks jf_descr != 0), and zero the item
-            // slots too. RPython's nursery allocation hands back zeroed memory
-            // (zeroed once per nursery reset); ours does not, so a fresh frame
-            // must be cleared here.
-            std::ptr::write_bytes(gcref.0 as *mut u8, 0, payload_bytes);
-            *((gcref.0 + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = frame_depth;
-        }
-        (gcref, None)
-    } else {
-        // One leading word stands in for the GcHeader the nursery branch
-        // above puts in front of the frame: the emitted write-barrier fast
-        // path loads the flag byte at a negative offset from the frame
-        // pointer, so without it that load reads outside the buffer.
-        const HEADER_WORDS: usize = majit_gc::header::GcHeader::SIZE / 8;
-        const _: () = assert!(HEADER_WORDS * 8 == majit_gc::header::GcHeader::SIZE);
-        // Off the per-thread free list by default, or one `calloc`/`free` pair
-        // per compiled entry if the owned arm was selected — `FrameHeapOwner`
-        // is where the two differ, and the buffer it hands back is zeroed to
-        // `words` either way.
-        let mut buf = FrameHeapOwner::new(HEADER_WORDS + jf_total, jitframe_pool_enabled());
-        let gcref = GcRef(unsafe { buf.as_mut_ptr().add(HEADER_WORDS) } as usize);
+    // llmodel.py:298 `frame = self.gc_ll_descr.malloc_jitframe(frame_info)`:
+    // the descr decides whether the frame is a nursery object under JITFRAME
+    // — traced through `jf_gcmap`, held by the shadow stack through a root
+    // slot the collector updates when it copies — or a host block. Input
+    // slots are read once at entry (before any GC point) and their values
+    // live in SSA/ref_root_slots afterward.
+    let (use_gc_alloc, jf) = with_gc_ll_descr(|gc| {
+        (
+            jitframe_is_gc_object(gc),
+            malloc_jitframe_no_collect(gc, payload_bytes),
+        )
+    });
+    let jf_gcref = GcRef(jf as usize);
+    unsafe {
         // jitframe.py:84 parity — `jf_frame.length` is the count of `Signed`
-        // payload slots after the length word.  The GC-alloc branch above
-        // already does this at line 6282; mirror it here so frame-size
-        // checks (e.g. `emit_attached_bridge_dispatch`'s `frame_fits` gate)
-        // behave identically in nursery-backed and Vec-backed modes.
-        unsafe {
-            *((gcref.0 + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = frame_depth;
-        }
-        (gcref, Some(buf))
-    };
+        // payload slots after the length word.
+        *((jf_gcref.0 + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = frame_depth;
+    }
+    // A host block is the deadframe's to release; a nursery frame is the
+    // collector's.
+    let heap_owner = (!use_gc_alloc).then(|| FrameHeapOwner::of(jf));
 
     let jf_ptr = jf_gcref.0 as *mut i64;
 
@@ -8307,10 +8093,10 @@ fn run_compiled_code_inner(
         let repeats = majit_backend::deadframe::frame_build_repeats();
         majit_backend::deadframe::count_frame_build_passes(repeats);
         for _ in 0..repeats {
-            const HEADER_WORDS: usize = majit_gc::header::GcHeader::SIZE / 8;
-            let mut scratch = FrameHeapOwner::new(HEADER_WORDS + jf_total, jitframe_pool_enabled());
+            let base =
+                with_gc_ll_descr(|gc| malloc_jitframe_no_collect(gc, payload_bytes)) as *mut i64;
+            let mut scratch = FrameHeapOwner::of(base as *mut majit_backend::jitframe::JitFrame);
             unsafe {
-                let base = scratch.as_mut_ptr().add(HEADER_WORDS);
                 *((base as usize + JF_FRAME_LENGTH_OFS as usize) as *mut usize) = frame_depth;
                 inputs.write_into(base.add(header_words));
             }
@@ -8359,9 +8145,7 @@ fn run_compiled_code_inner(
     }
 
     // llmodel.py:322: llop.gc_writebarrier(ll_frame)
-    if use_gc_alloc {
-        with_cranelift_gc_required(|gc| gc.write_barrier(jf_gcref));
-    }
+    with_gc_ll_descr(|gc| jitframe_write_barrier(gc, jf));
 
     // llmodel.py:323 parity: ll_frame = func(ll_frame)
     // The `trace_N_entry` wrapper takes a second `dispatch_key` argument
@@ -15879,7 +15663,6 @@ impl Drop for CraneliftBackend {
         // its own; matching dynasm's
         // `runner.rs DYNASM_ACTIVE_GC` reset on backend teardown.
         gc_box::clear_on_teardown();
-        let _ = CRANELIFT_JITFRAME_HEAP.try_with(|c| c.set(None));
     }
 }
 
@@ -18920,10 +18703,10 @@ mod tests {
         return_ref
     }
 
-    /// Register JITFRAME on `gc` and publish its id, which is what a frontend
-    /// does before it installs its collector (`eval.rs build_gc` registers the
-    /// shape, then `set_jitframe_gc_type_id`, and only then
-    /// `install_gc_standalone`). `resolve_jitframe_heap` requires that
+    /// Register JITFRAME on `gc` and tell the descr its id, which is what a
+    /// frontend does before it installs its collector (`eval.rs build_gc`
+    /// registers the shape, then `set_jitframe_type_id`, and only then
+    /// `install_gc_standalone`). `check_jitframe_descr` requires that
     /// ordering of any collector that has a type registry.
     ///
     /// JITFRAME goes in AFTER whatever types the fixture registered for
@@ -18932,7 +18715,7 @@ mod tests {
     /// exercising an id the shipped configuration cannot produce.
     fn publish_jitframe_type(gc: &mut MiniMarkGC) -> u32 {
         let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
-        set_jitframe_gc_type_id(id);
+        gc.set_jitframe_type_id(id);
         id
     }
 
@@ -18960,7 +18743,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "JITFRAME")]
     fn test_gc_install_without_published_jitframe_id_panics() {
-        clear_published_jitframe_gc_type_id();
         let _backend = CraneliftBackend::with_gc_allocator(Box::new(MiniMarkGC::new()));
     }
 
@@ -18976,7 +18758,7 @@ mod tests {
     fn test_gc_install_with_a_foreign_jitframe_id_panics() {
         let mut gc = MiniMarkGC::new();
         let plain = gc.register_type(TypeInfo::simple(16));
-        set_jitframe_gc_type_id(plain);
+        gc.set_jitframe_type_id(plain);
         let _backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
     }
 

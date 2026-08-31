@@ -471,6 +471,9 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
 
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
+    // jitframe.py — a collector with a type table carries JITFRAME before install.
+    let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+    majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
     backend.set_gc_allocator(Box::new(gc));
     let token = JitCellToken::new(41);
 
@@ -522,6 +525,9 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
+        // jitframe.py — a collector with a type table carries JITFRAME before install.
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
         backend.set_gc_allocator(Box::new(gc));
         let token = JitCellToken::new(45);
 
@@ -559,6 +565,9 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
+        // jitframe.py — a collector with a type table carries JITFRAME before install.
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
         backend.set_gc_allocator(Box::new(gc));
         let token = JitCellToken::new(46);
 
@@ -599,6 +608,9 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
+        // jitframe.py — a collector with a type table carries JITFRAME before install.
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
         backend.set_gc_allocator(Box::new(gc));
         let token = JitCellToken::new(47);
 

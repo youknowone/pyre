@@ -15,93 +15,49 @@ use majit_ir::{DescrRef, GcRef};
 use crate::ExitRecoveryLayout;
 use crate::jitframe::{FIRST_ITEM_OFFSET, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame};
 
-/// The Rust-heap backing of a jitframe, and where the memory goes when the
-/// deadframe holding it dies.
+/// The host-heap frame a deadframe owns, and its release.
 ///
-/// A backend with no JITFRAME type id to allocate under builds its frames out
-/// of the Rust heap instead of the nursery, one per compiled entry. The buffer
-/// is not read through this handle — the frame pointer the compiled code was
-/// handed points into it — so all this type does is decide the lifetime, which
-/// is why it is `_heap_owner` on the deadframe and never read there either.
+/// A descr with no `JITFRAME` type id builds its frames on the host heap
+/// (`jitframe::malloc_jitframe`), one per compiled entry. The frame is not
+/// read through this handle — the frame pointer the compiled code was handed
+/// points into it — so all this type does is decide the lifetime, which is
+/// why it is `_heap_owner` on the deadframe and never read there either.
 ///
-/// Two arms, chosen per allocation by [`jitframe_pool_enabled`], because what
-/// one costs against the other is a difference that has to be taken inside one
-/// binary:
-///
-/// * [`FrameHeapOwner::POOLED`] — the DEFAULT — takes the buffer off a
-///   per-thread free list and puts it back on drop, so a steady entry rate pays
-///   the allocator nothing after the first few calls.
-/// * [`FrameHeapOwner::OWNED`] is the probe arm: `vec![0i64; words]` in, free on
-///   drop. One `calloc`/`free` pair per entry.
-///
-/// Pooled is the default because it is the closer shape to the arm this whole
-/// type stands in for. `jitframe_allocate` builds the frame out of the GC
-/// nursery, which is a bump allocator with no per-frame release at all — that
-/// is the `use_gc_alloc` branch, live wherever a JITFRAME type id is
-/// registered. The allocator round trip is the deviation, not the baseline, so
-/// a build that reaches this type gets the free list unless it asks otherwise.
-///
-/// Measured, on a compiled cel entry: pooled is 2.62 ns/entry faster, negative
-/// in 24 of 24 shape-runs, and it makes the steady compiled tier
-/// allocation-free (`allocs_per_eval` 1.000 -> 0.000).
+/// Where the block goes on release is the free list's decision
+/// ([`jitframe_pool_enabled`]): `jitframe_allocate` builds the frame out of
+/// the GC nursery, a bump allocator with no per-frame release at all, so a
+/// steady entry rate that pays the allocator nothing is the closer shape and
+/// the default. Measured, on a compiled cel entry: pooled is 2.62 ns/entry
+/// faster, negative in 24 of 24 shape-runs, and it makes the steady compiled
+/// tier allocation-free (`allocs_per_eval` 1.000 -> 0.000). The owned arm —
+/// one allocation and one free per entry — is the probe.
 pub struct FrameHeapOwner {
-    /// Never empty for a live frame; `Drop` takes it out to hand it back.
-    buf: Vec<i64>,
-    /// Which arm allocated it, and therefore which one has to release it. A
-    /// buffer must go back to the arm it came from: pushing an `OWNED` one onto
-    /// the free list would be sound but would silently convert the probe arm
-    /// into the pooled one after its first entry.
-    pooled: bool,
+    frame: *mut JitFrame,
 }
 
 impl FrameHeapOwner {
-    pub const OWNED: bool = false;
-    pub const POOLED: bool = true;
-
-    /// A zeroed `words`-word buffer for one frame.
-    ///
-    /// Zeroed and not merely sized: the frame's header starts at word 0 and
-    /// `GuardNotForced` reads `jf_descr != 0`, so a reused buffer carrying the
-    /// previous entry's descr would fail a guard that did not fail. The owned
-    /// arm gets that from `calloc`; the pooled arm has to spell it.
-    ///
-    /// `pooled` is [`FrameHeapOwner::POOLED`] unless a caller selected the
-    /// other arm; the single call site reads [`jitframe_pool_enabled`].
-    pub fn new(words: usize, pooled: bool) -> Self {
-        let buf = if pooled {
-            take_pooled_frame_buf(words)
-        } else {
-            count_owned_frame_buf();
-            vec![0i64; words]
-        };
-        FrameHeapOwner { buf, pooled }
-    }
-
-    /// The base of the buffer — the word the frame's own header sits behind.
-    #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut i64 {
-        self.buf.as_mut_ptr()
+    /// Take over a host-heap frame from `jitframe::malloc_jitframe`.
+    pub fn of(frame: *mut JitFrame) -> Self {
+        FrameHeapOwner { frame }
     }
 }
 
 impl Drop for FrameHeapOwner {
-    /// Release the buffer, which for the pooled arm means handing it back.
+    /// Release the frame, which for the pooled arm means parking its block.
     ///
     /// This runs when the deadframe holding it drops, and the deadframe is the
     /// last thing that reads the frame: the compiled run finished before the
     /// deadframe was built, and every accessor on it goes through
     /// `jf_gcref()`. So the interior pointer compiled code was handed is dead
-    /// by the time the buffer is offered to the next entry. The pool hands a
-    /// buffer out by REMOVING it from the free list, so two live frames can
+    /// by the time the block is offered to the next entry. The pool hands a
+    /// block out by REMOVING it from the free list, so two live frames can
     /// never be looking at one.
     fn drop(&mut self) {
-        if self.pooled {
-            give_back_pooled_frame_buf(std::mem::take(&mut self.buf));
-        }
+        unsafe { crate::jitframe::free_host_jitframe(self.frame) };
     }
 }
 
-/// Frame buffers a thread keeps rather than frees.
+/// Frame blocks a thread keeps rather than frees.
 ///
 /// Small because the count that matters is the number of frames live at once,
 /// not the entry rate: entries are nested only by `execute_bridge` recursion
@@ -110,45 +66,28 @@ impl Drop for FrameHeapOwner {
 /// footprint without costing the ordinary one anything.
 const FRAME_POOL_CAPACITY: usize = 8;
 
-/// A buffer parked on the free list: a `Vec<i64>` taken apart into its three
-/// words, and put back together exactly as it was.
+/// A block parked on the free list: the base `jitframe::alloc_off_gc_jitframe`
+/// got from the allocator, and the size its slot records.
 #[derive(Clone, Copy)]
-struct ParkedBuf {
-    ptr: *mut i64,
-    len: usize,
-    cap: usize,
+struct ParkedBlock {
+    base: *mut u8,
+    total: usize,
 }
 
-impl ParkedBuf {
-    const EMPTY: ParkedBuf = ParkedBuf {
-        ptr: std::ptr::null_mut(),
-        len: 0,
-        cap: 0,
+impl ParkedBlock {
+    const EMPTY: ParkedBlock = ParkedBlock {
+        base: std::ptr::null_mut(),
+        total: 0,
     };
-
-    fn park(buf: Vec<i64>) -> Self {
-        let mut buf = std::mem::ManuallyDrop::new(buf);
-        ParkedBuf {
-            ptr: buf.as_mut_ptr(),
-            len: buf.len(),
-            cap: buf.capacity(),
-        }
-    }
-
-    fn unpark(self) -> Vec<i64> {
-        // Safety: `park` took these three from a live `Vec<i64>` and nothing
-        // else has owned them since.
-        unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) }
-    }
 }
 
-/// Frees a thread's parked buffers when the thread exits.
+/// Frees a thread's parked blocks when the thread exits.
 ///
 /// `FRAME_POOL` has no destructor so that its access path stays the direct
 /// one; this key has one, and is touched exactly once per thread, on the
 /// first park, which is what registers it. Thread-local destructors run in
 /// no fixed order, but a key without one stays readable throughout, so the
-/// pool is still there when this runs. A buffer parked after it ran — a
+/// pool is still there when this runs. A block parked after it ran — a
 /// deadframe dropped during thread teardown — is the one case that leaks.
 struct PoolReaper;
 
@@ -157,7 +96,7 @@ impl Drop for PoolReaper {
         let _ = FRAME_POOL.try_with(|pool| {
             let mut pool = pool.borrow_mut();
             for parked in &pool.free[..pool.free_len] {
-                drop(parked.unpark());
+                unsafe { crate::jitframe::dealloc_off_gc_block(parked.base, parked.total) };
             }
             pool.free_len = 0;
         });
@@ -174,16 +113,16 @@ thread_local! {
 /// kept on a key the hot path never touches.
 #[derive(Clone, Copy)]
 struct FramePool {
-    free: [ParkedBuf; FRAME_POOL_CAPACITY],
+    free: [ParkedBlock; FRAME_POOL_CAPACITY],
     free_len: usize,
     /// Whether `POOL_REAPER` has been registered on this thread.
     reaper_armed: bool,
-    /// Buffers the owned arm asked the allocator for.
+    /// Blocks the owned arm asked the allocator for.
     owned: u64,
-    /// Buffers the pooled arm handed out.
+    /// Blocks the pooled arm handed out.
     taken: u64,
-    /// …of which the free list was empty for, so the allocator was asked after
-    /// all. `taken - misses` is what pooling actually saved.
+    /// …of which the free list had nothing usable for, so the allocator was
+    /// asked after all. `taken - misses` is what pooling actually saved.
     misses: u64,
 }
 
@@ -192,29 +131,17 @@ thread_local! {
     ///
     /// The effect being bought is 2.62 ns per entry. A pool shared between
     /// threads costs an uncontended atomic read-modify-write pair to take and to
-    /// return a buffer, which is the same order as the saving, so a process-wide
+    /// return a block, which is the same order as the saving, so a process-wide
     /// free list would hand back what it was built to remove. Sharding by thread
     /// is what leaves the take and the return as plain pops and pushes.
     ///
     /// A field would be the alternative to a `thread_local!`, and there is no
     /// object to make it a field of: `run_compiled_code` and
-    /// `FrameHeapOwner::drop` share no owner, and the buffer is taken by one
-    /// and returned by the other, in a different scope and after the caller
-    /// has moved on.
-    ///
-    /// Per-thread is also the right scope for the lifetime, not merely a cheap
-    /// one. A buffer is taken and returned inside one compiled entry, which runs
-    /// to completion on its caller's thread and never hands the frame to another;
-    /// a buffer parked on some other thread's list is one this entry could not
-    /// have used.
-    ///
-    /// Handing a buffer out REMOVES it from `free`, so two live frames can never
-    /// address one. Every access is `try_with`: a frame outliving its thread's
-    /// TLS teardown would otherwise panic inside a `Drop`, and falling back to
-    /// the allocator is the answer there.
+    /// `execute_token` are free functions on the backend, and the backend
+    /// value itself is not on the entry path.
     static FRAME_POOL: RefCell<FramePool> = const {
         RefCell::new(FramePool {
-            free: [ParkedBuf::EMPTY; FRAME_POOL_CAPACITY],
+            free: [ParkedBlock::EMPTY; FRAME_POOL_CAPACITY],
             free_len: 0,
             reaper_armed: false,
             owned: 0,
@@ -224,48 +151,60 @@ thread_local! {
     };
 }
 
-fn take_pooled_frame_buf(words: usize) -> Vec<i64> {
-    let pooled = FRAME_POOL.try_with(|pool| {
-        let mut pool = pool.borrow_mut();
-        pool.taken += 1;
-        if pool.free_len == 0 {
-            pool.misses += 1;
-            None
-        } else {
-            pool.free_len -= 1;
-            Some(pool.free[pool.free_len].unpark())
-        }
-    });
-    match pooled {
-        Ok(Some(mut buf)) => {
-            // Grow-only. A frame is 21-22 words on the shapes measured so far
-            // and 16 more on the tall ones, so the list converges on the tallest
-            // frame the thread has run and stops resizing.
-            if buf.len() < words {
-                buf.resize(words, 0);
-            }
-            buf[..words].fill(0);
-            buf
-        }
-        _ => vec![0i64; words],
+/// A parked block of at least `total` bytes, for `alloc_off_gc_jitframe`.
+///
+/// `None` when the arm is owned (tallied as such), the list is empty, or its
+/// top block is too small — that one is released, so the list converges on
+/// the tallest frame the thread has run and stops churning.
+pub(crate) fn take_pooled_block(total: usize) -> Option<*mut u8> {
+    if !jitframe_pool_enabled() {
+        count_owned_frame_block();
+        return None;
     }
+    FRAME_POOL
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            pool.taken += 1;
+            if pool.free_len == 0 {
+                pool.misses += 1;
+                return None;
+            }
+            pool.free_len -= 1;
+            let parked = pool.free[pool.free_len];
+            if parked.total >= total {
+                return Some(parked.base);
+            }
+            pool.misses += 1;
+            unsafe { crate::jitframe::dealloc_off_gc_block(parked.base, parked.total) };
+            None
+        })
+        .ok()
+        .flatten()
 }
 
-fn give_back_pooled_frame_buf(buf: Vec<i64>) {
-    // A full list, or no list: `buf` drops and the allocator takes it back.
-    let _ = FRAME_POOL.try_with(|pool| {
-        let mut pool = pool.borrow_mut();
-        if pool.free_len < FRAME_POOL_CAPACITY {
+/// Park a block on the free list. `false` when it must go back to the
+/// allocator instead: the owned arm, a full list, or no list.
+pub(crate) fn give_back_pooled_block(base: *mut u8, total: usize) -> bool {
+    if !jitframe_pool_enabled() {
+        return false;
+    }
+    FRAME_POOL
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.free_len >= FRAME_POOL_CAPACITY {
+                return false;
+            }
             if !pool.reaper_armed {
                 pool.reaper_armed = true;
                 // First touch registers its destructor for this thread.
                 let _ = POOL_REAPER.try_with(|_| ());
             }
             let at = pool.free_len;
-            pool.free[at] = ParkedBuf::park(buf);
+            pool.free[at] = ParkedBlock { base, total };
             pool.free_len += 1;
-        }
-    });
+            true
+        })
+        .unwrap_or(false)
 }
 
 /// Tally one owned allocation.
@@ -275,7 +214,7 @@ fn give_back_pooled_frame_buf(buf: Vec<i64>) {
 /// This is charged to the OWNED arm alone, and the default arm is not OWNED —
 /// so it is a cost of the probe, not of the shipping path. Anyone reading an
 /// owned-arm figure should read it as the allocator round trip plus this.
-fn count_owned_frame_buf() {
+fn count_owned_frame_block() {
     let _ = FRAME_POOL.try_with(|pool| pool.borrow_mut().owned += 1);
 }
 
@@ -293,7 +232,7 @@ pub fn jitframe_pool_counts() -> (u64, u64, u64) {
         .unwrap_or((0, 0, 0))
 }
 
-/// Which arm [`FrameHeapOwner::new`] allocates through.
+/// Which arm `alloc_off_gc_jitframe` allocates through.
 ///
 /// `Unseeded` is the state before the first entry reads the selector, not a
 /// third strategy: the first read resolves it to one of the other two and
@@ -326,8 +265,8 @@ static POOL_ARM: AtomicU8 = AtomicU8::new(PoolArm::Unseeded as u8);
 
 /// Select the frame-allocation arm for subsequent compiled entries.
 ///
-/// Either direction: `false` selects [`FrameHeapOwner::OWNED`] on a build whose
-/// default is pooled. Overrides `MAJIT_JITFRAME_POOL`, which is only how a
+/// Either direction: `false` selects the owned arm on a build whose default
+/// is pooled. Overrides `MAJIT_JITFRAME_POOL`, which is only how a
 /// harness that cannot call this — a test binary with no hook of its own —
 /// picks an arm.
 pub fn set_jitframe_pool(on: bool) {
@@ -584,9 +523,9 @@ impl JitFrameDeadFrame {
     /// Take a root slot for `jf_gcref` and hold it for the deadframe's life.
     ///
     /// `heap_owner` decides whether the frame is rooted at all, because it is
-    /// the same condition: a frame handed a `Vec` owner was allocated out of
-    /// the Rust heap precisely because there was no type registry to allocate
-    /// it from the nursery under, and a frame allocated from the nursery is
+    /// the same condition: a frame handed an owner was built on the host heap
+    /// precisely because the descr had no `JITFRAME` type id to allocate it
+    /// from the nursery under, and a frame allocated from the nursery is
     /// always handed `None`.
     pub fn new(
         jf_gcref: GcRef,

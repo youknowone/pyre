@@ -37,37 +37,17 @@ pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
 use majit_ir::operand::Operand;
 
-/// Publish the native JITFRAME type id to the CPU selected by this
-/// metainterpreter build.
-///
-/// `MetaInterpStaticData.cpu` is the single backend authority in PyPy.  Keep
-/// that ownership at this crate boundary too: a workspace build may unify
-/// dependency features differently from an interpreter crate's own features,
-/// so the caller cannot reliably repeat the `BackendImpl` cfg decision.
-#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
-pub fn set_active_backend_jitframe_gc_type_id(id: u32) {
-    majit_backend_cranelift::set_jitframe_gc_type_id(id);
-}
-
-#[cfg(all(
-    feature = "dynasm",
-    not(feature = "cranelift"),
-    not(target_arch = "wasm32")
-))]
-pub fn set_active_backend_jitframe_gc_type_id(id: u32) {
-    majit_backend_dynasm::set_jitframe_gc_type_id(id);
-}
-
 /// Register RPython's `JITFRAME` shape on the frontend-owned collector and
-/// publish the assigned id to the selected native CPU.
+/// tell the descr its id.
 ///
-/// Registration belongs to the frontend because its type table fixes the id;
-/// publishing belongs here because this crate alone selects the active CPU.
-/// Call this before `JitDriver::set_gc_allocator`, which freezes the table.
+/// `jitframe.py` declares `JITFRAME` statically and the descr allocates it by
+/// name; here the frontend's type table fixes the id, so the descr is told
+/// once. Call this before `JitDriver::set_gc_allocator`, which freezes the
+/// table.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn register_active_backend_jitframe_gc_type(gc: &mut dyn majit_gc::GcAllocator) -> u32 {
     let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
-    set_active_backend_jitframe_gc_type_id(id);
+    gc.set_jitframe_type_id(id);
     id
 }
 

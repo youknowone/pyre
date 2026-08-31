@@ -3440,6 +3440,13 @@ mod tests {
     /// `dispatch_step: unwired opcode=0xd9` on the abort path.  Both are now
     /// registered.
     ///
+    /// The two float<->int bitcasts, `convert_float_bytes_to_longlong/f>i`
+    /// and `convert_longlong_bytes_to_float/i>f`, left the same way: a
+    /// `#[jit_interp]` arm that carries a float across a branch as its bits
+    /// emits them, so `build_inline_call_only_bh_builder` registers both and a
+    /// resume through such an arm dispatches them instead of panicking
+    /// `unwired opcode`.
+    ///
     /// The three `getinteriorfield_gc_*` loads left without the emitted set
     /// growing: they are registered pre-emptively, not in response to an
     /// observed panic naming one of them.  Their
@@ -3474,8 +3481,6 @@ mod tests {
             "conditional_call_ir_v/iiIRd",
             "conditional_call_value_ir_i/iiIRd>i",
             "conditional_call_value_ir_r/riIRd>r",
-            "convert_float_bytes_to_longlong/f>i",
-            "convert_longlong_bytes_to_float/i>f",
             "gc_load_indexed_f/riiii>f",
             "gc_load_indexed_i/riiii>i",
             "getlistitem_gc_f/ridd>f",

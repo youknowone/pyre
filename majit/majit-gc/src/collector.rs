@@ -928,6 +928,9 @@ pub struct MiniMarkGC {
     oldgen: OldGen,
     /// Type registry for tracing objects.
     pub types: TypeRegistry,
+    /// The registered `JITFRAME` type, once the frontend has named it
+    /// (`GcAllocator::set_jitframe_type_id`).
+    jitframe_type_id: Option<u32>,
     /// Root set.
     pub roots: RootSet,
     /// incminimark.py:344 `old_objects_pointing_to_young = AddressStack()`.
@@ -1267,6 +1270,7 @@ impl MiniMarkGC {
             published_nursery_top,
             oldgen: OldGen::new(),
             types: TypeRegistry::new(),
+            jitframe_type_id: None,
             roots: RootSet::new(),
             old_objects_pointing_to_young: Vec::new(),
             prebuilt_root_objects: Vec::new(),
@@ -8865,6 +8869,18 @@ impl GcAllocator for MiniMarkGC {
     /// this allocator — including before anything has been registered in it.
     fn has_type_registry(&self) -> bool {
         true
+    }
+
+    fn set_jitframe_type_id(&mut self, id: u32) {
+        assert!(
+            (id as usize) < self.types.len(),
+            "JITFRAME type id {id} is not registered on this collector"
+        );
+        self.jitframe_type_id = Some(id);
+    }
+
+    fn jitframe_type_id(&self) -> Option<u32> {
+        self.jitframe_type_id
     }
 
     /// gc.py `GcLLDescr_framework.supports_guard_gc_type = True`.

@@ -8,6 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use majit_backend::deadframe::{ExitDescr, JitFrameDeadFrame};
+use majit_backend::jitframe::{
+    HostHeapGc, check_jitframe_descr, jitframe_is_gc_object, jitframe_write_barrier,
+    malloc_jitframe, malloc_jitframe_no_collect,
+};
 use majit_backend::libc_deadframe::LibcJitFrameDeadFrame;
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
 // `gc_sync` hands out the concrete collector; the trait must be in scope for
@@ -289,108 +293,53 @@ pub(crate) fn with_dynasm_active_gc_mut<R>(
     None
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum JitFrameHeap {
-    Gc,
-    Libc,
-}
-
-/// The JITFRAME type id resolved against the installed collector, read by
-/// every compiled entry that allocates its frame.
-///
-/// Upstream keeps this on the CPU: `malloc_jitframe` (`llmodel.py:298`) reads
-/// `self.cpu.gc_ll_descr`, a plain process-wide field, because there is one
-/// collector. This crate has two install paths, and the resolved id must have
-/// the same scope as the collector it was resolved against, or an entry can
-/// name a shape the collector it allocates from never registered:
-///
-/// - `install_gc_standalone` installs the process-wide `gc_sync` singleton,
-///   so its id lives in a process-wide static, like upstream. Any thread that
-///   reaches compiled code reads it — including one that never ran the install
-///   itself, which the thread-local below could not answer for.
-/// - `install_gc_box` installs a thread-confined collector (the `gc_box`
-///   thread-local, scaffolding for the test binaries where each thread builds
-///   its own collector and registers a different number of types ahead of
-///   JITFRAME). An id resolved against that collector is only valid on that
-///   thread, so it lives beside the box, in a thread-local of the same scope.
-///   Without `majit-gc/gc_box` the `gc_box_installed()` probe is a constant
-///   `false`, the cell is unreachable, and it retires with the box.
-///
-/// Resolving once at install rather than at every entry keeps the hot entry
-/// from querying the type table (`resolve_jitframe_type_id`).
-static STANDALONE_JITFRAME_TYPE_ID: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
-
-thread_local! {
-    /// See [`STANDALONE_JITFRAME_TYPE_ID`]: the box-scoped twin.
-    static BOX_JITFRAME_TYPE_ID: core::cell::Cell<Option<u32>> = const {
-        core::cell::Cell::new(None)
-    };
-}
-
-fn resolve_jitframe_type_id(gc: &dyn majit_gc::GcAllocator) -> Option<u32> {
-    let id = crate::jitframe_gc_type_id()?;
-    (gc.type_size(id) == Some(JitFrame::alloc_size(0))).then_some(id)
-}
-
-fn set_standalone_jitframe_type_id(id: Option<u32>) {
-    STANDALONE_JITFRAME_TYPE_ID.store(id.unwrap_or(u32::MAX), Ordering::Release);
-}
-
-fn active_jitframe_type_id() -> Option<u32> {
-    if majit_gc::gc_box_installed() {
-        return BOX_JITFRAME_TYPE_ID.with(core::cell::Cell::get);
+/// `cpu.gc_ll_descr`: the installed collector, or [`HostHeapGc`] —
+/// `get_ll_description(None)` (gc.py:653) picks the Boehm descr when no
+/// framework GC is configured, and this is that descr. Same three-way
+/// routing as [`with_dynasm_active_gc_mut`], with the host descr in place of
+/// `None`.
+fn with_gc_ll_descr<R>(f: impl FnOnce(&mut dyn majit_gc::GcAllocator) -> R) -> R {
+    if gc_box::present() {
+        return gc_box::with_mut(f).expect("gc box present");
     }
-    match STANDALONE_JITFRAME_TYPE_ID.load(Ordering::Acquire) {
-        u32::MAX => None,
-        id => Some(id),
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|gc| f(gc));
     }
+    f(&mut HostHeapGc)
 }
 
 type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
 
-/// `gc_ll_descr.malloc_jitframe(frame_info)` (`llmodel.py:298`).
+/// `gc_ll_descr.malloc_jitframe(frame_info)` (`llmodel.py:298`) for a
+/// compiled entry.
 ///
-/// A registered JITFRAME type means the frontend installed the framework GC,
-/// so allocate the frame as the ordinary moving `GcStruct` upstream creates.
 /// Input refs take explicit owner-root slots across a possible collection,
-/// reproducing the roots RPython's GC transform puts around this allocation.
-/// A backend without a registered collector keeps the host fallback.
-
-fn alloc_entry_jitframe(
-    size_bytes: usize,
-    args: &[Value],
-) -> (*mut JitFrame, JitFrameHeap, EntryArgRoots) {
-    if let Some(type_id) = active_jitframe_type_id() {
-        // RPython's GC transform exposes every live Ref local while
-        // `malloc_jitframe` may collect. Rust's stack is not traced, so mirror
-        // those roots explicitly and read the possibly-forwarded values back
-        // when filling the frame below. Four stays inline for the ordinary
-        // portal shape; larger signatures pay one temporary host allocation.
-        let roots: EntryArgRoots = args
-            .iter()
-            .filter_map(|arg| match arg {
-                Value::Ref(value) => Some(majit_gc::shadow_stack::OwnerRootGuard::new(*value)),
-                _ => None,
-            })
-            .collect();
-        if let Some(gcref) =
-            with_dynasm_active_gc_mut(|gc| gc.alloc_nursery_typed(type_id, size_bytes))
-        {
-            assert!(!gcref.is_null(), "JITFRAME GC allocation failed");
-            unsafe { std::ptr::write_bytes(gcref.0 as *mut u8, 0, size_bytes) };
-            return (gcref.0 as *mut JitFrame, JitFrameHeap::Gc, roots);
-        }
-    }
-
-    let ptr = majit_backend::jitframe::alloc_off_gc_jitframe(size_bytes);
-    assert!(!ptr.is_null(), "off-GC JITFRAME allocation failed");
-    majit_gc::shadow_stack::register_libc_jitframe(ptr as usize);
-    (ptr, JitFrameHeap::Libc, EntryArgRoots::new())
+/// reproducing the roots RPython's GC transform puts around this allocation:
+/// Rust's stack is not traced, so the possibly-forwarded values are read back
+/// from the roots when the frame is filled. Four stays inline for the
+/// ordinary portal shape; larger signatures pay one temporary host allocation.
+/// Returns whether the frame is a collector object, which decides the
+/// deadframe that later owns it.
+fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bool, EntryArgRoots) {
+    with_gc_ll_descr(|gc| {
+        let gc_object = jitframe_is_gc_object(gc);
+        let roots: EntryArgRoots = if gc_object {
+            args.iter()
+                .filter_map(|arg| match arg {
+                    Value::Ref(value) => Some(majit_gc::shadow_stack::OwnerRootGuard::new(*value)),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            EntryArgRoots::new()
+        };
+        (malloc_jitframe(gc, size_bytes), gc_object, roots)
+    })
 }
 
-fn jitframe_is_gc_managed(frame: *mut JitFrame) -> bool {
-    with_dynasm_active_gc(|gc| gc.is_managed_heap_object(frame as usize)).unwrap_or(false)
+/// Whether the frames this thread's descr builds are collector objects.
+fn jitframe_is_gc_managed() -> bool {
+    with_gc_ll_descr(|gc| jitframe_is_gc_object(gc))
 }
 
 /// Store a GC allocator in the dynasm backend thread-local and register
@@ -481,7 +430,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     majit_gc::disarm_published_nursery();
     majit_gc::note_gc_box_installed();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
-    BOX_JITFRAME_TYPE_ID.with(|slot| slot.set(resolve_jitframe_type_id(gc.as_ref())));
+    check_jitframe_descr(gc.as_ref());
     gc_box::store(gc);
     register_active_hooks(supports_guard_gc_type);
 }
@@ -490,11 +439,11 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
 /// box, so every trampoline routes to the process-global `gc_sync` singleton
 /// (the per-thread GC box is the free-threading gap R4 removes).
 pub fn install_gc_standalone() {
-    majit_gc::gc_sync::gc_op(|gc| gc.freeze_types());
-    let (supports_guard_gc_type, jitframe_type_id) = majit_gc::gc_sync::gc_query(|gc| {
-        (gc.supports_guard_gc_type(), resolve_jitframe_type_id(gc))
+    majit_gc::gc_sync::gc_op(|gc| {
+        check_jitframe_descr(gc);
+        gc.freeze_types();
     });
-    set_standalone_jitframe_type_id(jitframe_type_id);
+    let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
     register_active_hooks(supports_guard_gc_type);
 }
 
@@ -504,7 +453,6 @@ pub fn install_gc_standalone() {
 /// freed memory.
 pub fn clear_gc_allocator() {
     gc_box::clear();
-    BOX_JITFRAME_TYPE_ID.with(|slot| slot.set(None));
 }
 
 /// TYPE_INFO / CLASSTYPE constants read by the dynasm assemblers for
@@ -1152,15 +1100,7 @@ pub extern "C" fn dynasm_nursery_slowpath_headerless(size: u64) -> u64 {
 /// through the trailing array, i.e. it excludes the GC header that the
 /// allocator prepends internally.
 pub extern "C" fn dynasm_nursery_slowpath_jitframe(frame_size: u64) -> u64 {
-    let type_id = active_jitframe_type_id();
-    with_dynasm_active_gc_mut(|gc| {
-        if let Some(type_id) = type_id {
-            gc.alloc_nursery_typed(type_id, frame_size as usize).0 as u64
-        } else {
-            gc.alloc_nursery(frame_size as usize).0 as u64
-        }
-    })
-    .unwrap_or_else(|| majit_backend::jitframe::alloc_off_gc_jitframe(frame_size as usize) as u64)
+    with_gc_ll_descr(|gc| malloc_jitframe(gc, frame_size as usize)) as u64
 }
 
 /// `_build_malloc_slowpath(kind='var')` parity: varsize nursery
@@ -1554,44 +1494,19 @@ pub unsafe extern "C" fn dynasm_realloc_frame(
     expected_depth: isize,
 ) -> *mut JitFrame {
     let base_ofs = DynasmBackend::get_baseofs_of_frame_field() as isize;
-    let gc_managed = jitframe_is_gc_managed(old_jf);
     let new_jf = unsafe {
         majit_backend::jitframe::realloc_frame(
             old_jf,
             expected_depth,
             base_ofs,
-            |size_bytes| {
-                if gc_managed {
-                    let type_id = active_jitframe_type_id()
-                        .expect("a managed JITFRAME has a published type id");
-                    let gcref = with_dynasm_active_gc_mut(|gc| {
-                        gc.alloc_nursery_no_collect_typed(type_id, size_bytes as usize)
-                    })
-                    .expect("a managed JITFRAME has an active collector");
-                    assert!(!gcref.is_null(), "JITFRAME realloc failed");
-                    std::ptr::write_bytes(gcref.0 as *mut u8, 0, size_bytes as usize);
-                    gcref.0 as *mut JitFrame
-                } else {
-                    majit_backend::jitframe::alloc_off_gc_jitframe(size_bytes as usize)
-                }
-            },
-            |new_jf| {
-                if gc_managed {
-                    with_dynasm_active_gc_mut(|gc| gc.write_barrier(GcRef(new_jf as usize)))
-                        .expect("a managed JITFRAME has an active collector");
-                } else {
-                    majit_gc::shadow_stack::register_libc_jitframe(new_jf as usize);
-                }
-            },
+            |size_bytes| with_gc_ll_descr(|gc| malloc_jitframe_no_collect(gc, size_bytes as usize)),
+            |new_jf| with_gc_ll_descr(|gc| jitframe_write_barrier(gc, new_jf)),
         )
     };
-    if gc_managed {
-        // `frame.jf_forward = new_frame` is a GC-pointer store on the old
-        // frame. `realloc_frame` documents this caller-side barrier, matching
-        // the framework transform around llmodel.py:141.
-        with_dynasm_active_gc_mut(|gc| gc.write_barrier(GcRef(old_jf as usize)))
-            .expect("a managed JITFRAME has an active collector");
-    }
+    // `frame.jf_forward = new_frame` is a GC-pointer store on the old
+    // frame. `realloc_frame` documents this caller-side barrier, matching
+    // the framework transform around llmodel.py:141.
+    with_gc_ll_descr(|gc| jitframe_write_barrier(gc, old_jf));
     if crate::majit_log_enabled() {
         eprintln!(
             "[dynasm][realloc-frame] old={old_jf:p} new={new_jf:p} expected_depth={expected_depth}"
@@ -3048,7 +2963,7 @@ impl Backend for DynasmBackend {
             Self::input_slot(args.len()),
             args.len()
         );
-        let (jf_ptr, frame_heap, arg_roots) =
+        let (jf_ptr, gc_object, arg_roots) =
             alloc_entry_jitframe(JitFrame::alloc_size(num_slots), args);
         unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
 
@@ -3176,18 +3091,19 @@ impl Backend for DynasmBackend {
         }
 
         // `llmodel.py return ll_frame` — the deadframe IS the frame the run
-        // returned. A framework-GC frame takes a movable owner-root slot;
-        // the no-collector fallback owns and later frees its off-GC chain.
-        match frame_heap {
-            JitFrameHeap::Gc => DeadFrame::JitFrame(JitFrameDeadFrame::new(
+        // returned. A collector object takes a movable owner-root slot; a
+        // host frame is owned, and its chain freed, by the deadframe.
+        if gc_object {
+            DeadFrame::JitFrame(JitFrameDeadFrame::new(
                 GcRef(result_jf as usize),
                 ExitDescr::owned(descr),
                 None,
                 None,
-            )),
-            JitFrameHeap::Libc => DeadFrame::LibcJitFrame(unsafe {
+            ))
+        } else {
+            DeadFrame::LibcJitFrame(unsafe {
                 LibcJitFrameDeadFrame::owning(jf_ptr, result_jf, num_slots, descr, None)
-            }),
+            })
         }
     }
 
@@ -3226,7 +3142,7 @@ impl Backend for DynasmBackend {
             Self::input_slot(args.len()),
             args.len()
         );
-        let (jf_ptr, frame_heap, _arg_roots) =
+        let (jf_ptr, gc_object, _arg_roots) =
             alloc_entry_jitframe(JitFrame::alloc_size(num_slots), &[]);
         unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
 
@@ -3289,9 +3205,9 @@ impl Backend for DynasmBackend {
         let guard_value_operand = majit_backend::guard_value_counter_slot(descr_fd)
             .map(|slot| unsafe { crate::llmodel::get_int_value_direct(result_jf, slot) as i64 });
 
-        // No deadframe is built on this path. GC-managed frames become
-        // unreachable here; the host fallback still owns and frees its chain.
-        if frame_heap == JitFrameHeap::Libc {
+        // No deadframe is built on this path. A collector frame becomes
+        // unreachable here; a host frame's chain is freed.
+        if !gc_object {
             unsafe { majit_backend::libc_deadframe::free_jitframe_chain(jf_ptr) };
         }
 
@@ -3342,7 +3258,7 @@ impl Backend for DynasmBackend {
         // returns it — the forced frame IS the deadframe, and it belongs to
         // the compiled run that is still executing, so this deadframe borrows
         // it rather than taking the chain over.
-        if jitframe_is_gc_managed(frame) {
+        if jitframe_is_gc_managed() {
             Some(DeadFrame::JitFrame(JitFrameDeadFrame::borrowing(
                 GcRef(frame as usize),
                 ExitDescr::owned(descr),
@@ -4354,10 +4270,18 @@ mod tests {
         })
     }
 
-    fn install_call_assembler_test_layout() {
+    /// `jitframe.py` — the `JITFRAME` shape a collector with a type table must
+    /// carry before `check_jitframe_descr` lets it be installed.
+    fn register_jitframe_type(gc: &mut MiniMarkGC) -> u32 {
+        let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        majit_gc::GcAllocator::set_jitframe_type_id(gc, id);
+        id
+    }
+
+    fn install_call_assembler_test_layout(jitframe_tid: u32) {
         crate::register_jitframe_layout(crate::JitFrameLayoutInfo {
             jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
-                jitframe_tid: crate::jitframe_gc_type_id().unwrap_or(u32::MAX),
+                jitframe_tid,
                 jitframe_fixed_size: JITFRAME_FIXED_SIZE,
                 jf_frame_info_ofs: JF_FRAME_INFO_OFS,
                 jf_descr_ofs: JF_DESCR_OFS,
@@ -4385,6 +4309,7 @@ mod tests {
         majit_gc::GcAllocator::register_vtable_for_type(&mut gc, int_vtable, int_tid);
 
         let mut backend = DynasmBackend::new();
+        register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         let resolved = backend.get_typeid_from_classptr_if_gcremovetypeptr(int_vtable);
@@ -4400,6 +4325,7 @@ mod tests {
         let obj = gc.alloc_with_type(obj_tid, 16);
 
         let mut backend = DynasmBackend::new();
+        register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         assert!(majit_gc::supports_guard_gc_type());
@@ -4485,6 +4411,7 @@ mod tests {
         consts.insert(10006, 16_i64);
         consts.insert(10007, 1_i64);
         backend.set_constants(consts);
+        register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![];
@@ -4557,6 +4484,7 @@ mod tests {
         consts.insert(10006, 16_i64);
         consts.insert(10007, 1_i64);
         backend.set_constants(consts);
+        register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![];
@@ -4636,6 +4564,7 @@ mod tests {
         consts.insert(10006, 111_i64);
         consts.insert(10007, 3_i64);
         backend.set_constants(consts);
+        register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_int(0)];
@@ -4717,6 +4646,7 @@ mod tests {
         consts.insert(10001, 256_i64);
         consts.insert(10002, 8_i64);
         backend.set_constants(consts);
+        register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref(0)];
@@ -4768,8 +4698,8 @@ mod tests {
         let wrong_vtable: usize = 0x2222_4400;
         majit_gc::GcAllocator::register_vtable_for_type(&mut gc, wrong_vtable, wrong_tid);
 
-        crate::set_jitframe_gc_type_id(jitframe_tid);
-        install_call_assembler_test_layout();
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
+        install_call_assembler_test_layout(jitframe_tid);
         install_test_libc_jitframe_tracer();
 
         let mut backend = DynasmBackend::new();
@@ -4858,8 +4788,8 @@ mod tests {
         let wrong_vtable: usize = 0x3333_5500;
         majit_gc::GcAllocator::register_vtable_for_type(&mut gc, wrong_vtable, wrong_tid);
 
-        crate::set_jitframe_gc_type_id(jitframe_tid);
-        install_call_assembler_test_layout();
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
+        install_call_assembler_test_layout(jitframe_tid);
         install_test_libc_jitframe_tracer();
 
         let mut backend = DynasmBackend::new();
@@ -5024,8 +4954,8 @@ mod tests {
         let payload_tid = gc.register_type(TypeInfo::simple(16));
         let payload = gc.alloc_with_type(payload_tid, 16);
 
-        crate::set_jitframe_gc_type_id(jitframe_tid);
-        install_call_assembler_test_layout();
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
+        install_call_assembler_test_layout(jitframe_tid);
         install_test_libc_jitframe_tracer();
 
         let mut backend = DynasmBackend::new();
@@ -5068,8 +4998,8 @@ mod tests {
         let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
         let payload_tid = gc.register_type(TypeInfo::simple(16));
 
-        crate::set_jitframe_gc_type_id(jitframe_tid);
-        install_call_assembler_test_layout();
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
+        install_call_assembler_test_layout(jitframe_tid);
         TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
 
         let mut backend = DynasmBackend::new();
@@ -5109,8 +5039,8 @@ mod tests {
         let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
         let payload_tid = gc.register_type(TypeInfo::simple(16));
 
-        crate::set_jitframe_gc_type_id(jitframe_tid);
-        install_call_assembler_test_layout();
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
+        install_call_assembler_test_layout(jitframe_tid);
         TEST_HELPER_ALLOC_TYPE_ID.store(payload_tid, Ordering::Relaxed);
 
         let mut backend = DynasmBackend::new();
