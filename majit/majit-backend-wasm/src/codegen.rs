@@ -3287,6 +3287,20 @@ pub fn build_wasm_module(
             vec![ValType::I32],
         );
     }
+    // Shared guard-exit spill functions, declared after every other family so
+    // an added arity cannot shift an index a call site already baked.
+    let spill_arities = spill_helper_arities(&guards);
+    let mut spill_helper_type_indices: Vec<u32> = Vec::with_capacity(spill_arities.len());
+    for &arity in &spill_arities {
+        spill_helper_type_indices.push(next_type_idx);
+        next_type_idx += 1;
+        types.ty().function(
+            std::iter::once(ValType::I32)
+                .chain(std::iter::repeat_n(ValType::I64, arity))
+                .collect::<Vec<_>>(),
+            Vec::new(),
+        );
+    }
     module.section(&types);
 
     // Import section
@@ -3341,6 +3355,9 @@ pub fn build_wasm_module(
     } else {
         functions.function(bridge_entry_type_idx.unwrap_or(0));
     }
+    for &type_idx in &spill_helper_type_indices {
+        functions.function(type_idx);
+    }
     module.section(&functions);
 
     // Only armed modules carry this global. The runner reads it after
@@ -3374,6 +3391,14 @@ pub fn build_wasm_module(
     // Code section
     let mut codes = CodeSection::new();
     let jit_call_idx = if needs_call { Some(0u32) } else { None };
+    // The spill functions follow this module's entry function(s) in the
+    // function and code sections alike, so their indices start past them.
+    let first_spill_func_idx = trace_func_idx + if label_param_entry { 2 } else { 1 };
+    let spill_helper_indices: indexmap::IndexMap<usize, u32> = spill_arities
+        .iter()
+        .enumerate()
+        .map(|(i, &arity)| (arity, first_spill_func_idx + i as u32))
+        .collect();
     let func = build_function(
         inputargs,
         &analysis_inputargs,
@@ -3414,11 +3439,15 @@ pub fn build_wasm_module(
         *trace_entry_census,
         label_param_entry,
         inline_trip.map(|probe| (probe, inline_trip_type_idx)),
+        &spill_helper_indices,
     )?;
     if label_param_entry {
         codes.function(&build_label_param_shim(trace_func_idx + 1));
     }
     codes.function(&func);
+    for &arity in &spill_arities {
+        codes.function(&build_spill_helper(arity));
+    }
     module.section(&codes);
 
     Ok((module.finish(), guards, num_ref_homes))
@@ -3439,6 +3468,75 @@ fn build_label_param_shim(wide_func_idx: u32) -> Function {
     sink.flush();
     drop(sink);
 
+    func
+}
+
+/// What a wasm function costs the host compiler before its body counts, in
+/// units of the body instructions the same cost would buy.
+///
+/// Collapsing 30.9 KB of `for_iter_list_fold` spill runs into 97 extra
+/// functions cut cranelift's compile time for its 44 modules from 130.8 ms to
+/// 117.7 ms, where the bytes alone were worth 21.1 ms; the difference puts a
+/// function's own fixed cost near 0.06 ms, about forty instructions of body.
+/// Charging it here keeps the near-break-even counts out.
+const SPILL_HELPER_FIXED_INSTRS: usize = 40;
+
+/// Fail-argument counts worth a shared spill function, from the guard exits
+/// this module is about to emit.
+///
+/// A guard exit writes its fail arguments to the positional exit slots, three
+/// wasm instructions each (`local.get 0`, the value, `i64.store`). Those runs
+/// are the largest single thing a trace module contains — 42% of the
+/// instructions across `synth/for_iter_list_fold`'s 44 modules. The host
+/// compiles every one of those modules with cranelift before the trace can
+/// run, at roughly 0.6 ms per kilobyte handed to it against a per-module fixed
+/// cost of about 0.2 ms, so what the module costs to admit is very nearly what
+/// it weighs. The spill is purely positional, so one function per argument
+/// count serves every exit of that count and the call site costs one
+/// instruction per argument instead of three.
+///
+/// A count is admitted only when the exits that share it pay for the function:
+/// `uses * (3n - (n + 2))` saved against `3n + 1` emitted, plus
+/// [`SPILL_HELPER_FIXED_INSTRS`] for the function itself. Counts of one
+/// argument never do (the call site is the same size as the stores), and a
+/// count used once never does. An arity admitted here that no exit reaches —
+/// a guard whose region was merged branches instead of spilling — costs its
+/// unused body and nothing else, so the estimate may over-admit safely.
+fn spill_helper_arities(guards: &[GuardExit]) -> Vec<usize> {
+    let mut uses: HashMap<usize, usize> = HashMap::new();
+    for guard in guards {
+        *uses.entry(guard.fail_arg_refs.len()).or_default() += 1;
+    }
+    let mut arities: Vec<usize> = uses
+        .into_iter()
+        .filter(|&(arity, uses)| {
+            arity >= 2
+                && uses >= 2
+                && uses * (2 * arity - 2) > 3 * arity + 1 + SPILL_HELPER_FIXED_INSTRS
+        })
+        .map(|(arity, _)| arity)
+        .collect();
+    // `HashMap` iteration order is not stable across runs, and two compilations
+    // of the same trace must emit byte-identical modules (`compile_module_cached`
+    // keys its host handle on the bytes).
+    arities.sort_unstable();
+    arities
+}
+
+/// One shared spill function: `(i32 frame_ptr, i64 x arity) -> ()`, writing its
+/// arguments to the positional exit slots `frame[1..=arity]`.
+fn build_spill_helper(arity: usize) -> Function {
+    let mut func = Function::new(Vec::new());
+    let mut raw_sink = func.instructions();
+    let mut sink = PeepSink::new(&mut raw_sink);
+    for i in 0..arity {
+        sink.local_get(0);
+        sink.local_get(1 + i as u32);
+        sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+    }
+    sink.end();
+    sink.flush();
+    drop(sink);
     func
 }
 
@@ -3504,6 +3602,7 @@ fn build_function(
     trace_entry_census: Option<crate::TraceEntryCensusStorage>,
     label_param_entry: bool,
     inline_trip: Option<(InlineTripProbe, u32)>,
+    spill_helper_indices: &indexmap::IndexMap<usize, u32>,
 ) -> Result<Function, BackendError> {
     // The CA arm requires residual types (the setup above forces arity >= 2
     // whenever it is emitted). Its `jit_call` fallback branches are retained
@@ -3710,6 +3809,7 @@ fn build_function(
         ref_homes,
         frame,
         counter_slot: counter_slot(inputargs, ops).map(|slot| slot as u64),
+        spill_helpers: spill_helper_indices,
     };
     let mut locals = Vec::new();
     let mut start = 0;
@@ -7512,6 +7612,10 @@ struct BridgeDispatch<'a> {
     /// The trace's one GUARD_VALUE counter slot (`counter_slot`), or `None`
     /// when no guard needs one.
     counter_slot: Option<u64>,
+    /// Fail-argument count -> the module function that spills that many
+    /// arguments, for the counts `spill_helper_arities` admitted. An exit whose
+    /// count is absent writes its own stores.
+    spill_helpers: &'a indexmap::IndexMap<usize, u32>,
 }
 
 fn emit_guard_true(
@@ -7723,6 +7827,7 @@ fn emit_guard_exit(
             guard_idx,
             op,
             dispatch.counter_slot,
+            dispatch.spill_helpers,
         );
         if dispatch.enabled {
             emit_guard_bridge_dispatch(sink, guard_idx, dispatch);
@@ -7738,6 +7843,7 @@ fn emit_guard_exit(
             guard_idx,
             op,
             dispatch.counter_slot,
+            dispatch.spill_helpers,
         );
     }
     sink.br(block_exit_depth);
@@ -7930,8 +8036,16 @@ fn emit_guard_spill(
     guard_idx: u32,
     op: &Op,
     counter_slot: Option<u64>,
+    spill_helpers: &indexmap::IndexMap<usize, u32>,
 ) {
-    emit_guard_fail_args_spill(sink, constants, value_types, op, counter_slot);
+    emit_guard_fail_args_spill(
+        sink,
+        constants,
+        value_types,
+        op,
+        counter_slot,
+        spill_helpers,
+    );
     emit_guard_fail_index_store(sink, exit_index(op, guard_idx));
 }
 
@@ -7956,14 +8070,26 @@ fn emit_guard_fail_args_spill(
     value_types: &ValueLocals,
     op: &Op,
     counter_slot: Option<u64>,
+    spill_helpers: &indexmap::IndexMap<usize, u32>,
 ) {
     let fail_args = exit_fail_args(op);
 
-    for (i, &arg_ref) in fail_args.iter().enumerate() {
-        let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;
+    // The shared function writes the same slots in the same order; the call
+    // site pushes the frame pointer once and each value once. The counter slot
+    // below is per-trace rather than positional, so it stays inline.
+    if let Some(&helper) = spill_helpers.get(&fail_args.len()) {
         sink.local_get(0);
-        emit_resolve(sink, constants, value_types, arg_ref);
-        sink.i64_store(mem64(offset));
+        for &arg_ref in &fail_args {
+            emit_resolve(sink, constants, value_types, arg_ref);
+        }
+        sink.call(helper);
+    } else {
+        for (i, &arg_ref) in fail_args.iter().enumerate() {
+            let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;
+            sink.local_get(0);
+            emit_resolve(sink, constants, value_types, arg_ref);
+            sink.i64_store(mem64(offset));
+        }
     }
     if let Some((operand, slot)) = counter_value_spill(op, &fail_args).zip(counter_slot) {
         let offset = FRAME_SLOT_BASE + slot * SLOT_SIZE;
