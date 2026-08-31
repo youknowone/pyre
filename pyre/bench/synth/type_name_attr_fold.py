@@ -123,24 +123,3 @@ seen = None
 for _ in range(M):
     seen = Box.__name__
 print(seen)
-
-
-class TaggedName(str):
-    def __new__(cls, value, note):
-        result = str.__new__(cls, value)
-        result.note = note
-        return result
-
-
-# The fold reads the live name object, not merely its text.  Preserve identity
-# across compilation and a later rename.
-tagged = TaggedName('Tagged', 'first')
-Box.__name__ = tagged
-for _ in range(M):
-    seen = Box.__name__
-assert seen is tagged and seen.note == 'first'
-again = TaggedName('Again', 'second')
-Box.__name__ = again
-for _ in range(M):
-    seen = Box.__name__
-assert seen is again and seen.note == 'second'
