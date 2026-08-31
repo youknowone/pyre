@@ -2757,9 +2757,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::front::option_map_or::rewire_map_or_call_sites(&mut lo.graph, &lo.map_or_sites)
         };
         // The `Option::is_none`/`is_some` rewrite (`front::option_is_none`)
-        // replaces the residual predicate call in place with a
-        // `__discriminant` comparison; no block split, so it needs no
-        // reachability sweep.  Same fail-safe contract as the diamonds above.
+        // replaces the residual predicate call in place with either an
+        // aggregate `__discriminant` comparison or, for the nullable
+        // RPython ref representation, a pointer-null comparison. No block
+        // split, so it needs no reachability sweep. Same fail-safe contract
+        // as the diamonds above.
         if !lo.is_none_sites.is_empty() {
             crate::front::option_is_none::rewire_is_none_call_sites(
                 &mut lo.graph,
@@ -5684,7 +5686,7 @@ impl<'a> Lowering<'a> {
                 if self.tyref_is_niche_option_ptr(dest_ty) {
                     match operands.into_iter().next() {
                         None => {
-                            let nullc = self.push_niche_null_ptr(mir_bb);
+                            let nullc = self.push_niche_null_ptr(mir_bb, dest_ty);
                             return Ok((None, nullc));
                         }
                         Some(op) => {
@@ -6015,18 +6017,42 @@ impl<'a> Lowering<'a> {
                 // (RPython has no `Option`; a maybe-null `Ptr` tests
                 // `ptr_nonzero`).
                 if self.tyref_is_niche_option_ptr(&place.ty) {
+                    let option_ty = clone_tyref(&place.ty);
                     let base = self.resolve_place(mir_bb, place)?;
-                    let nullc = self.push_niche_null_ptr(mir_bb);
-                    // The `ne` result is a `SomeBool`; a `SwitchInt` terminator
-                    // on it must close with `ExitCase::Bool`.  Record the
-                    // result-var id so `lower_switch` routes it through the
-                    // `If` bool path instead of the `Int`-exitcase path.
+                    let nullc = self.push_niche_null_ptr(mir_bb, &option_ty);
+                    // Preserve PyPy's identity test: first compute
+                    // `base is None`, then negate that bool for the Rust
+                    // discriminant (`Some` = 1). `ne` would dispatch to value
+                    // inequality on StringRepr/ListRepr, which is not a null
+                    // test (and FixedSizeListRepr deliberately has no such
+                    // operation). The final bool must close a `SwitchInt`
+                    // with `ExitCase::Bool`, so record its result id.
+                    let is_none = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let false_var = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let bb_id = self.block_id[mir_bb];
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(is_none.clone()),
+                        kind: OpKind::BinOp {
+                            op: "is_".to_string(),
+                            lhs: base,
+                            rhs: nullc,
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(false_var.clone()),
+                        kind: OpKind::ConstBool(false),
+                    });
                     self.niche_disc_vars.insert(res.id());
                     return Ok((
                         Some(OpKind::BinOp {
-                            op: "ne".to_string(),
-                            lhs: base,
-                            rhs: nullc,
+                            op: "eq".to_string(),
+                            lhs: is_none,
+                            rhs: false_var,
                             result_ty: ValueType::Int,
                         }),
                         res,
@@ -14409,6 +14435,35 @@ impl<'a> Lowering<'a> {
         self.option_payload_instance_class_root(dest_ty)
     }
 
+    /// Target projection for the null half of a nullable Option whose payload
+    /// the source translator has changed from a Rust container to an RPython
+    /// value repr. `null_mut()` begins as a classdef-less pointer; string and
+    /// list comparisons require the same `StringRepr` / `ListRepr` as their
+    /// receiver, exactly as `convert_const(None)` is applied on the selected
+    /// repr upstream. Ordinary pointer payloads already share InstanceRepr and
+    /// need no projection.
+    fn option_niche_null_cast(&self, option_ty: &TyRef) -> Option<(String, ValueType)> {
+        if !self.tyref_is_niche_option_ptr(option_ty) {
+            return None;
+        }
+        let payload = tyref_node(option_ty, self.llbc)?
+            .as_object()?
+            .get("Adt")?
+            .get("generics")?
+            .get("types")?
+            .get(0)?;
+        let stripped = strip_ty_wrappers(payload, self.llbc)?;
+        let rendered = charon_type_value_to_ast_string(stripped, self.llbc, 0);
+        let payload_ty = tyref_enum_payload_value_type(&TyRef::Other(payload.clone()), self.llbc);
+        if matches!(payload_ty, ValueType::Str) {
+            return Some((rendered, ValueType::Str));
+        }
+        if rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") {
+            return Some((rendered.clone(), ValueType::Ref(Some(rendered))));
+        }
+        None
+    }
+
     /// Resolve the destination `Option` of a `bool::then` / `bool::then_some`
     /// call into its `(option_owner, some_owner, payload_ty)` — the enum root
     /// ctor owner, the `Some` variant payload-field owner, and the payload
@@ -14740,6 +14795,8 @@ impl<'a> Lowering<'a> {
             result_var: result_var.clone(),
             option_owner,
             is_some,
+            niche: self.tyref_is_niche_option_ptr(&pointee),
+            niche_null_cast: self.option_niche_null_cast(&pointee),
         })
     }
 
@@ -15225,10 +15282,14 @@ impl<'a> Lowering<'a> {
             .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
     }
 
-    /// `true` when `ty` is represented as a one-word nullable `Option`:
+    /// `true` when `ty` is represented as a one-word nullable `Option` in
+    /// the translated RPython model:
     /// `Option<NonNull<T>>`, `Option<Box<T>>`, `Option<fn(..)>`, `Option<&mut T>`,
     /// `Option<&T>` with a thin (Sized) ADT pointee, or a raw pointer to a
-    /// thin nominal ADT.
+    /// thin nominal ADT. It also includes the exact Rust container spellings
+    /// that translate to one RPython GC pointer: `Option<Vec<T>>` becomes a
+    /// nullable `SomeList`, and `Option<&str>` becomes a nullable
+    /// `SomeString`.
     /// The JIT models each in ONE pointer word (`None` = null, `Some(p)` =
     /// the non-null payload pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
@@ -15263,18 +15324,23 @@ impl<'a> Lowering<'a> {
     /// references `&T` are included when the pointee is a thin (Sized)
     /// nominal ADT — equally a one-word null niche — via
     /// [`type_node_shared_ref_pointee`] gated on the pointee's resolved layout
-    /// size being concrete. Fat shared references are excluded: `&str` / `&[T]`
-    /// / `&dyn` carry no ADT def-id, and an unsized nominal newtype (a DST such
-    /// as `Wtf8 { bytes: [u8] }`) DOES carry a def-id but has no concrete layout
-    /// size — both are two-word references with no one-word niche payload.
+    /// size being concrete. Fat shared references are otherwise excluded:
+    /// `&[T]` / `&dyn` carry no ADT def-id, and an unsized nominal newtype (a
+    /// DST such as `Wtf8 { bytes: [u8] }`) DOES carry a def-id but has no
+    /// concrete layout size — both are two-word references with no one-word
+    /// niche payload. Bare `&str` is the deliberate exception because the
+    /// front has already replaced that Rust `(data, len)` spelling with
+    /// RPython's single `SomeString` value. PyPy `BuiltinCode.docstring` is
+    /// exactly `SomeString(can_be_None=True)` (`gateway.py:getdocstring`), not
+    /// a tag + payload aggregate.
     ///
     /// `front::iter_next` interaction (shared arm only). `Iterator::next()`
     /// returns `Option<&T>`, and `front::iter_next` rewrites its
     /// `__discriminant` match diamond into the native `[__iter_next]` op by
     /// matching a literal `FieldRead __discriminant` + `Value` exitswitch
     /// (`iter_next.rs` `rewire_one_next_site`). The `Discriminant` fold below
-    /// (`Rvalue::Discriminant`, this file) turns that into a pointer-null
-    /// `ne` bool switch when the recognizer accepts the receiver — for a
+    /// (`Rvalue::Discriminant`, this file) turns that into an identity-null
+    /// bool switch when the recognizer accepts the receiver — for a
     /// shared thin-ADT ref that would fire BEFORE iter_next runs and leave it
     /// no diamond to match, so the residual `next()` call would survive as an
     /// unregistered callee (a census Skip, not a miscompile). Currently
@@ -15340,6 +15406,21 @@ impl<'a> Lowering<'a> {
             let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc) else {
                 return false;
             };
+            // Rust's `&str` is a fat pointer, but this source translator has
+            // already projected the bare builtin `str` to RPython's single GC
+            // string pointer (`SomeString`). Preserve that projection through
+            // `Option`: None is the null string pointer and Some is the string
+            // itself. Do not admit nominal unsized wrappers here;
+            // `Option<&Wtf8>` remains the aggregate pinned below.
+            if stripped
+                .get("Adt")
+                .and_then(|a| a.get("id"))
+                .and_then(|id| id.get("Builtin"))
+                .and_then(serde_json::Value::as_str)
+                == Some("Str")
+            {
+                return true;
+            }
             // `&*mut T` is a thin shared reference even though its pointee is
             // itself a raw pointer rather than a nominal ADT.  This is the
             // shape of `<[*mut PyObject]>::get`: `Option<&PyObjectRef>` is one
@@ -15388,15 +15469,25 @@ impl<'a> Lowering<'a> {
         let Some(def_id) = adt_node_def_id(payload) else {
             return false;
         };
-        self.llbc
+        let payload_path = self
+            .llbc
             .type_by_id(def_id)
-            .map(|td| td.item_meta.name_path())
-            .as_deref()
-            == Some("core::ptr::non_null::NonNull")
+            .map(|td| td.item_meta.name_path());
+        // PyPy TextIOWrapper.pending_bytes is `None` or an ordinary RPython
+        // list (`interp_textio.py:_writeflush`). Rust's `Vec<T>` is a
+        // three-word source spelling, but the front translates it to the same
+        // one-pointer `SomeList`; retaining Rust's enum tag after that
+        // projection manufactures an attribute no RPython object has.
+        matches!(
+            payload_path.as_deref(),
+            Some("core::ptr::non_null::NonNull") | Some("alloc::vec::Vec")
+        )
     }
 
-    /// Emit a null pointer for a one-word niche `Option` (`None`) as a
-    /// `core::ptr::null_mut()` call, returning its result `Variable`.
+    /// Emit a null pointer for a nullable `Option` (`None`) as a
+    /// `core::ptr::null_mut()` call, returning its result `Variable`. A Rust
+    /// container projected to an RPython string/list is then narrowed to that
+    /// projected repr before it is returned or compared.
     ///
     /// `null_mut()` is preferred over a bare `ConstRefNull`: the annotator's
     /// `ptr_null_constant` types it as a classdef-less nullable `SomeInstance`
@@ -15409,9 +15500,26 @@ impl<'a> Lowering<'a> {
     /// merge.  Used by both the `Discriminant` null-test fold and the niche
     /// `Aggregate` `None` construction fold so every niche-Option null shares
     /// one repr-adaptive source.
-    fn push_niche_null_ptr(&mut self, mir_bb: usize) -> Variable {
+    fn push_niche_null_ptr(&mut self, mir_bb: usize, option_ty: &TyRef) -> Variable {
         let bb_id = self.block_id[mir_bb];
-        self.graph.push_null_mut_ptr(bb_id)
+        let null = self.graph.push_null_mut_ptr(bb_id);
+        let Some((root, result_ty)) = self.option_niche_null_cast(option_ty) else {
+            return null;
+        };
+        let narrowed = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::CAST_INSTANCE.to_string(), root],
+                },
+                args: vec![null],
+                result_ty,
+            },
+        });
+        narrowed
     }
 
     /// Lower `i64::checked_neg()` (`core::num::<Impl>::checked_neg` —
@@ -33290,7 +33398,7 @@ mod tests {
     /// `gettypeobject` (`gettypefor(..).map_or(PY_NULL, |p| p.as_ptr())`)
     /// must fold its `gettypefor` match through the niche
     /// `Option<NonNull<PyObject>>` path now that `gettypefor` returns a
-    /// one-word niche Option: the discriminant is a `ptr_ne` null-test
+    /// one-word niche Option: the map_or rewrite uses a `ptr_ne` null-test
     /// (`base != null_mut()`), NOT an aggregate `__discriminant` FieldRead,
     /// and the null is a `null_mut()` call (repr-adaptive) rather than a
     /// fixed-GCREF `ConstRefNull`.  Guards against a regression where the
@@ -33331,7 +33439,7 @@ mod tests {
             null_muts >= 1,
             "gettypeobject: expected a null_mut() feeding the niche ptr null-test"
         );
-        // The niche discriminant is a `ne` pointer null-test, and no
+        // The map_or niche discriminant contains a `ne` pointer null-test, and no
         // `__discriminant` FieldRead survives on the niche `gettypefor` result.
         let has_ne = graph
             .blocks
@@ -33375,16 +33483,29 @@ mod tests {
         let graph = super::lower_function(&llbc, "object_functionstr_type_name")
             .expect("lower object_functionstr_type_name");
 
-        // The niche match's discriminant is a `ne` pointer null-test.  It is
-        // routed through the `If` path (`set_branch`), which wraps the `ne` in
-        // an idempotent `bool` UnaryOp and switches on that wrapped var — so
-        // locate the block whose exitswitch is a `bool` UnaryOp over a `ne`.
-        let ne_result_ids: std::collections::HashSet<u64> = graph
+        // The niche match's Some-discriminant is `not (base is None)`. It is
+        // routed through the `If` path (`set_branch`), which may wrap the final
+        // bool in an idempotent `bool` UnaryOp. Locate switches on that final
+        // `eq(is_none, false)` value (or its wrapper).
+        let is_result_ids: std::collections::HashSet<u64> = graph
             .blocks
             .iter()
             .flat_map(|b| b.operations.iter())
             .filter_map(|op| match &op.kind {
-                OpKind::BinOp { op: name, .. } if name == "ne" => {
+                OpKind::BinOp { op: name, .. } if name == "is_" => {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect();
+        let some_result_ids: std::collections::HashSet<u64> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op: name, lhs, .. }
+                    if name == "eq" && is_result_ids.contains(&lhs.id()) =>
+                {
                     op.result.as_ref().map(|v| v.id())
                 }
                 _ => None,
@@ -33399,10 +33520,12 @@ mod tests {
             let switches_on_nulltest = b.operations.iter().any(|op| {
                 op.result.as_ref() == Some(sw)
                     && match &op.kind {
-                        OpKind::BinOp { op: name, .. } => name == "ne",
+                        OpKind::BinOp { op: name, lhs, .. } => {
+                            name == "eq" && is_result_ids.contains(&lhs.id())
+                        }
                         OpKind::UnaryOp {
                             op: name, operand, ..
-                        } => name == "bool" && ne_result_ids.contains(&operand.id()),
+                        } => name == "bool" && some_result_ids.contains(&operand.id()),
                         _ => false,
                     }
             });
@@ -33423,7 +33546,7 @@ mod tests {
         }
         assert!(
             checked >= 1,
-            "object_functionstr_type_name: expected a niche `ne` null-test switch block"
+            "object_functionstr_type_name: expected a niche identity-null-test switch block"
         );
     }
 
@@ -33516,6 +33639,62 @@ mod tests {
         assert_eq!(
             pos0_reads, 0,
             "the &mut niche arm must keep folding __pos_0"
+        );
+    }
+
+    /// PyPy `BuiltinCode.docstring` is a nullable RPython string and
+    /// `getdocstring` delegates to `space.newtext_or_none`: there is no enum
+    /// object carrying a `__discriminant` attribute. Rust spells the field as
+    /// `Option<&'static str>`, but the front's `SomeString` projection must
+    /// survive through that Option as one nullable GC pointer.
+    #[test]
+    #[ignore]
+    fn builtin_docstring_option_str_is_nullable_somestring() {
+        use crate::model::OpKind;
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "builtin_code_get_docstring")
+            .expect("lower builtin_code_get_docstring");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(&op.kind, OpKind::FieldRead { field, .. }
+                    if field.name == "__discriminant"))
+                .count(),
+            0,
+            "Option<&str> must test the nullable SomeString, not read an enum tag"
+        );
+        assert!(
+            ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_")),
+            "Option<&str> match must contain an identity null-test"
+        );
+    }
+
+    /// PyPy `W_TextIOWrapper.pending_bytes` is `None` or one ordinary list.
+    /// The Rust `Option<Vec<Vec<u8>>>` spelling therefore translates to a
+    /// nullable `SomeList`, not an enum shell around the list.
+    #[test]
+    #[ignore]
+    fn textio_pending_bytes_option_vec_is_nullable_somelist() {
+        use crate::model::OpKind;
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "write_flush").expect("lower TextIOWrapper.write_flush");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(&op.kind, OpKind::FieldRead { field, .. }
+                    if field.name == "__discriminant"))
+                .count(),
+            0,
+            "Option<Vec<_>> must test the nullable SomeList, not read an enum tag"
+        );
+        assert!(
+            !ops().any(|op| matches!(&op.kind,
+                OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                    if name == "is_some" || name == "is_none")),
+            "the Option predicate must not survive as a residual Rust method"
         );
     }
 
@@ -33893,7 +34072,7 @@ mod tests {
 
     /// End-to-end: `str_slice_args -> Result<Option<&Wtf8>, PyError>` (matched by
     /// `startswith`/`endswith`). Because `Wtf8` is an unsized DST, its
-    /// `Option<&Wtf8>` must NOT niche-fold — no pointer-null `ne` discriminant
+    /// `Option<&Wtf8>` must NOT niche-fold — no pointer identity-null discriminant
     /// against a `null_mut()` may appear, or the fat pointer's length word is
     /// lost. The residual/aggregate Option handling must survive. Loads the real
     /// LLBC, ignored.
@@ -33904,7 +34083,7 @@ mod tests {
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "str_slice_args").expect("lower str_slice_args");
-        // The niche discriminant fold emits `ne(base, null_mut())`; a declined
+        // The niche discriminant fold emits an identity test with `null_mut()`; a declined
         // Option keeps a `null_mut` builtin ONLY when genuinely niche. Assert no
         // `null_mut` call is synthesised for this graph's Option<&Wtf8> — the fat
         // ref must not be treated as a one-word niche.

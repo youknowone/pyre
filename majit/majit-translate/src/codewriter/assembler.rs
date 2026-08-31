@@ -4757,18 +4757,20 @@ fn op_kind_to_opname_with_kinds(kind: &crate::model::OpKind, operand_kinds: &str
             _ => format!("int_{op}"),
         };
     }
-    // RPython parity (`jtransform.py:1243-1255`): equality / inequality
-    // on Ref operands lowers to `ptr_eq` / `ptr_ne`, not the integer
-    // form.  Float arithmetic carries the full `float_*` opname through
-    // `op_kind_to_opname`'s BinOp arm already; here we only need to
-    // route the `eq` / `ne` labels emitted by the MIR front-end when
-    // they meet two Ref operands.  Mixed `ri` / `ir` Ref-Int shapes
+    // RPython parity (`rtyper/rmodel.py`, pairtype(Repr, Repr).rtype_is_,
+    // and `jtransform.py`'s pointer comparisons): equality, inequality,
+    // and identity on Ref operands lower to `ptr_eq` / `ptr_ne`, not the
+    // integer form. Float arithmetic carries the full `float_*` opname
+    // through `op_kind_to_opname`'s BinOp arm already; here we route the
+    // high-level labels emitted by the MIR front-end when they meet two Ref
+    // operands. Mixed `ri` / `ir` Ref-Int shapes
     // remain a kind-flow gap (see `default_bh_builder_unwired_set_*`
     // snapshot) — surfaced via the canonical fallthrough below.
     if let OpKind::BinOp { op, .. } = kind {
         match (op.as_str(), operand_kinds) {
             ("eq", "rr") => return "ptr_eq".into(),
             ("ne", "rr") => return "ptr_ne".into(),
+            ("is_", "rr") => return "ptr_eq".into(),
             _ => {}
         }
     }
@@ -5669,6 +5671,20 @@ mod tests {
     use super::*;
     use crate::flowspace::model::{ConstValue, HostObject};
     use crate::regalloc;
+
+    #[test]
+    fn surviving_ref_identity_uses_rpython_ptr_eq_opname() {
+        let lhs = crate::flowspace::model::Variable::new();
+        let rhs = crate::flowspace::model::Variable::new();
+        let identity = crate::model::OpKind::BinOp {
+            op: "is_".into(),
+            lhs,
+            rhs,
+            result_ty: crate::model::ValueType::Int,
+        };
+
+        assert_eq!(op_kind_to_opname_with_kinds(&identity, "rr"), "ptr_eq");
+    }
 
     #[test]
     fn vable_arraydescrof_pins_the_flat_word_base_for_pointer_items() {

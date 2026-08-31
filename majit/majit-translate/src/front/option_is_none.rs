@@ -1,12 +1,15 @@
-//! `Option::is_none` / `Option::is_some` → discriminant comparison (#131).
+//! `Option::is_none` / `Option::is_some` → representation test (#131).
 //!
-//! `is_none`/`is_some` are pure predicates on the receiver's tag: `is_none`
-//! is `opt.__discriminant == 0` and `is_some` is `opt.__discriminant != 0`
-//! (`None`=0, `Some`=1).  Unlike `unwrap_or`/`map_or` they read no payload
-//! and take no default, so there is no diamond and no block split — the
-//! residual one-arg `Method` call is replaced **in place** by a
-//! `__discriminant` `FieldRead` + `ConstInt(0)` + `BinOp` producing the same
-//! result `Variable`.
+//! `is_none`/`is_some` are pure predicates on the receiver's representation.
+//! An aggregate Option tests its tag: `is_none` is
+//! `opt.__discriminant == 0` and `is_some` is `opt.__discriminant != 0`
+//! (`None`=0, `Some`=1). A nullable RPython reference (`SomeInstance`,
+//! `SomeString`, or `SomeList` with `can_be_None=True`) has no enum object or
+//! tag field, so it uses RPython's pointer-identity `is None` operation
+//! (negated for `is_some`). Unlike
+//! `unwrap_or`/`map_or` these predicates read no payload and take no default,
+//! so there is no diamond and no block split; the residual one-arg `Method`
+//! call is replaced **in place** while preserving its result `Variable`.
 //!
 //! `is_none`/`is_some` bodies are Opaque (foreign `core`), so the receiver is
 //! the `Option` ADT and `first_is_self` routes the call to a
@@ -19,7 +22,7 @@
 //! graph the legacy walker already handled regresses.
 
 use crate::flowspace::model::Variable;
-use crate::model::{FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType};
+use crate::model::{CallTarget, FieldDescriptor, FunctionGraph, OpKind, SpaceOperation, ValueType};
 
 /// A recognized `Option::is_none(opt)` / `Option::is_some(opt)` call site
 /// captured during body lowering (`front::mir` `recognize_is_none_site`).
@@ -32,6 +35,14 @@ pub(crate) struct IsNoneSite {
     /// `true` for `is_some` (`__discriminant != 0`), `false` for `is_none`
     /// (`__discriminant == 0`).
     pub is_some: bool,
+    /// The receiver is the translated nullable-pointer representation. Its
+    /// predicate is an identity comparison with null; no `__discriminant`
+    /// exists.
+    pub niche: bool,
+    /// Optional `__cast_instance_intrinsic` target and result kind for a Rust
+    /// container projected to an RPython string/list repr. The null operand
+    /// must enter that same repr before comparison.
+    pub niche_null_cast: Option<(String, ValueType)>,
 }
 
 /// Rewrite every recorded `is_none`/`is_some` call into the discriminant
@@ -77,39 +88,101 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
     };
 
     // --- Structural validation passed; mutate the graph. ---
-    let disc = graph.alloc_value_var();
-    let zero = graph.alloc_value_var();
-    let op = if site.is_some { "ne" } else { "eq" };
-    let new_ops = vec![
-        SpaceOperation {
-            result: Some(disc.clone()),
-            kind: OpKind::FieldRead {
-                base: opt,
-                field: FieldDescriptor {
-                    name: "__discriminant".to_string(),
-                    owner_root: Some(site.option_owner.clone()),
-                    owner_id: None,
-                    base_is_deref: None,
-                    taken_by_address: false,
-                },
-                ty: ValueType::Int,
-                pure: true,
+    let new_ops = if site.niche {
+        let null = graph.alloc_value_var();
+        let mut ops = vec![SpaceOperation {
+            result: Some(null.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["core", "ptr", "null_mut"]),
+                args: vec![],
+                result_ty: ValueType::Ref(None),
             },
-        },
-        SpaceOperation {
-            result: Some(zero.clone()),
-            kind: OpKind::ConstInt(0),
-        },
-        SpaceOperation {
-            result: Some(site.result_var.clone()),
+        }];
+        let rhs = if let Some((root, result_ty)) = &site.niche_null_cast {
+            let narrowed = graph.alloc_value_var();
+            ops.push(SpaceOperation {
+                result: Some(narrowed.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
+                            root.clone(),
+                        ],
+                    },
+                    args: vec![null],
+                    result_ty: result_ty.clone(),
+                },
+            });
+            narrowed
+        } else {
+            null
+        };
+        let is_none = if site.is_some {
+            graph.alloc_value_var()
+        } else {
+            site.result_var.clone()
+        };
+        ops.push(SpaceOperation {
+            result: Some(is_none.clone()),
             kind: OpKind::BinOp {
-                op: op.to_string(),
-                lhs: disc,
-                rhs: zero,
+                op: "is_".to_string(),
+                lhs: opt,
+                rhs,
                 result_ty: ValueType::Int,
             },
-        },
-    ];
+        });
+        if site.is_some {
+            let false_var = graph.alloc_value_var();
+            ops.push(SpaceOperation {
+                result: Some(false_var.clone()),
+                kind: OpKind::ConstBool(false),
+            });
+            ops.push(SpaceOperation {
+                result: Some(site.result_var.clone()),
+                kind: OpKind::BinOp {
+                    op: "eq".to_string(),
+                    lhs: is_none,
+                    rhs: false_var,
+                    result_ty: ValueType::Int,
+                },
+            });
+        }
+        ops
+    } else {
+        let op = if site.is_some { "ne" } else { "eq" };
+        let disc = graph.alloc_value_var();
+        let zero = graph.alloc_value_var();
+        vec![
+            SpaceOperation {
+                result: Some(disc.clone()),
+                kind: OpKind::FieldRead {
+                    base: opt,
+                    field: FieldDescriptor {
+                        name: "__discriminant".to_string(),
+                        owner_root: Some(site.option_owner.clone()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                    },
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+            },
+            SpaceOperation {
+                result: Some(zero.clone()),
+                kind: OpKind::ConstInt(0),
+            },
+            SpaceOperation {
+                result: Some(site.result_var.clone()),
+                kind: OpKind::BinOp {
+                    op: op.to_string(),
+                    lhs: disc,
+                    rhs: zero,
+                    result_ty: ValueType::Int,
+                },
+            },
+        ]
+    };
     graph.blocks[a]
         .operations
         .splice(call_idx..=call_idx, new_ops);
@@ -119,7 +192,6 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::CallTarget;
 
     fn is_none_target(name: &str) -> CallTarget {
         CallTarget::method(name, Some("core::option::Option".to_string()))
@@ -130,6 +202,8 @@ mod tests {
             result_var,
             option_owner: "core::option::Option".into(),
             is_some,
+            niche: false,
+            niche_null_cast: None,
         }
     }
 
@@ -207,6 +281,84 @@ mod tests {
             OpKind::BinOp { op, .. } => assert_eq!(op, "ne", "is_some compares != 0"),
             other => panic!("result is not a BinOp: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rewrite_lifts_nullable_is_some_to_pointer_null_test() {
+        let mut g = FunctionGraph::new("test_nullable_is_some");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstRefNull, true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: is_none_target("is_some"),
+                    args: vec![opt.clone()],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(a, None);
+        let rewritten = rewire_is_none_call_sites(
+            &mut g,
+            &[IsNoneSite {
+                result_var: result.clone(),
+                option_owner: "core::option::Option".into(),
+                is_some: true,
+                niche: true,
+                niche_null_cast: None,
+            }],
+        );
+        assert_eq!(rewritten, 1);
+        assert!(
+            !g.blocks[a.0]
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::FieldRead { field, .. }
+                    if field.name == "__discriminant")),
+            "nullable RPython references have no enum tag field"
+        );
+        let null = g.blocks[a.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. }
+                    if target.to_string() == "core::ptr::null_mut" && args.is_empty() =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("one repr-adaptive null pointer");
+        let is_none = g.blocks[a.0]
+            .operations
+            .iter()
+            .find_map(|operation| match &operation.kind {
+                OpKind::BinOp {
+                    op: name, lhs, rhs, ..
+                } if name == "is_" && lhs == &opt && rhs == &null => operation.result.clone(),
+                _ => None,
+            })
+            .expect("opt is null identity test");
+        let false_var = g.blocks[a.0]
+            .operations
+            .iter()
+            .find_map(|operation| match operation.kind {
+                OpKind::ConstBool(false) => operation.result.clone(),
+                _ => None,
+            })
+            .expect("is_some negation false constant");
+        let predicate = g.blocks[a.0]
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&result))
+            .expect("is_some result producer");
+        assert!(
+            matches!(&predicate.kind, OpKind::BinOp { op, lhs, rhs, .. }
+                if op == "eq" && lhs == &is_none && rhs == &false_var),
+            "is_some on a nullable ref negates `opt is null`"
+        );
     }
 
     /// A producer op that is not a 1-arg call declines (fail-safe): the residual
