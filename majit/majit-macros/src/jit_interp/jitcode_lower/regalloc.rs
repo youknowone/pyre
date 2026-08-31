@@ -220,6 +220,18 @@ fn is_aux_builder_method(name: &str) -> bool {
         )
 }
 
+/// Rewrites one builder call's register literals, in argument order.
+///
+/// The pass works on tokens, so a register operand and an ordinary integer
+/// constant are both `Lit::Int` and nothing in the syntax tells them apart.
+/// What separates them is that `remaining` is seeded with exactly this op's
+/// reads and writes and each match spends one: by the time a constant is
+/// visited, the registers it could collide with are already spent. That holds
+/// only because **every builder method lists its register operands before its
+/// constants**. A method taking a constant first would let it consume the slot
+/// and leave the real register literal unrewritten — with the counts still
+/// balancing, so nothing here would report it. Keep new builder methods
+/// registers-first.
 struct LiteralRegisterRewriter<'a> {
     mapping: &'a HashMap<Register, Register>,
     remaining: HashMap<Register, usize>,
