@@ -7430,8 +7430,10 @@ impl<'a> Lowering<'a> {
     }
 
     /// Decode an inline-Field `dyn Trait` call operand into the
-    /// `(trait_root, method_name)` pair the `CallTarget::Indirect`
-    /// vtable-dispatch pipeline keys on.
+    /// `(trait_root, method_name)` pair carried as the `family_key` of the
+    /// [`OpKind::IndirectCall`] this lowers to.  `rpbc::lower_indirect_calls`
+    /// consumes that key to attach the same `c_graphs` PBC family
+    /// `FunctionReprBase.call` appends, then clears it.
     ///
     /// The inline dispatch reads the method fn-ptr straight out of the
     /// receiver's vtable — the operand's terminal projection is
