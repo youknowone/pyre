@@ -1103,6 +1103,16 @@ pub fn builtin_code_call_positional(
         // excess positionals reach the typed wrapper, which consumes its
         // declared prefix and silently ignores the rest.
         if unsafe { crate::builtin_code_get_fast_natural_arity(current_code) } == crate::HOPELESS {
+            // `descr_check` before the binder: binding reports a surplus
+            // positional or an unknown keyword, and upstream reaches neither
+            // until the receiver has answered for itself.
+            let (positional, _) = crate::builtins::split_builtin_kwargs(current_args);
+            unsafe {
+                crate::gateway::builtin_code_check_receiver(
+                    current_code as *const crate::gateway::BuiltinCode,
+                    positional,
+                )
+            }?;
             let fname = unsafe {
                 crate::gateway::builtin_code_call_name(current_code, current_args.first().copied())
             };
@@ -3076,6 +3086,14 @@ fn call_with_kwargs_in_ctx_impl(
             if let Some(sig) =
                 unsafe { crate::builtin_code_get_signature(code as pyre_object::PyObjectRef) }
             {
+                // `descr_check` before the binder, as above: a keyword that
+                // names nothing is reported only once the receiver stands.
+                unsafe {
+                    crate::gateway::builtin_code_check_receiver(
+                        code as *const crate::gateway::BuiltinCode,
+                        pos_args,
+                    )
+                }?;
                 let fname = unsafe {
                     crate::gateway::builtin_code_call_name(
                         code as pyre_object::PyObjectRef,

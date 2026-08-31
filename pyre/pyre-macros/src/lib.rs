@@ -1853,7 +1853,7 @@ fn expand_pyre_methods(
         // make_builtin_function(...))` they participate in a deferred
         // `w_getset_property_new(fget=, fset=)` build keyed by py_name.
         let mut inputs = m.sig.inputs.iter().peekable();
-        let (preamble, call_target, first_arg_idx) = match &kind {
+        let (recv_check, preamble, call_target, first_arg_idx) = match &kind {
             MethodKind::Instance
             | MethodKind::Getter(..)
             | MethodKind::Setter(..)
@@ -1888,26 +1888,65 @@ fn expand_pyre_methods(
                     quote! { &*s }
                 };
                 let needed = self_idx + 1;
+                // `descr_check` names the descriptor as Python sees it, and
+                // a `#[setter]` / `#[deleter]` reaches the type under the
+                // property's name rather than the `set_` / `del_` prefixed
+                // Rust one: `_CHUNK_SIZE`, not `set__CHUNK_SIZE`.
+                let descr_name = match &kind {
+                    MethodKind::Getter(py_name, _)
+                    | MethodKind::Setter(py_name, _)
+                    | MethodKind::Deleter(py_name, _) => py_name.clone(),
+                    _ => mname.to_string(),
+                };
+                // `method_check_args` runs `descr_check` against the owning
+                // type, which the wrapper knows as `PYNAME`.  The layout test
+                // here is the one that answers for a type carrying no
+                // `method_owner` row, so it words the refusal the same way
+                // rather than inventing its own.
+                //
+                // Split in two: `descr_check` precedes the clinic's own
+                // argument parsing, so `BytesIO.seek(1, 2, 3, 4)` names the
+                // receiver rather than the count.  The reference is bound
+                // only after the unwraps, which can collect, so the test runs
+                // twice and the second one never fails.
+                // Written without an `Option` combinator: a closure here
+                // becomes an aggregate and a `call_once` in every wrapper.
+                let recv_check = quote! {
+                    if args.len() < #needed || args[#self_idx].is_null() {
+                        return ::std::result::Result::Err(crate::gateway::receiver_mismatch(
+                            <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
+                            #descr_name,
+                            ::std::option::Option::None,
+                        ));
+                    }
+                    if <#self_ty>::from_obj(args[#self_idx]).is_none() {
+                        return ::std::result::Result::Err(crate::gateway::receiver_mismatch(
+                            <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
+                            #descr_name,
+                            ::std::option::Option::Some(args[#self_idx]),
+                        ));
+                    }
+                };
                 let preamble = quote! {
                     if args.len() < #needed {
-                        return ::std::result::Result::Err(
-                            crate::PyError::type_error(
-                                concat!("descriptor '", stringify!(#mname), "' requires self argument"),
-                            ),
-                        );
+                        return ::std::result::Result::Err(crate::gateway::receiver_mismatch(
+                            <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
+                            #descr_name,
+                            ::std::option::Option::None,
+                        ));
                     }
                     let __pyre_self = match <#self_ty>::from_obj(args[#self_idx]) {
                         ::std::option::Option::Some(s) => #bind_self,
                         ::std::option::Option::None => {
-                            return ::std::result::Result::Err(
-                                crate::PyError::type_error(
-                                    concat!("descriptor '", stringify!(#mname), "' got wrong receiver type"),
-                                ),
-                            );
+                            return ::std::result::Result::Err(crate::gateway::receiver_mismatch(
+                                <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
+                                #descr_name,
+                                ::std::option::Option::Some(args[#self_idx]),
+                            ));
                         }
                     };
                 };
-                (preamble, quote! { __pyre_self.#mname }, self_idx + 1)
+                (recv_check, preamble, quote! { __pyre_self.#mname }, self_idx + 1)
             }
             MethodKind::Static => {
                 if matches!(inputs.peek(), Some(FnArg::Receiver(_))) {
@@ -1916,7 +1955,7 @@ fn expand_pyre_methods(
                         "#[staticmethod]: must not take `self` / `&self` / `&mut self`",
                     ));
                 }
-                (quote! {}, quote! { <#self_ty>::#mname }, 0)
+                (quote! {}, quote! {}, quote! { <#self_ty>::#mname }, 0)
             }
             MethodKind::Class => {
                 if matches!(inputs.peek(), Some(FnArg::Receiver(_))) {
@@ -1926,7 +1965,7 @@ fn expand_pyre_methods(
                          not `&self` / `&mut self`",
                     ));
                 }
-                (quote! {}, quote! { <#self_ty>::#mname }, 0)
+                (quote! {}, quote! {}, quote! { <#self_ty>::#mname }, 0)
             }
         };
 
@@ -2216,6 +2255,7 @@ fn expand_pyre_methods(
             pub fn #wrapper_name(
                 args: &[::pyre_object::PyObjectRef],
             ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
+                #recv_check
                 #kwargs_preamble
                 #arity_preamble
                 #(#unwrap_stmts)*

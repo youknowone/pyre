@@ -863,6 +863,43 @@ pub unsafe fn builtin_code_set_owner(obj: PyObjectRef, owner: &'static MethodOwn
     unsafe { (*(obj as *mut BuiltinCode)).owner = owner };
 }
 
+/// `method_check_args`'s `descr_check` half: the receiver a descriptor was
+/// published for has to be present and of the owning type.
+///
+/// It runs ahead of the clinic's argument parsing, so a call that is wrong in
+/// both respects reports the receiver — `BytesIO.seek(1, 2, 3, 4)` names the
+/// `int`, not the count, and `deque.appendleft(x=1)` reports the missing
+/// receiver rather than the keyword.
+///
+/// # Safety
+/// `code` must point to a valid `BuiltinCode`.
+pub(crate) unsafe fn builtin_code_check_receiver(
+    code: *const BuiltinCode,
+    positional: &[PyObjectRef],
+) -> Result<(), crate::PyError> {
+    let owner = unsafe { (*code).owner };
+    if owner.is_null() {
+        return Ok(());
+    }
+    // `bind_kwargs_to_signature` lays out every declared slot and leaves the
+    // ones the call did not fill as `PY_NULL`, so a descriptor invoked with no
+    // receiver at all arrives with its `self` slot present but empty.  Reading
+    // that slot as an argument reported a missing receiver as a foreign one,
+    // and let a receiverless call past an owner carrying no layout test.
+    let receiver = positional.first().copied().filter(|r| !r.is_null());
+    let owner = unsafe { &*owner };
+    let accepted = matches!(receiver, Some(receiver)
+        if owner.is_instance.is_none_or(|is_instance| is_instance(receiver)));
+    if accepted {
+        return Ok(());
+    }
+    Err(receiver_mismatch(
+        owner.type_name,
+        unsafe { (*code).name },
+        receiver,
+    ))
+}
+
 /// Invoke a `BuiltinCode` after applying the receiver and arity checks its
 /// registration requires.  Every dispatch path — the interpreter's call paths,
 /// the JIT's residual call, and the bound-method fast paths — goes through
@@ -889,21 +926,11 @@ pub unsafe fn builtin_code_call(
     // the positional slice: counting it as the receiver would report the
     // keyword dict as the object the descriptor was called on.
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    // `bind_kwargs_to_signature` lays out every declared slot and leaves the
-    // ones the call did not fill as `PY_NULL`, so a descriptor invoked with no
-    // receiver at all arrives with its `self` slot present but empty.  Reading
-    // that slot as an argument reported a missing receiver as a foreign one,
-    // and let a receiverless call past an owner carrying no layout test.
+    unsafe { builtin_code_check_receiver(code, positional) }?;
+    // The receiver the two argument refusals below name, read the same way
+    // the check above reads it: an unfilled `self` slot is `PY_NULL`, not an
+    // argument the call supplied.
     let receiver = positional.first().copied().filter(|r| !r.is_null());
-    let owner = unsafe { (*code).owner };
-    if !owner.is_null() {
-        let owner = unsafe { &*owner };
-        let accepted = matches!(receiver, Some(receiver)
-            if owner.is_instance.is_none_or(|is_instance| is_instance(receiver)));
-        if !accepted {
-            return Err(receiver_mismatch(owner, unsafe { (*code).name }, receiver));
-        }
-    }
     // eval.py:16-23 — a `fast_natural_arity` of 0..=4 is the exact positional
     // count the implementation was registered for; `HOPELESS`,
     // `PASSTHROUGHARGS1` and the `FLATPYCALL` bit all exceed 4.  A body with a
@@ -1213,14 +1240,22 @@ pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
 
 /// Build the TypeError an unbound descriptor raises for a missing or
 /// foreign receiver.  Cold: it runs only on the failing call.
+///
+/// `ty` is the owning type's `tp_name`, which `descr_check` spells whole
+/// while `_PyObject_FunctionStr` shortens it to the last component, so
+/// `_io.BytesIO.getvalue` reports `unbound method BytesIO.getvalue() needs
+/// an argument` but `descriptor 'getvalue' for '_io.BytesIO' objects`.
+///
+/// A `getset_descriptor` refuses through `descr_check` as well, and its
+/// property name is not a slot name, so it takes the same two method
+/// wordings rather than the slot-wrapper pair.
 #[cold]
 #[inline(never)]
-fn receiver_mismatch(
-    owner: &MethodOwner,
+pub(crate) fn receiver_mismatch(
+    ty: &str,
     name: &str,
     receiver: Option<PyObjectRef>,
 ) -> crate::PyError {
-    let ty = owner.type_name;
     let slot_wrapper = is_slot_wrapper(ty, name);
     let message = match receiver {
         None if slot_wrapper => format!("descriptor '{name}' of '{ty}' object needs an argument"),
