@@ -3232,7 +3232,7 @@ impl std::error::Error for LowerError {}
 /// name it explicitly instead. Without a name `arraydescrof_concrete`
 /// returns no descr-set key, `canonicalize_keyed_descrs` drops the whole
 /// set, and the callee's `EffectInfo` degrades to `EF_RANDOM_EFFECTS`.
-const OBJECT_REF_GCARRAY_TYPE_ID: &str = "majit::object_ref_gcarray";
+pub(crate) const OBJECT_REF_GCARRAY_TYPE_ID: &str = "majit::object_ref_gcarray";
 /// PyPy `BytesListStrategy` / `AsciiListStrategy` expose `SomeString`
 /// elements, while `rmodel.externalvsinternal(..., gcref=True)` stores those
 /// GC pointers in `GcArray(GCREF)`.  The logical list identity must therefore

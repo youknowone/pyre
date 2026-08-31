@@ -914,6 +914,13 @@ impl<'a> Transformer<'a> {
         // `SpecTag` out of the annotator.
         fold_we_are_jitted_calls(&mut rewritten);
 
+        // Scalarise the front's iterator markers (`core::slice::iter`,
+        // `__iter_next`, `__majit_range`) that only the lifted spine's
+        // rtyper consumed (`rlist.py` / `rrange.py` reprs); a graph on
+        // this spine keeps them to the codewriter, where each is a
+        // symbolic residual no host symbol backs.
+        crate::codewriter::iter_lower::lower_iterators(&mut rewritten);
+
         self.call_argument_vars = rewritten
             .blocks
             .iter()
@@ -3764,6 +3771,35 @@ impl<'a> Transformer<'a> {
                 },
             };
             return self.rewrite_operation(&cast_op, graph_name, graph);
+        }
+        // `__getslice_rangefrom(l, start)` — the front's deferred `l[start:]`
+        // on a GC array.  The rtyper's `rtype_getslice` (`rlist.py`) turns
+        // the lifted graph's `getslice` into a direct call of
+        // `ll_listslice_startonly`; a graph on this spine never met the
+        // rtyper, so mint that helper here and redirect the call to it
+        // (`codewriter::getslice`).  Without the array's item kind the
+        // marker stays what it was, a residual call.
+        if crate::codewriter::getslice::is_getslice_rangefrom(op)
+            && let Some((item_ty, array_type_id)) =
+                crate::codewriter::getslice::array_identity_of_base(graph, &args[0])
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let path = crate::codewriter::getslice::listslice_startonly_path(
+                cc,
+                &item_ty,
+                array_type_id.as_deref(),
+            );
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: path.segments.clone(),
+                    },
+                    args: args.to_vec(),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return self.rewrite_operation(&helper_call, graph_name, graph);
         }
         // RPython `jtransform.py rewrite_op_jit_marker`:
         // marker calls never reach `guess_call_kind` — they dispatch straight
