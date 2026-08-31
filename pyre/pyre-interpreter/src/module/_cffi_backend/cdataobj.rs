@@ -926,7 +926,7 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
     if ct.kind == ctypeobj::KIND_FUNC {
-        return super::ctypefunc::call(ct, cdata.ptr, &args[1..]);
+        return super::ctypefunc::call(ct, cdata.ptr as usize, &args[1..]);
     }
     Err(PyError::type_error(format!(
         "cdata '{}' is not callable",

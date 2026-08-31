@@ -1,0 +1,505 @@
+//! The `CIF_DESCRIPTION` block and the call shape a trace can specialize —
+//! RPython: `rpython/rlib/jit_libffi.py`.
+//!
+//! For each C function, one `CIF_DESCRIPTION` block of raw memory is built
+//! and every field but `cif` filled in; `atypes` points at an array of
+//! `ffi_type *` that lives in the same block.  Following the four fields
+//! `ffi_prep_cif` takes are the three this file adds:
+//!
+//! * `exchange_size` — how big a buffer a call must allocate.  The first
+//!   `nargs` pointers of that buffer are the argument array
+//!   [`jit_ffi_call_impl_any`] fills in.
+//! * `exchange_result` — the offset in that buffer where the result lands.
+//! * `exchange_args[nargs]` — the offset of each argument.
+//!
+//! Each argument and the result have room for at least `SIZE_OF_FFI_ARG`
+//! bytes even when the value is smaller.
+//!
+//! # Why the call is split by result kind
+//!
+//! A trace turns the foreign call into `call_release_gil`.  Recording the
+//! result inside the metainterp would leave the freshly built result box out
+//! of the `guard_not_forced` fail arguments, so the call is a jitcode-level
+//! `direct_call` of its own whose result the caller stores back into the
+//! exchange buffer:
+//!
+//! ```text
+//!     %i0 = direct_call(libffi_call, ...)
+//!     -live-
+//!     raw_store(exchange_result, %i0)
+//! ```
+//!
+//! The `-live-` is what keeps the value across a failing `guard_not_forced`.
+//! `jit_ffi_call_impl_int` and its siblings read the same word back out of
+//! the buffer when they run interpreted, so the store is a no-op there and
+//! the two modes agree.
+
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    ),
+    not(any(target_env = "musl", target_env = "sgx"))
+))]
+mod imp {
+    use super::super::misc;
+    use libffi::low::{CodePtr, ffi_abi, ffi_cif, ffi_type};
+
+    /// `jit_libffi.py CIF_DESCRIPTION`.  An array of `nargs` exchange offsets
+    /// follows the record; `atypes` and any struct `ffi_type` follow that, all
+    /// inside the one block this describes.
+    #[repr(C)]
+    pub struct CifDescription {
+        pub cif: ffi_cif,
+        pub abi: ffi_abi,
+        pub nargs: usize,
+        pub rtype: *mut ffi_type,
+        pub atypes: *mut *mut ffi_type,
+        pub exchange_size: usize,
+        pub exchange_result: usize,
+    }
+
+    /// `jit_libffi.py SIZE_OF_FFI_ARG`.
+    pub const SIZE_OF_FFI_ARG: usize = std::mem::size_of::<libffi::low::ffi_arg>();
+
+    /// # Safety
+    /// `cif` must be a block [`super::super::ctypefunc::build_cif_descr`] built.
+    pub(crate) unsafe fn header(cif: usize) -> &'static mut CifDescription {
+        unsafe { &mut *(cif as *mut CifDescription) }
+    }
+
+    /// `cif_description.exchange_args`.
+    ///
+    /// # Safety
+    /// As [`header`].
+    pub(crate) unsafe fn exchange_args(cif: usize) -> *mut usize {
+        (cif + std::mem::size_of::<CifDescription>()) as *mut usize
+    }
+
+    // The block carries `hints={'immutable': True}`: every field is filled in
+    // before the first call through it and read-only afterwards.  Each reader
+    // below is one elidable leaf, so a call through a promoted function type
+    // reads them at trace time and the offsets it computes are constants.
+
+    /// `cif_description.exchange_size`.
+    ///
+    /// # Safety
+    /// As [`header`].
+    #[majit_macros::elidable_cannot_raise]
+    pub unsafe fn exchange_size(cif: usize) -> usize {
+        unsafe { header(cif).exchange_size }
+    }
+
+    /// `cif_description.exchange_result`.
+    ///
+    /// # Safety
+    /// As [`header`].
+    #[majit_macros::elidable_cannot_raise]
+    pub unsafe fn exchange_result(cif: usize) -> usize {
+        unsafe { header(cif).exchange_result }
+    }
+
+    /// `cif_description.exchange_args[i]`.
+    ///
+    /// # Safety
+    /// As [`header`]; `i` must be below `nargs`.
+    #[majit_macros::elidable_cannot_raise]
+    pub unsafe fn exchange_arg(cif: usize, i: usize) -> usize {
+        unsafe { exchange_args(cif).add(i).read() }
+    }
+
+    /// `cif_description.nargs`.
+    ///
+    /// # Safety
+    /// As [`header`].
+    #[majit_macros::elidable_cannot_raise]
+    pub unsafe fn nargs(cif: usize) -> usize {
+        unsafe { header(cif).nargs }
+    }
+
+    /// `cif_description.rtype`.
+    ///
+    /// # Safety
+    /// As [`header`].
+    #[majit_macros::elidable_cannot_raise]
+    pub unsafe fn rtype(cif: usize) -> usize {
+        unsafe { header(cif).rtype as usize }
+    }
+
+    /// `cif_description.atypes[i]`.
+    ///
+    /// # Safety
+    /// As [`header`]; `i` must be below `nargs`.
+    #[majit_macros::elidable_cannot_raise]
+    pub unsafe fn atype(cif: usize, i: usize) -> usize {
+        unsafe { header(cif).atypes.add(i).read() as usize }
+    }
+
+    /// `cif_description.abi`.
+    ///
+    /// # Safety
+    /// As [`header`].
+    #[majit_macros::elidable_cannot_raise]
+    pub unsafe fn abi(cif: usize) -> i64 {
+        unsafe { header(cif).abi as i64 }
+    }
+
+    /// The `kind` letters [`types::getkind`] answers with.
+    pub mod kind {
+        /// `void`.
+        pub const VOID: i64 = b'v' as i64;
+        /// `double`.
+        pub const FLOAT: i64 = b'f' as i64;
+        /// A signed integer.
+        pub const SIGNED: i64 = b'i' as i64;
+        /// An unsigned integer.
+        pub const UNSIGNED: i64 = b'u' as i64;
+        /// `float`, which travels in an integer-sized slot.
+        pub const SINGLEFLOAT: i64 = b'S' as i64;
+        /// An integer wider than a machine word.
+        pub const LONGLONG: i64 = b'L' as i64;
+        /// A struct passed by value.
+        pub const STRUCT: i64 = b'*' as i64;
+        /// Anything else, `long double` among it.
+        pub const OTHER: i64 = b'?' as i64;
+    }
+
+    /// `jit_libffi.py types` — the mapping the JIT needs from an `ffi_type`
+    /// to a less strict kind letter.
+    pub mod types {
+        use super::kind;
+        use libffi::low::{type_tag, types as ffi_types};
+
+        /// `types.slong` — `cast_type_to_ffitype(rffi.LONG)`.
+        fn slong() -> usize {
+            match std::mem::size_of::<std::ffi::c_long>() {
+                8 => &raw mut ffi_types::sint64 as usize,
+                4 => &raw mut ffi_types::sint32 as usize,
+                _ => &raw mut ffi_types::sint16 as usize,
+            }
+        }
+
+        /// `types.ulong` — `cast_type_to_ffitype(rffi.ULONG)`.
+        fn ulong() -> usize {
+            match std::mem::size_of::<std::ffi::c_ulong>() {
+                8 => &raw mut ffi_types::uint64 as usize,
+                4 => &raw mut ffi_types::uint32 as usize,
+                _ => &raw mut ffi_types::uint16 as usize,
+            }
+        }
+
+        /// `types.signed` — `cast_type_to_ffitype(rffi.SIGNED)`.  Win64 is
+        /// where this differs from [`slong`]: a machine word is eight bytes
+        /// there while a `long` is four.
+        fn signed() -> usize {
+            match std::mem::size_of::<isize>() {
+                8 => &raw mut ffi_types::sint64 as usize,
+                _ => &raw mut ffi_types::sint32 as usize,
+            }
+        }
+
+        /// `types.unsigned` — `cast_type_to_ffitype(rffi.UNSIGNED)`.
+        fn unsigned() -> usize {
+            match std::mem::size_of::<usize>() {
+                8 => &raw mut ffi_types::uint64 as usize,
+                _ => &raw mut ffi_types::uint32 as usize,
+            }
+        }
+
+        /// `types.getkind(ffi_type)`.
+        ///
+        /// The `slong` / `ulong` / `signed` / `unsigned` records are asked
+        /// before the explicit 64-bit ones, and they *are* the 64-bit records
+        /// wherever a `long` or a machine word is eight bytes wide, so an
+        /// eight-byte integer answers `i` / `u` there and only a 32-bit
+        /// platform reaches `L`.
+        ///
+        /// # Safety
+        /// `ffi_type` must be an `ffi_type` record, or zero.
+        #[majit_macros::elidable_cannot_raise]
+        pub unsafe fn getkind(ffi_type: usize) -> i64 {
+            if ffi_type == 0 {
+                return kind::OTHER;
+            }
+            if ffi_type == &raw mut ffi_types::void as usize {
+                return kind::VOID;
+            }
+            if ffi_type == &raw mut ffi_types::double as usize {
+                return kind::FLOAT;
+            }
+            if ffi_type == &raw mut ffi_types::float as usize {
+                return kind::SINGLEFLOAT;
+            }
+            if ffi_type == &raw mut ffi_types::pointer as usize {
+                return kind::UNSIGNED;
+            }
+            if ffi_type == slong() || ffi_type == signed() {
+                return kind::SIGNED;
+            }
+            if ffi_type == ulong() || ffi_type == unsigned() {
+                return kind::UNSIGNED;
+            }
+            if ffi_type == &raw mut ffi_types::sint8 as usize
+                || ffi_type == &raw mut ffi_types::sint16 as usize
+                || ffi_type == &raw mut ffi_types::sint32 as usize
+            {
+                return kind::SIGNED;
+            }
+            if ffi_type == &raw mut ffi_types::uint8 as usize
+                || ffi_type == &raw mut ffi_types::uint16 as usize
+                || ffi_type == &raw mut ffi_types::uint32 as usize
+            {
+                return kind::UNSIGNED;
+            }
+            if ffi_type == &raw mut ffi_types::sint64 as usize
+                || ffi_type == &raw mut ffi_types::uint64 as usize
+            {
+                return kind::LONGLONG;
+            }
+            if unsafe { is_struct(ffi_type) } {
+                return kind::STRUCT;
+            }
+            kind::OTHER
+        }
+
+        /// `types.getsize(ffi_type)`.
+        ///
+        /// # Safety
+        /// `ffi_type` must be an `ffi_type` record.
+        #[majit_macros::elidable_cannot_raise]
+        pub unsafe fn getsize(ffi_type: usize) -> usize {
+            unsafe { (*(ffi_type as *const libffi::low::ffi_type)).size }
+        }
+
+        /// `types.is_struct(ffi_type)`.
+        ///
+        /// # Safety
+        /// `ffi_type` must be an `ffi_type` record.
+        #[majit_macros::elidable_cannot_raise]
+        pub unsafe fn is_struct(ffi_type: usize) -> bool {
+            unsafe { (*(ffi_type as *const libffi::low::ffi_type)).type_ == type_tag::STRUCT }
+        }
+    }
+
+    /// `jit_libffi.py jit_ffi_call` — call the function `cif_description`
+    /// describes, with the arguments already converted into
+    /// `exchange_buffer`, and leave the result in that buffer at
+    /// `exchange_result`.
+    ///
+    /// `cif_description` has to be a trace constant for a trace to specialize
+    /// the call, which is why the caller promotes the function type before it
+    /// allocates the buffer.
+    ///
+    /// # Safety
+    /// `exchange_buffer` must be a buffer of `exchange_size(cif_description)`
+    /// bytes holding `nargs` converted arguments, and `func_addr` must be the
+    /// entry point the cif was prepared for.
+    pub unsafe fn jit_ffi_call(cif_description: usize, func_addr: usize, exchange_buffer: usize) {
+        let reskind = unsafe { types::getkind(rtype(cif_description)) };
+        if reskind == kind::VOID {
+            unsafe { jit_ffi_call_impl_void(cif_description, func_addr, exchange_buffer) };
+        } else if reskind == kind::SIGNED {
+            unsafe { do_ffi_call_sint(cif_description, func_addr, exchange_buffer) };
+        } else if reskind == kind::UNSIGNED {
+            unsafe { do_ffi_call_uint(cif_description, func_addr, exchange_buffer) };
+        } else if reskind == kind::FLOAT {
+            unsafe { do_ffi_call_float(cif_description, func_addr, exchange_buffer) };
+        } else if reskind == kind::SINGLEFLOAT {
+            unsafe { do_ffi_call_singlefloat(cif_description, func_addr, exchange_buffer) };
+        } else {
+            // The result kind is not one a trace can carry, so call
+            // `jit_ffi_call_impl_any` directly and let no `libffi_call`
+            // oopspec reach the JIT at all.  `call_release_gil` is not
+            // generated, so there is nothing to store back either.
+            // `L` arrives here as well: an integer wider than a machine word
+            // is a 32-bit-only kind (see [`types::getkind`]), and the
+            // longlong-through-a-float-register spelling it would need has no
+            // counterpart in the register banks this backend has.
+            unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
+        }
+    }
+
+    /// `jit_libffi.py _do_ffi_call_sint`.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    unsafe fn do_ffi_call_sint(cif_description: usize, func_addr: usize, exchange_buffer: usize) {
+        let result = unsafe { jit_ffi_call_impl_int(cif_description, func_addr, exchange_buffer) };
+        let target = exchange_buffer + unsafe { exchange_result(cif_description) };
+        match unsafe { types::getsize(rtype(cif_description)) } {
+            1 => misc::raw_write_i8(target, result),
+            2 => misc::raw_write_i16(target, result),
+            4 => misc::raw_write_i32(target, result),
+            // The default case expects a full signed number.
+            _ => misc::raw_write_i64(target, result),
+        }
+    }
+
+    /// `jit_libffi.py _do_ffi_call_uint`.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    unsafe fn do_ffi_call_uint(cif_description: usize, func_addr: usize, exchange_buffer: usize) {
+        let result = unsafe { jit_ffi_call_impl_int(cif_description, func_addr, exchange_buffer) };
+        let target = exchange_buffer + unsafe { exchange_result(cif_description) };
+        match unsafe { types::getsize(rtype(cif_description)) } {
+            1 => misc::raw_write_u8(target, result as u64),
+            2 => misc::raw_write_u16(target, result as u64),
+            4 => misc::raw_write_u32(target, result as u64),
+            // The default case expects a full unsigned number.
+            _ => misc::raw_write_u64(target, result as u64),
+        }
+    }
+
+    /// `jit_libffi.py _do_ffi_call_float`.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    unsafe fn do_ffi_call_float(cif_description: usize, func_addr: usize, exchange_buffer: usize) {
+        let result =
+            unsafe { jit_ffi_call_impl_float(cif_description, func_addr, exchange_buffer) };
+        let target = exchange_buffer + unsafe { exchange_result(cif_description) };
+        misc::raw_write_f64(target, result);
+    }
+
+    /// `jit_libffi.py _do_ffi_call_singlefloat`.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    unsafe fn do_ffi_call_singlefloat(
+        cif_description: usize,
+        func_addr: usize,
+        exchange_buffer: usize,
+    ) {
+        let result =
+            unsafe { jit_ffi_call_impl_singlefloat(cif_description, func_addr, exchange_buffer) };
+        let target = exchange_buffer + unsafe { exchange_result(cif_description) };
+        misc::raw_write_f32(target, result);
+    }
+
+    /// `jit_libffi.py jit_ffi_call_impl_int` — reads back a complete
+    /// `ffi_arg` word.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    #[majit_macros::oopspec("libffi_call(cif_description,func_addr,exchange_buffer)")]
+    pub unsafe fn jit_ffi_call_impl_int(
+        cif_description: usize,
+        func_addr: usize,
+        exchange_buffer: usize,
+    ) -> i64 {
+        unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
+        let resultdata = exchange_buffer + unsafe { exchange_result(cif_description) };
+        misc::raw_read_i64(resultdata)
+    }
+
+    /// `jit_libffi.py jit_ffi_call_impl_float`.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    #[majit_macros::oopspec("libffi_call(cif_description,func_addr,exchange_buffer)")]
+    pub unsafe fn jit_ffi_call_impl_float(
+        cif_description: usize,
+        func_addr: usize,
+        exchange_buffer: usize,
+    ) -> f64 {
+        unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
+        let resultdata = exchange_buffer + unsafe { exchange_result(cif_description) };
+        misc::raw_read_f64(resultdata)
+    }
+
+    /// `jit_libffi.py jit_ffi_call_impl_singlefloat`.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    #[majit_macros::oopspec("libffi_call(cif_description,func_addr,exchange_buffer)")]
+    pub unsafe fn jit_ffi_call_impl_singlefloat(
+        cif_description: usize,
+        func_addr: usize,
+        exchange_buffer: usize,
+    ) -> f64 {
+        unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
+        let resultdata = exchange_buffer + unsafe { exchange_result(cif_description) };
+        misc::raw_read_f32(resultdata)
+    }
+
+    /// `jit_libffi.py jit_ffi_call_impl_void`.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    #[majit_macros::oopspec("libffi_call(cif_description,func_addr,exchange_buffer)")]
+    pub unsafe fn jit_ffi_call_impl_void(
+        cif_description: usize,
+        func_addr: usize,
+        exchange_buffer: usize,
+    ) {
+        unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
+    }
+
+    /// `jit_libffi.py jit_ffi_call_impl_any` — the one that actually calls
+    /// libffi.  Everything above it exists to hand the JIT a typed result.
+    ///
+    /// # Safety
+    /// As [`jit_ffi_call`].
+    #[majit_macros::dont_look_inside_cannot_raise]
+    pub unsafe fn jit_ffi_call_impl_any(
+        cif_description: usize,
+        func_addr: usize,
+        exchange_buffer: usize,
+    ) {
+        let buffer_array = exchange_buffer as *mut *mut std::ffi::c_void;
+        for i in 0..unsafe { nargs(cif_description) } {
+            let data = exchange_buffer + unsafe { exchange_arg(cif_description, i) };
+            unsafe { buffer_array.add(i).write(data as *mut std::ffi::c_void) };
+        }
+        let resultdata = (exchange_buffer + unsafe { exchange_result(cif_description) })
+            as *mut std::ffi::c_void;
+        let descr = unsafe { header(cif_description) };
+        unsafe {
+            libffi::low::call_return_into(
+                &raw mut descr.cif,
+                CodePtr::from_ptr(func_addr as *mut std::ffi::c_void),
+                buffer_array,
+                resultdata,
+            );
+        }
+    }
+}
+
+#[cfg(not(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    ),
+    not(any(target_env = "musl", target_env = "sgx"))
+)))]
+mod imp {
+    /// No libffi on this target, so no foreign call can be described.
+    #[majit_macros::elidable_cannot_raise]
+    pub unsafe fn exchange_size(_cif: usize) -> usize {
+        0
+    }
+
+    #[majit_macros::elidable_cannot_raise]
+    pub unsafe fn exchange_result(_cif: usize) -> usize {
+        0
+    }
+
+    #[majit_macros::elidable_cannot_raise]
+    pub unsafe fn exchange_arg(_cif: usize, _i: usize) -> usize {
+        0
+    }
+
+    pub unsafe fn jit_ffi_call(
+        _cif_description: usize,
+        _func_addr: usize,
+        _exchange_buffer: usize,
+    ) {
+    }
+}
+
+pub use imp::*;

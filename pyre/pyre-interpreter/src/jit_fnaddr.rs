@@ -892,34 +892,81 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
             "pyre_interpreter::module::_cffi_backend::cerrno::errno_after",
             crate::module::_cffi_backend::cerrno::errno_after,
         );
-        upa4(
-            &mut entries,
-            "pyre_interpreter::module::_cffi_backend::ctypefunc::cif::invoke",
-            "pyre_interpreter::module::_cffi_backend::ctypefunc::invoke",
-            crate::module::_cffi_backend::ctypefunc::invoke,
-        );
         up1(
             &mut entries,
             "pyre_interpreter::module::_cffi_backend::ctypefunc::get_mustfree_flag",
             crate::module::_cffi_backend::ctypefunc::get_mustfree_flag,
         );
+        // `jit_libffi` reaches a trace through two families: the `CIF_DESCRIPTION`
+        // readers a walked `jit_ffi_call` folds against, and the per-result-kind
+        // `libffi_call` oopspec leaves it ends in.  Both spellings of each path
+        // are published because the bodies live in the module's cfg-selected
+        // inner module and are re-exported from the file.
         upa1(
             &mut entries,
-            "pyre_interpreter::module::_cffi_backend::ctypefunc::cif::exchange_size",
-            "pyre_interpreter::module::_cffi_backend::ctypefunc::exchange_size",
-            crate::module::_cffi_backend::ctypefunc::cif::exchange_size,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_size",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_size",
+            crate::module::_cffi_backend::jit_libffi::exchange_size,
         );
         upa1(
             &mut entries,
-            "pyre_interpreter::module::_cffi_backend::ctypefunc::cif::exchange_result",
-            "pyre_interpreter::module::_cffi_backend::ctypefunc::exchange_result",
-            crate::module::_cffi_backend::ctypefunc::cif::exchange_result,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_result",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_result",
+            crate::module::_cffi_backend::jit_libffi::exchange_result,
         );
         upa2(
             &mut entries,
-            "pyre_interpreter::module::_cffi_backend::ctypefunc::cif::exchange_arg",
-            "pyre_interpreter::module::_cffi_backend::ctypefunc::exchange_arg",
-            crate::module::_cffi_backend::ctypefunc::cif::exchange_arg,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_arg",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_arg",
+            crate::module::_cffi_backend::jit_libffi::exchange_arg,
+        );
+        upa1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::rtype",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::rtype",
+            crate::module::_cffi_backend::jit_libffi::rtype,
+        );
+        upa1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::nargs",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::nargs",
+            crate::module::_cffi_backend::jit_libffi::nargs,
+        );
+        upa1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::types::getkind",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::types::getkind",
+            crate::module::_cffi_backend::jit_libffi::types::getkind,
+        );
+        upa1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::types::getsize",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::types::getsize",
+            crate::module::_cffi_backend::jit_libffi::types::getsize,
+        );
+        upa3(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_int",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_int",
+            crate::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_int,
+        );
+        upa3(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_float",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_float",
+            crate::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_float,
+        );
+        upa3(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_singlefloat",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_singlefloat",
+            crate::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_singlefloat,
+        );
+        upa3(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_void",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_void",
+            crate::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_void,
         );
         p2(
             &mut entries,

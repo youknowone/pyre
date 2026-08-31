@@ -192,7 +192,7 @@ pub fn make_callback(
     let _ = roots.pin_root(w_callback);
 
     let functype = function_ctype(callback_arg(roots.get(callback_slot))?.ctype)?;
-    if functype.cif_descr.is_null() {
+    if functype.cif_descr == 0 {
         return Err(PyError::not_implemented(format!(
             "{}: callback with unsupported argument or return type or with '...'",
             functype.name()
@@ -202,7 +202,7 @@ pub fn make_callback(
     let status = unsafe {
         libffi::raw::ffi_prep_closure_loc(
             raw_closure.cast::<libffi::raw::ffi_closure>(),
-            functype.cif_descr.cast::<libffi::raw::ffi_cif>(),
+            functype.cif_descr as *mut libffi::raw::ffi_cif,
             Some(invoke_callback),
             userdata.cast::<libc::c_void>(),
             raw_code,

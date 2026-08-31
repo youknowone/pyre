@@ -10,11 +10,27 @@ use super::{allocator, cdataobj, ctypefunc, ctypeobj, ctypeptr};
 
 /// `W_FunctionWrapper`.
 #[crate::pyre_class("_cffi_backend.__FFIFunctionWrapper")]
+// `W_FunctionWrapper._immutable_ = True`: every field is written once, by
+// `new_function_wrapper`, and only read afterwards.
+#[majit_macros::jit_immutable_fields(
+    "w_ffi",
+    "fnptr",
+    "directfnptr",
+    "w_rawfunctype",
+    "w_fnname",
+    "w_modulename"
+)]
 #[derive(Default)]
 pub struct W_FunctionWrapper {
     pub w_ffi: PyObjectRef,
-    pub fnptr: *mut u8,
-    pub directfnptr: *mut u8,
+    /// `W_FunctionWrapper.fnptr` — the address of the C function, as
+    /// `rffi.CCHARP`.  A raw-flavour pointer is integer-kind, so the address
+    /// belongs in the integer register bank rather than among the references
+    /// a collector traces and rewrites.
+    pub fnptr: usize,
+    /// `W_FunctionWrapper.directfnptr` — the address of the C function
+    /// bypassing the API wrapper, zero when the module was built without one.
+    pub directfnptr: usize,
     pub w_rawfunctype: PyObjectRef,
     pub w_fnname: PyObjectRef,
     pub w_modulename: PyObjectRef,
@@ -27,8 +43,8 @@ fn wrapper_arg(w_wrapper: PyObjectRef) -> Result<&'static mut W_FunctionWrapper,
 
 pub fn new_function_wrapper(
     w_ffi: PyObjectRef,
-    fnptr: *mut u8,
-    directfnptr: *mut u8,
+    fnptr: usize,
+    directfnptr: usize,
     w_rawfunctype: PyObjectRef,
     fnname: &str,
     modulename: &str,
@@ -38,7 +54,7 @@ pub fn new_function_wrapper(
         .ok_or_else(|| PyError::system_error("expected a raw function type"))?;
     let ctype = ctypeobj::ctype_arg(raw.nostruct_ctype)?;
     assert_eq!(ctype.kind, ctypeobj::KIND_FUNC);
-    assert!(!ctype.cif_descr.is_null());
+    assert!(ctype.cif_descr != 0);
     if !raw.nostruct_locs.is_null() {
         assert_eq!(
             ctypefunc::fargs_of(ctype).len(),
@@ -123,7 +139,12 @@ fn wrapper_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         let _ = roots.pin_root(arg);
     }
     let wrapper = wrapper_arg(roots.get(wrapper_slot))?;
-    let raw = W_RawFuncType::from_obj(wrapper.w_rawfunctype)
+    // Everything about the type of the function is read as an immutable
+    // attribute of the raw function type, which makes it the obvious thing to
+    // promote in order to do the call: with it constant, `nostruct_ctype` and
+    // the `cif_descr` behind it are constants too.
+    let raw_type = majit_metainterp::jit::promote(wrapper.w_rawfunctype);
+    let raw = W_RawFuncType::from_obj(raw_type)
         .ok_or_else(|| PyError::system_error("function wrapper lost its raw type"))?;
     let nargs_expected = raw.nostruct_nargs as usize;
     let nargs_given = args.len().saturating_sub(1);
@@ -142,7 +163,6 @@ fn wrapper_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let mut call_args: Vec<PyObjectRef> = (1..args.len())
         .map(|i| roots.get(wrapper_slot + i))
         .collect();
-    let raw_type = wrapper.w_rawfunctype;
     let nostruct_ctype = raw.nostruct_ctype;
     let locs = if raw.nostruct_locs.is_null() {
         Vec::new()
@@ -225,11 +245,11 @@ fn wrapper_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// `W_FunctionWrapper.try_extract_direct_fnptr_as_cdata`.
 pub fn try_extract_direct_fnptr_as_cdata(w_wrapper: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let wrapper = wrapper_arg(w_wrapper)?;
-    if wrapper.directfnptr.is_null() {
+    if wrapper.directfnptr == 0 {
         return Ok(w_wrapper);
     }
     let w_ctype = typeof_wrapper(w_wrapper, wrapper.w_ffi)?;
-    Ok(cdataobj::new_cdata(wrapper.directfnptr, w_ctype))
+    Ok(cdataobj::new_cdata(wrapper.directfnptr as *mut u8, w_ctype))
 }
 
 static FUNCTION_WRAPPER_TYPE_OBJ: OnceLock<usize> = OnceLock::new();

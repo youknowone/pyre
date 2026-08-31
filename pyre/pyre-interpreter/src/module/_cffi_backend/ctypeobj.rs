@@ -90,6 +90,11 @@ pub const F_WITH_PACKED_CHANGE: i64 = 1 << 15;
 /// `W_CTypePointer._array_types`).  Thus a derived ctype dies with its last
 /// user while a repeated constructor still returns the live memoized object.
 #[crate::pyre_class("_cffi_backend.CType")]
+// `W_CTypeFunc._immutable_fields_` names `cif_descr`: the block is built once,
+// when the function type is created, and every later reader only reads it.
+// The declaration is what lets a call through a promoted function type fold
+// `exchange_size` / `exchange_args[i]` / `exchange_result` to trace constants.
+#[majit_macros::jit_immutable_fields("cif_descr")]
 pub struct W_CType {
     /// `W_CType.size` — the size of an instance, or -1 when unknown.
     pub size: i64,
@@ -128,9 +133,14 @@ pub struct W_CType {
     /// `W_CTypeFunc.abi`, the `FFI_*` calling convention.
     pub abi: i64,
     /// `W_CTypeFunc.cif_descr` — the `ffi_cif` this function type was
-    /// prepared with, built once here rather than once per call.  Null for a
+    /// prepared with, built once here rather than once per call.  Zero for a
     /// variadic function, whose cif depends on the arguments actually passed.
-    pub cif_descr: *mut u8,
+    ///
+    /// `CIF_DESCRIPTION` is a raw-flavour block, so `CIF_DESCRIPTION_P` is an
+    /// integer-kind pointer (`getkind(Ptr(TO))` answers `int` when
+    /// `TO._gckind` is `raw`) and the address belongs in the integer register
+    /// bank, not among the references a collector traces and rewrites.
+    pub cif_descr: usize,
     /// `W_CTypeStructOrUnion._fields_list` — a list of [`super::ctypestruct::W_CField`]
     /// in declaration order.  `PY_NULL` while the struct is opaque or lazy.
     pub fields_list: PyObjectRef,
@@ -408,7 +418,7 @@ impl Default for W_CType {
             flags: 0,
             fargs: pyre_object::PY_NULL,
             abi: 0,
-            cif_descr: std::ptr::null_mut(),
+            cif_descr: 0,
             fields_list: pyre_object::PY_NULL,
             fields_dict: pyre_object::PY_NULL,
             enumerators2values: pyre_object::PY_NULL,

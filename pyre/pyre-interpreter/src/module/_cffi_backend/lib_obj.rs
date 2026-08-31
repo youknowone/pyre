@@ -164,8 +164,8 @@ fn build_cpython_func(
     let modulename = libname(lib_arg(roots.get(lib_slot))?)?.to_string();
     wrapper::new_function_wrapper(
         lib_arg(roots.get(lib_slot))?.w_ffi,
-        g.address.cast(),
-        g.size_or_direct_fn.cast(),
+        g.address as usize,
+        g.size_or_direct_fn as usize,
         roots.get(raw_slot),
         fnname,
         &modulename,
