@@ -18630,12 +18630,20 @@ pub(crate) unsafe fn generator_frame_is_finished(
     // object for.
     crate::executioncontext::may_ignore_finalizer(gen_obj);
     if prompt_finalization {
-        PENDING_CLOSE_FINALIZER.with(|slot| slot.set(released_graph_has_finalizer));
+        // Accumulated, not assigned: one `close()` finishes every frame in a
+        // `yield from` chain, and the delegate is finished first. Assigning
+        // here would let the delegating frame's own census -- usually false --
+        // replace a delegate's true one before `descr_close` reads it, and the
+        // object whose last reference was a delegate local would not run
+        // `__del__` before `close()` returned.
+        PENDING_CLOSE_FINALIZER.with(|slot| slot.set(slot.get() || released_graph_has_finalizer));
     }
 }
 
-/// The census [`generator_frame_is_finished`] took before it cleared the
-/// frame's references, held until `descr_close` is back on its own stack.
+/// Whether any frame finished since the last read released a graph that can
+/// run application code -- the census [`generator_frame_is_finished`] takes
+/// before it clears a frame's references, held until `descr_close` is back on
+/// its own stack.
 ///
 /// The collection this gates runs `__del__`, so it cannot run from inside the
 /// teardown: `_invoke_execute_frame`'s `finally` has not restored the
