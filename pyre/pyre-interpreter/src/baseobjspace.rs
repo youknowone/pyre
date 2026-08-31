@@ -10762,7 +10762,6 @@ pub unsafe fn type_attr_value_fast_path(
     let w_value = lookup_in_type_where_wtf8(w_type, name)?;
     // typeobject.py:822 calls `space.get(w_value, w_None, self)`; `get`'s arms
     // for a null instance decide what that answers.
-    let value_type = crate::typedef::r#type(w_value)?.as_ptr();
     // `gateway.py descr_function_get` with no instance returns the function
     // itself.  Exact types only: those two are the layouts `get` binds through
     // that arm, and neither is subclassable, so no override can reach it.
@@ -10795,6 +10794,7 @@ pub unsafe fn type_attr_value_fast_path(
     // be the target of a `__class__` assignment, so an absent `__get__`
     // remains absent for the life of the trace, and the fold needs only the
     // receiver type's one version pin.
+    let value_type = crate::typedef::r#type(w_value)?.as_ptr();
     if lookup_in_type(value_type, "__get__").is_some()
         || pyre_object::w_type_is_heaptype(value_type)
     {
@@ -10884,12 +10884,13 @@ unsafe fn instance_dict_does_not_shadow(w_obj: PyObjectRef, name: &str) -> Optio
 /// dict at all (not merely no entry for `name`) — a dict the guards do not
 /// cover could grow a shadowing entry between trace and execution.
 ///
-/// # Safety
-/// `w_obj` must be a valid object pointer (null tolerated).
 /// The fourth element is `true` when the receiver was admitted on
 /// `callmethod.py`'s weaker terms — a mapdict instance whose dictionary
 /// currently has no entry of this name — and the caller therefore owes the
 /// map guard that makes a later store of it side-exit.
+///
+/// # Safety
+/// `w_obj` must be a valid object pointer (null tolerated).
 pub unsafe fn bound_method_attr_fast_path(
     w_obj: PyObjectRef,
     name: &str,
