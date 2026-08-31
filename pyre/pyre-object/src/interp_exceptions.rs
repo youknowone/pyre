@@ -157,6 +157,8 @@ pub enum ExcKind {
     /// Raised by `_weakref` when a proxy is dereferenced after the
     /// referent has been collected — pypy/module/_weakref/interp__weakref.py:347
     /// `oefmt(space.w_ReferenceError, "weakly referenced object no longer exists")`.
+    /// `interp__weakref::force` raises the hyphenated `proxy_check_ref`
+    /// wording instead.
     ReferenceError = 16,
     GeneratorExit = 17,
     RecursionError = 18,
