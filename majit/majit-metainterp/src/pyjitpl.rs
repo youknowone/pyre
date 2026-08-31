@@ -7092,10 +7092,15 @@ impl<M: Clone> MetaInterp<M> {
         // namespace, so no seed can resolve cut-op lookups anyway; an explicit
         // empty seed states that (producer lookup runs off new_operations /
         // phase1_emit_ops / resop_refs).
-        unroll_opt.phase2_input_ops_seed = Some(if cross_loop_cut.is_none() {
-            preamble_data.base.operations().to_vec()
-        } else {
+        // Only the peeling arm below reads this seed. When the jitdriver's
+        // `enable_opts` omits `unroll`, the optimize call is `InvalidLoop`
+        // before it looks at any of `unroll_opt`, and the retry builds its own
+        // `explicit_input_ops_seed` from the same operations — so populating it
+        // here would copy the whole recorded trace to be dropped.
+        unroll_opt.phase2_input_ops_seed = Some(if no_unroll || cross_loop_cut.is_some() {
             Vec::new()
+        } else {
+            preamble_data.base.operations().to_vec()
         });
         unroll_opt.call_pure_results = preamble_data.call_pure_results.clone();
         // RPython Box type parity: each InputArg carries its type from
@@ -7122,11 +7127,19 @@ impl<M: Clone> MetaInterp<M> {
         // intrinsic attribute on the Box itself, so no raw-u32 type
         // side-table propagation is needed; callers recover the type
         // through `OpRef::ty()` / `Const::get_type()`.
-        unroll_opt.snapshot_boxes = snapshot_map.clone();
-        unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
-        unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
-        unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
-        unroll_opt.snapshot_frame_pcs = snapshot_frame_pcs.clone();
+        // Phase 1's copy of the snapshot banks. The originals stay owned here
+        // because the `InvalidLoop` arm below moves them into the unroll-free
+        // optimizer, so this is a second set, one `Vec<SnapshotBox>` per
+        // recorded guard. A trace that records guards in the thousands makes
+        // that the largest single allocation of the compile, and the arm that
+        // never peels never reads it.
+        if !no_unroll {
+            unroll_opt.snapshot_boxes = snapshot_map.clone();
+            unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
+            unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
+            unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
+            unroll_opt.snapshot_frame_pcs = snapshot_frame_pcs.clone();
+        }
         // The original snapshot maps are re-cloned into `simple_opt` on the
         // InvalidLoop retry below, so they must stay rooted across the WHOLE
         // unroll. Each phase's `replace_compile_snapshot_roots` overwrites the
@@ -7140,15 +7153,26 @@ impl<M: Clone> MetaInterp<M> {
             &mut snapshot_vref_map,
         ]);
         // Until the first phase replace, also root unroll_opt's own clones (the
-        // phase-1 source) alongside the persistent originals.
-        self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
-            &mut unroll_opt.snapshot_boxes,
-            &mut unroll_opt.snapshot_vable_boxes,
-            &mut unroll_opt.snapshot_vref_boxes,
-            &mut snapshot_map,
-            &mut snapshot_vable_map,
-            &mut snapshot_vref_map,
-        ]);
+        // phase-1 source) alongside the persistent originals. Where there is no
+        // phase 1 those clones were never taken, and naming empty banks here
+        // would root nothing; the originals still are, which is what the arm
+        // that moves them into the unroll-free optimizer needs.
+        self.compile_snapshot_refs = if no_unroll {
+            collect_snapshot_const_ptr_slots(&mut [
+                &mut snapshot_map,
+                &mut snapshot_vable_map,
+                &mut snapshot_vref_map,
+            ])
+        } else {
+            collect_snapshot_const_ptr_slots(&mut [
+                &mut unroll_opt.snapshot_boxes,
+                &mut unroll_opt.snapshot_vable_boxes,
+                &mut unroll_opt.snapshot_vref_boxes,
+                &mut snapshot_map,
+                &mut snapshot_vable_map,
+                &mut snapshot_vref_map,
+            ])
+        };
 
         // RPython compile.py:278-294 parity: Phase 1 results must survive
         // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
