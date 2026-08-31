@@ -378,6 +378,15 @@ pub fn materialize_unit_variant_consts(jitcodes: &mut [Arc<JitCode>]) {
             let addr = {
                 let mut cells = CELLS.lock().unwrap();
                 if let Some((_, a)) = cells.iter().find(|(q, _)| *q == qualname) {
+                    // The cell holds the tag the first jitcode carried for
+                    // this qualname.  Two bodies assembled from different
+                    // graphs must agree on it: a silent disagreement would
+                    // share one cell and answer the wrong discriminant.
+                    debug_assert_eq!(
+                        unsafe { *(*a as *const i64) },
+                        tag,
+                        "unit-variant {qualname} carries two tags",
+                    );
                     *a
                 } else {
                     let a = Box::leak(Box::new(tag)) as *const i64 as i64;
@@ -509,6 +518,115 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    fn unit_variant_sentinel(ordinal: i64) -> i64 {
+        majit_translate::assembler::UNIT_VARIANT_CONST_SENTINEL_BASE | ordinal
+    }
+
+    /// Mirror of [`jitcode_with_str_consts`] for the unit-variant bank: the
+    /// assembler seeds `constants_r` with one sentinel per descriptor, in
+    /// emit order.
+    fn jitcode_with_unit_variant_consts(
+        descs: Vec<majit_translate::jitcode::UnitVariantConstDescriptor>,
+    ) -> Arc<JitCode> {
+        let len = descs
+            .iter()
+            .map(|d| d.constants_r_index + 1)
+            .max()
+            .unwrap_or(0);
+        let mut constants_r = vec![0_i64; len];
+        for (ordinal, d) in descs.iter().enumerate() {
+            constants_r[d.constants_r_index] = unit_variant_sentinel(ordinal as i64);
+        }
+        let jc = JitCode::new("test");
+        jc.set_body(JitCodeBody {
+            unit_variant_consts: descs,
+            constants_r: constants_r.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        });
+        Arc::new(jc)
+    }
+
+    fn unit_variant_desc(
+        qualname: &str,
+        tag: i64,
+    ) -> majit_translate::jitcode::UnitVariantConstDescriptor {
+        majit_translate::jitcode::UnitVariantConstDescriptor {
+            constants_r_index: 0,
+            qualname: qualname.to_owned(),
+            tag,
+        }
+    }
+
+    #[test]
+    fn materialize_unit_variant_consts_overwrites_sentinel_with_a_cell_holding_the_tag() {
+        let mut jcs = vec![jitcode_with_unit_variant_consts(vec![unit_variant_desc(
+            "StepResult::Continue",
+            0,
+        )])];
+        materialize_unit_variant_consts(&mut jcs);
+
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_ne!(
+            addr,
+            unit_variant_sentinel(0),
+            "sentinel must be overwritten"
+        );
+        assert_eq!(
+            (addr as u64) & SENTINEL_HIGH_MASK,
+            0,
+            "a real cell address must have the sentinel high bits clear",
+        );
+        // The discriminant read the portal switch performs: one word at
+        // offset 0 of the cell.
+        assert_eq!(unsafe { *(addr as *const i64) }, 0);
+    }
+
+    #[test]
+    fn materialize_unit_variant_consts_interns_one_cell_per_qualname() {
+        let mut jcs = vec![
+            jitcode_with_unit_variant_consts(vec![unit_variant_desc("JitAction::Return", 1)]),
+            jitcode_with_unit_variant_consts(vec![unit_variant_desc("JitAction::Return", 1)]),
+        ];
+        materialize_unit_variant_consts(&mut jcs);
+        let a0 = jcs[0].body().constants_r[0].get();
+        let a1 = jcs[1].body().constants_r[0].get();
+        assert_eq!(a0, a1, "one qualname must resolve to one immortal cell");
+        assert_ne!(a0, unit_variant_sentinel(0));
+        assert_eq!(unsafe { *(a0 as *const i64) }, 1);
+    }
+
+    /// The interner is process-wide, not per call: two separate
+    /// materializations of the same qualname share the cell, which is what
+    /// keeps a discriminant comparison between two jitcodes meaningful.
+    #[test]
+    fn materialize_unit_variant_consts_interns_across_separate_calls() {
+        let mut first = vec![jitcode_with_unit_variant_consts(vec![unit_variant_desc(
+            "LoopResult::Done",
+            2,
+        )])];
+        let mut second = vec![jitcode_with_unit_variant_consts(vec![unit_variant_desc(
+            "LoopResult::Done",
+            2,
+        )])];
+        materialize_unit_variant_consts(&mut first);
+        materialize_unit_variant_consts(&mut second);
+        assert_eq!(
+            first[0].body().constants_r[0],
+            second[0].body().constants_r[0],
+            "one qualname must resolve to one cell even when materialized \
+             one jitcode at a time",
+        );
+    }
+
+    /// A body carrying no unit-variant descriptors is skipped whole, so its
+    /// `constants_r` is left exactly as the assembler wrote it.
+    #[test]
+    fn materialize_unit_variant_consts_leaves_a_body_without_descriptors_alone() {
+        let mut jcs = vec![jitcode_with_unit_variant_consts(Vec::new())];
+        materialize_unit_variant_consts(&mut jcs);
+        assert!(jcs[0].body().constants_r.is_empty());
     }
 
     #[test]
