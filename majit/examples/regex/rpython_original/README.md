@@ -362,7 +362,9 @@ C** (555,383 against 4,514,372). So "if you don't change the `and` and `or`
 ... it's not particularly fast" is not a majit artifact and not a Rust
 artifact — it is a property of the spelling, and upstream pays it in the same
 direction and the same order of magnitude. majit pays it 4.1x harder than
-upstream does, which is the one gap in this table that is majit's own.
+upstream does, which is the one gap in this table that is majit's own — read
+that figure with the re-measurement below, which puts it at the top of a
+3.0-4.1x range.
 
 `PYPYLOG=jit-summary:-` on the `and`/`or` build at 262,144 characters says
 where upstream's time goes: 1 loop, **1185 bridges**, `Tracing 0.145s` +
@@ -372,7 +374,37 @@ so a pass of `n` characters grows at most about `n / 200` bridges however many
 distinct mark patterns the tree has. majit is rate-limited by the same
 parameter and grows 84 over 32,768 characters.
 
-### Where majit's 4.1x goes
+#### Re-measured 2026-09-01: the ratio is 3.0-4.1x, and the absolutes do not travel
+
+The table above was one sitting. Six same-round pairs taken on another --
+three at 1-minute load 4.0-4.6 and three at 5.9-9.2, every pair being the two
+binaries run back to back so one load spike moves both -- put the `and`/`or`
+ratio at **3.02, 3.22, 3.45, 3.56, 3.58 and 4.11**, median about 3.5x. The
+table's 4.09x (555,383 / 135,690) is the top of that range, so whatever the
+allocation work bought is inside this instrument's resolution rather than
+clearly above it. Claiming a speedup from it would not be supportable.
+
+What the six rounds do settle is that **the absolute columns are machine
+state, not results.** Between the two sittings majit's `and`/`or` row moved
+135,690 -> 181,717-330,438 and RPython's moved 555,383 -> 548,352-1,269,859:
+both about 2x, in the same direction, from nothing but the machine. Inside the
+second sitting the *same* RPython binary read 1,184,427 and then 663,658 a few
+minutes later as load went 4.0 to 9.2 -- 1.78x on one arm with nothing
+changed. Read every chars/s figure in this file as a ratio against the number
+printed beside it in the same round, never against a number from another day.
+
+Three things did reproduce. RPython's two `--opt=2` columns come back within
+1.11x and 1.13x of what is tabulated, and its JIT is 6.7x slower than its own
+C on this spelling against the 8.1x recorded -- so "both JITs lose to their
+own C, and majit loses harder" survives. The masking row read 0.88x, 1.61x and
+1.08x of RPython, but RPython's own masking column swung 2.02x across those
+same rounds, so that round resolves nothing finer than "consistent with the
+parity the table reports". And the allocation census, which does not depend on
+the machine at all, reproduces to the digit: 11.4 allocations and 1,360.4
+bytes per input character. That is why the census is the instrument this gap
+is graded with.
+
+### Where majit's share of that gap goes
 
 Three theories about that gap were measured and two of them were wrong, so the
 numbers matter more than the reasoning:
@@ -395,7 +427,7 @@ halves of that were wrong:
 
 The native callee call is at parity. `[bh-setpos]` and `[bh-frame]` are both
 33,222, so not one `inline_call` seats an interpreted frame — every one takes
-the native arm. The blackhole is 1.5x, not 55x, and 1.5x cannot produce 4.1x.
+the native arm. The blackhole is 1.5x, not 55x, and 1.5x cannot produce a 3-4x.
 
 The register-copy row was a real deviation. The proc-macro lowerer allocated
 every temporary monotonically, while upstream runs
