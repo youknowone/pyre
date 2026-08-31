@@ -307,6 +307,19 @@ PARSE_DECLTYPES = 2
 # as in the C module, while transaction mechanics remain on PyPy's Connection.
 LEGACY_TRANSACTION_CONTROL = -1
 
+
+def _check_autocommit(value):
+    # `autocommit_converter` takes True and False by identity, then requires an
+    # int equal to the sentinel.  A float -1.0, or an object whose `__eq__`
+    # answers True, is rejected: the type test is part of the contract.
+    if (value is not True and value is not False and
+            not (isinstance(value, int) and
+                 value == LEGACY_TRANSACTION_CONTROL)):
+        raise ValueError(
+            "autocommit must be True, False, or "
+            "sqlite3.LEGACY_TRANSACTION_CONTROL")
+
+
 # SQLite version information
 sqlite_version = str(_ffi.string(_lib.sqlite3_libversion()).decode('ascii'))
 _sqlite_version_triple = tuple(int(x) for x in sqlite_version.split('.'))
@@ -408,7 +421,10 @@ def connect(database, *args, **kwargs):
         if name in kwargs:
             raise TypeError("connect() got multiple values for argument '%s'" % name)
         values[name] = value
-    autocommit = kwargs.pop("autocommit", LEGACY_TRANSACTION_CONTROL)
+    # `module_connect` forwards the caller's own argument vector to the
+    # factory, so an omitted `autocommit` stays omitted: a factory written to
+    # the pre-3.14 `Connection` signature still accepts the call.
+    extra = {"autocommit": kwargs.pop("autocommit")} if "autocommit" in kwargs else {}
     for name in names:
         if name in kwargs:
             values[name] = kwargs.pop(name)
@@ -428,8 +444,7 @@ def connect(database, *args, **kwargs):
     res = factory(database=database, timeout=timeout,
                   detect_types=detect_types, isolation_level=isolation_level,
                   check_same_thread=check_same_thread, factory=factory,
-                  cached_statements=cached_statements, uri=uri,
-                  autocommit=autocommit)
+                  cached_statements=cached_statements, uri=uri, **extra)
     add_memory_pressure(100 * 1024)
     return res
 
@@ -469,11 +484,7 @@ class Connection(object):
     def __init__(self, database, timeout=5.0, detect_types=0, isolation_level="",
                  check_same_thread=True, factory=None, cached_statements=100,
                  uri=0, *, autocommit=LEGACY_TRANSACTION_CONTROL):
-        if (autocommit is not True and autocommit is not False and
-                autocommit != LEGACY_TRANSACTION_CONTROL):
-            raise ValueError(
-                "autocommit must be True, False, or "
-                "sqlite3.LEGACY_TRANSACTION_CONTROL")
+        _check_autocommit(autocommit)
         sys.audit("sqlite3.connect", database)
         self.__initialized = False
         db_star = _ffi.new('sqlite3 **')
@@ -543,10 +554,15 @@ class Connection(object):
 
     def __del__(self):
         if self._db:
-            # CPython 3.14 `connection_finalize` reports an unclosed database.
-            warnings.warn("unclosed database in %r" % self,
-                          ResourceWarning, stacklevel=1)
-            _lib.sqlite3_close(self._db)
+            try:
+                # `connection_finalize` reports an unclosed database.
+                warnings.warn("unclosed database in %r" % self,
+                              ResourceWarning, stacklevel=1)
+            finally:
+                # It closes the handle whether or not the report was raised as
+                # an error; a caller that promotes ResourceWarning otherwise
+                # leaks the database.
+                _lib.sqlite3_close(self._db)
 
     def close(self):
         if not self.__initialized:
@@ -1119,11 +1135,7 @@ class Connection(object):
         return LEGACY_TRANSACTION_CONTROL
 
     def __set_autocommit(self, value):
-        if (value is not True and value is not False and
-                value != LEGACY_TRANSACTION_CONTROL):
-            raise ValueError(
-                "autocommit must be True, False, or "
-                "sqlite3.LEGACY_TRANSACTION_CONTROL")
+        _check_autocommit(value)
         self._check_thread()
         self._check_closed()
         self._autocommit = value
