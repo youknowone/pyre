@@ -151,7 +151,7 @@ fn load_function(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     } else {
         w_ctype
     };
-    Ok(cdataobj::new_cdata(address as *mut u8, w_ctype))
+    Ok(cdataobj::new_cdata(address as usize, w_ctype))
 }
 
 /// `W_Library.read_variable`.

@@ -21,7 +21,7 @@ use super::misc;
 /// `cdata` must be readable for the width of a pointer.
 pub unsafe fn pointer_convert_to_object(ct: &W_CType, cdata: *const u8) -> PyObjectRef {
     let target = unsafe { cdata.cast::<*mut u8>().read_unaligned() };
-    cdataobj::new_cdata(target, ct.as_object())
+    cdataobj::new_cdata(target as usize, ct.as_object())
 }
 
 /// `W_CTypeArray.convert_to_object` — the array itself, not a copy.  An
@@ -36,7 +36,7 @@ pub unsafe fn array_convert_to_object(ct: &W_CType, cdata: *const u8) -> PyObjec
     } else {
         ct.as_object()
     };
-    cdataobj::new_cdata(cdata.cast_mut(), w_ctype)
+    cdataobj::new_cdata(cdata as usize, w_ctype)
 }
 
 /// `W_CTypePtrBase.convert_from_object`.
@@ -83,7 +83,7 @@ pub unsafe fn pointer_convert_from_object(
             return Err(ct.convert_error("compatible pointer", w_ob));
         }
     }
-    unsafe { cdata.cast::<*mut u8>().write_unaligned(source.ptr) };
+    unsafe { cdata.cast::<usize>().write_unaligned(source.ptr) };
     Ok(())
 }
 
@@ -103,7 +103,11 @@ pub unsafe fn array_convert_from_object(
         let item = item_of(ct)?;
         let length = source.array_length()?;
         unsafe {
-            std::ptr::copy_nonoverlapping(source.ptr, cdata, (item.size * length) as usize);
+            std::ptr::copy_nonoverlapping(
+                source.ptr as *const u8,
+                cdata,
+                (item.size * length) as usize,
+            );
         }
         return Ok(());
     }
@@ -208,7 +212,7 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
     if ct.has(ctypeobj::F_FILE_PTR) {
         let file = prepare_file(w_ob)?;
         if !file.is_null() {
-            return Ok(cdataobj::new_cdata(file.cast::<u8>(), w_ctype));
+            return Ok(cdataobj::new_cdata(file as usize, w_ctype));
         }
     }
     let value = if let Some(source) = W_CData::from_obj(w_ob)
@@ -216,7 +220,7 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
     {
         source.ptr
     } else {
-        misc::as_unsigned_long(w_ob, false)? as usize as *mut u8
+        misc::as_unsigned_long(w_ob, false)? as usize
     };
     Ok(cdataobj::new_cdata(value, w_ctype))
 }
@@ -283,7 +287,7 @@ pub(crate) fn pointer_newp_with_allocator(
             let cdata = cdataobj::cdata_arg(roots.get(ptr_slot))?;
             let item = ctypeobj::ctype_arg(w_item)?;
             unsafe {
-                ctypeobj::convert_from_object(item, cdata.ptr as usize, roots.get(init_slot))?;
+                ctypeobj::convert_from_object(item, cdata.ptr, roots.get(init_slot))?;
             }
         }
         return Ok(roots.get(ptr_slot));
@@ -299,7 +303,7 @@ pub(crate) fn pointer_newp_with_allocator(
         let cdata = cdataobj::cdata_arg(roots.get(cdata_slot))?;
         let ct = ctypeobj::ctype_arg(cdata.ctype)?;
         let item = item_of(ct)?;
-        unsafe { ctypeobj::convert_from_object(item, cdata.ptr as usize, w_init)? };
+        unsafe { ctypeobj::convert_from_object(item, cdata.ptr, w_init)? };
     }
     Ok(roots.get(cdata_slot))
 }
@@ -336,7 +340,7 @@ pub fn array_newp(
     if !unsafe { pyre_object::pyobject::is_none(w_init) } {
         let cdata = cdataobj::cdata_arg(roots.get(cdata_slot))?;
         let ct = ctypeobj::ctype_arg(cdata.ctype)?;
-        unsafe { array_convert_from_object(ct, cdata.ptr, w_init)? };
+        unsafe { array_convert_from_object(ct, cdata.ptr as *mut u8, w_init)? };
     }
     Ok(roots.get(cdata_slot))
 }
@@ -411,7 +415,7 @@ pub fn add(w_ctype: PyObjectRef, cdata: *mut u8, i: i64) -> Result<PyObjectRef, 
     } else {
         w_ctype
     };
-    Ok(cdataobj::new_cdata(target, w_result_ctype))
+    Ok(cdataobj::new_cdata(target as usize, w_result_ctype))
 }
 
 /// `W_CTypePtrOrArray.string`.
@@ -423,7 +427,7 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
     if !item.is_primitive() || item.kind == ctypeobj::KIND_PRIM_BOOL {
         return Err(ctypeobj::unexpected_string_argument(ct));
     }
-    if cdata.ptr.is_null() {
+    if cdata.ptr == 0 {
         let w_repr = crate::builtins::builtin_repr(&[w_cdata])?;
         return Err(PyError::runtime_error(format!(
             "cannot use string() on {}",
@@ -436,18 +440,18 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
     }
     // A pointer to a one-byte type builds a `bytes` up to the first NUL.
     if item.size == 1 {
-        let bytes = unsafe { read_until_nul(cdata.ptr, length) };
+        let bytes = unsafe { read_until_nul(cdata.ptr as *const u8, length) };
         return Ok(pyre_object::bytesobject::w_bytes_from_bytes(bytes));
     }
     if ct.is_unichar_ptr_or_array() {
         let measured = unsafe {
             if item.size == 2 {
-                super::wchar_helper::measure_length_16(cdata.ptr, length)?
+                super::wchar_helper::measure_length_16(cdata.ptr as *const u8, length)?
             } else {
-                super::wchar_helper::measure_length_32(cdata.ptr, length)?
+                super::wchar_helper::measure_length_32(cdata.ptr as *const u8, length)?
             }
         };
-        return unpack_ptr(ct, item, cdata.ptr, measured);
+        return unpack_ptr(ct, item, cdata.ptr as *mut u8, measured);
     }
     Err(ctypeobj::unexpected_string_argument(ct))
 }
@@ -585,9 +589,9 @@ unsafe fn accept_movable_str(
     }
     let buf = cdataobj::raw_alloc(value.len() as i64 + 1, false)?;
     unsafe {
-        std::ptr::copy_nonoverlapping(value.as_ptr(), buf, value.len());
-        buf.add(value.len()).write(0);
-        cdata.cast::<*mut u8>().write_unaligned(buf);
+        std::ptr::copy_nonoverlapping(value.as_ptr(), buf as *mut u8, value.len());
+        (buf as *mut u8).add(value.len()).write(0);
+        cdata.cast::<usize>().write_unaligned(buf);
         set_mustfree_flag(cdata, MUSTFREE_FREE);
     }
     Ok(true)
@@ -656,11 +660,11 @@ unsafe fn prepare_pointer_call_argument(
         .filter(|&n| n >= 0)
         .ok_or_else(|| PyError::overflow_error("array size would overflow a ssize_t"))?;
     let buf = cdataobj::raw_alloc(datasize, true)?;
-    if let Err(e) = unsafe { convert_array_from_object(ct, buf, w_init) } {
-        unsafe { libc::free(buf.cast::<libc::c_void>()) };
+    if let Err(e) = unsafe { convert_array_from_object(ct, buf as *mut u8, w_init) } {
+        unsafe { libc::free(buf as *mut libc::c_void) };
         return Err(e);
     }
-    unsafe { cdata.cast::<*mut u8>().write_unaligned(buf) };
+    unsafe { cdata.cast::<usize>().write_unaligned(buf) };
     Ok(MUSTFREE_FREE)
 }
 

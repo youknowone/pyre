@@ -104,13 +104,13 @@ pub unsafe fn read(
                 let size = structobj.length - field.offset;
                 if size >= 0 {
                     return Ok(cdataobj::new_cdata_sliced(
-                        p,
+                        p as usize,
                         ct.as_object(),
                         size / item.size,
                     ));
                 }
             }
-            Ok(cdataobj::new_cdata(p, ct.ctptr))
+            Ok(cdataobj::new_cdata(p as usize, ct.ctptr))
         }
         _ => unsafe { convert_bitfield_to_object(field, ct, p) },
     }
@@ -282,7 +282,7 @@ unsafe fn convert_bitfield_from_object(
 /// `cdata` must point at a struct of this type.
 pub unsafe fn convert_to_object(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyError> {
     ct.check_complete(false)?;
-    Ok(cdataobj::new_cdata(cdata.cast_mut(), ct.as_object()))
+    Ok(cdataobj::new_cdata(cdata as usize, ct.as_object()))
 }
 
 /// `W_CTypeStructOrUnion.copy_and_convert_to_object`.
@@ -306,7 +306,7 @@ unsafe fn copy_from_same(ct: &W_CType, cdata: *mut u8, w_ob: PyObjectRef) -> boo
         && source.ctype == ct.as_object()
         && ct.size >= 0
     {
-        unsafe { std::ptr::copy(source.ptr, cdata, ct.size as usize) };
+        unsafe { std::ptr::copy(source.ptr as *const u8, cdata, ct.size as usize) };
         return true;
     }
     false

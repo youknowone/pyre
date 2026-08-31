@@ -296,7 +296,7 @@ fn build_attr(w_lib: PyObjectRef, attr: &str) -> Result<Option<PyObjectRef>, PyE
                 let w_ctfnptr =
                     realize_c_type::W_RawFuncType::unwrap_as_fnptr(w_raw, roots.get(ffi_slot))?;
                 let _ = raw;
-                cdataobj::new_cdata(ptr, w_ctfnptr)
+                cdataobj::new_cdata(ptr as usize, w_ctfnptr)
             }
             _ => {
                 return Err(PyError::not_implemented(format!(

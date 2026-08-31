@@ -569,7 +569,7 @@ fn ffi_addressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         }
     }
     let cdata = cdataobj::cdata_arg(roots.get(base + 1))?;
-    let ptr = unsafe { cdata.ptr.offset(offset as isize) };
+    let ptr = cdata.ptr.wrapping_add_signed(offset as isize);
     let ptr_type = newtype::new_pointer_type(w_ctype)?;
     Ok(cdataobj::new_cdata(ptr, ptr_type))
 }

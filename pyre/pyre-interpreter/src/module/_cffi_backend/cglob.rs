@@ -94,7 +94,7 @@ pub fn address(w_glob: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let _ = roots.pin_root(w_glob);
     let ptr = fetch_global_var_addr(roots.get(glob_slot))?;
     let w_ctypeptr = newtype::new_pointer_type(glob_arg(roots.get(glob_slot))?.w_ctype)?;
-    Ok(cdataobj::new_cdata(ptr, w_ctypeptr))
+    Ok(cdataobj::new_cdata(ptr as usize, w_ctypeptr))
 }
 
 static GLOB_TYPE_OBJ: OnceLock<usize> = OnceLock::new();

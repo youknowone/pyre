@@ -189,12 +189,7 @@ fn wrapper_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         let result = cdataobj::cdata_arg(roots.get(result_slot))?;
         let result_ptr = ctypeobj::ctype_arg(result.ctype)?;
         assert_eq!(result_ptr.kind, ctypeobj::KIND_POINTER);
-        unsafe {
-            ctypeobj::convert_to_object(
-                ctypeobj::ctype_arg(result_ptr.ctitem)?,
-                result.ptr as usize,
-            )
-        }
+        unsafe { ctypeobj::convert_to_object(ctypeobj::ctype_arg(result_ptr.ctitem)?, result.ptr) }
     } else {
         if !locs.is_empty() {
             prepare_args(raw_type, &mut call_args, 0)?;
@@ -249,7 +244,7 @@ pub fn try_extract_direct_fnptr_as_cdata(w_wrapper: PyObjectRef) -> Result<PyObj
         return Ok(w_wrapper);
     }
     let w_ctype = typeof_wrapper(w_wrapper, wrapper.w_ffi)?;
-    Ok(cdataobj::new_cdata(wrapper.directfnptr as *mut u8, w_ctype))
+    Ok(cdataobj::new_cdata(wrapper.directfnptr, w_ctype))
 }
 
 static FUNCTION_WRAPPER_TYPE_OBJ: OnceLock<usize> = OnceLock::new();

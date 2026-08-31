@@ -93,7 +93,7 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let keepalive_slot = roots.base();
     let _ = roots.pin_root(w_cdata);
     let obj = MiniBuffer::allocate_stable(MiniBuffer {
-        ptr: cdata.ptr,
+        ptr: cdata.ptr as *mut u8,
         size,
         ..Default::default()
     });

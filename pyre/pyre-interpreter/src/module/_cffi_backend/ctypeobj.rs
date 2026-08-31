@@ -635,7 +635,7 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
     let ct = ctype_of(cdata).ok_or_else(|| PyError::type_error("expected a cdata object"))?;
     match ct.kind {
         KIND_POINTER | KIND_ARRAY => super::ctypeptr::string(w_cdata, maxlen),
-        _ if ct.has(F_ENUM) => unsafe { super::ctypeenum::string(ct, cdata.ptr) },
+        _ if ct.has(F_ENUM) => unsafe { super::ctypeenum::string(ct, cdata.ptr as *const u8) },
         _ if ct.is_primitive() => super::ctypeprim::string(w_cdata, maxlen),
         _ => Err(unexpected_string_argument(ct)),
     }

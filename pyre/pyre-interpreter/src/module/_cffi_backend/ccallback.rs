@@ -178,7 +178,7 @@ pub fn make_callback(
     let raw_side = Box::into_raw(side);
     unpublished.0 = std::ptr::null_mut();
     let w_callback = cdataobj::new_cdata_callback(
-        raw_code.cast::<u8>(),
+        raw_code as usize,
         roots.get(base),
         roots.get(base + 1),
         if has_onerror {

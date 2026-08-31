@@ -52,7 +52,11 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
                 let target = W_CData::from_obj(w_cdata)
                     .expect("new_cdata_mem returns a cdata")
                     .ptr;
-                std::ptr::copy_nonoverlapping(cdata as *const u8, target, ct.size as usize);
+                std::ptr::copy_nonoverlapping(
+                    cdata as *const u8,
+                    target as *mut u8,
+                    ct.size as usize,
+                );
                 Ok(w_cdata)
             }
             // `W_CTypePrimitiveComplex.convert_to_object`.
@@ -130,7 +134,11 @@ pub unsafe fn convert_from_object(
                     && ctypeobj::ctype_at(source.ctype)
                         .is_some_and(|s| s.kind == ctypeobj::KIND_PRIM_LONGDOUBLE)
                 {
-                    std::ptr::copy_nonoverlapping(source.ptr, cdata as *mut u8, ct.size as usize);
+                    std::ptr::copy_nonoverlapping(
+                        source.ptr as *const u8,
+                        cdata as *mut u8,
+                        ct.size as usize,
+                    );
                     return Ok(());
                 }
                 misc::write_raw_longdouble_data(
@@ -187,7 +195,7 @@ fn cast_integer(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, 
     // `W_CTypePrimitive.cast` writes through `write_raw_integer_data`, which
     // a signed type spells as a signed store and everything else as unsigned;
     // the two are the same bits at this width.
-    unsafe { misc::write_raw_unsigned_data(cdata.ptr as usize, value, ct.size)? };
+    unsafe { misc::write_raw_unsigned_data(cdata.ptr, value, ct.size)? };
     Ok(w_cdata)
 }
 
@@ -210,7 +218,7 @@ fn cast_float(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, Py
         && ctypeobj::ctype_at(source.ctype)
             .is_some_and(|s| s.kind == ctypeobj::KIND_PRIM_LONGDOUBLE)
     {
-        return unsafe { convert_to_object(ct, source.ptr as usize) };
+        return unsafe { convert_to_object(ct, source.ptr) };
     }
     // `unwrap_primitive_cdata` boxes a cdata source, so what it hands back is
     // a fresh object nothing else roots while `float_w` dispatches.
@@ -230,9 +238,9 @@ fn cast_float(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, Py
     let ct = ctypeobj::ctype_arg(cdata.ctype)?;
     unsafe {
         if ct.kind == ctypeobj::KIND_PRIM_LONGDOUBLE {
-            misc::write_raw_longdouble_data(cdata.ptr, value);
+            misc::write_raw_longdouble_data(cdata.ptr as *mut u8, value);
         } else {
-            misc::write_raw_float_data(cdata.ptr as usize, value, ct.size)?;
+            misc::write_raw_float_data(cdata.ptr, value, ct.size)?;
         }
     }
     Ok(w_cdata)
@@ -257,8 +265,8 @@ fn cast_complex(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, 
     let ct = ctypeobj::ctype_arg(cdata.ctype)?;
     let half = ct.size >> 1;
     unsafe {
-        misc::write_raw_float_data(cdata.ptr as usize, real, half)?;
-        misc::write_raw_float_data((cdata.ptr.offset(half as isize)) as usize, imag, half)?;
+        misc::write_raw_float_data(cdata.ptr, real, half)?;
+        misc::write_raw_float_data(cdata.ptr.wrapping_add_signed(half as isize), imag, half)?;
     }
     Ok(w_cdata)
 }
@@ -278,7 +286,7 @@ fn unwrap_primitive_cdata(ct: &W_CType, w_ob: PyObjectRef) -> Result<PyObjectRef
             ct.name()
         )));
     }
-    unsafe { convert_to_object(source_ct, source.ptr as usize) }
+    unsafe { convert_to_object(source_ct, source.ptr) }
 }
 
 /// `W_CTypePrimitive.cast_str`.
@@ -393,11 +401,11 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
     match ct.kind {
         // `W_CTypePrimitiveUniChar.string` — one character, as a `str`.
-        ctypeobj::KIND_PRIM_UNICHAR => unsafe { convert_to_object(ct, cdata.ptr as usize) },
+        ctypeobj::KIND_PRIM_UNICHAR => unsafe { convert_to_object(ct, cdata.ptr) },
         // `W_CTypePrimitiveBool.string` bypasses the size-1 case below.
         ctypeobj::KIND_PRIM_BOOL => Err(ctypeobj::unexpected_string_argument(ct)),
         _ if ct.size == 1 => Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[unsafe {
-            cdata.ptr.read()
+            (cdata.ptr as *const u8).read()
         }])),
         _ => {
             let _ = maxlen;
@@ -586,7 +594,7 @@ fn convert_to_char(ct: &W_CType, w_ob: PyObjectRef) -> Result<u8, PyError> {
     if let Some(source) = W_CData::from_obj(w_ob)
         && ctypeobj::ctype_at(source.ctype).is_some_and(|s| s.kind == ctypeobj::KIND_PRIM_CHAR)
     {
-        return Ok(unsafe { source.ptr.read() });
+        return Ok(unsafe { (source.ptr as *const u8).read() });
     }
     Err(ct.convert_error("string of length 1", w_ob))
 }
@@ -610,7 +618,7 @@ fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> 
         && source_ct.kind == ctypeobj::KIND_PRIM_UNICHAR
         && source_ct.size == ct.size
     {
-        return Ok(unsafe { misc::read_raw_unsigned_data(source.ptr as usize, ct.size)? } as u32);
+        return Ok(unsafe { misc::read_raw_unsigned_data(source.ptr, ct.size)? } as u32);
     }
     Err(ct.convert_error("unicode string of length 1", w_ob))
 }

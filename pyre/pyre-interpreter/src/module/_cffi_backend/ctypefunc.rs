@@ -595,10 +595,10 @@ pub(crate) mod cif {
         };
         builder.build()?;
         let rawmem = super::cdataobj::raw_alloc(builder.nb_bytes as i64, true)?;
-        builder.bufferp = rawmem;
+        builder.bufferp = rawmem as *mut u8;
         builder.nb_bytes = 0;
         if let Err(e) = builder.build() {
-            unsafe { libc::free(rawmem.cast::<libc::c_void>()) };
+            unsafe { libc::free(rawmem as *mut libc::c_void) };
             return Err(e);
         }
 
@@ -641,7 +641,7 @@ pub(crate) mod cif {
             None => unsafe { libffi::low::prep_cif(cif, abi, nargs, rtype, atypes) },
         };
         if prepared.is_err() {
-            unsafe { libc::free(rawmem.cast::<libc::c_void>()) };
+            unsafe { libc::free(rawmem as *mut libc::c_void) };
             return Err(PyError::system_error(
                 "libffi failed to build this function type",
             ));

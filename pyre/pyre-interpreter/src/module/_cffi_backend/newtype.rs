@@ -948,11 +948,11 @@ pub fn new_enum_type(
             )
         };
         if let Err(e) = written {
-            unsafe { libc::free(probe.cast::<libc::c_void>()) };
+            unsafe { libc::free(probe as *mut libc::c_void) };
             return Err(e);
         }
     }
-    unsafe { libc::free(probe.cast::<libc::c_void>()) };
+    unsafe { libc::free(probe as *mut libc::c_void) };
 
     let basectype = ctypeobj::ctype_arg(roots.get(base_slot))?;
     let w_ctype = ctypeobj::new_ctype(

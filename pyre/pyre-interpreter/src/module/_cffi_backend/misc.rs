@@ -490,7 +490,7 @@ pub fn object_as_bool(w_ob: PyObjectRef) -> Result<bool, PyError> {
         if let Some(ct) = super::ctypeobj::ctype_of(cdata)
             && ct.is_float_family()
         {
-            let ptr = cdata.ptr;
+            let ptr = cdata.ptr as *const u8;
             return if ct.kind == super::ctypeobj::KIND_PRIM_LONGDOUBLE {
                 Ok(unsafe { is_nonnull_longdouble(ptr) })
             } else {
@@ -552,11 +552,11 @@ pub fn dlopen_w(w_filename: PyObjectRef, flags: i64) -> Result<(String, usize, b
                 ct.name()
             )));
         }
-        if cdata.ptr.is_null() {
+        if cdata.ptr == 0 {
             return Err(PyError::runtime_error("cannot call dlopen(NULL)"));
         }
-        let fname = unsafe { ct.extra_repr(cdata.ptr)? };
-        return Ok((fname, adopt_raw_handle(cdata.ptr)?, false));
+        let fname = unsafe { ct.extra_repr(cdata.ptr as *const u8)? };
+        return Ok((fname, adopt_raw_handle(cdata.ptr as *mut u8)?, false));
     }
     let is_none = unsafe { pyre_object::pyobject::is_none(w_filename) };
     let fname = if is_none {

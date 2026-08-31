@@ -17,7 +17,7 @@ pub fn newp_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     let obj = cdataobj::new_cdata_handle(args[0], args[1]);
     let ptr = super::hide_reveal::hide_object(obj);
-    cdataobj::cdata_arg(obj)?.ptr = ptr;
+    cdataobj::cdata_arg(obj)?.ptr = ptr as usize;
     Ok(obj)
 }
 
@@ -32,12 +32,12 @@ pub fn from_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             ct.name()
         )));
     }
-    if cdata.ptr.is_null() {
+    if cdata.ptr == 0 {
         return Err(PyError::runtime_error(
             "cannot use from_handle() on NULL pointer",
         ));
     }
-    let Some(w_handle) = super::hide_reveal::reveal_object(cdata.ptr) else {
+    let Some(w_handle) = super::hide_reveal::reveal_object(cdata.ptr as *mut u8) else {
         return Err(PyError::system_error(
             "ffi.from_handle(): dead or bogus object handle",
         ));
