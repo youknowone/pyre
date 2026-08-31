@@ -408,8 +408,7 @@ pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
 
 pub trait LocalOpcodeHandler: SharedOpcodeHandler {
     fn load_local_value(&mut self, idx: usize) -> Result<Self::Value, PyError>;
-    fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
-        let _ = name;
+    fn load_local_checked_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
         let value = self.load_local_value(idx)?;
         self.guard_nonnull_value(value)?;
         Ok(value)
@@ -702,21 +701,18 @@ pub fn opcode_load_small_int<H: ConstantOpcodeHandler + ?Sized>(
 pub fn opcode_load_fast_checked<H: LocalOpcodeHandler + ?Sized>(
     handler: &mut H,
     idx: usize,
-    name: &str,
 ) -> Result<(), PyError> {
-    let value = handler.load_local_checked_value(idx, name)?;
+    let value = handler.load_local_checked_value(idx)?;
     handler.push_value(value)
 }
 
 pub fn opcode_load_fast_pair_checked<H: LocalOpcodeHandler + ?Sized>(
     handler: &mut H,
     idx1: usize,
-    name1: &str,
     idx2: usize,
-    name2: &str,
 ) -> Result<(), PyError> {
-    let v1 = handler.load_local_checked_value(idx1, name1)?;
-    let v2 = handler.load_local_checked_value(idx2, name2)?;
+    let v1 = handler.load_local_checked_value(idx1)?;
+    let v2 = handler.load_local_checked_value(idx2)?;
     handler.push_value(v1)?;
     handler.push_value(v2)
 }
@@ -1011,24 +1007,18 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         opcode_load_small_int(self, value)
     }
 
-    fn load_fast_checked(&mut self, idx: usize, name: &str) -> Result<(), PyError>
+    fn load_fast_checked(&mut self, idx: usize) -> Result<(), PyError>
     where
         Self: LocalOpcodeHandler,
     {
-        opcode_load_fast_checked(self, idx, name)
+        opcode_load_fast_checked(self, idx)
     }
 
-    fn load_fast_pair_checked(
-        &mut self,
-        idx1: usize,
-        name1: &str,
-        idx2: usize,
-        name2: &str,
-    ) -> Result<(), PyError>
+    fn load_fast_pair_checked(&mut self, idx1: usize, idx2: usize) -> Result<(), PyError>
     where
         Self: LocalOpcodeHandler,
     {
-        opcode_load_fast_pair_checked(self, idx1, name1, idx2, name2)
+        opcode_load_fast_pair_checked(self, idx1, idx2)
     }
 
     fn store_fast(&mut self, idx: usize) -> Result<(), PyError>
@@ -2837,19 +2827,7 @@ where
         unreachable!()
     };
     let idx = load_fast_var_num_to_index(var_num, op_arg);
-    // closure-free, Option-pattern-free `varnames.get(idx)` rewrite to
-    // keep the body within the Rust-AST adapter's RPython-orthodox
-    // subset (Position-2 adaptation per the annotator-monomorphization
-    // plan; RPython has no closure or sum-type-destructure analogue
-    // at the annotator layer). The bounds check stays a plain `<`
-    // comparison + indexed access so the lowered op sequence stays
-    // `lt + getitem` rather than walking into an `Option<&str>` enum.
-    let name = if idx < code_varnames_len(code) {
-        code.varnames[idx].as_ref()
-    } else {
-        "<cell>"
-    };
-    executor.load_fast_checked(idx, name)?;
+    executor.load_fast_checked(idx)?;
     Ok(StepResult::Continue)
 }
 
@@ -2866,14 +2844,7 @@ where
         unreachable!()
     };
     let idx = load_fast_var_num_to_index(var_num, op_arg);
-    // closure-free, Option-pattern-free rewrite — see execute_load_fast
-    // for the rationale.
-    let name = if idx < code_varnames_len(code) {
-        code.varnames[idx].as_ref()
-    } else {
-        "<cell>"
-    };
-    executor.load_fast_checked(idx, name)?;
+    executor.load_fast_checked(idx)?;
     Ok(StepResult::Continue)
 }
 
@@ -2891,17 +2862,7 @@ where
     };
     let idx1 = var_nums_to_first_index(var_nums, op_arg);
     let idx2 = var_nums_to_second_index(var_nums, op_arg);
-    let name1 = if idx1 < code_varnames_len(code) {
-        code.varnames[idx1].as_ref()
-    } else {
-        "<cell>"
-    };
-    let name2 = if idx2 < code_varnames_len(code) {
-        code.varnames[idx2].as_ref()
-    } else {
-        "<cell>"
-    };
-    executor.load_fast_pair_checked(idx1, name1, idx2, name2)?;
+    executor.load_fast_pair_checked(idx1, idx2)?;
     Ok(StepResult::Continue)
 }
 

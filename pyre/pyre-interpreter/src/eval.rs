@@ -2671,9 +2671,18 @@ impl LocalOpcodeHandler for PyFrame {
         Ok(locals_w!(self)[idx])
     }
 
-    fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
+    fn load_local_checked_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
         let value = locals_w!(self)[idx];
         if value.is_null() {
+            // Name resolution stays on the failure path only
+            // (pyopcode.py LOAD_FAST -> _load_fast_failed), keeping the
+            // varnames read out of the non-raising path.
+            let code = unsafe { &*crate::pyframe_get_pycode(self) };
+            let name = if idx < code.varnames.len() {
+                code.varnames[idx].as_str()
+            } else {
+                "<cell>"
+            };
             return Err(PyError::unbound_local_error(format!(
                 "cannot access local variable '{name}' where it is not associated with a value"
             )));
