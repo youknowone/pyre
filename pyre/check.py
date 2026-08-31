@@ -347,7 +347,9 @@ FLOOR_GATE_MIN_BASELINE_S = 10 * EXEC_TIME_FLOOR_S
 # slower than pypy -- not a thing anyone wants to be true, and one more number
 # to re-fit every time the ceiling moves.  The floor is only an instrument for
 # reporting that a ceiling has gone stale, so it sits at parity: reaching it is
-# the event worth a red run.
+# the event worth a red run.  A fixture whose ceiling is already at or under
+# parity has nothing left for it to report, and `perf_gate_floor` gives it no
+# floor at all.
 PERF_GATE_FLOOR_RATIO = 1.0
 # A ceiling also sets a lower bound at one sixth of itself, capped at
 # parity.  A wider runner-to-runner spread is a measurement or fixture defect
@@ -1822,9 +1824,17 @@ def wasm_ratio_gate(path):
 def perf_gate_floor(ceiling):
     """The pypy ratio a bench with this ceiling must not read below.
 
-    Use one sixth of the ceiling, capped at parity so a benchmark is never
+    One sixth of the ceiling, capped at parity so a benchmark is never
     required to remain slower than pypy.
+
+    None -- no floor at all -- for a ceiling at or under parity.  Such a
+    ceiling already asserts that the fixture is at least as fast as pypy, which
+    is the event the floor exists to report; a floor derived beneath it asserts
+    the opposite thing, that the fixture must not get much FASTER than pypy,
+    and beating pypy is not a result any run should go red for.
     """
+    if ceiling <= PERF_GATE_FLOOR_RATIO:
+        return None
     return min(PERF_GATE_FLOOR_RATIO, ceiling / PERF_GATE_FLOOR_DIVISOR)
 
 
@@ -5340,6 +5350,11 @@ def main():
         # synthetic suite.
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       None,    5,       None,    5)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       None,    5,       None,    5,    wasm_float_tol=True)
+        # fannkuch is almost nothing but cross-loop JUMP, which the two
+        # backends pay differently: cranelift's closing_jump carries a LABEL's
+        # values through jitframe slots (`emit_attached_loop_dispatch`) where
+        # dynasm remaps them in registers.  That is why its ceiling here is the
+        # wider of the pair, and why this bench alone needs the spread.
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       15)
         # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
         # suite as bridge_branchy_callee.py, gated against pypy by
