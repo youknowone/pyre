@@ -2840,6 +2840,13 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::module::thread::all_thread_hooks_current",
         thread_all_hooks_current,
     );
+    let ec_space_decrement_ticker: fn(&mut crate::PyExecutionContext, isize) -> isize =
+        crate::executioncontext::space_decrement_ticker;
+    p2(
+        &mut entries,
+        "pyre_interpreter::executioncontext::space_decrement_ticker",
+        ec_space_decrement_ticker,
+    );
     pa1(
         &mut entries,
         "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",

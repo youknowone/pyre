@@ -1051,14 +1051,7 @@ impl ExecutionContext {
         // action_dispatcher do NOT run.  Use `?` so a tracer error
         // short-circuits before touching actionflag.
         frame = self.bytecode_only_trace(frame)?;
-        // Copy the one-word wrapper out before the call: `&mut self.actionflag`
-        // is a GC-interior address, which rewrite_op_getsubstruct refuses (an
-        // abort is baked before the residual). The wrapper is Copy and points
-        // at the process-global flag, so a local copy reaches the same state —
-        // upstream's `self.space.actionflag` is likewise a plain reference
-        // read, never an interior pointer.
-        let mut actionflag = self.actionflag;
-        if actionflag.decrement_ticker(decr_by as isize) < 0 {
+        if space_decrement_ticker(self, decr_by as isize) < 0 {
             // executioncontext.py — `actionflag.action_dispatcher`.
             // Routed through a residual (dont_look_inside) boundary so the
             // tracer never sees the action machinery's trait-object
@@ -2375,6 +2368,18 @@ impl ActionFlagOps for SpaceActionFlag {
     fn decrement_ticker(&mut self, by: isize) -> isize {
         self.inner_mut().decrement_ticker(by)
     }
+}
+
+/// `dont_look_inside`: the ticker lives behind `SpaceActionFlag`'s interior
+/// pointer, which the codewriter refuses to lower (`rewrite_op_getsubstruct`
+/// bakes an abort before such a call). The residual takes the execution
+/// context itself, so no interior address appears in the caller's graph.
+/// Upstream traces carry the ticker as raw field operations instead; lowering
+/// this gate to those ops is a later port.
+#[majit_macros::dont_look_inside]
+pub fn space_decrement_ticker(ec: &mut ExecutionContext, by: isize) -> isize {
+    let mut actionflag = ec.actionflag;
+    actionflag.decrement_ticker(by)
 }
 
 pub struct AsyncAction {
