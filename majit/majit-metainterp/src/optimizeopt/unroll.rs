@@ -637,21 +637,38 @@ impl UnrollOptimizer {
         }
         optimizer.published_short_preamble_producer_slot =
             self.compile_short_preamble_producer_slot;
-        optimizer.published_resume_memo_slot = self.compile_resume_memos_slot;
-        if let Some(addr) = self.compile_resume_memos_slot {
-            // SAFETY: pyjitpl installs this address from
-            // `MetaInterp.compile_resume_memos` for the duration of one
-            // compile, and `CompileSnapshotRootsGuard` empties the vector
-            // before the compile returns. Unroll phases run on the same thread
-            // as the registered root walker.
-            unsafe {
-                (*(addr as *mut Vec<crate::resume::LiveResumeMemo>))
-                    .push(std::rc::Rc::downgrade(&optimizer.resumedata_memo));
-            }
-        }
+        self.register_resume_memo(optimizer);
         PublishedShortPreambleProducer {
             slot: self.compile_short_preamble_producer_slot,
             previous,
+        }
+    }
+
+    /// Hand `optimizer`'s resume memo to the metainterpreter's root area for
+    /// the rest of this compile.
+    ///
+    /// optimizer.py:732 gives every `Optimizer` its own `ResumeDataLoopMemo`,
+    /// and `store_final_boxes_in_guard` fills that memo's `rd_consts` with live
+    /// GCREFs as it numbers each guard. RPython reaches them through the
+    /// optimizer the compiling frame holds; here the walker reaches only what
+    /// the metainterpreter published, so each optimizer that numbers guards
+    /// registers its own memo — `unroll.py optimize_preamble`'s as well as
+    /// `optimize_peeled_loop`'s.
+    ///
+    /// The handle is `Weak`, so a dropped `Optimizer` needs no withdrawal:
+    /// `MetaInterp::walk_rd_consts_refs` keeps only the ones that upgrade.
+    fn register_resume_memo(&self, optimizer: &crate::optimizeopt::optimizer::Optimizer) {
+        let Some(addr) = self.compile_resume_memos_slot else {
+            return;
+        };
+        // SAFETY: pyjitpl installs this address from
+        // `MetaInterp.compile_resume_memos` for the duration of one compile,
+        // and `CompileSnapshotRootsGuard` empties the vector before the
+        // compile returns. Unroll phases run on the same thread as the
+        // registered root walker.
+        unsafe {
+            (*(addr as *mut Vec<crate::resume::LiveResumeMemo>))
+                .push(std::rc::Rc::downgrade(&optimizer.resumedata_memo));
         }
     }
 
@@ -845,6 +862,7 @@ impl UnrollOptimizer {
                 }
                 None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
             };
+            self.register_resume_memo(&opt_p1);
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.callinfocollection = self.callinfocollection.clone();
             opt_p1.cpu = self.cpu.clone();

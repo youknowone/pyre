@@ -413,14 +413,6 @@ pub struct Optimizer {
     /// `OptContext.active_short_preamble_producer` so the root walker always
     /// follows the builder's current home.
     pub(crate) published_short_preamble_producer_slot: Option<usize>,
-    /// Address of `MetaInterp.compile_resume_memos`, published for one compile.
-    ///
-    /// `optimizer.py:732` owns the memo for the whole trace optimization, so
-    /// its constant pool outlives any single guard and a collection can land
-    /// between two of them. Handing the handle to the metainterpreter puts it
-    /// where `walk_rd_consts_refs` already looks, which is what the registered
-    /// root area derives from its `data` pointer.
-    pub(crate) published_resume_memo_slot: Option<usize>,
     /// RPython unroll.py: `label_args = import_state(...)`.
     /// The peeled loop's LABEL must use these args, not the phase-1 end_args.
     pub imported_label_args: Option<Vec<OpRef>>,
@@ -1521,7 +1513,6 @@ impl Optimizer {
             imported_short_preamble_builder: None,
             short_preamble_producer: None,
             published_short_preamble_producer_slot: None,
-            published_resume_memo_slot: None,
             imported_label_args: None,
             patchguardop: None,
             skip_flush: false,
