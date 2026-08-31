@@ -25336,6 +25336,27 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     Ok(pyre_object::w_str_from_wtf8_managed(s))
 }
 
+/// `unicode_check_encoding_errors` — the name check `PyUnicode_Decode` runs
+/// ahead of its own empty-input return, which is what leaves `b''.decode('nope')`
+/// answering `''` in a release build and raising under `-X dev`.  Outside
+/// development mode the whole check is skipped; the two exempt lists are the
+/// names whose lookup it declines to pay for, and it matches them unnormalized.
+fn unicode_check_encoding_errors(encoding: &str, errors: &str) -> Result<(), crate::PyError> {
+    if !crate::importing::dev_mode_flag() {
+        return Ok(());
+    }
+    if !matches!(encoding, "utf-8" | "utf8" | "ascii") {
+        crate::module::_codecs::validate_encoding(encoding)?;
+    }
+    if !matches!(
+        errors,
+        "strict" | "ignore" | "replace" | "surrogateescape" | "surrogatepass"
+    ) {
+        crate::module::_codecs::validate_error_handler(errors)?;
+    }
+    Ok(())
+}
+
 /// Decode `data` under `encoding`/`errors` into a WTF-8 string, dispatching on
 /// the codec name the same way `bytes.decode` does.
 pub(crate) fn decode_bytes_to_wtf8(
@@ -25344,6 +25365,16 @@ pub(crate) fn decode_bytes_to_wtf8(
     errors: &str,
 ) -> Result<Wtf8Buf, crate::PyError> {
     let err_mode = errors;
+    // [3.14-spec] `PyUnicode_Decode` orders the name check, then the empty-input
+    // return, then the dispatch, so nothing below is reached for empty `data`
+    // and the codec name goes unread there.  `str_decode_utf_8` and its
+    // neighbours are entered from `PyUnicode_Decode` only once the size test has
+    // passed, so PyPy has no counterpart to the return and answers
+    // `LookupError` for every name.
+    unicode_check_encoding_errors(encoding, errors)?;
+    if data.is_empty() {
+        return Ok(Wtf8Buf::new());
+    }
     // The codec name is matched with case folded and `_` read as `-`.  Every
     // caller inside the runtime, and `bytes.decode`'s own default, already
     // spells it that way, so the rewrite is the exception and only it pays
@@ -25356,30 +25387,6 @@ pub(crate) fn decode_bytes_to_wtf8(
     } else {
         std::borrow::Cow::Borrowed(encoding)
     };
-    if crate::importing::dev_mode_flag()
-        && matches!(
-            enc_lower.as_ref(),
-            "utf-8"
-                | "utf8"
-                | "u8"
-                | "ascii"
-                | "us-ascii"
-                | "646"
-                | "latin-1"
-                | "latin1"
-                | "iso-8859-1"
-                | "8859"
-                | "raw-unicode-escape"
-                | "utf-16"
-                | "utf-16-le"
-                | "utf-16-be"
-                | "utf-32"
-                | "utf-32-le"
-                | "utf-32-be"
-        )
-    {
-        crate::module::_codecs::validate_error_handler(errors)?;
-    }
     let s = match enc_lower.as_ref() {
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
         "ascii" | "us-ascii" | "646" => {
