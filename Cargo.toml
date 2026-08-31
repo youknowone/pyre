@@ -50,7 +50,6 @@ members = [
     "pyre/pyre-wasm",
     "pyre/pyre-wasm-test",
     "pyre/pyre-wasm-runner",
-    "pyre/pyre-bench",
 ]
 
 [workspace.dependencies]

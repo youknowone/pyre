@@ -1,0 +1,50 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/CodSpeedHQ/codspeed/refs/heads/main/schemas/codspeed.schema.json
+#
+# CodSpeed measures the pyre binary running the benchmark files themselves.
+#
+# `exec` targets rather than a Rust harness, because the subject is a Python
+# interpreter: what we want counted is `pyre-dynasm <script>`, not a criterion
+# binary that links the interpreter and re-embeds the same Python as Rust
+# string constants. The scripts here are the ones `pyre/check.py` scores and
+# `pyre/wasm_check.py` runs, so there is one copy of each workload.
+#
+# ★One target is one process, which is the point rather than a side effect.
+# The JIT's compiled traces, warmup counters and codegen cache are
+# process-global, so several hot loops timed in one process contaminate each
+# other -- measured at two benchmarks disagreeing 5x, and a strict-subset
+# speedup reading 0.47x. Separate processes make that unrepresentable.
+#
+# Process startup costs 0.04s user against 4.10s for the ten scripts, so the
+# fixed overhead each measurement carries is ~1%. It does not need subtracting
+# the way `check.py` subtracts it: check.py divides one runtime's time by
+# another's, where a startup-sized denominator stops tracking, while CodSpeed
+# compares a command against its own history and a constant cancels in the
+# delta.
+
+options:
+  # Instruction counts under simulation are deterministic, so one round is the
+  # measurement rather than a sample of it. It is also what keeps the Valgrind
+  # budget at roughly ten minutes: ~100x on 4.10s of user CPU.
+  max-rounds: 1
+
+benchmarks:
+  - name: fannkuch
+    exec: ./target/release/pyre-dynasm pyre/bench/fannkuch.py
+  - name: fib_loop
+    exec: ./target/release/pyre-dynasm pyre/bench/fib_loop.py
+  - name: fib_recursive
+    exec: ./target/release/pyre-dynasm pyre/bench/fib_recursive.py
+  - name: float_loop
+    exec: ./target/release/pyre-dynasm pyre/bench/float_loop.py
+  - name: inline_helper
+    exec: ./target/release/pyre-dynasm pyre/bench/inline_helper.py
+  - name: int_loop
+    exec: ./target/release/pyre-dynasm pyre/bench/int_loop.py
+  - name: nbody
+    exec: ./target/release/pyre-dynasm pyre/bench/nbody.py
+  - name: nested_loop
+    exec: ./target/release/pyre-dynasm pyre/bench/nested_loop.py
+  - name: raise_catch_loop
+    exec: ./target/release/pyre-dynasm pyre/bench/raise_catch_loop.py
+  - name: spectral_norm
+    exec: ./target/release/pyre-dynasm pyre/bench/spectral_norm.py
