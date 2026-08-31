@@ -87,16 +87,24 @@ fn pyobj_container_add(obj: PyObjectRef) -> usize {
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
     );
     let cell_slot = pyre_object::gc_roots::pin_roots(&[cell]);
-    if PYOBJ_CONTAINER.load(Relaxed) == 0 {
-        // Nothing allocates between the list and the store, so the collector
-        // cannot run while the table is reachable only from this local.
-        PYOBJ_CONTAINER.store(
-            pyre_object::listobject::w_list_new_empty() as usize,
-            Relaxed,
-        );
+    // Publish the table with a compare-exchange, not a load/store pair: two
+    // threads adding their first `py_object` can both read zero, and a plain
+    // store lets the second one replace a table the first has already appended
+    // to.  The first thread's buffer keeps an index into the discarded list,
+    // which then resolves against the winner and answers another thread's
+    // object.  The loser's empty list is unreachable and collectable.
+    let mut table = PYOBJ_CONTAINER.load(Relaxed);
+    if table == 0 {
+        // Nothing allocates between the list and the exchange, so the
+        // collector cannot run while the table is reachable only from
+        // this local.
+        let fresh = pyre_object::listobject::w_list_new_empty() as usize;
+        table = match PYOBJ_CONTAINER.compare_exchange(0, fresh, Relaxed, Relaxed) {
+            Ok(_) => fresh,
+            Err(winner) => winner,
+        };
     }
-    let table_slot =
-        pyre_object::gc_roots::pin_roots(&[PYOBJ_CONTAINER.load(Relaxed) as PyObjectRef]);
+    let table_slot = pyre_object::gc_roots::pin_roots(&[table as PyObjectRef]);
     unsafe {
         pyre_object::listobject::w_list_append(
             pyre_object::gc_roots::shadow_stack_get(table_slot),

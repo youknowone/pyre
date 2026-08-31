@@ -37,7 +37,7 @@ WHICH = "head"
 ERR = ValueError("boom")
 
 
-def mid(i):
+def mid(_i):
     raise ValueError("boom")
 
 

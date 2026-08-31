@@ -908,9 +908,14 @@ impl TypeRegistry {
              (gctypelayout.can_add_new_types == False)"
         );
         let id = self.entries.len();
+        // `T_MEMBER_INDEX` is the low 16 bits of `infobits`, so an id past
+        // `u16::MAX` cannot round-trip through `encode_type_shape` — it would
+        // be masked back to a smaller index and mislabel the row.  The width
+        // is `gctypelayout.py`'s, so the bound belongs here rather than in a
+        // wider field.
         assert!(
-            id < u32::MAX as usize,
-            "TypeRegistry exhausted all representable u32 type ids"
+            id <= u16::MAX as usize,
+            "TypeRegistry exhausted the 16-bit T_MEMBER_INDEX field: id {id}"
         );
         if info.custom_trace.is_none()
             && let Some(parent_id) = info.parent
