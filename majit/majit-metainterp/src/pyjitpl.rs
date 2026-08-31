@@ -799,14 +799,20 @@ fn snapshot_map_from_trace_snapshots(
     SnapshotFramePcs,
 ) {
     let _ = constants; // legacy idx-Const pool no longer populated here; see SnapshotTagged::Const arm
-    let mut box_map = Vec::new();
-    let mut size_map = Vec::new();
-    let mut vable_map = Vec::new();
-    let mut vref_map = Vec::new();
+    // Recorder snapshot ids below come directly from `enumerate`, so all five
+    // maps are dense and have the final length in hand. RPython's opencoder
+    // also appends its snapshot payloads to flat buffers; repeatedly growing a
+    // sparse Rust adapter here only adds allocator traffic while preserving no
+    // extra semantics.
+    let snapshot_count = trace_snapshots.len();
+    let mut box_map = Vec::with_capacity(snapshot_count);
+    let mut size_map = Vec::with_capacity(snapshot_count);
+    let mut vable_map = Vec::with_capacity(snapshot_count);
+    let mut vref_map = Vec::with_capacity(snapshot_count);
     // Not `pc_map`: that name belongs to the `-live-` marker table keyed by
     // Python pc (`pc_map[py_pc]`, `pyre-jit/src/jit/codewriter.rs`). This is
     // keyed by snapshot id and holds one `(jitcode_index, pc, py_pc)` per frame.
-    let mut frame_pcs_map = Vec::new();
+    let mut frame_pcs_map = Vec::with_capacity(snapshot_count);
     // opencoder.py _encode: trace snapshot recorder only emits Box
     // (live deadframe slot) and Const (compile-time pool) payloads.
     // TAGVIRTUAL belongs to resume numbering (resume.py:_number_boxes)
@@ -844,7 +850,7 @@ fn snapshot_map_from_trace_snapshots(
             }
         }
     };
-    for (id, snap) in trace_snapshots.iter().enumerate() {
+    for snap in trace_snapshots {
         let boxes: Vec<SnapshotBox> = snap
             .frames
             .iter()
@@ -862,12 +868,11 @@ fn snapshot_map_from_trace_snapshots(
             .iter()
             .map(|f| (f.jitcode_index as i32, f.pc as i32, f.py_pc as i32))
             .collect();
-        let id = id as i32;
-        snapshot_insert(&mut box_map, id, boxes);
-        snapshot_insert(&mut size_map, id, frame_sizes);
-        snapshot_insert(&mut vable_map, id, vable_boxes);
-        snapshot_insert(&mut vref_map, id, vref_boxes);
-        snapshot_insert(&mut frame_pcs_map, id, frame_pcs);
+        box_map.push(Some(boxes));
+        size_map.push(Some(frame_sizes));
+        vable_map.push(Some(vable_boxes));
+        vref_map.push(Some(vref_boxes));
+        frame_pcs_map.push(Some(frame_pcs));
     }
     (box_map, size_map, vable_map, vref_map, frame_pcs_map)
 }
@@ -1930,6 +1935,11 @@ pub struct MetaInterp<M: Clone> {
     /// `popframe` (pyjitpl.py).  Initialized as empty by
     /// `initialize_state_from_start` and `rebuild_state_after_failure`.
     pub framestack: crate::pyjitpl::MIFrameStack,
+    /// pyjitpl.py `MetaInterp.free_frames_list` — popped frames whose
+    /// register storage can be reset by `MIFrame.setup` and reused by the next
+    /// inlined call. The list belongs to one MetaInterp exactly as upstream's
+    /// does; it is neither process-global nor thread-local.
+    pub free_frames_list: Vec<crate::pyjitpl::MIFrame>,
 
     /// pyjitpl.py `MetaInterp.portal_call_depth = 0` (class
     /// attribute, instance-mutated).  Counts the nesting depth of
@@ -3488,6 +3498,7 @@ impl<M: Clone> MetaInterp<M> {
             issubclass: Some(default_issubclass),
             staticdata: std::sync::Arc::new(MetaInterpStaticData::new()),
             framestack: crate::pyjitpl::MIFrameStack::empty(),
+            free_frames_list: Vec::new(),
             portal_call_depth: 0,
             call_ids: Vec::new(),
             current_call_id: 0,
@@ -13855,38 +13866,17 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        // compile.py: BridgeCompileData is built from the original
-        // history trace/runtime boxes. The explicit Rust TraceIterator
-        // preparation below mirrors unroll.py:187 `trace = trace.get_iter()`
-        // and must happen after this payload is formed.
+        // compile.py: BridgeCompileData carries the trace/runtime boxes into
+        // `UnrollOptimizer.optimize_bridge`, whose first operation is
+        // unroll.py:187 `trace = trace.get_iter()`.  In the Rust port the
+        // CompileData dispatch is flattened into this method (compile.rs
+        // `CompileData`), so build its short-lived view over that iterator's
+        // canonical `Rc<Op>` objects.  Building a separate `TreeLoop` from
+        // `bridge_ops.to_vec()` here used to allocate one throw-away `Rc<Op>`
+        // for every recorded operation, immediately before TraceIterator
+        // allocated the real fresh objects consumed by the optimizer.
         let bridge_runtime_boxes: Vec<OpRef> =
             Self::closing_jump_runtime_boxes(bridge_ops, bridge_inputargs);
-        let bridge_trace_data = TreeLoop::with_snapshots(
-            bridge_inputargs
-                .iter()
-                .map(InputArg::fresh_value_copy)
-                .collect(),
-            bridge_ops.to_vec(),
-            Vec::new(),
-        );
-        let bridge_resumestorage = pending_bridge_rd
-            .as_ref()
-            .map(|pending| pending.storage.as_ref());
-        let (bridge_inline_short_preamble, bridge_call_pure_results, bridge_runtime_boxes) = {
-            let bridge_data = compile::BridgeCompileData::new(
-                &bridge_trace_data,
-                &bridge_runtime_boxes,
-                bridge_resumestorage,
-                &call_pure_results,
-                inline_short_preamble,
-                self.warm_state.get_enable_opts(),
-            );
-            (
-                bridge_data.inline_short_preamble,
-                bridge_data.call_pure_results.clone(),
-                bridge_data.runtime_boxes.to_vec(),
-            )
-        };
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
@@ -13902,19 +13892,62 @@ impl<M: Clone> MetaInterp<M> {
             bridge_runtime_boxes,
             bridge_inputarg_base,
         );
-        let bridge_inputarg_types: Vec<majit_ir::OpRef> = prepared
-            .inputargs
+        let PreparedBridgeTrace {
+            ops: prepared_ops,
+            inputargs: prepared_inputargs,
+            snapshot_boxes,
+            snapshot_frame_sizes,
+            snapshot_vable_boxes,
+            snapshot_vref_boxes,
+            snapshot_frame_pcs,
+            pending_bridge_rd,
+            runtime_boxes: prepared_runtime_boxes,
+        } = prepared;
+        // `TreeLoop::from_oprc` preserves the TraceIterator identities rather
+        // than wrapping a second copy of every operation.  The inputargs on
+        // this CompileData-only view remain the original pre-iterator boxes,
+        // matching BridgeCompileData.__init__; optimizer consumers below use
+        // `prepared_inputargs`, matching `trace.get_iter().inputargs`.
+        let bridge_trace_data = TreeLoop::from_oprc(
+            bridge_inputargs
+                .iter()
+                .map(|arg| std::rc::Rc::new(arg.fresh_value_copy()))
+                .collect(),
+            prepared_ops,
+            Vec::new(),
+        );
+        let bridge_resumestorage = pending_bridge_rd
+            .as_ref()
+            .map(|pending| pending.storage.as_ref());
+        let (bridge_inline_short_preamble, bridge_call_pure_results) = {
+            let bridge_data = compile::BridgeCompileData::new(
+                &bridge_trace_data,
+                &prepared_runtime_boxes,
+                bridge_resumestorage,
+                &call_pure_results,
+                inline_short_preamble,
+                self.warm_state.get_enable_opts(),
+            );
+            // The flattened dispatch consumes this slice below rather than
+            // through BridgeCompileData::optimize, but constructing the
+            // payload still validates that both views name the same boxes.
+            debug_assert_eq!(bridge_data.runtime_boxes, prepared_runtime_boxes);
+            (
+                bridge_data.inline_short_preamble,
+                bridge_data.call_pure_results.clone(),
+            )
+        };
+        let bridge_inputarg_types: Vec<majit_ir::OpRef> = prepared_inputargs
             .iter()
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
             .collect();
-        let bridge_inputargs = prepared.inputargs.as_slice();
-        let bridge_ops = prepared.ops.as_slice();
-        let pending_bridge_rd = prepared.pending_bridge_rd;
+        let bridge_inputargs = prepared_inputargs.as_slice();
+        let bridge_ops = bridge_trace_data.ops.as_slice();
         // unroll.py:187 `trace = trace.get_iter()` rewrote the runtime boxes
         // into the fresh-iterator namespace; consume the translated list so
         // optimize_bridge's generate_guards reads them in the re-minted space.
-        let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
+        let bridge_runtime_boxes = prepared_runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
@@ -13929,11 +13962,11 @@ impl<M: Clone> MetaInterp<M> {
         // in the typed OpRef variant tag (`OpRef::input_arg_typed`); the
         // legacy `constant_types.insert(arg.index, arg.tp)` writes were
         // redundant with `opref_type`'s priority-0 variant-tag read.
-        optimizer.snapshot_boxes = prepared.snapshot_boxes;
-        optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
-        optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
-        optimizer.snapshot_vref_boxes = prepared.snapshot_vref_boxes;
-        optimizer.snapshot_frame_pcs = prepared.snapshot_frame_pcs;
+        optimizer.snapshot_boxes = snapshot_boxes;
+        optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
+        optimizer.snapshot_vable_boxes = snapshot_vable_boxes;
+        optimizer.snapshot_vref_boxes = snapshot_vref_boxes;
+        optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
         // Store bridge inputarg types so export_state can mint typed
         // `renamed_inputargs` OpRefs that carry their type intrinsically
         // (history.py:220 InputArg{Int,Ref,Float}.type Box parity).
@@ -16274,7 +16307,12 @@ impl<M: Clone> MetaInterp<M> {
         let raw = (greenkey.as_ref().map_or(0, |(key, _)| *key) as usize, 0);
         let _ = self.enter_inline_frame(raw);
         // pyjitpl.py: reuse / allocate MIFrame, push onto framestack.
-        let frame = crate::pyjitpl::MIFrame::setup(jitcode, 0, greenkey, self.tracing.as_mut());
+        let frame = if let Some(mut frame) = self.free_frames_list.pop() {
+            frame.setup_reused(jitcode, 0, greenkey, self.tracing.as_mut());
+            frame
+        } else {
+            crate::pyjitpl::MIFrame::setup(jitcode, 0, greenkey, self.tracing.as_mut())
+        };
         self.framestack.push(frame);
         self.framestack.len() - 1
     }
@@ -16347,9 +16385,8 @@ impl<M: Clone> MetaInterp<M> {
             }
             // pyjitpl.py: frame.cleanup_registers().
             frame.cleanup_registers();
-            // pyjitpl.py:2477: self.free_frames_list.append(frame) is
-            // an RPython memory-reuse optimization; pyre relies on the
-            // Rust drop to release register banks.
+            // pyjitpl.py:2477: self.free_frames_list.append(frame).
+            self.free_frames_list.push(frame);
         }
         // Mirror the TraceCtx inline-depth counter so trace recorder
         // bookkeeping stays balanced with the framestack pop.

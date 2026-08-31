@@ -701,6 +701,25 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         } else {
             inputargs.iter().map(|arg| arg.tp).collect()
         };
+        // Both resume-layout consumers below decode the same guard-owned
+        // `rd_numb`. RPython keeps one numbering stream on the descr and its
+        // consumers walk that shared data; decoding it twice here duplicated
+        // every vable, vref and frame vector solely to project two Rust layout
+        // views. Decode once and let both projections borrow the result.
+        let decoded_numbering = if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
+            (op.resolved_rd_numb(), op.resolved_rd_consts())
+        {
+            let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
+            Some(majit_ir::resumedata::rebuild_from_numbering(
+                &rd_numb_bytes,
+                &rd_consts_data,
+                &exit_types,
+                fvc_ref,
+                num_virtuals,
+            ))
+        } else {
+            None
+        };
         let resume_layout;
         let storage = if is_guard {
             let mut builder = ResumeDataVirtualAdder::new();
@@ -714,18 +733,10 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             // `resolved_rd_*` chases `descr.prev` (compile.py:849
             // ResumeGuardCopiedDescr.get_resumestorage) so a shared guard
             // reads the donor's resume data without an owned copy.
-            if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
-                (op.resolved_rd_numb(), op.resolved_rd_consts())
+            if let Some((_num_failargs, vable_values, _vref_values, frames)) =
+                decoded_numbering.as_ref()
             {
-                use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
-                let (_num_failargs, vable_values, _vref_values, frames) = rebuild_from_numbering(
-                    &rd_numb_bytes,
-                    &rd_consts_data,
-                    &exit_types,
-                    fvc_ref,
-                    num_virtuals,
-                );
+                use majit_ir::resumedata::RebuiltValue;
                 let vable_array = vable_values
                     .iter()
                     .map(|val| match val {
@@ -817,23 +828,15 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         // ResumeGuardCopiedDescr whose `prev` points at the donor;
         // the `resolved_rd_*` helpers chase that descr-side pointer
         // (compile.py get_resumestorage).
-        let recovery_layout = if op.resolved_rd_numb().is_some() {
+        let recovery_layout = if decoded_numbering.is_some() {
             // Consumer switchover path: rd_numb contains the full frame encoding.
             // Build recovery_layout from rd_numb + rd_virtuals.
             use majit_backend::{ExitRecoveryLayout, ExitValueSourceLayout};
             let (num_failargs, vable_layout, vref_layout, frames_layout) =
-                if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
-                    (op.resolved_rd_numb(), op.resolved_rd_consts())
+                if let Some((num_failargs, vable_values, vref_values, frames)) =
+                    decoded_numbering.as_ref()
                 {
-                    use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
-                    let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
-                    let (num_failargs, vable_values, vref_values, frames) = rebuild_from_numbering(
-                        &rd_numb_bytes,
-                        &rd_consts_data,
-                        &exit_types,
-                        fvc_ref,
-                        num_virtuals,
-                    );
+                    use majit_ir::resumedata::RebuiltValue;
                     debug_assert!(
                         vref_values.len() & 1 == 0,
                         "vref_values length must be even, got {}",
@@ -848,7 +851,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                         RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
                     };
                     (
-                        num_failargs,
+                        *num_failargs,
                         vable_values.iter().map(to_exit_source).collect::<Vec<_>>(),
                         vref_values.iter().map(to_exit_source).collect::<Vec<_>>(),
                         frames

@@ -1828,6 +1828,11 @@ pub struct JitDriver<S: JitState> {
     /// for buffers whose contents never move at all. `None` is the window
     /// between the two, which is what a nested entry finds.
     entry_scratch: Option<Box<EntryScratch>>,
+    /// Machine-word projection of one guard exit's typed deadframe values.
+    /// Kept separate from `entry_scratch`: bridge tracing can re-enter this
+    /// driver while the outer guard is still consuming these words, and that
+    /// nested entry should still be able to reuse the ordinary entry buffers.
+    exit_raw_scratch: Option<Vec<i64>>,
 }
 
 /// Per-entry scratch owned by [`JitDriver`]; see [`JitDriver::entry_scratch`].
@@ -2043,6 +2048,7 @@ impl<S: JitState> JitDriver<S> {
             portal_jd_index: None,
             state_field_fvc: None,
             entry_scratch: Some(Box::default()),
+            exit_raw_scratch: Some(Vec::new()),
             #[expect(
                 clippy::arc_with_non_send_sync,
                 reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
@@ -6185,9 +6191,9 @@ impl<S: JitState> JitDriver<S> {
                 live_values,
                 selected_dispatch_key,
             );
-            // The compiled body has run and nothing below reads the entry
-            // arguments, so the buffers go back before the first exit past
-            // this point.
+            // The compiled body no longer reads its entry arguments. Return
+            // these buffers before any guard-resume path can re-enter the
+            // driver to trace a bridge.
             self.entry_scratch_out(scratch);
             let mut result = result;
             if portal_rca {
@@ -6290,10 +6296,13 @@ impl<S: JitState> JitDriver<S> {
                 .exit_layout
                 .take()
                 .expect("a guard exit carries its exit layout");
-            // Projected here rather than carried on the result: only this arm
-            // and the detailed run below read machine words, and building the
-            // list on every entry charged the finish exit for both.
-            let raw_values = crate::compile::raw_exit_values(&result.typed_values);
+            // `warmstate.py execute_assembler` reads fail values from the
+            // deadframe in place. Pyre projects its typed exit buffer back to
+            // machine words for the resume helpers; reuse the entry scratch's
+            // raw buffer instead of spilling a fresh `ExitRawValues` whenever
+            // this guard has more than its inline width.
+            let mut raw_values = self.take_exit_raw_scratch();
+            raw_values.extend(result.typed_values.iter().map(Value::as_raw_i64));
             let descr_arc = result
                 .descr_arc
                 .take()
@@ -6401,6 +6410,7 @@ impl<S: JitState> JitDriver<S> {
                         green_key, trace_id, fail_index, pc,
                     );
                 }
+                self.exit_raw_scratch_out(raw_values);
                 return Some(pc);
             }
 
@@ -6875,6 +6885,7 @@ impl<S: JitState> JitDriver<S> {
                                 );
                             }
                         }
+                        self.exit_raw_scratch_out(raw_values);
                         return Some(pc);
                     }
                 }
@@ -6889,6 +6900,7 @@ impl<S: JitState> JitDriver<S> {
             self.meta.invalidate_loop(green_key);
             self.meta.remove_compiled_loop(green_key);
             self.meta.warm_state_mut().abort_tracing(green_key, true);
+            self.exit_raw_scratch_out(raw_values);
             return Some(guard_resume_pc);
         }
 
@@ -7206,6 +7218,16 @@ impl<S: JitState> JitDriver<S> {
     /// Return the buffers [`Self::take_entry_scratch`] handed out.
     fn entry_scratch_out(&mut self, scratch: Box<EntryScratch>) {
         self.entry_scratch = Some(scratch);
+    }
+
+    fn take_exit_raw_scratch(&mut self) -> Vec<i64> {
+        let mut raw = self.exit_raw_scratch.take().unwrap_or_default();
+        raw.clear();
+        raw
+    }
+
+    fn exit_raw_scratch_out(&mut self, raw: Vec<i64>) {
+        self.exit_raw_scratch = Some(raw);
     }
 
     /// The driver's static data, resolved once and then shared.
