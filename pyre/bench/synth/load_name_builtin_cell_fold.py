@@ -1,11 +1,11 @@
 # pyre-check: max-pypy-ratio=2.5
-# pyre-check: spec-folds=builtin_len
+# pyre-check: spec-folds=builtin_len_descent
 # pyre-check: skip-cpython
 # A module-scope LOAD_NAME whose name misses the module dict resolves through
 # the frame's builtin module.  The builtins cell folds under the module dict's
 # version? (so a later global binding shadows the builtin) and the builtins
 # dict's own version?.  The second loop proves that invalidation is seen: the
-# census reads `builtin_len` consulted twice and fired once, the decline being
+# census reads `builtin_len_descent` consulted twice and fired once, the decline being
 # the shadowed call.
 
 N = 225000000
