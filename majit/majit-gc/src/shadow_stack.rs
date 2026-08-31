@@ -1263,7 +1263,7 @@ pub unsafe fn push_resume_ref_roots(slice: &mut [i64]) {
             std::panic::Location::caller(),
         );
     }
-    if std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some() {
+    if crate::gc_nursery_poison_enabled() {
         const NURSERY_POISON_WORD: i64 = ((usize::MAX / 0xff) * 0xaa) as i64;
         if let Some(index) = slice.iter().position(|&value| value == NURSERY_POISON_WORD) {
             panic!(

@@ -5215,6 +5215,39 @@ impl<S: JitState> JitDriver<S> {
         ))
     }
 
+    /// Whether this guard's resume stream carries deferred heap writes over
+    /// more than one virtual.
+    ///
+    /// Read straight off the guard's own exit layout — the same lookup
+    /// `start_retrace_from_guard` makes for `retrace.storage`, but reachable
+    /// before a trace session exists, so a decline that turns on it does not
+    /// have to open one and tear it down.
+    ///
+    /// The virtual count is the whole question: a guard carrying deferred
+    /// writes over one virtual is served correctly and one carrying two is
+    /// not. See the caller for what separates them.
+    fn guard_carries_pending_fields(
+        &self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) -> bool {
+        let Some(descr_fd) = descr_arc.as_fail_descr() else {
+            return false;
+        };
+        let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
+            return false;
+        };
+        self.meta
+            .get_compiled_exit_layout_in_trace(
+                jct.green_key(),
+                descr_fd.trace_id(),
+                descr_fd.fail_index_per_trace(),
+            )
+            .and_then(|layout| layout.storage)
+            .is_some_and(|storage| {
+                !storage.rd_pendingfields.is_empty() && storage.rd_virtuals.len() > 1
+            })
+    }
+
     /// `compile.py handle_fail`'s bridging arm.
     ///
     /// Upstream's `handle_fail` is an if/else: a guard that `must_compile()`
@@ -5236,32 +5269,6 @@ impl<S: JitState> JitDriver<S> {
     /// therefore sited BEFORE the walk: once the walk has run, the tail has
     /// happened, and handing the same guard to the blackhole would apply it a
     /// second time.
-    /// Whether this guard's resume stream carries deferred heap writes.
-    ///
-    /// Read straight off the guard's own exit layout — the same lookup
-    /// `start_retrace_from_guard` makes for `retrace.storage`, but reachable
-    /// before a trace session exists, so a decline that turns on it does not
-    /// have to open one and tear it down.
-    fn guard_carries_pending_fields(
-        &self,
-        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
-    ) -> bool {
-        let Some(descr_fd) = descr_arc.as_fail_descr() else {
-            return false;
-        };
-        let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
-            return false;
-        };
-        self.meta
-            .get_compiled_exit_layout_in_trace(
-                jct.green_key(),
-                descr_fd.trace_id(),
-                descr_fd.fail_index_per_trace(),
-            )
-            .and_then(|layout| layout.storage)
-            .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
-    }
-
     fn bridge_from_guard_resume_position(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -5275,16 +5282,63 @@ impl<S: JitState> JitDriver<S> {
         // position to re-enter at; every other JitState resumes through its
         // own frontend.
         let dispatch = self.dispatch_jitcode().cloned()?;
-        // OPEN, and narrower than it was. The reader applies these guards'
-        // writes op-for-op as the blackhole does, and the virtualizable
-        // arrays are now written back from the resume stream, but a
-        // self-interpreting workload still reads one operand twice when these
-        // guards are served — and stops doing so when the virtualizable's
-        // banded arms are put out of reach, so what the walk resumes on is
-        // still described somewhere this entry does not restore. The scalars
-        // are the remaining candidate: they are carried by the state-field
-        // resume mechanism, disjoint from the array restore, and nothing
-        // writes them into the live state before the walk reads through them.
+        // OPEN, and the cut below is a MASK rather than the boundary. It
+        // refuses a guard whose deferred writes span more than one virtual,
+        // and at the parameter table's `trace_eagerness` a self-interpreting
+        // workload is byte-exact with it in place. Lowering that parameter —
+        // nothing else — reproduces the same class of wrong answer WITH the
+        // cut in place, deterministically, from one setting downwards.
+        //
+        // What that reproduction settles, and what it overturns:
+        //
+        //   * declining EVERY guard-resume entry restores the correct output
+        //     at every `trace_eagerness` tried, and also with the cut widened
+        //     to serve every deferred-write guard. This entry is the necessary
+        //     component; the virtual count is not.
+        //   * `MAJIT_MAX_BRIDGES` bisects the reproduction to one entry, and
+        //     that entry carries NO deferred writes and NO virtuals at all.
+        //     Seventy-one guard-resume entries precede it and are sound. The
+        //     shape this comment used to blame — a two-node push chain whose
+        //     outer virtual names the inner and whose one deferred write is
+        //     the list head — is what the cut refuses, not what corrupts.
+        //
+        // What the corrupting entry records is a bridge that closes with a
+        // JUMP into an already-compiled loop, and it passes a VARIABLE in the
+        // argument position that every other close in the same run fills with
+        // a literal — one of a handful of literals, each the value the loop
+        // behind that target token was specialized on. The bridge's own
+        // guards prove only that the variable is not one OTHER literal.
+        //
+        // Nothing in this frontend's close path proves the incoming state
+        // satisfies the target label: `unroll.py jump_to_existing_trace` is
+        // where upstream generates the guards that make a specialized label
+        // safe to enter, and its per-target-token log is EMPTY for this
+        // workload — with the unroll pass enabled as well as without it.
+        // Enabling that pass changes which bytes come out wrong and not that
+        // they are wrong, so the missing pass is not by itself the account.
+        //
+        // Also measured out, in the same reproduction:
+        //
+        //   * a `GuardRequirement` whose box is not reachable from the jump
+        //     arguments emits nothing and is skipped rather than declined —
+        //     a real hole, but declining on it fires on no target token here
+        //     and leaves every wrong byte unchanged,
+        //   * `rd_locs.len()` equals `num_failargs` on every guard in the
+        //     refused census, so no failarg resolves through the deadframe's
+        //     out-of-range identity-slot fallback,
+        //   * the bridge's inputargs are contiguous and cover every failarg,
+        //   * the rewrite lowers a resumed `New` to the headerless nursery
+        //     opcode, so materialized objects come from the frontend's own
+        //     pool at the offsets their descrs carry, and
+        //   * the collector is not involved: the wrong bytes are identical
+        //     with collection disabled, the run performs none, and the
+        //     frontend's own structural invariant stays silent. What the
+        //     served entry produces is a wrong VALUE on an intact structure.
+        //
+        // The cut stays because it is measured to halve this frontend's
+        // guard failures and because widening it is measured to produce a
+        // wrong answer at the shipped parameter; it is NOT a soundness
+        // argument, and the entry above it is where the account is still owed.
         //
         // Sited here rather than in the ladder below because
         // `compile.py ResumeGuardDescr.handle_fail` runs ONE of resume.py's
@@ -6493,7 +6547,7 @@ impl<S: JitState> JitDriver<S> {
                     // whenever `virtualizable_info` is non-null.
                     let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
                     {
-                        let mut current = Some(&mut bh);
+                        let mut current = Some(&mut *bh);
                         while let Some(frame) = current {
                             frame.state_field_layout = sf_layout.clone();
                             if !seed_vinfo_ptr.is_null() {
@@ -6554,7 +6608,7 @@ impl<S: JitState> JitDriver<S> {
                                     // Layout + vinfo were seeded across the
                                     // whole chain before the loop started.
                                     bh_builder.release_interp(bh);
-                                    bh = *caller;
+                                    bh = caller;
                                     cur_exc = next_exc;
                                 }
                                 // The bottommost frame always raises

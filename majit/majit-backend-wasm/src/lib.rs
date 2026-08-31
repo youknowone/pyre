@@ -517,6 +517,23 @@ fn diag_bump(i: usize) {
 const FROZEN_CHAIN_VALUE_SLOTS: usize = 64;
 const FROZEN_CHAIN_REF_HOMES: usize = 128;
 const FROZEN_CHAIN_LABEL_REF_SLOTS: usize = 2;
+/// Slots a frozen layout is rounded up to.
+///
+/// A chained bridge runs in its source token's frame and reaches its target's
+/// label loader, so the two layouts have to agree offset for offset — the
+/// chain is refused outright when they do not. Above the floors the two
+/// numbers are each loop's own spill count, and sibling loops through the same
+/// interpreter differ by a slot or two, which is enough to refuse a chain that
+/// is otherwise exactly the shape the floors exist to keep compiled. Rounding
+/// lands those siblings on one layout; the cost is the rounded-away slots,
+/// bounded by this constant per compiled token.
+const FROZEN_CHAIN_SLOT_GRANULARITY: usize = 16;
+
+/// `n` rounded up to a whole number of [`FROZEN_CHAIN_SLOT_GRANULARITY`] slots.
+fn frozen_slot_count(n: usize) -> usize {
+    n.div_ceil(FROZEN_CHAIN_SLOT_GRANULARITY) * FROZEN_CHAIN_SLOT_GRANULARITY
+}
+
 /// Words a label-parameter entry accepts after `frame_ptr`. One value for
 /// every such entry in the process: a loop-closing JUMP reaches its target
 /// with `return_call_indirect` on the shared table, and that type-checks the
@@ -3506,8 +3523,8 @@ impl majit_backend::Backend for WasmBackend {
         let frame = match entry_bridge_target {
             Some(target) => target.frame,
             None => codegen::FrameGeometry::compact(
-                raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS),
-                raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES) + label_ref_slots,
+                frozen_slot_count(raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS)),
+                frozen_slot_count(raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES)) + label_ref_slots,
                 label_ref_slots,
             ),
         };
@@ -4126,6 +4143,51 @@ impl majit_backend::Backend for WasmBackend {
                         _ => false,
                     })
                 });
+            // The JUMP hands input `k` back at position `k` only when it
+            // re-presents the state the guard failed on unchanged. One that
+            // reorders those inputs starts the next pass from a different state
+            // vector, which is the same reasoning the heap carve-out below
+            // uses: the shield refuses PROVABLY static bridges, and a permuted
+            // state is not the byte-identical one the livelock argument rests
+            // on. An arg that is not an input reload at all (a baked constant,
+            // a fresh allocation) is static by itself and does not make the
+            // JUMP a permutation.
+            //
+            // Reordering is not by itself enough, though. Read the arg list as
+            // a map from JUMP position to the input position it reloads: the
+            // state one pass produces is `s'[j] = s[source[j]]`, so a second
+            // pass leaves it unchanged exactly when every position a source
+            // names reloads ITSELF. `JUMP(input0, input0)` is the smallest
+            // case — it moves slot 0 into slot 1 once and is a fixed point from
+            // then on, so it re-presents byte-identical state and is refused
+            // here as any verbatim reload is. A source chain that is not
+            // stationary after one pass (a swap, a rotation) is admitted: its
+            // orbit does have a finite period, but the shield is a static
+            // approximation of the bridge alone — it does not model the loop
+            // body that runs between two passes, which is where such a bridge's
+            // advance actually comes from. Refusing one is not local to the
+            // bridge either: the decline registers the guard in
+            // `declined_bridge_guards`, which sends every later failure of it
+            // to blackhole resume.
+            let permutes_inputs = ops
+                .iter()
+                .rev()
+                .find(|op| op.opcode == majit_ir::OpCode::Jump)
+                .is_some_and(|jump| {
+                    let sources: Vec<Option<usize>> = jump
+                        .getarglist()
+                        .iter()
+                        .map(|arg| match arg {
+                            majit_ir::operand::Operand::InputArg(ia) => {
+                                input_pos.get(&ia.index).copied()
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    sources.iter().any(|source| {
+                        source.is_some_and(|k| sources.get(k).copied().flatten() != Some(k))
+                    })
+                });
             // Loop state carried on the HEAP (a permutation array flipped via
             // setarrayitem, an object field bumped via setfield, a residual
             // call's arbitrary effects) advances the cycle without any JUMP
@@ -4148,7 +4210,7 @@ impl majit_backend::Backend for WasmBackend {
                             | Unicodesetitem
                     )
             });
-            if !advances && !mutates_heap {
+            if !advances && !permutes_inputs && !mutates_heap {
                 diag_bump(11); // declined: loop-closing bridge advances no loop-carried value
                 return Err(BackendError::Unsupported(
                     "wasm backend: loop-closing bridge advances no loop-carried value \

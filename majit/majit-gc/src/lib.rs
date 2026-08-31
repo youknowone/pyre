@@ -194,6 +194,20 @@ pub fn gc_freelist_diag_enabled() -> bool {
     *ENABLED
 }
 
+/// `MAJIT_GC_NURSERY_POISON` — the poison-word audit the resume-root
+/// registration runs over the slice it is handed.
+///
+/// Read once, for the reason [`gc_lifetime_log_enabled`] gives, and with a
+/// sharper case: the gate sits in `shadow_stack::push_resume_ref_roots`, which
+/// every blackhole resume calls once per rebuilt frame and once per virtuals
+/// cache, and `std::env::var_os` takes the environment lock and scans it
+/// linearly whether or not the variable is set.
+pub fn gc_nursery_poison_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some());
+    *ENABLED
+}
+
 /// `MAJIT_LOG`, read once — the same gate `majit_metainterp::majit_log_enabled`
 /// caches, for the collector's own per-collection sites.
 pub fn majit_log_enabled() -> bool {
@@ -967,6 +981,36 @@ pub trait GcAllocator: Send {
     /// gc.py get_nursery_top_addr parity.
     /// Address of the published nursery_top slot that JIT code reads.
     fn nursery_top_addr(&self) -> usize;
+
+    /// Address of the head of a singly-linked recycle list an inline
+    /// allocation may take a cell from before it bumps, or 0 when this
+    /// allocator keeps none.
+    ///
+    /// A cell on the list is threaded through its second word — the same word
+    /// a two-word headerless allocation publishes as its link — so taking the
+    /// head is a load of the head, a load of that cell's link, and a store
+    /// back. The default keeps inline allocation a pure bump, which is what an
+    /// allocator that recycles nothing wants; one that DOES recycle has to
+    /// report the list here, because a bump-only fast path goes dead as soon
+    /// as the current chunk fills and the allocator starts living off the list.
+    fn nursery_recycle_list_addr(&self) -> usize {
+        0
+    }
+
+    /// Address of a two-word `[base, width]` pair naming the byte range whose
+    /// cells the recycle list accepts, or 0 when this allocator publishes
+    /// none.
+    ///
+    /// Publishing it alongside [`Self::nursery_recycle_list_addr`] declares
+    /// that releasing a cell whose address satisfies the unsigned test
+    /// `addr - base < width` is exactly `cell.link = *head; *head = cell`,
+    /// with the link word at offset 8 — the same two-word headerless cell the
+    /// inline nursery bump initialises. A cell that fails the test has to
+    /// reach the ordinary helper, which is also where the whole release goes
+    /// when either address is 0.
+    fn nursery_recycle_window_addr(&self) -> usize {
+        0
+    }
 
     /// Maximum size for nursery allocation (larger objects go to old gen directly).
     fn max_nursery_object_size(&self) -> usize;

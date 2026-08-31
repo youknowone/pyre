@@ -3127,6 +3127,9 @@ impl<'a> AssemblerARM64<'a> {
             | OpCode::CallReleaseGilI
             | OpCode::CallReleaseGilF
             | OpCode::CallReleaseGilN => {
+                let is_raw_free = op.opcode == OpCode::CallN
+                    && op.with_call_descr(|cd| cd.get_extra_info().oopspecindex)
+                        == Some(majit_ir::OopSpecIndex::RawFree);
                 if matches!(
                     op.opcode,
                     OpCode::CallMayForceI
@@ -3139,7 +3142,11 @@ impl<'a> AssemblerARM64<'a> {
                 ) {
                     self._store_force_index_if_next_guard(ops, op_index, fail_index);
                 }
-                self.genop_call_with_arglocs(op, arglocs);
+                if is_raw_free {
+                    self.genop_nursery_free_inline(op, arglocs);
+                } else {
+                    self.genop_call_with_arglocs(op, arglocs);
+                }
             }
             OpCode::CallR => {
                 let is_nursery_alloc = op.with_call_descr(|cd| cd.get_extra_info().runtime_helper)
@@ -5564,14 +5571,16 @@ impl<'a> AssemblerARM64<'a> {
     /// interpreter's own nursery, whose payload is the call's two arguments:
     /// the value at offset 0 and the successor link at offset 8.
     ///
-    /// The fast path only advances `nursery_free` and stores those two words,
-    /// so it cannot collect and emits no gcmap. The slow path is the ordinary
-    /// residual call wrapper, which may collect inside the callee; the callee
-    /// is free to treat the second argument as a keep-root, since that is the
-    /// object the new node links to. This is sound because the op is still a
-    /// call: the optimizer's residual-call emission fences pending setfields
-    /// before the allocation, so a collector that walks the interpreter's own
-    /// structures finds roots that are current.
+    /// The fast path takes the head of the allocator's recycle list when it
+    /// reports one and has one, otherwise advances `nursery_free`, and stores
+    /// those two words. Neither can collect, so it emits no gcmap. The slow
+    /// path is the ordinary residual call wrapper, which may collect inside
+    /// the callee; the callee is free to treat the second argument as a
+    /// keep-root, since that is the object the new node links to. This is
+    /// sound because the op is still a call: the optimizer's residual-call
+    /// emission fences pending setfields before the allocation, so a collector
+    /// that walks the interpreter's own structures finds roots that are
+    /// current.
     fn genop_nursery_alloc_inline(&mut self, op: &Op, arglocs: &[Loc]) {
         // Two-word headerless node: value@0, link@8.
         const NURSERY_ALLOC_NODE_SIZE: u32 = 16;
@@ -5592,10 +5601,30 @@ impl<'a> AssemblerARM64<'a> {
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
+        let bump = self.mc.new_dynamic_label();
+        let init = self.mc.new_dynamic_label();
 
         // Fast path uses ONLY reserved IP regs (x14/x15/x16/x17); never touches a
         // regalloc-managed register, so the slow path's original arglocs stay
-        // intact. x16=nf_addr->base, x17=base, x14=newf(temp), x15=nt_addr->top.
+        // intact. x16=slot address, x17=cell, x14=newf/link(temp), x15=top(temp).
+        //
+        // Take from the recycle list first, exactly as the callee's own
+        // allocation order does. A bump-only fast path would agree with the
+        // callee only while the current chunk has room: once it fills, an
+        // allocator that recycles serves every request from the list, the bump
+        // pointer stays at the limit, and the fast path never fires again.
+        let recycle_addr = crate::runner::dynasm_nursery_recycle_list_addr();
+        if recycle_addr != 0 {
+            self.emit_mov_imm64(16, recycle_addr as i64); // x16 = &recycle_head
+            dynasm!(self.mc ; .arch aarch64
+                ; ldr x17, [x16]                    // x17 = cell = *recycle_head
+                ; cbz x17, =>bump                   // empty -> bump instead
+                ; ldr x14, [x17, 8]                 // x14 = cell's link word
+                ; str x14, [x16]                    // *recycle_head = link
+                ; b =>init
+            );
+        }
+        dynasm!(self.mc ; .arch aarch64 ; =>bump);
         self.emit_mov_imm64(16, nf_addr as i64); // x16 = &nursery_free
         dynasm!(self.mc ; .arch aarch64
             ; ldr x17, [x16]                        // x17 = base = *nursery_free
@@ -5608,6 +5637,7 @@ impl<'a> AssemblerARM64<'a> {
             ; b.hi =>slow_path                      // newf > top -> exhausted
             ; str x14, [x16]                        // *nursery_free = newf
         );
+        dynasm!(self.mc ; .arch aarch64 ; =>init);
         // Init node fields; value/next loaded from ORIGINAL arglocs (no pre-clobber).
         // load_loc_to_reg returns a managed reg untouched, or loads Frame/Immed into
         // the IP scratch we pass (x15 and x14 are free here: top consumed, newf stored).
@@ -5620,6 +5650,63 @@ impl<'a> AssemblerARM64<'a> {
             self.store_rax_to_result(op.pos.get());
         }
         dynasm!(self.mc ; .arch aarch64 ; b =>done);
+
+        dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
+        self.genop_call_with_arglocs(op, arglocs);
+        dynasm!(self.mc ; .arch aarch64 ; =>done);
+    }
+
+    /// Inline recycle push for a `raw_free` whose allocator publishes a
+    /// recycle window.
+    ///
+    /// Publishing the window and the list head declares that releasing a cell
+    /// inside the window is exactly `cell.link = *head; *head = cell`, with
+    /// the link word at offset 8 — the same two-word headerless cell
+    /// [`Self::genop_nursery_alloc_inline`] hands out. An allocator that
+    /// publishes neither keeps the whole release on the residual call, and so
+    /// does a cell the window rejects, which is how a null pointer and a cell
+    /// the allocator no longer owns reach the callee's own tests.
+    ///
+    /// The op stays a call, so `before_call` has already put the register file
+    /// in its across-the-call shape; what this replaces is the branch to the
+    /// callee and the callee's own body. It cannot collect and emits no
+    /// gcmap, matching the descr the release carries.
+    fn genop_nursery_free_inline(&mut self, op: &Op, arglocs: &[Loc]) {
+        let window_addr = crate::runner::dynasm_nursery_recycle_window_addr();
+        let head_addr = crate::runner::dynasm_nursery_recycle_list_addr();
+        if window_addr == 0 || head_addr == 0 {
+            self.genop_call_with_arglocs(op, arglocs);
+            return;
+        }
+        let func_index = 3 + usize::from(op.opcode.is_call_release_gil());
+        let Some(&cell_loc) = arglocs.get(func_index + 1) else {
+            self.genop_call_with_arglocs(op, arglocs);
+            return;
+        };
+
+        let slow_path = self.mc.new_dynamic_label();
+        let done = self.mc.new_dynamic_label();
+
+        // Fast path uses ONLY reserved IP regs (x14/x15/x16/x17), so the slow
+        // path's original arglocs stay intact. `load_loc_to_reg` returns a
+        // managed register untouched, or loads a Frame/Immed operand into the
+        // x17 scratch; neither can be x14/x15/x16.
+        let cell = self.load_loc_to_reg(&cell_loc, 17);
+        self.emit_mov_imm64(16, window_addr as i64); // x16 = &[base, width]
+        dynasm!(self.mc ; .arch aarch64
+            ; ldr x14, [x16]                    // x14 = base
+            ; ldr x15, [x16, 8]                 // x15 = width
+            ; sub x14, X(cell), x14             // x14 = cell - base
+            ; cmp x14, x15
+            ; b.hs =>slow_path                  // outside the window
+        );
+        self.emit_mov_imm64(16, head_addr as i64); // x16 = &recycle_head
+        dynasm!(self.mc ; .arch aarch64
+            ; ldr x14, [x16]                    // x14 = *recycle_head
+            ; str x14, [X(cell), 8]             // cell's link word = old head
+            ; str X(cell), [x16]                // *recycle_head = cell
+            ; b =>done
+        );
 
         dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
         self.genop_call_with_arglocs(op, arglocs);

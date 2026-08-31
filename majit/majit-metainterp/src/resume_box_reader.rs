@@ -680,6 +680,18 @@ pub fn materialize_bridge_virtual(
                     return OpRef::NONE;
                 }
                 cache.set_concrete_root(vidx, ptr);
+                // `allocate_struct` is `metainterp.execute_new(typedescr)` for
+                // this reader, and `execute_and_record` stamps the value onto
+                // the `RefFrontendOp` it returns. Recording the NEW without it
+                // leaves the only OpRef that names this object carrying no
+                // concrete, and the cache that does carry one dies with this
+                // walk: a field of one virtual holding another is then read
+                // back during the resumed walk as an address-less box.
+                //
+                // Stamped on the recorded op rather than kept beside it
+                // because `walk_active_trace_refs` walks `recorder.ops()`, so
+                // a concrete parked there is forwarded when the object moves.
+                ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
             }
             // resume.py self.setfields(decoder, struct)
             if !setfields(
@@ -1254,7 +1266,7 @@ pub fn replay_pending_fields(
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     cache: &mut BridgeVirtualCache<'_>,
 ) -> bool {
-    let __diag = std::env::var_os("MAJIT_BRIDGE_DIAG").is_some();
+    let __diag = crate::bridge_diag_enabled();
     let Some(storage) = resume_data.storage.as_ref() else {
         if __diag {
             eprintln!("[replay] storage=None (no pendingfields replayed)");

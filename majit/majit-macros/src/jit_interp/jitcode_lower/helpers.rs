@@ -735,3 +735,55 @@ pub(super) fn word_result_addr_for_kind(
 ) -> Option<TokenStream> {
     matches!(kind, BindingKind::Int).then(|| word_result_addr_tokens(func, arg_kinds))
 }
+
+/// [`word_result_addr_tokens`] for a target the trace records with a `()`
+/// result.
+///
+/// Void needs its own because what `word_result_addr_tokens` widens is the
+/// *result*, and there is none here — but the parameters still have to be the
+/// machine words a call carries them in. A target declaring a pointer
+/// parameter is spelled narrower than that wherever a pointer is narrower than
+/// a word, and an indirect call that type-checks its callee will not accept it;
+/// the shim is the function that call names instead.
+///
+/// Emitted only where the two spellings can differ. Where a pointer already
+/// fills a word the target IS its own shim, and standing one in front of it
+/// would add a frame to every call and hand every consumer keyed on a callee's
+/// address a stand-in instead.
+pub(super) fn word_void_addr_tokens(
+    func: &impl ToTokens,
+    arg_kinds: &[BindingKind],
+) -> TokenStream {
+    let params: Vec<Ident> = (0..arg_kinds.len())
+        .map(|i| format_ident!("__majit_a{i}"))
+        .collect();
+    let holes: Vec<TokenStream> = arg_kinds
+        .iter()
+        .map(|kind| match kind {
+            BindingKind::Float => quote! { _ },
+            _ => quote! { i64 },
+        })
+        .collect();
+    let args: Vec<TokenStream> = arg_kinds
+        .iter()
+        .zip(&params)
+        .map(|(kind, param)| match kind {
+            BindingKind::Float => quote! { #param },
+            _ => quote! { unsafe { majit_ir::CallArgWord::from_call_word(#param) } },
+        })
+        .collect();
+    quote! {
+        {
+            #[cfg(target_arch = "wasm32")]
+            let __majit_void_target = {
+                let __majit_word_shim: fn(#(#holes),*) = |#(#params),*| {
+                    #func(#(#args),*);
+                };
+                __majit_word_shim as *const ()
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let __majit_void_target = #func as *const ();
+            __majit_void_target
+        }
+    }
+}
