@@ -432,7 +432,8 @@ its resume data in a nursery; majit still builds both out of `Rc<Op>` and
 per-guard vectors. This pass removes one common-case tax: upstream stores
 `GuardResOp._fail_args` only on guards, so the unified Rust `Op` no longer
 embeds three inline `Operand` slots in every ordinary operation. `Op` allocations
-fall from 296 to 256 bytes. The remaining allocation traffic is still the
+fall from 280 to 240 bytes: that field measures 72 bytes as a
+`SmallVec<[Operand; 3]>` against 32 as a `Vec` header. The remaining allocation traffic is still the
 largest majit-only cost; it is now smaller, not gone.
 
 ### Driver ownership is now the same on both sides
@@ -514,11 +515,12 @@ already stable:
   to ask `is_const` or obtain its value. `OptBoxEnv` and `force_box` now answer
   directly from the resolved operand, and `TraceIterator` preserves an already
   decoded constant.
-* `bhimpl_jit_merge_point` allocated six new `Vec` backings and boxed the
-  144-byte `ContinueRunningNormallyArgs` payload on every deopt. The pooled
-  blackhole frame retains the cleared backing capacities, while the control
-  payload moves inline through `DispatchError` and `JitException` and then back
-  into that frame.
+* `bhimpl_jit_merge_point` allocated six new `Vec` backings and a fresh
+  144-byte `ContinueRunningNormallyArgs` box on every deopt. The pooled
+  blackhole frame now retains that box together with the six cleared backing
+  capacities: the handoff crosses `DispatchError` and `JitException` as a
+  `Box`, so neither enum is widened by a variant only a deopt reaches, and the
+  same box returns to the frame once the payload has been consumed.
 
 At 65,536 characters these changes move the measured row from 45.6 allocations
 and 7,517 bytes per character to 21.6 and 2,891 (−52.6% and −61.5%). At the
