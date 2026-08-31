@@ -326,17 +326,25 @@ LEGACY_TRANSACTION_CONTROL = -1
 
 
 def _check_autocommit(value):
-    # `autocommit_converter` takes True and False by identity, then requires an
-    # int whose *value* is the sentinel: it reads the value with
-    # `PyLong_AsLong`.  So a float -1.0, an object whose `__eq__` answers True,
-    # and an int subclass that overrides `__eq__` to spoof -1 are all rejected
-    # -- hence `int.__eq__` rather than `==`.
-    if (value is not True and value is not False and
-            not (isinstance(value, int) and
-                 int.__eq__(value, LEGACY_TRANSACTION_CONTROL) is True)):
-        raise ValueError(
-            "autocommit must be True, False, or "
-            "sqlite3.LEGACY_TRANSACTION_CONTROL")
+    """The accepted value, narrowed to what the connection may store.
+
+    `autocommit_converter` takes True and False by identity, then reads an int
+    with `PyLong_AsLong` and keeps the C long.  So a float -1.0, an object
+    whose `__eq__` answers True, and an int subclass that overrides `__eq__` to
+    spoof -1 are all rejected -- hence `int.__eq__` rather than `==` -- and an
+    accepted subclass is narrowed to the sentinel itself.  Narrowing is what
+    keeps the later `_autocommit == LEGACY_TRANSACTION_CONTROL` tests off a
+    subclass's `__eq__`, which would otherwise deny the legacy branch a
+    transaction and run DML in SQLite's own autocommit mode.
+    """
+    if value is True or value is False:
+        return value
+    if (isinstance(value, int) and
+            int.__eq__(value, LEGACY_TRANSACTION_CONTROL) is True):
+        return LEGACY_TRANSACTION_CONTROL
+    raise ValueError(
+        "autocommit must be True, False, or "
+        "sqlite3.LEGACY_TRANSACTION_CONTROL")
 
 
 # SQLite version information
@@ -503,7 +511,7 @@ class Connection(object):
     def __init__(self, database, timeout=5.0, detect_types=0, isolation_level="",
                  check_same_thread=True, factory=None, cached_statements=100,
                  uri=0, *, autocommit=LEGACY_TRANSACTION_CONTROL):
-        _check_autocommit(autocommit)
+        autocommit = _check_autocommit(autocommit)
         sys.audit("sqlite3.connect", database)
         self.__initialized = False
         db_star = _ffi.new('sqlite3 **')
@@ -1158,7 +1166,7 @@ class Connection(object):
         return LEGACY_TRANSACTION_CONTROL
 
     def __set_autocommit(self, value):
-        _check_autocommit(value)
+        value = _check_autocommit(value)
         self._check_thread()
         self._check_closed()
         self._autocommit = value
