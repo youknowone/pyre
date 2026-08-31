@@ -36,10 +36,14 @@ fn mini_buffer_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdataobj::cdata_arg(w_cdata)?;
     let ct = ctypeobj::ctype_at(cdata.ctype)
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
-    let explicit_size = args.len() > 2;
+    // The signature binder pads an omitted optional argument with `PY_NULL`.
+    // `WrappedDefault(-1)` in PyPy makes that indistinguishable from no third
+    // app-level argument to `MiniBuffer___new__`.
+    let explicit_size = args.get(2).is_some_and(|value| !value.is_null());
     let mut size = match args.get(2) {
-        Some(&w_size) => crate::baseobjspace::int_w(w_size)?,
+        Some(&w_size) if !w_size.is_null() => crate::baseobjspace::int_w(w_size)?,
         None => -1,
+        Some(_) => -1,
     };
     match ct.kind {
         ctypeobj::KIND_POINTER => {
@@ -255,7 +259,13 @@ fn init_buffer_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
     };
     store("__doc__", pyre_object::w_str_new(DOC));
-    store("__new__", crate::typedef::make_new_descr(mini_buffer_new));
+    store(
+        "__new__",
+        crate::typedef::make_new_descr_with_signature(
+            mini_buffer_new,
+            crate::gateway::Signature::new(vec!["cls", "cdata", "size"], None, None, 0, 1),
+        ),
+    );
     for (name, f, arity) in [
         ("__len__", mini_len as crate::gateway::BuiltinCodeFn, 1u16),
         ("__getitem__", mini_getitem, 2),

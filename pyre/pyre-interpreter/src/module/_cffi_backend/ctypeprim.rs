@@ -516,7 +516,9 @@ pub fn unsigned_as_object(ct: &W_CType, value: u64) -> PyObjectRef {
     if value <= i64::MAX as u64 {
         return pyre_object::w_int_new(value as i64);
     }
-    pyre_object::longobject::w_long_new(majit_rlib::rbigint::RBigInt::from_u128(u128::from(value)))
+    // `space.newint(r_uint(value))` — `rbigint.fromrarith_int` on the
+    // unsigned word.
+    pyre_object::longobject::w_long_new(majit_rlib::rbigint::RBigInt::fromrarith_uint(value))
 }
 
 /// `W_CTypePrimitiveUnsigned._compute_vrange_max`, and
