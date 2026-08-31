@@ -630,6 +630,19 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     {
         arm.call(&mut store, ())?;
     }
+    // A deferred merge re-emits its whole owner, so what it costs cranelift
+    // scales with that module's size. `PYRE_WASM_INLINE_TRIP_BYTES=<N>` prices
+    // it at N bridge entries per byte; the guest keeps its flat entry
+    // threshold as the floor. Set so the two rates behind that conversion can
+    // be swept on one binary.
+    if let Some(entries_per_byte) = std::env::var("PYRE_WASM_INLINE_TRIP_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        && let Ok(arm) =
+            instance.get_typed_func::<u64, ()>(&mut store, "pyre_jit_inline_trip_bytes_factor")
+    {
+        arm.call(&mut store, entries_per_byte)?;
+    }
     // Parameter bridge entries are the default. The guest has no environment,
     // so an explicit host-side opt-out must travel through this export before
     // tracing begins.

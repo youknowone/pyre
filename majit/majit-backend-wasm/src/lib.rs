@@ -335,6 +335,10 @@ static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Off for the loop-body half of the class. See `inline_nonheader_enable`.
 static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Entries a merge must earn per byte of the module it re-emits. See
+/// `inline_trip_threshold_for`. Zero leaves `INLINE_TRIP_THRESHOLD` as the
+/// whole rule.
+static INLINE_TRIP_BYTES_FACTOR: AtomicU64 = AtomicU64::new(DEFAULT_INLINE_TRIP_BYTES_FACTOR);
 static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
 
 /// One compiled trace's guest-memory entry counters.  The generated module
@@ -483,6 +487,36 @@ pub fn inline_nonheader_enable() {
 
 fn inline_nonheader_enabled() -> bool {
     INLINE_NONHEADER_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Set the per-byte entry price a deferred merge must earn, from the host
+/// before guest execution, in place of [`DEFAULT_INLINE_TRIP_BYTES_FACTOR`].
+/// Zero leaves [`INLINE_TRIP_THRESHOLD`] as the whole rule.
+pub fn set_inline_trip_bytes_factor(entries_per_byte: u64) {
+    INLINE_TRIP_BYTES_FACTOR.store(entries_per_byte, Ordering::Relaxed);
+}
+
+/// Entries the bridge standing in for a merge must be entered before the merge
+/// is taken, for an owner whose last emission was `owner_module_bytes` long.
+///
+/// A merge re-emits the whole owner, so its cost scales with the owner's size
+/// rather than the region's: cranelift charges about 0.65 ms per KB of module,
+/// while a cross-module crossing the merge removes is about 2.5 ns. Those two
+/// rates are what [`INLINE_TRIP_BYTES_FACTOR`] converts between; a bridge's
+/// entry count is a floor on the crossings removed, so the price is a floor
+/// too.
+///
+/// [`INLINE_TRIP_THRESHOLD`] stays as the lower bound, because a fixture whose
+/// entire crossing budget is under a millisecond cannot pay back any rebuild.
+///
+/// Above the price at which a merge is refused outright sits a band where the
+/// price only postpones a merge that is taken anyway, and every crossing in
+/// that window is paid for nothing. The default sits below that band.
+fn inline_trip_threshold_for(owner_module_bytes: u32) -> u64 {
+    let priced = INLINE_TRIP_BYTES_FACTOR
+        .load(Ordering::Relaxed)
+        .saturating_mul(owner_module_bytes as u64);
+    priced.max(INLINE_TRIP_THRESHOLD)
 }
 
 /// Disable guard-to-bridge value parameters from the host before guest
@@ -1979,6 +2013,19 @@ static INLINE_TRIP_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
 /// worth 0.75x on 72.0M crossings removed.
 const INLINE_TRIP_THRESHOLD: u64 = 100_000;
 
+/// The per-byte half of the same price, in entries per byte of the module the
+/// merge re-emits — see [`inline_trip_threshold_for`], which takes the larger
+/// of the two.
+///
+/// A merge charges cranelift for the whole owner while the crossings it removes
+/// answer only to the bridge, so a fixture whose owner is large enough loses on
+/// a merge the entry count alone would have taken. At this value `fannkuch`
+/// keeps 8 of its 10 merges and `nbody` 3 of its 4, dropping 30KB and 18KB of
+/// emitted module, while the merges of the four fixtures that never lose one
+/// are postponed by an amount too small to charge them anything. Twice this is
+/// already inside the band where postponement dominates.
+const DEFAULT_INLINE_TRIP_BYTES_FACTOR: u64 = 40;
+
 /// A merge that passed every inline check and is waiting on
 /// [`INLINE_TRIP_THRESHOLD`] entries into the bridge compiled in its place.
 struct PendingInline {
@@ -2079,6 +2126,7 @@ fn register_pending_inline(
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
     cells_base_ptr: u32,
+    owner_module_bytes: u32,
 ) -> codegen::InlineTripProbe {
     let counter_addr = Box::leak(Box::new(0u64)) as *const u64 as usize as u32;
     let dispatch_cell_index = region.source_fail_index;
@@ -2094,7 +2142,7 @@ fn register_pending_inline(
     });
     codegen::InlineTripProbe {
         counter_addr,
-        threshold: INLINE_TRIP_THRESHOLD,
+        threshold: inline_trip_threshold_for(owner_module_bytes),
         trip_fn_ptr: inline_trip_helper_slot() as i64,
         pending_id,
         cells_base_ptr,
@@ -2763,6 +2811,7 @@ impl WasmBackend {
             compiled._bridge_owned_cells.borrow_mut().push(owner);
         }
         compiled.bridge_cells_base.set(new_cells_base);
+        compiled.module_bytes.set(code_size as u32);
         compiled.num_guard_cells.set(guard_exits.len());
         {
             let mut metas = compiled.chained_trace_meta.borrow_mut();
@@ -3781,6 +3830,7 @@ impl majit_backend::Backend for WasmBackend {
             num_ref_homes,
             frame,
             bridge_cells_base: std::cell::Cell::new(bridge_cells_base),
+            module_bytes: std::cell::Cell::new(code_size as u32),
             num_guard_cells: std::cell::Cell::new(guard_exits.len()),
             has_preamble,
             label_descrs,
@@ -4549,17 +4599,21 @@ impl majit_backend::Backend for WasmBackend {
                 gc_table_base,
                 constants: self.constants.clone(),
             };
-            // The cell the owner's guard consults, by address of the field
-            // rather than by value: a later re-emission reallocates the array
-            // and the probe has to reach the live one.
-            let cells_base_ptr = owner
+            // The cell the owner's guard consults travels by address of the
+            // field rather than by value: a later re-emission reallocates the
+            // array and the probe has to reach the live one. The owner's size
+            // travels by value, because it prices this merge alone.
+            let (cells_base_ptr, owner_module_bytes) = owner
                 .compiled
                 .get()
                 .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-                .map_or(0, |loop_| {
-                    &loop_.bridge_cells_base as *const std::cell::Cell<u32> as usize as u32
+                .map_or((0, 0), |loop_| {
+                    (
+                        &loop_.bridge_cells_base as *const std::cell::Cell<u32> as usize as u32,
+                        loop_.module_bytes.get(),
+                    )
                 });
-            register_pending_inline(owner, region, cells_base_ptr)
+            register_pending_inline(owner, region, cells_base_ptr, owner_module_bytes)
         });
         let pending_guard = PendingInlineGuard(inline_trip.map(|probe| probe.pending_id));
 

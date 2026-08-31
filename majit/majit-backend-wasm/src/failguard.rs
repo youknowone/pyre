@@ -881,6 +881,12 @@ pub struct CompiledWasmLoop {
     /// table slot here. `0` when the trace has no in-module dispatch (native, or
     /// a guardless / straight-line trace).
     pub bridge_cells_base: Cell<u32>,
+    /// Byte length of the module this loop was last emitted as, own ops and
+    /// every merged region together. A merge re-emits the whole owner, so this
+    /// is what the next merge charges cranelift, and
+    /// `inline_trip_threshold_for` turns it into the entry count that merge has
+    /// to earn before it is taken.
+    pub(crate) module_bytes: Cell<u32>,
     /// Number of cells in the `bridge_cells_base` array = this loop's own guard
     /// count at compile time. A bridge attaches only to one of these original
     /// guards (`source_fail_index < num_guard_cells`); descrs appended past this
