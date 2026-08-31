@@ -2286,6 +2286,34 @@ pub(super) fn finish_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyObje
     fill_interpreter_slots(mirror, w_type);
 }
 
+/// Hand the vectorcall protocol down from `base` to `tp`.
+///
+/// The offset always travels, so that `PyVectorcall_Call` -- which reads it
+/// without consulting the flag -- keeps working for a subclass; the flag
+/// travels only to a subclass that leaves `tp_call` alone, and decides whether
+/// the offset is read of its own accord.  A class derived in Python from a C
+/// type that lends its instances a function keeps lending it: the instance is
+/// sized by the base's `tp_basicsize`, which the caller copies for exactly that
+/// reason, and filled by the base's `tp_new`.
+///
+/// Both have to run before `tp_call` is filled in.  A subclass that does
+/// declare its own `tp_call` means it, and it is `tp_call` -- not the function
+/// its base lends instances -- that has to answer for it.
+fn inherit_vectorcall(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
+    unsafe {
+        if (*tp).tp_vectorcall_offset == 0 {
+            (*tp).tp_vectorcall_offset = (*base).tp_vectorcall_offset;
+        }
+        if (*tp).tp_call.is_null()
+            && (*base)
+                .tp_flags
+                .contains(TpFlags::PY_TPFLAGS_HAVE_VECTORCALL)
+        {
+            (*tp).tp_flags |= TpFlags::PY_TPFLAGS_HAVE_VECTORCALL;
+        }
+    }
+}
+
 /// `typeobject.py:945-996 inherit_slots` — what a mirror takes from its base.
 ///
 /// Narrower than the [`inherit_slots`] `PyType_Ready` runs: the slots left out
@@ -2385,24 +2413,9 @@ fn inherit_mirror_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         sq_inplace_repeat,
     );
     suite!(tp_as_mapping, mp_length, mp_subscript, mp_ass_subscript);
-    unsafe {
-        if (*tp).tp_vectorcall_offset == 0 {
-            (*tp).tp_vectorcall_offset = (*base).tp_vectorcall_offset;
-        }
-        // A class derived in Python from a C type that lends its instances a
-        // function keeps lending it: the instance is sized by the base's
-        // `tp_basicsize`, which the caller copies for exactly that reason, and
-        // filled by the base's `tp_new`.  `fill_interpreter_slots` runs after
-        // this and installs the trampoline in `tp_call`, so the test for a
-        // `tp_call` of the subclass's own has to happen here.
-        if (*tp).tp_call.is_null()
-            && (*base)
-                .tp_flags
-                .contains(TpFlags::PY_TPFLAGS_HAVE_VECTORCALL)
-        {
-            (*tp).tp_flags |= TpFlags::PY_TPFLAGS_HAVE_VECTORCALL;
-        }
-    }
+    // `fill_interpreter_slots` runs after this and installs the trampoline in
+    // `tp_call`, so the vectorcall inheritance has to happen here.
+    inherit_vectorcall(tp, base);
 }
 
 /// `true` when `tp` is a type whose storage is the mirror layer's to release —
@@ -4605,27 +4618,9 @@ fn inherit_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
     if base.is_null() {
         return;
     }
-    // The offset always travels, so that `PyVectorcall_Call` -- which reads it
-    // without consulting the flag -- keeps working for a subclass; the flag
-    // travels only to a subclass that leaves `tp_call` alone, and decides
-    // whether the offset is read of its own accord.
-    //
-    // Both have to happen before the copy below fills `tp_call` in, because
-    // afterwards every subclass reads as having declared one.  A subclass that
-    // does declare its own `tp_call` means it, and it is `tp_call` -- not the
-    // function its base lends instances -- that has to answer for it.
-    unsafe {
-        if (*tp).tp_vectorcall_offset == 0 {
-            (*tp).tp_vectorcall_offset = (*base).tp_vectorcall_offset;
-        }
-        if (*tp).tp_call.is_null()
-            && (*base)
-                .tp_flags
-                .contains(TpFlags::PY_TPFLAGS_HAVE_VECTORCALL)
-        {
-            (*tp).tp_flags |= TpFlags::PY_TPFLAGS_HAVE_VECTORCALL;
-        }
-    }
+    // Before the copy below fills `tp_call` in, because afterwards every
+    // subclass reads as having declared one.
+    inherit_vectorcall(tp, base);
     macro_rules! inherit {
         ($($field:ident),* $(,)?) => {
             $(
