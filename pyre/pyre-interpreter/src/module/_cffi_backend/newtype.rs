@@ -943,7 +943,7 @@ pub fn new_enum_type(
         let written = unsafe {
             ctypeobj::convert_from_object(
                 ctypeobj::ctype_arg(roots.get(base_slot))?,
-                probe,
+                probe as usize,
                 roots.get(values_slot + i),
             )
         };

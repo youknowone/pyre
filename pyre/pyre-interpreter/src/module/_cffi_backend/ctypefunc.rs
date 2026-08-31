@@ -31,8 +31,8 @@ pub const MUSTFREE_FILE: u8 = 2;
 /// `data` must be an argument slot of an exchange buffer whose ctype is a
 /// pointer, so the byte before it belongs to this argument.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub unsafe fn get_mustfree_flag(data: *const u8) -> u8 {
-    unsafe { data.sub(1).read() }
+pub unsafe fn get_mustfree_flag(data: usize) -> u8 {
+    unsafe { (data as *const u8).sub(1).read() }
 }
 
 /// `ctypefunc.py set_mustfree_flag`.
@@ -236,11 +236,7 @@ fn do_call(
                 Err(e) => break 'body Err(e),
             };
             match unsafe {
-                ctypeobj::convert_argument_from_object(
-                    argtype,
-                    data as *mut u8,
-                    roots.get(args_slot + i),
-                )
+                ctypeobj::convert_argument_from_object(argtype, data, roots.get(args_slot + i))
             } {
                 Ok(true) => mustfree_max_plus_1 = i + 1,
                 Ok(false) => {}
@@ -250,10 +246,10 @@ fn do_call(
         // `clibffi.py jit_ffi_call` swaps the thread's alternate errno into
         // the C runtime around every foreign call.
         super::cerrno::errno_before();
-        unsafe { invoke(cif, funcaddr, buffer as *mut u8, args_w.len()) };
+        unsafe { invoke(cif, funcaddr, buffer, args_w.len()) };
         super::cerrno::errno_after();
         let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
-        unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata as *mut u8) }
+        unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
     };
     match called {
         Ok(w_res) => {
@@ -284,7 +280,7 @@ fn release_arguments(
             continue;
         }
         let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
-        if unsafe { get_mustfree_flag(data as *const u8) } == MUSTFREE_FREE {
+        if unsafe { get_mustfree_flag(data) } == MUSTFREE_FREE {
             let raw = cdataobj::raw_read_ptr(data);
             cdataobj::raw_free(raw);
         }
@@ -358,23 +354,23 @@ pub(crate) mod cif {
     /// `nargs` converted arguments, and `funcaddr` must be the entry point the
     /// cif was prepared for.
     #[majit_macros::dont_look_inside_cannot_raise]
-    pub unsafe fn invoke(cif: *mut u8, funcaddr: *mut u8, buffer: *mut u8, nargs: usize) {
-        let argptrs = buffer.cast::<*mut std::ffi::c_void>();
+    pub unsafe fn invoke(cif: *mut u8, funcaddr: *mut u8, buffer: usize, nargs: usize) {
+        let argptrs = buffer as *mut *mut std::ffi::c_void;
         for i in 0..nargs {
             unsafe {
                 argptrs
                     .add(i)
-                    .write(buffer.add(exchange_arg(cif, i)).cast::<std::ffi::c_void>())
+                    .write((buffer + exchange_arg(cif, i)) as *mut std::ffi::c_void)
             };
         }
-        let resultdata = unsafe { buffer.add(exchange_result(cif)) };
+        let resultdata = (buffer + unsafe { exchange_result(cif) }) as *mut std::ffi::c_void;
         let descr = unsafe { header(cif) };
         unsafe {
             libffi::low::call_return_into(
                 &raw mut descr.cif,
                 CodePtr::from_ptr(funcaddr.cast::<std::ffi::c_void>()),
                 argptrs,
-                resultdata.cast::<std::ffi::c_void>(),
+                resultdata,
             );
         }
     }
@@ -782,7 +778,7 @@ pub(crate) mod cif {
     }
 
     #[majit_macros::dont_look_inside_cannot_raise]
-    pub unsafe fn invoke(_cif: *mut u8, _funcaddr: *mut u8, _buffer: *mut u8, _nargs: usize) {}
+    pub unsafe fn invoke(_cif: *mut u8, _funcaddr: *mut u8, _buffer: usize, _nargs: usize) {}
 }
 
 pub use cif::{build_cif_descr, free_cif_descr, invoke};

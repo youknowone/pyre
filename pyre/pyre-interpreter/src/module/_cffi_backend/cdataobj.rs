@@ -744,7 +744,7 @@ fn cdata_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
     if ct.is_primitive() {
-        let w_ob = unsafe { ctypeobj::convert_to_object(ct, cdata.ptr)? };
+        let w_ob = unsafe { ctypeobj::convert_to_object(ct, cdata.ptr as usize)? };
         if W_CData::from_obj(w_ob).is_none() {
             return Ok(pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
                 w_ob,
@@ -1001,9 +1001,12 @@ fn compare_mode(w_self: PyObjectRef, w_other: PyObjectRef) -> Result<CompareMode
     let other_slot = roots.base();
     let _ = roots.pin_root(w_other);
     let ob1_slot = other_slot + 1;
-    let _ = roots.pin_root(unsafe { ctypeobj::convert_to_object(cdata.ctype_ref()?, cdata.ptr)? });
+    let _ = roots
+        .pin_root(unsafe { ctypeobj::convert_to_object(cdata.ctype_ref()?, cdata.ptr as usize)? });
     let w_ob2 = match other {
-        Some(other) => unsafe { ctypeobj::convert_to_object(other.ctype_ref()?, other.ptr)? },
+        Some(other) => unsafe {
+            ctypeobj::convert_to_object(other.ctype_ref()?, other.ptr as usize)?
+        },
         None => roots.get(other_slot),
     };
     Ok(CompareMode::Objects(roots.get(ob1_slot), w_ob2))
@@ -1056,7 +1059,9 @@ fn cdata_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     let item = ctypeobj::ctype_at(ct.ctitem)
         .ok_or_else(|| PyError::system_error("indexed ctype without an item type"))?;
-    unsafe { ctypeobj::convert_to_object(item, cdata.ptr.offset((i * item.size) as isize)) }
+    unsafe {
+        ctypeobj::convert_to_object(item, (cdata.ptr.offset((i * item.size) as isize)) as usize)
+    }
 }
 
 /// `W_CData.setitem`.
@@ -1081,7 +1086,7 @@ fn cdata_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     unsafe {
         ctypeobj::convert_from_object(
             item,
-            cdata.ptr.offset((i * item.size) as isize),
+            (cdata.ptr.offset((i * item.size) as isize)) as usize,
             roots.get(value_slot),
         )?;
     }
@@ -1289,7 +1294,7 @@ fn do_setslice(
             Err(err) => return Err(err),
         }
         let element = unsafe { target.offset((i * item_size) as isize) };
-        unsafe { ctypeobj::convert_from_object(item, element, roots.get(item_slot))? };
+        unsafe { ctypeobj::convert_from_object(item, element as usize, roots.get(item_slot))? };
     }
     match crate::baseobjspace::next(roots.get(iter_slot)) {
         Ok(_) => Err(PyError::value_error(format!(

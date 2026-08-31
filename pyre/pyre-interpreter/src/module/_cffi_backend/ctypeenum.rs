@@ -20,10 +20,10 @@ use super::misc;
 unsafe fn get_value(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyError> {
     if ct.kind == ctypeobj::KIND_PRIM_SIGNED {
         return Ok(pyre_object::w_int_new(unsafe {
-            misc::read_raw_signed_data(cdata, ct.size)?
+            misc::read_raw_signed_data(cdata as usize, ct.size)?
         }));
     }
-    let value = unsafe { misc::read_raw_unsigned_data(cdata, ct.size)? };
+    let value = unsafe { misc::read_raw_unsigned_data(cdata as usize, ct.size)? };
     Ok(super::ctypeprim::unsigned_as_object(ct, value))
 }
 

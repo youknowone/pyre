@@ -281,7 +281,7 @@ fn build_attr(w_lib: PyObjectRef, attr: &str) -> Result<Option<PyObjectRef>, PyE
                     unsafe { fetch(ptr) };
                     ptr
                 };
-                unsafe { ctypeobj::convert_to_object(ct, ptr)? }
+                unsafe { ctypeobj::convert_to_object(ct, ptr as usize)? }
             }
             parse_c_type::OP_DLOPEN_FUNC => {
                 let ptr = cdlopen_fetch(roots.get(lib_slot), attr)?;

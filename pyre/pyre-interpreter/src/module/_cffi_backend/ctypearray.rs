@@ -94,5 +94,5 @@ fn next_w(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         .ok_or_else(|| PyError::system_error("iterator without an item type"))?;
     let result = it.next;
     it.next = unsafe { it.next.offset(item.size as isize) };
-    unsafe { ctypeobj::convert_to_object(item, result) }
+    unsafe { ctypeobj::convert_to_object(item, result as usize) }
 }

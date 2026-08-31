@@ -161,7 +161,7 @@ fn read_variable(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(args[1])?;
     let name = crate::baseobjspace::text_w(args[2])?;
     let address = variable_address(lib, name)?;
-    unsafe { ctypeobj::convert_to_object(ct, address) }
+    unsafe { ctypeobj::convert_to_object(ct, address as usize) }
 }
 
 /// `W_Library.write_variable`.
@@ -176,7 +176,9 @@ fn write_variable(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(args[1])?;
     let name = crate::baseobjspace::text_w(args[2])?;
     let address = variable_address(lib, name)?;
-    unsafe { ctypeobj::convert_from_object(ct, address.cast_mut(), roots.get(value_slot))? };
+    unsafe {
+        ctypeobj::convert_from_object(ct, address.cast_mut() as usize, roots.get(value_slot))?
+    };
     Ok(pyre_object::w_none())
 }
 

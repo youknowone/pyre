@@ -93,7 +93,7 @@ pub unsafe fn read(
     let ct = field.ctype_ref()?;
     let p = unsafe { cdata.offset(field.offset as isize) };
     match field.bitshift {
-        BS_REGULAR => unsafe { ctypeobj::convert_to_object(ct, p) },
+        BS_REGULAR => unsafe { ctypeobj::convert_to_object(ct, p as usize) },
         BS_EMPTY_ARRAY => {
             // A variable-length array reads as far as the owning allocation
             // reaches; without one it decays to the pointer type.
@@ -126,7 +126,7 @@ pub unsafe fn write(field: &W_CField, cdata: *mut u8, w_ob: PyObjectRef) -> Resu
     if field.is_bitfield() {
         unsafe { convert_bitfield_from_object(field, ct, p, w_ob) }
     } else {
-        unsafe { ctypeobj::convert_from_object(ct, p, w_ob) }
+        unsafe { ctypeobj::convert_from_object(ct, p as usize, w_ob) }
     }
 }
 
@@ -201,7 +201,7 @@ unsafe fn convert_bitfield_to_object(
     cdata: *const u8,
 ) -> Result<PyObjectRef, PyError> {
     let bitsize = field.bitsize as u32;
-    let raw = unsafe { misc::read_raw_unsigned_data(cdata, ct.size)? };
+    let raw = unsafe { misc::read_raw_unsigned_data(cdata as usize, ct.size)? };
     // A field as wide as its own type shifts by the full width.  The masks are
     // built with the shift the hardware performs — which leaves the operand
     // alone — because that is what the translated `r_ulonglong` arithmetic
@@ -263,13 +263,13 @@ unsafe fn convert_bitfield_from_object(
         .wrapping_sub(1)
         .wrapping_shl(shift);
     let rawvalue = (value as u64).wrapping_shl(shift);
-    let mut raw = unsafe { misc::read_raw_unsigned_data(cdata, ct.size)? };
+    let mut raw = unsafe { misc::read_raw_unsigned_data(cdata as usize, ct.size)? };
     raw = (raw & !rawmask) | (rawvalue & rawmask);
     unsafe {
         if is_signed {
-            misc::write_raw_signed_data(cdata, raw as i64, ct.size)
+            misc::write_raw_signed_data(cdata as usize, raw as i64, ct.size)
         } else {
-            misc::write_raw_unsigned_data(cdata, raw, ct.size)
+            misc::write_raw_unsigned_data(cdata as usize, raw, ct.size)
         }
     }
 }

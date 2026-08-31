@@ -270,7 +270,7 @@ unsafe fn prepare_args_tuple(
     for i in 0..fargs.len() {
         let farg = ctypeobj::ctype_arg(roots.get(fargs_base + i))?;
         let ll_arg = unsafe { ll_args.add(i).read() }.cast::<u8>();
-        let w_arg = unsafe { ctypeobj::convert_to_object(farg, ll_arg)? };
+        let w_arg = unsafe { ctypeobj::convert_to_object(farg, ll_arg as usize)? };
         let _ = roots.pin_root(w_arg);
     }
     let mut args_w = Vec::with_capacity(fargs.len());
@@ -307,10 +307,10 @@ unsafe fn convert_from_object_fficallback(
     let small_result = fresult.size >= 0 && (fresult.size as usize) < SIZE_OF_FFI_ARG;
     if small_result && fresult.has(ctypeobj::F_PRIMITIVE_INTEGER) {
         if fresult.kind == ctypeobj::KIND_PRIM_SIGNED && !fresult.has(ctypeobj::F_ENUM) {
-            unsafe { ctypeobj::convert_from_object(fresult, ll_res, w_res)? };
+            unsafe { ctypeobj::convert_from_object(fresult, ll_res as usize, w_res)? };
             let value = super::misc::as_long(w_res)?;
             return unsafe {
-                super::misc::write_raw_signed_data(ll_res, value, SIZE_OF_FFI_ARG as i64)
+                super::misc::write_raw_signed_data(ll_res as usize, value, SIZE_OF_FFI_ARG as i64)
             };
         }
         unsafe { std::ptr::write_bytes(ll_res, 0, SIZE_OF_FFI_ARG) };
@@ -318,7 +318,7 @@ unsafe fn convert_from_object_fficallback(
             ll_res = unsafe { ll_res.add(SIZE_OF_FFI_ARG - fresult.size as usize) };
         }
     }
-    unsafe { ctypeobj::convert_from_object(fresult, ll_res, w_res) }
+    unsafe { ctypeobj::convert_from_object(fresult, ll_res as usize, w_res) }
 }
 
 fn write_error_return_value(callback: &W_CData, ll_res: *mut u8) {

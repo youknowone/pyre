@@ -316,7 +316,7 @@ impl W_CType {
             // `W_CTypePrimitive.extra_repr` — `repr(convert_to_object(cdata))`.
             let roots = pyre_object::gc_roots::push_roots();
             let ob_slot = roots.base();
-            let _ = roots.pin_root(unsafe { convert_to_object(self, cdata)? });
+            let _ = roots.pin_root(unsafe { convert_to_object(self, cdata as usize)? });
             let w_repr = crate::builtins::builtin_repr(&[roots.get(ob_slot)])?;
             return Ok(unsafe { pyre_object::w_str_get_value(w_repr) }.to_string());
         }
@@ -450,12 +450,18 @@ pub fn root_forever_slot(obj: PyObjectRef) -> *const usize {
 ///
 /// # Safety
 /// `cdata` must be readable for `ct.size` bytes.
-pub unsafe fn convert_to_object(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyError> {
+pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRef, PyError> {
     match ct.kind {
         // `W_CTypeFunc(W_CTypePtrBase)` inherits the same conversion.
-        KIND_POINTER | KIND_FUNC => Ok(super::ctypeptr::pointer_convert_to_object(ct, cdata)),
-        KIND_ARRAY => Ok(super::ctypeptr::array_convert_to_object(ct, cdata)),
-        KIND_STRUCT | KIND_UNION => super::ctypestruct::convert_to_object(ct, cdata),
+        KIND_POINTER | KIND_FUNC => Ok(super::ctypeptr::pointer_convert_to_object(
+            ct,
+            cdata as *const u8,
+        )),
+        KIND_ARRAY => Ok(super::ctypeptr::array_convert_to_object(
+            ct,
+            cdata as *const u8,
+        )),
+        KIND_STRUCT | KIND_UNION => super::ctypestruct::convert_to_object(ct, cdata as *const u8),
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_to_object(ct, cdata) },
         _ => Err(PyError::type_error(format!(
             "cannot return a cdata '{}'",
@@ -471,13 +477,13 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: *const u8) -> Result<PyObje
 /// `cdata` must be readable for `ct.size` bytes unless the ctype is `void`.
 pub unsafe fn copy_and_convert_to_object(
     ct: &W_CType,
-    cdata: *const u8,
+    cdata: usize,
 ) -> Result<PyObjectRef, PyError> {
     if ct.kind == KIND_VOID {
         return Ok(pyre_object::w_none());
     }
     if ct.is_struct_or_union() {
-        return unsafe { super::ctypestruct::copy_and_convert_to_object(ct, cdata) };
+        return unsafe { super::ctypestruct::copy_and_convert_to_object(ct, cdata as *const u8) };
     }
     unsafe { convert_to_object(ct, cdata) }
 }
@@ -488,17 +494,19 @@ pub unsafe fn copy_and_convert_to_object(
 /// `cdata` must be writable for `ct.size` bytes.
 pub unsafe fn convert_from_object(
     ct: &W_CType,
-    cdata: *mut u8,
+    cdata: usize,
     w_ob: PyObjectRef,
 ) -> Result<(), PyError> {
     match ct.kind {
         // `W_CTypeFunc(W_CTypePtrBase)` inherits the same conversion.
         KIND_POINTER | KIND_FUNC => unsafe {
-            super::ctypeptr::pointer_convert_from_object(ct, cdata, w_ob)
+            super::ctypeptr::pointer_convert_from_object(ct, cdata as *mut u8, w_ob)
         },
-        KIND_ARRAY => unsafe { super::ctypeptr::array_convert_from_object(ct, cdata, w_ob) },
+        KIND_ARRAY => unsafe {
+            super::ctypeptr::array_convert_from_object(ct, cdata as *mut u8, w_ob)
+        },
         KIND_STRUCT | KIND_UNION => unsafe {
-            super::ctypestruct::convert_from_object(ct, cdata, w_ob)
+            super::ctypestruct::convert_from_object(ct, cdata as *mut u8, w_ob)
         },
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_from_object(ct, cdata, w_ob) },
         _ => Err(PyError::type_error(format!(
@@ -577,7 +585,7 @@ pub unsafe fn float(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyErr
 /// `cdata` must be readable for `ct.size` bytes.
 pub unsafe fn complex(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyError> {
     if ct.kind == KIND_PRIM_COMPLEX {
-        return unsafe { super::ctypeprim::convert_to_object(ct, cdata) };
+        return unsafe { super::ctypeprim::convert_to_object(ct, cdata as usize) };
     }
     Err(PyError::type_error(format!(
         "complex() not supported on cdata '{}'",
@@ -630,11 +638,13 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
 /// byte just before it when the ctype is a pointer.
 pub unsafe fn convert_argument_from_object(
     ct: &W_CType,
-    cdata: *mut u8,
+    cdata: usize,
     w_ob: PyObjectRef,
 ) -> Result<bool, PyError> {
     if ct.kind == KIND_POINTER {
-        return unsafe { super::ctypeptr::pointer_convert_argument_from_object(ct, cdata, w_ob) };
+        return unsafe {
+            super::ctypeptr::pointer_convert_argument_from_object(ct, cdata as *mut u8, w_ob)
+        };
     }
     unsafe { convert_from_object(ct, cdata, w_ob)? };
     Ok(false)

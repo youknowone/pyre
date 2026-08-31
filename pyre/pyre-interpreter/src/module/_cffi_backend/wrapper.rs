@@ -169,7 +169,12 @@ fn wrapper_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         let result = cdataobj::cdata_arg(roots.get(result_slot))?;
         let result_ptr = ctypeobj::ctype_arg(result.ctype)?;
         assert_eq!(result_ptr.kind, ctypeobj::KIND_POINTER);
-        unsafe { ctypeobj::convert_to_object(ctypeobj::ctype_arg(result_ptr.ctitem)?, result.ptr) }
+        unsafe {
+            ctypeobj::convert_to_object(
+                ctypeobj::ctype_arg(result_ptr.ctitem)?,
+                result.ptr as usize,
+            )
+        }
     } else {
         if !locs.is_empty() {
             prepare_args(raw_type, &mut call_args, 0)?;

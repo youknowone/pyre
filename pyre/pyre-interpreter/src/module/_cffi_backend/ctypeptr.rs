@@ -137,7 +137,7 @@ pub unsafe fn convert_array_from_object(
         }
         for i in 0..items.len() {
             let element = unsafe { cdata.offset(i as isize * item.size as isize) };
-            unsafe { ctypeobj::convert_from_object(item, element, roots.get(base + i))? };
+            unsafe { ctypeobj::convert_from_object(item, element as usize, roots.get(base + i))? };
         }
         return Ok(());
     }
@@ -283,7 +283,7 @@ pub(crate) fn pointer_newp_with_allocator(
             let cdata = cdataobj::cdata_arg(roots.get(ptr_slot))?;
             let item = ctypeobj::ctype_arg(w_item)?;
             unsafe {
-                ctypeobj::convert_from_object(item, cdata.ptr, roots.get(init_slot))?;
+                ctypeobj::convert_from_object(item, cdata.ptr as usize, roots.get(init_slot))?;
             }
         }
         return Ok(roots.get(ptr_slot));
@@ -299,7 +299,7 @@ pub(crate) fn pointer_newp_with_allocator(
         let cdata = cdataobj::cdata_arg(roots.get(cdata_slot))?;
         let ct = ctypeobj::ctype_arg(cdata.ctype)?;
         let item = item_of(ct)?;
-        unsafe { ctypeobj::convert_from_object(item, cdata.ptr, w_init)? };
+        unsafe { ctypeobj::convert_from_object(item, cdata.ptr as usize, w_init)? };
     }
     Ok(roots.get(cdata_slot))
 }
@@ -499,7 +499,7 @@ pub fn unpack_ptr(
     let base = roots.base();
     for i in 0..length {
         let element = unsafe { ptr.offset((i * item.size) as isize) };
-        let _ = roots.pin_root(unsafe { ctypeobj::convert_to_object(item, element)? });
+        let _ = roots.pin_root(unsafe { ctypeobj::convert_to_object(item, element as usize)? });
     }
     let items = (0..length as usize).map(|i| roots.get(base + i)).collect();
     Ok(pyre_object::w_list_new(items))
