@@ -7,7 +7,7 @@
 #
 # `framelocalsproxy_setitem` sends such a key to `FrameDebugData.w_extra_locals`
 # and touches neither a fast slot nor `w_locals`, and
-# `frame_locals_proxy_snapshot` copies that dict in ahead of the fastlocals.
+# `frame_locals_proxy_snapshot` appends that dict after the fastlocals.
 # Both `locals()` folds rebuild the mapping WITHOUT it -- the callee arm from
 # `CalleeLocalsShadow`, the portal arm from the virtualizable's slot array --
 # so each needs its own gate on `w_extra_locals` rather than reading a null

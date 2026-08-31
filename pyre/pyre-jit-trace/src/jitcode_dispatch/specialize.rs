@@ -11325,11 +11325,13 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     }
     // `f_extra_locals` is the OTHER half of what the residual reports.  A
     // proxy write whose key names no writable fast local lands there
-    // (`framelocalsproxy_setitem`) and sets NEITHER `w_locals` nor a slot, and
-    // `frame_locals_proxy_snapshot` copies it in ahead of the fastlocals.
-    // Read through the same shadow payload as `w_locals`; a holder mismatch
-    // declines.  A present extras dict is copied into the rebuilt mapping
-    // before the slot overlay, the same extras-first order the snapshot uses.
+    // (`framelocalsproxy_setitem`) and sets NEITHER `w_locals` nor a slot, so
+    // the mapping this fold rebuilds from slots alone would silently drop the
+    // key.  Read through the same shadow payload as `w_locals`; a holder
+    // mismatch declines.  A present extras dict is copied into the rebuilt
+    // mapping before the slot overlay, so a slot that also names the key wins,
+    // and the null direction is pinned by a guard below so a write mid-loop
+    // side-exits instead.
     let w_extra_locals = if shadow_debugdata.is_null() {
         pyre_object::PY_NULL
     } else {
