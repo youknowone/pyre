@@ -1891,6 +1891,19 @@ mod ssl_socket_methods {
     }
 
     fn receive_transport(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
+        receive_transport_bounded(socket, false)
+    }
+
+    /// `track_record` stops the socket read at the boundary the connection's
+    /// `shutdown_record` is tracking, and accounts what it read against it.
+    /// The shutdown exchange needs that: what follows the peer's close_notify
+    /// is the plaintext `unwrap()` hands back with the socket, and a read that
+    /// crossed the boundary would feed those bytes to the TLS stream, where
+    /// nothing can return them.
+    fn receive_transport_bounded(
+        socket: &mut W_SSLSocket,
+        track_record: bool,
+    ) -> Result<(), crate::PyError> {
         ensure_connection(socket)?;
         if !unsafe { is_none(socket.incoming) } {
             let incoming = W_MemoryBIO::from_obj(socket.incoming)
@@ -1918,8 +1931,16 @@ mod ssl_socket_methods {
         let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
         crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, false)?;
         let mut buf = vec![0u8; 32 * 1024];
+        let want = if track_record {
+            socket.shutdown_record.want().min(buf.len())
+        } else {
+            buf.len()
+        };
         let read = match crate::module::_socket::interp_socket::socket_recv_bytes(
-            transport, fd, &mut buf, 0,
+            transport,
+            fd,
+            &mut buf[..want],
+            0,
         ) {
             Ok(read) => read,
             Err(error) if is_blocking_error(&error) => {
@@ -1935,6 +1956,9 @@ mod ssl_socket_methods {
                 pyre_native::ssl::TLS_ERROR_EOF,
                 "EOF occurred in violation of protocol".to_string(),
             ));
+        }
+        if track_record {
+            socket.shutdown_record.consume(&buf[..read]);
         }
         receive_tls(socket, &buf[..read]).map(|_| ())
     }
@@ -2559,9 +2583,10 @@ mod ssl_socket_methods {
                 // A message callback requires returning to the interpreter
                 // after every record.  Keep PyPy's shutdown loop in that
                 // case too, but use the callback-aware transport helpers
-                // instead of the released pump.
+                // instead of the released pump -- reading to the same record
+                // boundary the pump stops at.
                 while !unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
-                    receive_transport(self)?;
+                    receive_transport_bounded(self, true)?;
                     flush_transport(self)?;
                 }
             }
