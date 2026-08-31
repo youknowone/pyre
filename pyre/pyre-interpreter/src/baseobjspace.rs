@@ -11855,13 +11855,17 @@ unsafe fn descr_not_settable_error(descr: PyObjectRef) -> crate::PyError {
 /// constructs the `%N`/`%T` message through `oefmt` only after it fails.  All
 /// of pyre's Member entry points share the same error half, matching the one
 /// upstream method instead of duplicating message construction per entry.
+///
+/// [3.14-spec] `Member.typecheck` writes `to '%T' object`; `descr_check`
+/// writes `to a '%.100s' object`, the same wording the method, wrapper and
+/// getset descriptors already carry here.
 pub(crate) unsafe fn member_typecheck_error(
     descr: PyObjectRef,
     obj: PyObjectRef,
 ) -> crate::PyError {
     let w_cls = pyre_object::w_member_get_cls(descr);
     crate::PyError::type_error(format!(
-        "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
+        "descriptor '{}' for '{}' objects doesn't apply to a '{}' object",
         pyre_object::w_member_get_name(descr),
         pyre_object::w_type_get_name(w_cls),
         pyre_object::type_name_of(obj),
