@@ -303,17 +303,17 @@ pub fn frame_anchor_release(depth: usize) {
     majit_gc::shadow_stack::try_pop_to(depth);
 }
 
-/// One-word residual-call ABI for the three slot ops and for the two
-/// [`FrameAnchor`] methods a walked handler graph reaches.
+/// One-word residual-call ABI for the three slot ops, and — as separate
+/// functions below — for the two [`FrameAnchor`] methods a walked handler
+/// graph reaches.
 ///
 /// A value-returning residual is lowered as `(i64 x n) -> i64`; a raw
 /// `*mut PyFrame` / `usize` signature is narrower than a word on wasm32,
 /// where `call_indirect` type-checks its callee.
 ///
-/// The two method spellings share these bridges because the front scalarises
-/// the one-word anchor: `FrameAnchor::new` is `from_raw`, and the `&self` of
-/// `FrameAnchor::live` reaches the residual as the anchor's own value rather
-/// than its address (the same scalarisation the ticker wrapper hit).
+/// Each spelling gets its own bridge because `jit_trace_fnaddrs()` reads one
+/// address back as one function: two unrelated paths sharing an address is
+/// what `registered_paths_sharing_an_address_are_alias_spellings` refuses.
 pub extern "C" fn frame_anchor_push_jit_abi(frame: i64) -> i64 {
     frame_anchor_push(frame as *mut PyFrame) as i64
 }
@@ -326,6 +326,35 @@ pub extern "C" fn frame_anchor_live_jit_abi(depth: i64) -> i64 {
 /// One-word residual-call ABI for [`frame_anchor_release`].
 pub extern "C" fn frame_anchor_release_jit_abi(depth: i64) {
     frame_anchor_release(depth as usize);
+}
+
+/// One-word residual-call ABI for [`FrameAnchor::new`], which the `anchor`
+/// handler graph residualizes rather than inlining.
+///
+/// The anchor is one word, and the trace keeps that word: the construction is
+/// handed back without running `Drop`, exactly as the aggregate return did
+/// when the method itself was the registered target.
+pub extern "C" fn frame_anchor_new_jit_abi(frame: i64) -> i64 {
+    // SAFETY: the residual's slot holds the frame the walked graph read it
+    // from, or null, which `from_raw` anticipates.
+    let anchor = unsafe { FrameAnchor::from_raw(frame as *mut PyFrame) };
+    let depth = anchor.depth;
+    std::mem::forget(anchor);
+    depth as i64
+}
+
+/// One-word residual-call ABI for [`FrameAnchor::live`].
+///
+/// `front::mir` aliases an `Rvalue::Ref` over a bare local to that local's own
+/// Variable without emitting an address-of, so the method's `&self` reaches
+/// the residual as the one-word anchor's value — the depth — rather than a
+/// pointer to it.
+pub extern "C" fn frame_anchor_live_method_jit_abi(anchor: i64) -> i64 {
+    let anchor = std::mem::ManuallyDrop::new(FrameAnchor {
+        depth: anchor as usize,
+        _not_send: std::marker::PhantomData,
+    });
+    anchor.live() as i64
 }
 
 /// rpython/memory/gctransform/framework.py `root_walker.walk_roots` parity:

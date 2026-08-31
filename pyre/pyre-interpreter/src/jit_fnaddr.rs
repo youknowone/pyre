@@ -2865,23 +2865,24 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // The `anchor` handler graph residualizes `FrameAnchor::new` itself
     // (its aggregate return keeps it out of inlining), and `push_anchored`
     // reads back through `FrameAnchor::live`; bind both under the exact
-    // path spellings the codewriter hashes for method targets.  Both reach
-    // the same bridges as the free slot ops: `new` is `from_raw`, and
-    // `front::mir` aliases an `Rvalue::Ref` over a bare local to that local's
-    // own Variable without emitting an address-of, so `live`'s `&self`
-    // arrives as the one-word anchor's value — the depth — rather than a
-    // pointer to it.
+    // path spellings the codewriter hashes for method targets.  They carry
+    // their own bridges rather than sharing the free slot ops': one address
+    // must name one function here.  `new` is `from_raw` handed back without a
+    // `Drop`, and `front::mir` aliases an `Rvalue::Ref` over a bare local to
+    // that local's own Variable without emitting an address-of, so `live`'s
+    // `&self` arrives as the one-word anchor's value — the depth — rather
+    // than a pointer to it.
     cpa1(
         &mut entries,
         "eval::FrameAnchor::new",
         "pyre_interpreter::eval::FrameAnchor::new",
-        crate::eval::frame_anchor_push_jit_abi,
+        crate::eval::frame_anchor_new_jit_abi,
     );
     cpa1(
         &mut entries,
         "eval::FrameAnchor::live",
         "pyre_interpreter::eval::FrameAnchor::live",
-        crate::eval::frame_anchor_live_jit_abi,
+        crate::eval::frame_anchor_live_method_jit_abi,
     );
     cp1(
         &mut entries,
