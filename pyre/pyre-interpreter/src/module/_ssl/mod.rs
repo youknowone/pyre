@@ -212,6 +212,11 @@ fn native_result<T>(result: Result<T, (i32, String)>) -> Result<T, crate::PyErro
 }
 
 fn tls_error(code: i32, message: String) -> crate::PyError {
+    // `PyErr_NoMemory()`: a destination the allocator refused is a
+    // `MemoryError` carrying no message, not an `SSLError` with an errno.
+    if code == pyre_native::ssl::TLS_ERROR_NO_MEMORY {
+        return crate::PyError::memory_error("");
+    }
     let verify_code = (code >= pyre_native::ssl::TLS_ERROR_CERT_VERIFY_BASE)
         .then_some(code - pyre_native::ssl::TLS_ERROR_CERT_VERIFY_BASE);
     let class_name = match code {

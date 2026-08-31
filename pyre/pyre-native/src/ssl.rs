@@ -2616,6 +2616,11 @@ pub const TLS_ERROR_WANT_READ: i32 = 2;
 pub const TLS_ERROR_WANT_WRITE: i32 = 3;
 pub const TLS_ERROR_ZERO_RETURN: i32 = 6;
 pub const TLS_ERROR_EOF: i32 = 8;
+/// Not an `SSL_ERROR_*` code: the destination buffer a read has to allocate
+/// before it can enter the TLS engine, refused by the allocator.  `read` maps
+/// it to `MemoryError`, which is what `PyBytes_FromStringAndSize` failing
+/// gives `_ssl__SSLSocket_read_impl`.
+pub const TLS_ERROR_NO_MEMORY: i32 = 9;
 /// Internal discriminator carrying an OpenSSL-compatible X509 verification
 /// code to the interpreter without changing Python's public `errno` (which
 /// remains SSL_ERROR_SSL == 1).
@@ -3632,7 +3637,16 @@ pub unsafe fn connection_read_plain(
     use std::io::Read;
     let connection = unsafe { &mut *connection };
     connection.process_received_tls()?;
-    let mut output = vec![0; size];
+    // `_ssl__SSLSocket_read_impl` allocates the destination with
+    // `PyBytes_FromStringAndSize(NULL, len)` before it reaches `SSL_read`, so
+    // a length no allocator can satisfy raises rather than aborting.  The
+    // `resize` below cannot grow past what this reserved, so it cannot abort
+    // either.
+    let mut output: Vec<u8> = Vec::new();
+    if output.try_reserve_exact(size).is_err() {
+        return Err((TLS_ERROR_NO_MEMORY, String::new()));
+    }
+    output.resize(size, 0);
     match connection.active_mut()?.reader().read(&mut output) {
         // A clean close_notify is EOF at the Python stream layer. CPython's
         // SSL_read wrapper returns b"" here; SSLZeroReturnError is reserved
