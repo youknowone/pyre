@@ -5233,35 +5233,16 @@ impl PyFrame {
     /// Whether a modelled `fast2locals` can reproduce this code object's
     /// locals mapping from the fastlocals alone.
     ///
-    /// Only the plain-locals half of `fast2locals` is modelled: the cell /
-    /// freevar half (pyframe.py:576-598) reads through `w_cell_get` per slot
-    /// and the `CO_FAST_HIDDEN` slots are skipped, so a code object carrying
-    /// either is refused and keeps the residual path.  A non-OPTIMIZED
-    /// (module / class / exec) frame is refused too: it hands back its LIVE
-    /// namespace rather than the independent copy
-    /// [`PyFrame::frame_locals_snapshot`] builds for a function frame.
-    pub fn code_locals_are_plain_fastlocals(code: &CodeObject) -> bool {
-        Self::code_locals_are_modelled_fastlocals(code)
-            && code.cellvars.is_empty()
-            && code.freevars.is_empty()
-    }
-
-    /// [`PyFrame::code_locals_are_plain_fastlocals`] widened to the code
-    /// objects whose cell and freevar slots a modelled `fast2locals` can also
-    /// reproduce.
+    /// The cell / freevar half of [`PyFrame::fast2locals`] (pyframe.py:576-598)
+    /// is one extra read per slot — `w_cell_get`, i.e. `Cell.contents` — over a
+    /// slot the caller already holds, so a model that can read that field
+    /// reproduces it, and both `locals()` expansion arms do.
     ///
-    /// The cell half of [`PyFrame::fast2locals`] is one extra read per slot —
-    /// `w_cell_get`, i.e. `Cell.contents` — over a slot the caller already
-    /// holds, so a model that can read that field can reproduce it.  What
-    /// stays refused is what the plain predicate refuses for its own reasons:
-    /// a non-OPTIMIZED (module / class / exec) frame, which hands back its
-    /// LIVE namespace rather than an independent copy, and `CO_FAST_HIDDEN`
-    /// slots, which `fast2locals` skips only on non-OPTIMIZED frames and whose
-    /// comprehension names must not leak into one.
-    ///
-    /// Kept beside the plain predicate rather than replacing it: the portal
-    /// arm of the `locals()` fold reads slots out of the virtualizable array
-    /// and models no cell read, so it still needs the narrow question.
+    /// What stays refused: a non-OPTIMIZED (module / class / exec) frame,
+    /// which hands back its LIVE namespace rather than the independent copy
+    /// [`PyFrame::frame_locals_snapshot`] builds for a function frame, and
+    /// `CO_FAST_HIDDEN` slots, which `fast2locals` skips only on non-OPTIMIZED
+    /// frames and whose comprehension names must not leak into one.
     pub fn code_locals_are_modelled_fastlocals(code: &CodeObject) -> bool {
         code.flags.contains(CodeFlags::OPTIMIZED)
             && !(0..code.varnames.len()).any(|i| hidden_local(code, i))
