@@ -2331,11 +2331,22 @@ impl Bookkeeper {
                 }
             }
         }
+        let is_enum_variant = {
+            let guard = self.struct_fields.borrow();
+            guard.as_ref().is_some_and(|registry| {
+                n.rsplit_once("::")
+                    .is_some_and(|(parent, _)| registry.is_enum_base(parent))
+            })
+        };
         for (field_name, field_ty) in &fields {
             if field_name == "__class__" {
                 continue;
             }
-            let s_value = self.project_struct_field_type(field_ty);
+            let s_value = if is_enum_variant {
+                self.project_enum_variant_payload_field_type(field_ty)
+            } else {
+                self.project_struct_field_type(field_ty)
+            };
             let mut classdef_mut = classdef.borrow_mut();
             let attr = classdef_mut
                 .attrs
@@ -2369,6 +2380,43 @@ impl Bookkeeper {
             }
         }
         Ok(())
+    }
+
+    /// Project an enum payload through the same aggregate identity its
+    /// synthetic constructor uses.  Rust tuples are temporarily represented
+    /// by a per-shape internal class (`Tuple<T0,...>`) in `front::mir`, not by
+    /// a Python tuple value: the ctor and every `__pos_N` access intern that
+    /// one class before the generated low-level `GcStruct` is emitted.  A
+    /// generic enum's pre-registered payload row must name that exact class,
+    /// otherwise prepass setup sees `SomeTuple` while the constructor later
+    /// writes `SomeInstance(Tuple<...>)`.
+    ///
+    /// This is the incremental equivalent of RPython's global ordering:
+    /// annotation finishes before `InstanceRepr._setup_repr` reads attrs
+    /// (`rpython/rtyper/rclass.py:487-518`).  It does not add a union rule or
+    /// synthesize a missing rtype field; it seeds the concrete constructor
+    /// identity before the shared repr can be cached.
+    fn project_enum_variant_payload_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
+        let trimmed = field_ty.trim();
+        if let Some(inner) = trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+            let items = split_generic_args(inner);
+            if !items.is_empty() {
+                let shape = format!("Tuple<{}>", items.join(","));
+                let registered = self
+                    .struct_fields
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|registry| registry.fields.contains_key(&shape));
+                if registered && let Ok(classdef) = self.getuniqueclassdef_for_struct_root(&shape) {
+                    return SomeValue::Instance(super::model::SomeInstance::new(
+                        Some(classdef),
+                        false,
+                        std::collections::BTreeMap::new(),
+                    ));
+                }
+            }
+        }
+        self.project_struct_field_type(field_ty)
     }
 
     /// TODO: no upstream equivalent.  The closest thing upstream,

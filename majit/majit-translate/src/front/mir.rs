@@ -617,18 +617,13 @@ fn is_primitive_payload_type(s: &str) -> bool {
     )
 }
 
-/// Whether a rendered payload type is an inline multi-word aggregate — a
-/// tuple `(A, B)`, array `[T; N]`, or slice `[T]` — rather than a single
-/// GC-word reference or a scalar.  The suffixed-owner textual field descr
-/// has no `StructId` for such a payload, so `type_flag_from_str` would fall
-/// back to a one-GC-word `Ref` (correct for a reference, WRONG for an
-/// inline aggregate that spans several words), so it must fail closed.  A
-/// tuple/array whose inner type is itself unresolved already renders with a
-/// `??` marker and is caught upstream; this only screens the resolved
-/// inline-aggregate spellings.
-fn is_inline_aggregate_type(s: &str) -> bool {
-    let s = s.trim();
-    (s.starts_with('(') && s != "()") || s.starts_with('[')
+/// Whether a rendered payload remains an inline Rust array/slice for which
+/// the translated field representation has not been established here.  A
+/// tuple is deliberately excluded: RPython gives every non-empty tuple a
+/// `Ptr(GcStruct(...))` representation, and pyre lowers tuple construction to
+/// that same GC-managed object shape.
+fn is_inline_array_or_slice_type(s: &str) -> bool {
+    s.trim().starts_with('[')
 }
 
 /// Register per-instantiation SUFFIXED variant payload rows for the
@@ -647,16 +642,20 @@ fn is_inline_aggregate_type(s: &str) -> bool {
 /// Substituting the instantiation's concrete type args into each variant
 /// field's type-var position recovers the concrete row, keyed under the
 /// same suffixed spellings (`{enum}{suffix}::{variant}`) that
-/// `getuniqueclassdef_for_enum_variant` projects through.  A variant
-/// registers when every payload field substitutes to either a heap
-/// (one-GC-word) type or — for a single-field variant — a primitive scalar
-/// (`Result<i64>`, `Option<bool>`): the textual descr path resolves the
-/// scalar's bank/width from the row type string, and a sole field sits at
-/// byte offset 0 so its layout is unambiguous.  An unresolved `??`
-/// placeholder, an inline multi-word aggregate (tuple/array/slice), or a
-/// primitive field in a multi-field variant (mixed scalar widths could
-/// reorder under `repr(Rust)`) leaves the variant unregistered (fail-closed
-/// Skip).  The qualified spelling always publishes; the bare-leaf / crate-
+/// `getuniqueclassdef_for_enum_variant` projects through.  A tuple payload is
+/// a GC reference in the translated program, even though Rust stores it
+/// inline: RPython's `TupleRepr` uses
+/// `Ptr(GcStruct('tupleN', ...))` (`rpython/rtyper/rtuple.py:119-126`), and
+/// pyre's synthetic aggregate constructor follows that representation.
+/// Consequently its textual field descr must use the ordinary one-word
+/// `Ref` fallback, not reject the row based on the source Rust width.  A
+/// variant registers when every payload field resolves and a primitive
+/// scalar in a multi-field source variant cannot make the descriptor offset
+/// ambiguous.  An unresolved `??` placeholder, an array/slice aggregate whose
+/// translated field representation is not established here, or a primitive
+/// field in a multi-field variant (mixed scalar widths could reorder under
+/// `repr(Rust)`) leaves the variant unregistered (fail-closed Skip).  The
+/// qualified spelling always publishes; the bare-leaf / crate-
 /// stripped spellings publish only while the leaf survived
 /// `harden_duplicate_leaf_metadata`, so a duplicate enum leaf fails closed
 /// instead of projecting whichever colliding decl was inserted first.  The
@@ -707,13 +706,14 @@ fn register_ref_enum_instantiation_rows(
                 let concrete = substitute_field_type(&f.ty, &inst.args, llbc);
                 let trimmed = concrete.trim();
                 // Register a field only when it is layout-safe for the
-                // suffixed owner's textual descr: a single-GC-word heap
-                // reference, or (sole field, offset 0) a real unboxed scalar.
-                // Fail closed on an unresolved `??` placeholder, an inline
-                // multi-word aggregate (tuple/array/slice), the unit / empty
-                // render, or a scalar outside a single-field variant.
+                // translated suffixed owner's textual descr: a GC-managed
+                // value (including RPython tuples, represented by one
+                // pointer), or (sole field, offset 0) a real unboxed scalar.
+                // Fail closed on an unresolved `??` placeholder, an
+                // array/slice aggregate, the unit / empty render, or a scalar
+                // outside a single-field variant.
                 let layout_safe = !concrete.contains("??")
-                    && !is_inline_aggregate_type(trimmed)
+                    && !is_inline_array_or_slice_type(trimmed)
                     && trimmed != "()"
                     && !trimmed.is_empty()
                     && (!is_primitive_payload_type(&concrete) || single_field);
@@ -35114,6 +35114,103 @@ mod tests {
                     )
             }),
             "dstrategy assignment must retain the declared DictStrategyRef class"
+        );
+    }
+
+    /// `mini_buffer_params` constructs `Option<(*mut u8, usize)>`.  The Rust
+    /// payload is inline, but the translator gives the internal aggregate one
+    /// GC-managed `Tuple<...>` class identity; the per-instantiation `Some`
+    /// row must therefore be seeded with that same identity before any shared
+    /// `InstanceRepr` can cache the variant layout.
+    #[test]
+    #[ignore]
+    fn mini_buffer_params_preregisters_tuple_payload_row() {
+        use crate::annotator::model::SomeValue;
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                std::slice::from_ref(&llbc),
+                crate::HostStaticAddrs::default(),
+                &["module::_cffi_backend::cbuffer"],
+                &["mini_buffer_params", "call_once"],
+            )
+            .expect("build mini_buffer_params semantic program");
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name == "mini_buffer_params"),
+            "mini_buffer_params semantic function"
+        );
+        let tuple_owner = program
+            .functions
+            .iter()
+            .flat_map(|function| &function.graph.blocks)
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name == "Tuple<*mut u8,usize>" => Some(name.clone()),
+                _ => None,
+            })
+            .expect("concrete tuple aggregate class");
+
+        let (variant_owner, rows) = program
+            .struct_fields
+            .fields
+            .iter()
+            .find(|(owner, _)| owner.ends_with("Option<(*mut u8,usize)>::Some"))
+            .expect("concrete Option<tuple>::Some registry row");
+        assert_eq!(
+            rows,
+            &vec![("__pos_0".to_string(), "(*mut u8,usize)".to_string())],
+            "the concrete tuple payload must not fall back to the ??T template"
+        );
+        let variant_owner = variant_owner.clone();
+
+        let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+        bk.set_struct_fields(std::rc::Rc::new(program.struct_fields));
+        bk.set_enum_variant_by_discriminant(std::rc::Rc::new(program.enum_variant_by_discriminant));
+        for root in bk.struct_root_names() {
+            bk.getuniqueclassdef_for_struct_root(&root)
+                .expect("project struct root");
+        }
+        bk.pre_register_enum_variant_classes();
+
+        let enum_root = variant_owner
+            .strip_suffix("::Some")
+            .expect("Some-qualified owner");
+        let variant = bk
+            .getuniqueclassdef_for_enum_variant(enum_root, "Some")
+            .expect("resolve pre-registered Some classdef");
+        let variant = variant.borrow();
+        let Some(SomeValue::Instance(payload)) =
+            variant.attrs.get("__pos_0").map(|attr| &attr.s_value)
+        else {
+            panic!(
+                "Some.__pos_0 must carry the concrete tuple class, got {:?}",
+                variant.attrs.get("__pos_0").map(|attr| &attr.s_value)
+            )
+        };
+        assert_eq!(
+            payload
+                .classdef
+                .as_ref()
+                .expect("tuple payload classdef")
+                .borrow()
+                .name,
+            tuple_owner,
+            "the pre-registered payload and constructor must share one class"
+        );
+        assert!(
+            !variant.attrs["__pos_0"].readonly,
+            "the constructor payload must be an instance field before repr setup"
         );
     }
 
