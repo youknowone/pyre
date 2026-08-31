@@ -9280,6 +9280,38 @@ pub(crate) struct GeneratorResumeCensus {
     yield_marker_offset: Option<usize>,
     /// `(ops, merge_points, residual_calls)` over the whole body.
     ops_to_yield: (usize, usize, usize),
+    /// What [`fbw_callee_body_replay_scan`] says about the body, or `None` if
+    /// the descr pool did not resolve.
+    replay: Option<GeneratorResumeReplay>,
+}
+
+/// The half of the census that prices a ROLLBACK-based resume.
+///
+/// A resume walk that declines mid-body leaves the generator's REAL frame
+/// written: the locals array through `store_live_frame_array_slot` and
+/// `last_instr` through `store_live_frame_static_int`, neither of which is a
+/// fresh frame the decline can simply discard.  The walk's non-commit epilogue
+/// can put both back (`fbw_locals_mirror_rollback`,
+/// `fbw_exit_last_instr_rollback`), but only for effects the journal covers,
+/// so what decides the resume is whether the body carries an op that commits
+/// outside it.  That is exactly the question the replay scan already answers
+/// for the FOR_ITER inline admissions.
+#[derive(Clone, Copy)]
+pub(crate) struct GeneratorResumeReplay {
+    /// The pc-set-aware verdict: what the body is once its poisoned ops are
+    /// excluded.
+    safety: CalleeReplaySafety,
+    /// [`CalleeReplayScan::verdict`] — what a caller that cannot carry a pc
+    /// set must read, so any poison at all reads `Dirty`.
+    verdict: CalleeReplaySafety,
+    /// Total poisoned offsets, and how many of them sit at or after the resume
+    /// marker.  A body poisoned only in its prologue is one the resume never
+    /// enters, so the whole-body verdict overstates its risk.
+    poison: (usize, usize),
+    /// Offsets inside one of the body's own protected regions.
+    protected: usize,
+    /// The scan could not model the body, so no pc set describes it.
+    unscannable: bool,
 }
 
 /// Decide whether a `FOR_ITER` over `iter_obj` names a generator resume the
@@ -9298,6 +9330,7 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
         tables: (0, 0),
         yield_marker_offset: None,
         ops_to_yield: (0, 0, 0),
+        replay: None,
     };
     macro_rules! decline {
         ($v:expr) => {{
@@ -9361,8 +9394,29 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
     let Some(marker) = census.marker_offset else {
         decline!(V::NoResumeEntry)
     };
-    let _ = marker;
     census.ops_to_yield = generator_resume_op_scan(body.code);
+    if let Some((descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_pycode) {
+        let scan = fbw_callee_body_replay_scan(
+            body.code,
+            &[],
+            body.num_regs_i,
+            body.constants_i,
+            body.num_regs_r,
+            body.constants_r,
+            &descr_refs,
+            false,
+        );
+        census.replay = Some(GeneratorResumeReplay {
+            safety: scan.safety,
+            verdict: scan.verdict(),
+            poison: (
+                scan.poison.len(),
+                scan.poison.iter().filter(|&&off| off >= marker).count(),
+            ),
+            protected: scan.protected.len(),
+            unscannable: scan.unscannable,
+        });
+    }
     census.verdict = V::Admissible;
     census
 }
@@ -9497,7 +9551,9 @@ pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
         let (ops, merge_points, residual_calls) = census.ops_to_yield;
         eprintln!(
             "[gen-census] pc={} {} resume_py={} n_py={} tables={:?} marker={:?} \
-             yield_marker={:?} loop_header={} ops={} mp={} residual={}",
+             yield_marker={:?} loop_header={} ops={} mp={} residual={} \
+             safety={} verdict={} poison={} poison_after_marker={} protected={} \
+             unscannable={}",
             op.pc,
             census.verdict.label(),
             census.resume_py_pc as isize,
@@ -9509,6 +9565,16 @@ pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
             ops,
             merge_points,
             residual_calls,
+            census
+                .replay
+                .map_or("-".into(), |r| format!("{:?}", r.safety)),
+            census
+                .replay
+                .map_or("-".into(), |r| format!("{:?}", r.verdict)),
+            census.replay.map_or(0, |r| r.poison.0),
+            census.replay.map_or(0, |r| r.poison.1),
+            census.replay.map_or(0, |r| r.protected),
+            census.replay.is_some_and(|r| r.unscannable),
         );
     }
     Ok(None)
