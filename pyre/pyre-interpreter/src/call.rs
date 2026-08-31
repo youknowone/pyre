@@ -4340,23 +4340,19 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
         },
     );
     frame.fix_array_ptrs();
-    // `pycode.py _compute_flatcall` deliberately rejects a function when a
-    // positional argument is also a cellvar.  That is the shape zero-argument
-    // super gets when a nested function captures `self`/`cls`: it reaches this
-    // generic Function.call_args path even though `PyCode.funcrun` still enters
-    // `frame.run` and is JIT-eligible in PyPy.  Keep the repair scoped to code
-    // which actually names `super`; routing every generic descriptor/protocol
-    // call through pyre's portal changes unrelated stdlib trace topology until
-    // the broader Function.call_args port is ready as one unit.
-    let positional_arg_is_cellvar = code_ref.cellvars.iter().any(|cell| {
-        code_ref
-            .varnames
-            .iter()
-            .take(code_ref.arg_count as usize)
-            .any(|arg| arg == cell)
-    });
-    let names_super = code_ref.names.iter().any(|name| name == "super");
-    let result = if positional_arg_is_cellvar && names_super {
+    // `pycode.py PyCode.funcrun` ends in `frame.run(...)`, the JIT-eligible
+    // entry, for every function it activates; `fast_natural_arity` decides only
+    // whether `Function.funccall` may take the flat-call shortcut.  Here it
+    // still decides the entry, and the shapes it answers HOPELESS for —
+    // `*args`, `**kwargs`, a keyword-only parameter, an argument that is also a
+    // cellvar — have no other route to the JIT at all, because the flat path is
+    // the one that carries the portal.  Route those; a normally-shaped function
+    // reaching this generic activation keeps the plain loop until the wider
+    // `Function.call_args` port lands, since giving every descriptor and
+    // protocol call the portal moves stdlib trace topology on its own.
+    let arity =
+        unsafe { crate::pycode::code_get_fast_natural_arity(w_code as pyre_object::PyObjectRef) };
+    let result = if arity as usize == crate::HOPELESS as usize {
         let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
         frame.run_with_jit()
     } else {
