@@ -142,6 +142,20 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
 /// (`optimizeopt/virtualize.rs`) requires the parent to virtualize
 /// the store.  A parentless field (getfield round-trip / non-virtualized
 /// store) keeps the placeholder builder.
+/// The byte offset a field descriptor names, without minting the optimizer
+/// object beside it.
+///
+/// `field_descr_ref_from_bh` returns this same offset paired with a freshly
+/// built descr. A caller that already holds the pool's resolved descr
+/// (`MIFrame::runtime_optimizer_descr`) wants only this half, and enforces the
+/// same invariant; `site` names the opcode so the abort still says which one.
+pub fn field_offset_from_bh(descr: &crate::blackhole::BhDescr, site: &str) -> usize {
+    match descr {
+        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
+        other => panic!("{site}: descriptor is not a Field: {other:?}"),
+    }
+}
+
 pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_ir::DescrRef) {
     match descr {
         crate::blackhole::BhDescr::Field {
@@ -4064,10 +4078,7 @@ where
                         crate::blackhole::BhDescr::Field { field_size, .. } => *field_size,
                         _ => 8,
                     };
-                    let offset = match bh {
-                        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
-                        other => panic!("BC_SETFIELD_GC: descriptor is not a Field: {other:?}"),
-                    };
+                    let offset = field_offset_from_bh(bh, "BC_SETFIELD_GC");
                     let fielddescr = frame
                         .runtime_optimizer_descr(descr_idx)
                         .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
@@ -4356,10 +4367,7 @@ where
                         } => (*field_size, *is_field_signed),
                         _ => (8, false),
                     };
-                    let offset = match bh {
-                        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
-                        other => panic!("BC_GETFIELD_GC: descriptor is not a Field: {other:?}"),
-                    };
+                    let offset = field_offset_from_bh(bh, "BC_GETFIELD_GC");
                     let fielddescr = frame
                         .runtime_optimizer_descr(descr_idx)
                         .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
@@ -4447,10 +4455,7 @@ where
                     let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                         panic!("BC_GETFIELD_GC_F: descrs[{descr_idx}] is not a BhDescr entry")
                     });
-                    let offset = match bh {
-                        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
-                        other => panic!("BC_GETFIELD_GC_F: descriptor is not a Field: {other:?}"),
-                    };
+                    let offset = field_offset_from_bh(bh, "BC_GETFIELD_GC_F");
                     (
                         offset,
                         frame
@@ -9155,12 +9160,7 @@ where
                             "BC_NEWLIST_CLEAR: descrs[{length_descr_idx}] is not a BhDescr entry"
                         )
                     });
-                    let offset = match bh {
-                        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
-                        other => {
-                            panic!("BC_NEWLIST_CLEAR: length descriptor is not a Field: {other:?}")
-                        }
-                    };
+                    let offset = field_offset_from_bh(bh, "BC_NEWLIST_CLEAR length");
                     let descr = frame
                         .runtime_optimizer_descr(length_descr_idx)
                         .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
@@ -9171,12 +9171,7 @@ where
                     let bh = frame.runtime_bh_descr(items_descr_idx).unwrap_or_else(|| {
                         panic!("BC_NEWLIST_CLEAR: descrs[{items_descr_idx}] is not a BhDescr entry")
                     });
-                    let offset = match bh {
-                        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
-                        other => {
-                            panic!("BC_NEWLIST_CLEAR: items descriptor is not a Field: {other:?}")
-                        }
-                    };
+                    let offset = field_offset_from_bh(bh, "BC_NEWLIST_CLEAR items");
                     let descr = frame
                         .runtime_optimizer_descr(items_descr_idx)
                         .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);

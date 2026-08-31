@@ -5722,9 +5722,10 @@ impl JitCodeBuilder {
         {
             panic!("{disagreement}");
         }
-        for descr in &mut self.descrs {
-            descr.resolve_optimizer_descr();
-        }
+        self.descrs = std::mem::take(&mut self.descrs)
+            .into_iter()
+            .map(RuntimeBhDescr::into_resolved)
+            .collect();
         self.patch_const_u8_refs();
         // RPython `jitcode.py JitCode.setup self._resulttypes = resulttypes`.
         // Upstream `assembler.py:217-219` records the result-kind

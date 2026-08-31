@@ -1079,6 +1079,18 @@ pub struct OptBoxEnv<'a> {
     pub ctx: &'a OptContext,
 }
 
+/// resume.py `getconst`: the word a `Const` carries, and the type tag naming
+/// which register file it belongs in. `Void` has no register file of its own
+/// and numbers as a zero int, the same as an unresolvable operand.
+fn const_value_as_word(value: Value) -> (i64, majit_ir::Type) {
+    match value {
+        Value::Int(v) => (v, majit_ir::Type::Int),
+        Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
+        Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
+        Value::Void => (0, majit_ir::Type::Int),
+    }
+}
+
 impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     fn get_box_replacement(&self, opref: OpRef) -> OpRef {
         self.ctx.get_replacement_opref(opref)
@@ -1142,22 +1154,14 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // zero-allocation path for the inline representation just recognized
         // by `is_const` above.
         if let Some(value) = self.ctx.get_constant(opref) {
-            return match value {
-                Value::Int(v) => (v, majit_ir::Type::Int),
-                Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
-                Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
-                Value::Void => (0, majit_ir::Type::Int),
-            };
+            return const_value_as_word(value);
         }
         match self
             .ctx
             .get_box_replacement_operand_opt(opref)
             .and_then(|cb| cb.const_value())
         {
-            Some(Value::Int(v)) => (v, majit_ir::Type::Int),
-            Some(Value::Float(f)) => (f.to_bits() as i64, majit_ir::Type::Float),
-            Some(Value::Ref(r)) => (r.0 as i64, majit_ir::Type::Ref),
-            Some(Value::Void) => (0, majit_ir::Type::Int),
+            Some(value) => const_value_as_word(value),
             None => {
                 if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) = self
                     .ctx

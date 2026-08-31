@@ -310,24 +310,23 @@ impl RuntimeBhDescr {
     /// Finalize a field entry after its canonical parent layout has been
     /// patched.  Mirrors `Assembler.descrs` in RPython: resolution happens
     /// once per descriptor object, not once per executed field opcode.
-    pub(crate) fn resolve_optimizer_descr(&mut self) {
-        let Self::Descr(canonical) = self else {
-            return;
-        };
-        if !matches!(canonical.as_ref(), CanonicalBhDescr::Field { .. }) {
-            return;
+    ///
+    /// Takes the entry by value so the canonical box moves straight into the
+    /// resolved variant. Rewriting it through `&mut self` would need a stand-in
+    /// entry to hold the slot while the box moves out, and any stand-in is
+    /// both an allocation and a descriptor the pool never meant to contain.
+    pub(crate) fn into_resolved(self) -> Self {
+        match self {
+            Self::Descr(canonical)
+                if matches!(canonical.as_ref(), CanonicalBhDescr::Field { .. }) =>
+            {
+                Self::ResolvedDescr {
+                    canonical,
+                    optimizer: std::sync::OnceLock::new(),
+                }
+            }
+            other => other,
         }
-        let canonical = match std::mem::replace(
-            self,
-            Self::Descr(Box::new(CanonicalBhDescr::VableField { index: 0 })),
-        ) {
-            Self::Descr(canonical) => canonical,
-            _ => unreachable!("field descriptor changed while being finalized"),
-        };
-        *self = Self::ResolvedDescr {
-            canonical,
-            optimizer: std::sync::OnceLock::new(),
-        };
     }
 
     /// RPython parity: `isinstance(value, JitCode)` assertion at

@@ -22,7 +22,7 @@ pub enum JitException {
     /// jitexc.py ExitFrameWithExceptionRef
     ExitFrameWithExceptionRef(GcRef),
     /// jitexc.py ContinueRunningNormally
-    ContinueRunningNormally(ContinueRunningNormallyArgs),
+    ContinueRunningNormally(Box<ContinueRunningNormallyArgs>),
     /// pyre-only: the blackhole stopped without finishing the frame.
     ///
     /// Reached from a pyre `abort_permanent` marker and from the two

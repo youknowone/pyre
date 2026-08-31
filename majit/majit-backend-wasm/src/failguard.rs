@@ -704,6 +704,15 @@ pub fn remove_call_assembler_targets_for_compiled_ptr(compiled_ptr: u32) {
     ca_dispatch_remove_compiled_ptr(compiled_ptr);
 }
 
+/// One position in the global fail-index space: claimed by
+/// `reserve_fail_descrs` and filled by `register_fail_descrs`. The two steps
+/// are separate so a compile can bake `base + local` into its guards before
+/// the descrs those guards name exist.
+enum FailDescrSlot {
+    Reserved,
+    Registered(Arc<WasmFailDescr>),
+}
+
 /// Global `frame[0]` fail-index space.
 ///
 /// Cross-trace chaining (`LABEL_TARGETS`) means the module that last wrote
@@ -713,21 +722,18 @@ pub fn remove_call_assembler_targets_for_compiled_ptr(compiled_ptr: u32) {
 /// the host — resolving `frame[0]` against the entry loop's own `fail_descrs`
 /// picks a wrong descr (wrong arg types/resume ⇒ type confusion). So every
 /// compile (`compile_loop` and `compile_bridge`) allocates its exits from this
-/// one global space: it passes the registry length as codegen's
-/// `fail_index_base`, guards write `base + local` into `frame[0]`, and the
-/// registered descrs land at exactly those registry positions — any `frame[0]`
+/// one global space: it reserves as many positions as it has exits and passes
+/// the first as codegen's `fail_index_base`, guards write `base + local` into
+/// `frame[0]`, and the registered descrs fill exactly those reserved positions — any `frame[0]`
 /// then resolves here regardless of which chained module wrote it. The
 /// per-guard bridge-cell epilogue keeps its local indexing by subtracting the
 /// owning module's base (`codegen`'s cell lookup).
 ///
 /// Entries are never removed: a dropped loop's modules are unreachable (its
 /// label targets are retracted and its token is gone), so its entries are just
-/// retained memory, bounded by the total number of compiled exits.
-enum FailDescrSlot {
-    Reserved,
-    Registered(Arc<WasmFailDescr>),
-}
-
+/// retained memory. A compile that reserves its range and then fails leaves
+/// its slots `Reserved` for good, so the bound is the number of exits
+/// compilation was *attempted* for, not the number that reached a module.
 static FAIL_DESCR_REGISTRY: parking_lot::Mutex<Option<Vec<FailDescrSlot>>> =
     parking_lot::Mutex::new(None);
 

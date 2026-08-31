@@ -13907,7 +13907,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
-        // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`),
+        // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
         let prepared = prepare_bridge_trace_for_optimizer(
             bridge_ops,
             bridge_inputargs,
