@@ -7310,6 +7310,14 @@ fn emit_guard_exit(
     // zero drift, nbody_50k matches the reference exactly, and the full
     // bench suite is correct.  `MAJIT_CL_NO_CLOSING_JUMP` is an opt-out
     // hatch for A/B and rollback.
+    //
+    // The carried values take a round trip the register-to-register form
+    // does not: this path publishes them into jitframe slots and the
+    // target's `br_table` loader reads them back, so a crossing costs in
+    // proportion to the target LABEL's arity.  Carrying them in the
+    // `return_call_indirect` signature instead would need one entry
+    // signature covering the union of every LABEL's arity, which is why
+    // they go through the frame.
     if let Some((ll_loop_code_addr, label_block_id_addr, target_frame_depth_addr)) =
         info.external_jump_ll_loop_code_addr
     {

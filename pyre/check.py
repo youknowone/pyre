@@ -5340,6 +5340,11 @@ def main():
         # synthetic suite.
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       None,    5,       None,    5)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       None,    5,       None,    5,    wasm_float_tol=True)
+        # fannkuch is almost nothing but cross-loop JUMP, which the two
+        # backends pay differently: cranelift's closing_jump carries a LABEL's
+        # values through jitframe slots (`emit_attached_loop_dispatch`) where
+        # dynasm remaps them in registers.  That is why its ceiling here is the
+        # wider of the pair, and why this bench alone needs the spread.
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       15)
         # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
         # suite as bridge_branchy_callee.py, gated against pypy by
