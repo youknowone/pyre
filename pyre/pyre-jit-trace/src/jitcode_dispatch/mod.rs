@@ -8216,23 +8216,16 @@ pub(crate) unsafe fn resolve_inlinable_callee(
 ///
 /// Returns the resolved `__call__` alongside the class it was found through and
 /// that class's version tag, which is what pins the lookup: the walker's
-/// counterpart of `space.lookup` promoting the type.  A `__call__` that is not
-/// a plain inlinable function — a builtin slot, a `classmethod`, another
-/// callable object — has no body to walk and declines here, exactly as
-/// `resolve_inlinable_callee` declines a non-`Function` callee.
+/// counterpart of `space.lookup` promoting the type.  What kind of callable the
+/// answer is — an app-level function to inline, a builtin gateway to descend
+/// into — is the caller's question; a lookup this cannot pin (an unversioned
+/// class, a class whose `__call__` is `type.__call__`) declines here.
 ///
 /// # Safety
 /// `callable` must be a valid object.
-unsafe fn resolve_instance_dunder_call(
+unsafe fn lookup_instance_dunder_call(
     callable: pyre_object::PyObjectRef,
-) -> Option<(
-    pyre_object::PyObjectRef,
-    pyre_object::PyObjectRef,
-    u64,
-    *const (),
-    usize,
-    bool,
-)> {
+) -> Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef, u64)> {
     if callable.is_null() {
         return None;
     }
@@ -8253,6 +8246,28 @@ unsafe fn resolve_instance_dunder_call(
         return None;
     }
     let method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__call__") }?;
+    Some((method, w_class, version_tag))
+}
+
+/// [`lookup_instance_dunder_call`] narrowed to an app-level `__call__` the
+/// walker can inline.  A `__call__` that is not a plain inlinable function — a
+/// `classmethod`, another callable object — has no body to walk and declines
+/// here, exactly as `resolve_inlinable_callee` declines a non-`Function`
+/// callee; a builtin gateway `__call__` is `try_walker_inline_builtin_call`'s.
+///
+/// # Safety
+/// `callable` must be a valid object.
+unsafe fn resolve_instance_dunder_call(
+    callable: pyre_object::PyObjectRef,
+) -> Option<(
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    u64,
+    *const (),
+    usize,
+    bool,
+)> {
+    let (method, w_class, version_tag) = unsafe { lookup_instance_dunder_call(callable) }?;
     let (w_code, nparams, has_closure) = unsafe { resolve_inlinable_callee(method) }?;
     Some((method, w_class, version_tag, w_code, nparams, has_closure))
 }

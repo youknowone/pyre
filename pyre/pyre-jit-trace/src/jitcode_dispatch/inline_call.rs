@@ -3654,6 +3654,29 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     } else {
         (callable_operand, method_form.then_some(null_or_self))
     };
+    // `descroperation.py DescrOperation.call_args`'s third arm: a callable
+    // that is neither a `Function` nor a `Method` dispatches through
+    // `space.lookup(w_obj, '__call__')`, bound to the object.  When that
+    // `__call__` is a builtin gateway, the wrapper is entered below with the
+    // instance as its receiver, and the lookup is pinned on the instance's
+    // class the way `space.lookup` promotes the type.  An app-level `__call__`
+    // belongs to `try_walker_inline_call`'s `resolve_instance_dunder_call`.
+    let mut instance_call_class = None;
+    // A type-dict `__call__` installed from a `BuiltinCode` is a slot wrapper:
+    // the same `Function` carrier under `SLOT_WRAPPER_TYPE`, so the carrier
+    // test admits it and the `Function.code` read below is the same load.
+    let (callable, receiver) =
+        if method_form || bound_method || unsafe { pyre_interpreter::is_function(callable) } {
+            (callable, receiver)
+        } else {
+            match unsafe { lookup_instance_dunder_call(callable) } {
+                Some((method, w_class, version_tag)) => {
+                    instance_call_class = Some((w_class, version_tag));
+                    (method, Some(callable_operand))
+                }
+                None => (callable, receiver),
+            }
+        };
     // Every decline below is silent otherwise, and they are not
     // interchangeable: `not is_function` is a class call or another
     // non-Function callable, while `no jitcode for address` names a builtin
@@ -3688,7 +3711,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             }
         };
     }
-    if !unsafe { pyre_interpreter::is_function(callable) } {
+    if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
         builtin_inline_decline!("not is_function", 0usize);
         return Ok(None);
     }
@@ -3877,6 +3900,22 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
 
     let mut callable_guard_op = r_args[0];
     let mut receiver_op = method_form.then_some(r_args[1]);
+    if let Some((w_class, version_tag)) = instance_call_class {
+        // The promoted-class lookup shape: the class and its version tag
+        // together fix the `__call__` answer, so the wrapper this call
+        // dispatches to is a constant of the pinned class rather than a field
+        // the `GuardValue` below would have to read off the operand.
+        walker_guard_exception_attr_slot(
+            ctx,
+            op.pc,
+            r_args[0],
+            callable_operand,
+            w_class,
+            version_tag,
+        )?;
+        callable_guard_op = ctx.trace_ctx.const_ref(callable as i64);
+        receiver_op = Some(r_args[0]);
+    }
     if bound_method {
         // pypy/interpreter/function.py `_Method._immutable_fields_`:
         // guard the carrier layout, read both fields live, and only promote

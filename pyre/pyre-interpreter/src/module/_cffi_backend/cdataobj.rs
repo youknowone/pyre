@@ -67,8 +67,14 @@ pub struct W_CData {
 }
 
 impl W_CData {
+    // Spelled as a `match` rather than `Option::ok_or_else`: the closure the
+    // combinator takes is a callee of its own, and a traced `W_CData.call`
+    // would stop at it.
     fn ctype_ref(&self) -> Result<&'static mut W_CType, PyError> {
-        ctypeobj::ctype_at(self.ctype).ok_or_else(|| PyError::system_error("cdata without a ctype"))
+        match ctypeobj::ctype_at(self.ctype) {
+            Some(ct) => Ok(ct),
+            None => Err(PyError::system_error("cdata without a ctype")),
+        }
     }
 
     /// `W_CData._sizeof` and the overrides of it.
@@ -171,12 +177,13 @@ impl W_CData {
 
 /// `@unwrap_spec(w_cdata=cdataobj.W_CData)`.
 pub fn cdata_arg(w_cdata: PyObjectRef) -> Result<&'static mut W_CData, PyError> {
-    W_CData::from_obj(w_cdata).ok_or_else(|| {
-        PyError::type_error(format!(
+    match W_CData::from_obj(w_cdata) {
+        Some(cdata) => Ok(cdata),
+        None => Err(PyError::type_error(format!(
             "expected a cdata object, got '{}'",
             crate::type_methods::arg_type_name(w_cdata)
-        ))
-    })
+        ))),
+    }
 }
 
 // ── construction ────────────────────────────────────────────────────────
@@ -457,6 +464,36 @@ pub fn add_memory_pressure(w_cdata: PyObjectRef, size: i64) {
 /// `lltype.malloc(rffi.CCHARP.TO, size, flavor='raw')`.  A zero-size request
 /// still returns a distinct address, so `newp` on an empty array does not
 /// hand back NULL.
+/// `lltype.malloc(rffi.CCHARP.TO, size, flavor='raw')` — the raw block a
+/// traced caller allocates; the JIT sees it as the `raw_malloc_varsize_char`
+/// residual (`support.py ll_raw_malloc_varsize_char`).  Null on exhaustion;
+/// the caller raises the MemoryError.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_malloc_varsize_char(size: usize) -> *mut u8 {
+    unsafe { libc::malloc(size.max(1)).cast::<u8>() }
+}
+
+/// `lltype.free(ptr, flavor='raw')` — the `raw_free` residual
+/// (`support.py ll_raw_free`).
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_free(ptr: *mut u8) {
+    unsafe { libc::free(ptr.cast::<libc::c_void>()) }
+}
+
+/// `rffi.ptradd` — advance a raw byte pointer without a memory access
+/// (`direct_ptradd` residual shape).
+#[majit_macros::elidable_cannot_raise]
+pub fn raw_ptradd(ptr: *mut u8, offset: usize) -> *mut u8 {
+    ptr.wrapping_add(offset)
+}
+
+/// One pointer-sized load out of an exchange-buffer argument slot
+/// (`rffi.cast(rffi.CCHARPP, data)[0]`).
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_ptr(data: *mut u8) -> *mut u8 {
+    unsafe { data.cast::<*mut u8>().read_unaligned() }
+}
+
 pub fn raw_alloc(size: i64, zero: bool) -> Result<*mut u8, PyError> {
     if size < 0 {
         return Err(PyError::value_error("negative allocation size"));
@@ -618,7 +655,7 @@ fn init_cdata_type(ns: PyObjectRef) {
     // `__call__` and `__exit__` take a variable number of arguments.
     store(
         "__call__",
-        crate::make_builtin_function("__call__", cdata_call),
+        crate::make_builtin_function("__call__", __majit_wrap_cdata_call),
     );
     store(
         "__exit__",
@@ -858,7 +895,20 @@ fn cdata_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 /// `W_CData.call`.
-fn cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+///
+/// Named `__majit_wrap_*` and published below: `BuiltinCode.func` is a PBC
+/// whose family `builtin_wrapper_indirect_graphs` builds out of exactly the
+/// wrapper paths that carry a registered graph, and a traced cdata call
+/// reaches this body through `bytecode_for_address` on the function's
+/// address.  Registered under any other name it has no member in that family,
+/// and every `cdata(...)` stays a `bh_call_fn` residual with the argument
+/// conversions and the foreign call opaque behind it.
+pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    // A gateway body reads its argument count before any argument; the
+    // walker locates the argument array's item descriptor by that order.
+    if args.is_empty() {
+        return Err(PyError::type_error("__call__ needs a cdata receiver"));
+    }
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
     if ct.kind == ctypeobj::KIND_FUNC {
@@ -869,6 +919,15 @@ fn cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         ct.name()
     )))
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_cdata_call: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_cdata_call)),
+        func: __majit_wrap_cdata_call,
+    };
 
 /// `W_CData.getattr`.
 fn cdata_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {

@@ -68,6 +68,111 @@ pub fn fast_int_layout(bits: u32) -> (i64, i64) {
 
 // ── raw reads and writes ────────────────────────────────────────────────
 
+// ── per-width raw accessors ─────────────────────────────────────────────
+// The one-width memory access under each `match size` arm above, split out
+// so a trace carries a residual load/store of the right width while the
+// match itself (its size operand a trace constant) folds away.
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_i8(p: *const u8) -> i64 {
+    unsafe { p.cast::<i8>().read_unaligned() as i64 }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_u8(p: *const u8) -> u64 {
+    unsafe { p.cast::<u8>().read_unaligned() as u64 }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_i8(p: *mut u8, v: i64) {
+    unsafe { p.cast::<i8>().write_unaligned(v as i8) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_u8(p: *mut u8, v: u64) {
+    unsafe { p.cast::<u8>().write_unaligned(v as u8) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_i16(p: *const u8) -> i64 {
+    unsafe { p.cast::<i16>().read_unaligned() as i64 }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_u16(p: *const u8) -> u64 {
+    unsafe { p.cast::<u16>().read_unaligned() as u64 }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_i16(p: *mut u8, v: i64) {
+    unsafe { p.cast::<i16>().write_unaligned(v as i16) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_u16(p: *mut u8, v: u64) {
+    unsafe { p.cast::<u16>().write_unaligned(v as u16) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_i32(p: *const u8) -> i64 {
+    unsafe { p.cast::<i32>().read_unaligned() as i64 }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_u32(p: *const u8) -> u64 {
+    unsafe { p.cast::<u32>().read_unaligned() as u64 }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_i32(p: *mut u8, v: i64) {
+    unsafe { p.cast::<i32>().write_unaligned(v as i32) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_u32(p: *mut u8, v: u64) {
+    unsafe { p.cast::<u32>().write_unaligned(v as u32) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_i64(p: *const u8) -> i64 {
+    unsafe { p.cast::<i64>().read_unaligned() as i64 }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_u64(p: *const u8) -> u64 {
+    unsafe { p.cast::<u64>().read_unaligned() as u64 }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_i64(p: *mut u8, v: i64) {
+    unsafe { p.cast::<i64>().write_unaligned(v as i64) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_u64(p: *mut u8, v: u64) {
+    unsafe { p.cast::<u64>().write_unaligned(v as u64) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_f32(p: *const u8) -> f64 {
+    unsafe { f64::from(p.cast::<f32>().read_unaligned()) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_f32(p: *mut u8, v: f64) {
+    unsafe { p.cast::<f32>().write_unaligned(v as f32) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_f64(p: *const u8) -> f64 {
+    unsafe { f64::from(p.cast::<f64>().read_unaligned()) }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_f64(p: *mut u8, v: f64) {
+    unsafe { p.cast::<f64>().write_unaligned(v as f64) }
+}
+
 /// `misc.py read_raw_signed_data`.
 ///
 /// # Safety
@@ -75,10 +180,10 @@ pub fn fast_int_layout(bits: u32) -> (i64, i64) {
 pub unsafe fn read_raw_signed_data(target: *const u8, size: i64) -> Result<i64, PyError> {
     unsafe {
         Ok(match size {
-            1 => target.cast::<i8>().read_unaligned() as i64,
-            2 => target.cast::<i16>().read_unaligned() as i64,
-            4 => target.cast::<i32>().read_unaligned() as i64,
-            8 => target.cast::<i64>().read_unaligned(),
+            1 => raw_read_i8(target),
+            2 => raw_read_i16(target),
+            4 => raw_read_i32(target),
+            8 => raw_read_i64(target),
             _ => return Err(bad_integer_size()),
         })
     }
@@ -91,10 +196,10 @@ pub unsafe fn read_raw_signed_data(target: *const u8, size: i64) -> Result<i64, 
 pub unsafe fn read_raw_unsigned_data(target: *const u8, size: i64) -> Result<u64, PyError> {
     unsafe {
         Ok(match size {
-            1 => u64::from(target.read()),
-            2 => u64::from(target.cast::<u16>().read_unaligned()),
-            4 => u64::from(target.cast::<u32>().read_unaligned()),
-            8 => target.cast::<u64>().read_unaligned(),
+            1 => raw_read_u8(target),
+            2 => raw_read_u16(target),
+            4 => raw_read_u32(target),
+            8 => raw_read_u64(target),
             _ => return Err(bad_integer_size()),
         })
     }
@@ -111,10 +216,10 @@ pub unsafe fn write_raw_signed_data(
 ) -> Result<(), PyError> {
     unsafe {
         match size {
-            1 => target.cast::<i8>().write_unaligned(source as i8),
-            2 => target.cast::<i16>().write_unaligned(source as i16),
-            4 => target.cast::<i32>().write_unaligned(source as i32),
-            8 => target.cast::<i64>().write_unaligned(source),
+            1 => raw_write_i8(target, source),
+            2 => raw_write_i16(target, source),
+            4 => raw_write_i32(target, source),
+            8 => raw_write_i64(target, source),
             _ => return Err(bad_integer_size()),
         }
     }
@@ -132,10 +237,10 @@ pub unsafe fn write_raw_unsigned_data(
 ) -> Result<(), PyError> {
     unsafe {
         match size {
-            1 => target.write(source as u8),
-            2 => target.cast::<u16>().write_unaligned(source as u16),
-            4 => target.cast::<u32>().write_unaligned(source as u32),
-            8 => target.cast::<u64>().write_unaligned(source),
+            1 => raw_write_u8(target, source),
+            2 => raw_write_u16(target, source),
+            4 => raw_write_u32(target, source),
+            8 => raw_write_u64(target, source),
             _ => return Err(bad_integer_size()),
         }
     }
@@ -149,8 +254,8 @@ pub unsafe fn write_raw_unsigned_data(
 pub unsafe fn read_raw_float_data(target: *const u8, size: i64) -> Result<f64, PyError> {
     unsafe {
         Ok(match size {
-            4 => f64::from(target.cast::<f32>().read_unaligned()),
-            8 => target.cast::<f64>().read_unaligned(),
+            4 => raw_read_f32(target),
+            8 => raw_read_f64(target),
             _ => return Err(bad_float_size()),
         })
     }
@@ -163,8 +268,8 @@ pub unsafe fn read_raw_float_data(target: *const u8, size: i64) -> Result<f64, P
 pub unsafe fn write_raw_float_data(target: *mut u8, source: f64, size: i64) -> Result<(), PyError> {
     unsafe {
         match size {
-            4 => target.cast::<f32>().write_unaligned(source as f32),
-            8 => target.cast::<f64>().write_unaligned(source),
+            4 => raw_write_f32(target, source),
+            8 => raw_write_f64(target, source),
             _ => return Err(bad_float_size()),
         }
     }
