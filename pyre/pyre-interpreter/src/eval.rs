@@ -3989,6 +3989,95 @@ pub fn with_except_start_values(
     }
 }
 
+/// Resolve the value half of CPython 3.14's fused `LOAD_SUPER_ATTR`.
+///
+/// The observable opcode still honours the `super` value loaded from globals.
+/// For the exact builtin zero-argument case, pass the live frame explicitly to
+/// PyPy's `_super_from_frame` equivalent instead of rediscovering it through
+/// `ExecutionContext::gettopframe`: an inlined caller has its own red frame,
+/// and that frame is what `_super_check` must read.  Keeping this as ordinary
+/// interpreter source lets the translator generate the `_super_check` and
+/// `W_Super.getattribute` call graph instead of teaching the tracer a second
+/// implementation of either one.
+pub fn load_super_attr_value_w(
+    global_super: PyObjectRef,
+    self_obj: PyObjectRef,
+    cls: PyObjectRef,
+    frame: *mut PyFrame,
+    w_name: PyObjectRef,
+    is_two_arg: bool,
+    self_is_cell: bool,
+    class_slot: isize,
+) -> Result<PyObjectRef, PyError> {
+    if !unsafe { pyre_object::is_str(w_name) } {
+        return Err(PyError::runtime_error(format!(
+            "LOAD_SUPER_ATTR requires a string name"
+        )));
+    }
+    let exact_builtin_zero_arg =
+        !is_two_arg && crate::builtins::is_builtin_super_type(global_super);
+    let proxy = if is_two_arg {
+        crate::call::call_function_impl_result(global_super, &[cls, self_obj])?
+    } else if exact_builtin_zero_arg {
+        crate::builtins::builtin_super_from_frame_layout(frame, self_is_cell, class_slot)?
+    } else {
+        crate::call::call_function_impl_result(global_super, &[])?
+    };
+    if exact_builtin_zero_arg {
+        // The selected slot is PyPy's `W_Super.getattribute`, so enter that
+        // ordinary interpreter body directly.  The generic `getattr` wrapper
+        // would redispatch to the same slot after publishing a Rust slice with
+        // `pin_roots`; individual pins are the translated shadow-stack
+        // `setarrayitem`s and keep this generated call graph word-ABI-only.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let operands = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(proxy);
+        let _ = pyre_object::gc_roots::pin_root(w_name);
+        return unsafe {
+            crate::baseobjspace::super_getattribute_code_name(
+                pyre_object::gc_roots::shadow_stack_get(operands),
+                pyre_object::gc_roots::shadow_stack_get(operands + 1),
+            )
+        };
+    }
+    crate::baseobjspace::getattr(proxy, w_name)
+}
+
+/// Index-taking blackhole twin of [`load_super_attr_value_w`].
+///
+/// The opcode interpreter and generated JitCode carry PyPy's already-wrapped
+/// `co_names_w[nameindex]`.  The standalone blackhole ABI still carries its
+/// compact `(w_code, nameindex)` pair, so realize the same immutable name here
+/// before entering the shared value path.
+pub fn load_super_attr_value(
+    global_super: PyObjectRef,
+    self_obj: PyObjectRef,
+    cls: PyObjectRef,
+    frame: *mut PyFrame,
+    w_code: PyObjectRef,
+    name_idx: usize,
+    is_two_arg: bool,
+) -> Result<PyObjectRef, PyError> {
+    let code = unsafe { &*(crate::w_code_get_ptr(w_code) as *const crate::CodeObject) };
+    let Some(name) = code.names.get(name_idx) else {
+        return Err(PyError::runtime_error(format!(
+            "LOAD_SUPER_ATTR name index {name_idx} out of range"
+        )));
+    };
+    let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(w_code, name_idx, name) };
+    let (self_is_cell, class_slot) = crate::builtins::bare_super_frame_layout_words(code);
+    load_super_attr_value_w(
+        global_super,
+        self_obj,
+        cls,
+        frame,
+        w_name,
+        is_two_arg,
+        self_is_cell,
+        class_slot,
+    )
+}
+
 impl OpcodeStepExecutor for PyFrame {
     fn pop_top(&mut self) -> Result<(), PyError> {
         let _ = self.pop_value()?;
@@ -5296,26 +5385,33 @@ impl OpcodeStepExecutor for PyFrame {
     // → super(class, self).attr
     fn load_super_attr_with(
         &mut self,
-        name: &str,
+        name_idx: usize,
         is_method: bool,
         is_two_arg: bool,
     ) -> Result<(), PyError> {
+        let w_code = self.pycode as PyObjectRef;
+        let name = &self.code().names[name_idx];
+        // Resolve while the three opcode operands still live in the frame's
+        // value stack.  First realization may allocate; after publication the
+        // interned `co_names_w` entry is immutable, as in PyPy's `getname_w`.
+        let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(w_code, name_idx, name) };
+        let (self_is_cell, class_slot) =
+            crate::builtins::bare_super_frame_layout_words(self.code());
         let self_obj = self.pop();
         let cls = self.pop();
         let global_super = self.pop();
         let anchor = FrameAnchor::new(self);
 
-        // CPython 3.14 `LOAD_SUPER_ATTR`: the callable loaded from globals is
-        // authoritative (it may shadow builtins.super).  Bit 1 distinguishes
-        // `super(type, obj)` from zero-argument `super()`; `cls` / `self_obj`
-        // are stack operands for the fast builtin case but are not arguments
-        // to a shadowing zero-arg callable.
-        let proxy = if is_two_arg {
-            crate::call::call_function_impl_result(global_super, &[cls, self_obj])?
-        } else {
-            crate::call::call_function_impl_result(global_super, &[])?
-        };
-        let result = crate::baseobjspace::getattr_str(proxy, name)?;
+        let result = load_super_attr_value_w(
+            global_super,
+            self_obj,
+            cls,
+            anchor.live(),
+            w_name,
+            is_two_arg,
+            self_is_cell,
+            class_slot,
+        )?;
 
         // CPython _PySuper_Lookup: determines whether the resolved attr
         // is an unbound method (needs self binding) or a staticmethod /

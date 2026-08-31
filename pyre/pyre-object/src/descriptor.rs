@@ -23,6 +23,24 @@ pub struct W_Super {
     pub obj: PyObjectRef,
 }
 
+/// Allocate the empty proxy in the same graph that constructs its Rust
+/// payload.  Keeping the aggregate and `malloc_typed_stable` together is the
+/// source shape `fuse_boxing_alloc` lowers to PyPy's `new_with_vtable`;
+/// accepting a `W_Super` payload from the caller would make that by-value
+/// aggregate execute before the generated inline call.
+fn w_super_alloc_empty() -> PyObjectRef {
+    let value = W_Super {
+        ob: PyObject {
+            ob_type: &SUPER_TYPE as *const PyType,
+            w_class: get_instantiate(&SUPER_TYPE),
+        },
+        super_type: PY_NULL,
+        obj_type: PY_NULL,
+        obj: PY_NULL,
+    };
+    crate::lltype::malloc_typed_stable(value) as PyObjectRef
+}
+
 /// Create a new super proxy.
 pub fn w_super_new(
     super_type: PyObjectRef,
@@ -43,35 +61,20 @@ pub fn w_super_new(
     let _ = crate::gc_roots::pin_root(super_type);
     let _ = crate::gc_roots::pin_root(obj_type);
     let _ = crate::gc_roots::pin_root(obj);
-    let header = PyObject {
-        ob_type: &SUPER_TYPE as *const PyType,
-        w_class: get_instantiate(&SUPER_TYPE),
-    };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SUPER_GC_TYPE_ID, W_SUPER_OBJECT_SIZE);
-    let super_type = crate::gc_roots::shadow_stack_get(save_point);
-    let obj_type = crate::gc_roots::shadow_stack_get(save_point + 1);
-    let obj = crate::gc_roots::shadow_stack_get(save_point + 2);
-    if !raw.is_null() {
-        unsafe {
-            std::ptr::write(
-                raw as *mut W_Super,
-                W_Super {
-                    ob: header,
-                    super_type,
-                    obj_type,
-                    obj,
-                },
-            );
-        }
-        crate::gc_hook::try_gc_write_barrier(raw);
-        return raw as PyObjectRef;
+    // Allocate first, then install the GC-forwarded roots.  This is PyPy's
+    // ordinary malloc + setfield shape; spelling the raw byte allocation and
+    // whole-struct `ptr::write` here left the embedded `PyObject` aggregate as
+    // a synthetic callable in generated JitCode.
+    let super_obj = w_super_alloc_empty();
+    unsafe {
+        w_super_set_fields(
+            super_obj,
+            crate::gc_roots::shadow_stack_get(save_point),
+            crate::gc_roots::shadow_stack_get(save_point + 1),
+            crate::gc_roots::shadow_stack_get(save_point + 2),
+        );
     }
-    W_Super::allocate(W_Super {
-        ob: header,
-        super_type,
-        obj_type,
-        obj,
-    })
+    super_obj
 }
 
 #[inline]

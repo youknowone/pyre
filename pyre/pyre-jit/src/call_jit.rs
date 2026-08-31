@@ -6337,40 +6337,16 @@ pub extern "C" fn bh_load_super_attr_fn(
     name_idx: i64,
     is_two_arg: i64,
 ) -> i64 {
-    let w_code = w_code_ptr as pyre_object::PyObjectRef;
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
-    };
     let idx = name_idx as usize;
-    debug_assert!(
-        idx < code.names.len(),
-        "bh_load_super_attr_fn name_idx {idx} out of range ({} names) — codegen invariant",
-        code.names.len()
+    let result = pyre_interpreter::eval::load_super_attr_value(
+        global_super as pyre_object::PyObjectRef,
+        self_obj as pyre_object::PyObjectRef,
+        cls as pyre_object::PyObjectRef,
+        frame as usize as *mut pyre_interpreter::PyFrame,
+        w_code_ptr as pyre_object::PyObjectRef,
+        idx,
+        is_two_arg != 0,
     );
-    if idx >= code.names.len() {
-        return 0;
-    }
-    let name = code.names[idx].as_ref();
-    let global_super = global_super as pyre_object::PyObjectRef;
-    let self_obj = self_obj as pyre_object::PyObjectRef;
-    let cls = cls as pyre_object::PyObjectRef;
-    let proxy = if is_two_arg != 0 {
-        pyre_interpreter::call::call_function_impl_result(global_super, &[cls, self_obj])
-    } else if pyre_interpreter::builtins::is_builtin_super_type(global_super) {
-        // `descriptor.py W_Super.descr_init` traces
-        // `space.getexecutioncontext().gettopframe()` into the active MIFrame.
-        // The JIT threads that frame as a red operand: an inlined callee must
-        // read its own `self` / `__class__` cells, never the outer portal's.
-        pyre_interpreter::builtins::builtin_super_from_frame(
-            frame as usize as *mut pyre_interpreter::PyFrame,
-        )
-    } else {
-        // CPython 3.14 makes the global `super` binding authoritative.  A
-        // shadowing callable still receives zero arguments exactly as the
-        // interpreter path does.
-        pyre_interpreter::call::call_function_impl_result(global_super, &[])
-    };
-    let result = proxy.and_then(|proxy| pyre_interpreter::baseobjspace::getattr_str(proxy, name));
     match result {
         Ok(result) => result as i64,
         Err(mut err) => {

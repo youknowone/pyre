@@ -426,6 +426,11 @@ thread_local! {
     /// Cached `ALL_JITCODES` index of `pos_inner` for the current thread.
     /// Resolved by graph key, for the reason given above.
     static POS_INNER_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
+    /// Cached `ALL_JITCODES` index of the interpreter-source
+    /// `load_super_attr_value_w` body.  The fused CPython opcode reaches this
+    /// ordinary graph so `_super_check` and `W_Super.getattribute` are traced
+    /// from their generated JitCodes, as PyPy traces their RPython owners.
+    static LOAD_SUPER_ATTR_VALUE_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
 }
 
 /// Scan the build-time names index for the unique entry equal to `name`.
@@ -587,6 +592,17 @@ pub fn pos_inner_jitcode() -> Option<Arc<JitCode>> {
     let idx = POS_INNER_JITCODE_INDEX.with(|cell| {
         *cell.get_or_init(|| {
             compute_pathed_jitcode_index("pyre_interpreter::objspace::descroperation::pos_inner")
+        })
+    })?;
+    get_jitcode_by_index(idx)
+}
+
+/// The wrapped-name interpreter-source value half of `LOAD_SUPER_ATTR`, resolved by the
+/// graph key the codewriter allocated it under and cached per thread.
+pub fn load_super_attr_value_jitcode() -> Option<Arc<JitCode>> {
+    let idx = LOAD_SUPER_ATTR_VALUE_JITCODE_INDEX.with(|cell| {
+        *cell.get_or_init(|| {
+            compute_pathed_jitcode_index("pyre_interpreter::eval::load_super_attr_value_w")
         })
     })?;
     get_jitcode_by_index(idx)

@@ -1,6 +1,6 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
-# pyre-check: spec-folds=load_deref,load_super_attr,super_attr_unwrap
+# pyre-check: spec-folds=load_deref,load_super_attr,load_super_attr_descent,super_attr_unwrap
 # Zero-argument `super().val()` with the loop INSIDE the super-bearing method,
 # in the `for` spelling — the `for` twin of `load_super_attr.py`.
 #

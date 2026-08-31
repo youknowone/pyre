@@ -12204,7 +12204,27 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 pub fn builtin_super_from_frame(
     frame_ptr: *mut crate::pyframe::PyFrame,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (w_class, w_self) = super_operands_from_frame(frame_ptr)?;
+    if frame_ptr.is_null() {
+        return Err(crate::PyError::runtime_error("super(): no current frame"));
+    }
+    let frame = unsafe { &*frame_ptr };
+    let (self_is_cell, class_slot) = bare_super_frame_layout_words(frame.code());
+    builtin_super_from_frame_layout(frame_ptr, self_is_cell, class_slot)
+}
+
+/// Frame-red / pycode-green half of [`builtin_super_from_frame`].
+///
+/// PyPy computes `_get_self_location(frame.pycode)` from the green code object
+/// and reads only `frame.locals_cells_stack_w` from the red frame.  The
+/// generated opcode helper receives those two green layout words explicitly,
+/// so it never interprets the host Rust `CodeObject` layout as translated GC
+/// fields.
+pub fn builtin_super_from_frame_layout(
+    frame_ptr: *mut crate::pyframe::PyFrame,
+    self_is_cell: bool,
+    class_slot: isize,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (w_class, w_self) = super_operands_from_frame_layout(frame_ptr, self_is_cell, class_slot)?;
     let obj_type = super_check(w_class, w_self)?;
     Ok(pyre_object::descriptor::w_super_new(
         w_class, obj_type, w_self,
@@ -12259,45 +12279,64 @@ pub fn bare_super_frame_layout(code: &crate::CodeObject) -> Option<BareSuperFram
     })
 }
 
+/// Word ABI for the green result of [`bare_super_frame_layout`].
+///
+/// `-2` preserves the distinct no-arguments arm; `-1` is a missing
+/// `__class__` cell; non-negative values are locals-plus indices.
+pub fn bare_super_frame_layout_words(code: &crate::CodeObject) -> (bool, isize) {
+    match bare_super_frame_layout(code) {
+        None => (false, -2),
+        Some(layout) => (
+            layout.self_is_cell,
+            layout.class_slot.map(|slot| slot as isize).unwrap_or(-1),
+        ),
+    }
+}
+
 /// The `(__class__ cell, arg[0])` pair zero-argument `super()` is built from.
 ///
 /// Every raising arm here reads frame state and runs no Python, so a caller
 /// may take the `Err` and walk away without having changed anything.
-fn super_operands_from_frame(
+fn super_operands_from_frame_layout(
     frame_ptr: *mut crate::pyframe::PyFrame,
+    self_is_cell: bool,
+    class_slot: isize,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
     if frame_ptr.is_null() {
         return Err(crate::PyError::runtime_error("super(): no current frame"));
     }
     let frame = unsafe { &*frame_ptr };
-    let code = frame.code();
-    let Some(layout) = bare_super_frame_layout(code) else {
+    if class_slot == -2 {
         return Err(crate::PyError::runtime_error("super(): no arguments"));
-    };
+    }
 
     let self_slot = locals_w!(frame)[0];
-    let w_self = if layout.self_is_cell
-        && !self_slot.is_null()
-        && unsafe { pyre_object::is_cell(self_slot) }
-    {
-        unsafe { pyre_object::w_cell_get(self_slot) }
-    } else {
-        self_slot
-    };
+    let w_self =
+        if self_is_cell && !self_slot.is_null() && unsafe { pyre_object::is_cell(self_slot) } {
+            unsafe { pyre_object::w_cell_get(self_slot) }
+        } else {
+            self_slot
+        };
     if w_self.is_null() {
         return Err(crate::PyError::runtime_error("super(): arg[0] deleted"));
     }
 
-    let Some(class_slot) = layout.class_slot else {
+    if class_slot < 0 {
         return Err(crate::PyError::runtime_error(
             "super(): __class__ cell not found",
         ));
+    }
+    let class_slot = class_slot as usize;
+    // Keep the virtualizable array access immediate, as PyPy's
+    // `_super_from_frame` does with `frame.locals_cells_stack_w[index]`.
+    // Passing the array through `slice::get` makes the array object itself an
+    // SSA link argument, which `jtransform.py` correctly rejects as a
+    // virtualizable-array escape.
+    let class_cell = if class_slot < locals_w!(frame).len() {
+        locals_w!(frame)[class_slot]
+    } else {
+        PY_NULL
     };
-    let class_cell = locals_w!(frame)
-        .as_slice()
-        .get(class_slot)
-        .copied()
-        .unwrap_or(PY_NULL);
     let w_class = if !class_cell.is_null() && unsafe { pyre_object::is_cell(class_cell) } {
         unsafe { pyre_object::w_cell_get(class_cell) }
     } else {

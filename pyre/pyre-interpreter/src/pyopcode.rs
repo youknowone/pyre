@@ -1590,7 +1590,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
     fn load_super_attr_with(
         &mut self,
-        _name: &str,
+        _name_idx: usize,
         _is_method: bool,
         _is_two_arg: bool,
     ) -> Result<(), PyError> {
@@ -3588,10 +3588,9 @@ pub fn execute_load_super_attr<E: OpcodeStepExecutor>(
     };
     let raw = op_arg_as_usize(op_arg);
     let idx = raw >> 2;
-    let name = &code.names[idx];
     let is_method = (raw & 1) != 0;
     let is_two_arg = (raw & 2) != 0;
-    executor.load_super_attr_with(name, is_method, is_two_arg)?;
+    executor.load_super_attr_with(idx, is_method, is_two_arg)?;
     Ok(StepResult::Continue)
 }
 

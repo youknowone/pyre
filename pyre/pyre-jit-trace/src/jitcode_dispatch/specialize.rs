@@ -4792,6 +4792,123 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
 /// `W_Super.getattribute` never consults the receiver's dict, so `o.name = x`
 /// cannot shadow `super().name`.
 #[allow(clippy::too_many_arguments)]
+fn try_walker_orthodox_load_super_attr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    global_super: OpRef,
+    self_obj: OpRef,
+    cls: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some(concrete_super) = walker_concrete_ref_object(ctx, global_super) else {
+        return Ok(None);
+    };
+    if !pyre_interpreter::builtins::is_builtin_super_type(concrete_super) {
+        return Ok(None);
+    }
+    let Some(concrete_cls) = walker_concrete_ref_object(ctx, cls) else {
+        return Ok(None);
+    };
+    let Some(concrete_self) = walker_concrete_ref_object(ctx, self_obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+
+    // The generated body is safe to try transactionally when both the
+    // `_super_check` and descriptor-binding path are Python-free.  The tests
+    // here are only a descent gate; the guards and result come exclusively
+    // from `load_super_attr_value`'s generated JitCode.  Python-running arms
+    // keep the established residual/fallback route until SubRaise propagation
+    // from an opcode-owned helper walk is wired below this boundary.
+    let Some((_objtype, _version, w_descr, class_mode)) = (unsafe {
+        pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, &name)
+    }) else {
+        return Ok(None);
+    };
+    if super_attr_binding(w_descr, concrete_self, class_mode).is_none() {
+        return Ok(None);
+    }
+
+    let Some(jc_arc) = crate::jitcode_runtime::load_super_attr_value_jitcode() else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let Some((frame_box, frame_ptr)) = walker_executing_frame_box(ctx) else {
+        return Ok(None);
+    };
+    let sym = unsafe { &*sym_ptr };
+    let w_code = w_code_ptr as pyre_object::PyObjectRef;
+    // PyPy's opcode hands `W_Super.getattribute` the immutable wrapped
+    // `co_names_w[nameindex]`, not the host `Vec` that owns the compiler's
+    // strings.  Realize that same interned object before descending so the
+    // generated graph does not need to reinterpret Rust's `Vec` layout.
+    let w_name = unsafe {
+        pyre_interpreter::pycode::w_code_getname_w_or_new(w_code, name_idx, name.as_ref())
+    };
+    let code = unsafe {
+        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
+    };
+    let (self_is_cell, class_slot) =
+        pyre_interpreter::builtins::bare_super_frame_layout_words(code);
+    let w_name_arg = ctx.trace_ctx.const_ref(w_name as i64);
+    let is_two_arg = ctx.trace_ctx.const_int(0);
+    let self_is_cell_arg = ctx.trace_ctx.const_int(i64::from(self_is_cell));
+    let class_slot_arg = ctx.trace_ctx.const_int(class_slot as i64);
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        "load_super_attr_value_commit",
+        "load_super_attr_value_call_site",
+        &[is_two_arg, self_is_cell_arg, class_slot_arg],
+        &[
+            ConcreteValue::Int(0),
+            ConcreteValue::Int(i64::from(self_is_cell)),
+            ConcreteValue::Int(class_slot as i64),
+        ],
+        &[global_super, self_obj, cls, frame_box, w_name_arg],
+        &[
+            ConcreteValue::Ref(concrete_super),
+            ConcreteValue::Ref(concrete_self),
+            ConcreteValue::Ref(concrete_cls),
+            ConcreteValue::Ref(frame_ptr as pyre_object::PyObjectRef),
+            ConcreteValue::Ref(w_name),
+        ],
+    );
+    let (outcome, _walk_start) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => {
+            return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc });
+        }
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -4808,6 +4925,23 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
     }
     if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
         return Ok(None);
+    }
+    if spec_gate(SpecFold::LoadSuperAttrDescent, || {
+        try_walker_orthodox_load_super_attr(
+            ctx,
+            op_pc,
+            global_super,
+            self_obj,
+            cls,
+            w_code_ptr,
+            name_idx,
+            dst,
+            dst_bank,
+        )
+    })?
+    .is_some()
+    {
+        return Ok(Some(()));
     }
     let Some(concrete_super) = walker_concrete_ref_object(ctx, global_super) else {
         return Ok(None);

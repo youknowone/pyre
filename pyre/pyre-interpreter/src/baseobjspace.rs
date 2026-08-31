@@ -410,11 +410,10 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
     if !is_type_like_w(w_type) {
         return false;
     }
-    let mro_ptr = w_type_get_mro(w_type);
-    if !mro_ptr.is_null() {
-        return mro_contains((*mro_ptr).as_slice(), cls);
-    }
-    issubtype_slow_and_wrong(w_type, cls)
+    // One owner for `_issubtype`: under the JIT this registered
+    // `dont_look_inside` helper is the residual scan inside PyPy's
+    // `_pure_issubtype`; it also owns the partially-initialized slow path.
+    pyre_object::w_type_issubtype(w_type, cls)
 }
 
 /// JIT walker accessor for `issubtype_w` without exposing the internal helper
@@ -6616,6 +6615,26 @@ pub(crate) fn super_getattribute(obj: PyObjectRef, w_name: PyObjectRef) -> PyRes
     }
 }
 
+/// `W_Super.getattribute` entry for a name realized from `CodeObject.names`.
+///
+/// `LOAD_SUPER_ATTR` starts with the interpreter's `&str` code-name table and
+/// only wraps that value for PyPy's `co_names_w` interface, so this boundary
+/// cannot carry a lone surrogate.  Keep the general wrapped-name entry above
+/// for explicit `super.__getattribute__` calls; this opcode-only spelling
+/// avoids materializing Rust's `Result<&str, Utf8Error>` in generated JitCode.
+///
+/// # Safety
+/// `w_name` must be a string created from a valid UTF-8 code name.
+pub(crate) unsafe fn super_getattribute_code_name(
+    obj: PyObjectRef,
+    w_name: PyObjectRef,
+) -> PyResult {
+    let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    super_getattribute_str(obj, unsafe {
+        pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
+    })
+}
+
 // ─── `w_name`-taking attribute API ───
 //
 // `descroperation.py/247/255 getattr/setattr/delattr(space, w_obj,
@@ -11748,7 +11767,10 @@ pub unsafe fn isinstance_w(w_obj: PyObjectRef, w_cls: PyObjectRef) -> bool {
     let w_obj_type = if is_instance(w_obj) {
         w_instance_get_type(w_obj)
     } else {
-        crate::typedef::r#type(w_obj).map_or(pyre_object::PY_NULL, |p| p.as_ptr())
+        match crate::typedef::r#type(w_obj) {
+            Some(w_type) => w_type.as_ptr(),
+            None => pyre_object::PY_NULL,
+        }
     };
     if w_obj_type.is_null() {
         return false;
