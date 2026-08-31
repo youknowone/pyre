@@ -74,12 +74,12 @@ const NODE_NAME: &str = "(none)";
 
 /// `inet_aton` — the lenient parser.
 pub(super) fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
-    super::inet_text::aton(text.to_bytes())
+    super::inet::aton(text.to_bytes())
 }
 
 /// `inet_ntoa` — the dotted-quad spelling of four address bytes.
 pub(super) fn inet_ntoa(packed: [u8; 4]) -> Option<String> {
-    Some(super::inet_text::ntoa(packed))
+    Some(super::inet::ntoa(packed))
 }
 
 /// `inet_pton`'s two failures, which it reports through different channels: a
@@ -96,8 +96,8 @@ pub(crate) enum PtonError {
 pub(super) fn pton(family: i32, text: &std::ffi::CStr) -> Result<Vec<u8>, PtonError> {
     let bytes = text.to_bytes();
     let packed = match family {
-        AF_INET => super::inet_text::pton_v4(bytes).map(|a| a.to_vec()),
-        AF_INET6 => super::inet_text::pton_v6(bytes).map(|a| a.to_vec()),
+        AF_INET => super::inet::pton_v4(bytes).map(|a| a.to_vec()),
+        AF_INET6 => super::inet::pton_v6(bytes).map(|a| a.to_vec()),
         _ => {
             return Err(PtonError::Family(crate::builtins::wasm_errno::EAFNOSUPPORT));
         }
@@ -108,10 +108,10 @@ pub(super) fn pton(family: i32, text: &std::ffi::CStr) -> Result<Vec<u8>, PtonEr
 /// `inet_ntop` — the canonical spelling of a packed address.
 pub(super) fn ntop(family: i32, packed: &[u8]) -> Option<String> {
     match family {
-        AF_INET => Some(super::inet_text::ntoa([
+        AF_INET => Some(super::inet::ntoa([
             packed[0], packed[1], packed[2], packed[3],
         ])),
-        AF_INET6 => Some(super::inet_text::ntop_v6(packed)),
+        AF_INET6 => Some(super::inet::ntop_v6(packed)),
         _ => None,
     }
 }

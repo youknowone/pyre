@@ -2590,7 +2590,7 @@ mod certificate_methods {
                 return Ok(self.der);
             }
             if encoding == 1 || encoding == 0x101 {
-                let encoded = pyre_native::binascii::b2a_base64(
+                let encoded = rustpython_common::binascii::b2a_base64(
                     unsafe { pyre_object::bytesobject::w_bytes_data(self.der) },
                     false,
                 );

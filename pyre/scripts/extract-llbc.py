@@ -33,12 +33,14 @@ from llbc_extract import CrateSpec, llbc_dest_path, run_cli  # noqa: E402
 # `--no-typecheck` was tried beside it and made the pass slower.
 CHARON_ARGS = ["--hide-marker-traits"]
 
-# `pyre-native` is the stable library/backend boundary.  Charon follows local
+# `pyre-native` is the stable native/backend boundary.  Charon follows local
 # workspace dependencies by default, so merely moving an implementation into
 # that crate does *not* keep it out of an extracting crate's ULLBC.  Keep the
 # crate root opaque explicitly: callers retain declarations for residual calls
-# and opaque pointer/value types, while crypto/codec/TLS bodies and generated
-# tables are never translated into the interpreter or JIT artefacts.
+# and opaque pointer/value types, while compression/crypto/TLS bodies are never
+# translated into the interpreter or JIT artefacts.  Reusable pure engines live
+# in rustpython-common instead; the output audit below guards their foreign
+# boundary as well.
 PYRE_RUNTIME_CHARON_ARGS = [*CHARON_ARGS, "--opaque", "pyre_native"]
 
 SPECS: dict[str, CrateSpec] = {
@@ -179,30 +181,51 @@ def main() -> None:
             if crate not in {"pyre-module", "pyre-interpreter", "pyre-jit"}:
                 continue
             artefact = dest_dir / SPECS[crate].output_name
-            _assert_native_items_opaque(artefact)
+            _assert_runtime_library_items_opaque(artefact)
 
 
-def _assert_native_items_opaque(path: Path) -> None:
-    """Refuse a ULLBC that contains a translated `pyre_native` item body."""
+def _assert_runtime_library_items_opaque(path: Path) -> None:
+    """Refuse translated native or rustpython-common engine bodies."""
     delimiter = b'{"def_id":'
     native_prefix = b',"item_meta":{"name":[{"Ident":["pyre_native",0]'
+    common_prefix = b',"item_meta":{"name":[{"Ident":["rustpython_common",0]'
+    # `inet` reaches an artefact only on a target with no host socket layer,
+    # since `_socket` imports it exactly there; on the hosts this script
+    # extracts from, that entry matches nothing and guards the extraction
+    # targets rather than the current ones.
+    common_engine_prefixes = (
+        common_prefix + b'},{"Ident":["binascii",0]',
+        common_prefix + b'},{"Ident":["inet",0]',
+        common_prefix + b'},{"Ident":["json",0]',
+        common_prefix + b'},{"Ident":["encodings",0]},{"Ident":["cjk",0]',
+    )
     opacity_key = b'"opacity":"'
     buffer = bytearray()
 
     def check_record(record: bytes | bytearray) -> None:
         comma = record.find(b",")
-        if comma < 0 or not record[comma:].startswith(native_prefix):
+        if comma < 0:
+            return
+        item = record[comma:]
+        # A workspace-local body is only ever legitimate as `Opaque`; a crate
+        # Charon never enters is `Foreign` instead, and either answer keeps the
+        # engine out of the artefact.
+        if item.startswith(native_prefix):
+            boundary, allowed = "pyre_native", {"Opaque"}
+        elif any(item.startswith(prefix) for prefix in common_engine_prefixes):
+            boundary, allowed = "rustpython_common engine", {"Opaque", "Foreign"}
+        else:
             return
         start = record.find(opacity_key)
         if start < 0:
-            raise SystemExit(f"extract-llbc.py: {path} native item has no opacity")
+            raise SystemExit(f"extract-llbc.py: {path} {boundary} item has no opacity")
         start += len(opacity_key)
         end = record.find(b'"', start)
         opacity = bytes(record[start:end]).decode("ascii", errors="replace")
-        if opacity != "Opaque":
+        if opacity not in allowed:
             raise SystemExit(
-                f"extract-llbc.py: {path} contains a {opacity} pyre_native item; "
-                "native library bodies must stay outside runtime ULLBC"
+                f"extract-llbc.py: {path} contains a {opacity} {boundary} item; "
+                "library bodies must stay outside runtime ULLBC"
             )
 
     with path.open("rb") as source:
