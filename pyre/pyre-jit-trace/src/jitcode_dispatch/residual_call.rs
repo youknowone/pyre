@@ -7634,7 +7634,33 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // other forces-branch paths (CALL_MAY_FORCE_*, the loopinvariant
     // sub-case below, the elidable branch, the default branch) come
     // out of `select_residual_call_opcode`.
-    if ei.is_call_release_gil() {
+    // pyjitpl.py forces-branch sub-case, ahead of the release-gil one:
+    //     if effectinfo.oopspecindex == effectinfo.OS_LIBFFI_CALL:
+    //         resbox = self.metainterp.direct_libffi_call(allboxes, c_result, descr)
+    //     if resbox is None: ...release_gil / may_force...
+    // A decline lands on exactly that fallthrough.
+    let libffi_recorded = if ei.oopspecindex == majit_ir::OopSpecIndex::LibffiCall {
+        match direct_libffi_call(
+            ctx,
+            ei,
+            &allboxes,
+            call_descr,
+            dst_bank,
+            dst,
+            op.pc,
+            "dispatch_residual_call_iRd_kind",
+        )? {
+            LibffiCallOutcome::Raised(outcome) => return Ok((outcome, op.next_pc)),
+            LibffiCallOutcome::Recorded => true,
+            LibffiCallOutcome::Declined => false,
+        }
+    } else {
+        false
+    };
+    if libffi_recorded {
+        // `direct_libffi_call` recorded the specialized call and both of the
+        // forces branch's guards.
+    } else if ei.is_call_release_gil() {
         if let Some(outcome) = direct_call_release_gil(
             ctx,
             ei,
@@ -9076,7 +9102,33 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
 
     // pyjitpl.py forces-branch sub-case: route release-gil through
     // `direct_call_release_gil`.  Mirrors `dispatch_residual_call_iRd_kind`.
-    if ei.is_call_release_gil() {
+    // pyjitpl.py forces-branch sub-case, ahead of the release-gil one:
+    //     if effectinfo.oopspecindex == effectinfo.OS_LIBFFI_CALL:
+    //         resbox = self.metainterp.direct_libffi_call(allboxes, c_result, descr)
+    //     if resbox is None: ...release_gil / may_force...
+    // A decline lands on exactly that fallthrough.
+    let libffi_recorded = if ei.oopspecindex == majit_ir::OopSpecIndex::LibffiCall {
+        match direct_libffi_call(
+            ctx,
+            ei,
+            &allboxes,
+            call_descr,
+            dst_bank,
+            dst,
+            op.pc,
+            "dispatch_residual_call_iIRd_kind",
+        )? {
+            LibffiCallOutcome::Raised(outcome) => return Ok((outcome, op.next_pc)),
+            LibffiCallOutcome::Recorded => true,
+            LibffiCallOutcome::Declined => false,
+        }
+    } else {
+        false
+    };
+    if libffi_recorded {
+        // `direct_libffi_call` recorded the specialized call and both of the
+        // forces branch's guards.
+    } else if ei.is_call_release_gil() {
         if let Some(outcome) = direct_call_release_gil(
             ctx,
             ei,
@@ -9323,7 +9375,33 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    if ei.is_call_release_gil() {
+    // pyjitpl.py forces-branch sub-case, ahead of the release-gil one:
+    //     if effectinfo.oopspecindex == effectinfo.OS_LIBFFI_CALL:
+    //         resbox = self.metainterp.direct_libffi_call(allboxes, c_result, descr)
+    //     if resbox is None: ...release_gil / may_force...
+    // A decline lands on exactly that fallthrough.
+    let libffi_recorded = if ei.oopspecindex == majit_ir::OopSpecIndex::LibffiCall {
+        match direct_libffi_call(
+            ctx,
+            ei,
+            &allboxes,
+            call_descr,
+            dst_bank,
+            dst,
+            op.pc,
+            "dispatch_residual_call_iIRFd_kind",
+        )? {
+            LibffiCallOutcome::Raised(outcome) => return Ok((outcome, op.next_pc)),
+            LibffiCallOutcome::Recorded => true,
+            LibffiCallOutcome::Declined => false,
+        }
+    } else {
+        false
+    };
+    if libffi_recorded {
+        // `direct_libffi_call` recorded the specialized call and both of the
+        // forces branch's guards.
+    } else if ei.is_call_release_gil() {
         if let Some(outcome) = direct_call_release_gil(
             ctx,
             ei,
