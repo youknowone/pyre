@@ -549,7 +549,11 @@ class Connection(object):
         sys.audit("sqlite3.connect/handle", self)
         # CPython 3.14 `pysqlite_connection_init_impl`: disabled autocommit
         # starts and thereafter continuously maintains an explicit transaction.
-        if self._autocommit is False:
+        # `pysqlite_connection_set_isolation_level` avoids `commit()` for the
+        # same reason it notes -- it also runs from here -- while this port
+        # calls it, so `isolation_level=None` has already opened the
+        # transaction through that maintenance branch.
+        if self._autocommit is False and not self.in_transaction:
             self._begin()
 
     def __del__(self):
