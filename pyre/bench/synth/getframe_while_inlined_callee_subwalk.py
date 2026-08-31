@@ -29,8 +29,9 @@
 #     declares that set as `last_instr`, `pycode`, `valuestackdepth`,
 #     `debugdata` and `locals_cells_stack_w`.  `f_lasti` reads `last_instr`, so
 #     its gateway forces.  A bare call forces nothing, and neither does a read
-#     of `f_code` or `f_back`: `pyframe.rs descr_typecheck_fget_f_code` and
-#     `..._f_back` each say at their own definition why they carry no marker.
+#     of `f_code` or `f_back`: `pyframe.rs`
+#     `__majit_wrap_descr_typecheck_fget_f_code` and `..._fget_f_back` each say
+#     at their own definition why they carry no marker.
 # Changing any of the three can silently stop exercising the path.
 #
 # The printed total counts one callee entry per iteration, so a resume that

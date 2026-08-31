@@ -97,14 +97,15 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// `interp_jit.py`'s string list: `last_instr`, `pycode`, `valuestackdepth`,
 /// `debugdata` and the `locals_cells_stack_w` array (`w_globals` is skipped;
 /// no `PyFrame` field answers to it).  `pyframe.rs`
-/// `descr_typecheck_fget_f_back` and `..._fget_f_builtins` read `f_backref`
-/// and `w_builtin`, so they carry none.
+/// `__majit_wrap_descr_typecheck_fget_f_back` and `..._fget_f_builtins` read
+/// `f_backref` and `w_builtin`, so they carry none.
 ///
 /// A hand-placed marker owes one question upstream's injection never has to
 /// ask, because it fires at every access in every graph rather than once per
 /// gateway: can the trace's shadow and the live frame disagree about the field
 /// this body reads?  For `pycode` they cannot — it is written only at frame
-/// construction — so `descr_typecheck_fget_f_code` carries no marker either.
+/// construction — so `__majit_wrap_descr_typecheck_fget_f_code` carries no
+/// marker either.
 /// Each of the three says so at its own definition, with what the marker
 /// measured.
 ///

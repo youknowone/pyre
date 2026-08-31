@@ -37,9 +37,10 @@
 # `sys._getframe` takes no virtualizable force of its own; `rvirtualizable.py
 # hook_access_field` places one at each REDIRECTED field access, and `f_lasti`
 # reads `last_instr`, one of the five `virtualizable_gen.rs` declares.  The
-# `f_code.co_name` both oracles read is not a second escape — `pyframe.rs
-# descr_typecheck_fget_f_code` carries no marker and says at its own definition
-# why `pycode` needs none — and `leaf_a`'s call is at depth 0, which
+# `f_code.co_name` both oracles read is not a second escape — `pyframe.rs`
+# `__majit_wrap_descr_typecheck_fget_f_code` carries no marker and says at its
+# own definition why `pycode` needs none — and `leaf_a`'s call is at depth 0,
+# which
 # `try_walker_specialize_sys_getframe` answers out of the portal virtualizable
 # the walk already holds, so the same read there moves no counter (measured).
 # `part_a` therefore keeps its identity oracle over compiled code while the
