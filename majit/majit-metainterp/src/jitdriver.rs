@@ -4012,11 +4012,33 @@ impl<S: JitState> JitDriver<S> {
                             .meta
                             .trace_ctx()
                             .and_then(|ctx| ctx.close_greens.clone());
-                        let resolved_key = self
-                            .meta
-                            .trace_ctx()
-                            .and_then(|ctx| ctx.close_green_key_hash())
-                            .or_else(|| self.current_trace_green_key());
+                        // `get_procedure_token(greenboxes)` (pyjitpl.py) walks
+                        // the cell chain and settles a chained bucket on the
+                        // greens themselves; a bare bucket hash cannot, because a
+                        // bucket whose occupant was filed under a minted cell key
+                        // holds no cell AT the hash. `compile_loop` files and
+                        // looks its loop up under the resolved key
+                        // (`WarmEnterState::resolve_cell_key`), so a door reading
+                        // the unresolved hash and a `compile_loop` reading the
+                        // resolved one answer differently about one close: the
+                        // door reports no target and falls through to a
+                        // `compile_loop` that refuses the same key for already
+                        // having a loop, giving the trace up as ABORT_BAD_LOOP.
+                        // The guard is left as it was, so every later failure
+                        // retraces it to the same answer and no bridge is ever
+                        // built. Resolve here so both doors read one cell.
+                        let close_key = self.meta.trace_ctx().and_then(|ctx| ctx.close_green_key());
+                        let resolved_key = match &close_key {
+                            Some(key) => {
+                                let make_key = || key.clone();
+                                Some(self.meta.resolve_cell_key(
+                                    key.get_uhash(),
+                                    Some(&make_key as &dyn Fn() -> majit_ir::GreenKey),
+                                ))
+                            }
+                            // `ctx.green_key` is resolved at trace start.
+                            None => self.current_trace_green_key(),
+                        };
                         // The cell token a close resolves is `jump_op.getdescr()`
                         // upstream (unroll.py:196 `cell_token =
                         // jump_op.getdescr()`, :321-322 `jitcelltoken =
@@ -4032,7 +4054,11 @@ impl<S: JitState> JitDriver<S> {
                         );
                         if crate::closedbg_enabled() {
                             eprintln!(
-                                "@@@CLOSE BRIDGE-TARGET close_greens={close_greens:?} resolved_key={} origin_key={}",
+                                "@@@CLOSE BRIDGE-TARGET close_greens={close_greens:?} close_hash={} resolved_key={} origin_key={}",
+                                close_key
+                                    .as_ref()
+                                    .map(|k| k.get_uhash() as i64)
+                                    .unwrap_or(-1),
                                 resolved_key.map(|k| k as i64).unwrap_or(-1),
                                 self.current_trace_green_key()
                                     .map(|k| k as i64)
