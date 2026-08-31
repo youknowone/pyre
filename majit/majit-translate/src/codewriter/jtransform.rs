@@ -3821,25 +3821,6 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
-        // `reload_top_root` re-reads the top shadow-stack slot and carries the
-        // value that slot was published with as its argument; the JIT does not
-        // distinguish an object from its post-move address, so the call is an
-        // alias of its operand and emits no jitcode op.  `pin_root` is NOT
-        // folded: it PUBLISHES its operand to a fresh root-stack slot, and
-        // hand-written brackets read those slots back positionally through
-        // bound `shadow_stack_len` / `shadow_stack_get` residuals
-        // (`w_slice_new`: three pins, then `shadow_stack_get(save_point + i)`
-        // after a collecting allocation).  Eliding the pin drops the slots the
-        // retained reads index into.
-        if let CallTarget::FunctionPath { segments } = target
-            && let [.., crate_name, module, leaf] = segments.as_slice()
-            && crate_name == crate::runtime_names::crates::OBJECT
-            && module == "gc_roots"
-            && leaf == "reload_top_root"
-            && args.len() == 1
-        {
-            return RewriteResult::Identity(args[0].clone());
-        }
         // A zero-arg transparent `Tuple` constructor is the unit value `()` —
         // the MIR return-place aggregate of a `-> ()` function (e.g.
         // `w_list_append`).  It carries no payload and no runtime
@@ -12565,11 +12546,13 @@ mod tests {
         }
     }
 
-    /// `reload_top_root` aliases its operand and contributes no operation;
-    /// `pin_root` keeps its call, because it publishes a root-stack slot that
-    /// bound `shadow_stack_get` residuals read back positionally.
+    /// Both root-stack operations keep their call.  `pin_root` publishes a
+    /// slot that bound `shadow_stack_get` residuals read back positionally,
+    /// and `reload_top_root` re-reads the slot after a collection may have
+    /// moved the object; a trace that keeps the pre-move word instead has no
+    /// other forwarding for it.
     #[test]
-    fn gc_root_reload_elides_but_pin_root_keeps_its_publication() {
+    fn gc_root_pin_and_reload_keep_their_calls() {
         for leaf in ["pin_root", "reload_top_root"] {
             let config = GraphTransformConfig::default();
             let mut transformer = Transformer::new(&config);
@@ -12597,15 +12580,10 @@ mod tests {
                 &format!("gc_roots_{leaf}"),
                 &mut graph,
             );
-            let elides = leaf == "reload_top_root";
-            if elides {
-                assert!(matches!(rewritten, RewriteResult::Identity(alias) if alias == arg));
-            } else {
-                assert!(
-                    !matches!(rewritten, RewriteResult::Identity(_)),
-                    "pin_root must keep its publication"
-                );
-            }
+            assert!(
+                matches!(rewritten, RewriteResult::Keep),
+                "{leaf} must keep its call unrewritten"
+            );
 
             graph.blocks[entry.0].operations.push(op);
             let exceptblock = graph.exceptblock;
@@ -12615,10 +12593,14 @@ mod tests {
                 &format!("gc_roots_{leaf}"),
                 exceptblock,
             );
-            assert_eq!(
-                graph.blocks[entry.0].operations.is_empty(),
-                elides,
-                "reload_top_root elides; pin_root stays"
+            let surviving = &graph.blocks[entry.0].operations;
+            assert_eq!(surviving.len(), 1, "{leaf} must survive as one operation");
+            assert!(
+                matches!(
+                    &surviving[0].kind,
+                    OpKind::Call { target: survived, .. } if *survived == target
+                ),
+                "{leaf} must survive as the same call, not a replacement"
             );
         }
     }

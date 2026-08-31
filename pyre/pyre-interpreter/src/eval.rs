@@ -303,6 +303,31 @@ pub fn frame_anchor_release(depth: usize) {
     majit_gc::shadow_stack::try_pop_to(depth);
 }
 
+/// One-word residual-call ABI for the three slot ops and for the two
+/// [`FrameAnchor`] methods a walked handler graph reaches.
+///
+/// A value-returning residual is lowered as `(i64 x n) -> i64`; a raw
+/// `*mut PyFrame` / `usize` signature is narrower than a word on wasm32,
+/// where `call_indirect` type-checks its callee.
+///
+/// The two method spellings share these bridges because the front scalarises
+/// the one-word anchor: `FrameAnchor::new` is `from_raw`, and the `&self` of
+/// `FrameAnchor::live` reaches the residual as the anchor's own value rather
+/// than its address (the same scalarisation the ticker wrapper hit).
+pub extern "C" fn frame_anchor_push_jit_abi(frame: i64) -> i64 {
+    frame_anchor_push(frame as *mut PyFrame) as i64
+}
+
+/// One-word residual-call ABI for [`frame_anchor_live`].
+pub extern "C" fn frame_anchor_live_jit_abi(depth: i64) -> i64 {
+    frame_anchor_live(depth as usize) as i64
+}
+
+/// One-word residual-call ABI for [`frame_anchor_release`].
+pub extern "C" fn frame_anchor_release_jit_abi(depth: i64) {
+    frame_anchor_release(depth as usize);
+}
+
 /// rpython/memory/gctransform/framework.py `root_walker.walk_roots` parity:
 /// expose every live slot of `PyFrame.locals_cells_stack_w` on the active
 /// f_backref chain as a GC root.

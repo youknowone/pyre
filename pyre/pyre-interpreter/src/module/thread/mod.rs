@@ -366,6 +366,18 @@ pub(crate) fn all_thread_hooks_current(ec: &crate::PyExecutionContext) -> bool {
         && ec.profile_all_generation == PROFILE_ALL_GENERATION.load(Ordering::Acquire)
 }
 
+/// One-word residual-call ABI for [`all_thread_hooks_current`].
+///
+/// A value-returning residual is lowered as `(i64) -> i64`; the Rust
+/// signature's reference argument and `bool` result are narrower than a word
+/// on wasm32, where `call_indirect` type-checks its callee.
+pub extern "C" fn all_thread_hooks_current_jit_abi(ec: i64) -> i64 {
+    // SAFETY: the residual's slot is the execution context the walked graph
+    // read it from; it outlives the call.
+    let ec = unsafe { &*(ec as *const crate::PyExecutionContext) };
+    all_thread_hooks_current(ec) as i64
+}
+
 /// `dont_look_inside`: the per-thread trace/profile safepoint reads the
 /// process-wide generation counters and hook mutexes and applies any change
 /// to this thread's `ExecutionContext`.  The JIT does not trace this cold

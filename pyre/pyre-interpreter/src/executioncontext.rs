@@ -2382,6 +2382,18 @@ pub fn space_decrement_ticker(ec: &mut ExecutionContext, by: isize) -> isize {
     actionflag.decrement_ticker(by)
 }
 
+/// One-word residual-call ABI for [`space_decrement_ticker`].
+///
+/// The residual lowering types a value-returning call as `(i64, i64) -> i64`;
+/// the Rust signature's reference and `isize` are narrower than a word on
+/// wasm32, where `call_indirect` type-checks its callee.
+pub extern "C" fn space_decrement_ticker_jit_abi(ec: i64, by: i64) -> i64 {
+    // SAFETY: the residual's first slot is the execution context the walked
+    // graph read it from; it outlives the call.
+    let ec = unsafe { &mut *(ec as *mut ExecutionContext) };
+    space_decrement_ticker(ec, by as isize) as i64
+}
+
 pub struct AsyncAction {
     pub space: PyObjectRef,
     _action_index: isize,

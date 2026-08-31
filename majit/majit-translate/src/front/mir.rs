@@ -18458,12 +18458,15 @@ fn gc_root_pin_path(name: &str) -> bool {
 /// W_Root instance, re-creating on the read side exactly the StringRepr-meets-
 /// InstanceRepr union the write-side stamp exists to remove.  `get` is the
 /// only such leaf in `gc_roots`, so the match stays unambiguous.
+///
+/// `reload_top_root` answers the same kind of slot for the top entry, so it
+/// carries the stamp for the same reason.
 fn gc_root_gcref_result_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.iter().any(|s| *s == "gc_roots")
         && matches!(
             segments.last(),
-            Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get")
+            Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get") | Some(&"reload_top_root")
         )
 }
 

@@ -55,10 +55,6 @@ impl<T: rustpython_compiler_core::bytecode::OpArgType> ResidualSlot
 {
 }
 
-/// `FrameAnchor` is one machine word: a `usize` shadow-stack depth plus a
-/// zero-sized `PhantomData` marker, returned in a single register.
-impl ResidualRet for crate::eval::FrameAnchor {}
-
 impl<T> ResidualSlot for &T {}
 impl<T> ResidualSlot for &mut T {}
 impl<T> ResidualSlot for *const T {}
@@ -1073,16 +1069,6 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::shadow_stack_cell",
         pyre_object::gc_roots::shadow_stack_cell,
     );
-    // `pin_root` stays a real residual (jtransform folds only
-    // `reload_top_root`): it publishes its operand to a fresh root-stack
-    // slot that the bound `shadow_stack_len` / `shadow_stack_get` reads
-    // above index back into.
-    pa1(
-        &mut entries,
-        "pyre_object::gc_roots::pin_root",
-        "pyre_object::pin_root",
-        pyre_object::gc_roots::pin_root,
-    );
     // The other two thirds of the `push_roots` bracket.  Both take the cell
     // pointer `shadow_stack_cell` returns, so a descent that gets past the
     // resolution lands on these next; all three are one-word scalars in and
@@ -1167,6 +1153,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::gc_roots::pin_root",
         "pyre_object::pin_root",
         pyre_object::gc_roots::pin_root,
+    );
+    // `reload_top_root` re-reads the top entry of the `majit_gc` shadow stack
+    // (a different structure from `pin_root`'s root stack) after a call that
+    // may have moved what was published there.  A trace that kept the pre-move
+    // word instead has no other forwarding for it, so the call stays a
+    // residual — and a `Ref` result makes it a direct `call_indirect`, hence
+    // the word-ABI bridge rather than the raw `fn` its neighbours bind.
+    cpa1(
+        &mut entries,
+        "pyre_object::gc_roots::reload_top_root",
+        "pyre_object::reload_top_root",
+        pyre_object::gc_roots::reload_top_root_jit_abi,
     );
     // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
     // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through
@@ -2821,94 +2819,85 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 
     // Eval-breaker poll residuals: the dispatch-loop poll reads the breaker
     // word, drains a pending memory-error bit, and services stop-the-world /
-    // finalization requests through these cross-crate helpers.  These rows
-    // and the frame-anchor rows below are reached only by the split-portal
-    // jitcode walk; they publish raw Rust `fn` pointers, whose wasm32
-    // signature types would mismatch the word-typed indirect-call table, so
-    // the registration is native-only — on wasm32 the paths fall back to
-    // the safe symbolic hash.
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let eval_breaker_load: fn() -> usize = majit_ir::eval_breaker_word::load;
-        p0(
-            &mut entries,
-            "majit_ir::eval_breaker_word::load",
-            eval_breaker_load,
-        );
-        let eval_breaker_take_memory_error: fn() -> bool =
-            majit_ir::eval_breaker_word::take_memory_error;
-        p0(
-            &mut entries,
-            "majit_ir::eval_breaker_word::take_memory_error",
-            eval_breaker_take_memory_error,
-        );
-        let gc_safepoint_poll: fn() = majit_gc::gc_sync::safepoint_poll;
-        p0(
-            &mut entries,
-            "majit_gc::gc_sync::safepoint_poll",
-            gc_safepoint_poll,
-        );
-        let thread_park_if_finalizing: fn() = crate::module::thread::park_if_finalizing;
-        p0(
-            &mut entries,
-            "pyre_interpreter::module::thread::park_if_finalizing",
-            thread_park_if_finalizing,
-        );
-        let thread_all_hooks_current: fn(&crate::PyExecutionContext) -> bool =
-            crate::module::thread::all_thread_hooks_current;
-        p1(
-            &mut entries,
-            "pyre_interpreter::module::thread::all_thread_hooks_current",
-            thread_all_hooks_current,
-        );
-        let ec_space_decrement_ticker: fn(&mut crate::PyExecutionContext, isize) -> isize =
-            crate::executioncontext::space_decrement_ticker;
-        p2(
-            &mut entries,
-            "pyre_interpreter::executioncontext::space_decrement_ticker",
-            ec_space_decrement_ticker,
-        );
-        // The `anchor` handler graph residualizes `FrameAnchor::new` itself
-        // (its aggregate return keeps it out of inlining), and `push_anchored`
-        // reads back through `FrameAnchor::live`; bind both under the exact
-        // path spellings the codewriter hashes for method targets.
-        let eval_frame_anchor_new: fn(&mut crate::PyFrame) -> crate::eval::FrameAnchor =
-            crate::eval::FrameAnchor::new;
-        pa1(
-            &mut entries,
-            "eval::FrameAnchor::new",
-            "pyre_interpreter::eval::FrameAnchor::new",
-            eval_frame_anchor_new,
-        );
-        let eval_frame_anchor_live_method: fn(&crate::eval::FrameAnchor) -> *mut crate::PyFrame =
-            crate::eval::FrameAnchor::live;
-        pa1(
-            &mut entries,
-            "eval::FrameAnchor::live",
-            "pyre_interpreter::eval::FrameAnchor::live",
-            eval_frame_anchor_live_method,
-        );
-        let eval_frame_anchor_push: fn(*mut crate::PyFrame) -> usize =
-            crate::eval::frame_anchor_push;
-        p1(
-            &mut entries,
-            "pyre_interpreter::eval::frame_anchor_push",
-            eval_frame_anchor_push,
-        );
-        let eval_frame_anchor_live: fn(usize) -> *mut crate::PyFrame =
-            crate::eval::frame_anchor_live;
-        p1(
-            &mut entries,
-            "pyre_interpreter::eval::frame_anchor_live",
-            eval_frame_anchor_live,
-        );
-        let eval_frame_anchor_release: fn(usize) = crate::eval::frame_anchor_release;
-        p1(
-            &mut entries,
-            "pyre_interpreter::eval::frame_anchor_release",
-            eval_frame_anchor_release,
-        );
-    }
+    // finalization requests through these cross-crate helpers.
+    //
+    // The value-returning ones ride a word-ABI bridge.  A residual whose
+    // result is Int/Ref lowers to a direct `call_indirect` typed
+    // `(i64 x n) -> i64` (`ResidualCallAbi::Word`, the default), and a Rust
+    // `-> usize` / `-> bool` / `&T` argument is narrower than a word on
+    // wasm32, where the call type-checks its callee.  The two `-> ()` polls
+    // keep their plain rows because they take no arguments: `() -> ()` is the
+    // type the void residual family declares on every target.  A void residual
+    // that DOES take arguments needs a bridge like any other, which is why
+    // `frame_anchor_release` has one.
+    cp0(
+        &mut entries,
+        "majit_ir::eval_breaker_word::load",
+        majit_ir::eval_breaker_word::load_jit_abi,
+    );
+    cp0(
+        &mut entries,
+        "majit_ir::eval_breaker_word::take_memory_error",
+        majit_ir::eval_breaker_word::take_memory_error_jit_abi,
+    );
+    let gc_safepoint_poll: fn() = majit_gc::gc_sync::safepoint_poll;
+    p0(
+        &mut entries,
+        "majit_gc::gc_sync::safepoint_poll",
+        gc_safepoint_poll,
+    );
+    let thread_park_if_finalizing: fn() = crate::module::thread::park_if_finalizing;
+    p0(
+        &mut entries,
+        "pyre_interpreter::module::thread::park_if_finalizing",
+        thread_park_if_finalizing,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::module::thread::all_thread_hooks_current",
+        crate::module::thread::all_thread_hooks_current_jit_abi,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::executioncontext::space_decrement_ticker",
+        crate::executioncontext::space_decrement_ticker_jit_abi,
+    );
+    // The `anchor` handler graph residualizes `FrameAnchor::new` itself
+    // (its aggregate return keeps it out of inlining), and `push_anchored`
+    // reads back through `FrameAnchor::live`; bind both under the exact
+    // path spellings the codewriter hashes for method targets.  Both reach
+    // the same bridges as the free slot ops: `new` is `from_raw`, and
+    // `front::mir` aliases an `Rvalue::Ref` over a bare local to that local's
+    // own Variable without emitting an address-of, so `live`'s `&self`
+    // arrives as the one-word anchor's value — the depth — rather than a
+    // pointer to it.
+    cpa1(
+        &mut entries,
+        "eval::FrameAnchor::new",
+        "pyre_interpreter::eval::FrameAnchor::new",
+        crate::eval::frame_anchor_push_jit_abi,
+    );
+    cpa1(
+        &mut entries,
+        "eval::FrameAnchor::live",
+        "pyre_interpreter::eval::FrameAnchor::live",
+        crate::eval::frame_anchor_live_jit_abi,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::eval::frame_anchor_push",
+        crate::eval::frame_anchor_push_jit_abi,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::eval::frame_anchor_live",
+        crate::eval::frame_anchor_live_jit_abi,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::eval::frame_anchor_release",
+        crate::eval::frame_anchor_release_jit_abi,
+    );
     pa1(
         &mut entries,
         "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
