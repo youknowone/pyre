@@ -11263,11 +11263,32 @@ fn unicode_to_decimal_w(
 /// source object, not the whitespace-trimmed or Unicode-normalized buffer the
 /// number parser consumes internally.
 fn invalid_int_literal(w_source: PyObjectRef, base: u32) -> crate::PyError {
-    let source_repr = unsafe { crate::display::py_repr_wtf8(w_source) }
+    // `%.200R` clips the rendering at 200 code points, closing quote included
+    // — a long literal is reported unterminated.
+    const MAX_REPR_CODE_POINTS: usize = 200;
+    // `_PyLong_FromBytes` renders the buffer it was handed through a fresh
+    // `PyBytes_FromStringAndSize`, so a `bytearray` — or a subclass of either
+    // — reports its contents as `b'-'` rather than its own repr.
+    let rendered = if unsafe { pyre_object::bytesobject::is_bytes_like(w_source) } {
+        // Copy the contents out before allocating: the source is free to move
+        // while the new object is built.
+        let clipped = unsafe {
+            let data = pyre_object::bytesobject::bytes_like_data(w_source);
+            data[..data.len().min(MAX_REPR_CODE_POINTS)].to_vec()
+        };
+        pyre_object::bytesobject::w_bytes_from_bytes(&clipped)
+    } else {
+        w_source
+    };
+    let source_repr = unsafe { crate::display::py_repr_wtf8(rendered) }
         .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<unprintable>".to_string()));
+    let mut clipped = rustpython_wtf8::Wtf8Buf::new();
+    for point in source_repr.code_points().take(MAX_REPR_CODE_POINTS) {
+        clipped.push(point);
+    }
     crate::PyError::value_error(crate::display::wtf8_format!(
         format!("invalid literal for int() with base {base}: "),
-        source_repr
+        clipped
     ))
 }
 
@@ -21920,9 +21941,85 @@ fn float_round_ndigits(v: f64, ndigits: i64) -> f64 {
             .parse::<f64>()
             .unwrap_or(v)
     } else {
-        let factor = 10f64.powi((-ndigits) as i32);
-        round_half_even(v / factor) * factor
+        round_to_power_of_ten(v, (-ndigits) as u32)
     }
+}
+
+/// Round `v` to the nearest multiple of `10^k`, ties to even, and answer the
+/// double nearest that decimal.
+///
+/// `double_round` gets this by rounding the exact decimal expansion exactly
+/// once — `_Py_dg_dtoa(v, 3, ndigits, ...)` then `_Py_dg_strtod`. Scaling by
+/// `10f64.powi(k)` instead rounds twice: the quotient is already the nearest
+/// double to `v / 10^k`, so a value whose exact quotient sits just off a tie
+/// can be pushed onto it, and the multiply back adds a second error —
+/// `round(7.378703e20, -1)` landed a ulp high that way.
+///
+/// The expansion is read off `trunc()`, which is exact, plus one bit saying
+/// whether anything was dropped: only the digits at and left of the rounding
+/// position decide the answer, and everything to the right of the point can
+/// only break a tie.
+fn round_to_power_of_ten(v: f64, k: u32) -> f64 {
+    if !v.is_finite() {
+        return v;
+    }
+    let truncated = v.trunc();
+    let has_fraction = v != truncated;
+    // `truncated` is integer-valued, so rendering it with no fractional digits
+    // is exact however large it is.
+    let digits = format!("{:.0}", truncated.abs());
+    let k = k as usize;
+    let (head, tail) = if digits.len() > k {
+        digits.split_at(digits.len() - k)
+    } else {
+        ("", digits.as_str())
+    };
+    // Compare the discarded suffix against half of `10^k`. Both sides are
+    // rendered at width `k`, so the comparison is the numeric one.
+    let mut discarded = vec![b'0'; k - tail.len()];
+    discarded.extend_from_slice(tail.as_bytes());
+    let mut half = vec![b'0'; k];
+    half[0] = b'5';
+    let round_up = match discarded.cmp(&half) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // An exact tie in the integer digits is only a tie when nothing was
+        // dropped after the point; otherwise the value is above the midpoint.
+        std::cmp::Ordering::Equal => {
+            has_fraction || head.as_bytes().last().is_some_and(|d| (d - b'0') % 2 == 1)
+        }
+    };
+    let mut rounded = head.as_bytes().to_vec();
+    if round_up {
+        increment_decimal_digits(&mut rounded);
+    }
+    let mut text = String::with_capacity(rounded.len() + k + 1);
+    if v.is_sign_negative() {
+        text.push('-');
+    }
+    // An empty head is the whole value rounding away, which still has to spell
+    // a number for the parse below.
+    text.push_str(if rounded.is_empty() {
+        "0"
+    } else {
+        std::str::from_utf8(&rounded).unwrap_or("0")
+    });
+    text.extend(std::iter::repeat_n('0', k));
+    // Rounding up can carry past the largest double, which the caller reports
+    // as `rounded value too large to represent`.
+    text.parse::<f64>().unwrap_or(v)
+}
+
+/// Add one to a decimal digit string in place, growing it on carry-out.
+fn increment_decimal_digits(digits: &mut Vec<u8>) {
+    for digit in digits.iter_mut().rev() {
+        if *digit < b'9' {
+            *digit += 1;
+            return;
+        }
+        *digit = b'0';
+    }
+    digits.insert(0, b'1');
 }
 
 /// Whether the receiver's `__round__` is still one of the two the builtin
@@ -22398,7 +22495,19 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
         // underscore removal and parsing, including strict surrogate
         // rejection.
         let s = unicode_to_decimal_w(a)?;
-        let (r, i) = parse_complex_str(&s).ok_or_else(|| {
+        // `_Py_string_to_number_with_underscores` validates the separators
+        // itself and reports a misplaced one under its own wording, naming the
+        // *original* argument rather than the decimal-normalized copy; only a
+        // string that survives that pass reaches `complex_from_string_inner`
+        // and its "malformed" message.
+        let Some(cleaned) = strip_numeric_underscores(&s) else {
+            let source_repr = unsafe { crate::display::py_repr_wtf8(a)? };
+            return Err(crate::PyError::value_error(crate::display::wtf8_format!(
+                "could not convert string to complex: ",
+                source_repr
+            )));
+        };
+        let (r, i) = parse_complex_str(&cleaned).ok_or_else(|| {
             crate::PyError::new(
                 crate::PyErrorKind::ValueError,
                 "complex() arg is a malformed string".to_string(),

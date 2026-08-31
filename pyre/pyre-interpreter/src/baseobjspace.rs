@@ -2157,11 +2157,14 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             pyre_object::bytesobject::bytes_like_getitem(obj, actual as usize) as i64,
         ));
     }
-    let name = if is_bytes { "byte" } else { "bytearray" };
-    Err(PyError::new(
-        PyErrorKind::IndexError,
-        format!("{name} index out of range"),
-    ))
+    // `bytes_item` names no type in the out-of-range message, unlike
+    // `bytearray_getitem`.
+    let message = if is_bytes {
+        "index out of range"
+    } else {
+        "bytearray index out of range"
+    };
+    Err(PyError::new(PyErrorKind::IndexError, message.to_string()))
 }
 
 #[inline(never)]
