@@ -10962,6 +10962,16 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
 /// no blackhole image to hand them to,
 /// `run_blackhole_interp_to_cancel_tracing` has nowhere to resume, so the walk
 /// goes on recording exactly as it does there.
+/// Name the gate a `locals()` / `vars()` / `dir()` expansion declined at, so a
+/// census over a corpus attributes every refusal to one gate rather than
+/// re-deriving it by reading.  `arm` distinguishes the standard-virtualizable
+/// expansion from the inlined-callee one, which decline for different reasons.
+fn locals_expansion_declined(arm: &str, why: &str) {
+    if fbw_debug_abort_enabled() {
+        eprintln!("[decline-why] LOCALS-{arm} {why}");
+    }
+}
+
 fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -11123,20 +11133,26 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    macro_rules! decline {
+        ($why:literal) => {{
+            locals_expansion_declined("PORTAL", $why);
+            return Ok(None);
+        }};
+    }
     // Plain zero-argument `bh_call_fn(callable, PY_NULL)` shape only.
     if r_args.len() != 2 {
-        return Ok(None);
+        decline!("arity-not-zero-arg");
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
     let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
         (arg_concretes[0], arg_concretes[1])
     else {
-        return Ok(None);
+        decline!("args-not-refs");
     };
     // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
     // as arg0 — not a plain `locals()` call.
     if concrete_callable.is_null() || !null_or_self.is_null() {
-        return Ok(None);
+        decline!("bound-receiver-or-null-callable");
     }
     // `vars()` with no argument delegates straight to `builtin_locals`
     // (`app_inspect.py`), so both names share the fold; `vars(obj)` and
@@ -11149,7 +11165,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     } else if pyre_interpreter::builtins::is_builtin_dir_function(concrete_callable) {
         FrameLocalsBuiltin::SortedNames
     } else {
-        return Ok(None);
+        decline!("not-a-locals-builtin");
     };
     // Inside an inline sub-walk or an inlined callee body, the frame
     // `gettopframe_nohidden()` resolves is the CALLEE's, which the expansion
@@ -11176,7 +11192,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         ctx.trace_ctx.standard_virtualizable_box(),
         ctx.trace_ctx.standard_virtualizable_ptr(),
     ) else {
-        return Ok(None);
+        decline!("no-standard-virtualizable");
     };
     // The frame `locals()` reports on is `ec.gettopframe_nohidden()`
     // (`interp_inspect.py:7-11`).  Resolve it the same way and require it to BE
@@ -11184,17 +11200,17 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // handed out through the backref chain, resolves elsewhere and declines.
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
-        return Ok(None);
+        decline!("no-exec-context");
     }
     let frame = unsafe { (*ec).gettopframe_nohidden() };
     if frame.is_null() || frame as usize != vable_ptr {
-        return Ok(None);
+        decline!("top-frame-not-the-virtualizable");
     }
     let frame_ref = unsafe { &*frame };
     let code_ptr = unsafe { pyre_interpreter::pyframe::pyframe_get_pycode(frame_ref) };
     let code_obj = unsafe { &*code_ptr };
     if !pyre_interpreter::PyFrame::code_locals_are_modelled_fastlocals(code_obj) {
-        return Ok(None);
+        decline!("not-modelled-fastlocals");
     }
     let numlocals = code_obj.varnames.len();
     // `fast2locals` binds one key per localsplus slot: `varnames` below
@@ -11240,23 +11256,23 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // `locals_cells_stack_w` is PyFrame's only virtualizable array
     // (`virtualizable_gen.rs arrays`), so array index 0 names it.
     let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
-        return Ok(None);
+        decline!("no-virtualizable-info");
     };
     let Some(lengths) = ctx
         .trace_ctx
         .virtualizable_array_lengths()
         .map(<[usize]>::to_vec)
     else {
-        return Ok(None);
+        decline!("no-virtualizable-array-lengths");
     };
     if info.num_arrays() != 1 || lengths.first().copied().unwrap_or(0) < nslots {
-        return Ok(None);
+        decline!("vable-array-shape-too-narrow");
     }
     let (Some(fdescr), Some(adescr)) = (
         info.array_field_descrs().first().cloned(),
         info.array_descrs.first().cloned(),
     ) else {
-        return Ok(None);
+        decline!("no-vable-array-descrs");
     };
     // `fast2locals` opens on `self.getorcreatedebug()` (pyframe.py) and
     // writes into ITS `w_locals`: the mapping is the FRAME's, carried across
@@ -11269,7 +11285,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         .trace_ctx
         .virtualizable_entry_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
     else {
-        return Ok(None);
+        decline!("no-debugdata-vable-entry");
     };
     // Read the mapping through the SHADOW's payload, which is what the emitted
     // `getfield_gc_r` reads, and require it to be the one the residual would
@@ -11287,7 +11303,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         unsafe { (*shadow_debugdata).w_locals }
     };
     if !std::ptr::eq(w_locals, frame_ref.get_w_locals()) {
-        return Ok(None);
+        decline!("shadow-mapping-not-the-frames");
     }
     // `f_extra_locals` is the OTHER half of what the residual reports.  A
     // proxy write whose key names no writable fast local lands there
@@ -11303,7 +11319,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         unsafe { (*shadow_debugdata).w_extra_locals }
     };
     if !w_extra_locals.is_null() || !frame_ref.get_extra_locals().is_null() {
-        return Ok(None);
+        decline!("frame-has-extra-locals");
     }
     // Two shapes, each pinned by a guard so the compiled loop side-exits when
     // the frame moves to the other one:
@@ -11329,7 +11345,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
                     && std::ptr::eq((*w_locals).w_class, canonical_dict)
             })
     {
-        return Ok(None);
+        decline!("frame-mapping-not-exact-dict");
     }
     // Resolve every slot's shadow entry BEFORE emitting anything, so a slot the
     // shadow cannot answer declines from a clean trace position.  The read is
@@ -11340,7 +11356,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     for i in 0..nslots {
         let flat = info.get_index_in_array(0, i, &lengths);
         let Some((slot_op, entry_value)) = ctx.trace_ctx.virtualizable_entry_at(flat) else {
-            return Ok(None);
+            decline!("slot-no-vable-entry");
         };
         // The value comes from the SHADOW, never from `locals_w!(frame)`.  An
         // unsynchronized virtualizable's heap array holds whatever the frame
@@ -11362,7 +11378,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             .unwrap_or(entry_value)
         {
             majit_ir::Value::Ref(gcref) => gcref.as_usize() as pyre_object::PyObjectRef,
-            _ => return Ok(None),
+            _ => decline!("slot-concrete-not-ref"),
         };
         let cell = is_cell_slot(i);
         let value = if cell {
@@ -11372,7 +11388,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             // second arm with its own guard, so decline instead -- the same
             // answer the callee arm gives at `cell-slot-not-a-cell`.
             if held.is_null() || !unsafe { pyre_object::is_cell(held) } {
-                return Ok(None);
+                decline!("cell-slot-not-a-cell");
             }
             unsafe { pyre_object::w_cell_get(held) }
         } else {
@@ -11384,7 +11400,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         // The fresh arm never held the key, so it skips the delete and needs
         // none.
         if cell && i >= numlocals && value.is_null() && frame_owned {
-            return Ok(None);
+            decline!("unbound-cell-slot-needs-delitem");
         }
         slots.push(PortalLocalSlot { value, cell });
     }
@@ -11478,7 +11494,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // publishing it; nothing has been emitted yet, so decline and let the
     // residual raise.
     if concrete_result.is_null() {
-        return Ok(None);
+        decline!("concrete-result-null");
     }
     let concrete_locals_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete_locals as usize));
 
@@ -11910,21 +11926,12 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     concrete_callable: pyre_object::PyObjectRef,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    /// Name the gate that declined.  Unlike the portal arm's decline, which
-    /// falls through to the generic residual, this one costs the caller its
-    /// whole inlined callee, so "the expansion models no part of this shape"
-    /// has to be attributable to one gate rather than re-derived by reading.
+    /// Name the gate that declined.  A decline here costs the caller its whole
+    /// inlined callee, so "the expansion models no part of this shape" has to
+    /// be attributable to one gate rather than re-derived by reading.
     macro_rules! decline {
         ($why:literal) => {{
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] LOCALS-IN-CALLEE {}", $why);
-            }
-            return Ok(None);
-        }};
-        ($why:literal, $($arg:tt)*) => {{
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] LOCALS-IN-CALLEE {}", format!($why, $($arg)*));
-            }
+            locals_expansion_declined("IN-CALLEE", $why);
             return Ok(None);
         }};
     }
