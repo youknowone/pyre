@@ -1,12 +1,13 @@
 # pyre-check: spec-folds=load_attr,builtin_getattr
-# pyre-check: max-wasm-ratio=5.2
-# This threshold=1 fixture compiles 70 wasm loops against 30 native loops. On
-# the final wasm-host module, four ratio probes reached 4.2x..4.5x; the runner's
-# own census attributes 183.2ms to materializing 31 trace functions in wasmtime
-# and only 40.7ms to all 436 guest/host residual crossings. Eliminating every
-# crossing would therefore still not make the global 4x ceiling reliable here.
-# The 5.2x allowance is the 4.5x high-water mark plus the required 15% fitting
-# margin; the exact loop/abort/guard jitstats below remain independently gated.
+# pyre-check: max-wasm-ratio=6.3
+# Function.call_args now enters every application-level callee through the
+# recursive portal, matching PyPy's PyCode.funcrun -> PyFrame.run chain.  The
+# oracle reaches 446 loops / 4 bridges in this pure-Python pickle workload;
+# pyre's wasm run reaches 72 / 0, so suppressing those entry traces to recover
+# the old timing would move away from the oracle.  wasm materializes the traces
+# as separate modules, while this fixture also retains 450 host residual calls.
+# The post-port ratios reproduce at 5.3x and 5.4x against dynasm; 6.3x is the
+# highest observation plus WASM_RATIO_FIT_HEADROOM (15%).
 # The attribute fold, 690 firings across the corpus and undeclared. Pure-Python
 # pickle drives it 122 times here, more than any other fixture.  It also reaches
 # `builtin_getattr`, which a corpus census found no other fixture firing: once

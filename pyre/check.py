@@ -194,13 +194,22 @@ WASM_TIMEOUT_SCALE = 4.0
 # short_circuit_boxed_int_cross_fn 3.0x/3.5x and pickle_terminal_raise_resume
 # steady at 3.4x.
 #
-# ⛔Every one of those is a gated reading, not an exempted one: no fixture in
-# the tree carries a `max-wasm-ratio` header any more. This paragraph used to
-# except builtin_folds_hot and math_folds_hot as allowance-holders and no longer
-# can. The ratios are from a base that has since moved -- one later ubuntu run
-# of 249 gated fixtures read pickle_terminal_raise_resume worst at 3.26x with
-# foriter_make_function_body absent from the table, which under the union rule
-# below is a reason to census again, not a refutation of 3.74x.
+# Those were all base-gated readings at the time: this paragraph used to except
+# builtin_folds_hot and math_folds_hot as allowance-holders, then no fixture in
+# the tree carried a `max-wasm-ratio` header. The ratios are from a base that
+# has since moved -- one later ubuntu run of 249 gated fixtures read
+# pickle_terminal_raise_resume worst at 3.26x with foriter_make_function_body
+# absent from the table, which under the union rule below is a reason to census
+# again, not a refutation of 3.74x.
+#
+# The Function.call_args parity port deliberately changed that census: Python
+# dunders that the old shortcut kept on the plain evaluator now enter the
+# recursive portal just as PyCode.funcrun -> PyFrame.run does in PyPy.  The
+# float_subclass_binop_dispatch and pickle_terminal_raise_resume fixtures carry
+# fitted allowances for the resulting wasm module-compilation tax.  Their
+# headers record both oracle topology and the measurements; removing the new
+# traces to regain this base ceiling would restore the very deviation the port
+# fixed.
 #
 # Under the highest-observed-plus-15% rule the allowances are fitted with, that
 # 3.74x asks for 4.30x -- ABOVE this constant. 4.0 is therefore not slack: it
@@ -1799,17 +1808,18 @@ def wasm_ratio_gate(path):
     Read for every bench rather than synthetic ones alone, because the fixtures
     that need an allowance are not all synthetic.
 
-    What the fixtures carrying one have in common: the wasm backend reaches
-    CPython-level objects through interpreter round-trips and allocates each on
-    a Rust heap the wasm path does not yet collect, so a loop dominated by that
-    work runs several times dynasm's execution time for a reason that is
-    structural rather than a regression. The allowances are set at the highest
-    ratio observed plus 15% (`WASM_RATIO_FIT_HEADROOM`, which `print_summary`
-    also requires before it will call an allowance outgrown), and each fixture
-    records the ratios it was fitted to. ubuntu-24.04 is the only runner that
-    builds wasm, so it supplies most of them; a fixture sitting on the gate
-    locally is fitted here instead, which is why an allowance can name a host
-    no CI run measures.
+    Fixtures carrying one must record their structural reason. Historically
+    that was the wasm backend reaching CPython-level objects through interpreter
+    round-trips and allocating each on a Rust heap the wasm path does not yet
+    collect. Function-entry-heavy fixtures can instead be dominated by wasm's
+    one-module-per-trace compilation tax after an orthodox portal change; their
+    headers must pin the corresponding PyPy topology so an allowance cannot
+    hide over-tracing. The allowances are set at the highest ratio observed
+    plus 15% (`WASM_RATIO_FIT_HEADROOM`, which `print_summary` also requires
+    before it will call an allowance outgrown), and each fixture records the
+    ratios it was fitted to. ubuntu-24.04 is the only runner that builds wasm,
+    so it supplies most of them; a fixture sitting on the gate locally is fitted
+    here instead, which is why an allowance can name a host no CI run measures.
 
     15% because the ratio moves with host load even though both sides are
     user-CPU and measured in the same invocation: fannkuch reads 2.9x on an
