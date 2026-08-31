@@ -18645,7 +18645,7 @@ thread_local! {
     static PENDING_CLOSE_FINALIZER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn take_pending_close_finalizer() -> bool {
+pub(crate) fn take_pending_close_finalizer() -> bool {
     PENDING_CLOSE_FINALIZER.with(|slot| slot.replace(false))
 }
 
@@ -19318,7 +19318,16 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
         }
     }
     let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
-    let outcome = match generator_send_ex(gen_obj, w_none(), Some(err), None, true) {
+    let sent = generator_send_ex(gen_obj, w_none(), Some(err), None, true);
+    // Taken unconditionally, so a census no arm below spends cannot be read by
+    // a later close.
+    let released_graph_has_finalizer = take_pending_close_finalizer();
+    // The boundary collection runs `__del__`, so only an arm that has already
+    // consumed the propagation root may take it. `Ok(_)` and the trailing
+    // `Err(e)` leave their exception in flight in this native local, which the
+    // collector does not root, and a collection there sweeps its traceback
+    // chain out from under `record_application_traceback`.
+    match sent {
         Ok(_) => {
             // Generator yielded after GeneratorExit — RuntimeError.
             // generator.py:267-268 `"%s ignored GeneratorExit" % self.KIND`.
@@ -19338,6 +19347,7 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             // unlike a Python handler, no PUSH_EXC_INFO will clear the
             // temporary propagation root for us.
             crate::eval::set_in_flight_exception(PY_NULL);
+            generator_close_finalizer_boundary(released_graph_has_finalizer);
             value
         }
         Err(e) if e.kind == PyErrorKind::GeneratorExit => {
@@ -19345,12 +19355,11 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             // GeneratorExit after matching it.  Mirror PUSH_EXC_INFO's
             // ownership transfer by ending pyre's propagation root here.
             crate::eval::set_in_flight_exception(PY_NULL);
+            generator_close_finalizer_boundary(released_graph_has_finalizer);
             Ok(w_none())
         }
         Err(e) => Err(e),
-    };
-    generator_close_finalizer_boundary(take_pending_close_finalizer());
-    outcome
+    }
 }
 
 pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {

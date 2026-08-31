@@ -4928,6 +4928,9 @@ impl PyFrame {
                         true,
                     )
                 };
+                crate::baseobjspace::generator_close_finalizer_boundary(
+                    crate::baseobjspace::take_pending_close_finalizer(),
+                );
                 return Ok(());
             }
             // pyframe.py:815-820: a dead `f_generator_wref` simply skips the
