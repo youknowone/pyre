@@ -475,10 +475,15 @@ pub fn load_extension_module(
     // the one library owned by `EXTENSIONS`, so resolve PyPy's cache before
     // opening on this host abstraction.
     if let Some(handle) = cached_extension_handle(path) {
-        if lookup_cffi_init(handle, name).is_none() && lookup_init(handle, name)?.is_none() {
+        // `create_extension_module` takes the CFFI branch before it reaches the
+        // extension cache, so a generated module is rebuilt on every import.
+        // Serving one from the cache restores `name` alone and leaves the
+        // `name.lib` entry the initializer also registers missing.
+        let cffi = lookup_cffi_init(handle, name).is_some();
+        if !cffi && lookup_init(handle, name)?.is_none() {
             return Err(missing_init_error(name, path));
         }
-        if let Some(module) = cached_extension(name, path) {
+        if !cffi && let Some(module) = cached_extension(name, path) {
             let roots = pyre_object::gc_roots::push_roots();
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(module);
