@@ -10057,6 +10057,16 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
+    // The one frame binding the whole dispatch loop reads through. Seeded from
+    // the parameter here — the parameter itself is not read inside the loop —
+    // and re-seeded through `FrameView::reload(f)` after every collection
+    // point. At the jit_merge_point split only greens and reds may stay live
+    // (`split_before_jit_merge_point` links exactly those), and `f` is the
+    // marker's red, so chaining every reload through `f` keeps the split
+    // legal; a fresh `frame as *mut PyFrame` cast inside the loop would be
+    // value-numbered into one definition that crosses the split as neither.
+    let mut f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+
     loop {
         // PyPy's ActionFlag is one process breaker.  Keep pyre's free-threaded
         // finalization and STW extensions on the same already-established
@@ -10093,7 +10103,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // after every collection-point call in this loop (bytecode_trace,
         // perform_actions, execute_opcode_step, handle_exception, can_enter_jit /
         // maybe_compile_and_run).
-        let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+        f = FrameView::reload(f);
 
         // The plain evaluator's twin: a bounded major collection that reached
         // `max_heap_size` owes a `MemoryError`, and the safepoint above — which
@@ -10125,7 +10135,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 &mut next_instr,
             ) {
                 // handle_exception allocates → re-seed before the write.
-                let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                f = FrameView::reload(f);
                 unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                 continue;
             }
@@ -10145,13 +10155,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             pc,
             marker_profiled,
             marker_pycode,
-            unsafe { &mut *(frame as *mut PyFrame) },
+            unsafe { &mut *f },
             marker_ec,
         );
-        // The marker's red `frame` is the function parameter — the one
-        // variable declared live across the split, as PyFrame.dispatch's
-        // `self` is upstream. The marker does not collect; raw reads keep
-        // going through the reload-seeded `f`.
+        // `f` is the marker's red `frame` — the one frame value declared
+        // live across the split, as PyFrame.dispatch's `self` is upstream.
+        // The marker does not collect.
 
         // `interp_jit.py` `PyFrame.dispatch`: `co_code = pycode.co_code`,
         // read from the green the marker just declared and nowhere else. One
@@ -10234,7 +10243,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             if unsafe { &mut *f }.take_failed_attr_before_opcode() {
                 unsafe { (*ec_ptr).run_failed_attr_finalizers() };
             }
-            let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+            f = FrameView::reload(f);
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             // A compiled back-edge deopts when the process breaker is armed.
             // On resume, run the live frame's ordinary bytecode_trace so its
@@ -10254,14 +10263,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     // bytecode_trace at this opcode.  In particular, an
                     // asynchronously injected exception must be catchable by
                     // the target frame's surrounding try/except.
-                    let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                    f = FrameView::reload(f);
                     let mut next_instr = unsafe { &*f }.next_instr();
                     if pyre_interpreter::eval::handle_exception(
                         unsafe { &mut *f },
                         &mut err,
                         &mut next_instr,
                     ) {
-                        let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                        f = FrameView::reload(f);
                         unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                         continue;
                     }
@@ -10269,7 +10278,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 }
                 // bytecode_trace may allocate (tracer callback) → the frame may
                 // have moved; re-seed before reading it again.
-                let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                f = FrameView::reload(f);
                 // A trace callback may perform a debugger line-jump by
                 // setting `frame.f_lineno` (`fset_f_lineno` → `last_instr
                 // = best_addr`).  The opcode for this iteration was
@@ -10310,7 +10319,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                         // the current opcode so the frame's try/except can catch
                         // it. `frame.last_instr` was set to `pc` above, so
                         // `handle_exception` finds the covering handler.
-                        let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                        f = FrameView::reload(f);
                         let mut next_instr = unsafe { &*f }.next_instr();
                         if pyre_interpreter::eval::handle_exception(
                             unsafe { &mut *f },
@@ -10319,7 +10328,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                         ) {
                             // handle_exception may allocate; re-seed before the
                             // final frame write.
-                            let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                            f = FrameView::reload(f);
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
@@ -10331,7 +10340,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // The ec block above may have run bytecode_trace / perform_actions
         // (collection points) on a fall-through path; re-seed before the
         // opcode dispatch.
-        let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+        f = FrameView::reload(f);
         let mut next_instr = unsafe { &*f }.next_instr();
         let step_result =
             execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, next_instr);
@@ -10357,7 +10366,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 }
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer for the compile path.
-                let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                f = FrameView::reload(f);
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
                 let marker_ec = pyre_interpreter::call::getexecutioncontext();
@@ -10373,12 +10382,12 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     loop_header_pc,
                     marker_profiled,
                     marker_pycode,
-                    unsafe { &mut *(frame as *mut PyFrame) },
+                    unsafe { &mut *f },
                     marker_ec,
                 ) {
                     // maybe_compile_and_run compiles and may allocate → re-seed
                     // before handle_exception reads the frame.
-                    let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                    f = FrameView::reload(f);
                     let loop_result = take_pending_loop_exit(marker_ec);
                     // warmspot.py handle_jitexception: an
                     // `ExitFrameWithExceptionRef` from a direct compiled-code
@@ -10400,7 +10409,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                             &mut next_instr,
                         ) {
                             // handle_exception may allocate → re-seed.
-                            let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                            f = FrameView::reload(f);
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
@@ -10414,14 +10423,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Err(mut err) => {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer.
-                let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                f = FrameView::reload(f);
                 if pyre_interpreter::eval::handle_exception(
                     unsafe { &mut *f },
                     &mut err,
                     &mut next_instr,
                 ) {
                     // handle_exception may allocate → re-seed before the write.
-                    let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+                    f = FrameView::reload(f);
                     unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                     continue;
                 }
