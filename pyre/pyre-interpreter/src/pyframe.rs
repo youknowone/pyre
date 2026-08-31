@@ -3137,10 +3137,16 @@ impl PyFrame {
         self.getorcreate_debug_data(init_lineno)
     }
 
-    /// PyPy-compatible alias for `code()`.
+    /// `pyframe.py PyFrame.getcode`: `hint(self.pycode, promote=True)`.
+    /// `pycode` is a virtualizable field, so a trace reads it as a box; the
+    /// promote is what makes the code object — and every code-invariant the
+    /// callers below read off it — a constant for the compiled loop.  The
+    /// undecorated [`PyFrame::code`] is the read for paths upstream reaches
+    /// through `self.pycode` directly.
     #[inline]
     pub fn getcode(&self) -> &CodeObject {
-        self.code()
+        let pycode = majit_metainterp::jit::promote(self.pycode);
+        unsafe { &*(crate::w_code_get_ptr(pycode as pyre_object::PyObjectRef) as *const CodeObject) }
     }
 
     /// PyPy-compatible `fget_code`.
@@ -5051,8 +5057,7 @@ impl PyFrame {
         let locals_roots = pyre_object::gc_roots::push_roots();
         let locals_slot = locals_roots.base();
         let _ = locals_roots.pin_root(w_locals);
-        let code_ptr = unsafe { pyframe_get_pycode(&*frame_anchor.live()) };
-        let code = unsafe { &*code_ptr };
+        let code = unsafe { (*frame_anchor.live()).getcode() };
         let numlocals = code.varnames.len();
 
         for i in 0..numlocals {
@@ -5156,8 +5161,7 @@ impl PyFrame {
         let locals_roots = pyre_object::gc_roots::push_roots();
         let locals_slot = locals_roots.base();
         let _ = locals_roots.pin_root(w_locals);
-        let code_ptr = unsafe { pyframe_get_pycode(&*frame_anchor.live()) };
-        let code = unsafe { &*code_ptr };
+        let code = unsafe { (*frame_anchor.live()).getcode() };
         let varnames = &code.varnames;
         let numlocals = varnames.len();
 
