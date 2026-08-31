@@ -302,6 +302,18 @@ unsafe fn write_code(
     Ok(())
 }
 
+/// `w_float_str`: the decimal spelling versions 0 and 1 carry a float in.
+/// `PyOS_double_to_string(v, 'g', 17, 0, NULL)` rendered through
+/// `w_short_pstring`, i.e. a one-byte length and that many bytes.  The
+/// infinities and NaN name themselves, and a negative NaN loses its sign.
+fn w_float_str(out: &mut Vec<u8>, value: f64) {
+    let text = rustpython_common::format::FormatSpec::parse(".17g")
+        .and_then(|spec| spec.format_float(value))
+        .expect("'.17g' is a valid float format spec");
+    out.write_u8(text.len() as u8);
+    out.write_slice(text.as_bytes());
+}
+
 fn write_object(
     out: &mut Vec<u8>,
     obj: PyObjectRef,
@@ -383,12 +395,26 @@ fn write_object(
             wire::serialize_value::<_, ConstantData>(out, DumpableValue::Integer(&value))
                 .unwrap_or_else(|never| match never {});
         } else if !is_heap_type && is_float(obj) {
-            out.write_u8(b'g');
-            out.write_u64(w_float_get_value(obj).to_bits());
+            let value = w_float_get_value(obj);
+            if version > 1 {
+                out.write_u8(b'g');
+                out.write_u64(value.to_bits());
+            } else {
+                out.write_u8(b'f');
+                w_float_str(out, value);
+            }
         } else if !is_heap_type && is_complex(obj) {
-            out.write_u8(b'y');
-            out.write_u64(w_complex_get_real(obj).to_bits());
-            out.write_u64(w_complex_get_imag(obj).to_bits());
+            let real = w_complex_get_real(obj);
+            let imag = w_complex_get_imag(obj);
+            if version > 1 {
+                out.write_u8(b'y');
+                out.write_u64(real.to_bits());
+                out.write_u64(imag.to_bits());
+            } else {
+                out.write_u8(b'x');
+                w_float_str(out, real);
+                w_float_str(out, imag);
+            }
         } else if !is_heap_type && is_str(obj) {
             let value = w_str_get_wtf8(obj).as_bytes();
             let interned = unicodeobject::is_interned_exact_str(obj);
