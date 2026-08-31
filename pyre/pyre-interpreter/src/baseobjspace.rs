@@ -18630,8 +18630,23 @@ pub(crate) unsafe fn generator_frame_is_finished(
     // object for.
     crate::executioncontext::may_ignore_finalizer(gen_obj);
     if prompt_finalization {
-        generator_close_finalizer_boundary(released_graph_has_finalizer);
+        PENDING_CLOSE_FINALIZER.with(|slot| slot.set(released_graph_has_finalizer));
     }
+}
+
+/// The census [`generator_frame_is_finished`] took before it cleared the
+/// frame's references, held until `descr_close` is back on its own stack.
+///
+/// The collection this gates runs `__del__`, so it cannot run from inside the
+/// teardown: `_invoke_execute_frame`'s `finally` has not restored the
+/// execution context yet and the frame it is unwinding is still reachable from
+/// native locals the collector does not root.
+thread_local! {
+    static PENDING_CLOSE_FINALIZER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn take_pending_close_finalizer() -> bool {
+    PENDING_CLOSE_FINALIZER.with(|slot| slot.replace(false))
 }
 
 /// CPython 3.14 `gen_close` / `_PyFrame_ClearExceptCode`: releasing the
@@ -19298,11 +19313,12 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             } else {
                 generator_frame_is_finished(gen_obj, &mut *frame_ptr, prompt_finalizers);
             }
+            generator_close_finalizer_boundary(take_pending_close_finalizer());
             return Ok(w_none());
         }
     }
     let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
-    match generator_send_ex(gen_obj, w_none(), Some(err), None, true) {
+    let outcome = match generator_send_ex(gen_obj, w_none(), Some(err), None, true) {
         Ok(_) => {
             // Generator yielded after GeneratorExit — RuntimeError.
             // generator.py:267-268 `"%s ignored GeneratorExit" % self.KIND`.
@@ -19332,7 +19348,9 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             Ok(w_none())
         }
         Err(e) => Err(e),
-    }
+    };
+    generator_close_finalizer_boundary(take_pending_close_finalizer());
+    outcome
 }
 
 pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
