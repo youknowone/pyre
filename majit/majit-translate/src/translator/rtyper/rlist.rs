@@ -3045,8 +3045,11 @@ fn build_ll_arraymove_arm(
 ///
 /// * The `length <= 1` head.  Upstream's own comment says it is there "to
 ///   ensure that we get a proper effectinfo.write_descrs_arrays", not for
-///   speed, and the minted helper carries no `list.ll_arraymove` oopspec
-///   either — the same pairing `ll_arraycopy` is still missing.
+///   speed.  The arms below reach that same effectinfo through their own
+///   per-item `setarrayitem`, which upstream's memmove arm does not have.
+///   The `list.ll_arraymove` oopspec this helper is marked with is what
+///   `_handle_list_call` reads to emit OS_ARRAYMOVE; the same pairing
+///   `ll_arraycopy` is still missing.
 /// * The `must_split_gc_address_space()` dispatch and the
 ///   `raw_memmove_no_free` fast path it guards.  The body below IS
 ///   upstream's split-address-space branch, taken unconditionally.  That is

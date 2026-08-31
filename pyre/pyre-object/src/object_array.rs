@@ -172,7 +172,14 @@ pub extern "C" fn jit_ll_arraymove(array: i64, source_start: i64, dest_start: i6
         "ll_arraymove dest_start must be non-negative"
     );
 
-    let address = array as usize;
+    // A residual call copies its argument out of the jitframe before it
+    // enters host Rust.  A collection which ran at that boundary rewrites the
+    // jitframe/root slot but not this ABI copy, so follow the forwarding word
+    // before the layout query, the barriers and the copy all read the header.
+    // `gc_shrink_array` resolves the same way for the same reason; RPython's
+    // GC transform makes the equivalent reload around `rgc.ll_arraymove`
+    // automatically.
+    let address = crate::gc_hook::try_gc_current_object_address(array as *mut u8) as usize;
     let layout = majit_gc::gc_varsize_layout(address).unwrap_or(majit_gc::GcVarSizeLayout {
         base_size: ITEMS_BLOCK_TOKEN.base_size,
         item_size: ITEMS_BLOCK_TOKEN.item_size,

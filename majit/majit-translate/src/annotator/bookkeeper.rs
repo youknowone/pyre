@@ -1995,13 +1995,22 @@ impl Bookkeeper {
             let Some(n) = next else { break };
             self.project_struct_rows(&n)?;
         }
-        // Do not pre-emptively mark every projected row mutable.  RPython's
-        // `Attribute.modified` is driven by the actual constructor `setattr`
-        // during annotation (`unaryop.py SomeInstance.setattr`), which the
-        // adapter's FieldWrite lowering already emits.  Eagerly modifying the
-        // whole class here materializes fields no observed constructor wrote
-        // and hides phase-order bugs in repr setup.
-        self.getuniqueclassdef(&variant_host)
+        let classdef = self.getuniqueclassdef(&variant_host)?;
+        // Every payload row on a Rust enum variant is assigned by that
+        // variant's constructor. In RPython terms these are mutable instance
+        // attributes, not readonly class attributes: `Attribute.modified`
+        // runs during annotation before `InstanceRepr._setup_repr` builds its
+        // field table. Pyre pre-mints variants at session start so inheritance
+        // ids stay stable; mark the projected payload rows at that same point
+        // to preserve RPython's attrs-before-repr ordering even when another
+        // subject caches the repr before this constructor is annotated.
+        {
+            let mut classdef_mut = classdef.borrow_mut();
+            for attr in classdef_mut.attrs.values_mut() {
+                attr.modified(Some(&classdef))?;
+            }
+        }
+        Ok(classdef)
     }
 
     /// Register a trait family for receiver-driven method dispatch: a base

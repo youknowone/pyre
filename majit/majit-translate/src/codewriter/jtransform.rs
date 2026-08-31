@@ -4819,8 +4819,9 @@ impl<'a> Transformer<'a> {
     ) -> Option<RewriteResult> {
         use crate::codewriter::type_state::ConcreteType;
         // jtransform.py `_handle_list_call`: `list.ll_arraymove` is an OS9
-        // residual call. Descriptor analysis still sees the helper graph (and
-        // its literal length-one array store) through `op`; only the function
+        // residual call. Descriptor analysis still sees the helper graph —
+        // its per-item `setarrayitem` arms are what populate
+        // `effectinfo.write_descrs_arrays` — through `op`; only the function
         // address is retargeted to the native barrier+memmove body.
         if oopspec_name == "list.ll_arraymove" {
             let move_target = CallTarget::function_path(["jit_ll_arraymove"]);
