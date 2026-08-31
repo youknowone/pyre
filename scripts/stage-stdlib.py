@@ -40,31 +40,54 @@ ROOT = Path(__file__).resolve().parent.parent
 IMPLEMENTATION = "pyre3.14t"
 
 
-def extension_suffix() -> str:
-    """The suffix `cpyext::extension_suffix` publishes on supported hosts."""
-    if sys.platform == "darwin":
-        return ".pyre314-darwin.so"
+# The suffix `cpyext::extension_suffix` publishes for each release target.
+# The importer looks for exactly this name, so a file staged under any other
+# one is never found -- which is what a host-derived suffix produces when the
+# archive is cross-compiled.
+EXTENSION_SUFFIXES = {
+    "aarch64-apple-darwin": ".pyre314-darwin.so",
+    "x86_64-apple-darwin": ".pyre314-darwin.so",
+    "aarch64-unknown-linux-gnu": ".pyre314-aarch64-linux-gnu.so",
+    "x86_64-unknown-linux-gnu": ".pyre314-x86_64-linux-gnu.so",
+}
+
+
+def host_target() -> str | None:
+    """The release triple this host builds loadable extensions for."""
     machine = platform.machine().lower()
-    if machine in {"x86_64", "amd64"}:
-        return ".pyre314-x86_64-linux-gnu.so"
-    if machine in {"aarch64", "arm64"}:
-        return ".pyre314-aarch64-linux-gnu.so"
-    return ".pyre314-linux-gnu.so"
+    architecture = {
+        "x86_64": "x86_64",
+        "amd64": "x86_64",
+        "aarch64": "aarch64",
+        "arm64": "aarch64",
+    }.get(machine)
+    if architecture is None:
+        return None
+    if sys.platform == "darwin":
+        return f"{architecture}-apple-darwin"
+    if sys.platform.startswith("linux"):
+        return f"{architecture}-unknown-linux-gnu"
+    return None
 
 
-def build_sqlite3_cffi(destination: Path) -> None:
+def build_sqlite3_cffi(destination: Path, targets: list[str]) -> bool:
     """PyPy `package.py:create_package`'s `_sqlite3_build.py` entry.
 
     The generated library must be compiled by PyPy so cffi selects its
     `_cffi_pypyinit_*` form.  Pyre's extension loader consumes that immutable
     type context directly; renaming only the import suffix does not alter the
     native ABI.
+
+    Answers whether an owner for `_sqlite3` was staged.
     """
-    if os.name == "nt":
-        # Pyre's cpyext/host-dlopen feature is currently enabled only on macOS
-        # and Linux, so publishing an un-loadable Windows extension would hide
-        # the clean public-module fallback failure.
-        return
+    # cffi compiles through the host toolchain, so the library it produces
+    # loads only on the host's own triple.  A cross-compiled archive -- and
+    # Windows, where host dlopen is not built at all -- gets no extension
+    # rather than one its interpreter can never load.
+    host = host_target()
+    staged = [target for target in targets if target == host and target in EXTENSION_SUFFIXES]
+    if not staged:
+        return False
     pypy = os.environ.get("PYPY3") or shutil.which("pypy3")
     if not pypy:
         raise SystemExit("staging sqlite3 requires pypy3 (or PYPY3)")
@@ -98,8 +121,10 @@ print("PYRE_SQLITE3_CFFI=" + _sqlite3_build._ffi.compile(
         outputs = [line.removeprefix(marker) for line in result.stdout.splitlines() if line.startswith(marker)]
         if len(outputs) != 1:
             raise SystemExit("_sqlite3_build.py did not report exactly one extension path")
-        shutil.copy2(outputs[0], destination / f"_sqlite3_cffi{extension_suffix()}")
+        for target in staged:
+            shutil.copy2(outputs[0], destination / f"_sqlite3_cffi{EXTENSION_SUFFIXES[target]}")
     shutil.copy2(ROOT / "lib_pypy" / "_sqlite3.py", destination / "_sqlite3.py")
+    return True
 
 
 def ignored(_directory: str, names: list[str]) -> set[str]:
@@ -162,7 +187,7 @@ def stdlib_destination(assets_root: Path) -> Path:
     return assets_root / "lib" / IMPLEMENTATION
 
 
-def stage(assets_root: Path) -> None:
+def stage(assets_root: Path, targets: list[str]) -> None:
     destination = stdlib_destination(assets_root).resolve()
     allowed_root = (ROOT / "dist-assets").resolve()
     if destination == allowed_root or allowed_root not in destination.parents:
@@ -178,7 +203,17 @@ def stage(assets_root: Path) -> None:
     # would expose CPython-only test shims such as `_testcapi` and suppress
     # intended fallbacks for modules pyre owns natively.
     shutil.copytree(ROOT / "lib-python" / "3", destination, ignore=ignored)
-    build_sqlite3_cffi(destination)
+    if not build_sqlite3_cffi(destination, targets):
+        # `sqlite3/dbapi2.py` opens with `from _sqlite3 import *`, so without an
+        # owner the package raises from inside itself on every import.  Ship
+        # the absence instead: `import sqlite3` then reports a missing module,
+        # which is what the archive actually offers.
+        shutil.rmtree(destination / "sqlite3", ignore_errors=True)
+        print(
+            "stage-stdlib: no loadable _sqlite3 owner for "
+            f"{', '.join(targets) or 'this host'}; the sqlite3 package is not staged",
+            file=sys.stderr,
+        )
 
     if not (destination / "site.py").is_file():
         raise SystemExit("staged stdlib does not contain site.py")
@@ -192,8 +227,14 @@ def main() -> None:
         type=Path,
         help="directory whose contents dist copies into the archive root",
     )
+    parser.add_argument(
+        "targets",
+        nargs="*",
+        help="Rust target triples this archive is built for (default: the host)",
+    )
     args = parser.parse_args()
-    stage(args.assets_root)
+    targets = args.targets or [target for target in [host_target()] if target]
+    stage(args.assets_root, targets)
 
 
 if __name__ == "__main__":

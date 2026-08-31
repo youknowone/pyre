@@ -178,7 +178,7 @@ jobs:
         shell: bash
         env:
           PYPY3: ${{ steps.pypy-stdlib.outputs.python-path }}
-        run: python3 scripts/stage-stdlib.py dist-assets
+        run: python3 scripts/stage-stdlib.py dist-assets ${{ join(matrix.targets, ' ') }}
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot
