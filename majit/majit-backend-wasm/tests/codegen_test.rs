@@ -296,11 +296,26 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
     assert_ran_ok("wasm fannkuch", &wasm_run);
     assert_same_stdout("wasm fannkuch", &wasm_run, &dynasm_run);
-    // `compiles` is the host's module-compile tally, one per loop and one per
-    // bridge, so it follows from the committed `pyre/bench/fannkuch.wasm.jitstats`:
-    // `loops_compiled=6` + `bridges_compiled=24`. Re-record it alongside that
-    // baseline.
-    assert_eq!(stat_value(&stderr, "compiles"), 30);
+    // `compiles` is the host's module-compile tally: one per loop, one per
+    // bridge, and one more each time a region merged into its owner re-emits
+    // it. The first two follow from the committed
+    // `pyre/bench/fannkuch.wasm.jitstats` (`loops_compiled=6` +
+    // `bridges_compiled=24`) and are re-recorded alongside that baseline; the
+    // third is `reemit_ok` on this same stderr. Reading it rather than pinning
+    // a total keeps the tally an identity that a compile belonging to none of
+    // the three still breaks, and the bound below is what a merge count can
+    // never pass: a merge re-emits the owner once for a bridge it took.
+    const FANNKUCH_LOOPS: u64 = 6;
+    const FANNKUCH_BRIDGES: u64 = 24;
+    let reemits = stat_value(&stderr, "reemit_ok");
+    assert!(
+        reemits <= FANNKUCH_BRIDGES,
+        "more owner re-emissions ({reemits}) than bridges to have merged:\n{stderr}"
+    );
+    assert_eq!(
+        stat_value(&stderr, "compiles"),
+        FANNKUCH_LOOPS + FANNKUCH_BRIDGES + reemits
+    );
     assert!(
         stat_value(&stderr, "jit_calls") < 100,
         "uniform-i64 blackhole helpers still reflected through the host:\n{stderr}"
