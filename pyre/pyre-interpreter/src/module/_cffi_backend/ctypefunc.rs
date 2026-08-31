@@ -221,7 +221,7 @@ fn do_call(
     }
     let size = unsafe { exchange_size(cif) };
     let buffer = cdataobj::raw_malloc_varsize_char(size);
-    if buffer.is_null() {
+    if buffer == 0 {
         return Err(PyError::new(
             crate::PyErrorKind::MemoryError,
             "out of memory",
@@ -236,7 +236,11 @@ fn do_call(
                 Err(e) => break 'body Err(e),
             };
             match unsafe {
-                ctypeobj::convert_argument_from_object(argtype, data, roots.get(args_slot + i))
+                ctypeobj::convert_argument_from_object(
+                    argtype,
+                    data as *mut u8,
+                    roots.get(args_slot + i),
+                )
             } {
                 Ok(true) => mustfree_max_plus_1 = i + 1,
                 Ok(false) => {}
@@ -246,10 +250,10 @@ fn do_call(
         // `clibffi.py jit_ffi_call` swaps the thread's alternate errno into
         // the C runtime around every foreign call.
         super::cerrno::errno_before();
-        unsafe { invoke(cif, funcaddr, buffer, args_w.len()) };
+        unsafe { invoke(cif, funcaddr, buffer as *mut u8, args_w.len()) };
         super::cerrno::errno_after();
         let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
-        unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
+        unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata as *mut u8) }
     };
     match called {
         Ok(w_res) => {
@@ -269,7 +273,7 @@ fn do_call(
 fn release_arguments(
     w_fargs: PyObjectRef,
     cif: *mut u8,
-    buffer: *mut u8,
+    buffer: usize,
     mustfree_max_plus_1: usize,
 ) {
     for i in 0..mustfree_max_plus_1 {
@@ -280,7 +284,7 @@ fn release_arguments(
             continue;
         }
         let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
-        if unsafe { get_mustfree_flag(data) } == MUSTFREE_FREE {
+        if unsafe { get_mustfree_flag(data as *const u8) } == MUSTFREE_FREE {
             let raw = cdataobj::raw_read_ptr(data);
             cdataobj::raw_free(raw);
         }

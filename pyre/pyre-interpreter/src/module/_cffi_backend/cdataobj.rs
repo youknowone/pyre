@@ -466,32 +466,46 @@ pub fn add_memory_pressure(w_cdata: PyObjectRef, size: i64) {
 /// hand back NULL.
 /// `lltype.malloc(rffi.CCHARP.TO, size, flavor='raw')` — the raw block a
 /// traced caller allocates; the JIT sees it as the `raw_malloc_varsize_char`
-/// residual (`support.py ll_raw_malloc_varsize_char`).  Null on exhaustion;
+/// residual (`support.py ll_raw_malloc_varsize_char`).  Zero on exhaustion;
 /// the caller raises the MemoryError.
+///
+/// The whole raw-memory family below spells its addresses `usize` rather
+/// than `*mut u8`.  `getkind(Ptr(TO))` answers `int` whenever `TO._gckind`
+/// is `raw` (`history.py`), which is what puts a raw block address in the
+/// integer register bank and lets `raw_ptradd` be an `int_add` over it.
+/// `*mut u8` cannot carry that: it is this tree's erased spelling of a
+/// *managed* object — the parameter type of every GC hook, the return type
+/// of every GC allocator, and the pointee of every root slot — so it banks
+/// as a reference the collector traces and rewrites.  A raw block is
+/// neither traced nor moved, and the two must not share a spelling.
+#[majit_macros::oopspec("raw_malloc_varsize_char(size)")]
 #[majit_macros::dont_look_inside_cannot_raise]
-pub fn raw_malloc_varsize_char(size: usize) -> *mut u8 {
-    unsafe { libc::malloc(size.max(1)).cast::<u8>() }
+pub fn raw_malloc_varsize_char(size: usize) -> usize {
+    unsafe { libc::malloc(size.max(1)) as usize }
 }
 
 /// `lltype.free(ptr, flavor='raw')` — the `raw_free` residual
 /// (`support.py ll_raw_free`).
+#[majit_macros::oopspec("raw_free(ptr)")]
 #[majit_macros::dont_look_inside_cannot_raise]
-pub fn raw_free(ptr: *mut u8) {
-    unsafe { libc::free(ptr.cast::<libc::c_void>()) }
+pub fn raw_free(ptr: usize) {
+    unsafe { libc::free(ptr as *mut libc::c_void) }
 }
 
-/// `rffi.ptradd` — advance a raw byte pointer without a memory access
+/// `rffi.ptradd` — advance a raw byte address without a memory access
 /// (`direct_ptradd` residual shape).
+#[majit_macros::oopspec("raw_ptradd(ptr, offset)")]
 #[majit_macros::elidable_cannot_raise]
-pub fn raw_ptradd(ptr: *mut u8, offset: usize) -> *mut u8 {
+pub fn raw_ptradd(ptr: usize, offset: usize) -> usize {
     ptr.wrapping_add(offset)
 }
 
 /// One pointer-sized load out of an exchange-buffer argument slot
 /// (`rffi.cast(rffi.CCHARPP, data)[0]`).
+#[majit_macros::oopspec("raw_read_ptr(data)")]
 #[majit_macros::dont_look_inside_cannot_raise]
-pub fn raw_read_ptr(data: *mut u8) -> *mut u8 {
-    unsafe { data.cast::<*mut u8>().read_unaligned() }
+pub fn raw_read_ptr(data: usize) -> usize {
+    unsafe { (data as *const usize).read_unaligned() }
 }
 
 pub fn raw_alloc(size: i64, zero: bool) -> Result<*mut u8, PyError> {
