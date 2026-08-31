@@ -9755,13 +9755,21 @@ fn walker_numeric_builtin_class(obj: pyre_object::PyObjectRef) -> pyre_object::P
 }
 
 /// Walker-native mirror of the trait `trace_guard_exact_w_class`
-/// (`trace_opcode.rs`): emit `getfield_gc_r(w_class)` → `ptr_eq(expected)`
-/// → `guard_true` so the spec_ii fast path only stays live for an element
-/// whose Python-level `w_class` is the canonical type object — a later
+/// (`trace_opcode.rs`): emit `getfield_gc_r(w_class)` →
+/// `guard_value(expected)` so the spec_ii fast path only stays live for an
+/// element whose Python-level `w_class` is the canonical type object — a later
 /// subclass sharing the payload `ob_type` side-exits rather than being
 /// silently rewrapped as a plain int.  Skipped for an unescaped element (a
 /// fresh `wrapint` box is provably plain, and reading its `w_class` would
 /// force the box OptVirtualize removes).
+///
+/// Spelled `guard_value` rather than `ptr_eq` + `guard_true` because only
+/// `guard_value` teaches the optimizer the equality: `rewrite.py
+/// postprocess_GUARD_VALUE` runs `make_constant(arg0, arg1)`, so the read
+/// becomes a constant and exports LEVEL_CONSTANT at the loop jump instead of
+/// being carried as a label argument.  `optimize_GUARD_TRUE` learns nothing
+/// about the box inside a `ptr_eq`, which leaves a loop-invariant class word
+/// to be re-read and re-compared once per iteration.
 fn walker_guard_exact_w_class<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9790,8 +9798,12 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     let actual =
         crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
     let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
-    let eq = ctx.trace_ctx.record_op(OpCode::PtrEq, &[actual, expected]);
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[eq])
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[actual, expected])?;
+    // `implement_guard_value`'s second half (`pyjitpl.py:1915-1928`): the guard
+    // has proved the read equals the constant, so the heapcache serves the
+    // constant to every later reader of the same box.
+    ctx.trace_ctx.heap_cache_mut().replace_box(actual, expected);
+    Ok(())
 }
 
 /// Global descr-pool sub-jitcode lookup (resolves a global jitcode index

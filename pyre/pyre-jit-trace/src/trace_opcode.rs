@@ -393,8 +393,9 @@ fn trace_guard_exact_w_class(
     let descr = crate::descr::w_class_descr();
     let actual = crate::state::opimpl_getfield_gc_r(ctx, obj, descr);
     let expected = ctx.const_ref(expected_typeobj as i64);
-    let eq = ctx.record_op(OpCode::PtrEq, &[actual, expected]);
-    frame.generate_guard(ctx, OpCode::GuardTrue, &[eq]);
+    frame.generate_guard(ctx, OpCode::GuardValue, &[actual, expected]);
+    // `implement_guard_value` parity (`pyjitpl.py:1915-1928`).
+    ctx.heap_cache_mut().replace_box(actual, expected);
 }
 
 #[allow(dead_code)]
