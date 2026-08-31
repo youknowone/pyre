@@ -938,6 +938,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         // ABI-UNSOUND: `Result<*mut PyObject, error::PyError>` does not fit one residual slot.
         push_abi_unsound_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
     }
+    // `BUILTIN_WRAPPER_DESCRIPTORS` does not exist on wasm32
+    // (`linkme::distributed_slice` has no arm for `target_os = "unknown"`),
+    // so the loop above registers nothing there and
+    // `bytecode_for_address(__majit_wrap_builtin_len)` finds no jitcode: the
+    // builtin `len` gateway descent then declines before its spec gate.  The
+    // address is used for the jitcode lookup only — the gateway body is
+    // descended, never residual-called — so register the one wrapper the
+    // descent recognises explicitly, the way this file registers every other
+    // wasm-reachable helper.
+    #[cfg(target_arch = "wasm32")]
+    push_abi_unsound_fnaddr(
+        &mut entries,
+        "pyre_interpreter::builtins::__majit_wrap_builtin_len",
+        crate::builtins::__majit_wrap_builtin_len as *const (),
+    );
 
     // `type_object()` accessors are `dont_look_inside` (`majit-translate`
     // `front::llbc_hints` stamps them: the JIT residualizes the `OnceLock` body
