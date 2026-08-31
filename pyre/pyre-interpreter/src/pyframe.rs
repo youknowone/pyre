@@ -3146,7 +3146,9 @@ impl PyFrame {
     #[inline]
     pub fn getcode(&self) -> &CodeObject {
         let pycode = majit_metainterp::jit::promote(self.pycode);
-        unsafe { &*(crate::w_code_get_ptr(pycode as pyre_object::PyObjectRef) as *const CodeObject) }
+        unsafe {
+            &*(crate::w_code_get_ptr(pycode as pyre_object::PyObjectRef) as *const CodeObject)
+        }
     }
 
     /// PyPy-compatible `fget_code`.
