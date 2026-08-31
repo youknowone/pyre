@@ -310,11 +310,13 @@ LEGACY_TRANSACTION_CONTROL = -1
 
 def _check_autocommit(value):
     # `autocommit_converter` takes True and False by identity, then requires an
-    # int equal to the sentinel.  A float -1.0, or an object whose `__eq__`
-    # answers True, is rejected: the type test is part of the contract.
+    # int whose *value* is the sentinel: it reads the value with
+    # `PyLong_AsLong`.  So a float -1.0, an object whose `__eq__` answers True,
+    # and an int subclass that overrides `__eq__` to spoof -1 are all rejected
+    # -- hence `int.__eq__` rather than `==`.
     if (value is not True and value is not False and
             not (isinstance(value, int) and
-                 value == LEGACY_TRANSACTION_CONTROL)):
+                 int.__eq__(value, LEGACY_TRANSACTION_CONTROL) is True)):
         raise ValueError(
             "autocommit must be True, False, or "
             "sqlite3.LEGACY_TRANSACTION_CONTROL")
