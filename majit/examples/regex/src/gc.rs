@@ -47,9 +47,9 @@ pub fn install() {
         majit_gc::gc_sync::store_singleton(Box::new(majit_gc::collector::MiniMarkGC::new()));
         majit_gc::gc_sync::register_thread();
         // `jitframe.py:49` `rgc.register_custom_trace_hook(JITFRAME, ...)` and
-        // the id the descr allocates every frame under
+        // the descr-owned id every backend allocates its frames under
         // (`pyjitpl.rs register_active_backend_jitframe_gc_type`, which is
-        // `eval.rs`'s own publication).
+        // `eval.rs`'s own registration).
         majit_gc::gc_sync::gc_op(|gc| {
             majit_metainterp::register_active_backend_jitframe_gc_type(gc);
         });

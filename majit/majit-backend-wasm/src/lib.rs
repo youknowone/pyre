@@ -638,8 +638,8 @@ fn guard_fail_args_advanced(
 use failguard::{
     CallAssemblerTarget, ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr,
     WasmFrameData, ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot,
-    call_assembler_target, fail_descr_base, global_fail_descr, label_target,
-    publish_call_assembler_target, publish_label_target, register_fail_descrs,
+    call_assembler_target, global_fail_descr, label_target, publish_call_assembler_target,
+    publish_label_target, register_fail_descrs, reserve_fail_descrs,
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
@@ -2643,7 +2643,6 @@ impl WasmBackend {
             ));
         }
 
-        inputs.fail_index_base = fail_descr_base();
         // `guard_exit_count` walks the whole op list it is handed, so each
         // count is taken once here: the exit loop below needs the per-region
         // counts for every one of its exits, and re-deriving them there would
@@ -2655,6 +2654,7 @@ impl WasmBackend {
             .map(|region| codegen::guard_exit_count(&region.inputargs, &region.ops))
             .collect();
         let merged_guard_count = own_guard_count + region_guard_counts.iter().sum::<usize>();
+        inputs.fail_index_base = reserve_fail_descrs(merged_guard_count);
         let (new_cells_base, new_cells_owner) = codegen::alloc_bridge_cells(merged_guard_count);
         inputs.bridge_cells_base = new_cells_base;
         let (wasm_bytes, guard_exits, _) = codegen::build_wasm_module(&inputs)?;
@@ -3549,9 +3549,9 @@ impl majit_backend::Backend for WasmBackend {
         // Exit indices come from the global fail-index space so a cross-trace
         // chain's `frame[0]` resolves regardless of which module wrote it
         // (`failguard::FAIL_DESCR_REGISTRY`).
-        let fail_index_base = fail_descr_base();
-        let (bridge_cells_base, bridge_cells_owner) =
-            codegen::alloc_bridge_cells(codegen::guard_exit_count(inputargs, ops));
+        let guard_exit_count = codegen::guard_exit_count(inputargs, ops);
+        let fail_index_base = reserve_fail_descrs(guard_exit_count);
+        let (bridge_cells_base, bridge_cells_owner) = codegen::alloc_bridge_cells(guard_exit_count);
         let module_inputs = codegen::ModuleBuildInputs {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             // Keep these rewritten operations exactly as intern_ref_constants
@@ -4476,13 +4476,13 @@ impl majit_backend::Backend for WasmBackend {
 
         // This bridge's exit indices come from the global fail-index space,
         // like every trace's (`failguard::FAIL_DESCR_REGISTRY`).
-        let base = fail_descr_base();
+        let guard_exit_count = codegen::guard_exit_count(inputargs, ops);
+        let base = reserve_fail_descrs(guard_exit_count);
         // `rpython/jit/backend/model.py:145`: a bridge compiled after an
         // invalidation starts valid; only a later invalidation may kill its
         // `GUARD_NOT_INVALIDATED` operations.
         let bridge_flag = original_token.mint_bridge_invalidation_flag();
-        let (bridge_cells_base, bridge_cells_owner) =
-            codegen::alloc_bridge_cells(codegen::guard_exit_count(inputargs, ops));
+        let (bridge_cells_base, bridge_cells_owner) = codegen::alloc_bridge_cells(guard_exit_count);
         let module_inputs = codegen::ModuleBuildInputs {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             ops: ops_owned.clone(),

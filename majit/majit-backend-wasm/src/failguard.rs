@@ -132,14 +132,14 @@ impl Drop for WasmFrameData {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
 
     use majit_gc::GcAllocator;
     use majit_ir::GcRef;
 
     use super::{Type, WasmFailDescr, WasmFrameData};
-    use super::{fail_descr_base, global_fail_descr, register_fail_descrs};
+    use super::{global_fail_descr, register_fail_descrs, reserve_fail_descrs};
 
     struct RootCountingGc(Arc<AtomicUsize>);
 
@@ -254,7 +254,7 @@ mod tests {
         // The emitted CALL_ASSEMBLER check compares against a baked reserved
         // index, so a trace whose own exits started below the reserved block
         // would collide with it.
-        let base = fail_descr_base();
+        let base = reserve_fail_descrs(3);
         assert!(base >= super::FINISH_EXIT_INDEX_COUNT);
         for (index, types) in [
             (super::FINISH_EXIT_INDEX_VOID, &[][..]),
@@ -288,6 +288,44 @@ mod tests {
                     .fail_index,
                 base + i,
             );
+        }
+    }
+
+    #[test]
+    fn parallel_compiles_reserve_disjoint_fail_descr_ranges() {
+        const COMPILES: usize = 8;
+        const EXITS: usize = 2;
+        let all_reserved = Arc::new(Barrier::new(COMPILES));
+        let threads: Vec<_> = (0..COMPILES)
+            .map(|trace_id| {
+                let all_reserved = Arc::clone(&all_reserved);
+                std::thread::spawn(move || {
+                    let base = reserve_fail_descrs(EXITS);
+                    let descrs: Vec<_> = (0..EXITS)
+                        .map(|index| {
+                            Arc::new(WasmFailDescr {
+                                fail_index: base + index as u32,
+                                trace_id: trace_id as u64,
+                                fail_arg_types: vec![Type::Int],
+                                is_finish: false,
+                                meta_descr: None,
+                            })
+                        })
+                        .collect();
+                    all_reserved.wait();
+                    register_fail_descrs(&descrs);
+                    (base, trace_id)
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            let (base, trace_id) = thread.join().expect("parallel compile panicked");
+            for index in 0..EXITS {
+                let descr = global_fail_descr(base + index as u32)
+                    .expect("reserved fail descr was not registered");
+                assert_eq!(descr.trace_id, trace_id as u64);
+            }
         }
     }
 
@@ -477,12 +515,14 @@ fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<W
 /// Claim the reserved block if the registry has not been opened yet. Called
 /// under the registry lock from every entry point that can grow or read it, so
 /// a trace can never take a `fail_descr_base` below `FINISH_EXIT_INDEX_COUNT`.
-fn reserve_finish_exit_block(vec: &mut Vec<Arc<WasmFailDescr>>) {
+fn reserve_finish_exit_block(vec: &mut Vec<FailDescrSlot>) {
     if !vec.is_empty() {
         return;
     }
     for index in 0..FINISH_EXIT_INDEX_COUNT {
-        vec.push(reserved_finish_descr(index, None));
+        vec.push(FailDescrSlot::Registered(reserved_finish_descr(
+            index, None,
+        )));
     }
 }
 
@@ -508,6 +548,9 @@ pub fn attached_finish_exit_index(descr: &Option<DescrRef>) -> Option<u32> {
     vec[..FINISH_EXIT_INDEX_COUNT as usize]
         .iter()
         .position(|reserved| {
+            let FailDescrSlot::Registered(reserved) = reserved else {
+                unreachable!("the reserved finish block contains an empty slot")
+            };
             reserved
                 .meta_descr
                 .as_ref()
@@ -525,7 +568,8 @@ pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
     let mut reg = FAIL_DESCR_REGISTRY.lock();
     let vec = reg.get_or_insert_with(Default::default);
     reserve_finish_exit_block(vec);
-    vec[exit_index as usize] = reserved_finish_descr(exit_index, Some(descr));
+    vec[exit_index as usize] =
+        FailDescrSlot::Registered(reserved_finish_descr(exit_index, Some(descr)));
 }
 
 /// Stable, guest-memory dispatch entries, keyed by CALL_ASSEMBLER token.
@@ -679,34 +723,43 @@ pub fn remove_call_assembler_targets_for_compiled_ptr(compiled_ptr: u32) {
 /// Entries are never removed: a dropped loop's modules are unreachable (its
 /// label targets are retracted and its token is gone), so its entries are just
 /// retained memory, bounded by the total number of compiled exits.
-static FAIL_DESCR_REGISTRY: parking_lot::Mutex<Option<Vec<Arc<WasmFailDescr>>>> =
+enum FailDescrSlot {
+    Reserved,
+    Registered(Arc<WasmFailDescr>),
+}
+
+static FAIL_DESCR_REGISTRY: parking_lot::Mutex<Option<Vec<FailDescrSlot>>> =
     parking_lot::Mutex::new(None);
 
-/// The next free global fail index — pass as `fail_index_base` to
-/// `codegen::build_wasm_module`, then register the built descrs with
-/// `register_fail_descrs`. The wasm host is single-threaded, so no other
-/// compile can interleave between the two calls.
-pub fn fail_descr_base() -> u32 {
+/// Atomically reserve `count` global fail indices and return the first one.
+/// Pass that base to `codegen::build_wasm_module`, then fill the reserved
+/// slots with `register_fail_descrs`. Reserving the range under this lock keeps
+/// native parallel compiles and tests from receiving the same base; the wasm
+/// host remains single-threaded, but the backend is also exercised natively.
+pub fn reserve_fail_descrs(count: usize) -> u32 {
     let mut reg = FAIL_DESCR_REGISTRY.lock();
     let vec = reg.get_or_insert_with(Default::default);
     reserve_finish_exit_block(vec);
-    vec.len() as u32
+    let base = vec.len() as u32;
+    vec.resize_with(vec.len() + count, || FailDescrSlot::Reserved);
+    base
 }
 
-/// Append a compile's exit descrs to the global space. Each descr's
-/// `fail_index` (already base-offset by `build_wasm_module`) must equal the
-/// registry position it lands at.
+/// Fill a compile's previously reserved slots. Each descr's `fail_index`
+/// (already base-offset by `build_wasm_module`) names its registry position.
 pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
     let mut reg = FAIL_DESCR_REGISTRY.lock();
     let vec = reg.get_or_insert_with(Default::default);
     reserve_finish_exit_block(vec);
     for d in descrs {
-        debug_assert_eq!(
-            d.fail_index as usize,
-            vec.len(),
-            "fail descr registered out of lockstep with its global fail_index"
+        let slot = vec
+            .get_mut(d.fail_index as usize)
+            .expect("fail descr registered without reserving its global fail_index");
+        assert!(
+            matches!(slot, FailDescrSlot::Reserved),
+            "global fail_index registered more than once"
         );
-        vec.push(Arc::clone(d));
+        *slot = FailDescrSlot::Registered(Arc::clone(d));
     }
 }
 
@@ -715,7 +768,11 @@ pub fn global_fail_descr(fail_index: u32) -> Option<Arc<WasmFailDescr>> {
     FAIL_DESCR_REGISTRY
         .lock()
         .as_ref()
-        .and_then(|v| v.get(fail_index as usize).cloned())
+        .and_then(|v| v.get(fail_index as usize))
+        .and_then(|slot| match slot {
+            FailDescrSlot::Reserved => None,
+            FailDescrSlot::Registered(descr) => Some(Arc::clone(descr)),
+        })
 }
 
 /// Global `label descr identity → LabelTarget` registry (see `LabelTarget`).
