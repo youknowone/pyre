@@ -2531,6 +2531,12 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
         };
         if !carrier.is_null() && crate::function::is_function(carrier) {
             crate::function::function_set_new_self(carrier, type_obj);
+            // The call path reaches the `BuiltinCode`, not the `Function`, so
+            // `tp_new_wrapper`'s tests need the same type on the code object.
+            let code = crate::function::getcode(carrier) as PyObjectRef;
+            if !code.is_null() && crate::gateway::is_builtin_code(code) {
+                crate::gateway::builtin_code_set_new_self(code, type_obj);
+            }
         }
     }
     // typeobject.py:1738-1742 — `if isinstance(descrvalue, GetSetProperty):
@@ -5436,15 +5442,20 @@ fn init_zip_type(ns: PyObjectRef) {
 ///         raise TypeError("%N.__new__(%N) is not safe, use %N.__new__()", ...)
 ///     return w_subtype
 /// ```
-pub(crate) fn check_user_subclass(
+pub(crate) fn check_new_subtype(
     w_self: PyObjectRef,
     w_subtype: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     if w_subtype.is_null() || !unsafe { pyre_object::is_type(w_subtype) } {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
+        // `tp_new_wrapper` names the offending argument's type after the
+        // sentence; `check_user_subclass` writes the same suffix quoted
+        // (`('%T')`).  Unquoted, as `subclass_to_tag`'s own copy of this
+        // refusal already writes it.
         return Err(crate::PyError::type_error(format!(
-            "{}.__new__(X): X is not a type object",
+            "{}.__new__(X): X is not a type object ({})",
             self_name,
+            crate::type_methods::arg_type_name(w_subtype),
         )));
     }
     if std::ptr::eq(w_subtype, w_self) {
@@ -5461,7 +5472,29 @@ pub(crate) fn check_user_subclass(
             self_name, sub_name, sub_name, self_name,
         )));
     }
-    // typeobject.py:520-523 — layout safety. The base allocator only knows
+    Ok(())
+}
+
+/// [`check_new_subtype`] plus the layout test that closes `object.__new__(dict)`.
+///
+/// The two are separated because only the first half applies where a
+/// constructor is reached to *build* an instance: `type_call` invokes
+/// `type->tp_new(type, ...)` directly rather than through the `__new__`
+/// descriptor, so `tp_new_wrapper`'s layout test never sees an ordinary
+/// `T(...)`.  `class VS(ValueError, StopIteration)` is what the difference
+/// costs: `StopIteration`'s `value` gives VS a layout typedef that
+/// `ValueError`'s does not match, where the wrapper's own criterion — the
+/// `tp_new` the most-derived static base carries — finds both answering
+/// `BaseException.__new__` and allows it.
+pub(crate) fn check_user_subclass(
+    w_self: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    check_new_subtype(w_self, w_subtype)?;
+    if std::ptr::eq(w_subtype, w_self) {
+        return Ok(());
+    }
+    // typedef.py layout safety. The base allocator only knows
     // how to fill the parent layout; if the subtype introduces extra slots
     // (different layout typedef), allocating through it would corrupt the
     // foreign layout.

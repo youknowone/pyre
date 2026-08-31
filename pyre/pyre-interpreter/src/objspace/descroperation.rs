@@ -3346,13 +3346,17 @@ unsafe fn concat_operand_name(obj: PyObjectRef) -> String {
 /// type, so a `list` subclass still reports `list` on the left.
 unsafe fn list_concat_type_error(rhs: PyObjectRef) -> PyError {
     let name = unsafe { concat_operand_name(rhs) };
-    PyError::type_error(format!("can only concatenate list (not \"{name}\") to list"))
+    PyError::type_error(format!(
+        "can only concatenate list (not \"{name}\") to list"
+    ))
 }
 
 /// `tuple_concat`'s refusal, the same shape as `list_concat`'s.
 unsafe fn tuple_concat_type_error(rhs: PyObjectRef) -> PyError {
     let name = unsafe { concat_operand_name(rhs) };
-    PyError::type_error(format!("can only concatenate tuple (not \"{name}\") to tuple"))
+    PyError::type_error(format!(
+        "can only concatenate tuple (not \"{name}\") to tuple"
+    ))
 }
 
 /// `bytes_concat`'s refusal, which it raises when either operand fails

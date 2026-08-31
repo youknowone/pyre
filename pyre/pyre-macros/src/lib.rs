@@ -1946,7 +1946,12 @@ fn expand_pyre_methods(
                         }
                     };
                 };
-                (recv_check, preamble, quote! { __pyre_self.#mname }, self_idx + 1)
+                (
+                    recv_check,
+                    preamble,
+                    quote! { __pyre_self.#mname },
+                    self_idx + 1,
+                )
             }
             MethodKind::Static => {
                 if matches!(inputs.peek(), Some(FnArg::Receiver(_))) {

@@ -676,6 +676,13 @@ pub struct BuiltinCode {
     /// is not one.  `'static` like the rest, so it is neither a Drop
     /// obligation nor a GC pointer.
     pub wrapper: *const WrapperCall,
+    /// `tp_new_wrapper`'s `self` — the type whose `tp_new` this code is, or
+    /// null for every builtin that is not a `__new__` carrier.  It is the same
+    /// value `Function::w_new_self` holds, stamped from the same place, and it
+    /// sits outside `gc_ptr_offsets` for the same reason that one does: a
+    /// defining type is a static-region `W_TypeObject` that is never
+    /// nursery-relocated.
+    pub new_self: PyObjectRef,
 }
 
 /// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
@@ -778,6 +785,7 @@ fn builtin_code_new_full(
         owner: std::ptr::null(),
         module: "",
         wrapper: std::ptr::null(),
+        new_self: pyre_object::PY_NULL,
     }) as PyObjectRef
 }
 
@@ -863,6 +871,54 @@ pub unsafe fn builtin_code_set_owner(obj: PyObjectRef, owner: &'static MethodOwn
     unsafe { (*(obj as *mut BuiltinCode)).owner = owner };
 }
 
+/// Record the type a `__new__` carrier belongs to, so the call path can run
+/// `tp_new_wrapper`'s tests against it.  Stamped beside
+/// `function_set_new_self`, from which it takes both its value and its
+/// first-writer rule: an inherited `__new__` keeps the ancestor's stamp.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`; `w_type` to a valid type.
+pub unsafe fn builtin_code_set_new_self(obj: PyObjectRef, w_type: PyObjectRef) {
+    unsafe {
+        let code = &mut *(obj as *mut BuiltinCode);
+        if code.new_self.is_null() {
+            code.new_self = w_type;
+        }
+    }
+}
+
+/// `tp_new_wrapper`'s tests for a first argument that is not the defining type.
+///
+/// The arity refusal is the wrapper's own; the two that follow it — non-type
+/// and not-a-subtype — are `check_new_subtype`, where PyPy keeps them and
+/// which `object.__new__` and `int.__new__` already reach.
+///
+/// The layout test that closes `object.__new__(dict)` is deliberately not run
+/// here.  `type_call` reaches `type->tp_new` directly rather than through the
+/// `__new__` descriptor, so an ordinary `T(...)` never meets it, and pyre
+/// routes construction through this very carrier: applying it would refuse
+/// `class VS(ValueError, StopIteration)` at `VS('done')`.  The constructors
+/// that need it keep calling `check_user_subclass` themselves.
+///
+/// `dont_look_inside` because the caller is descended into: the message
+/// formatting, the MRO walk and the layout reads all belong on the cold side
+/// of an opaque call rather than in each caller's JitCode.
+#[cold]
+#[majit_macros::dont_look_inside]
+fn tp_new_wrapper_check(
+    new_self: PyObjectRef,
+    cls: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if cls.is_null() {
+        let name = unsafe { pyre_object::w_type_get_name(new_self) };
+        return Err(crate::PyError::type_error(format!(
+            "{name}.__new__(): not enough arguments"
+        )));
+    }
+    crate::typedef::check_new_subtype(new_self, cls)?;
+    Ok(pyre_object::PY_NULL)
+}
+
 /// `method_check_args`'s `descr_check` half: the receiver a descriptor was
 /// published for has to be present and of the owning type.
 ///
@@ -877,6 +933,23 @@ pub(crate) unsafe fn builtin_code_check_receiver(
     code: *const BuiltinCode,
     positional: &[PyObjectRef],
 ) -> Result<(), crate::PyError> {
+    // A `__new__` carrier takes the class to instantiate where a method takes
+    // its receiver, so it is `tp_new_wrapper`'s tests that apply, not
+    // `descr_check`'s.  The two are exclusive: `stamp_method_owners` leaves a
+    // carrier's `owner` null.
+    let new_self = unsafe { (*code).new_self };
+    if !new_self.is_null() {
+        let cls = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+        // Constructing the defining type itself is the common call and passes
+        // every test, so it answers on a pointer compare and never reaches the
+        // walks below.  `check_user_subclass` early-returns on the same
+        // identity; the test is repeated here to keep the whole cold path,
+        // messages included, behind one opaque call.
+        if !std::ptr::eq(cls, new_self) {
+            tp_new_wrapper_check(new_self, cls)?;
+        }
+        return Ok(());
+    }
     let owner = unsafe { (*code).owner };
     if owner.is_null() {
         return Ok(());

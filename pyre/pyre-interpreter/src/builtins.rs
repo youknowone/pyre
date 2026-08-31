@@ -16535,10 +16535,7 @@ unsafe fn classdir_into(w_cls: PyObjectRef, names_slot: usize) -> Result<(), cra
     unsafe { classdir_recurse(w_cls, names_slot) }
 }
 
-unsafe fn classdir_recurse(
-    w_cls: PyObjectRef,
-    names_slot: usize,
-) -> Result<(), crate::PyError> {
+unsafe fn classdir_recurse(w_cls: PyObjectRef, names_slot: usize) -> Result<(), crate::PyError> {
     // The class and its bases are read across calls that run Python, so the
     // receiver is published rather than carried in a Rust local.
     let _roots = pyre_object::gc_roots::push_roots();

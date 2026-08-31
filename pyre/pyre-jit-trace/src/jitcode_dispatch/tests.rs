@@ -738,7 +738,11 @@ fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     let count = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .find(|op| inline_call_callee_name(&wrapper.code, op) == Some("leading_non_null_count"))
         .expect("signature-bound wrapper counts its leading non-null argument slots");
-    assert_eq!(wrapper.code[count.pc + 3], 1, "the count takes one argument");
+    assert_eq!(
+        wrapper.code[count.pc + 3],
+        1,
+        "the count takes one argument"
+    );
     let args_reg = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .find(|op| op.key == "arraylen_gc/rd>i")
         .map(|op| wrapper.code[op.pc + 1])
@@ -14488,5 +14492,3 @@ fn the_traceback_walk_receivers_pin_their_class_through_the_payload() {
         "list is acceptable as a base class, so its payload does not determine w_class",
     );
 }
-
-

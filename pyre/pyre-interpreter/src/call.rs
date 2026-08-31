@@ -5365,7 +5365,10 @@ fn build_class_inner(
         && classcell.is_some_and(|value| unsafe { !pyre_object::is_cell(value) })
     {
         let value = classcell.unwrap();
-        return Err(crate::builtins::cell_slot_type_error("__classcell__", value));
+        return Err(crate::builtins::cell_slot_type_error(
+            "__classcell__",
+            value,
+        ));
     }
     // CPython 3.14 type_new_set_classdict: compiler-generated annotation
     // functions and comprehensions capture `__classdict__` through this
