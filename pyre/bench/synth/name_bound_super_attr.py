@@ -1,3 +1,5 @@
+# pyre-check: max-pypy-ratio=3
+# pyre-check: skip-cpython
 # pyre-check: spec-folds=two_arg_super_call,load_attr_on_super
 # `super(C, self)` bound to a name, then read — the spelling LOAD_SUPER_ATTR
 # does not cover, because the name binding splits the proxy construction and
@@ -11,6 +13,16 @@
 # optimizer answers from the emission itself, so the allocation dies and this
 # shape costs what `super(C, self).val(x)` costs.
 #
+# N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S` and the ratio is a
+# measurement rather than warmup -- see `zero_arg_super_attr.py` for the
+# reasoning and the numbers.  pypy runs ~0.65ns per iteration here, so
+# 250,000,000 lands its execution time near 0.17s.  cpython cannot usefully
+# run that many, hence `skip-cpython`.
+#
+# The ceiling is fitted to what that measurement reads: 1.7x on dynasm and
+# 1.8x on cranelift, carried with room for a slower host.
+# `load_super_attr.py` carries the same 3 for the same family.
+#
 try:
     import pypyjit
 
@@ -18,7 +30,7 @@ try:
 except ImportError:
     pass
 
-N = 20000
+N = 250000000
 
 
 class Base:
