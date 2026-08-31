@@ -11197,6 +11197,14 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
                 None => locals,
             };
         }
+        // The rewrite above allocates on every bound slot, and the tail
+        // allocates again, so a collection can have forwarded any value the
+        // resolution pass captured as a bare pointer.  The emit pass stamps
+        // these onto the `Cell.contents` reads it records; take them from the
+        // pins that tracked the move, exactly as `locals_root` is taken below.
+        for (modelled, &value_root) in slots.iter_mut().zip(&value_roots) {
+            modelled.value = pyre_object::gc_roots::shadow_stack_get(value_root);
+        }
         (pyre_object::gc_roots::shadow_stack_get(locals_root), result)
     };
     // A slot rewrite or the tail reports a failure as PY_NULL instead of
@@ -11850,7 +11858,12 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     // The slots that bind a key.  An empty cell binds none — `fast2locals`
     // deletes the name there, and this mapping is fresh, so there is nothing
     // to delete.
-    let bound: Vec<&ModelledLocalSlot> = slots.iter().filter(|s| !s.value.is_null()).collect();
+    let bound: Vec<usize> = slots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.value.is_null())
+        .map(|(i, _)| i)
+        .collect();
     // Authentic mapping, built through the SAME helpers the emitted calls
     // name, so the recording-time value and the compiled loop's value cannot
     // diverge.  Nothing here touches the frame, so a decline below — or a
@@ -11863,9 +11876,9 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         // pin that was about to take it.
         let value_roots: Vec<usize> = bound
             .iter()
-            .map(|slot| {
+            .map(|&i| {
                 let root = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(slot.value);
+                let _ = pyre_object::gc_roots::pin_root(slots[i].value);
                 root
             })
             .collect();
@@ -11873,10 +11886,10 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         let _ = pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_dict_new() });
         let mut result = pyre_object::PY_NULL;
         let mut slot_failed = false;
-        for (slot, &value_root) in bound.iter().zip(&value_roots) {
+        for (&i, &value_root) in bound.iter().zip(&value_roots) {
             // The store allocates, so both the mapping and the value are
             // re-read from their pinned slots on every pass.
-            let (setitem, name_index) = slot.binder(numlocals);
+            let (setitem, name_index) = slots[i].binder(numlocals);
             let updated = setitem(
                 pyre_object::gc_roots::shadow_stack_get(locals_root) as i64,
                 code_ptr as i64,
@@ -11894,6 +11907,14 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
                 Some(tail) => tail(locals as i64) as pyre_object::PyObjectRef,
                 None => locals,
             };
+        }
+        // The rewrite above allocates on every bound slot, and the tail
+        // allocates again, so a collection can have forwarded any value the
+        // resolution pass captured as a bare pointer.  The emit pass stamps
+        // these onto the `Cell.contents` reads it records; take them from the
+        // pins that tracked the move, exactly as `locals_root` is taken below.
+        for (&i, &value_root) in bound.iter().zip(&value_roots) {
+            slots[i].value = pyre_object::gc_roots::shadow_stack_get(value_root);
         }
         (pyre_object::gc_roots::shadow_stack_get(locals_root), result)
     };
