@@ -2093,6 +2093,7 @@ fn jit_compile_trace(
     caller: &mut Caller<'_, Host>,
     bytes_ptr: u32,
     bytes_len: u32,
+    kind: &str,
 ) -> Result<(Table, Func, Option<Func>)> {
     caller.data_mut().jit_compile_count += 1;
     let memory = caller
@@ -2110,7 +2111,20 @@ fn jit_compile_trace(
     caller.data_mut().jit_compile_bytes += bytes.len() as u64;
     let compile_start = std::time::Instant::now();
     let module_result = Module::new(&engine, &bytes);
-    caller.data_mut().jit_compile_time_ns += compile_start.elapsed().as_nanos();
+    let compile_elapsed = compile_start.elapsed();
+    caller.data_mut().jit_compile_time_ns += compile_elapsed.as_nanos();
+    // Diagnostic: PYRE_WASM_COMPILE_CENSUS=1 reports each cranelift compile
+    // separately. The aggregate on the stats line cannot say what a re-emitted
+    // owner costs against a first compile of the same trace, nor whether the
+    // per-module cost is linear in the bytes, and both decide whether the
+    // answer to compile latency is emitting less or emitting it elsewhere.
+    if std::env::var_os("PYRE_WASM_COMPILE_CENSUS").is_some() {
+        eprintln!(
+            "[compile-census] kind={kind} bytes={} ms={:.3}",
+            bytes.len(),
+            compile_elapsed.as_secs_f64() * 1e3
+        );
+    }
     let module = match module_result {
         Ok(m) => m,
         Err(e) => {
@@ -2194,7 +2208,7 @@ fn jit_compile_trace(
 
 /// Compile and instantiate a trace, then append its export to the trace table.
 fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
-    let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
+    let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len, "compile")?;
     // Register the trace into the shared indirect function table so it is
     // reachable by table index. `grow` returns the newly appended slot.
     //
@@ -2227,7 +2241,7 @@ fn jit_replace(
             "jit_replace_wasm: id {func_id} is not a trace slot"
         )));
     }
-    let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
+    let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len, "replace")?;
     if !matches!(
         table.get(&mut *caller, func_id as u64),
         Some(Ref::Func(Some(_)))
