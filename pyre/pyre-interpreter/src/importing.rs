@@ -4596,6 +4596,71 @@ fn install_importlib_bootstrap(
     Ok(())
 }
 
+/// pylifecycle.c `init_importlib` / `init_importlib_external`: run the
+/// bootstrap sequence so `sys.meta_path` / `sys.path_hooks` are populated and
+/// `importlib.util.find_spec` works — which `runpy._get_module_details` (the
+/// `-m` entry) requires. The native importer does not consult `sys.meta_path`,
+/// so before this `importlib._bootstrap` has neither `sys` nor `_imp` injected
+/// and `meta_path` is empty.
+///
+/// Interpreter startup owns the step, not one launcher: a launcher that skips
+/// it leaves `sys.modules["importlib._bootstrap"]` absent, which is the one
+/// condition under which [`dunder_import`] serves every import natively
+/// instead of through `_bootstrap.__import__`.
+#[cfg(feature = "host_env")]
+pub fn init_importlib_bootstrap(
+    canonical: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    let bootstrapped = bootstrap_importlib_modules(canonical, execution_context);
+    // pylifecycle.c init_sys_streams, which follows init_importlib: the
+    // standard streams can reach a text codec from here on.  A failed
+    // bootstrap leaves the native importer serving imports, so the codec is
+    // still reachable and the streams still want it.
+    let stream_codecs = crate::module::sys::vm::init_stream_codecs();
+    // A bootstrap failure is the more fundamental of the two, so it wins;
+    // otherwise a codec the streams could not build is reported rather than
+    // leaving a stream that reports itself unreadable.
+    bootstrapped.and(stream_codecs)
+}
+
+/// Off-`host_env` builds reach no bootstrap sources, so the native importer is
+/// the only importer and there is nothing to install.
+#[cfg(not(feature = "host_env"))]
+pub fn init_importlib_bootstrap(
+    _canonical: PyObjectRef,
+    _execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    Ok(())
+}
+
+/// `_bootstrap._setup` (importlib/_bootstrap.py) reads the bootstrap builtins
+/// `_thread`/`_warnings`/`_weakref` from `sys.modules`, so import them first to
+/// seed `sys.modules`; a name already present skips `_builtin_from_name` and
+/// keeps the natively-registered module object authoritative.
+#[cfg(feature = "host_env")]
+fn bootstrap_importlib_modules(
+    canonical: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    let import =
+        |name: &str| importhook(name, canonical, pyre_object::PY_NULL, 0, execution_context);
+
+    for name in ["_thread", "_warnings", "_weakref"] {
+        import(name)?;
+    }
+    import("sys")?;
+    import("_imp")?;
+    // Importing the bootstrap module fires `install_importlib_bootstrap`
+    // (the native load hook) as its body finishes: `_install(sys, _imp)`,
+    // `_install_external_importers()` — which imports and links
+    // `_frozen_importlib_external` — and the `_frozen_importlib` alias.
+    // A cached module skips the hook, so running this again (`-i` reaches
+    // the REPL after `run_source`) does not re-append the importers.
+    import("importlib._bootstrap")?;
+    Ok(())
+}
+
 #[cfg(feature = "host_env")]
 fn set_frozen_alias_metadata(
     module: PyObjectRef,

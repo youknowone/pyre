@@ -117,7 +117,7 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
 
             // pylifecycle.c init_importlib before site — see run_source.
             if let Err(e) =
-                crate::init_importlib_bootstrap(canonical, Rc::as_ptr(&execution_context))
+                importing::init_importlib_bootstrap(canonical, Rc::as_ptr(&execution_context))
             {
                 eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
             }

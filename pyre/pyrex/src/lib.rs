@@ -1517,55 +1517,6 @@ pub(crate) fn import_site(
     init_warnoptions(w_main_globals, ec_ptr);
 }
 
-/// Run the `init_importlib` / `init_importlib_external` sequence
-/// (pylifecycle.c) so `sys.meta_path` / `sys.path_hooks` are populated and
-/// `importlib.util.find_spec` works — which `runpy._get_module_details`
-/// (the `-m` entry) requires. pyre's native importer does not consult
-/// `sys.meta_path`, so before this `importlib._bootstrap` has neither `sys`
-/// nor `_imp` injected and `meta_path` is empty.
-///
-/// `_bootstrap._setup` (importlib/_bootstrap.py) reads the bootstrap builtins
-/// `_thread`/`_warnings`/`_weakref` from `sys.modules`, so import them first to
-/// seed `sys.modules`; a name already present skips `_builtin_from_name` and
-/// keeps the natively-registered module object authoritative.
-pub(crate) fn init_importlib_bootstrap(
-    canonical: pyre_object::PyObjectRef,
-    ec_ptr: *const pyre_interpreter::PyExecutionContext,
-) -> Result<(), pyre_interpreter::PyError> {
-    let bootstrapped = bootstrap_importlib_modules(canonical, ec_ptr);
-    // pylifecycle.c init_sys_streams, which follows init_importlib: the
-    // standard streams can reach a text codec from here on.  A failed
-    // bootstrap leaves the native importer serving imports, so the codec is
-    // still reachable and the streams still want it.
-    let stream_codecs = pyre_interpreter::module::sys::vm::init_stream_codecs();
-    // A bootstrap failure is the more fundamental of the two, so it wins;
-    // otherwise a codec the streams could not build is reported rather than
-    // leaving a stream that reports itself unreadable.
-    bootstrapped.and(stream_codecs)
-}
-
-fn bootstrap_importlib_modules(
-    canonical: pyre_object::PyObjectRef,
-    ec_ptr: *const pyre_interpreter::PyExecutionContext,
-) -> Result<(), pyre_interpreter::PyError> {
-    let import =
-        |name: &str| importing::importhook(name, canonical, pyre_object::PY_NULL, 0, ec_ptr);
-
-    for name in ["_thread", "_warnings", "_weakref"] {
-        import(name)?;
-    }
-    import("sys")?;
-    import("_imp")?;
-    // Importing the bootstrap module fires `install_importlib_bootstrap`
-    // (the native load hook) as its body finishes: `_install(sys, _imp)`,
-    // `_install_external_importers()` — which imports and links
-    // `_frozen_importlib_external` — and the `_frozen_importlib` alias.
-    // A cached module skips the hook, so running this again (`-i` reaches
-    // the REPL after `run_source`) does not re-append the importers.
-    import("importlib._bootstrap")?;
-    Ok(())
-}
-
 /// PyPy object-space finalization / `threading._shutdown`: run the app-level
 /// callback before module teardown, then join native non-daemon handles.
 fn run_threading_shutdown() {
@@ -2096,7 +2047,7 @@ fn run_module(module: &str, no_site: bool, run_code: bool) -> Option<MainSession
     importing::set_sys_module("__main__", main_module);
 
     let result = (|| -> Result<(), pyre_interpreter::PyError> {
-        init_importlib_bootstrap(canonical, ec_ptr)?;
+        importing::init_importlib_bootstrap(canonical, ec_ptr)?;
         import_site(no_site, canonical, ec_ptr);
         runpy_run_module_as_main(canonical, ec_ptr, module, true)?;
         Ok(())
@@ -2697,7 +2648,7 @@ fn run_script_path(
         // pylifecycle.c init_importlib before site: install the importlib
         // bootstrap so `sys.meta_path` / `sys.path_hooks` are populated before
         // the run target is chosen.
-        if let Err(e) = init_importlib_bootstrap(canonical, ec_ptr) {
+        if let Err(e) = importing::init_importlib_bootstrap(canonical, ec_ptr) {
             eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
         }
         path_hook_accepts(filename, canonical, ec_ptr)
@@ -2800,7 +2751,7 @@ fn run_source(
     // `sys.meta_path` / `sys.path_hooks` from the first user statement.
     // A failure (no reachable stdlib) is non-fatal — the native importer
     // keeps serving imports, the minimal-importer role.
-    if let Err(e) = init_importlib_bootstrap(canonical, ec_ptr) {
+    if let Err(e) = importing::init_importlib_bootstrap(canonical, ec_ptr) {
         eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
     }
 

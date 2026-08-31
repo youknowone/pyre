@@ -17185,6 +17185,13 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         };
+        // A backend that cannot compile a CALL_ASSEMBLER entering this token
+        // declines every trace carrying the edge. Fall back to the residual
+        // emission the caller keeps running for a `(None, None)` answer, the
+        // same shape the tmp-callback refusal above takes.
+        if target_token.call_assembler_refused() {
+            return (None, None);
+        }
         let vable_index = target_token.virtualizable_arg_index();
         // pyjitpl.py:3601 opnum = OpHelpers.call_assembler_for_descr(calldescr)
         let opnum = match descr_view.result_type() {

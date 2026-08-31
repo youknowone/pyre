@@ -296,11 +296,26 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
     assert_ran_ok("wasm fannkuch", &wasm_run);
     assert_same_stdout("wasm fannkuch", &wasm_run, &dynasm_run);
-    // `compiles` is the host's module-compile tally, one per loop and one per
-    // bridge, so it follows from the committed `pyre/bench/fannkuch.wasm.jitstats`:
-    // `loops_compiled=6` + `bridges_compiled=24`. Re-record it alongside that
-    // baseline.
-    assert_eq!(stat_value(&stderr, "compiles"), 30);
+    // `compiles` is the host's module-compile tally: one per loop, one per
+    // bridge, and one more each time a region merged into its owner re-emits
+    // it. The first two follow from the committed
+    // `pyre/bench/fannkuch.wasm.jitstats` (`loops_compiled=6` +
+    // `bridges_compiled=24`) and are re-recorded alongside that baseline; the
+    // third is `reemit_ok` on this same stderr. Reading it rather than pinning
+    // a total keeps the tally an identity that a compile belonging to none of
+    // the three still breaks, and the bound below is what a merge count can
+    // never pass: a merge re-emits the owner once for a bridge it took.
+    const FANNKUCH_LOOPS: u64 = 6;
+    const FANNKUCH_BRIDGES: u64 = 24;
+    let reemits = stat_value(&stderr, "reemit_ok");
+    assert!(
+        reemits <= FANNKUCH_BRIDGES,
+        "more owner re-emissions ({reemits}) than bridges to have merged:\n{stderr}"
+    );
+    assert_eq!(
+        stat_value(&stderr, "compiles"),
+        FANNKUCH_LOOPS + FANNKUCH_BRIDGES + reemits
+    );
     assert!(
         stat_value(&stderr, "jit_calls") < 100,
         "uniform-i64 blackhole helpers still reflected through the host:\n{stderr}"
@@ -1564,6 +1579,7 @@ fn inlined_bridge_without_owner_loop_label_declines() {
         &inputargs,
         vec![guard, finish],
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
@@ -1687,6 +1703,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             ops: owner_ops,
             inlined_bridges: vec![codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 0,
                 outside_loop: false,
                 trace_id: 7,
@@ -1900,6 +1917,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             ops: owner_ops(),
             inlined_bridges: vec![codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 1,
                 outside_loop: false,
                 trace_id: 7,
@@ -3623,6 +3641,7 @@ fn build_owner_with_region_closing_at(
         &inputargs,
         ops,
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
@@ -3798,6 +3817,7 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
         &inputargs,
         ops,
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
@@ -4020,16 +4040,14 @@ fn host_loop_inputargs() -> Vec<InputArg> {
     ]
 }
 
-/// The complement of the decline below. With the same owner, guard and bridge
-/// but no invalidation, nothing short-circuits the inline arm: the bridge
-/// resumes at the loop header, so it takes the arm that merges on the spot and
-/// reaches the install. On the host that install cannot complete — there is no
-/// wasm host, so the owner's module was never materialized and the rebuild
-/// refuses — which is what `bridge_diag(37)` records. So this does not assert
-/// an accepted inline (only a wasm host can produce one); it pins that the
-/// invalidation decline is the ONLY thing separating the two tests.
+/// The complement of the invalidation decline below. With the same valid owner,
+/// guard and bridge, a header-resuming region reaches the inline candidate but
+/// waits for the same entry-count trip as every other region. This pins the
+/// cost gate before any wasm host is involved: the host-only install trial must
+/// not run until the bridge has proved hot enough to pay for rebuilding its
+/// whole owner module.
 #[test]
-fn a_valid_owner_reaches_the_inline_trial() {
+fn a_valid_header_owner_defers_the_inline_trial() {
     use majit_backend::Backend;
 
     let _serialized = HOST_COMPILE_LOCK.lock();
@@ -4055,8 +4073,8 @@ fn a_valid_owner_reaches_the_inline_trial() {
     let declines_before = majit_backend_wasm::bridge_diag(50);
     let deferred_before = majit_backend_wasm::bridge_diag(54);
     let trials_before = majit_backend_wasm::bridge_diag(37);
-    // A merge is only considered once there is a callback to defer the
-    // outside-loop half to; the guest publishes the real one.
+    // A merge is only considered once there is a callback to act on the
+    // entry-count trip; the guest publishes the real one.
     majit_backend_wasm::set_inline_trip_helper_slot(1);
     backend
         .compile_bridge(
@@ -4075,14 +4093,14 @@ fn a_valid_owner_reaches_the_inline_trial() {
         declines_before,
         "a valid owner is not declined by the invalidation arm"
     );
-    assert_eq!(
-        majit_backend_wasm::bridge_diag(54),
-        deferred_before,
-        "a header-resuming region is not the half that waits on a trip"
-    );
     assert!(
-        majit_backend_wasm::bridge_diag(37) > trials_before,
-        "the inline trial reached the merged install"
+        majit_backend_wasm::bridge_diag(54) > deferred_before,
+        "a header-resuming region waits on the entry-count trip"
+    );
+    assert_eq!(
+        majit_backend_wasm::bridge_diag(37),
+        trials_before,
+        "the deferred region has not tried to rebuild the owner yet"
     );
 }
 
@@ -4232,6 +4250,7 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
         &inputargs,
         ops,
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
@@ -4349,6 +4368,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
         ops,
         vec![
             codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 0,
                 outside_loop: false,
                 trace_id: 1,
@@ -4358,6 +4378,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
                 constants: indexmap::IndexMap::new(),
             },
             codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 1,
                 outside_loop: false,
                 trace_id: 2,
@@ -4456,6 +4477,7 @@ fn run_preamble_region_repro() -> (i64, i64, i64) {
         &inputargs,
         ops,
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: true,
             trace_id: 1,
@@ -4638,6 +4660,7 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
         ops,
         vec![
             codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 1,
                 outside_loop: false,
                 trace_id: 2,
@@ -4647,6 +4670,7 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
                 constants: indexmap::IndexMap::new(),
             },
             codegen::InlinedBridge {
+                external_jump: None,
                 source_fail_index: 0,
                 outside_loop: true,
                 trace_id: 1,
@@ -4719,6 +4743,7 @@ fn a_preamble_region_closing_at_a_label_past_its_guard_declines() {
         &vec![InputArg::from_type(Type::Int, 0)],
         ops,
         vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: true,
             trace_id: 1,
@@ -4903,6 +4928,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
         inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
         ops,
         inlined_bridges: vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
@@ -5100,6 +5126,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
         ops,
         inlined_bridges: vec![codegen::InlinedBridge {
+            external_jump: None,
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,

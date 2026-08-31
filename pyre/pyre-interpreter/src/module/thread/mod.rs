@@ -649,11 +649,7 @@ pub(crate) fn after_fork_child() {
     let handles = std::mem::take(&mut *ACTIVE_HANDLES.lock());
     for handle in handles {
         if let Some(handle_obj) = W_ThreadHandle::from_obj(handle as PyObjectRef) {
-            let mut state = handle_obj.state.lock();
-            if state.started && state.ident != ident {
-                state.done = true;
-                handle_obj.done.notify_all();
-            } else if state.started {
+            if handle_obj.after_fork_reinit(ident) {
                 ACTIVE_HANDLES.lock().push(handle);
             }
         }
@@ -1216,7 +1212,7 @@ pub use rlock_class::W_RLock;
 mod handle_class {
     use super::*;
 
-    #[derive(Default)]
+    #[derive(Clone, Copy, Default)]
     pub(super) struct HandleState {
         pub(super) started: bool,
         pub(super) done: bool,
@@ -1334,6 +1330,33 @@ mod handle_class {
 pub use handle_class::W_ThreadHandle;
 
 impl W_ThreadHandle {
+    /// CPython `_PyThread_AfterFork` / PyPy `rthread.thread_after_fork`.
+    ///
+    /// The parent main thread can be asleep in this handle's condvar when a
+    /// worker forks.  That waiter does not exist in the child, so neither the
+    /// inherited mutex nor parking_lot's process-global waiter queue may be
+    /// touched there.  Preserve only the plain handle fields and install new
+    /// native synchronization state before `threading._after_fork` joins the
+    /// vanished main thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn after_fork_reinit(&self, current_ident: i64) -> bool {
+        let this = self as *const Self as *mut Self;
+        unsafe {
+            // After fork only the calling thread exists.  Reading through
+            // `get_mut` deliberately avoids acquiring the inherited mutex.
+            let mut state = *(*this).state.get_mut();
+            let is_current = state.started && state.ident == current_ident;
+            if state.started && !is_current {
+                state.done = true;
+            }
+            // Do not drop either inherited primitive: their waiter metadata
+            // names threads which exist only in the parent process.
+            std::ptr::write(&mut (*this).state, Mutex::new(state));
+            std::ptr::write(&mut (*this).done, Condvar::new());
+            is_current
+        }
+    }
+
     fn start(&self, ident: i64) -> Result<(), crate::PyError> {
         let mut state = self.state.lock();
         if state.started {

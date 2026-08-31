@@ -1919,6 +1919,17 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
                 return Ok(None);
             }
         };
+    // A backend that has established it cannot compile a CALL_ASSEMBLER into
+    // this token declines the whole trace carrying the edge, not the edge.
+    // Recording the plain residual costs this fold; recording the edge costs
+    // the trace, and — when the trace is a bridge — the guard it was traced
+    // from, which is then refused a bridge for the rest of the run.
+    if token.call_assembler_refused() {
+        if p2_diag_enabled() {
+            eprintln!("[p2-ca] decline pc={} reason=ca-refused", op.pc);
+        }
+        return Ok(None);
+    }
     if p2_diag_enabled() {
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number);
     }
@@ -2245,6 +2256,12 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
     let _ = nlocals;
+    // Same rule as the self-recursive arm: an edge the backend refuses costs
+    // the trace that carries it, so decline the edge and let the generic
+    // residual path re-enter the callee.
+    if token.call_assembler_refused() {
+        return resolved_inline_decline(op.pc, line!());
+    }
     // `do_recursive_call`'s funcbox and ABI, resolved before the first
     // recorded op so an unwired driver declines the inline instead of
     // leaving a half-emitted CALL behind.
