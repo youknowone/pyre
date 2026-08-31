@@ -818,8 +818,10 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
     match dict_update(roots.get(base), roots.get(base + 1)) {
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
             // The update ran Python, so the operand is named at the address it
-            // has now rather than the one the call was made with.
-            let type_name = unsafe { pyre_object::type_name_of(roots.get(base + 1)) };
+            // has now rather than the one the call was made with.  `%T` is the
+            // Python-visible class: a class deriving from a builtin shares that
+            // builtin's storage while presenting its own name.
+            let type_name = crate::error::type_name_of(roots.get(base + 1));
             Err(PyError::type_error(format!(
                 "'{type_name}' object is not a mapping"
             )))
@@ -872,7 +874,7 @@ pub fn dict_merge_value(
         // `if not space.ismapping_w(w_item): raise oefmt(... "%s argument
         // after ** must be a mapping, not %T")`.
         if !crate::baseobjspace::ismapping_w(source()) {
-            let type_name = unsafe { pyre_object::type_name_of(source()) };
+            let type_name = crate::error::type_name_of(source());
             return Err(crate::argument::raise_type_error(
                 w_callable(),
                 format!("argument after ** must be a mapping, not {type_name}"),
