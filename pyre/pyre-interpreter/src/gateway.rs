@@ -1013,6 +1013,19 @@ fn no_keyword_arguments(code: &BuiltinCode, receiver: Option<PyObjectRef>) -> cr
 /// name first (`f = MyList([1]).append`) produces the other callable kind and
 /// reports `MyList.append()`; pyre hands out one callable kind and so takes
 /// the declaring class, the form both call syntaxes reach.
+/// The qualifier a descriptor of `type_name` reports itself under.
+///
+/// `type_ready_fill_dict` names a static type's methods after the last
+/// component of `tp_name`, so `array.array.tolist.__qualname__` is
+/// `array.tolist` and `_io.BytesIO.getvalue.__qualname__` is
+/// `BytesIO.getvalue`.  The wordings that name the *type* rather than the
+/// callable keep the whole `tp_name` instead — `descriptor 'tolist' for
+/// 'array.array' objects` — so only the qualified-name forms come through
+/// here.  Undotted names pass through unchanged.
+fn method_qualifier(type_name: &str) -> &str {
+    type_name.rsplit('.').next().unwrap_or(type_name)
+}
+
 fn builtin_names(
     code: &BuiltinCode,
     receiver: Option<PyObjectRef>,
@@ -1028,7 +1041,7 @@ fn builtin_names(
                 },
                 _ => owner.type_name,
             };
-            format!("{ty}.{}", code.name)
+            format!("{}.{}", method_qualifier(ty), code.name)
         }
     };
     (owner, qualname)
@@ -1199,7 +1212,10 @@ fn receiver_mismatch(owner: &MethodOwner, name: &str, args: &[PyObjectRef]) -> c
     let slot_wrapper = is_slot_wrapper(ty, name);
     let message = match args.first() {
         None if slot_wrapper => format!("descriptor '{name}' of '{ty}' object needs an argument"),
-        None => format!("unbound method {ty}.{name}() needs an argument"),
+        None => format!(
+            "unbound method {}.{name}() needs an argument",
+            method_qualifier(ty)
+        ),
         Some(&receiver) => {
             let received = crate::baseobjspace::object_functionstr_type_name(receiver);
             if slot_wrapper {

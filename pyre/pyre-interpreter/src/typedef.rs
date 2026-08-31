@@ -2184,6 +2184,11 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "bytes_iterator" => pyre_object::is_seq_iter,
         "bytearray_iterator" => pyre_object::is_seq_iter,
         "memory_iterator" => pyre_object::is_seq_iter,
+        // Without the layout test every `array.array` descriptor reads a
+        // foreign receiver through `W_Array`: the itemsize getter hands back
+        // whatever bytes sit at that offset and `w_array_len` divides the
+        // buffer length by it.
+        "array.array" => pyre_object::interp_array::is_array,
         "array.arrayiterator" => pyre_object::is_seq_iter,
         "list_iterator" => pyre_object::is_list_iter,
         "list_reverseiterator" => pyre_object::is_list_reverse_iter,
