@@ -5064,8 +5064,8 @@ mod tests {
         let cell = ws.get_cell(key).expect("decline keeps the warm-state cell");
         assert_eq!(cell.abort_count, 0);
         assert_eq!(cell.state, BaseJitCellState::NotHot);
-        assert_eq!(cell.flags & JcFlags::JC_TRACING, 0);
-        assert_eq!(cell.flags & JcFlags::JC_DONT_TRACE_HERE, 0);
+        assert!(!cell.flags.contains(JcFlags::JC_TRACING));
+        assert!(!cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE));
         assert!(ws.can_inline_callable(key));
     }
 
