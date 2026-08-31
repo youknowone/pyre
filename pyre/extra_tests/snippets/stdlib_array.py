@@ -1284,3 +1284,80 @@ assert error.exception.encoding == "utf-32-" + (
 assert error.exception.object == opposite_bytes
 assert error.exception.start == 4
 assert error.exception.end == 8
+
+
+# PyPy `_fromiterable` keeps the iterator as a translated live variable across
+# both `next()` and per-item conversion.  Force collections at each boundary
+# so the Rust shadow-stack port must reload the forwarded iterator slot.
+class CollectingIterator:
+    def __init__(self):
+        self.value = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        import gc
+
+        gc.collect()
+        if self.value == 4:
+            raise StopIteration
+        self.value += 1
+        return self.value
+
+
+collected = array("i")
+collected.extend(CollectingIterator())
+assert collected.tolist() == [1, 2, 3, 4]
+
+
+# `index_count_array` takes `stop = min(stop, arr.len)` once before its loop,
+# so an `__eq__` that appends is never searched there.  The shared search here
+# reads the length back at every boundary, which is what 3.14 observes.
+def growing_needle(target):
+    class Needle:
+        def __init__(self):
+            self.calls = 0
+
+        def __eq__(self, other):
+            self.calls += 1
+            if self.calls == 1:
+                target.extend([7, 7])
+            return other == 7
+
+    return Needle()
+
+
+searched = array("i", [1, 2, 3])
+assert searched.index(growing_needle(searched)) == 3
+assert len(searched) == 5
+
+counted = array("i", [1, 2, 3])
+assert counted.count(growing_needle(counted)) == 2
+
+contained = array("i", [1, 2, 3])
+assert growing_needle(contained) in contained
+
+removed = array("i", [1, 2, 3])
+removed.remove(growing_needle(removed))
+assert removed.tolist() == [1, 2, 3, 7]
+
+
+# A shrinking `__eq__` ends the search at the new length instead of reading
+# past the storage the items were unpacked from.
+shrunk = array("i", [1, 2, 3, 4, 5])
+
+
+class ShrinkingNeedle:
+    def __init__(self):
+        self.calls = 0
+
+    def __eq__(self, other):
+        self.calls += 1
+        if self.calls == 1:
+            del shrunk[2:]
+        return False
+
+
+assert shrunk.count(ShrinkingNeedle()) == 0
+assert shrunk.tolist() == [1, 2]

@@ -2644,14 +2644,22 @@ fn read_script_source(
     // module imports use.  The bytes then go through the tokenizer's BOM /
     // PEP 263 decoding in every build.
     match importing::read_source_bytes(Path::new(path)) {
-        Ok(bytes) => match pyre_interpreter::decode_source_bytes(
+        Ok(bytes) => match pyre_interpreter::decode_file_source_bytes(
             &bytes,
             rustpython_wtf8::Wtf8::new(path),
             false,
         ) {
             Ok(source) => source,
-            Err(error) => {
-                pyre_interpreter::eprint_exception(&error, false);
+            Err(mut error) => {
+                // A decoded source file can fail before a frame exists (an
+                // embedded NUL or a bad encoding declaration), but its
+                // SyntaxError still carries filename/line/text. Route it
+                // through the same startup hook and syntax fallback as the
+                // compile failure below so that location is not collapsed
+                // into the generic one-line exception rendering.
+                if !pyre_interpreter::error::print_exception_via_excepthook(&mut error) {
+                    pyre_interpreter::eprint_syntax_error(&error);
+                }
                 end_after_startup_failure(canonical, ec_ptr, 1);
             }
         },

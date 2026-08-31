@@ -230,7 +230,7 @@ fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
 
 /// Copy the keyword arguments into a namespace instance's dict, skipping the
 /// `__pyre_kw__` marker. Shared by `sys.namespace` and `types.SimpleNamespace`
-/// construction. `_structseq.py:172` `self.__dict__.update(kwargs)` writes the
+/// construction. `lib_pypy._structseq.SimpleNamespace.__init__` writes the
 /// instance dict directly, so `setdictvalue` is used rather than `setattr` — a
 /// subclass `__setattr__` is not consulted during construction.
 fn namespace_apply_kwargs(self_obj: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::PyResult {
@@ -431,11 +431,74 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
     )
 }
 
+fn simple_namespace_method(
+    name: &'static str,
+    function: fn(&[PyObjectRef]) -> crate::PyResult,
+    arity: u16,
+    doc: &'static str,
+    text_signature: &'static str,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let method = crate::gateway::make_builtin_function_with_arity_and_doc(
+        name, function, arity, doc,
+    );
+    let _ = pyre_object::gc_roots::pin_root(method);
+    let signature = w_str_new(text_signature);
+    let method = pyre_object::gc_roots::shadow_stack_get(slot);
+    unsafe { crate::function::fset_func_text_signature(method, signature) };
+    method
+}
+
+fn simple_namespace_variadic_method(
+    name: &'static str,
+    function: fn(&[PyObjectRef]) -> crate::PyResult,
+    doc: &'static str,
+    text_signature: &'static str,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let method = crate::gateway::make_builtin_function_with_doc(name, function, doc);
+    let _ = pyre_object::gc_roots::pin_root(method);
+    let signature = w_str_new(text_signature);
+    let method = pyre_object::gc_roots::shadow_stack_get(slot);
+    unsafe { crate::function::fset_func_text_signature(method, signature) };
+    method
+}
+
+fn simple_namespace_new_descr() -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let descr = crate::typedef::make_new_descr_with_doc(
+        simple_namespace_new,
+        "Create and return a new object.  See help(type) for accurate signature.",
+    );
+    let _ = pyre_object::gc_roots::pin_root(descr);
+    let signature = w_str_new("($type, *args, **kwargs)");
+    let descr = pyre_object::gc_roots::shadow_stack_get(slot);
+    unsafe { crate::function::fset_func_text_signature(descr, signature) };
+    descr
+}
+
+/// Receiver predicate for the gateways materialised from PyPy's app-level
+/// `SimpleNamespace` methods.  Its storage remains the ordinary instance/map
+/// layout, so the descriptor owner must check Python type membership rather
+/// than pretending that every object with that shared layout is a namespace.
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn is_simple_namespace(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    crate::typedef::r#type(obj).is_some_and(|obj_type| unsafe {
+        crate::baseobjspace::issubtype_w(obj_type.as_ptr(), simple_namespace_type())
+    })
+}
+
 /// `types.SimpleNamespace` — the attribute-bag type exposed as
 /// `type(sys.implementation)` and re-published by `types.py`
 /// (`SimpleNamespace = type(sys.implementation)`).
 ///
-/// `_structseq.py:166 SimpleNamespace`, with CPython 3.14's newer constructor,
+/// `lib_pypy._structseq.SimpleNamespace`, with CPython 3.14's newer constructor,
 /// full rich-comparison surface, pickle reducer and `__replace__`.  Storage
 /// remains PyPy-shaped: the values live in the instance dict, not a side
 /// table or a second native mapping.
@@ -452,68 +515,130 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
         let tp = crate::typedef::make_builtin_type_with_overridetypedef(
             "types.SimpleNamespace",
             |ns| {
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "__new__",
-                    crate::typedef::make_new_descr(simple_namespace_new),
-                );
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "__init__",
-                    crate::make_builtin_function("__init__", simple_namespace_init),
-                );
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "__repr__",
-                    make_builtin_function_with_arity("__repr__", simple_namespace_repr, 1),
-                );
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "__eq__",
-                    make_builtin_function_with_arity("__eq__", simple_namespace_eq, 2),
-                );
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "__ne__",
-                    make_builtin_function_with_arity("__ne__", simple_namespace_ne, 2),
-                );
-                for (name, function) in [
-                    ("__lt__", simple_namespace_lt as fn(&[PyObjectRef]) -> crate::PyResult),
-                    ("__le__", simple_namespace_le),
-                    ("__gt__", simple_namespace_gt),
-                    ("__ge__", simple_namespace_ge),
-                ] {
-                    pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                        ns,
-                        name,
-                        make_builtin_function_with_arity(name, function, 2),
-                    );
+                let _roots = pyre_object::gc_roots::push_roots();
+                let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(ns);
+
+                macro_rules! install {
+                    ($name:literal, $value:expr) => {{
+                        let value = $value;
+                        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(value);
+                        let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+                        let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+                        unsafe {
+                            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                                ns, $name, value,
+                            )
+                        };
+                    }};
                 }
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
+
+                // PyPy `lib_pypy._structseq.SimpleNamespace` is an app-level
+                // class: the class-body rows lead the namespace in source
+                // order.  CPython 3.14 contributes the additional observable
+                // slots below, but does not replace that storage owner.
+                // [3.14-spec] `PyNamespace_Type`'s docs/signatures and rich
+                // slots ↔ `lib_pypy._structseq.SimpleNamespace`'s smaller
+                // class body — callers observe the former metadata while the
+                // instance dict and control-flow shape remain the latter's.
+                install!("__module__", w_str_new("types"));
+                install!("__doc__", w_str_new("A simple attribute-based namespace."));
+                install!("__new__", simple_namespace_new_descr());
+                install!(
+                    "__init__",
+                    simple_namespace_variadic_method(
+                        "__init__",
+                        simple_namespace_init,
+                        "Initialize self.  See help(type(self)) for accurate signature.",
+                        "($self, /, *args, **kwargs)",
+                    )
+                );
+                install!(
+                    "__repr__",
+                    simple_namespace_method(
+                        "__repr__",
+                        simple_namespace_repr,
+                        1,
+                        "Return repr(self).",
+                        "($self, /)",
+                    )
+                );
+                install!(
+                    "__eq__",
+                    simple_namespace_method(
+                        "__eq__",
+                        simple_namespace_eq,
+                        2,
+                        "Return self==value.",
+                        "($self, value, /)",
+                    )
+                );
+                install!(
+                    "__ne__",
+                    simple_namespace_method(
+                        "__ne__",
+                        simple_namespace_ne,
+                        2,
+                        "Return self!=value.",
+                        "($self, value, /)",
+                    )
+                );
+                for (name, function, doc) in [
+                    (
+                        "__lt__",
+                        simple_namespace_lt as fn(&[PyObjectRef]) -> crate::PyResult,
+                        "Return self<value.",
+                    ),
+                    ("__le__", simple_namespace_le, "Return self<=value."),
+                    ("__gt__", simple_namespace_gt, "Return self>value."),
+                    ("__ge__", simple_namespace_ge, "Return self>=value."),
+                ] {
+                    let method = simple_namespace_method(
+                        name,
+                        function,
+                        2,
+                        doc,
+                        "($self, value, /)",
+                    );
+                    let method_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(method);
+                    let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+                    let method = pyre_object::gc_roots::shadow_stack_get(method_slot);
+                    unsafe {
+                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                            ns, name, method,
+                        )
+                    };
+                }
+                install!(
                     "__reduce__",
-                    make_builtin_function_with_arity("__reduce__", simple_namespace_reduce, 1),
+                    simple_namespace_method(
+                        "__reduce__",
+                        simple_namespace_reduce,
+                        1,
+                        "Return state information for pickling",
+                        "($self, /)",
+                    )
                 );
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
+                install!(
                     "__replace__",
-                    make_builtin_function("__replace__", simple_namespace_replace),
+                    simple_namespace_variadic_method(
+                        "__replace__",
+                        simple_namespace_replace,
+                        "Return a copy of the namespace object with new values for the specified attributes.",
+                        "($self, /, **changes)",
+                    )
                 );
-                // SimpleNamespace defines no `__hash__`, so it inherits None
-                // and is unhashable.
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__hash__", w_none());
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "__dict__",
-                    crate::typedef::dict_descr(),
-                );
-            }
+                install!("__dict__", crate::typedef::dict_descr());
             },
             object,
             object_typedef,
         );
-        unsafe { w_type_set_hasdict(tp, true) };
+        unsafe {
+            w_type_set_hasdict(tp, true);
+            pyre_object::w_type_set_text_signature(tp, "(mapping_or_iterable=(), /, **kwargs)");
+        }
         tp as usize
     });
     raw as PyObjectRef
@@ -596,13 +721,13 @@ fn simple_namespace_repr(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_str_from_wtf8_managed(text))
 }
 
-/// `_structseq.py:185 SimpleNamespace.__eq__` — structural over `__dict__`
+/// `lib_pypy._structseq.SimpleNamespace.__eq__` — structural over `__dict__`
 /// when `other` is a namespace, NotImplemented otherwise.
 fn simple_namespace_eq(args: &[PyObjectRef]) -> crate::PyResult {
     simple_namespace_richcompare(args, "__eq__", crate::baseobjspace::CompareOp::Eq)
 }
 
-/// `_structseq.py:190 SimpleNamespace.__ne__`.
+/// `lib_pypy._structseq.SimpleNamespace.__ne__`.
 fn simple_namespace_ne(args: &[PyObjectRef]) -> crate::PyResult {
     simple_namespace_richcompare(args, "__ne__", crate::baseobjspace::CompareOp::Ne)
 }

@@ -1541,6 +1541,20 @@ pub fn make_slot_wrapper_with_arity(
     crate::function_new_slot_wrapper(code as *const (), name.to_string())
 }
 
+/// Fixed-arity [`make_slot_wrapper`] carrying the app-visible docstring from
+/// PyPy's `interp2app` function.  Slot-wrapper carriers use the same
+/// `BuiltinCode.docstring` storage as ordinary gateway functions.
+pub fn make_slot_wrapper_with_arity_and_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    docstring: &'static str,
+) -> PyObjectRef {
+    debug_assert!(arity <= 4);
+    let code = builtin_code_new_full(name, func, Some(docstring), arity, std::ptr::null());
+    crate::function_new_slot_wrapper(code as *const (), name.to_string())
+}
+
 /// Build a CPython-compatible variadic slot-wrapper descriptor.
 pub fn make_slot_wrapper(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
     let code = builtin_code_new(name, func);

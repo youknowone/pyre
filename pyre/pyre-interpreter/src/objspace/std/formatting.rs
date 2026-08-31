@@ -762,7 +762,9 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
         CFormatType::String(CFormatConversion::Repr | CFormatConversion::Ascii) => {
             Ok(spec.format_bytes(crate::builtins::py_ascii(obj)?.as_bytes()))
         }
-        // `format_obj` reads `%b` and `%s` as the same conversion for bytes.
+        // `fmt_s` delegates to `fmt_b` whenever the format string is bytes, so
+        // the two conversions coerce identically; the parser keeps `%b` as its
+        // own format type, which is why both spellings reach this one arm.
         CFormatType::Bytes | CFormatType::String(CFormatConversion::Str) => {
             if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
                 return Ok(spec.format_bytes(pyre_object::bytesobject::bytes_like_data(src)));
@@ -878,9 +880,10 @@ unsafe fn spec_format_string(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Wtf
             };
             Ok(spec.format_string(result))
         }
-        // `%b` is a bytes-only conversion; a `CFormatContext::Str` parse
-        // rejects the `b` as an unsupported format character, so the unicode
-        // formatter never sees a spec carrying it.
+        // `%b` is a bytes-only conversion: `fmt_b` answers `unknown_fmtchar()`
+        // in unicode mode, and a `CFormatContext::Str` parse rejects the `b` as
+        // an unsupported format character, so the unicode formatter never sees
+        // a spec carrying it.
         CFormatType::Bytes => unreachable!("`%b` does not parse in a str format string"),
         CFormatType::Number(number_type) => {
             let value = match number_type {
@@ -1390,5 +1393,55 @@ mod tests {
             .unwrap_err()
         };
         assert_error(error, PyErrorKind::ValueError, "width too big");
+    }
+
+    #[test]
+    fn percent_b_is_parsed_in_bytes_only() {
+        crate::typedef::init_typeobjects();
+
+        // `%b` never reaches `spec_format_string`; it fails as the generic
+        // unsupported conversion instead.  `fmt_b` exists, so PyPy acquires the
+        // operand before rejecting the character and agrees with 3.14 here --
+        // unlike `%z` above, where only 3.14 asks for the operand first.
+        let error =
+            unsafe { str_format_percent(w_str_new("%b"), w_tuple_new(Vec::new())).unwrap_err() };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "not enough arguments for format string",
+        );
+
+        let error = unsafe {
+            str_format_percent(w_str_new("%b"), w_tuple_new(vec![w_int_new(1)])).unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "unsupported format character 'b' (0x62) at index 1",
+        );
+
+        // In bytes formatting `%b` carries the same padding and coercion rules
+        // as `%s`, and both report the `%b` wording on a non-bytes operand.
+        let formatted = unsafe {
+            bytes_format_percent(
+                w_bytes_from_bytes(b"%5b|"),
+                w_tuple_new(vec![w_bytes_from_bytes(b"x")]),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            unsafe { pyre_object::bytesobject::bytes_like_data(formatted) },
+            b"    x|"
+        );
+
+        let error = unsafe {
+            bytes_format_percent(w_bytes_from_bytes(b"%b"), w_tuple_new(vec![w_int_new(1)]))
+                .unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "%b requires a bytes-like object, or an object that implements __bytes__, not 'int'",
+        );
     }
 }

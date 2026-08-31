@@ -1,9 +1,10 @@
 //! Bindings to the C declaration parser — PyPy:
-//! `pypy/module/_cffi_backend/parse_c_type.py`.
+//! `pypy/module/_cffi_backend/parse_c_type.py`, kept with its C parser outside
+//! the interpreter's Charon/LLBC extraction.
 //!
-//! The parser itself is `src/parse_c_type.c`, taken verbatim from the same
-//! place PyPy takes it (`pypy/module/_cffi_backend/src/`) and compiled by
-//! `build.rs`.  It is the one piece of `_cffi_backend` that is C on both
+//! The parser itself is `cffi_backend/src/parse_c_type.c`, taken verbatim from
+//! the same place PyPy takes it (`pypy/module/_cffi_backend/src/`) and compiled
+//! by `build.rs`.  It is the one piece of `_cffi_backend` that is C on both
 //! interpreters: the opcode stream it writes is the format a compiled cffi
 //! extension module embeds, so re-spelling the grammar in another language
 //! would be a second implementation of a wire format rather than a port.
@@ -217,10 +218,10 @@ pub struct ExternPyS {
     pub reserved2: *mut c_void,
 }
 
-/// The parser reads `info->ctx` unconditionally — `search_in_typenames` asks
-/// for `ctx->num_typenames` before it can conclude there is nothing to search —
-/// so a caller hands it a zeroed context, never a null one.  That is what
-/// `parse_c_type.py:allocate_ctxobj` builds when it has no source context.
+// The parser reads `info->ctx` unconditionally — `search_in_typenames` asks
+// for `ctx->num_typenames` before it can conclude there is nothing to search —
+// so a caller hands it a zeroed context, never a null one.  That is what
+// `parse_c_type.py:allocate_ctxobj` builds when it has no source context.
 unsafe extern "C" {
     pub fn pypy_parse_c_type(info: *mut ParseInfoS, input: *const c_char) -> c_int;
     pub fn pypy_search_in_globals(

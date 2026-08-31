@@ -245,6 +245,14 @@ pub unsafe fn is_async_gen_asend(obj: PyObjectRef) -> bool {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_async_gen_athrow(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &ASYNC_GEN_ATHROW_TYPE) }
+}
+
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_generator_or_coroutine(obj: PyObjectRef) -> bool {
     unsafe { is_generator(obj) || is_coroutine(obj) || is_async_generator(obj) }
 }

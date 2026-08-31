@@ -5,7 +5,7 @@
 //! are fields on their owning Python objects.  In particular, there is no TLS
 //! or process side-table for semantic state.
 
-mod machinery;
+use rustpython_common::json as machinery;
 
 use pyre_object::{PyObjectRef, gc_roots};
 use rustpython_wtf8::Wtf8;

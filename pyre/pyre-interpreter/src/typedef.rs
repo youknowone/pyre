@@ -1018,8 +1018,12 @@ pub fn init_typeobjects() {
                 &pyre_object::descriptor::SUPER_TYPE as *const PyType,
             ) as usize,
         );
-        let generator_type =
-            new_typeobject_with_base("generator", init_generator_type, object_type);
+        let generator_type = new_typeobject_with_base_and_layout(
+            "generator",
+            init_generator_type,
+            object_type,
+            &pyre_object::generator::GENERATOR_TYPE as *const PyType,
+        );
         // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — a generator is produced
         // only by calling a generator function, never by `generator()`,
         // so `tp_new` is NULL and pickling refuses it.
@@ -1032,8 +1036,12 @@ pub fn init_typeobjects() {
             &pyre_object::generator::GENERATOR_TYPE as *const PyType as usize,
             generator_type as usize,
         );
-        let coroutine_type =
-            new_typeobject_with_base("coroutine", init_coroutine_type, object_type);
+        let coroutine_type = new_typeobject_with_base_and_layout(
+            "coroutine",
+            init_coroutine_type,
+            object_type,
+            &pyre_object::generator::COROUTINE_TYPE as *const PyType,
+        );
         unsafe {
             pyre_object::w_type_set_disallow_instantiation(coroutine_type);
             pyre_object::w_type_set_acceptable_as_base_class(coroutine_type, false);
@@ -1043,8 +1051,12 @@ pub fn init_typeobjects() {
             &pyre_object::generator::COROUTINE_TYPE as *const PyType as usize,
             coroutine_type as usize,
         );
-        let async_generator_type =
-            new_typeobject_with_base("async_generator", init_async_generator_type, object_type);
+        let async_generator_type = new_typeobject_with_base_and_layout(
+            "async_generator",
+            init_async_generator_type,
+            object_type,
+            &pyre_object::generator::ASYNC_GENERATOR_TYPE as *const PyType,
+        );
         unsafe {
             pyre_object::w_type_set_disallow_instantiation(async_generator_type);
             pyre_object::w_type_set_acceptable_as_base_class(async_generator_type, false);
@@ -1054,10 +1066,11 @@ pub fn init_typeobjects() {
             &pyre_object::generator::ASYNC_GENERATOR_TYPE as *const PyType as usize,
             async_generator_type as usize,
         );
-        let coroutine_wrapper_type = new_typeobject_with_base(
+        let coroutine_wrapper_type = new_typeobject_with_base_and_layout(
             "coroutine_wrapper",
             init_coroutine_wrapper_type,
             object_type,
+            &pyre_object::generator::COROUTINE_WRAPPER_TYPE as *const PyType,
         );
         unsafe {
             pyre_object::w_type_set_disallow_instantiation(coroutine_wrapper_type);
@@ -1084,7 +1097,12 @@ pub fn init_typeobjects() {
                 init_async_gen_athrow_type as fn(PyObjectRef),
             ),
         ] {
-            let ty = new_typeobject_with_base(name, init, object_type);
+            let ty = new_typeobject_with_base_and_layout(
+                name,
+                init,
+                object_type,
+                pytype as *const PyType,
+            );
             unsafe {
                 pyre_object::w_type_set_disallow_instantiation(ty);
                 pyre_object::w_type_set_acceptable_as_base_class(ty, false);
@@ -1688,6 +1706,10 @@ pub fn init_typeobjects() {
                 &pyre_object::functional::ZIP_TYPE as *const PyType,
                 "(*iterables, strict=False)",
             ),
+            (
+                &pyre_object::interp_itertools::COUNT_TYPE as *const PyType,
+                "(start=0, step=1)",
+            ),
             // The internal object families 3.14 also publishes a signature
             // for. Each is constructible from Python, so `inspect.signature`
             // resolves against these rather than falling back to `(*args,
@@ -1701,10 +1723,15 @@ pub fn init_typeobjects() {
                 &pyre_object::pyobject::NOTIMPLEMENTED_TYPE as *const PyType,
                 "()",
             ),
+            (&pyre_object::NONE_TYPE as *const PyType, "()"),
             (&pyre_object::MODULE_TYPE as *const PyType, "(name, doc=None)"),
             (
                 &pyre_object::MAPPING_PROXY_TYPE as *const PyType,
                 "(mapping)",
+            ),
+            (
+                &crate::pytraceback::PYTRACEBACK_TYPE as *const PyType,
+                "(tb_next, tb_frame, tb_lasti, tb_lineno)",
             ),
             (
                 &pyre_object::nestedscope::CELL_TYPE as *const PyType,
@@ -2155,6 +2182,20 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "map" => pyre_object::functional::is_map,
         "filter" => pyre_object::functional::is_filter,
         "zip" => pyre_object::functional::is_zip,
+        "itertools.count" => pyre_object::interp_itertools::is_count,
+        "itertools.repeat" => pyre_object::interp_itertools::is_repeat,
+        // `GeneratorIterator`, `Coroutine` and `AsyncGenerator` share one
+        // Rust payload, but PyPy gives each its own TypeDef and gateway
+        // receiver check.  Keep the predicates kind-specific: accepting any
+        // member of the shared layout would make an unbound descriptor from
+        // one TypeDef callable on either of the other two.
+        "generator" => pyre_object::generator::is_generator,
+        "coroutine" => pyre_object::generator::is_coroutine,
+        "async_generator" => pyre_object::generator::is_async_generator,
+        "coroutine_wrapper" => pyre_object::generator::is_coroutine_wrapper,
+        "async_generator_asend" => pyre_object::generator::is_async_gen_asend,
+        "async_generator_athrow" => pyre_object::generator::is_async_gen_athrow,
+        "types.SimpleNamespace" => crate::module::sys::vm::is_simple_namespace,
         "property" => pyre_object::descriptor::is_property,
         "super" => pyre_object::descriptor::is_super,
     }
@@ -3216,6 +3257,7 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             "descriptor '__init__' of 'module' object needs an argument",
         ));
     }
+    let self_ = module_require(positional[0], "__init__", false)?;
     let given = positional.len().saturating_sub(1);
     if given > 2 {
         return Err(crate::PyError::type_error(format!(
@@ -3258,7 +3300,6 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             "module() missing required argument 'name' (pos 1)",
         ));
     };
-    let self_ = positional[0];
     if !unsafe { pyre_object::is_str(w_name) } {
         let received = if unsafe { pyre_object::is_none(w_name) } {
             "None".to_string()
@@ -3300,17 +3341,31 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// `_frozen_importlib._module_repr`, which implements the spec/file/name
 /// precedence shared by CPython 3.14.
 fn module_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
+    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__repr__", false)?;
     Ok(pyre_object::w_str_from_wtf8_managed(module_repr_string(
         module,
     )?))
 }
 
-fn module_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+fn module_require(
+    obj: PyObjectRef,
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
     if obj.is_null() || !unsafe { pyre_object::is_module(obj) } {
-        return Err(crate::PyError::type_error(format!(
-            "descriptor '{name}' for 'module' objects doesn't apply to this object"
-        )));
+        let received = if obj.is_null() {
+            "NULL".to_string()
+        } else {
+            type_name_of(obj)
+        };
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for 'module' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a 'module' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
     }
     Ok(obj)
 }
@@ -3405,7 +3460,11 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
 /// module-specific AttributeError wording, so the descriptor is the direct
 /// entry point into that same implementation.
 fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__getattribute__")?;
+    let module = module_require(
+        args.first().copied().unwrap_or(PY_NULL),
+        "__getattribute__",
+        false,
+    )?;
     // The descriptor is reachable with any name `getattr` accepts, so it
     // takes the same WTF-8 split rather than demanding a `&str` view a
     // lone-surrogate name cannot give.
@@ -3418,7 +3477,7 @@ fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// module.py `Module.descr_module__dir__`.
 fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__dir__")?;
+    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__dir__", true)?;
     // module.py:164 — deliberately perform ordinary attribute lookup rather
     // than reading `self.w_dict`: a ModuleType subclass may shadow
     // `__dict__`, in which case the resulting non-dict is a TypeError.
@@ -3448,7 +3507,11 @@ fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 }
 
 fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")?;
+    let module = module_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__annotations__",
+        false,
+    )?;
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -3464,7 +3527,7 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // a circular importer sees the partial mapping, while the completed
     // module's next read must evaluate all annotations afresh.
     let is_initializing =
-        module_is_initializing(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+        module_is_initializing(pyre_object::gc_roots::shadow_stack_get(dict_slot))?;
     let annotations = match crate::baseobjspace::finditem_str(
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
         "__annotate__",
@@ -3502,29 +3565,27 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(pyre_object::gc_roots::shadow_stack_get(annotations_slot))
 }
 
-/// RustPython `PyModule::is_initializing`: inspect the importlib-owned spec
-/// without making failures in optional metadata observable through an
-/// otherwise valid `module.__annotations__` read.
-fn module_is_initializing(w_dict: PyObjectRef) -> bool {
+/// RustPython `PyModule::is_initializing`, through PyPy importing.py's
+/// `is_spec_initializing`: missing optional metadata reads false, while an
+/// actual lookup or truth-test failure remains observable.
+fn module_is_initializing(w_dict: PyObjectRef) -> Result<bool, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
     let _ = roots.pin_root(w_dict);
-    if let Ok(Some(spec)) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__spec__") {
-        let spec_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(spec);
-        if let Ok(initializing) =
-            crate::baseobjspace::getattr_str(roots.get(spec_slot), "_initializing")
-        {
-            let initializing_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = roots.pin_root(initializing);
-            return crate::baseobjspace::is_true(roots.get(initializing_slot)).unwrap_or(false);
-        }
-    }
-    false
+    let Some(spec) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__spec__")? else {
+        return Ok(false);
+    };
+    let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(spec);
+    crate::importing::is_spec_initializing(roots.get(spec_slot))
 }
 
 fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")?;
+    let module = module_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__annotations__",
+        false,
+    )?;
     let value = args[2];
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let _roots = pyre_object::gc_roots::push_roots();
@@ -3547,7 +3608,11 @@ fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn module_annotations_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")?;
+    let module = module_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__annotations__",
+        false,
+    )?;
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -3569,7 +3634,11 @@ fn module_annotations_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")?;
+    let module = module_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__annotate__",
+        false,
+    )?;
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
     let _ = roots.pin_root(unsafe { pyre_object::w_module_get_w_dict(module) });
@@ -3588,7 +3657,11 @@ fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 fn module_annotate_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")?;
+    let module = module_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__annotate__",
+        false,
+    )?;
     let value = args[2];
     if !unsafe { pyre_object::is_none(value) } && !crate::baseobjspace::callable_w(value) {
         return Err(crate::PyError::type_error(
@@ -3631,30 +3704,50 @@ fn init_module_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(module_descr_new),
+            make_new_descr_with_doc(
+                module_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", module_descr_init),
+            crate::gateway::make_builtin_function_with_doc(
+                "__init__",
+                module_descr_init,
+                "Initialize self.  See help(type(self)) for accurate signature.",
+            ),
         )
     };
-    for (name, function, arity) in [
+    for (name, function, arity, doc) in [
         (
             "__repr__",
             module_descr_repr as crate::gateway::BuiltinCodeFn,
             1,
+            "Return repr(self).",
         ),
-        ("__getattribute__", module_descr_getattribute, 2),
-        ("__dir__", module_descr_dir, 1),
+        (
+            "__getattribute__",
+            module_descr_getattribute,
+            2,
+            "Return getattr(self, name).",
+        ),
+        (
+            "__dir__",
+            module_descr_dir,
+            1,
+            "__dir__() -> list\nspecialized dir() implementation",
+        ),
     ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, arity),
+                crate::gateway::make_builtin_function_with_arity_and_doc(
+                    name, function, arity, doc,
+                ),
             )
         };
     }
@@ -3666,6 +3759,18 @@ fn init_module_type(ns: PyObjectRef) {
                 pyre_object::MEMBER_MODULE_DICT,
                 "__dict__".to_owned(),
                 pyre_object::PY_NULL,
+            ),
+        )
+    };
+    // `Module.typedef` places the public type doc after `__dict__` and
+    // before the annotations descriptor. Keep that structural order while
+    // using the 3.14 wording (which omits PyPy's signature preamble).
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            pyre_object::w_str_new(
+                "Create a module object.\n\nThe name must be a string; the optional doc argument can have any type.",
             ),
         )
     };
@@ -3691,13 +3796,44 @@ fn init_module_type(ns: PyObjectRef) {
             ),
         )
     };
+    // PyPy `Module.typedef` supplies these Function carriers and their
+    // registration order. [3.14-spec] Attach the measured Argument Clinic
+    // signatures through the same Function.w_text_signature field.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__getattribute__", "($self, name, /)"),
+        ("__dir__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("module TypeDef callable was just installed");
+        let roots = pyre_object::gc_roots::push_roots();
+        let function_slot = roots.base();
+        let _ = roots.pin_root(function);
+        let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(w_str_new(text_signature));
+        unsafe {
+            crate::function::fset_func_text_signature(
+                pyre_object::gc_roots::shadow_stack_get(function_slot),
+                pyre_object::gc_roots::shadow_stack_get(signature_slot),
+            )
+        };
+    }
+}
+
+fn set_type_callable_text_signature(ns: PyObjectRef, name: &str, text_signature: &str) {
+    let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+        .expect("TypeDef callable was just installed");
+    let roots = pyre_object::gc_roots::push_roots();
+    let function_slot = roots.base();
+    let _ = roots.pin_root(function);
+    let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_str_new(text_signature));
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__doc__",
-            pyre_object::w_str_new(
-                "Create a module object.\n\nThe name must be a string; the optional doc argument can have any type.",
-            ),
+        crate::function::fset_func_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(function_slot),
+            pyre_object::gc_roots::shadow_stack_get(signature_slot),
         )
     };
 }
@@ -3706,14 +3842,24 @@ fn singleton_receiver(
     args: &[PyObjectRef],
     owner: &str,
     name: &str,
+    method_descriptor: bool,
     predicate: unsafe fn(PyObjectRef) -> bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     if self_.is_null() || !unsafe { predicate(self_) } {
-        return Err(crate::PyError::type_error(format!(
-            "descriptor '{name}' requires a '{owner}' object but received a '{}'",
-            type_name_of(self_),
-        )));
+        let received = if self_.is_null() {
+            "NULL".to_string()
+        } else {
+            type_name_of(self_)
+        };
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for '{owner}' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a '{owner}' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
     }
     Ok(self_)
 }
@@ -3732,32 +3878,40 @@ fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     Ok(pyre_object::special::w_ellipsis())
 }
 
+/// PyPy `pypy/interpreter/typedef.py Ellipsis.typedef`.
 fn init_ellipsis_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__doc__",
-            w_str_new("The type of the Ellipsis singleton."),
-        )
-    };
+    // Preserve the real PyPy type-dict order (`__new__`, `__repr__`,
+    // `__reduce__`, `__doc__`). [3.14-spec] The carrier docs and signatures
+    // below are the public values measured on CPython 3.14.2; storage remains
+    // PyPy `Function.w_text_signature` / `BuiltinCode.docstring`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(ellipsis_descr_new),
+            make_new_descr_with_doc(
+                ellipsis_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__repr__",
                 |args| {
-                    singleton_receiver(args, "ellipsis", "__repr__", pyre_object::is_ellipsis)?;
+                    singleton_receiver(
+                        args,
+                        "ellipsis",
+                        "__repr__",
+                        false,
+                        pyre_object::is_ellipsis,
+                    )?;
                     Ok(w_str_new("Ellipsis"))
                 },
                 1,
+                "Return repr(self).",
             ),
         )
     };
@@ -3765,16 +3919,36 @@ fn init_ellipsis_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_method_descriptor_with_arity(
                 "__reduce__",
                 |args| {
-                    singleton_receiver(args, "ellipsis", "__reduce__", pyre_object::is_ellipsis)?;
+                    singleton_receiver(
+                        args,
+                        "ellipsis",
+                        "__reduce__",
+                        true,
+                        pyre_object::is_ellipsis,
+                    )?;
                     Ok(w_str_new("Ellipsis"))
                 },
                 1,
             ),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new("The type of the Ellipsis singleton."),
+        )
+    };
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__reduce__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
+    }
 }
 
 /// special.py: NotImplemented.descr_new_notimplemented
@@ -3792,38 +3966,39 @@ fn notimplemented_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     Ok(pyre_object::special::w_not_implemented())
 }
 
-/// typedef.py:948-954 NotImplemented.typedef
+/// PyPy `pypy/interpreter/typedef.py NotImplemented.typedef`.
 fn init_notimplemented_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::w_dict_setitem_str(
-            ns,
-            "__doc__",
-            pyre_object::w_str_new("The type of the NotImplemented singleton."),
-        )
-    };
+    // Preserve real PyPy's shared order (`__new__`, `__repr__`, `__reduce__`,
+    // `__bool__`, `__doc__`). [3.14-spec] Only the measured CPython 3.14.2
+    // docs/signatures and the hard boolean-context TypeError differ.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(notimplemented_descr_new),
+            make_new_descr_with_doc(
+                notimplemented_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__repr__",
                 |args| {
                     singleton_receiver(
                         args,
                         "NotImplementedType",
                         "__repr__",
+                        false,
                         pyre_object::is_not_implemented,
                     )?;
                     Ok(w_str_new("NotImplemented"))
                 },
                 1,
+                "Return repr(self).",
             ),
         )
     };
@@ -3831,13 +4006,14 @@ fn init_notimplemented_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_method_descriptor_with_arity(
                 "__reduce__",
                 |args| {
                     singleton_receiver(
                         args,
                         "NotImplementedType",
                         "__reduce__",
+                        true,
                         pyre_object::is_not_implemented,
                     )?;
                     Ok(w_str_new("NotImplemented"))
@@ -3852,13 +4028,14 @@ fn init_notimplemented_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__bool__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__bool__",
                 |args| {
                     singleton_receiver(
                         args,
                         "NotImplementedType",
                         "__bool__",
+                        false,
                         pyre_object::is_not_implemented,
                     )?;
                     Err(crate::PyError::type_error(
@@ -3866,9 +4043,25 @@ fn init_notimplemented_type(ns: PyObjectRef) {
                     ))
                 },
                 1,
+                "True if self else False",
             ),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new("The type of the NotImplemented singleton."),
+        )
+    };
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__reduce__", "($self, /)"),
+        ("__bool__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
+    }
 }
 
 /// noneobject.py `W_NoneObject.typedef`, plus Python 3.14's singleton rich
@@ -3888,7 +4081,7 @@ fn none_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn none_ordering(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
-    singleton_receiver(args, "NoneType", name, pyre_object::is_none)?;
+    singleton_receiver(args, "NoneType", name, false, pyre_object::is_none)?;
     Ok(pyre_object::w_not_implemented())
 }
 
@@ -3909,52 +4102,66 @@ fn none_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn init_none_type(ns: PyObjectRef) {
+    // Preserve `W_NoneObject.typedef`'s shared order (`__new__`, `__bool__`,
+    // `__repr__`, then `__doc__` after the 3.14-only rich-comparison slots).
+    // [3.14-spec] The extra slots and their public docs/signatures are the
+    // values measured on CPython 3.14.2; None storage and identity stay PyPy's.
     let entries = [
         (
-            "__doc__",
-            pyre_object::w_str_new("The type of the None singleton."),
+            "__new__",
+            make_new_descr_with_doc(
+                none_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         ),
-        ("__new__", make_new_descr(none_descr_new)),
         (
             "__bool__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__bool__",
                 |args| {
-                    singleton_receiver(args, "NoneType", "__bool__", pyre_object::is_none)?;
+                    singleton_receiver(args, "NoneType", "__bool__", false, pyre_object::is_none)?;
                     Ok(pyre_object::w_bool_from(false))
                 },
                 1,
+                "True if self else False",
             ),
         ),
         (
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__repr__",
                 |args| {
-                    singleton_receiver(args, "NoneType", "__repr__", pyre_object::is_none)?;
+                    singleton_receiver(args, "NoneType", "__repr__", false, pyre_object::is_none)?;
                     Ok(w_str_new("None"))
                 },
                 1,
+                "Return repr(self).",
             ),
         ),
         (
             "__hash__",
-            crate::make_slot_wrapper_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__hash__",
                 |args| {
-                    let self_ =
-                        singleton_receiver(args, "NoneType", "__hash__", pyre_object::is_none)?;
+                    let self_ = singleton_receiver(
+                        args,
+                        "NoneType",
+                        "__hash__",
+                        false,
+                        pyre_object::is_none,
+                    )?;
                     Ok(pyre_object::w_int_new(crate::builtins::hash_value(self_)))
                 },
                 1,
+                "Return hash(self).",
             ),
         ),
         (
             "__eq__",
-            crate::make_slot_wrapper_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__eq__",
                 |args| {
-                    singleton_receiver(args, "NoneType", "__eq__", pyre_object::is_none)?;
+                    singleton_receiver(args, "NoneType", "__eq__", false, pyre_object::is_none)?;
                     if args.len() >= 2 && unsafe { pyre_object::is_none(args[1]) } {
                         Ok(pyre_object::w_bool_from(true))
                     } else {
@@ -3962,14 +4169,15 @@ fn init_none_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "Return self==value.",
             ),
         ),
         (
             "__ne__",
-            crate::make_slot_wrapper_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__ne__",
                 |args| {
-                    singleton_receiver(args, "NoneType", "__ne__", pyre_object::is_none)?;
+                    singleton_receiver(args, "NoneType", "__ne__", false, pyre_object::is_none)?;
                     if args.len() >= 2 && unsafe { pyre_object::is_none(args[1]) } {
                         Ok(pyre_object::w_bool_from(false))
                     } else {
@@ -3977,25 +4185,47 @@ fn init_none_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "Return self!=value.",
             ),
         ),
     ];
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str(ns, name, value) };
     }
-    for (name, function) in [
-        ("__lt__", none_lt as DunderFn),
-        ("__le__", none_le as DunderFn),
-        ("__gt__", none_gt as DunderFn),
-        ("__ge__", none_ge as DunderFn),
+    for (name, function, doc) in [
+        ("__lt__", none_lt as DunderFn, "Return self<value."),
+        ("__le__", none_le as DunderFn, "Return self<=value."),
+        ("__gt__", none_gt as DunderFn, "Return self>value."),
+        ("__ge__", none_ge as DunderFn, "Return self>=value."),
     ] {
         unsafe {
             pyre_object::w_dict_setitem_str(
                 ns,
                 name,
-                crate::make_slot_wrapper_with_arity(name, function, 2),
+                crate::gateway::make_slot_wrapper_with_arity_and_doc(name, function, 2, doc),
             )
         };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new("The type of the None singleton."),
+        )
+    };
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__bool__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
     }
 }
 
@@ -8116,11 +8346,97 @@ fn traceback_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 fn init_pytraceback_type(ns: PyObjectRef) {
+    // CPython 3.14 `PyTraceBack_Type` public documentation. PyPy's
+    // `PyTraceback.typedef` is the structural owner below.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new("Create a new traceback object."),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(traceback_descr_new),
+            make_new_descr_with_doc(
+                traceback_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
+        )
+    };
+    // `PyTraceback.typedef` registers `__dir__` immediately after the
+    // 3.14-omitted pickle helpers; preserve that relative TypeDef order.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__dir__",
+            make_builtin_function_with_arity(
+                "__dir__",
+                |args| {
+                    dict_iterator_receiver(
+                        args,
+                        "__dir__",
+                        true,
+                        "traceback",
+                        &crate::pytraceback::PYTRACEBACK_TYPE,
+                        false,
+                    )?;
+                    crate::type_methods::arity_slot(args, 0)?;
+                    Ok(pyre_object::w_list_new(vec![
+                        pyre_object::w_str_new("tb_frame"),
+                        pyre_object::w_str_new("tb_next"),
+                        pyre_object::w_str_new("tb_lasti"),
+                        pyre_object::w_str_new("tb_lineno"),
+                    ]))
+                },
+                1,
+            ),
+        )
+    };
+
+    // `PyTraceback.typedef` wires `tb_frame` as a bare
+    // `interp_attrproperty_w('frame')` — return the live `PyFrame` itself
+    // (`FRAME_TYPE` typedef) as the user-visible `frame` object.  The
+    // traceback keeps that frame reachable through
+    // `pytraceback_object_custom_trace`, and the GC subsystem is installed
+    // at boot (`init_gc_subsystem`), so all frames — including under
+    // `PYRE_JIT=0` — are GC-owned oldgen blocks that stay alive as long as
+    // the traceback references them.
+    let frame_getter = make_builtin_function_with_arity(
+        "tb_frame",
+        |args| {
+            let tb = args[1];
+            if tb.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(tb) };
+            if frame.is_null() {
+                return Ok(pyre_object::w_none());
+            }
+            // Mark escaped so the JIT keeps the frame materialised for
+            // the exposed reference (pyframe.py `mark_as_escaped`), the
+            // way `sys/vm.py _getframe` does for the frame it hands out.
+            // This store has no counterpart on the upstream `tb_frame`,
+            // whose complete caller set is `executioncontext.py leave`,
+            // `error.py OperationError.get_traceback`,
+            // `interp_exceptions.py descr_gettraceback` and
+            // `sys/vm.py _getframe` — a deviation, not a port.
+            unsafe { (*frame).mark_as_escaped() };
+            Ok(frame as pyre_object::PyObjectRef)
+        },
+        2,
+    );
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "tb_frame",
+            make_getset_property_named(
+                frame_getter,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                "tb_frame",
+            ),
         )
     };
     // pytraceback.py descr_get_tb_lasti — the slot is handed out as it is.
@@ -8254,70 +8570,16 @@ fn init_pytraceback_type(ns: PyObjectRef) {
         )
     };
 
-    // `typedef.py PyTraceback.typedef` wires `tb_frame` as a bare
-    // `interp_attrproperty_w('frame')` — return the live `PyFrame` itself
-    // (`FRAME_TYPE` typedef) as the user-visible `frame` object.  The
-    // traceback keeps that frame reachable through
-    // `pytraceback_object_custom_trace`, and the GC subsystem is installed
-    // at boot (`init_gc_subsystem`), so all frames — including under
-    // `PYRE_JIT=0` — are GC-owned oldgen blocks that stay alive as long as
-    // the traceback references them.
-    let frame_getter = make_builtin_function_with_arity(
-        "tb_frame",
-        |args| {
-            let tb = args[1];
-            if tb.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(tb) };
-            if frame.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            // Mark escaped so the JIT keeps the frame materialised for
-            // the exposed reference (pyframe.py `mark_as_escaped`), the
-            // way `sys/vm.py _getframe` does for the frame it hands out.
-            // This store has no counterpart on the upstream `tb_frame`,
-            // whose complete caller set is `executioncontext.py leave`,
-            // `error.py OperationError.get_traceback`,
-            // `interp_exceptions.py descr_gettraceback` and
-            // `sys/vm.py _getframe` — a deviation, not a port.
-            unsafe { (*frame).mark_as_escaped() };
-            Ok(frame as pyre_object::PyObjectRef)
-        },
-        2,
-    );
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "tb_frame",
-            make_getset_property_named(
-                frame_getter,
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-                "tb_frame",
-            ),
-        )
-    };
-    // `pytraceback.py descr__dir__` — returns the list of
-    // public traceback attribute names.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__dir__",
-            make_builtin_function_with_arity(
-                "__dir__",
-                |_args| {
-                    Ok(pyre_object::w_list_new(vec![
-                        pyre_object::w_str_new("tb_frame"),
-                        pyre_object::w_str_new("tb_next"),
-                        pyre_object::w_str_new("tb_lasti"),
-                        pyre_object::w_str_new("tb_lineno"),
-                    ]))
-                },
-                1,
-            ),
-        )
-    };
+    // PyPy `PyTraceback.typedef` supplies the carriers/order; [3.14-spec]
+    // attach Argument Clinic metadata through Function.w_text_signature.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__dir__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("traceback TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 /// `pypy/interpreter/typedef.py:736-753 PyFrame.typedef` — the `frame`
@@ -8543,7 +8805,7 @@ fn init_frame_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "clear",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "clear",
                 |args| {
                     let f = frame_ptr(args[0]);
@@ -8553,6 +8815,7 @@ fn init_frame_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_none())
                 },
                 1,
+                "Clear all references held by the frame.",
             ),
         )
     };
@@ -8562,7 +8825,7 @@ fn init_frame_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__repr__",
                 |args| {
                     let f = frame_ptr(args[0]);
@@ -8574,9 +8837,19 @@ fn init_frame_type(ns: PyObjectRef) {
                     ))
                 },
                 1,
+                "Return repr(self).",
             ),
         )
     };
+
+    // PyPy `PyFrame.typedef` owns both callables above.  CPython 3.14's
+    // `PyFrame_Type` supplies their method/slot metadata, which the Rust
+    // gateway cannot infer from the upstream Python function objects.
+    for name in ["clear", "__repr__"] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("frame TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new("($self, /)")) };
+    }
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:1605-1623`
@@ -8961,6 +9234,25 @@ pub(crate) fn mappingproxy_from_mapping(
 }
 
 fn init_mappingproxy_type(ns: PyObjectRef) {
+    // PyPy `interp2app` rejects an unbound receiver before entering every
+    // `W_DictProxyObject` method. CPython exposes the ordinary methods as
+    // method descriptors and the operator methods as slot wrappers, which
+    // accounts for their two measured error-message forms.
+    fn require_mappingproxy_receiver(
+        args: &[PyObjectRef],
+        name: &str,
+        method_descriptor: bool,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        dict_iterator_receiver(
+            args,
+            name,
+            method_descriptor,
+            "mappingproxy",
+            &pyre_object::MAPPING_PROXY_TYPE,
+            false,
+        )
+    }
+
     // Python 3.14 `PyDictProxy_Type`: "Read-only proxy of a mapping."
     // PyPy's module doc spells out the same contract, while its TypeDef
     // predates the explicit type-doc slot.
@@ -8976,19 +9268,10 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(mappingproxy_descr_new),
-        )
-    };
-    // dictproxyobject.py:117 __class_getitem__ = interp2app(
-    //     generic_alias_class_getitem, as_classmethod=True)
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
+            make_new_descr_with_doc(
+                mappingproxy_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     // dictproxyobject.py descr_len → space.len(self.w_mapping)
@@ -8996,13 +9279,15 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__len__",
-            make_builtin_function("__len__", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_int_new(0));
-                }
-                crate::type_methods::arity_slot(args, 0)?;
-                crate::baseobjspace::len_slot(args[0])
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__len__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__len__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
+                    crate::baseobjspace::len_slot(args[0])
+                },
+                "Return len(self).",
+            ),
         )
     };
     // dictproxyobject.py descr_getitem → space.getitem(self.w_mapping, w_key)
@@ -9010,10 +9295,15 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getitem__",
-            make_builtin_function("__getitem__", |args| {
-                crate::type_methods::arity_slot(args, 1)?;
-                crate::baseobjspace::getitem(args[0], args[1])
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__getitem__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__getitem__", false)?;
+                    crate::type_methods::arity_slot(args, 1)?;
+                    crate::baseobjspace::getitem(args[0], args[1])
+                },
+                "Return self[key].",
+            ),
         )
     };
     // dictproxyobject.py descr_contains → space.contains(self.w_mapping, w_key)
@@ -9021,12 +9311,17 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__contains__",
-            make_builtin_function("__contains__", |args| {
-                crate::type_methods::arity_slot(args, 1)?;
-                Ok(pyre_object::w_bool_from(crate::baseobjspace::contains(
-                    args[0], args[1],
-                )?))
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__contains__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__contains__", false)?;
+                    crate::type_methods::arity_slot(args, 1)?;
+                    Ok(pyre_object::w_bool_from(crate::baseobjspace::contains(
+                        args[0], args[1],
+                    )?))
+                },
+                "Return bool(key in self).",
+            ),
         )
     };
     // dictproxyobject.py descr_iter → space.iter(self.w_mapping)
@@ -9034,12 +9329,35 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__iter__",
-            make_builtin_function("__iter__", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_none());
-                }
-                crate::baseobjspace::iter(args[0])
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__iter__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__iter__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
+                    crate::baseobjspace::iter(args[0])
+                },
+                "Implement iter(self).",
+            ),
+        )
+    };
+    // dictproxyobject.py descr_str → space.str(self.w_mapping)
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__str__",
+            crate::gateway::make_builtin_function_with_doc(
+                "__str__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__str__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
+                    unsafe {
+                        Ok(pyre_object::w_str_from_wtf8_managed(
+                            crate::display::py_str_wtf8(args[0])?,
+                        ))
+                    }
+                },
+                "Return str(self).",
+            ),
         )
     };
     // dictproxyobject.py descr_repr →
@@ -9048,47 +9366,19 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function("__repr__", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_str_new("mappingproxy({})"));
-                }
-                unsafe {
-                    Ok(pyre_object::w_str_from_wtf8_managed(
-                        crate::display::py_repr_wtf8(args[0])?,
-                    ))
-                }
-            }),
-        )
-    };
-    // dictproxyobject.py descr_str → space.str(self.w_mapping)
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__str__",
-            make_builtin_function("__str__", |args| {
-                if args.is_empty() {
-                    return Ok(pyre_object::w_str_new(""));
-                }
-                unsafe {
-                    Ok(pyre_object::w_str_from_wtf8_managed(
-                        crate::display::py_str_wtf8(args[0])?,
-                    ))
-                }
-            }),
-        )
-    };
-    // dictproxyobject.py descr_ior → unconditional TypeError; the
-    // proxy is read-only so in-place merge is rejected by name even
-    // when the rhs would otherwise be acceptable for `__or__`.
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__ior__",
-            make_builtin_function("__ior__", |_args| {
-                Err(crate::PyError::type_error(
-                    "'|=' is not supported by mappingproxy; use '|' instead",
-                ))
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__repr__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__repr__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
+                    unsafe {
+                        Ok(pyre_object::w_str_from_wtf8_managed(
+                            crate::display::py_repr_wtf8(args[0])?,
+                        ))
+                    }
+                },
+                "Return repr(self).",
+            ),
         )
     };
     // Python 3.14 `mappingproxy_hash`: delegate to the wrapped mapping.
@@ -9099,22 +9389,18 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__hash__",
                 |args| {
-                    let proxy = args[0];
-                    if !unsafe { pyre_object::is_dict_proxy(proxy) } {
-                        let received = unsafe { (*(*proxy).ob_type).name };
-                        return Err(crate::PyError::type_error(format!(
-                            "descriptor '__hash__' requires a 'mappingproxy' object but received a '{received}'"
-                        )));
-                    }
+                    let proxy = require_mappingproxy_receiver(args, "__hash__", false)?;
+                    crate::type_methods::arity_slot(args, 0)?;
                     let mapping = unsafe { pyre_object::w_dict_proxy_get_mapping(proxy) };
                     Ok(pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
                         mapping,
                     )?))
                 },
                 1,
+                "Return hash(self).",
             ),
         )
     };
@@ -9126,23 +9412,29 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__or__",
-            make_builtin_function("__or__", |args| {
-                crate::type_methods::arity_slot(args, 1)?;
-                let lhs = args[0];
-                let rhs = unsafe {
-                    if pyre_object::is_dict_proxy(args[1]) {
-                        pyre_object::w_dict_proxy_get_mapping(args[1])
-                    } else {
-                        args[1]
+            crate::gateway::make_builtin_function_with_doc(
+                "__or__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__or__", false)?;
+                    crate::type_methods::arity_slot(args, 1)?;
+                    let lhs = args[0];
+                    let rhs = unsafe {
+                        if pyre_object::is_dict_proxy(args[1]) {
+                            pyre_object::w_dict_proxy_get_mapping(args[1])
+                        } else {
+                            args[1]
+                        }
+                    };
+                    if !unsafe { crate::baseobjspace::isinstance_w(rhs, gettypeobject(&DICT_TYPE)) }
+                    {
+                        return Ok(pyre_object::w_not_implemented());
                     }
-                };
-                if !unsafe { pyre_object::is_dict(rhs) } {
-                    return Ok(pyre_object::w_not_implemented());
-                }
-                let new_dict = crate::type_methods::dict_method_copy(&[lhs])?;
-                crate::type_methods::dict_method_update(&[new_dict, rhs])?;
-                Ok(new_dict)
-            }),
+                    let new_dict = crate::type_methods::dict_method_copy(&[lhs])?;
+                    crate::type_methods::dict_method_update(&[new_dict, rhs])?;
+                    Ok(new_dict)
+                },
+                "Return self|value.",
+            ),
         )
     };
     // dictproxyobject.py descr_ror →
@@ -9151,23 +9443,53 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ror__",
-            make_builtin_function("__ror__", |args| {
-                crate::type_methods::arity_slot(args, 1)?;
-                let self_mapping = unsafe {
-                    if pyre_object::is_dict_proxy(args[0]) {
-                        pyre_object::w_dict_proxy_get_mapping(args[0])
-                    } else {
-                        args[0]
+            crate::gateway::make_builtin_function_with_doc(
+                "__ror__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__ror__", false)?;
+                    crate::type_methods::arity_slot(args, 1)?;
+                    let self_mapping = unsafe {
+                        if pyre_object::is_dict_proxy(args[0]) {
+                            pyre_object::w_dict_proxy_get_mapping(args[0])
+                        } else {
+                            args[0]
+                        }
+                    };
+                    let lhs = unsafe {
+                        if pyre_object::is_dict_proxy(args[1]) {
+                            pyre_object::w_dict_proxy_get_mapping(args[1])
+                        } else {
+                            args[1]
+                        }
+                    };
+                    if !unsafe { crate::baseobjspace::isinstance_w(lhs, gettypeobject(&DICT_TYPE)) }
+                    {
+                        return Ok(pyre_object::w_not_implemented());
                     }
-                };
-                let lhs = args[1];
-                if !unsafe { pyre_object::is_dict(lhs) } {
-                    return Ok(pyre_object::w_not_implemented());
-                }
-                let new_dict = crate::type_methods::dict_method_copy(&[lhs])?;
-                crate::type_methods::dict_method_update(&[new_dict, self_mapping])?;
-                Ok(new_dict)
-            }),
+                    crate::baseobjspace::call_method_result(lhs, "__or__", &[self_mapping])
+                },
+                "Return value|self.",
+            ),
+        )
+    };
+    // dictproxyobject.py descr_ior → unconditional TypeError; the
+    // proxy is read-only so in-place merge is rejected by name even
+    // when the rhs would otherwise be acceptable for `__or__`.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ior__",
+            crate::gateway::make_builtin_function_with_doc(
+                "__ior__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__ior__", false)?;
+                    crate::type_methods::arity_slot(args, 1)?;
+                    Err(crate::PyError::type_error(
+                        "'|=' is not supported by mappingproxy; use '|' instead",
+                    ))
+                },
+                "Return self|=value.",
+            ),
         )
     };
     // dictproxyobject.py descr_reversed →
@@ -9176,23 +9498,33 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reversed__",
-            make_builtin_function("__reversed__", |args| {
-                dict_iterator_receiver(
-                    args,
-                    "__reversed__",
-                    true,
-                    "mappingproxy",
-                    &pyre_object::MAPPING_PROXY_TYPE,
-                    false,
-                )?;
-                let dict = crate::type_methods::resolve_dict_backing(args[0]);
-                Ok(
-                    pyre_object::dictmultiobject::w_dict_view_reverse_iterator_new(
-                        dict,
-                        pyre_object::dictmultiobject::DictViewKind::Keys,
-                    ),
-                )
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__reversed__",
+                |args| {
+                    require_mappingproxy_receiver(args, "__reversed__", true)?;
+                    crate::type_methods::arity_no_args(args, "__reversed__")?;
+                    forward_mapping_method(args, "__reversed__")
+                },
+                "D.__reversed__() -> reverse iterator",
+            ),
+        )
+    };
+    // dictproxyobject.py __class_getitem__ = interp2app(
+    //     generic_alias_class_getitem, as_classmethod=True)
+    let class_getitem = crate::gateway::make_builtin_function_with_arity_and_doc(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+        2,
+        "mappingproxy objects are generic over two types, signifying (respectively) the types of their keys and values",
+    );
+    unsafe {
+        crate::function::fset_func_text_signature(class_getitem, w_str_new("($type, object, /)"))
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(class_getitem),
         )
     };
     // dictproxyobject.py get_w / 75 keys_w / 78 values_w / 81 items_w /
@@ -9211,57 +9543,86 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
                 proxy
             }
         };
-        let method = crate::baseobjspace::getattr_str(mapping, name)?;
-        crate::call::call_function_impl_result(method, &args[1..])
+        crate::baseobjspace::call_method_result(mapping, name, &args[1..])
     }
     fn proxy_get(args: &[PyObjectRef]) -> crate::PyResult {
+        require_mappingproxy_receiver(args, "get", true)?;
+        crate::type_methods::arity_between(args, "get", 1, 2)?;
         forward_mapping_method(args, "get")
     }
     fn proxy_keys(args: &[PyObjectRef]) -> crate::PyResult {
+        require_mappingproxy_receiver(args, "keys", true)?;
+        crate::type_methods::arity_no_args(args, "keys")?;
         forward_mapping_method(args, "keys")
     }
     fn proxy_values(args: &[PyObjectRef]) -> crate::PyResult {
+        require_mappingproxy_receiver(args, "values", true)?;
+        crate::type_methods::arity_no_args(args, "values")?;
         forward_mapping_method(args, "values")
     }
     fn proxy_items(args: &[PyObjectRef]) -> crate::PyResult {
+        require_mappingproxy_receiver(args, "items", true)?;
+        crate::type_methods::arity_no_args(args, "items")?;
         forward_mapping_method(args, "items")
     }
     fn proxy_copy(args: &[PyObjectRef]) -> crate::PyResult {
+        require_mappingproxy_receiver(args, "copy", true)?;
+        crate::type_methods::arity_no_args(args, "copy")?;
         forward_mapping_method(args, "copy")
     }
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "get",
-            make_builtin_function("get", proxy_get),
+            crate::gateway::make_builtin_function_with_doc(
+                "get",
+                proxy_get,
+                "Return the value for key if key is in the mapping, else default.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "keys",
-            make_builtin_function("keys", proxy_keys),
+            crate::gateway::make_builtin_function_with_doc(
+                "keys",
+                proxy_keys,
+                "D.keys() -> a set-like object providing a view on D's keys",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "values",
-            make_builtin_function("values", proxy_values),
+            crate::gateway::make_builtin_function_with_doc(
+                "values",
+                proxy_values,
+                "D.values() -> an object providing a view on D's values",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "items",
-            make_builtin_function("items", proxy_items),
+            crate::gateway::make_builtin_function_with_doc(
+                "items",
+                proxy_items,
+                "D.items() -> a set-like object providing a view on D's items",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "copy",
-            make_builtin_function("copy", proxy_copy),
+            crate::gateway::make_builtin_function_with_doc(
+                "copy",
+                proxy_copy,
+                "D.copy() -> a shallow copy of D",
+            ),
         )
     };
     // dictproxyobject.py:91-100 cmp methods (eq/ne/lt/le/gt/ge) →
@@ -9274,6 +9635,15 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         args: &[PyObjectRef],
         op: crate::baseobjspace::CompareOp,
     ) -> Result<PyObjectRef, crate::PyError> {
+        let name = match op {
+            crate::baseobjspace::CompareOp::Eq => "__eq__",
+            crate::baseobjspace::CompareOp::Ne => "__ne__",
+            crate::baseobjspace::CompareOp::Gt => "__gt__",
+            crate::baseobjspace::CompareOp::Ge => "__ge__",
+            crate::baseobjspace::CompareOp::Lt => "__lt__",
+            crate::baseobjspace::CompareOp::Le => "__le__",
+        };
+        require_mappingproxy_receiver(args, name, false)?;
         crate::type_methods::arity_slot(args, 1)?;
         // descr_op → getattr(space, op)(self.w_mapping, w_other): the
         // comparison runs on the wrapped mapping, not the proxy itself.
@@ -9311,44 +9681,101 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__eq__",
-            make_builtin_function("__eq__", proxy_eq),
+            crate::gateway::make_builtin_function_with_doc(
+                "__eq__",
+                proxy_eq,
+                "Return self==value.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ne__",
-            make_builtin_function("__ne__", proxy_ne),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__lt__",
-            make_builtin_function("__lt__", proxy_lt),
-        )
-    };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__le__",
-            make_builtin_function("__le__", proxy_le),
+            crate::gateway::make_builtin_function_with_doc(
+                "__ne__",
+                proxy_ne,
+                "Return self!=value.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__gt__",
-            make_builtin_function("__gt__", proxy_gt),
+            crate::gateway::make_builtin_function_with_doc(
+                "__gt__",
+                proxy_gt,
+                "Return self>value.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ge__",
-            make_builtin_function("__ge__", proxy_ge),
+            crate::gateway::make_builtin_function_with_doc(
+                "__ge__",
+                proxy_ge,
+                "Return self>=value.",
+            ),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__lt__",
+            crate::gateway::make_builtin_function_with_doc(
+                "__lt__",
+                proxy_lt,
+                "Return self<value.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__le__",
+            crate::gateway::make_builtin_function_with_doc(
+                "__le__",
+                proxy_le,
+                "Return self<=value.",
+            ),
+        )
+    };
+    // PyPy `W_DictProxyObject.typedef` supplies the callable carriers and
+    // their registration order above. [3.14-spec] Attach the measured
+    // Argument Clinic signatures through PyPy's own Function
+    // `w_text_signature` field; no operation or storage owner is replaced.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("__iter__", "($self, /)"),
+        ("__str__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("__ior__", "($self, value, /)"),
+        ("__reversed__", "($self, /)"),
+        ("get", "($self, key, default=None, /)"),
+        ("keys", "($self, /)"),
+        ("values", "($self, /)"),
+        ("items", "($self, /)"),
+        ("copy", "($self, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("mappingproxy TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 // ── Tuple TypeDef ────────────────────────────────────────────────────
@@ -11454,6 +11881,27 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
         (8 * word, 0)
     } else if is(&pyre_object::functional::ENUMERATE_TYPE) {
         (9 * word, 0)
+    } else if is(&pyre_object::generator::GENERATOR_TYPE)
+        || is(&pyre_object::generator::COROUTINE_TYPE)
+        || is(&pyre_object::generator::ASYNC_GENERATOR_TYPE)
+    {
+        // CPython 3.14t `_PyGenObject_HEAD` through
+        // `_PyInterpreterFrame.localsplus`: the free-threaded object header
+        // adds two words and `tlbc_index` fills the frame's existing padding.
+        // The flexible locals/cells/value-stack slots are pointer-sized.
+        (21 * word, word)
+    } else if is(&pyre_object::generator::COROUTINE_WRAPPER_TYPE)
+        || is(&pyre_object::generator::ASYNC_GEN_VALUE_WRAPPER_TYPE)
+    {
+        // CPython 3.14t `PyCoroWrapper` / `_PyAsyncGenWrappedValue`:
+        // the free-threaded object header followed by one owned reference.
+        (5 * word, 0)
+    } else if is(&pyre_object::generator::ASYNC_GEN_ASEND_TYPE)
+        || is(&pyre_object::generator::ASYNC_GEN_ATHROW_TYPE)
+    {
+        // CPython 3.14t `PyAsyncGenASend` / `PyAsyncGenAThrow`: the
+        // free-threaded header, two owned references and the padded state.
+        (7 * word, 0)
     } else if is(&pyre_object::weakref::WEAKREF_LAYOUT_TYPE) {
         // CPython 3.14 `PyWeakReference`: object header, doubly-linked
         // weakref list, callback, hash/cache word and vectorcall slot, plus
@@ -15861,34 +16309,45 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(|args| {
-                if args.len() != 3 {
-                    return Err(crate::PyError::type_error(format!(
-                        "method expected 2 arguments, got {}",
-                        args.len().saturating_sub(1),
-                    )));
-                }
-                crate::function::descr_method__new__(args[0], args[1], args[2])
-            }),
+            make_new_descr_with_doc(
+                |args| {
+                    if args.len() != 3 {
+                        return Err(crate::PyError::type_error(format!(
+                            "method expected 2 arguments, got {}",
+                            args.len().saturating_sub(1),
+                        )));
+                    }
+                    crate::function::descr_method__new__(args[0], args[1], args[2])
+                },
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            make_builtin_function("__call__", crate::function::descr_method_call),
+            crate::gateway::make_builtin_function_with_doc(
+                "__call__",
+                crate::function::descr_method_call,
+                "Call self as a function.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| unsafe {
-                let method = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                let cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-                crate::function::descr_method_get(method, obj, cls)
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__get__",
+                |args| unsafe {
+                    let method = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                    let cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                    crate::function::descr_method_get(method, obj, cls)
+                },
+                "Return an attribute of instance, which is of type owner.",
+            ),
         )
     };
     // typedef.py:839-840 ─
@@ -15950,10 +16409,11 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getattribute__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__getattribute__",
                 |args| unsafe { crate::function::descr_method_getattribute(args[0], args[1]) },
                 2,
+                "Return getattr(self, name).",
             ),
         )
     };
@@ -15961,10 +16421,11 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__eq__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__eq__",
                 |args| unsafe { crate::function::descr_method_eq(args[0], args[1]) },
                 2,
+                "Return self==value.",
             ),
         )
     };
@@ -15972,10 +16433,11 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ne__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__ne__",
                 |args| unsafe { crate::function::descr_method_ne(args[0], args[1]) },
                 2,
+                "Return self!=value.",
             ),
         )
     };
@@ -15999,17 +16461,17 @@ fn init_method_type(ns: PyObjectRef) {
     fn ge(args: &[PyObjectRef]) -> crate::PyResult {
         order(args, "__ge__")
     }
-    for (name, function) in [
-        ("__lt__", lt as MethodOrderFn),
-        ("__le__", le),
-        ("__gt__", gt),
-        ("__ge__", ge),
+    for (name, function, doc) in [
+        ("__lt__", lt as MethodOrderFn, "Return self<value."),
+        ("__le__", le, "Return self<=value."),
+        ("__gt__", gt, "Return self>value."),
+        ("__ge__", ge, "Return self>=value."),
     ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, 2),
+                crate::gateway::make_builtin_function_with_arity_and_doc(name, function, 2, doc),
             )
         };
     }
@@ -16017,7 +16479,7 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__hash__",
                 |args| unsafe {
                     Ok(pyre_object::w_int_new(crate::function::descr_method_hash(
@@ -16025,6 +16487,7 @@ fn init_method_type(ns: PyObjectRef) {
                     )?))
                 },
                 1,
+                "Return hash(self).",
             ),
         )
     };
@@ -16032,10 +16495,11 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__repr__",
                 |args| unsafe { crate::function::descr_method_repr(args[0]) },
                 1,
+                "Return repr(self).",
             ),
         )
     };
@@ -16050,6 +16514,30 @@ fn init_method_type(ns: PyObjectRef) {
             ),
         )
     };
+
+    // PyPy `Method.typedef` supplies the callable carriers in the order
+    // above.  CPython 3.14's method slots/method table supply their public
+    // signatures and docs; attach the signatures after the TypeDef-shaped
+    // registration so no operation is reimplemented around the port.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__call__", "($self, /, *args, **kwargs)"),
+        ("__get__", "($self, instance, owner=None, /)"),
+        ("__getattribute__", "($self, name, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__hash__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("__reduce__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("method TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 fn code_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
@@ -16094,39 +16582,55 @@ fn init_code_type(ns: PyObjectRef) {
     // slots (`__replace__`, `co_branches`, adaptive bytes and ordering
     // wrappers) added from `PyCode_Type`. Every field descriptor reads the
     // single compiler CodeObject stored by `PyCode`.
+    let new_descr = make_new_descr_with_doc(
+        code_descr_new,
+        "Create and return a new object.  See help(type) for accurate signature.",
+    );
     unsafe {
+        // [3.14-spec] PyPy `PyCode.typedef` installs its app-level
+        // `descr_code__new__`; CPython 3.14's `add_tp_new_wrapper` exposes
+        // the equivalent carrier with this generic tp_new signature.  The
+        // detailed constructor signature remains on the `code` type itself.
+        crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"));
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__doc__",
             pyre_object::w_str_new("Create a code object.  Not for the faint of heart."),
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__new__",
-            make_new_descr(code_descr_new),
-        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr);
     }
     for (name, function) in [
         ("__eq__", code_descr_eq as crate::gateway::BuiltinCodeFn),
         ("__ne__", code_descr_ne as crate::gateway::BuiltinCodeFn),
     ] {
+        let doc = if name == "__eq__" {
+            "Return self==value."
+        } else {
+            "Return self!=value."
+        };
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, 2),
+                crate::gateway::make_builtin_function_with_arity_and_doc(name, function, 2, doc),
             );
         }
     }
-    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+    for (name, doc) in [
+        ("__lt__", "Return self<value."),
+        ("__le__", "Return self<=value."),
+        ("__gt__", "Return self>value."),
+        ("__ge__", "Return self>=value."),
+    ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(
+                crate::gateway::make_builtin_function_with_arity_and_doc(
                     name,
                     |_args| Ok(pyre_object::special::w_not_implemented()),
                     2,
+                    doc,
                 ),
             );
         }
@@ -16135,29 +16639,41 @@ fn init_code_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__hash__",
                 |args| unsafe { Ok(pyre_object::w_int_new(crate::pycode::code_hash(args[0])?)) },
                 1,
+                "Return hash(self).",
             ),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__repr__",
                 |args| unsafe { crate::pycode::code_repr(args[0]) },
                 1,
+                "Return repr(self).",
             ),
         );
     }
 
-    for name in ["replace", "__replace__"] {
+    for (name, doc) in [
+        (
+            "replace",
+            "Return a copy of the code object with new values for the specified fields.",
+        ),
+        ("__replace__", "The same as replace()."),
+    ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function(name, |args| unsafe { crate::pycode::code_replace(args) }),
+                crate::gateway::make_builtin_function_with_doc(
+                    name,
+                    |args| unsafe { crate::pycode::code_replace(args) },
+                    doc,
+                ),
             );
         }
     }
@@ -16165,10 +16681,11 @@ fn init_code_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "_varname_from_oparg",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "_varname_from_oparg",
                 |args| unsafe { crate::pycode::code_varname_from_oparg(args[0], args[1]) },
                 2,
+                "(internal-only) Return the local variable name for the given oparg.\n\nWARNING: this method is for internal use only and may change or go\naway.",
             ),
         );
     }
@@ -16193,6 +16710,31 @@ fn init_code_type(ns: PyObjectRef) {
                 make_builtin_function_with_arity(name, function, 1),
             );
         }
+    }
+
+    // PyPy's `PyCode.typedef` supplies the callable entries and CPython
+    // 3.14's `PyCode_Type` method table supplies their Argument Clinic / slot
+    // wrapper metadata.  Attach that metadata to the same carriers after the
+    // TypeDef-shaped registration above.
+    for (name, text_signature) in [
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__hash__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("replace", "($self, /, **changes)"),
+        ("__replace__", "($self, /, **changes)"),
+        ("_varname_from_oparg", "($self, /, oparg)"),
+        ("co_positions", "($self, /)"),
+        ("co_lines", "($self, /)"),
+        ("co_branches", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("code TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 
     for name in [
@@ -16621,6 +17163,10 @@ fn cell_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
 /// the version oracle where it differs: its public cell type deliberately
 /// omits PyPy 3.11's `__reduce__` and `__setstate__` pickle hooks.
 fn init_cell_type(ns: PyObjectRef) {
+    let new_descr = make_new_descr_with_doc(
+        cell_descr_new,
+        "Create and return a new object.  See help(type) for accurate signature.",
+    );
     let entries = [
         (
             "__doc__",
@@ -16628,39 +17174,92 @@ fn init_cell_type(ns: PyObjectRef) {
                 "Create a new cell object.\n\n  contents\n    the contents of the cell. If not specified, the cell will be empty,\n    and \n further attempts to access its cell_contents attribute will\n    raise a ValueError.",
             ),
         ),
-        ("__new__", make_new_descr(cell_descr_new)),
+        ("__new__", new_descr),
         (
             "__eq__",
-            make_builtin_function_with_arity("__eq__", cell_descr_eq, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__eq__",
+                cell_descr_eq,
+                2,
+                "Return self==value.",
+            ),
         ),
         (
             "__ne__",
-            make_builtin_function_with_arity("__ne__", cell_descr_ne, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__ne__",
+                cell_descr_ne,
+                2,
+                "Return self!=value.",
+            ),
         ),
         (
             "__lt__",
-            make_builtin_function_with_arity("__lt__", cell_descr_lt, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__lt__",
+                cell_descr_lt,
+                2,
+                "Return self<value.",
+            ),
         ),
         (
             "__gt__",
-            make_builtin_function_with_arity("__gt__", cell_descr_gt, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__gt__",
+                cell_descr_gt,
+                2,
+                "Return self>value.",
+            ),
         ),
         (
             "__le__",
-            make_builtin_function_with_arity("__le__", cell_descr_le, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__le__",
+                cell_descr_le,
+                2,
+                "Return self<=value.",
+            ),
         ),
         (
             "__ge__",
-            make_builtin_function_with_arity("__ge__", cell_descr_ge, 2),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__ge__",
+                cell_descr_ge,
+                2,
+                "Return self>=value.",
+            ),
         ),
         ("__hash__", w_none()),
         (
             "__repr__",
-            make_builtin_function_with_arity("__repr__", cell_descr_repr, 1),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__repr__",
+                cell_descr_repr,
+                1,
+                "Return repr(self).",
+            ),
         ),
     ];
     for (name, value) in entries {
         unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    // PyPy `Cell.typedef` supplies the callable carriers above in its source
+    // order.  [3.14-spec] CPython 3.14's cell slots expose these public
+    // signatures and docs; attach only the metadata after the PyPy-shaped
+    // registration rather than replacing any cell operation.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__repr__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("cell TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
     // `nestedscope.py descr__cell_contents`:
     //
@@ -28424,44 +29023,182 @@ fn generator_readonly_attribute(args: &[PyObjectRef]) -> crate::PyResult {
     )))
 }
 
+/// CPython 3.14 `gen_sizeof`, over PyPy's generator-owned `pycode`.
+fn generator_descr_sizeof(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+    let generator = args[0];
+    let w_code = unsafe { pyre_object::generator::w_generator_get_pycode(generator) };
+    let code = unsafe { &*(crate::pycode::w_code_get_ptr(w_code) as *const crate::CodeObject) };
+    // `_PyFrame_NumSlotsForCodeObject`: locals-plus followed by the maximum
+    // operand stack. `pyframe::ncells` excludes cellvars that alias locals,
+    // matching CPython's `co_nlocalsplus` rather than blindly summing names.
+    let slots = code
+        .varnames
+        .len()
+        .checked_add(crate::pyframe::ncells(code))
+        .and_then(|value| value.checked_add(code.max_stackdepth as usize))
+        .ok_or_else(crate::builtins::reservation_failed)?;
+    let basicsize = cpython_type_layout(gettypeobject(&pyre_object::generator::GENERATOR_TYPE))
+        .expect("generator has CPython layout metadata")
+        .0 as usize;
+    let bytes = slots
+        .checked_mul(std::mem::size_of::<usize>())
+        .and_then(|value| basicsize.checked_add(value))
+        .ok_or_else(crate::builtins::reservation_failed)?;
+    Ok(w_int_new(bytes as i64))
+}
+
+/// PyPy `Coroutine._finalize_` / CPython 3.14 `_PyGen_Finalize`.
+///
+/// Unlike `generator.close`, finalizing a never-awaited coroutine warns and
+/// leaves its frame available.  The GC and the public `__del__` wrapper must
+/// enter the same interpreter-owned finalizer path.
+fn coroutine_descr_finalize(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::arity_no_args(args, "__del__")?;
+    crate::baseobjspace::generator_finalize(args[0])
+}
+
+/// CPython 3.14 `_PyGen_Finalize`, routed through PyPy's async-generator hook
+/// owner when one was captured by `AsyncGenerator.init_hooks`.
+fn async_generator_descr_finalize(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::arity_no_args(args, "__del__")?;
+    let async_generator = args[0];
+    let has_finalizer = unsafe {
+        !pyre_object::generator::w_generator_is_exhausted(async_generator)
+            && !pyre_object::generator::w_async_generator_get_finalizer(async_generator).is_null()
+    };
+    if has_finalizer {
+        crate::baseobjspace::generator_finalize(async_generator)
+    } else {
+        crate::baseobjspace::generator_close_method(&[async_generator])
+    }
+}
+
 /// PyPy `generator.py GeneratorIterator.typedef`, augmented only by the
 /// concrete slots Python 3.14 exposes on `types.GeneratorType`.
 fn init_generator_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
-    for (name, function, arity) in [
-        ("__repr__", generator_descr_repr as DunderFn, 1),
-        ("__next__", crate::baseobjspace::generator_next_method, 1),
-        ("send", crate::baseobjspace::generator_send_method, 2),
-        ("close", crate::baseobjspace::generator_close_method, 1),
-        ("__iter__", crate::baseobjspace::iter_self_method, 1),
-        ("__del__", crate::baseobjspace::generator_close_method, 1),
+    // Preserve `GeneratorIterator.typedef`'s shared order first.  CPython
+    // 3.14's extra finalizer/size/generic-alias entries follow those methods,
+    // ahead of PyPy's descriptor block and terminal `__doc__`.
+    for (name, function, arity, doc) in [
+        (
+            "__repr__",
+            generator_descr_repr as DunderFn,
+            1,
+            "Return repr(self).",
+        ),
+        (
+            "__next__",
+            crate::baseobjspace::generator_next_method,
+            1,
+            "Implement next(self).",
+        ),
     ] {
-        let function = if name == "__next__" {
-            crate::gateway::make_builtin_function_with_arity_and_doc(
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
                 name,
-                function,
-                arity,
-                "Implement next(self).",
+                crate::gateway::make_slot_wrapper_with_arity_and_doc(name, function, arity, doc),
             )
-        } else {
-            make_builtin_function_with_arity(name, function, arity)
         };
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, function) };
     }
     unsafe {
-        pyre_object::w_dict_setitem_str(
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "send",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "send",
+                crate::baseobjspace::generator_send_method,
+                2,
+                "send(value) -> send 'value' into generator,\nreturn next yielded value or raise StopIteration.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "throw",
-            make_builtin_function("throw", crate::baseobjspace::generator_throw_method),
-        );
-        pyre_object::w_dict_setitem_str(
+            crate::gateway::make_method_descriptor_with_doc(
+                "throw",
+                crate::baseobjspace::generator_throw_method,
+                "throw(value)\nthrow(type[,value[,tb]])\n\nRaise exception in generator, return next yielded value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "close",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "close",
+                crate::baseobjspace::generator_close_method,
+                1,
+                "close() -> raise GeneratorExit inside generator.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iter__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__iter__",
+                crate::baseobjspace::iter_self_method,
+                1,
+                "Implement iter(self).",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__del__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__del__",
+                crate::baseobjspace::generator_close_method,
+                1,
+                "Called when the instance is about to be destroyed.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "__sizeof__",
+                generator_descr_sizeof,
+                1,
+                "gen.__sizeof__() -> size of gen in memory, in bytes",
+            ),
+        )
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let function_slot = roots.base();
+    let _ = roots.pin_root(crate::gateway::make_builtin_function_with_arity_and_doc(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+        2,
+        "generators are generic over the types of their yield, send, and return values",
+    ));
+    let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_str_new("($type, object, /)"));
+    unsafe {
+        crate::function::fset_func_text_signature(
+            roots.get(function_slot),
+            roots.get(signature_slot),
+        )
+    };
+    let classmethod_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::function::w_classmethod_new(
+        roots.get(function_slot),
+    ));
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
-        );
+            roots.get(classmethod_slot),
+        )
     }
     for (name, getter) in [
         ("gi_running", generator_get_running as DunderFn),
@@ -28512,68 +29249,134 @@ fn init_generator_type(ns: PyObjectRef) {
             )
         };
     }
+    unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", w_none()) };
+    for (name, text_signature) in [
+        ("__repr__", "($self, /)"),
+        ("__next__", "($self, /)"),
+        ("send", "($self, object, /)"),
+        ("close", "($self, /)"),
+        ("__iter__", "($self, /)"),
+        ("__del__", "($self, /)"),
+        ("__sizeof__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
+    }
 }
 
 /// PyPy `generator.py Coroutine.typedef`.
 fn init_coroutine_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
-    for (name, function, arity, doc) in [
-        ("__repr__", coroutine_descr_repr as DunderFn, 1, None),
-        (
+    // Preserve `Coroutine.typedef`'s shared order first.  The concrete
+    // finalizer/size/generic-alias entries from Python 3.14 follow its method
+    // block, before PyPy's descriptor block and terminal `__doc__`.
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__repr__",
+                coroutine_descr_repr,
+                1,
+                "Return repr(self).",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
             "send",
-            crate::baseobjspace::generator_send_method,
-            2,
-            Some(
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "send",
+                crate::baseobjspace::generator_send_method,
+                2,
                 "send(arg) -> send 'arg' into coroutine,\nreturn next iterated value or raise StopIteration.",
             ),
-        ),
-        (
-            "close",
-            crate::baseobjspace::generator_close_method,
-            1,
-            Some("close() -> raise GeneratorExit inside coroutine."),
-        ),
-        (
-            "__await__",
-            crate::baseobjspace::coroutine_await_method,
-            1,
-            None,
-        ),
-        (
-            "__del__",
-            crate::baseobjspace::generator_close_method,
-            1,
-            None,
-        ),
-    ] {
-        let function = match doc {
-            Some(doc) => {
-                crate::gateway::make_builtin_function_with_arity_and_doc(name, function, arity, doc)
-            }
-            None => make_builtin_function_with_arity(name, function, arity),
-        };
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, function) };
-    }
+        )
+    };
     unsafe {
-        pyre_object::w_dict_setitem_str(
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "throw",
-            crate::gateway::make_builtin_function_with_doc(
+            crate::gateway::make_method_descriptor_with_doc(
                 "throw",
                 crate::baseobjspace::generator_throw_method,
                 "throw(value)\nthrow(type[,value[,traceback]])\n\nRaise exception in coroutine, return next iterated value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
             ),
-        );
-        // CPython 3.14 Objects/genobject.c coro_methods — Py_GenericAlias
-        // with METH_CLASS.
-        pyre_object::w_dict_setitem_str(
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "close",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "close",
+                crate::baseobjspace::generator_close_method,
+                1,
+                "close() -> raise GeneratorExit inside coroutine.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__await__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__await__",
+                crate::baseobjspace::coroutine_await_method,
+                1,
+                "Return an iterator to be used in await expression.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__del__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__del__",
+                coroutine_descr_finalize,
+                1,
+                "Called when the instance is about to be destroyed.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "__sizeof__",
+                generator_descr_sizeof,
+                1,
+                "gen.__sizeof__() -> size of gen in memory, in bytes",
+            ),
+        )
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let function_slot = roots.base();
+    let _ = roots.pin_root(crate::gateway::make_builtin_function_with_arity_and_doc(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+        2,
+        "coroutines are generic over the types of their yield, send, and return values",
+    ));
+    let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_str_new("($type, object, /)"));
+    unsafe {
+        crate::function::fset_func_text_signature(
+            roots.get(function_slot),
+            roots.get(signature_slot),
+        )
+    };
+    let classmethod_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::function::w_classmethod_new(
+        roots.get(function_slot),
+    ));
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
-        );
+            roots.get(classmethod_slot),
+        )
     }
     for (name, getter) in [
         ("cr_running", coroutine_get_running as DunderFn),
@@ -28624,52 +29427,118 @@ fn init_coroutine_type(ns: PyObjectRef) {
             )
         };
     }
+    unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", w_none()) };
+    for (name, text_signature) in [
+        ("__repr__", "($self, /)"),
+        ("send", "($self, object, /)"),
+        ("close", "($self, /)"),
+        ("__await__", "($self, /)"),
+        ("__del__", "($self, /)"),
+        ("__sizeof__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
+    }
 }
 
 /// PyPy `generator.py AsyncGenerator.typedef`.
 fn init_async_generator_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
-    for (name, function, arity) in [
-        ("__repr__", async_generator_descr_repr as DunderFn, 1),
-        (
-            "asend",
-            crate::baseobjspace::async_generator_asend_method,
-            2,
-        ),
-        (
-            "aclose",
-            crate::baseobjspace::async_generator_aclose_method,
-            1,
-        ),
-        ("__aiter__", crate::baseobjspace::iter_self_method, 1),
-        (
-            "__anext__",
-            crate::baseobjspace::async_generator_anext_method,
-            1,
-        ),
-    ] {
-        unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                make_builtin_function_with_arity(name, function, arity),
-            )
-        };
-    }
+    // Preserve `AsyncGenerator.typedef`'s shared order first.  Python 3.14's
+    // finalizer/size entries follow the method block; PyPy's class-getitem
+    // entry remains after the descriptor block, immediately before `__doc__`.
     unsafe {
-        pyre_object::w_dict_setitem_str(
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__repr__",
+                async_generator_descr_repr,
+                1,
+                "Return repr(self).",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "asend",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "asend",
+                crate::baseobjspace::async_generator_asend_method,
+                2,
+                "asend(v) -> send 'v' in generator.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "athrow",
-            make_builtin_function("athrow", crate::baseobjspace::async_generator_athrow_method),
-        );
-        pyre_object::w_dict_setitem_str(
+            crate::gateway::make_method_descriptor_with_doc(
+                "athrow",
+                crate::baseobjspace::async_generator_athrow_method,
+                "athrow(value)\nathrow(type[,value[,tb]])\n\nraise exception in generator.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
-            "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
-        );
+            "aclose",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "aclose",
+                crate::baseobjspace::async_generator_aclose_method,
+                1,
+                "aclose() -> raise GeneratorExit inside generator.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__aiter__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__aiter__",
+                crate::baseobjspace::iter_self_method,
+                1,
+                "Return an awaitable, that resolves in asynchronous iterator.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__anext__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__anext__",
+                crate::baseobjspace::async_generator_anext_method,
+                1,
+                "Return a value or raise StopAsyncIteration.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__del__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__del__",
+                async_generator_descr_finalize,
+                1,
+                "Called when the instance is about to be destroyed.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "__sizeof__",
+                generator_descr_sizeof,
+                1,
+                "gen.__sizeof__() -> size of gen in memory, in bytes",
+            ),
+        )
     }
     for (name, getter) in [
         ("ag_running", async_generator_get_running as DunderFn),
@@ -28718,6 +29587,45 @@ fn init_async_generator_type(ns: PyObjectRef) {
             )
         };
     }
+    let roots = pyre_object::gc_roots::push_roots();
+    let function_slot = roots.base();
+    let _ = roots.pin_root(crate::gateway::make_builtin_function_with_arity_and_doc(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+        2,
+        "async generators are generic over the types of their yield and send values",
+    ));
+    let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_str_new("($type, object, /)"));
+    unsafe {
+        crate::function::fset_func_text_signature(
+            roots.get(function_slot),
+            roots.get(signature_slot),
+        )
+    };
+    let classmethod_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::function::w_classmethod_new(
+        roots.get(function_slot),
+    ));
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__class_getitem__",
+            roots.get(classmethod_slot),
+        )
+    }
+    unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", w_none()) };
+    for (name, text_signature) in [
+        ("__repr__", "($self, /)"),
+        ("asend", "($self, object, /)"),
+        ("aclose", "($self, /)"),
+        ("__aiter__", "($self, /)"),
+        ("__anext__", "($self, /)"),
+        ("__del__", "($self, /)"),
+        ("__sizeof__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
+    }
 }
 
 fn init_async_gen_value_wrapper_type(ns: PyObjectRef) {
@@ -28728,8 +29636,15 @@ fn init_buffer_wrapper_type(ns: PyObjectRef) {
     unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
 }
 
+/// CPython 3.14 `async_gen_asend_finalize` / `async_gen_athrow_finalize`,
+/// using PyPy's registered finalizer path for the awaitable owner.
+fn async_gen_awaitable_descr_finalize(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::arity_no_args(args, "__del__")?;
+    crate::baseobjspace::async_gen_awaitable_finalize(args[0]);
+    Ok(w_none())
+}
+
 fn init_async_gen_awaitable_type(ns: PyObjectRef, athrow: bool) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
     let (next, send, throw, close) = if athrow {
         (
             crate::baseobjspace::async_gen_athrow_next_method as DunderFn,
@@ -28745,30 +29660,88 @@ fn init_async_gen_awaitable_type(ns: PyObjectRef, athrow: bool) {
             crate::baseobjspace::async_gen_asend_close_method as DunderFn,
         )
     };
-    for (name, function, arity) in [
+    // PyPy `AsyncGenABase.typedef`: await, iter, next, close, send, throw.
+    // Python 3.14's public finalizer wrapper follows the shared block and the
+    // terminal `__doc__` remains last.
+    for (name, function, doc) in [
         (
             "__await__",
             crate::baseobjspace::iter_self_method as DunderFn,
-            1,
+            "Return an iterator to be used in await expression.",
         ),
         (
             "__iter__",
             crate::baseobjspace::iter_self_method as DunderFn,
-            1,
+            "Implement iter(self).",
         ),
-        ("__next__", next, 1),
-        ("send", send, 2),
-        ("close", close, 1),
+        ("__next__", next, "Implement next(self)."),
     ] {
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, arity),
+                crate::gateway::make_slot_wrapper_with_arity_and_doc(name, function, 1, doc),
             )
         };
     }
-    unsafe { pyre_object::w_dict_setitem_str(ns, "throw", make_builtin_function("throw", throw)) };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "close",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "close",
+                close,
+                1,
+                "close() -> raise GeneratorExit inside generator.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "send",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "send",
+                send,
+                2,
+                "send(value) -> send 'value' into generator,\nreturn next yielded value or raise StopIteration.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "throw",
+            crate::gateway::make_method_descriptor_with_doc(
+                "throw",
+                throw,
+                "throw(value)\nthrow(type[,value[,tb]])\n\nRaise exception in generator, return next yielded value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__del__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__del__",
+                async_gen_awaitable_descr_finalize,
+                1,
+                "Called when the instance is about to be destroyed.",
+            ),
+        )
+    };
+    unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", w_none()) };
+    for (name, text_signature) in [
+        ("__await__", "($self, /)"),
+        ("__iter__", "($self, /)"),
+        ("__next__", "($self, /)"),
+        ("close", "($self, /)"),
+        ("send", "($self, object, /)"),
+        ("__del__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
+    }
 }
 
 fn init_async_gen_asend_type(ns: PyObjectRef) {
@@ -28781,43 +29754,77 @@ fn init_async_gen_athrow_type(ns: PyObjectRef) {
 
 /// PyPy `generator.py CoroutineWrapper.typedef`.
 fn init_coroutine_wrapper_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
-    for (name, function, arity) in [
+    // `CoroutineWrapper.typedef` and CPython's `_PyCoroWrapper_Type` share
+    // this exact method order.
+    for (name, function, doc) in [
         (
             "__iter__",
             crate::baseobjspace::iter_self_method as DunderFn,
-            1,
+            "Implement iter(self).",
         ),
         (
             "__next__",
             crate::baseobjspace::coroutine_wrapper_next_method,
-            1,
-        ),
-        (
-            "send",
-            crate::baseobjspace::coroutine_wrapper_send_method,
-            2,
-        ),
-        (
-            "close",
-            crate::baseobjspace::coroutine_wrapper_close_method,
-            1,
+            "Implement next(self).",
         ),
     ] {
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, arity),
+                crate::gateway::make_slot_wrapper_with_arity_and_doc(name, function, 1, doc),
             )
         };
     }
     unsafe {
-        pyre_object::w_dict_setitem_str(
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "send",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "send",
+                crate::baseobjspace::coroutine_wrapper_send_method,
+                2,
+                "send(arg) -> send 'arg' into coroutine,\nreturn next iterated value or raise StopIteration.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "throw",
-            make_builtin_function("throw", crate::baseobjspace::coroutine_wrapper_throw_method),
-        );
+            crate::gateway::make_method_descriptor_with_doc(
+                "throw",
+                crate::baseobjspace::coroutine_wrapper_throw_method,
+                "throw(value)\nthrow(type[,value[,traceback]])\n\nRaise exception in coroutine, return next iterated value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "close",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "close",
+                crate::baseobjspace::coroutine_wrapper_close_method,
+                1,
+                "close() -> raise GeneratorExit inside coroutine.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new("A wrapper object implementing __await__ for coroutines."),
+        )
+    };
+    for (name, text_signature) in [
+        ("__iter__", "($self, /)"),
+        ("__next__", "($self, /)"),
+        ("send", "($self, object, /)"),
+        ("close", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
     }
 }
 
@@ -29599,22 +30606,73 @@ fn count_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_str_from_wtf8(text))
 }
 
+/// [3.14-spec] CPython `count_slots` publishes `Py_tp_getattro`, while PyPy's
+/// `W_Count.typedef` inherits the same lookup from `object`.  Keep the lookup
+/// in the object space and expose only the additional observable type-dict
+/// entry; `W_Count`'s storage and every other operation remain PyPy-owned.
+fn count_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    let name_obj = args.get(1).copied().unwrap_or(PY_NULL);
+    if !unsafe { pyre_object::is_str(name_obj) } {
+        return Err(crate::PyError::type_error("attribute name must be string"));
+    }
+    let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) };
+    match name.as_str() {
+        Ok(name) => crate::baseobjspace::object_getattribute(obj, name),
+        Err(_) => unsafe {
+            crate::baseobjspace::object_getattribute_surrogate(obj, name_obj, name)
+        },
+    }
+}
+
 fn init_count_type(ns: PyObjectRef) {
-    // Source order follows W_Count.typedef.  `__reduce__` is the one explicit
-    // Python-3.14 semantic delta (the concrete type no longer exposes it).
+    // Source order follows `W_Count.typedef`: constructor, iteration, repr,
+    // terminal doc. `__reduce__` is the one removed Python-3.14 surface entry;
+    // `count_slots`' observable `__getattribute__` entry is inserted before
+    // the terminal doc without changing the PyPy-owned operation order.
     let entries = [
-        ("__new__", make_new_descr(count_descr_new)),
+        (
+            "__new__",
+            make_new_descr_with_doc(
+                count_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
+        ),
         (
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__iter__",
+                crate::baseobjspace::iter_self_method,
+                1,
+                "Implement iter(self).",
+            ),
         ),
         (
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__next__",
+                crate::baseobjspace::iter_next_method,
+                1,
+                "Implement next(self).",
+            ),
         ),
         (
             "__repr__",
-            make_builtin_function_with_arity("__repr__", count_descr_repr, 1),
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__repr__",
+                count_descr_repr,
+                1,
+                "Return repr(self).",
+            ),
+        ),
+        (
+            "__getattribute__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__getattribute__",
+                count_descr_getattribute,
+                2,
+                "Return getattr(self, name).",
+            ),
         ),
         (
             "__doc__",
@@ -29625,6 +30683,15 @@ fn init_count_type(ns: PyObjectRef) {
     ];
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__iter__", "($self, /)"),
+        ("__next__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("__getattribute__", "($self, name, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
     }
 }
 
@@ -29675,24 +30742,66 @@ fn repeat_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_str_from_wtf8(text))
 }
 
+/// [3.14-spec] CPython `repeat_slots` publishes `Py_tp_getattro`, while PyPy's
+/// `W_Repeat.typedef` inherits object lookup.  Expose that observable type-dict
+/// entry through the same object-space operation without changing PyPy's
+/// repeat storage, iteration, or source order.
 fn init_repeat_type(ns: PyObjectRef) {
+    // Source order follows PyPy `W_Repeat.typedef`: constructor, iteration,
+    // length hint, next, repr, and terminal doc.  CPython 3.14's observable
+    // `__getattribute__` slot entry is the sole inserted operation.
     let entries = [
-        ("__new__", make_new_descr(repeat_descr_new)),
+        (
+            "__new__",
+            make_new_descr_with_doc(
+                repeat_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
+        ),
         (
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__iter__",
+                crate::baseobjspace::iter_self_method,
+                1,
+                "Implement iter(self).",
+            ),
         ),
         (
             "__length_hint__",
-            make_builtin_function_with_arity("__length_hint__", repeat_descr_length_hint, 1),
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "__length_hint__",
+                repeat_descr_length_hint,
+                1,
+                "Private method returning an estimate of len(list(it)).",
+            ),
         ),
         (
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__next__",
+                crate::baseobjspace::iter_next_method,
+                1,
+                "Implement next(self).",
+            ),
         ),
         (
             "__repr__",
-            make_builtin_function_with_arity("__repr__", repeat_descr_repr, 1),
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__repr__",
+                repeat_descr_repr,
+                1,
+                "Return repr(self).",
+            ),
+        ),
+        (
+            "__getattribute__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__getattribute__",
+                count_descr_getattribute,
+                2,
+                "Return getattr(self, name).",
+            ),
         ),
         (
             "__doc__",
@@ -29703,6 +30812,16 @@ fn init_repeat_type(ns: PyObjectRef) {
     ];
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__iter__", "($self, /)"),
+        ("__length_hint__", "($self, /)"),
+        ("__next__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("__getattribute__", "($self, name, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
     }
 }
 
@@ -29816,6 +30935,7 @@ fn compress_iter_self(args: &[PyObjectRef]) -> crate::PyResult {
         args,
         "itertools.compress",
         "__iter__",
+        false,
         pyre_object::interp_itertools::is_compress,
     )
 }
@@ -29825,6 +30945,7 @@ fn compress_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
         args,
         "itertools.compress",
         "__next__",
+        false,
         pyre_object::interp_itertools::is_compress,
     )?;
     crate::baseobjspace::next(obj)
@@ -29861,6 +30982,7 @@ fn starmap_iter_self(args: &[PyObjectRef]) -> crate::PyResult {
         args,
         "itertools.starmap",
         "__iter__",
+        false,
         pyre_object::interp_itertools::is_starmap,
     )
 }
@@ -29870,6 +30992,7 @@ fn starmap_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
         args,
         "itertools.starmap",
         "__next__",
+        false,
         pyre_object::interp_itertools::is_starmap,
     )?;
     crate::baseobjspace::next(obj)

@@ -81,6 +81,8 @@ assert encoder.getstate() == 0
 
 decoder = codecs.getincrementaldecoder("hz")()
 assert decoder.getstate() == (b"", 0)
+assert codecs.getincrementaldecoder("gbk")().decode(bytearray(b"abc")) == "abc"
+assert codecs.getincrementaldecoder("gbk")().decode(memoryview(b"abc")) == "abc"
 assert decoder.decode(b"~{") == ""
 gb_state = decoder.getstate()
 assert gb_state == (b"", 1), gb_state
@@ -89,6 +91,30 @@ decoder.setstate(gb_state)
 assert decoder.decode(b"AD") == "聊"
 assert decoder.decode(b"~}", final=True) == ""
 assert decoder.getstate() == (b"", 0)
+
+
+class ErrorName(str):
+    def __str__(self):
+        raise AssertionError("codec error names are extracted without __str__")
+
+    def __getitem__(self, key):
+        raise AssertionError("codec error names are extracted without overrides")
+
+
+assigned_errors = ErrorName("ignore")
+decoder.errors = assigned_errors
+assert decoder.errors == "ignore"
+assert type(decoder.errors) is str
+assert decoder.errors is not assigned_errors
+
+
+class CodecState(int):
+    def to_bytes(self, *args, **kwargs):
+        raise AssertionError("codec setstate must bypass int.to_bytes overrides")
+
+
+codecs.getincrementaldecoder("gbk")().setstate((b"", CodecState(0)))
+codecs.getincrementalencoder("gbk")().setstate(CodecState(0))
 
 # The persistent PyPy engine is not transactional: a shift completed before a
 # later bad code point/byte remains live after the exception.

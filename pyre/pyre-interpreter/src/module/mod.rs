@@ -26,22 +26,16 @@ pub mod _cffi_backend;
 #[allow(non_snake_case)]
 pub mod _codecs;
 #[allow(non_snake_case)]
-#[cfg(not(target_arch = "wasm32"))]
 pub mod _codecs_cn;
 #[allow(non_snake_case)]
-#[cfg(not(target_arch = "wasm32"))]
 pub mod _codecs_hk;
 #[allow(non_snake_case)]
-#[cfg(not(target_arch = "wasm32"))]
 pub mod _codecs_iso2022;
 #[allow(non_snake_case)]
-#[cfg(not(target_arch = "wasm32"))]
 pub mod _codecs_jp;
 #[allow(non_snake_case)]
-#[cfg(not(target_arch = "wasm32"))]
 pub mod _codecs_kr;
 #[allow(non_snake_case)]
-#[cfg(not(target_arch = "wasm32"))]
 pub mod _codecs_tw;
 #[allow(non_snake_case)]
 pub mod _collections;
@@ -70,7 +64,6 @@ pub mod _lsprof;
 #[allow(non_snake_case)]
 pub mod _lzma;
 #[allow(non_snake_case)]
-#[cfg(not(target_arch = "wasm32"))]
 pub mod _multibytecodec;
 #[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]

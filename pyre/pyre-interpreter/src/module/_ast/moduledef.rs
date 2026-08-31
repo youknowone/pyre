@@ -137,13 +137,19 @@ fn ast_method_descriptor(
     let _ = roots.pin_root(wrapper);
     let code = unsafe { crate::function::getcode(roots.get(wrapper_slot)) } as PyObjectRef;
     unsafe { crate::gateway::builtin_code_set_owner(code, &AST_METHOD_OWNER) };
-    let qualname = pyre_object::w_str_new(&format!("AST.{name}"));
+    let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(&format!("AST.{name}")));
+    let text_signature_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(text_signature));
     unsafe {
-        crate::function::function_set_qualname(roots.get(wrapper_slot), qualname);
+        crate::function::function_set_qualname(
+            roots.get(wrapper_slot),
+            roots.get(qualname_slot),
+        );
         crate::function::function_set_objclass(roots.get(wrapper_slot), ast_type());
         crate::function::fset_func_text_signature(
             roots.get(wrapper_slot),
-            pyre_object::w_str_new(text_signature),
+            roots.get(text_signature_slot),
         );
     }
     roots.get(wrapper_slot)
@@ -875,15 +881,17 @@ fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
     if let Some(dict_slot) = dict_slot {
         for (base, len) in [(fields_base, fields.len()), (attributes_base, attributes.len())] {
             for index in 0..len {
-                let key = roots.get(base + index);
                 if let Some(value) =
-                    crate::baseobjspace::finditem(roots.get(dict_slot), key)?
+                    crate::baseobjspace::finditem(
+                        roots.get(dict_slot),
+                        roots.get(base + index),
+                    )?
                 {
                     let value_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = roots.pin_root(value);
                     crate::baseobjspace::setitem(
                         roots.get(payload_slot),
-                        key,
+                        roots.get(base + index),
                         roots.get(value_slot),
                     )?;
                 }

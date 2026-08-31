@@ -4528,7 +4528,6 @@ enum DecodeResume {
     /// `exc.object` back, so replacing it neither redirects decoding nor
     /// widens the range a position may name, and a non-bytes value is
     /// simply not looked at.
-    #[cfg(not(target_arch = "wasm32"))]
     OriginalInput,
 }
 
@@ -4565,7 +4564,6 @@ pub(crate) fn call_registered_decode_error_handler(
 /// [`call_registered_decode_error_handler`] for a multibyte codec, which
 /// resumes in the buffer it started on whatever the handler did to
 /// `exc.object`.  Only the position comes back.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn call_registered_multibyte_decode_error_handler(
     err_mode: &str,
     codec: &str,
@@ -4661,7 +4659,6 @@ fn call_decode_error_handler(
             }
             Some(unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) }.to_vec())
         }
-        #[cfg(not(target_arch = "wasm32"))]
         DecodeResume::OriginalInput => None,
     };
 
@@ -4710,7 +4707,6 @@ pub(crate) enum EncodeErrorOwner {
     /// including `charmap_encode` and the win32 code-page encoder.
     UnicodeObject,
     /// `multibytecodec_encerror` — the CJK engines.
-    #[cfg(not(target_arch = "wasm32"))]
     MultibyteCodec,
 }
 

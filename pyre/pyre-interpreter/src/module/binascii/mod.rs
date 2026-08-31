@@ -1,17 +1,12 @@
 //! binascii module — PyPy: `pypy/module/binascii/`.
 //!
 //! base64 / hex / uu / quoted-printable / crc conversions. The byte transforms
-//! are a deliberate duplication of RustPython's verified `binascii` core, ported
-//! verbatim into [`transforms`] (pure `&[u8]` in / `Vec<u8>` out) and kept
-//! outside the LLBC extraction; this module is the W_Root argument/error glue.
-
-// Verbatim vendored transform core. `rlecode_hqx` / `rledecode_hqx` live here
-// for completeness but are not part of the 3.14 module surface (removed with
-// binhex), so they stay unexposed.
-#[allow(dead_code)]
-mod transforms;
+//! live in `rustpython_common::binascii` (pure `&[u8]` in / `Vec<u8>` out),
+//! shared by runtimes and outside LLBC extraction; this module is the W_Root
+//! argument/error glue.
 
 use pyre_object::*;
+use rustpython_common::binascii as transforms;
 
 /// A required slot the `Signature` binder left `PY_NULL` because the caller
 /// omitted it.  `_PyArg` reports the bare parameter name and its 1-based

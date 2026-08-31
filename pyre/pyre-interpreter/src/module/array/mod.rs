@@ -330,9 +330,10 @@ fn array_extend_iterable(
     // per-item resize check.
     let w_iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
-    let w_iter = pyre_object::gc_roots::pin_root(w_iter);
+    let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_iter);
     loop {
-        match crate::baseobjspace::next(w_iter) {
+        match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
             Ok(w_item) => {
                 let obj = pyre_object::gc_roots::shadow_stack_get(base);
                 array_append_value(obj, w_item)?;
@@ -1024,9 +1025,18 @@ fn array_remove_method(args: &[PyObjectRef]) -> PyResult {
 /// First matching index, or the total number of matches, via `==`.
 fn array_index_count(obj: PyObjectRef, w_value: PyObjectRef, count: bool) -> Result<i64, PyError> {
     // PyPy `index_count_array` shares this loop between index-like searches
-    // and count.  The receiver and needle stay red/live, and `arr.len` is
-    // checked at every loop boundary because equality is user code that may
-    // resize and collect either object.
+    // and count.  The receiver and needle stay red/live because equality is
+    // user code that may resize and collect either object.
+    //
+    // [3.14-spec] `index_count_array` takes `stop = min(stop, arr.len)` once
+    // before the loop, so an `__eq__` that appends is never searched, while
+    // 3.14 keeps searching the array as it grows.  Measured on 3.14.2, an
+    // `array('i', [1, 2, 3])` whose needle extends it by two 7s answers
+    // `count()` 2, `in` True and a successful `remove()`; pypy3 7.3.20
+    // answers 0, False and ValueError.  Re-reading is also what bounds the
+    // storage here: a shrink leaves PyPy's separately allocated raw buffer
+    // addressable, whereas this Vec's length is the bound, so the length is
+    // read back at every loop boundary rather than snapshotted.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj, w_value]);
     let mut cnt = 0i64;
@@ -1074,11 +1084,11 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
     } else {
         0
     };
-    // [3.14-spec] CPython `array_array_index_impl` uses PY_SSIZE_T_MAX for an
-    // omitted stop and re-reads Py_SIZE(self) on every iteration, so growth
-    // from `__eq__` remains searchable.  PyPy's `index_count_array` has the
-    // same live `while i < arr.len` source shape, although the installed
-    // PyPy oracle snapshots this re-entrant case.
+    // [3.14-spec] An omitted stop is the largest index and growth from
+    // `__eq__` stays searchable in 3.14, while `index_count_array` takes
+    // `stop = min(stop, arr.len)` once before its loop and never revisits it.
+    // Measured on 3.14.2, an `array('i', [1, 2, 3])` whose needle extends it
+    // by two 7s answers `index()` 3; pypy3 7.3.20 raises ValueError.
     let mut stop = if args.len() >= 4 {
         crate::sliceobject::eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(
             base + 3,

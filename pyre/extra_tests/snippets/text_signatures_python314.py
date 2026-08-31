@@ -12,6 +12,7 @@ type does not duplicate the test machinery or interpreter startup.
 import array
 import builtins
 import inspect
+import itertools
 import sys
 import types
 
@@ -120,13 +121,121 @@ TYPE_EXPECTED = {
     map: "(function, iterable, /, *iterables, strict=False)",
     filter: "(function, iterable, /)",
     zip: "(*iterables, strict=False)",
+    itertools.count: "(start=0, step=1)",
 }
 
 for cls, signature in TYPE_EXPECTED.items():
     assert cls.__text_signature__ == signature, cls
 
-for cls in (int, str, bytes, bytearray, dict, range, slice, super, type):
+for cls in (
+    int,
+    str,
+    bytes,
+    bytearray,
+    dict,
+    range,
+    slice,
+    super,
+    type,
+    itertools.repeat,
+):
     assert cls.__text_signature__ is None, cls
+
+
+# itertools_count_metadata_python314
+
+COUNT_EXPECTED = {
+    "__new__": (
+        "Create and return a new object.  See help(type) for accurate signature.",
+        "($type, *args, **kwargs)",
+    ),
+    "__repr__": ("Return repr(self).", "($self, /)"),
+    "__getattribute__": ("Return getattr(self, name).", "($self, name, /)"),
+    "__iter__": ("Implement iter(self).", "($self, /)"),
+    "__next__": ("Implement next(self).", "($self, /)"),
+}
+
+for name, (doc, signature) in COUNT_EXPECTED.items():
+    descriptor = itertools.count.__dict__[name]
+    assert descriptor.__doc__ == doc, name
+    assert descriptor.__text_signature__ == signature, name
+
+assert str(inspect.signature(itertools.count)) == "(start=0, step=1)"
+assert "__reduce__" not in itertools.count.__dict__
+
+for name, args in {
+    "__repr__": ({},),
+    "__getattribute__": ({}, "x"),
+    "__iter__": ({},),
+    "__next__": ({},),
+}.items():
+    try:
+        itertools.count.__dict__[name](*args)
+    except TypeError as exc:
+        assert str(exc) == (
+            f"descriptor '{name}' requires a 'itertools.count' object "
+            "but received a 'dict'"
+        )
+    else:
+        raise AssertionError(name)
+
+
+# itertools_repeat_metadata_python314
+
+REPEAT_EXPECTED = {
+    "__new__": (
+        "builtin_function_or_method",
+        "Create and return a new object.  See help(type) for accurate signature.",
+        "($type, *args, **kwargs)",
+    ),
+    "__repr__": ("wrapper_descriptor", "Return repr(self).", "($self, /)"),
+    "__getattribute__": (
+        "wrapper_descriptor",
+        "Return getattr(self, name).",
+        "($self, name, /)",
+    ),
+    "__iter__": ("wrapper_descriptor", "Implement iter(self).", "($self, /)"),
+    "__next__": ("wrapper_descriptor", "Implement next(self).", "($self, /)"),
+    "__length_hint__": (
+        "method_descriptor",
+        "Private method returning an estimate of len(list(it)).",
+        "($self, /)",
+    ),
+}
+
+for name, (carrier, doc, signature) in REPEAT_EXPECTED.items():
+    descriptor = itertools.repeat.__dict__[name]
+    assert type(descriptor).__name__ == carrier, name
+    assert descriptor.__doc__ == doc, name
+    assert descriptor.__text_signature__ == signature, name
+
+assert "__reduce__" not in itertools.repeat.__dict__
+
+for name, args in {
+    "__repr__": ({},),
+    "__getattribute__": ({}, "x"),
+    "__iter__": ({},),
+    "__next__": ({},),
+}.items():
+    try:
+        itertools.repeat.__dict__[name](*args)
+    except TypeError as exc:
+        assert str(exc) == (
+            f"descriptor '{name}' requires a 'itertools.repeat' object "
+            "but received a 'dict'"
+        )
+    else:
+        raise AssertionError(name)
+
+try:
+    itertools.repeat.__dict__["__length_hint__"]({})
+except TypeError as exc:
+    assert str(exc) == (
+        "descriptor '__length_hint__' for 'itertools.repeat' objects "
+        "doesn't apply to a 'dict' object"
+    )
+else:
+    raise AssertionError("__length_hint__")
 
 
 # bytearray_text_signatures_python314
@@ -1036,8 +1145,10 @@ EXPECTED_TYPES = {
     types.EllipsisType: "()",
     types.GenericAlias: "(origin, args, /)",
     types.NotImplementedType: "()",
+    types.NoneType: "()",
     types.ModuleType: "(name, doc=None)",
     types.MappingProxyType: "(mapping)",
+    types.TracebackType: "(tb_next, tb_frame, tb_lasti, tb_lineno)",
     types.CellType: "([contents])",
     types.MethodType: "(function, instance, /)",
     types.FunctionType: (
@@ -1055,8 +1166,550 @@ EXPECTED_TYPES = {
 for owner, signature in EXPECTED_TYPES.items():
     assert owner.__text_signature__ == signature, (owner, owner.__text_signature__)
 
+
+# singleton_type_text_signatures_python314
+
+EXPECTED_SINGLETON_METHODS = {
+    types.EllipsisType: {
+        "__new__": "($type, *args, **kwargs)",
+        "__repr__": "($self, /)",
+        "__reduce__": "($self, /)",
+    },
+    types.NotImplementedType: {
+        "__new__": "($type, *args, **kwargs)",
+        "__repr__": "($self, /)",
+        "__reduce__": "($self, /)",
+        "__bool__": "($self, /)",
+    },
+    types.NoneType: {
+        "__new__": "($type, *args, **kwargs)",
+        "__bool__": "($self, /)",
+        "__repr__": "($self, /)",
+        "__hash__": "($self, /)",
+        "__eq__": "($self, value, /)",
+        "__ne__": "($self, value, /)",
+        "__lt__": "($self, value, /)",
+        "__le__": "($self, value, /)",
+        "__gt__": "($self, value, /)",
+        "__ge__": "($self, value, /)",
+    },
+}
+for owner, methods in EXPECTED_SINGLETON_METHODS.items():
+    check_descriptors(owner, methods)
+
+GENERIC_NEW_DOC = "Create and return a new object.  See help(type) for accurate signature."
+EXPECTED_SINGLETON_DOCS = {
+    types.EllipsisType: {
+        "__new__": GENERIC_NEW_DOC,
+        "__repr__": "Return repr(self).",
+        "__reduce__": None,
+    },
+    types.NotImplementedType: {
+        "__new__": GENERIC_NEW_DOC,
+        "__repr__": "Return repr(self).",
+        "__reduce__": None,
+        "__bool__": "True if self else False",
+    },
+    types.NoneType: {
+        "__new__": GENERIC_NEW_DOC,
+        "__bool__": "True if self else False",
+        "__repr__": "Return repr(self).",
+        "__hash__": "Return hash(self).",
+        "__eq__": "Return self==value.",
+        "__ne__": "Return self!=value.",
+        "__lt__": "Return self<value.",
+        "__le__": "Return self<=value.",
+        "__gt__": "Return self>value.",
+        "__ge__": "Return self>=value.",
+    },
+}
+for owner, methods in EXPECTED_SINGLETON_DOCS.items():
+    for name, doc in methods.items():
+        assert getattr(owner, name).__doc__ == doc, (owner, name)
+
+
+# generator_type_text_signatures_python314
+
+EXPECTED_GENERATOR_METHODS = {
+    "__repr__": "($self, /)",
+    "__next__": "($self, /)",
+    "send": "($self, object, /)",
+    "close": "($self, /)",
+    "__iter__": "($self, /)",
+    "__del__": "($self, /)",
+    "__sizeof__": "($self, /)",
+    "__class_getitem__": "($type, object, /)",
+}
+check_descriptors(types.GeneratorType, EXPECTED_GENERATOR_METHODS)
+assert types.GeneratorType.throw.__text_signature__ is None
+
+EXPECTED_GENERATOR_DOCS = {
+    "__repr__": "Return repr(self).",
+    "__next__": "Implement next(self).",
+    "send": "send(value) -> send 'value' into generator,\nreturn next yielded value or raise StopIteration.",
+    "throw": (
+        "throw(value)\nthrow(type[,value[,tb]])\n\n"
+        "Raise exception in generator, return next yielded value or raise\n"
+        "StopIteration.\nthe (type, val, tb) signature is deprecated, \n"
+        "and may be removed in a future version of Python."
+    ),
+    "close": "close() -> raise GeneratorExit inside generator.",
+    "__iter__": "Implement iter(self).",
+    "__del__": "Called when the instance is about to be destroyed.",
+    "__sizeof__": "gen.__sizeof__() -> size of gen in memory, in bytes",
+    "__class_getitem__": "generators are generic over the types of their yield, send, and return values",
+}
+for name, doc in EXPECTED_GENERATOR_DOCS.items():
+    assert getattr(types.GeneratorType, name).__doc__ == doc, name
+
+
+# coroutine_type_text_signatures_python314
+
+EXPECTED_COROUTINE_METHODS = {
+    "__repr__": "($self, /)",
+    "__del__": "($self, /)",
+    "__await__": "($self, /)",
+    "send": "($self, object, /)",
+    "close": "($self, /)",
+    "__sizeof__": "($self, /)",
+    "__class_getitem__": "($type, object, /)",
+}
+check_descriptors(types.CoroutineType, EXPECTED_COROUTINE_METHODS)
+assert types.CoroutineType.throw.__text_signature__ is None
+
+EXPECTED_COROUTINE_DOCS = {
+    "__repr__": "Return repr(self).",
+    "__del__": "Called when the instance is about to be destroyed.",
+    "__await__": "Return an iterator to be used in await expression.",
+    "send": "send(arg) -> send 'arg' into coroutine,\nreturn next iterated value or raise StopIteration.",
+    "throw": (
+        "throw(value)\nthrow(type[,value[,traceback]])\n\n"
+        "Raise exception in coroutine, return next iterated value or raise\n"
+        "StopIteration.\nthe (type, val, tb) signature is deprecated, \n"
+        "and may be removed in a future version of Python."
+    ),
+    "close": "close() -> raise GeneratorExit inside coroutine.",
+    "__sizeof__": "gen.__sizeof__() -> size of gen in memory, in bytes",
+    "__class_getitem__": "coroutines are generic over the types of their yield, send, and return values",
+}
+for name, doc in EXPECTED_COROUTINE_DOCS.items():
+    assert getattr(types.CoroutineType, name).__doc__ == doc, name
+
+
+# async_generator_type_text_signatures_python314
+
+EXPECTED_ASYNC_GENERATOR_METHODS = {
+    "__repr__": "($self, /)",
+    "__del__": "($self, /)",
+    "__aiter__": "($self, /)",
+    "__anext__": "($self, /)",
+    "asend": "($self, object, /)",
+    "aclose": "($self, /)",
+    "__sizeof__": "($self, /)",
+    "__class_getitem__": "($type, object, /)",
+}
+check_descriptors(types.AsyncGeneratorType, EXPECTED_ASYNC_GENERATOR_METHODS)
+assert types.AsyncGeneratorType.athrow.__text_signature__ is None
+
+EXPECTED_ASYNC_GENERATOR_DOCS = {
+    "__repr__": "Return repr(self).",
+    "__del__": "Called when the instance is about to be destroyed.",
+    "__aiter__": "Return an awaitable, that resolves in asynchronous iterator.",
+    "__anext__": "Return a value or raise StopAsyncIteration.",
+    "asend": "asend(v) -> send 'v' in generator.",
+    "athrow": (
+        "athrow(value)\nathrow(type[,value[,tb]])\n\n"
+        "raise exception in generator.\nthe (type, val, tb) signature is deprecated, \n"
+        "and may be removed in a future version of Python."
+    ),
+    "aclose": "aclose() -> raise GeneratorExit inside generator.",
+    "__sizeof__": "gen.__sizeof__() -> size of gen in memory, in bytes",
+    "__class_getitem__": "async generators are generic over the types of their yield and send values",
+}
+for name, doc in EXPECTED_ASYNC_GENERATOR_DOCS.items():
+    assert getattr(types.AsyncGeneratorType, name).__doc__ == doc, name
+
+
+# generator_awaitable_type_text_signatures_python314
+
+async def _metadata_coroutine():
+    return None
+
+
+async def _metadata_async_generator():
+    yield None
+
+
+_metadata_coroutine_object = _metadata_coroutine()
+_metadata_coroutine_wrapper = _metadata_coroutine_object.__await__()
+_metadata_coroutine_wrapper_type = type(_metadata_coroutine_wrapper)
+check_descriptors(
+    _metadata_coroutine_wrapper_type,
+    {
+        "__iter__": "($self, /)",
+        "__next__": "($self, /)",
+        "send": "($self, object, /)",
+        "close": "($self, /)",
+    },
+)
+assert _metadata_coroutine_wrapper_type.throw.__text_signature__ is None
+assert _metadata_coroutine_wrapper_type.__doc__ == (
+    "A wrapper object implementing __await__ for coroutines."
+)
+
+_metadata_asend_generator = _metadata_async_generator()
+_metadata_asend = _metadata_asend_generator.__anext__()
+_metadata_athrow_generator = _metadata_async_generator()
+_metadata_athrow = _metadata_athrow_generator.athrow(ValueError)
+_metadata_async_awaitable_types = (type(_metadata_asend), type(_metadata_athrow))
+
+EXPECTED_ASYNC_AWAITABLE_METHODS = {
+    "__iter__": "($self, /)",
+    "__next__": "($self, /)",
+    "__del__": "($self, /)",
+    "__await__": "($self, /)",
+    "send": "($self, object, /)",
+    "close": "($self, /)",
+}
+for owner in _metadata_async_awaitable_types:
+    check_descriptors(owner, EXPECTED_ASYNC_AWAITABLE_METHODS)
+    assert owner.throw.__text_signature__ is None
+
+EXPECTED_COROUTINE_WRAPPER_DOCS = {
+    "__iter__": "Implement iter(self).",
+    "__next__": "Implement next(self).",
+    "send": "send(arg) -> send 'arg' into coroutine,\nreturn next iterated value or raise StopIteration.",
+    "throw": (
+        "throw(value)\nthrow(type[,value[,traceback]])\n\n"
+        "Raise exception in coroutine, return next iterated value or raise\n"
+        "StopIteration.\nthe (type, val, tb) signature is deprecated, \n"
+        "and may be removed in a future version of Python."
+    ),
+    "close": "close() -> raise GeneratorExit inside coroutine.",
+}
+for name, doc in EXPECTED_COROUTINE_WRAPPER_DOCS.items():
+    assert getattr(_metadata_coroutine_wrapper_type, name).__doc__ == doc, name
+
+EXPECTED_ASYNC_AWAITABLE_DOCS = {
+    "__iter__": "Implement iter(self).",
+    "__next__": "Implement next(self).",
+    "__del__": "Called when the instance is about to be destroyed.",
+    "__await__": "Return an iterator to be used in await expression.",
+    "send": "send(value) -> send 'value' into generator,\nreturn next yielded value or raise StopIteration.",
+    "throw": (
+        "throw(value)\nthrow(type[,value[,tb]])\n\n"
+        "Raise exception in generator, return next yielded value or raise\n"
+        "StopIteration.\nthe (type, val, tb) signature is deprecated, \n"
+        "and may be removed in a future version of Python."
+    ),
+    "close": "close() -> raise GeneratorExit inside generator.",
+}
+for owner in _metadata_async_awaitable_types:
+    for name, doc in EXPECTED_ASYNC_AWAITABLE_DOCS.items():
+        assert getattr(owner, name).__doc__ == doc, (owner, name)
+
+_metadata_coroutine_wrapper.close()
+_metadata_asend.close()
+_metadata_athrow.close()
+_metadata_asend_generator.__del__()
+_metadata_athrow_generator.__del__()
+
+
+# module_text_signatures_python314
+
+EXPECTED_MODULE_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__init__": "($self, /, *args, **kwargs)",
+    "__repr__": "($self, /)",
+    "__getattribute__": "($self, name, /)",
+    "__dir__": "($self, /)",
+}
+check_descriptors(types.ModuleType, EXPECTED_MODULE_METHODS)
+
+EXPECTED_MODULE_DOCS = {
+    "__new__": "Create and return a new object.  See help(type) for accurate signature.",
+    "__init__": "Initialize self.  See help(type(self)) for accurate signature.",
+    "__repr__": "Return repr(self).",
+    "__getattribute__": "Return getattr(self, name).",
+    "__dir__": "__dir__() -> list\nspecialized dir() implementation",
+}
+for name, doc in EXPECTED_MODULE_DOCS.items():
+    assert getattr(types.ModuleType, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.ModuleType.__new__)) == "(*args, **kwargs)"
+assert str(inspect.signature(types.ModuleType.__init__)) == "(self, /, *args, **kwargs)"
+assert str(inspect.signature(types.ModuleType.__getattribute__)) == "(self, name, /)"
+assert str(inspect.signature(types.ModuleType.__dir__)) == "(self, /)"
+
+
+# cell_text_signatures_python314
+
+EXPECTED_CELL_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__eq__": "($self, value, /)",
+    "__ne__": "($self, value, /)",
+    "__lt__": "($self, value, /)",
+    "__le__": "($self, value, /)",
+    "__gt__": "($self, value, /)",
+    "__ge__": "($self, value, /)",
+    "__repr__": "($self, /)",
+}
+check_descriptors(types.CellType, EXPECTED_CELL_METHODS)
+
+EXPECTED_CELL_DOCS = {
+    "__new__": "Create and return a new object.  See help(type) for accurate signature.",
+    "__eq__": "Return self==value.",
+    "__ne__": "Return self!=value.",
+    "__lt__": "Return self<value.",
+    "__le__": "Return self<=value.",
+    "__gt__": "Return self>value.",
+    "__ge__": "Return self>=value.",
+    "__repr__": "Return repr(self).",
+}
+for name, doc in EXPECTED_CELL_DOCS.items():
+    assert getattr(types.CellType, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.CellType.__new__)) == "(*args, **kwargs)"
+assert str(inspect.signature(types.CellType.__eq__)) == "(self, value, /)"
+assert str(inspect.signature(types.CellType.__repr__)) == "(self, /)"
+
+
+# mappingproxy_text_signatures_python314
+
+EXPECTED_MAPPINGPROXY_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__len__": "($self, /)",
+    "__getitem__": "($self, key, /)",
+    "__contains__": "($self, key, /)",
+    "__iter__": "($self, /)",
+    "__str__": "($self, /)",
+    "__repr__": "($self, /)",
+    "__hash__": "($self, /)",
+    "__or__": "($self, value, /)",
+    "__ror__": "($self, value, /)",
+    "__ior__": "($self, value, /)",
+    "__reversed__": "($self, /)",
+    "__class_getitem__": "($type, object, /)",
+    "get": "($self, key, default=None, /)",
+    "keys": "($self, /)",
+    "values": "($self, /)",
+    "items": "($self, /)",
+    "copy": "($self, /)",
+    "__eq__": "($self, value, /)",
+    "__ne__": "($self, value, /)",
+    "__gt__": "($self, value, /)",
+    "__ge__": "($self, value, /)",
+    "__lt__": "($self, value, /)",
+    "__le__": "($self, value, /)",
+}
+check_descriptors(types.MappingProxyType, EXPECTED_MAPPINGPROXY_METHODS)
+
+EXPECTED_MAPPINGPROXY_DOCS = {
+    "__new__": "Create and return a new object.  See help(type) for accurate signature.",
+    "__len__": "Return len(self).",
+    "__getitem__": "Return self[key].",
+    "__contains__": "Return bool(key in self).",
+    "__iter__": "Implement iter(self).",
+    "__str__": "Return str(self).",
+    "__repr__": "Return repr(self).",
+    "__hash__": "Return hash(self).",
+    "__or__": "Return self|value.",
+    "__ror__": "Return value|self.",
+    "__ior__": "Return self|=value.",
+    "__reversed__": "D.__reversed__() -> reverse iterator",
+    "__class_getitem__": (
+        "mappingproxy objects are generic over two types, signifying "
+        "(respectively) the types of their keys and values"
+    ),
+    "get": "Return the value for key if key is in the mapping, else default.",
+    "keys": "D.keys() -> a set-like object providing a view on D's keys",
+    "values": "D.values() -> an object providing a view on D's values",
+    "items": "D.items() -> a set-like object providing a view on D's items",
+    "copy": "D.copy() -> a shallow copy of D",
+    "__eq__": "Return self==value.",
+    "__ne__": "Return self!=value.",
+    "__gt__": "Return self>value.",
+    "__ge__": "Return self>=value.",
+    "__lt__": "Return self<value.",
+    "__le__": "Return self<=value.",
+}
+for name, doc in EXPECTED_MAPPINGPROXY_DOCS.items():
+    assert getattr(types.MappingProxyType, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.MappingProxyType.get)) == (
+    "(self, key, default=None, /)"
+)
+assert str(inspect.signature(types.MappingProxyType.__reversed__)) == "(self, /)"
+assert str(inspect.signature(types.MappingProxyType.__class_getitem__)) == "(object, /)"
+
+
+# traceback_text_signatures_python314
+
+EXPECTED_TRACEBACK_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__dir__": "($self, /)",
+}
+check_descriptors(types.TracebackType, EXPECTED_TRACEBACK_METHODS)
+
+assert types.TracebackType.__doc__ == "Create a new traceback object."
+assert types.TracebackType.__new__.__doc__ == (
+    "Create and return a new object.  See help(type) for accurate signature."
+)
+assert types.TracebackType.__dir__.__doc__ is None
+assert str(inspect.signature(types.TracebackType.__new__)) == "(*args, **kwargs)"
+assert str(inspect.signature(types.TracebackType.__dir__)) == "(self, /)"
+
+
+assert types.CodeType.__dict__["__new__"].__text_signature__ == "($type, *args, **kwargs)"
+assert str(inspect.signature(types.CodeType.__new__)) == "(*args, **kwargs)"
+assert types.CodeType.__new__.__doc__ == (
+    "Create and return a new object.  See help(type) for accurate signature."
+)
+
+EXPECTED_CODE_METHODS = {
+    "__eq__": "($self, value, /)",
+    "__ne__": "($self, value, /)",
+    "__lt__": "($self, value, /)",
+    "__le__": "($self, value, /)",
+    "__gt__": "($self, value, /)",
+    "__ge__": "($self, value, /)",
+    "__hash__": "($self, /)",
+    "__repr__": "($self, /)",
+    "replace": "($self, /, **changes)",
+    "__replace__": "($self, /, **changes)",
+    "_varname_from_oparg": "($self, /, oparg)",
+    "co_positions": "($self, /)",
+    "co_lines": "($self, /)",
+    "co_branches": "($self, /)",
+}
+check_descriptors(types.CodeType, EXPECTED_CODE_METHODS)
+
+EXPECTED_CODE_DOCS = {
+    "__eq__": "Return self==value.",
+    "__ne__": "Return self!=value.",
+    "__lt__": "Return self<value.",
+    "__le__": "Return self<=value.",
+    "__gt__": "Return self>value.",
+    "__ge__": "Return self>=value.",
+    "__hash__": "Return hash(self).",
+    "__repr__": "Return repr(self).",
+    "replace": (
+        "Return a copy of the code object with new values for the specified fields."
+    ),
+    "__replace__": "The same as replace().",
+    "_varname_from_oparg": (
+        "(internal-only) Return the local variable name for the given oparg.\n\n"
+        "WARNING: this method is for internal use only and may change or go\naway."
+    ),
+}
+for name, doc in EXPECTED_CODE_DOCS.items():
+    assert getattr(types.CodeType, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.CodeType.replace)) == "(self, /, **changes)"
+assert str(inspect.signature(types.CodeType.co_positions)) == "(self, /)"
+
+
+# frame_text_signatures_python314
+
+EXPECTED_FRAME_METHODS = {
+    "clear": "($self, /)",
+    "__repr__": "($self, /)",
+}
+check_descriptors(types.FrameType, EXPECTED_FRAME_METHODS)
+
+assert types.FrameType.clear.__doc__ == "Clear all references held by the frame."
+assert types.FrameType.__repr__.__doc__ == "Return repr(self)."
+assert str(inspect.signature(types.FrameType.clear)) == "(self, /)"
+assert str(inspect.signature(types.FrameType.__repr__)) == "(self, /)"
+
+
+# method_text_signatures_python314
+
+EXPECTED_METHOD_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__call__": "($self, /, *args, **kwargs)",
+    "__get__": "($self, instance, owner=None, /)",
+    "__getattribute__": "($self, name, /)",
+    "__eq__": "($self, value, /)",
+    "__ne__": "($self, value, /)",
+    "__lt__": "($self, value, /)",
+    "__le__": "($self, value, /)",
+    "__gt__": "($self, value, /)",
+    "__ge__": "($self, value, /)",
+    "__hash__": "($self, /)",
+    "__repr__": "($self, /)",
+    "__reduce__": "($self, /)",
+}
+check_descriptors(types.MethodType, EXPECTED_METHOD_METHODS)
+
+EXPECTED_METHOD_DOCS = {
+    "__new__": "Create and return a new object.  See help(type) for accurate signature.",
+    "__call__": "Call self as a function.",
+    "__get__": "Return an attribute of instance, which is of type owner.",
+    "__getattribute__": "Return getattr(self, name).",
+    "__eq__": "Return self==value.",
+    "__ne__": "Return self!=value.",
+    "__lt__": "Return self<value.",
+    "__le__": "Return self<=value.",
+    "__gt__": "Return self>value.",
+    "__ge__": "Return self>=value.",
+    "__hash__": "Return hash(self).",
+    "__repr__": "Return repr(self).",
+}
+for name, doc in EXPECTED_METHOD_DOCS.items():
+    assert getattr(types.MethodType, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.MethodType.__call__)) == "(self, /, *args, **kwargs)"
+assert str(inspect.signature(types.MethodType.__get__)) == "(self, instance, owner=None, /)"
+
+
 assert str(inspect.signature(types.MethodType)) == "(function, instance, /)"
 assert str(inspect.signature(types.ModuleType)) == "(name, doc=None)"
+
+
+# simple_namespace_text_signatures_python314
+
+assert types.SimpleNamespace.__doc__ == "A simple attribute-based namespace."
+assert types.SimpleNamespace.__text_signature__ == (
+    "(mapping_or_iterable=(), /, **kwargs)"
+)
+EXPECTED_SIMPLE_NAMESPACE_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__repr__": "($self, /)",
+    "__lt__": "($self, value, /)",
+    "__le__": "($self, value, /)",
+    "__eq__": "($self, value, /)",
+    "__ne__": "($self, value, /)",
+    "__gt__": "($self, value, /)",
+    "__ge__": "($self, value, /)",
+    "__init__": "($self, /, *args, **kwargs)",
+    "__reduce__": "($self, /)",
+    "__replace__": "($self, /, **changes)",
+}
+check_descriptors(types.SimpleNamespace, EXPECTED_SIMPLE_NAMESPACE_METHODS)
+
+EXPECTED_SIMPLE_NAMESPACE_DOCS = {
+    "__new__": "Create and return a new object.  See help(type) for accurate signature.",
+    "__repr__": "Return repr(self).",
+    "__lt__": "Return self<value.",
+    "__le__": "Return self<=value.",
+    "__eq__": "Return self==value.",
+    "__ne__": "Return self!=value.",
+    "__gt__": "Return self>value.",
+    "__ge__": "Return self>=value.",
+    "__init__": "Initialize self.  See help(type(self)) for accurate signature.",
+    "__reduce__": "Return state information for pickling",
+    "__replace__": (
+        "Return a copy of the namespace object with new values for the "
+        "specified attributes."
+    ),
+}
+for name, doc in EXPECTED_SIMPLE_NAMESPACE_DOCS.items():
+    assert getattr(types.SimpleNamespace, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.SimpleNamespace)) == (
+    "(mapping_or_iterable=(), /, **kwargs)"
+)
 
 
 # module_doc_python314

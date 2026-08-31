@@ -15,7 +15,6 @@
 use majit_gc::GcStepTransition;
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
-use std::io::Write;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
@@ -1263,11 +1262,8 @@ fn dump_rpy_heap_fd(fd: i32) -> Result<(), crate::PyError> {
 fn typeids_z_bytes() -> Result<Vec<u8>, crate::PyError> {
     let text = majit_gc::get_typeids_text()
         .ok_or_else(|| crate::PyError::not_implemented("operation not implemented by this GC"))?;
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
-    encoder
-        .write_all(&text)
-        .and_then(|_| encoder.finish())
-        .map_err(|error| crate::PyError::os_error(error.to_string()))
+    pyre_native::zlib::compress(&text, 9, pyre_native::zlib::MAX_WBITS)
+        .map_err(crate::PyError::os_error)
 }
 
 /// The spelling each typeid sidecar wants. `app_referents.py:34` opens

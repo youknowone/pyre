@@ -1,5 +1,13 @@
 # pyre-check: gate=1
 
+try:
+    from _pypy_generic_alias import _create_union
+except ModuleNotFoundError:
+    # CPython owns GenericAlias in the runtime and has no PyPy-private helper.
+    # Keep the shared slot surface in the cross-runtime gate; exercise this
+    # helper's PyPy-specific contract only where its owner exists.
+    _create_union = None
+
 GA = type(list[int])
 required = {
     '__repr__', '__hash__', '__call__',
@@ -31,3 +39,9 @@ assert GA.__ne__(list[int], list[str]) is True
 assert GA.__ne__(list[int], list[int]) is False
 assert GA.__ne__(list[int], list) is NotImplemented
 assert GA.__lt__(list[int], list[str]) is NotImplemented
+
+if _create_union is not None:
+    assert _create_union(1, int) is NotImplemented
+    assert _create_union(int, 1) is NotImplemented
+    assert _create_union(int, int) is int
+    assert _create_union(int, str) == int | str

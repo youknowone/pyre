@@ -373,7 +373,7 @@ impl SourceProvider for NullSourceProvider {
 // SAME `find_in_dirs` probes (`<dir>/re/__init__.py`, `<dir>/enum.py`, …) that
 // hit a real FS on native resolve here once `mount` is on sys.path.
 #[cfg(feature = "wasm_vfs")]
-pub static VFS_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/stdlib_vfs.lz4"));
+pub static VFS_BLOB: &[u8] = pyre_native::vfs::STDLIB_BLOB;
 
 #[cfg(feature = "wasm_vfs")]
 enum VfsEntry {
@@ -393,30 +393,11 @@ impl VfsProvider {
     /// synthetic `Dir` entry for every ancestor directory (so `is_dir` answers
     /// for `re/`, `collections/`, and the mount itself).
     fn from_blob(blob: &[u8], mount: &Path) -> Self {
-        let raw = lz4_flex::block::decompress_size_prepended(blob)
-            .expect("wasm_vfs: corrupt embedded stdlib blob");
+        let files = pyre_native::vfs::unpack(blob).expect("wasm_vfs: corrupt embedded stdlib blob");
         let mut map: HashMap<PathBuf, VfsEntry> = HashMap::new();
         map.insert(mount.to_path_buf(), VfsEntry::Dir);
 
-        let mut pos = 0usize;
-        let read_u32 = |raw: &[u8], pos: &mut usize| -> usize {
-            let n = u32::from_le_bytes(raw[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            n
-        };
-        let count = read_u32(&raw, &mut pos);
-        for _ in 0..count {
-            let name_len = read_u32(&raw, &mut pos);
-            let name = std::str::from_utf8(&raw[pos..pos + name_len])
-                .expect("wasm_vfs: non-utf8 module name")
-                .to_owned();
-            pos += name_len;
-            let src_len = read_u32(&raw, &mut pos);
-            let src = std::str::from_utf8(&raw[pos..pos + src_len])
-                .expect("wasm_vfs: non-utf8 module source")
-                .to_owned();
-            pos += src_len;
-
+        for (name, source) in files {
             let full = mount.join(&name);
             // Register every ancestor directory under `mount` as a Dir.
             let mut ancestor = full.parent();
@@ -427,7 +408,7 @@ impl VfsProvider {
                 map.entry(dir.to_path_buf()).or_insert(VfsEntry::Dir);
                 ancestor = dir.parent();
             }
-            map.insert(full, VfsEntry::File(Arc::from(src.as_str())));
+            map.insert(full, VfsEntry::File(Arc::from(source.as_str())));
         }
         VfsProvider { map }
     }
@@ -722,19 +703,12 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_immutables_map);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_cn);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_jp);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_iso2022);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_hk);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_kr);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_tw);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_multibytecodec);
     // moduledef.py: `applevel_name = os.name` installs the one posix module
     // under `os.name` — `"posix"` on a POSIX host, `"nt"` on Windows, where a
@@ -4337,6 +4311,11 @@ fn load_source_module(
     let (pathname_str, filename_bytes) = crate::pycode::split_code_filename_bytes(path_bytes, None);
     // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
     // bad declaration is the tokenizer's SyntaxError, not an ImportError.
+    // [3.14-spec] CPython 3.14 `SourceFileLoader.exec_module` rejects an
+    // embedded NUL here with `source_as_string`'s unlocated "source code
+    // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
+    // observable while its command-line file path retains PyPy's located
+    // tokenizer boundary through `decode_file_source_bytes`.
     let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
 
     let _root = pyre_object::gc_roots::push_roots();
@@ -4357,11 +4336,7 @@ fn load_source_module(
             let code =
                 parse_source_module(&pathname_str, &source).map_err(|error| match error {
                     crate::syntax_warnings::SourceCompileError::Compile(error) => {
-                        let mut message =
-                            rustpython_wtf8::Wtf8Buf::from_string("cannot compile '".to_string());
-                        message.push_wtf8(&path_text);
-                        message.push_str(&format!("': {error}"));
-                        crate::PyError::new(crate::PyErrorKind::ImportError, message)
+                        crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
                     }
                     crate::syntax_warnings::SourceCompileError::Warning(error) => error,
                 })?;
@@ -6635,9 +6610,10 @@ mod tests {
         assert!(vfs.is_file(&mount.join("enum.py")));
 
         // Source is readable and non-empty; misses report NotFound.
-        let src = vfs.read_to_string(&mount.join("re/__init__.py")).unwrap();
+        let src =
+            String::from_utf8(vfs.read_to_bytes(&mount.join("re/__init__.py")).unwrap()).unwrap();
         assert!(src.contains("def compile"));
-        assert!(vfs.read_to_string(&mount.join("re/_nope.py")).is_err());
+        assert!(vfs.read_to_bytes(&mount.join("re/_nope.py")).is_err());
         assert!(!vfs.is_file(&mount.join("re/_nope.py")));
     }
 
