@@ -10240,6 +10240,30 @@ impl<'a> Lowering<'a> {
                 let (segments, method_hint) = if args.len() == 1 && is_slice_to_vec(&segments) {
                     (vec!["list".to_string()], None)
                 } else if args.len() == 2
+                    && is_vec_extend_segments(&segments)
+                    && second_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_vec_value(ty, self.llbc))
+                {
+                    // PyPy expresses these source sites as list
+                    // concatenation / `list.extend`, and
+                    // `AbstractListRepr.rtype_method_extend` lowers them to
+                    // `ll_extend`.  Rust's `Vec::extend(Vec<T>)` consumes its
+                    // source, but the source is dead after the call and both
+                    // values are translated lists, so route this exact
+                    // by-value Vec input through the already-orthodox
+                    // `extend_from_slice` → list.extend bridge.  An iterator
+                    // value (`Vec::IntoIter`, Map, Range, or a custom iterator)
+                    // is not a list and deliberately keeps the residual wall.
+                    (
+                        vec![
+                            "vec".to_string(),
+                            "Vec".to_string(),
+                            "extend_from_slice".to_string(),
+                        ],
+                        None,
+                    )
+                } else if args.len() == 2
                     && crate::front::str_find::is_rpython_str_slice_prefix(&segments)
                 {
                     // PyPy's `name[:dotindex]` reaches ordinary
@@ -25204,6 +25228,19 @@ fn is_slice_to_vec(segments: &[String]) -> bool {
         if a == "alloc" && b == "slice" && c == "<Impl>" && d == "to_vec")
 }
 
+fn is_vec_extend_segments(segments: &[String]) -> bool {
+    segments == ["vec", "Vec", "extend"]
+}
+
+/// Whether a call operand is a concrete `Vec<T>` value (possibly borrowed).
+/// A `Vec::IntoIter<T>` is deliberately excluded: it is an iterator repr, may
+/// already be partially consumed, and therefore cannot be treated as the
+/// complete source list merely because it originated from one.  An arbitrary
+/// `IntoIterator<Item=T>` has no list-representation proof either.
+fn tyref_is_vec_value(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc).as_deref() == Some("alloc::vec::Vec")
+}
+
 /// The `fmt::Arguments::new(pieces, args)` constructor that `format_args!`
 /// builds from the on-stack pieces+args arrays.
 fn is_arguments_new_path(segments: &[String]) -> bool {
@@ -30046,6 +30083,105 @@ mod tests {
             0,
             "no residual Map::collect reload wall"
         );
+    }
+
+    /// Representative interpreter loops iterate `&[*mut PyObject]`, whose
+    /// `Option<&*mut PyObject>` is folded to the identity-null niche shape:
+    /// `(opt is null) == false`.  This is still RPython's `ptr_nonzero`
+    /// predicate and must feed the same `next` + StopIteration rewrite as the
+    /// aggregate Option shape above.  The four roots here fan out to most of
+    /// the census's `slice::Iter::next` failures.  Ignored by default because
+    /// it loads the real interpreter LLBC.
+    #[test]
+    #[ignore]
+    fn iter_next_fold_real_identity_null_niche() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for function in [
+            "pyre_interpreter::call::call_builtin_code_positional",
+            "pyre_interpreter::runtime_ops::build_map_from_refs",
+            "pyre_interpreter::display::py_repr_wtf8",
+            "pyre_interpreter::baseobjspace::mutated",
+        ] {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|e| panic!("lower {function}: {e}"));
+            let count_call_leaf = |leaf: &[&str]| {
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.operations.iter())
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                                if super::fmt_path_ends_with(segments, leaf)
+                        )
+                    })
+                    .count()
+            };
+            assert_eq!(
+                count_call_leaf(&["slice", "iter", "Iter", "next"]),
+                0,
+                "{function}: identity-null niche loop must not retain residual Iter::next"
+            );
+            assert!(
+                count_call_leaf(&["__iter_next"]) >= 1,
+                "{function}: identity-null niche loop must emit a native next op"
+            );
+        }
+    }
+
+    /// A concrete `Vec<T>` source is the translated-list case of PyPy's
+    /// `list.extend`; an arbitrary `IntoIterator` is not.  Pin both sides to
+    /// production LLBC so the frontend never broadens the bridge to Map or a
+    /// custom iterator.
+    #[test]
+    #[ignore]
+    fn vec_extend_retargets_only_concrete_vec_sources() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let count = |function: &str, leaf: &str| {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|e| panic!("lower {function}: {e}"));
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            if segments == &["vec", "Vec", leaf]
+                    )
+                })
+                .count()
+        };
+
+        for function in [
+            "pyre_interpreter::argument::combine_starargs_wrapped",
+            "pyre_interpreter::argument::combine_starstarargs_wrapped",
+            "pyre_interpreter::objspace::descroperation::list_repeat",
+        ] {
+            assert_eq!(count(function, "extend"), 0, "{function}");
+            assert!(count(function, "extend_from_slice") >= 1, "{function}");
+        }
+        let map_only = "pyre_interpreter::baseobjspace::generator_unpack_into";
+        assert_eq!(
+            count(map_only, "extend_from_slice"),
+            0,
+            "{map_only}: an iterator source must not take the list-to-list bridge"
+        );
+        assert!(count(map_only, "extend") >= 1, "{map_only}");
+
+        // This function has both a concrete Vec source and a Map source.  The
+        // former may bridge, but the latter must remain visible as `extend`.
+        let mixed = "pyre_interpreter::_structseq::new_instance_with_extra";
+        assert!(count(mixed, "extend_from_slice") >= 1, "{mixed}");
+        assert!(count(mixed, "extend") >= 1, "{mixed}");
     }
 
     /// Anchor the `&self` `Option::is_some` fold to the real lowered IR of
