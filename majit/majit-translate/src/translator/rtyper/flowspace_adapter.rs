@@ -6379,6 +6379,7 @@ mod tests {
                 funcptr: vars[1].clone(),
                 args: vec![vars[2].clone()],
                 graphs: None,
+                family_key: None,
                 result_ty: ValueType::Int,
             },
         };

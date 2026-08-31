@@ -1626,6 +1626,7 @@ impl<'a> Transformer<'a> {
                 funcptr,
                 args,
                 graphs,
+                family_key: _,
                 result_ty,
             } if self.config.classify_calls => self.lower_indirect_call_op(
                 op,
@@ -7580,6 +7581,7 @@ fn remap_op(
             funcptr,
             args,
             graphs,
+            family_key,
             result_ty,
         } => {
             let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
@@ -7587,6 +7589,7 @@ fn remap_op(
                 funcptr: remap_var(funcptr),
                 args: args.iter().map(remap_var).collect(),
                 graphs: graphs.clone(),
+                family_key: family_key.clone(),
                 result_ty: result_ty.clone(),
             }
         }

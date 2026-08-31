@@ -739,6 +739,13 @@ impl GraphStore {
             .filter_map(move |(p, k)| self.graphs.get(k).map(|s| (p, &s.graph)))
     }
 
+    /// Every source funcobj graph exactly once, irrespective of how many
+    /// alias paths name it.  Used by the rtyping boundary that attaches the
+    /// final PBC family to deferred indirect-call operations.
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut FunctionGraph> {
+        self.graphs.values_mut().map(|slot| &mut slot.graph)
+    }
+
     /// Number of registered alias spellings (path count), matching the old
     /// `HashMap<CallPath, _>::len()` so `iter()`-sized allocations stay correct.
     pub(crate) fn len(&self) -> usize {
@@ -3260,10 +3267,7 @@ impl CallControl {
         graph: FunctionGraph,
     ) {
         if let Some(trait_root) = trait_root {
-            self.trait_method_impls
-                .entry((trait_root.to_string(), method_name.to_string()))
-                .or_default()
-                .push(impl_type.to_string());
+            self.register_trait_family_member(method_name, trait_root, impl_type);
             self.method_to_impl_types
                 .entry(method_name.to_string())
                 .or_default()
@@ -3283,6 +3287,32 @@ impl CallControl {
             // qualified path; its `owner_root = Some(impl_type)` keeps it
             // separate from other impls' same-named methods.
             self.insert_function_graph_indexed(qualified_path, graph);
+        }
+    }
+
+    /// Add one concrete graph to the PBC row for an indirect trait call,
+    /// without also making it a name-based concrete-method candidate.
+    ///
+    /// RPython keeps these two relations separate: `FunctionReprBase.call`
+    /// obtains `c_graphs` from `row_of_graphs.values()`, while concrete
+    /// method lookup follows the receiver's class/MRO.  Pyre's concrete
+    /// trait-impl methods are registered through the inherent-method path to
+    /// preserve that receiver lookup, but they still belong to the PBC row
+    /// used by a `dyn Trait` vtable call.  Required trait methods have no
+    /// default graph, so omitting this membership makes their otherwise
+    /// closed family look unknown to every graph analyzer.
+    pub fn register_trait_family_member(
+        &mut self,
+        method_name: &str,
+        trait_root: &str,
+        impl_type: &str,
+    ) {
+        let members = self
+            .trait_method_impls
+            .entry((trait_root.to_string(), method_name.to_string()))
+            .or_default();
+        if !members.iter().any(|member| member == impl_type) {
+            members.push(impl_type.to_string());
         }
     }
 
@@ -3794,6 +3824,7 @@ impl CallControl {
             "find_all_graphs requires at least one portal target; \
              use find_all_graphs_for_tests() if no portal is available"
         );
+        self.materialize_deferred_indirect_families();
         self.find_all_graphs_bfs(policy);
     }
 
@@ -3801,6 +3832,7 @@ impl CallControl {
     /// Production code must use `find_all_graphs()` with portal seeded.
     #[cfg(test)]
     pub fn find_all_graphs_for_tests(&mut self) {
+        self.materialize_deferred_indirect_families();
         if self.jitdrivers_sd.is_empty() {
             let all_paths: Vec<CallPath> = self.function_graphs.keys().cloned().collect();
             for path in all_paths {
@@ -3810,6 +3842,49 @@ impl CallControl {
         }
         let mut policy = crate::policy::DefaultJitPolicy::new();
         self.find_all_graphs_bfs(&mut policy);
+    }
+
+    /// Attach the final `c_graphs` list to vtable calls the MIR frontend has
+    /// already expressed as [`OpKind::IndirectCall`].  RPython's
+    /// `FunctionReprBase.call` appends `row_of_graphs.values()` during
+    /// rtyping, before `CallControl.find_all_graphs` and every graph analyzer
+    /// read the operation.  Pyre registers the whole Rust program lazily, so
+    /// the frontend temporarily carries only `(trait_root, method_name)` in
+    /// `family_key`; this is the matching end of that rtyping boundary.
+    ///
+    /// Materialising the family on the shared graph object is essential.  A
+    /// transform-time fill on a cloned graph is too late: candidate discovery
+    /// and the recursive effect analyzers inspect the registered source graph
+    /// first and would read `graphs: None` as an unknown family/top result.
+    fn materialize_deferred_indirect_families(&mut self) {
+        let trait_method_impls = &self.trait_method_impls;
+        let function_graphs = &mut self.function_graphs;
+        for graph in function_graphs.values_mut() {
+            for op in graph
+                .blocks
+                .iter_mut()
+                .flat_map(|block| block.operations.iter_mut())
+            {
+                let OpKind::IndirectCall {
+                    graphs, family_key, ..
+                } = &mut op.kind
+                else {
+                    continue;
+                };
+                let Some((trait_root, method_name)) = family_key.take() else {
+                    continue;
+                };
+                let family = trait_method_impls
+                    .get(&(trait_root.clone(), method_name.clone()))
+                    .into_iter()
+                    .flatten()
+                    .map(|impl_type| {
+                        CallPath::for_impl_method(impl_type.as_str(), method_name.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                *graphs = (!family.is_empty()).then_some(family);
+            }
+        }
     }
 
     fn find_all_graphs_bfs(&mut self, policy: &mut dyn JitPolicy) {
@@ -9536,6 +9611,7 @@ mod tests {
                 funcptr: crate::flowspace::model::Variable::new(),
                 args: vec![],
                 graphs,
+                family_key: None,
                 result_ty: ValueType::Void,
             },
         }
@@ -11712,6 +11788,60 @@ mod tests {
         assert_eq!(
             cc.guess_call_kind(&indirect_call_op(None)),
             CallKind::Residual
+        );
+    }
+
+    /// `FunctionReprBase.call` attaches the PBC graph row before
+    /// `CallControl.find_all_graphs`.  A MIR vtable call starts with the same
+    /// identity in `family_key`; graph discovery must materialise it on the
+    /// registered graph, not wait for the later jitcode clone.
+    #[test]
+    fn graph_discovery_materializes_deferred_vtable_family() {
+        let mut cc = CallControl::new();
+        for owner in ["A", "B"] {
+            cc.register_function_graph(
+                CallPath::for_impl_method(owner, "run"),
+                FunctionGraph::new(format!("{owner}::run")),
+            );
+            cc.register_trait_family_member("run", "Handler", owner);
+        }
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let funcptr = caller.alloc_value_var();
+        caller
+            .block_mut(caller.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::IndirectCall {
+                    funcptr,
+                    args: Vec::new(),
+                    graphs: None,
+                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    result_ty: ValueType::Void,
+                },
+            });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.find_all_graphs_for_tests();
+
+        let caller = cc
+            .function_graphs
+            .get(&caller_path)
+            .expect("registered caller");
+        let op = &caller.block(caller.startblock).operations[0];
+        let OpKind::IndirectCall {
+            graphs, family_key, ..
+        } = &op.kind
+        else {
+            panic!("caller operation must remain an indirect call");
+        };
+        assert!(family_key.is_none(), "the rtyping key must be consumed");
+        assert_eq!(
+            graphs.as_ref().map(Vec::len),
+            Some(2),
+            "the registered source graph must carry the complete PBC family"
         );
     }
 

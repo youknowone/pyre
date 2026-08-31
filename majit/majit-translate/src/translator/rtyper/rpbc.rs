@@ -338,9 +338,18 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
     let builtin_wrappers = call_control.builtin_wrapper_indirect_graphs();
     for block in &mut graph.blocks {
         for op in &mut block.operations {
-            if let OpKind::IndirectCall { graphs, .. } = &mut op.kind
-                && graphs.as_deref().is_some_and(<[_]>::is_empty)
+            if let OpKind::IndirectCall {
+                graphs, family_key, ..
+            } = &mut op.kind
             {
+                if let Some((trait_root, method_name)) = family_key.take() {
+                    let family = call_control.all_impls_for_indirect(&trait_root, &method_name);
+                    *graphs = (!family.is_empty()).then_some(family);
+                    continue;
+                }
+                if !graphs.as_deref().is_some_and(<[_]>::is_empty) {
+                    continue;
+                }
                 // Filling the marker with an empty wrapper set would leave
                 // `Some([])`, which every family analyzer reads as "the
                 // family is known and has no members" and folds to its
@@ -466,6 +475,7 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
                 funcptr: funcptr_var,
                 args,
                 graphs,
+                family_key: None,
                 result_ty,
             },
         };
@@ -907,6 +917,91 @@ pub(crate) mod tests {
         assert_eq!(indirect_call_count, 1);
     }
 
+    /// `ClassRepr.getclsfield` produces a real vtable `getfield`, and
+    /// `FunctionReprBase.call` only appends the PBC graph family before its
+    /// `indirect_call`.  A MIR dynamic-call operand already contains that
+    /// field projection, so rtyping must retain it rather than replace it with
+    /// pyre's name-only `VtableMethodPtr` pseudo-op (which no backend can
+    /// execute).
+    #[test]
+    fn existing_vtable_field_read_keeps_its_funcptr_and_only_fills_family() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ValueType};
+
+        let mut cc = CallControl::new();
+        cc.register_trait_method(
+            "run",
+            Some("Handler"),
+            "A",
+            crate::model::FunctionGraph::new("A::run"),
+        );
+
+        let mut graph = crate::model::FunctionGraph::new("caller");
+        let receiver = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "vtable".to_string(),
+                    ty: ValueType::Ref(Some("Handler::{vtable}".to_string())),
+                    class_root: Some("Handler::{vtable}".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        let funcptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: receiver,
+                    field: FieldDescriptor::new(
+                        "method_run",
+                        Some("Handler::{vtable}".to_string()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::IndirectCall {
+                    funcptr: funcptr.clone(),
+                    args: Vec::new(),
+                    graphs: None,
+                    family_key: Some(("Handler".to_string(), "run".to_string())),
+                    result_ty: ValueType::Void,
+                },
+                true,
+            )
+            .unwrap();
+
+        lower_indirect_calls(&mut graph, &cc);
+
+        let ops = &graph.blocks[graph.startblock.0].operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::VtableMethodPtr { .. })),
+            "an existing getfield must not be replaced by VtableMethodPtr",
+        );
+        let indirect = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::IndirectCall {
+                    funcptr: actual,
+                    graphs,
+                    family_key,
+                    ..
+                } => Some((actual, graphs, family_key)),
+                _ => None,
+            })
+            .expect("indirect call survives rtyping");
+        assert_eq!(indirect.0, &funcptr);
+        assert_eq!(indirect.1.as_ref().map(Vec::len), Some(1));
+        assert!(indirect.2.is_none(), "rtyper must consume the family key");
+    }
+
     #[test]
     fn indirect_family_result_retypes_opaque_caller_result() {
         use crate::call::CallControl;
@@ -1061,6 +1156,7 @@ pub(crate) mod tests {
                 funcptr: funcptr_var,
                 args: vec![],
                 graphs: Some(Vec::new()),
+                family_key: None,
                 result_ty: ValueType::Void,
             },
             true,

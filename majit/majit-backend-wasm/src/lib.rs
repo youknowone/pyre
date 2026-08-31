@@ -1488,11 +1488,17 @@ fn wasm_bh_alloc(type_id: u32, payload_size: usize) -> i64 {
         majit_gc::gc_write_barrier(GcRef(gc_ptr));
         return gc_ptr as i64;
     }
+    if type_id != 0 {
+        // `GcLLDescr_framework._bh_malloc` returns NULL on failure so the
+        // blackhole wrapper can raise `MemoryError`.  A raw fallback for a
+        // typed descr drops the GC header and its tracing layout.
+        return 0;
+    }
     wasm_bh_alloc_raw(payload_size)
 }
 
-/// Non-GC descrs (`type_id == 0`, raw buffers) and a runtime with no allocator
-/// installed keep the plain zeroed malloc the dynasm runner falls back to.
+/// Non-GC descrs (`type_id == 0`, raw buffers) keep the plain zeroed malloc the
+/// dynasm runner uses for the same descr shape.
 fn wasm_bh_alloc_raw(size: usize) -> i64 {
     let Ok(layout) = std::alloc::Layout::from_size_align(size.max(1), 8) else {
         return 0;
@@ -3387,13 +3393,21 @@ impl majit_backend::Backend for WasmBackend {
 
     /// llmodel.py bh_new_array(length, arraydescr).
     fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        let length = usize::try_from(length).expect("bh_new_array length must be non-negative");
+        let Ok(length) = usize::try_from(length) else {
+            return 0;
+        };
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
         let len_offset = arraydescr
             .array_len_offset()
             .expect("bh_new_array requires ArrayDescr.lendescr");
         let type_id = arraydescr.resolve_gc_tid();
-        let ptr = wasm_bh_alloc(type_id, base_size + itemsize * length);
+        let Some(payload_size) = itemsize
+            .checked_mul(length)
+            .and_then(|items| base_size.checked_add(items))
+        else {
+            return 0;
+        };
+        let ptr = wasm_bh_alloc(type_id, payload_size);
         if ptr != 0 {
             unsafe {
                 *((ptr as *mut u8).add(len_offset) as *mut usize) = length;
@@ -3413,14 +3427,14 @@ impl majit_backend::Backend for WasmBackend {
 
     /// `LLtypeMixin.bh_newstr` → `gc_ll_descr.gc_malloc_str`.
     fn bh_newstr(&self, length: i64) -> i64 {
-        let length = usize::try_from(length).expect("bh_newstr length must be non-negative");
+        let Ok(length) = usize::try_from(length) else {
+            return 0;
+        };
         let base_size = 2 * std::mem::size_of::<usize>() + 1;
-        let ptr = wasm_bh_alloc(
-            majit_gc::lowlevel_str_type_id(),
-            base_size
-                .checked_add(length)
-                .expect("bh_newstr allocation size overflow"),
-        );
+        let Some(payload_size) = base_size.checked_add(length) else {
+            return 0;
+        };
+        let ptr = wasm_bh_alloc(majit_gc::lowlevel_str_type_id(), payload_size);
         if ptr != 0 {
             unsafe {
                 *((ptr as *mut u8).add(std::mem::size_of::<usize>()) as *mut usize) = length;
@@ -3431,15 +3445,17 @@ impl majit_backend::Backend for WasmBackend {
 
     /// `LLtypeMixin.bh_newunicode` → `gc_ll_descr.gc_malloc_unicode`.
     fn bh_newunicode(&self, length: i64) -> i64 {
-        let length = usize::try_from(length).expect("bh_newunicode length must be non-negative");
+        let Ok(length) = usize::try_from(length) else {
+            return 0;
+        };
         let base_size = 2 * std::mem::size_of::<usize>();
-        let ptr = wasm_bh_alloc(
-            majit_gc::lowlevel_unicode_type_id(),
-            length
-                .checked_mul(std::mem::size_of::<u32>())
-                .and_then(|items| base_size.checked_add(items))
-                .expect("bh_newunicode allocation size overflow"),
-        );
+        let Some(payload_size) = length
+            .checked_mul(std::mem::size_of::<u32>())
+            .and_then(|items| base_size.checked_add(items))
+        else {
+            return 0;
+        };
+        let ptr = wasm_bh_alloc(majit_gc::lowlevel_unicode_type_id(), payload_size);
         if ptr != 0 {
             unsafe {
                 *((ptr as *mut u8).add(std::mem::size_of::<usize>()) as *mut usize) = length;
@@ -5353,6 +5369,23 @@ mod tests {
     use majit_ir::forwarding::bound_operand_from_opref as rb;
 
     static WASM_COMPILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn typed_blackhole_allocation_never_falls_back_to_raw_memory() {
+        // No active wasm GC is installed on this test thread.  A typed descr
+        // therefore has no legal allocator and must report NULL to
+        // blackhole.py `_get_method`; the previous raw fallback returned a
+        // headerless block that the collector could neither identify nor
+        // trace.
+        assert_eq!(wasm_bh_alloc(1, 32), 0);
+    }
+
+    #[test]
+    fn blackhole_varsize_rejects_negative_lengths_without_panicking() {
+        let backend = WasmBackend::new();
+        assert_eq!(backend.bh_newstr(-1), 0);
+        assert_eq!(backend.bh_newunicode(-1), 0);
+    }
 
     #[test]
     fn cross_loop_terminal_jump_uses_target_descr_identity() {

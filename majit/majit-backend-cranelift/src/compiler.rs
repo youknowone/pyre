@@ -17849,6 +17849,13 @@ impl majit_backend::Backend for CraneliftBackend {
         if gc_ptr != 0 {
             return gc_ptr;
         }
+        if sizedescr.resolve_gc_tid() != 0 && !sizedescr.is_headerless() {
+            // `GcLLDescr_framework._bh_malloc` must keep a typed allocation
+            // inside the GC heap.  NULL is the fallible result consumed by
+            // blackhole.py `_get_method`; a raw fallback would have no GC
+            // header or trace layout.
+            return 0;
+        }
         let layout =
             std::alloc::Layout::from_size_align(size, 8).unwrap_or(std::alloc::Layout::new::<u8>());
         unsafe { std::alloc::alloc_zeroed(layout) as i64 }
@@ -17889,7 +17896,9 @@ impl majit_backend::Backend for CraneliftBackend {
 
     /// llmodel.py bh_new_array / bh_new_array_clear.
     fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        let length = usize::try_from(length).expect("bh_new_array length must be non-negative");
+        let Ok(length) = usize::try_from(length) else {
+            return 0;
+        };
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
         let len_offset = arraydescr
             .array_len_offset()
@@ -17939,13 +17948,17 @@ impl majit_backend::Backend for CraneliftBackend {
 
     /// `LLtypeMixin.bh_newstr` → `gc_ll_descr.gc_malloc_str`.
     fn bh_newstr(&self, length: i64) -> i64 {
-        let length = u64::try_from(length).expect("bh_newstr length must be non-negative");
+        let Ok(length) = u64::try_from(length) else {
+            return 0;
+        };
         gc_malloc_str_helper(majit_gc::lowlevel_str_type_id() as u64, length) as i64
     }
 
     /// `LLtypeMixin.bh_newunicode` → `gc_ll_descr.gc_malloc_unicode`.
     fn bh_newunicode(&self, length: i64) -> i64 {
-        let length = u64::try_from(length).expect("bh_newunicode length must be non-negative");
+        let Ok(length) = u64::try_from(length) else {
+            return 0;
+        };
         gc_malloc_unicode_helper(majit_gc::lowlevel_unicode_type_id() as u64, length) as i64
     }
 
