@@ -2531,19 +2531,45 @@ pub fn npure_cellvars(code: &CodeObject) -> usize {
     let mut count = 0;
     for c in code.cellvars.iter() {
         let cs: &str = c.as_ref();
-        let mut overlaps = false;
-        for v in code.varnames.iter() {
-            let vs: &str = v.as_ref();
-            if vs == cs {
-                overlaps = true;
-                break;
-            }
-        }
-        if !overlaps {
+        if !cellvar_overlaps_varname(code, cs) {
             count += 1;
         }
     }
     count
+}
+
+/// True when cellvar `name` also names a varname, so the unified slot layout
+/// gave it that varname's slot and it is not part of the pure-cellvar band.
+#[inline]
+#[majit_macros::elidable_cannot_raise]
+fn cellvar_overlaps_varname(code: &CodeObject, name: &str) -> bool {
+    for v in code.varnames.iter() {
+        let vs: &str = v.as_ref();
+        if vs == name {
+            return true;
+        }
+    }
+    false
+}
+
+/// Position in `code.cellvars` of the `n`-th cellvar that does not also name a
+/// varname -- the `n`-th entry of the pure-cellvar band [`npure_cellvars`]
+/// counts.  Returns `code.cellvars.len()` when `n` is past the band.
+#[inline]
+#[majit_macros::elidable_cannot_raise]
+fn nth_pure_cellvar_index(code: &CodeObject, n: usize) -> usize {
+    let mut seen = 0;
+    for ci in 0..code.cellvars.len() {
+        let cs: &str = code.cellvars[ci].as_ref();
+        if cellvar_overlaps_varname(code, cs) {
+            continue;
+        }
+        if seen == n {
+            return ci;
+        }
+        seen += 1;
+    }
+    code.cellvars.len()
 }
 
 #[inline]
@@ -5160,22 +5186,26 @@ impl PyFrame {
         if !code.flags.contains(CodeFlags::OPTIMIZED) {
             return Ok(());
         }
-        let pure_cells: Vec<&_> = code
-            .cellvars
-            .iter()
-            .filter(|c| {
-                let cs: &str = c.as_ref();
-                !varnames.iter().any(|v| {
-                    let vs: &str = v.as_ref();
-                    vs == cs
-                })
-            })
-            .collect();
-        let npure = pure_cells.len();
+        // `freevarnames = co_cellvars` and, under `CO_OPTIMIZED`,
+        // `+ co_freevars` -- one loop over the concatenation.  The
+        // concatenation is not materialized here: the pure-cellvar band is
+        // addressed positionally through [`nth_pure_cellvar_index`], the same
+        // overlap test [`npure_cellvars`] counts with.  A cellvar that also
+        // names a varname shares that varname's slot in the unified layout and
+        // was written by the loop above, so it holds no band position.
+        //
+        // Positional addressing rather than a filtered `Vec` because this
+        // graph is `unroll_safe`: the walker descends into the body, and a
+        // collected `Vec` puts the closure environment, the iterator adapters
+        // and the allocation on the descent's blocker frontier as calls with
+        // no lowering -- `fast2locals::closure`, `Filter::collect`,
+        // `Iter::filter`, `Range::any`, `Box::new`.  None of them has an
+        // upstream counterpart; the upstream loop indexes two name arrays.
+        let npure = npure_cellvars(code);
         let freevarnames_len = npure + code.freevars.len();
         for i in 0..freevarnames_len {
             let name: &str = if i < npure {
-                pure_cells[i].as_ref()
+                code.cellvars[nth_pure_cellvar_index(code, i)].as_ref()
             } else {
                 code.freevars[i - npure].as_ref()
             };
