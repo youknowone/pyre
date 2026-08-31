@@ -2227,7 +2227,59 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "collections.deque" => crate::module::_collections::is_deque,
         "mmap.mmap" => mmap_layout,
     }
+    macro_rules! owners_named {
+        ($($key:literal as $tp:literal => $pred:path),+ $(,)?) => {
+            match type_name {
+                $($key => {
+                    static OWNER: crate::gateway::MethodOwner = crate::gateway::MethodOwner {
+                        type_name: $tp,
+                        is_instance: Some(|obj| unsafe { $pred(obj) }),
+                    };
+                    return Some(&OWNER);
+                })+
+                _ => {}
+            }
+        };
+    }
+    // `_ctypes` builds its two element bases as heap types, whose `name` is
+    // the bare one `__name__` reports, so a dotted key would rename them.
+    // The `tp_name` their descriptors are refused by is spelled here instead:
+    // `descriptor '__getitem__' requires a '_ctypes.Array' object`, while
+    // `stamp_method_owners` still qualifies the methods as `Array.__getitem__`
+    // from its last component.
+    owners_named! {
+        "Array" as "_ctypes.Array" => ctypes_array_layout,
+        "_Pointer" as "_ctypes._Pointer" => ctypes_pointer_layout,
+    }
     Some(untested_method_owner(type_name))
+}
+
+/// `_ctypes.Array`'s layout test.  The module is not built under `sandbox`
+/// nor without `host_env`, where the type is never created either, so the row
+/// above is dead there rather than wrong.
+fn ctypes_array_layout(obj: PyObjectRef) -> bool {
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    {
+        crate::module::_ctypes::metaclass::is_array_instance(obj)
+    }
+    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
+/// `_ctypes._Pointer`'s layout test, gated the same way.
+fn ctypes_pointer_layout(obj: PyObjectRef) -> bool {
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    {
+        crate::module::_ctypes::metaclass::is_pointer_instance(obj)
+    }
+    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    {
+        let _ = obj;
+        false
+    }
 }
 
 /// `mmap.mmap`'s layout test.  The module is not built for wasm32 or under
