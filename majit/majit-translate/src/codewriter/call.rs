@@ -2595,14 +2595,20 @@ impl CallControl {
                 // carries no token (synthetic / positional construction).
                 // Both spellings hash to the same `u64` for a non-colliding
                 // type, so this keeps the runtime-publish convergence.
-                // A source StructId identifies the generic declaration, not a
-                // concrete Rust instantiation. RPython's cache key is the
-                // concrete low-level STRUCT object, so instantiated owners use
-                // their full canonical spelling while monomorphic owners keep
-                // the source-attached collision-free identity token.
-                let struct_key = match owner_id {
-                    Some(sid) if !owner_root.contains('<') => LLType::Struct(sid.as_u64()),
-                    _ => LLType::Struct(path_hash(&majit_ir::descr::canonical_struct_name(
+                // RPython's cache key is the concrete low-level STRUCT object,
+                // and a source StructId already is one: `concrete_adt_struct_id`
+                // mints an instantiated owner through `StructId::instantiate`,
+                // so `Option<usize>::Some` and `Option<BinOpKind>::Some` are
+                // already distinct tokens here. `struct_id_for_name` instantiates
+                // the same way for an owner that carries no token, which is what
+                // `assembler::fielddescrof` stamps onto the emitted descr's
+                // `type_id` — resolve the key exactly as it does, or the effect
+                // set recorded below and the shipped field descr name one struct
+                // under two different hashes and never converge.
+                let registry_struct_id = majit_ir::descr::struct_id_for_name(owner_root);
+                let struct_key = match owner_id.or(registry_struct_id) {
+                    Some(sid) => LLType::Struct(sid.as_u64()),
+                    None => LLType::Struct(path_hash(&majit_ir::descr::canonical_struct_name(
                         owner_root,
                     ))),
                 };
@@ -2622,7 +2628,6 @@ impl CallControl {
                 // publish under the same `struct_key` carries the real
                 // vtable on its PyreSizeDescr — cache-hit returns
                 // *that* Arc here unchanged).
-                let registry_struct_id = majit_ir::descr::struct_id_for_name(owner_root);
                 if owner_id.is_some() && registry_struct_id.is_none() {
                     majit_ir::descr::record_field_owner_id_registry_miss();
                 }

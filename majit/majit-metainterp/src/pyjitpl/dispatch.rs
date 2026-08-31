@@ -10407,6 +10407,27 @@ where
     machine.run_to_end(ctx, sym, runtime)
 }
 
+/// Write one merge-point argument into the register and value slot its bank
+/// owns. Greens and reds differ only in where the `OpRef` came from — a
+/// freshly minted constant for a green, the caller's live box for a red — so
+/// the write itself is shared.
+fn seed_register(frame: &mut MIFrame, kind: JitArgKind, reg: usize, opref: OpRef, value: i64) {
+    match kind {
+        JitArgKind::Int => {
+            frame.int_regs[reg] = Some(opref);
+            frame.int_values[reg] = Some(value);
+        }
+        JitArgKind::Ref => {
+            frame.ref_regs[reg] = Some(opref);
+            frame.ref_values[reg] = Some(value);
+        }
+        JitArgKind::Float => {
+            frame.float_regs[reg] = Some(opref);
+            frame.float_values[reg] = Some(value);
+        }
+    }
+}
+
 /// Build an [`MIFrame`] whose first instruction is a JitDriver merge point.
 ///
 /// `MIFrame::setup_call` is the ordinary callee-entry path and resets the
@@ -10459,20 +10480,7 @@ pub fn setup_frame_from_merge_point(
                 JitArgKind::Ref => ctx.const_ref(value),
                 JitArgKind::Float => ctx.const_float(value),
             };
-            match kind {
-                JitArgKind::Int => {
-                    frame.int_regs[reg] = Some(opref);
-                    frame.int_values[reg] = Some(value);
-                }
-                JitArgKind::Ref => {
-                    frame.ref_regs[reg] = Some(opref);
-                    frame.ref_values[reg] = Some(value);
-                }
-                JitArgKind::Float => {
-                    frame.float_regs[reg] = Some(opref);
-                    frame.float_values[reg] = Some(value);
-                }
-            }
+            seed_register(&mut frame, kind, reg, opref, value);
         }
     }
     for (bank, kind) in [JitArgKind::Int, JitArgKind::Ref, JitArgKind::Float]
@@ -10491,20 +10499,7 @@ pub fn setup_frame_from_merge_point(
             "merge-point red {kind:?} register count disagrees with its typed arguments",
         );
         for (&reg, (opref, value)) in regs.iter().zip(args) {
-            match kind {
-                JitArgKind::Int => {
-                    frame.int_regs[reg] = Some(opref);
-                    frame.int_values[reg] = Some(value);
-                }
-                JitArgKind::Ref => {
-                    frame.ref_regs[reg] = Some(opref);
-                    frame.ref_values[reg] = Some(value);
-                }
-                JitArgKind::Float => {
-                    frame.float_regs[reg] = Some(opref);
-                    frame.float_values[reg] = Some(value);
-                }
-            }
+            seed_register(&mut frame, kind, reg, opref, value);
         }
     }
     // The walker reads from `code_cursor`; `pc` is only the portal anchor.

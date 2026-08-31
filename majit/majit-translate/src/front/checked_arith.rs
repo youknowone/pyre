@@ -539,6 +539,22 @@ fn rewire_checked_arith_ok_or_else(
         return Err("checked-arith block does not have one exit".to_string());
     };
     let saved_a_exit = a_exit.clone();
+    // The overflow rewrite below replaces EVERY occurrence of the checked
+    // result in this edge, while `position` names only the first. With the
+    // value in two slots the second block-C inputarg would take the rewritten
+    // operand without ever being validated against the receiver — decline the
+    // shape rather than validate one slot and rewrite two, the same fail-safe
+    // cut the multi-slot payload collapse above takes.
+    let opt_slots = saved_a_exit
+        .args
+        .iter()
+        .filter(|arg| matches!(arg, LinkArg::Value(value) if value == opt))
+        .count();
+    if opt_slots > 1 {
+        return Err(format!(
+            "checked result is threaded into {opt_slots} ok_or_else link slots"
+        ));
+    }
     let Some(opt_pos) = saved_a_exit
         .args
         .iter()
@@ -875,6 +891,26 @@ mod tests {
             .collect();
         assert_eq!(result_variants.iter().filter(|is_err| !**is_err).count(), 1);
         assert_eq!(result_variants.iter().filter(|is_err| **is_err).count(), 1);
+        // The two shells alone do not prove the rewrite wired the raise: an
+        // `emit_call_once` that stopped emitting its call, or an overflow link
+        // that lost its typed exitcase, both leave the shells standing.
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::Method { name, receiver_root: Some(owner), .. }, .. }
+                        if name == "call_once" && owner == "test::closure")
+                }),
+            "the Err arm must invoke the ok_or_else closure"
+        );
+        assert!(
+            g.blocks[a.0]
+                .exits
+                .iter()
+                .any(|exit| exit.exitcase.as_ref() == Some(&overflowerror_exitcase())),
+            "the overflow link must carry the OverflowError exitcase"
+        );
     }
 
     #[test]

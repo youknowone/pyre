@@ -20739,20 +20739,39 @@ fn tyref_option_fieldless_niche(ty: &TyRef, llbc: &Llbc) -> Option<FieldlessOpti
     }
     let target = std::env::var("TARGET").unwrap_or_default();
     let storage_ty = td.layout_for_target(&target)?.discriminant_int_type()?;
-    let none_tag = i64::try_from(variants.len()).ok()?;
-    let max = match storage_ty {
-        "u8" => u8::MAX as i64,
-        "u16" => u16::MAX as i64,
-        "u32" => u32::MAX as i64,
-        // `i64` cannot express the upper half of u64, but a dense enum with
-        // that many variants cannot occur in an LLBC declaration in practice.
-        "u64" => i64::MAX,
-        _ => return None,
-    };
-    (none_tag <= max).then_some(FieldlessOptionNiche {
+    let none_tag = fieldless_option_none_tag(variants.len(), storage_ty)?;
+    Some(FieldlessOptionNiche {
         none_tag,
         storage_ty,
     })
+}
+
+/// The value the compiler reserved for `None` in an `Option<E>` over a
+/// fieldless enum with `variants` densely numbered variants stored in
+/// `storage_ty` — `None` when this layer cannot know it, which is every
+/// case today.
+///
+/// MEASURED, and the measurement refutes `variants` itself as the tag. On
+/// this toolchain a dense fieldless enum in a `u8` puts `None` at `2` with
+/// two variants but at `255` — the storage maximum, not the variant count —
+/// with three, four, five and eight, a 300-variant enum in a `u16` puts it
+/// at `65535`, and a single-variant enum is inverted outright (`None` is
+/// `0`, `Some` is `1`). So a derived `variants` tag names a value the
+/// compiler never writes, the `ne` against it misclassifies every `Some`,
+/// and a constructed `None` is indistinguishable from a live variant.
+///
+/// The tag that would be right is the niche the compiler actually reserved,
+/// and this artefact does not carry it: Charon spells a discriminant only as
+/// `Branch { offset, int_ty }` or `Known`, with no niche encoding, and runs
+/// with `monomorphize: false`, so there is no `Option<E>` layout to read one
+/// off either. Rust does not specify the placement, so it is not derivable
+/// by rule. Declining here leaves every `Option<fieldless enum>` on the
+/// ordinary aggregate lowering; the tag threading the combinators carry
+/// ([`crate::front::option_unwrap_or::UnwrapOrSite::fieldless_none_tag`])
+/// stays exercised by its own tests and is ready for a niche encoding that
+/// reaches the artefact.
+fn fieldless_option_none_tag(_variants: usize, _storage_ty: &str) -> Option<i64> {
+    None
 }
 
 /// The `TypeDecl` behind `ty` when it resolves to a fieldless (C-like)
