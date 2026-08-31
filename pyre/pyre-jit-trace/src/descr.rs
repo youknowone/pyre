@@ -987,7 +987,9 @@ fn build_object_descr_group_with_extra_gc_edges(
         )
         .collect();
     debug_assert!(
-        specs.iter().all(|s| s.field_type != Type::Ref || s.field_size == WORD),
+        specs
+            .iter()
+            .all(|s| s.field_type != Type::Ref || s.field_size == WORD),
         "a Ref field is one pointer; size it WORD, not a literal"
     );
     let mut gc_edges: Vec<Arc<dyn FieldDescr>> = vec![W_CLASS_FIELD_DESCR.clone()];
@@ -1085,7 +1087,9 @@ fn build_bare_gcstruct_descr_group(
         )
         .collect();
     debug_assert!(
-        specs.iter().all(|s| s.field_type != Type::Ref || s.field_size == WORD),
+        specs
+            .iter()
+            .all(|s| s.field_type != Type::Ref || s.field_size == WORD),
         "a Ref field is one pointer; size it WORD, not a literal"
     );
     let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
@@ -1910,8 +1914,24 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 true,
                 false,
             ),
-            ("stop", RANGE_STOP_OFFSET, WORD, Type::Ref, false, true, false),
-            ("step", RANGE_STEP_OFFSET, WORD, Type::Ref, false, true, false),
+            (
+                "stop",
+                RANGE_STOP_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "step",
+                RANGE_STEP_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
             (
                 "length",
                 RANGE_LENGTH_OFFSET,
@@ -4470,7 +4490,15 @@ fn build_native_user_mapdict_group(
                 false,
                 false,
             ),
-            ("storage", storage_offset, WORD, Type::Ref, false, false, false),
+            (
+                "storage",
+                storage_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         simple_name,
         def_path,
