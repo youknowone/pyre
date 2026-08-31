@@ -3638,7 +3638,12 @@ pub unsafe fn connection_read_plain(
         // SSL_read wrapper returns b"" here; SSLZeroReturnError is reserved
         // for lower-level error reporting paths, not ordinary recv().
         Ok(0) => {
-            connection.peer_sent_close_notify = true;
+            // `Read::read` answers `Ok(0)` for an empty buffer whatever the
+            // connection holds, so a zero-length request is not that
+            // observation and must not record a close the peer never sent.
+            if size != 0 {
+                connection.peer_sent_close_notify = true;
+            }
             Ok(Vec::new())
         }
         Ok(read) => {

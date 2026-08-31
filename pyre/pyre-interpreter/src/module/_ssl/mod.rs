@@ -2196,14 +2196,23 @@ mod ssl_socket_methods {
             };
             let size = if let Some(buffer) = writable.as_mut() {
                 let capacity = unsafe { buffer.as_mut_slice() }.len();
-                if requested < 0 {
+                // `_read_buf`: a length that is not positive, or larger than
+                // the buffer, is the buffer's own length.
+                if requested <= 0 || requested as usize > capacity {
                     capacity
                 } else {
-                    capacity.min(requested as usize)
+                    requested as usize
                 }
             } else {
                 requested as usize
             };
+            // `_read_buf` answers a zero-length buffer with 0 before reaching
+            // `SSL_read`, so an empty request never observes the connection --
+            // a plaintext read of no bytes would otherwise report the peer's
+            // EOF and, after a local shutdown, raise `SSLZeroReturnError`.
+            if size == 0 {
+                return Ok(w_int_new(0));
+            }
             let data = if let Some((transport, fd)) = pump_transport(self)? {
                 // `SSL_read` under one `PySSL_BEGIN_ALLOW_THREADS`: the
                 // plaintext drain, the transport read and the record parsing
