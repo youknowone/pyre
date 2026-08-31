@@ -4474,6 +4474,41 @@ mod tests {
         );
     }
 
+    /// Every `BUILTIN_WRAPPER_DESCRIPTORS` member must carry the
+    /// `__majit_wrap_` leaf.  That prefix is how
+    /// `CallControl::compute_builtin_wrapper_indirect_graphs` populates the
+    /// `BuiltinCode.func` PBC family, and the family is what seeds the
+    /// codewriter BFS and materialises a jitcode per member.  A descriptor
+    /// spelled any other way still publishes an address and still binds at
+    /// runtime, so nothing fails — it simply joins no family, gets no
+    /// jitcode, and leaves every indirect site that would dispatch to it
+    /// residual.
+    ///
+    /// `descr_typecheck_fget_getdictscope` was spelled that way, and the
+    /// `f_locals` getset was what it cost: the walker reached the gateway as
+    /// a residual `CallMayForce` and escaped, so the
+    /// `jit_force_virtualizable` the gateway carries was never deleted from a
+    /// looked-inside copy.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn every_builtin_wrapper_descriptor_carries_the_family_prefix() {
+        let stray: Vec<&str> = crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS
+            .iter()
+            .map(|wrapper| wrapper.path)
+            .filter(|path| {
+                !path
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|leaf| leaf.starts_with("__majit_wrap_"))
+            })
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "these wrapper descriptors cannot join the BuiltinCode.func PBC \
+             family, so they get no jitcode: {stray:?}",
+        );
+    }
+
     /// `BUILTIN_WRAPPER_DESCRIPTORS` is only pushed into the binding table off
     /// wasm32, so the lookup below has nothing to find there.
     #[test]

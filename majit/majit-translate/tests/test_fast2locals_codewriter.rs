@@ -105,7 +105,7 @@ fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let gateway = lower_named(&llbc, "descr_typecheck_fget_getdictscope");
+    let gateway = lower_named(&llbc, "__majit_wrap_descr_typecheck_fget_getdictscope");
     let method = lower_named(&llbc, "fget_getdictscope");
     assert!(
         call_leafs(&gateway)

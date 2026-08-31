@@ -3366,7 +3366,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         make_module_builtin_function_with_arity("globals", builtin_globals, 0)
     });
     crate::module_ns_get_or_insert_with(ns, "locals", || {
-        make_module_builtin_function_with_arity("locals", builtin_locals, 0)
+        make_module_builtin_function_with_arity("locals", __majit_wrap_builtin_locals, 0)
     });
     crate::module_ns_get_or_insert_with(ns, "exec", || {
         make_module_builtin_function("exec", builtin_exec)
@@ -16277,7 +16277,15 @@ fn topframe_for_locals() -> *mut crate::PyFrame {
     // The force materializes the fastlocals through a backend hook whose callee
     // this crate cannot follow, so it is judged as able to collect.
     let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-    crate::executioncontext::force_frame_before_locals_read(frame);
+    // Spelled as the marker, not as a direct `force_frame_before_locals_read`.
+    // Both bodies are the same call, but only this name is what
+    // `jtransform.py rewrite_op_jit_force_virtualizable` deletes, and this
+    // graph now HAS a jitcode: `__majit_wrap_builtin_locals` puts `locals`
+    // in the `BuiltinCode.func` family, so the codewriter looks inside here.
+    // A direct force would survive into the traced copy and force a
+    // virtualizable the trace is meanwhile keeping symbolic; the residual
+    // copy still runs the body and still forces.
+    crate::executioncontext::jit_force_virtualizable(frame);
     anchor.live()
 }
 
@@ -16301,6 +16309,40 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let frame_mut = unsafe { &mut *frame };
     frame_mut.frame_locals_snapshot()
 }
+
+/// `BuiltinCode.func` PBC member for `locals`.
+///
+/// Builtins installed by hand must publish one, or
+/// `CallControl::compute_builtin_wrapper_indirect_graphs` leaves the builtin
+/// out of the family, `get_jitcode` is never called for its body, and the
+/// walker declines the CALL with `no jitcode for address` — measured on
+/// `locals_proxy_extra_key_hot`, where `locals` was one of three such names.
+///
+/// Unlike `__majit_wrap_builtin_len` this adds no JIT-shaped body, and that is
+/// a measured limit rather than a simplification.  The descent resolves its
+/// heap-cache item key with `wrapper_args_item_descr_index`, which reads the
+/// first `getarrayitem_gc_r` after the first `arraylen_gc` in the wrapper's own
+/// body; a no-argument wrapper has neither, so the descent declines with
+/// `wrapper args item descriptor unresolved` even though the key it wants would
+/// seed an empty item list.  With the un-lowered-helper scan on, that decline
+/// comes second — `PYRE_FBW_DESCENT_SCAN_OFF=1` is what shows it.
+///
+/// So what this buys is reach, not a descent: the chain below is codewritten,
+/// which is what lets `rewrite_op_jit_force_virtualizable` delete the force in
+/// `topframe_for_locals`, and `try_walker_specialize_builtin_locals` remains
+/// the mechanism that makes `locals()` cheap.
+pub fn __majit_wrap_builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_locals(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_builtin_locals_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_builtin_locals"),
+        func: __majit_wrap_builtin_locals,
+    };
 
 fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);

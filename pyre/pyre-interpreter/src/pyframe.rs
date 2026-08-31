@@ -2531,19 +2531,45 @@ pub fn npure_cellvars(code: &CodeObject) -> usize {
     let mut count = 0;
     for c in code.cellvars.iter() {
         let cs: &str = c.as_ref();
-        let mut overlaps = false;
-        for v in code.varnames.iter() {
-            let vs: &str = v.as_ref();
-            if vs == cs {
-                overlaps = true;
-                break;
-            }
-        }
-        if !overlaps {
+        if !cellvar_overlaps_varname(code, cs) {
             count += 1;
         }
     }
     count
+}
+
+/// True when cellvar `name` also names a varname, so the unified slot layout
+/// gave it that varname's slot and it is not part of the pure-cellvar band.
+#[inline]
+#[majit_macros::elidable_cannot_raise]
+fn cellvar_overlaps_varname(code: &CodeObject, name: &str) -> bool {
+    for v in code.varnames.iter() {
+        let vs: &str = v.as_ref();
+        if vs == name {
+            return true;
+        }
+    }
+    false
+}
+
+/// Position in `code.cellvars` of the `n`-th cellvar that does not also name a
+/// varname -- the `n`-th entry of the pure-cellvar band [`npure_cellvars`]
+/// counts.  Returns `code.cellvars.len()` when `n` is past the band.
+#[inline]
+#[majit_macros::elidable_cannot_raise]
+fn nth_pure_cellvar_index(code: &CodeObject, n: usize) -> usize {
+    let mut seen = 0;
+    for ci in 0..code.cellvars.len() {
+        let cs: &str = code.cellvars[ci].as_ref();
+        if cellvar_overlaps_varname(code, cs) {
+            continue;
+        }
+        if seen == n {
+            return ci;
+        }
+        seen += 1;
+    }
+    code.cellvars.len()
 }
 
 #[inline]
@@ -2717,7 +2743,16 @@ pub fn code_flags_make_generator(flags: crate::CodeFlags) -> bool {
 /// half; `jtransform.py rewrite_op_jit_force_virtualizable` deletes it from
 /// jitcode.  Publishing the wrapper descriptor seeds the same candidate
 /// graph `BuiltinCode.func` would contribute from the generated wrapper.
-pub fn descr_typecheck_fget_getdictscope(
+///
+/// The `__majit_wrap_` leaf is what makes that seeding happen, and it is not
+/// decoration: `CallControl::compute_builtin_wrapper_indirect_graphs`
+/// populates the `BuiltinCode.func` PBC family by that prefix, and the family
+/// is what enters `candidate_graphs` and gets a `get_jitcode`.  Written by
+/// hand rather than by `#[pyre_methods]`, the wrapper still has to spell it —
+/// otherwise it publishes an address, binds at runtime, joins no family, and
+/// the deletion above never runs on anything, because the codewriter never
+/// looks inside this graph at all.
+pub fn __majit_wrap_descr_typecheck_fget_getdictscope(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
@@ -2737,9 +2772,9 @@ static __majit_builtin_wrapper_target_fget_getdictscope: crate::gateway::Builtin
         path: concat!(
             module_path!(),
             "::",
-            stringify!(descr_typecheck_fget_getdictscope)
+            stringify!(__majit_wrap_descr_typecheck_fget_getdictscope)
         ),
-        func: descr_typecheck_fget_getdictscope,
+        func: __majit_wrap_descr_typecheck_fget_getdictscope,
     };
 
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_code`.
@@ -3429,7 +3464,7 @@ impl PyFrame {
     /// Upstream is `return self.getdictscope()`.  Optimized frames answer
     /// with a write-through `FrameLocalsProxy` instead: `lib-python/3/test/
     /// test_frame.py` `FrameLocalsProxy.__name__`.  The residual force lives
-    /// on [`descr_typecheck_fget_getdictscope`], the GetSetProperty wrapper,
+    /// on [`__majit_wrap_descr_typecheck_fget_getdictscope`], the GetSetProperty wrapper,
     /// not here — `jtransform.py rewrite_op_jit_force_virtualizable` deletes
     /// it from jitcode; the interpreter copy still runs.
     pub fn fget_getdictscope(&mut self) -> Result<PyObjectRef, crate::PyError> {
@@ -5151,22 +5186,26 @@ impl PyFrame {
         if !code.flags.contains(CodeFlags::OPTIMIZED) {
             return Ok(());
         }
-        let pure_cells: Vec<&_> = code
-            .cellvars
-            .iter()
-            .filter(|c| {
-                let cs: &str = c.as_ref();
-                !varnames.iter().any(|v| {
-                    let vs: &str = v.as_ref();
-                    vs == cs
-                })
-            })
-            .collect();
-        let npure = pure_cells.len();
+        // `freevarnames = co_cellvars` and, under `CO_OPTIMIZED`,
+        // `+ co_freevars` -- one loop over the concatenation.  The
+        // concatenation is not materialized here: the pure-cellvar band is
+        // addressed positionally through [`nth_pure_cellvar_index`], the same
+        // overlap test [`npure_cellvars`] counts with.  A cellvar that also
+        // names a varname shares that varname's slot in the unified layout and
+        // was written by the loop above, so it holds no band position.
+        //
+        // Positional addressing rather than a filtered `Vec` because this
+        // graph is `unroll_safe`: the walker descends into the body, and a
+        // collected `Vec` puts the closure environment, the iterator adapters
+        // and the allocation on the descent's blocker frontier as calls with
+        // no lowering -- `fast2locals::closure`, `Filter::collect`,
+        // `Iter::filter`, `Range::any`, `Box::new`.  None of them has an
+        // upstream counterpart; the upstream loop indexes two name arrays.
+        let npure = npure_cellvars(code);
         let freevarnames_len = npure + code.freevars.len();
         for i in 0..freevarnames_len {
             let name: &str = if i < npure {
-                pure_cells[i].as_ref()
+                code.cellvars[nth_pure_cellvar_index(code, i)].as_ref()
             } else {
                 code.freevars[i - npure].as_ref()
             };
@@ -5194,35 +5233,16 @@ impl PyFrame {
     /// Whether a modelled `fast2locals` can reproduce this code object's
     /// locals mapping from the fastlocals alone.
     ///
-    /// Only the plain-locals half of `fast2locals` is modelled: the cell /
-    /// freevar half (pyframe.py:576-598) reads through `w_cell_get` per slot
-    /// and the `CO_FAST_HIDDEN` slots are skipped, so a code object carrying
-    /// either is refused and keeps the residual path.  A non-OPTIMIZED
-    /// (module / class / exec) frame is refused too: it hands back its LIVE
-    /// namespace rather than the independent copy
-    /// [`PyFrame::frame_locals_snapshot`] builds for a function frame.
-    pub fn code_locals_are_plain_fastlocals(code: &CodeObject) -> bool {
-        Self::code_locals_are_modelled_fastlocals(code)
-            && code.cellvars.is_empty()
-            && code.freevars.is_empty()
-    }
-
-    /// [`PyFrame::code_locals_are_plain_fastlocals`] widened to the code
-    /// objects whose cell and freevar slots a modelled `fast2locals` can also
-    /// reproduce.
+    /// The cell / freevar half of [`PyFrame::fast2locals`] (pyframe.py:576-598)
+    /// is one extra read per slot — `w_cell_get`, i.e. `Cell.contents` — over a
+    /// slot the caller already holds, so a model that can read that field
+    /// reproduces it, and both `locals()` expansion arms do.
     ///
-    /// The cell half of [`PyFrame::fast2locals`] is one extra read per slot —
-    /// `w_cell_get`, i.e. `Cell.contents` — over a slot the caller already
-    /// holds, so a model that can read that field can reproduce it.  What
-    /// stays refused is what the plain predicate refuses for its own reasons:
-    /// a non-OPTIMIZED (module / class / exec) frame, which hands back its
-    /// LIVE namespace rather than an independent copy, and `CO_FAST_HIDDEN`
-    /// slots, which `fast2locals` skips only on non-OPTIMIZED frames and whose
-    /// comprehension names must not leak into one.
-    ///
-    /// Kept beside the plain predicate rather than replacing it: the portal
-    /// arm of the `locals()` fold reads slots out of the virtualizable array
-    /// and models no cell read, so it still needs the narrow question.
+    /// What stays refused: a non-OPTIMIZED (module / class / exec) frame,
+    /// which hands back its LIVE namespace rather than the independent copy
+    /// [`PyFrame::frame_locals_snapshot`] builds for a function frame, and
+    /// `CO_FAST_HIDDEN` slots, which `fast2locals` skips only on non-OPTIMIZED
+    /// frames and whose comprehension names must not leak into one.
     pub fn code_locals_are_modelled_fastlocals(code: &CodeObject) -> bool {
         code.flags.contains(CodeFlags::OPTIMIZED)
             && !(0..code.varnames.len()).any(|i| hidden_local(code, i))
