@@ -8563,6 +8563,18 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && (self.is_to_string_identity(&reg, first_arg_ty.as_ref())
                         || self.is_string_clone_identity(&reg, first_arg_ty.as_ref()))
+                    // A `Wtf8::to_wtf8_buf` that defines a proven mutable
+                    // accumulator is not the ordinary immutable-string copy
+                    // this identity arm models.  Its later `push*` calls and
+                    // single materialisation spell RPython's
+                    // `StringBuilder`; let the builder-ctor arm below emit
+                    // `newstringbuilder` plus the seed append.  Otherwise the
+                    // identity shortcut binds the accumulator to the source
+                    // `SomeString`, and the terminal `build` asks that string
+                    // for a builder-only method.
+                    && !(self.builder_mode
+                        && str_builder_ctor_leaf(self.llbc, &reg).is_some()
+                        && is_builder_mode_accumulator(self.body, self.llbc, dest_local))
                 {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -9379,8 +9391,9 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Ref(None),
                         },
                     });
-                    // `Wtf8Buf::from_string(initial)` is the Rust ownership
-                    // spelling of an RPython builder followed by its first
+                    // `Wtf8Buf::from_string(initial)` and
+                    // `Wtf8::to_wtf8_buf(&initial)` are the Rust ownership
+                    // spellings of an RPython builder followed by its first
                     // append.  Keep the initial value as an append operand;
                     // passing it to `new` would misread it as the optional
                     // integer capacity argument.
@@ -9393,7 +9406,7 @@ impl<'a> Lowering<'a> {
                     // `ll_new(len(s))` (`:57-63`) is the PREBUILT-constant
                     // path — a builder already built at translation time —
                     // and is not this callsite.
-                    if builder_ctor_leaf == Some("from_string") {
+                    if matches!(builder_ctor_leaf, Some("from_string" | "to_wtf8_buf")) {
                         let void = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Void);
@@ -34585,6 +34598,81 @@ mod tests {
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "py_repr_wtf8").expect("lower py_repr_wtf8");
+        // Prove every append/build receiver is rooted at a builder ctor.
+        // Start from every phi as a candidate and remove any phi fed by a
+        // non-candidate; this greatest fixed point admits loop-carried
+        // builders while rejecting the old `to_wtf8_buf` identity value
+        // (a plain SomeString producer) and every phi reachable from it.
+        let builder_roots: std::collections::HashSet<u64> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &[crate::runtime_names::shims::STRINGBUILDER_NEW])
+                .then(|| op.result.as_ref().expect("builder new result").id())
+            })
+            .collect();
+        let mut builder_values = builder_roots.clone();
+        builder_values.extend(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.inputargs)
+                .map(|input| input.id()),
+        );
+        loop {
+            let mut changed = false;
+            for block in &graph.blocks {
+                for (pos, input) in block.inputargs.iter().enumerate() {
+                    let incoming: Vec<_> = graph
+                        .blocks
+                        .iter()
+                        .flat_map(|source| &source.exits)
+                        .filter(|link| link.target == block.id)
+                        .filter_map(|link| link.args.get(pos))
+                        .collect();
+                    if (incoming.is_empty()
+                        || incoming.iter().any(|arg| {
+                            arg.as_variable()
+                                .is_none_or(|value| !builder_values.contains(&value.id()))
+                        }))
+                        && !builder_roots.contains(&input.id())
+                    {
+                        changed |= builder_values.remove(&input.id());
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let unproven_builder_receivers: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                block.operations.iter().filter_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        ..
+                    } if matches!(segments.as_slice(), [marker]
+                        if marker == crate::runtime_names::shims::STRINGBUILDER_APPEND
+                            || marker == crate::runtime_names::shims::STRINGBUILDER_BUILD) =>
+                    {
+                        args.first()
+                            .filter(|recv| !builder_values.contains(&recv.id()))
+                            .map(|recv| (block.id, segments.clone(), recv.clone()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(
+            unproven_builder_receivers.is_empty(),
+            "builder operations must receive a value rooted at newstringbuilder: \
+             {unproven_builder_receivers:#?}"
+        );
         let residual: Vec<_> = graph
             .blocks
             .iter()
