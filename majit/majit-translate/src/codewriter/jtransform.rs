@@ -4522,6 +4522,14 @@ impl<'a> Transformer<'a> {
             {
                 return prepend_const_prefix(&mut const_prefix_ops, result);
             }
+            // The per-width raw accessors and `rffi.ptradd`: upstream the
+            // rtyper lowers these to `raw_load` / `raw_store` / pointer
+            // arithmetic before the codewriter runs
+            // (`jtransform.py:1156-1171`); a leaf on this spine declares
+            // the same lowering through its oopspec name.
+            if let Some(result) = self._handle_raw_access_call(base, op, args, graph) {
+                return prepend_const_prefix(&mut const_prefix_ops, result);
+            }
             // NOTE: conditional_call!/conditional_call_elidable!/record_known_result!
             // are handled by jitcode_lower (proc-macro level), NOT here.
             // The codewriter AST parser does not expand macro_rules!, so these
@@ -4612,6 +4620,103 @@ impl<'a> Transformer<'a> {
         let result =
             self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name);
         prepend_const_prefix(&mut const_prefix_ops, result)
+    }
+
+    /// The raw-memory oopspec family.  `raw_ptradd(p, ofs)` lowers to plain
+    /// pointer arithmetic (`int_add` — the shape `optimize_INT_ADD` follows
+    /// into a raw-slice info), and `raw_read_<width>` / `raw_write_<width>`
+    /// lower to `raw_load` / `raw_store` on the already-offset pointer with
+    /// a zero byte offset (`jtransform.py:1156-1171 rewrite_op_raw_store` /
+    /// `rewrite_op_raw_load`, descr `arraydescrof(rffi.CArray(T))`).  The
+    /// single-float width stays a residual call — `jit_libffi.py types`
+    /// special-cases the `'S'` kind the same way — and a float store stays
+    /// residual too: the insn table carries no `raw_store_f` bytecode.
+    fn _handle_raw_access_call(
+        &mut self,
+        oopspec_name: &str,
+        op: &SpaceOperation,
+        args: &[crate::flowspace::model::Variable],
+        graph: &mut FunctionGraph,
+    ) -> Option<RewriteResult> {
+        if oopspec_name == "raw_ptradd" {
+            let [p, ofs] = args else {
+                return None;
+            };
+            // `op_kind_to_opname` prefixes plain `BinOp` spellings with
+            // `int_`, so the short spelling lands on `int_add`.
+            return Some(RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::BinOp {
+                    op: "add".to_string(),
+                    lhs: p.clone(),
+                    rhs: ofs.clone(),
+                    result_ty: ValueType::Int,
+                },
+            }]));
+        }
+        let (is_store, width) = if let Some(width) = oopspec_name.strip_prefix("raw_write_") {
+            (true, width)
+        } else if let Some(width) = oopspec_name.strip_prefix("raw_read_") {
+            (false, width)
+        } else {
+            return None;
+        };
+        let (item_ty, itemsize, is_item_signed) = match width {
+            "i8" => (ValueType::Int, 1, true),
+            "u8" => (ValueType::Int, 1, false),
+            "i16" => (ValueType::Int, 2, true),
+            "u16" => (ValueType::Int, 2, false),
+            "i32" => (ValueType::Int, 4, true),
+            "u32" => (ValueType::Int, 4, false),
+            "i64" => (ValueType::Int, 8, true),
+            "u64" => (ValueType::Int, 8, false),
+            // A float element carries no sign flag; the descr keys on its type.
+            "f64" => (ValueType::Float, 8, false),
+            "ptr" => (ValueType::Int, crate::layout::target_word_size(), false),
+            _ => return None,
+        };
+        if is_store && item_ty == ValueType::Float {
+            return None;
+        }
+        // The leaf receives an already-offset pointer; the raw op's byte
+        // offset is the constant zero.
+        let zero = graph
+            .alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        let zero_op = SpaceOperation {
+            result: Some(zero.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let kind = if is_store {
+            let [p, value] = args else {
+                return None;
+            };
+            OpKind::RawStore {
+                base: p.clone(),
+                offset: zero,
+                value: value.clone(),
+                item_ty,
+                itemsize,
+                is_item_signed,
+            }
+        } else {
+            let [p] = args else {
+                return None;
+            };
+            OpKind::RawLoad {
+                base: p.clone(),
+                offset: zero,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            }
+        };
+        Some(RewriteResult::Replace(vec![
+            zero_op,
+            SpaceOperation {
+                result: op.result.clone(),
+                kind,
+            },
+        ]))
     }
 
     /// Port of `Transformer._handle_virtual_ref_call` in `jtransform.py`.
@@ -7543,6 +7648,34 @@ fn remap_op(
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
         | OpKind::NewWithVtable { .. } => op.kind.clone(),
+        OpKind::RawLoad {
+            base,
+            offset,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => OpKind::RawLoad {
+            base: remap_value(base, aliases),
+            offset: remap_value(offset, aliases),
+            item_ty: item_ty.clone(),
+            itemsize: *itemsize,
+            is_item_signed: *is_item_signed,
+        },
+        OpKind::RawStore {
+            base,
+            offset,
+            value,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => OpKind::RawStore {
+            base: remap_value(base, aliases),
+            offset: remap_value(offset, aliases),
+            value: remap_value(value, aliases),
+            item_ty: item_ty.clone(),
+            itemsize: *itemsize,
+            is_item_signed: *is_item_signed,
+        },
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },
@@ -8305,6 +8438,10 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         // `_handle_virtual_ref_call` arm beside it — upstream gives those two
         // no `oopspecindex`, because it turns them into operations rather than
         // calls. Remaining oopspecs map to OS_* indices.
+        // jtransform.py:677-681 `_rewrite_raw_malloc`: a char varsize raw
+        // malloc is the one raw allocation the optimizer can virtualise
+        // (`virtualize.py do_RAW_MALLOC_VARSIZE_CHAR`).
+        "raw_malloc_varsize_char" => OopSpecIndex::RawMallocVarsizeChar,
         "raw_free" => OopSpecIndex::RawFree,
         // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,

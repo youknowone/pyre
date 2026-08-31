@@ -4652,6 +4652,42 @@ fn write_vable_field_ref_reg<Sym: WalkSym>(
     Ok(())
 }
 
+/// One raw integer element read of `itemsize` bytes at `addr`, widened to
+/// `i64` by the descr's signedness — the `bhimpl_raw_load_i` width dispatch.
+///
+/// # Safety
+/// `addr` must name readable memory of at least `itemsize` bytes.
+unsafe fn raw_load_int(addr: *const u8, itemsize: usize, signed: bool) -> i64 {
+    unsafe {
+        match (itemsize, signed) {
+            (1, true) => i64::from(addr.cast::<i8>().read_unaligned()),
+            (1, false) => i64::from(addr.read_unaligned()),
+            (2, true) => i64::from(addr.cast::<i16>().read_unaligned()),
+            (2, false) => i64::from(addr.cast::<u16>().read_unaligned()),
+            (4, true) => i64::from(addr.cast::<i32>().read_unaligned()),
+            (4, false) => i64::from(addr.cast::<u32>().read_unaligned()),
+            (8, _) => addr.cast::<i64>().read_unaligned(),
+            _ => panic!("raw_load descr itemsize {itemsize} is not a minted width"),
+        }
+    }
+}
+
+/// Store counterpart of [`raw_load_int`] — `bhimpl_raw_store_i`.
+///
+/// # Safety
+/// `addr` must name writable memory of at least `itemsize` bytes.
+unsafe fn raw_store_int(addr: *mut u8, itemsize: usize, value: i64) {
+    unsafe {
+        match itemsize {
+            1 => addr.write_unaligned(value as u8),
+            2 => addr.cast::<u16>().write_unaligned(value as u16),
+            4 => addr.cast::<u32>().write_unaligned(value as u32),
+            8 => addr.cast::<i64>().write_unaligned(value),
+            _ => panic!("raw_store descr itemsize {itemsize} is not a minted width"),
+        }
+    }
+}
+
 /// Int-bank twin of [`read_ref_reg_concrete`] (Int-bank concrete shadow).
 /// Reads the Int-bank slot at the operand index from
 /// `ctx.concrete_registers_i`.  Returns `ConcreteValue::Null` for
@@ -11699,17 +11735,40 @@ fn handle<Sym: WalkSym>(
         "setfield_gc_f/rfd" => setfield_gc_via_heapcache(code, op, ctx, 'f'),
         // Raw memory carries no heapcache bookkeeping: where the `_gc_`
         // family consults and updates the cache, `pyjitpl.py`'s raw pair
-        // only records.
+        // only records into the cache-free path.
         //
         //   def opimpl_raw_load_i(self, addrbox, offsetbox, arraydescr):
         //       return self.execute_with_descr(rop.RAW_LOAD_I, arraydescr,
         //                                      addrbox, offsetbox)
         //
+        // `execute_with_descr` executes the load as well as recording it,
+        // and the walk is the execution: the address was produced by
+        // residual calls the walk ran natively, so when both operands carry
+        // concretes the load is performed against the live memory and the
+        // result shadow gets the loaded word.  Without concretes the result
+        // stays `Null` and readers decline instead of consuming a value the
+        // walker did not observe.
         // Operand layout `iid>i`: 1B base + 1B offset + 2B descr + 1B dst.
         "raw_load_i/iid>i" => {
             let base = read_int_reg(code, op, 0, ctx)?;
             let offset = read_int_reg(code, op, 1, ctx)?;
             let descr = read_descr(code, op, 2, ctx)?;
+            let concrete = match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                read_int_reg_concrete(code, op, 1, ctx),
+                descr.as_array_descr(),
+            ) {
+                (ConcreteValue::Int(b), ConcreteValue::Int(o), Some(ad)) => {
+                    let addr = b.wrapping_add(o) as usize as *const u8;
+                    // SAFETY: the walk already executed the residuals that
+                    // produced `addr`, so it names live raw memory of at
+                    // least `item_size` bytes.
+                    let value =
+                        unsafe { raw_load_int(addr, ad.item_size(), ad.is_item_signed()) };
+                    ConcreteValue::Int(value)
+                }
+                _ => ConcreteValue::Null,
+            };
             // pyjitpl.py `opimpl_raw_load_i`.
             ctx.trace_ctx
                 .profiler()
@@ -11721,10 +11780,38 @@ fn handle<Sym: WalkSym>(
                 ctx.trace_ctx
                     .record_op_with_descr(OpCode::RawLoadI, &[base, offset], descr);
             let dst = code[op.pc + 5] as usize;
-            // The walk never performed the load, so the result carries no
-            // recording-time concrete and readers decline instead of
-            // consuming a value the walker did not observe.
-            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+            write_int_reg(ctx, op.pc, dst, result, concrete)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // Float twin: `opimpl_raw_load_f`.  The Float bank carries no
+        // concrete shadow, so this arm records without executing; a float
+        // consumer that needs the concrete value declines downstream.
+        // Operand layout `iid>f`: 1B base + 1B offset + 2B descr + 1B dst.
+        "raw_load_f/iid>f" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let offset = read_int_reg(code, op, 1, ctx)?;
+            let descr = read_descr(code, op, 2, ctx)?;
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawLoadF, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawLoadF, majit_metainterp::counters::RECORDED_OPS);
+            let result =
+                ctx.trace_ctx
+                    .record_op_with_descr(OpCode::RawLoadF, &[base, offset], descr);
+            let dst = code[op.pc + 5] as usize;
+            let len = ctx.registers_f.len();
+            let slot =
+                ctx.registers_f
+                    .get_mut(dst)
+                    .ok_or(DispatchError::RegisterOutOfRange {
+                        pc: op.pc,
+                        reg: dst,
+                        len,
+                        bank: "f",
+                    })?;
+            *slot = result;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // `_opimpl_raw_store` delegates to `execute_raw_store`:
@@ -11732,13 +11819,42 @@ fn handle<Sym: WalkSym>(
         //   self.execute_and_record(rop.RAW_STORE, arraydescr,
         //                           addrbox, offsetbox, valuebox)
         //
-        // Records and nothing else — no cache update, no result register.
+        // `execute_and_record` performs the store as well as recording it,
+        // and the walk is the execution: skipping the store would hand the
+        // rest of the walked body a buffer the program never filled.  A
+        // non-concrete operand therefore declines the walk instead of
+        // continuing past a lost store.  No cache update, no result
+        // register.
         // Operand layout `iiid`: 1B base + 1B offset + 1B value + 2B descr.
         "raw_store_i/iiid" => {
             let base = read_int_reg(code, op, 0, ctx)?;
             let offset = read_int_reg(code, op, 1, ctx)?;
             let value = read_int_reg(code, op, 2, ctx)?;
             let descr = read_descr(code, op, 3, ctx)?;
+            match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                read_int_reg_concrete(code, op, 1, ctx),
+                read_int_reg_concrete(code, op, 2, ctx),
+                descr.as_array_descr(),
+            ) {
+                (
+                    ConcreteValue::Int(b),
+                    ConcreteValue::Int(o),
+                    ConcreteValue::Int(v),
+                    Some(ad),
+                ) => {
+                    let addr = b.wrapping_add(o) as usize as *mut u8;
+                    // SAFETY: same contract as the raw_load arm — the walk
+                    // executed the residuals that produced `addr`.
+                    unsafe { raw_store_int(addr, ad.item_size(), v) };
+                }
+                _ => {
+                    return Err(DispatchError::UnsupportedOpname {
+                        pc: op.pc,
+                        key: "raw_store_i/iiid non-concrete operand",
+                    });
+                }
+            }
             // pyjitpl.py `_opimpl_raw_store`.
             ctx.trace_ctx
                 .profiler()

@@ -2056,6 +2056,101 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::RawLoad {
+                base,
+                offset,
+                item_ty: _,
+                itemsize,
+                is_item_signed,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert_eq!(
+                    kc, 'i',
+                    "raw_load base must be int-kind (a raw address), got {kc:?} — \
+                     graph {:?}",
+                    self.current_graph_name,
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let (reg, kc) = self.lookup_reg_with_kind_var(offset, regallocs);
+                assert_eq!(
+                    kc, 'i',
+                    "raw_load byte offset must be int-kind, got {kc:?} — graph {:?}",
+                    self.current_graph_name,
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let result = op
+                    .result
+                    .as_ref()
+                    .expect("raw_load produces the loaded element");
+                let (result_reg, result_kind) = self.lookup_reg_with_kind_var(result, regallocs);
+                let descr_ty = if result_kind == 'f' {
+                    crate::model::ValueType::Float
+                } else {
+                    crate::model::ValueType::Int
+                };
+                let descr_idx = self.emit_ready_descr(raw_carray_descrof(
+                    &descr_ty,
+                    *itemsize,
+                    *is_item_signed,
+                ));
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                argcodes.push('>');
+                argcodes.push(result_kind);
+                state.code.push(result_reg);
+                let key = format!("raw_load_{result_kind}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+            OpKind::RawStore {
+                base,
+                offset,
+                value,
+                item_ty: _,
+                itemsize,
+                is_item_signed,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert_eq!(
+                    kc, 'i',
+                    "raw_store base must be int-kind (a raw address), got {kc:?} — \
+                     graph {:?}",
+                    self.current_graph_name,
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let (reg, kc) = self.lookup_reg_with_kind_var(offset, regallocs);
+                assert_eq!(
+                    kc, 'i',
+                    "raw_store byte offset must be int-kind, got {kc:?} — graph {:?}",
+                    self.current_graph_name,
+                );
+                state.code.push(reg);
+                argcodes.push(kc);
+                let (reg, value_kind) = self.lookup_reg_with_kind_var(value, regallocs);
+                assert_eq!(
+                    value_kind, 'i',
+                    "raw_store value must be int-kind (the insn table carries \
+                     no raw_store_f), got {value_kind:?} — graph {:?}",
+                    self.current_graph_name,
+                );
+                state.code.push(reg);
+                argcodes.push(value_kind);
+                let descr_idx = self.emit_ready_descr(raw_carray_descrof(
+                    &crate::model::ValueType::Int,
+                    *itemsize,
+                    *is_item_signed,
+                ));
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let key = format!("raw_store_{value_kind}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             OpKind::ArrayRead {
                 base,
                 index,
@@ -2920,6 +3015,8 @@ impl Assembler {
             use crate::model::OpKind;
             match kind {
                 OpKind::Input { .. } => "Input",
+                OpKind::RawLoad { .. } => "RawLoad",
+                OpKind::RawStore { .. } => "RawStore",
                 OpKind::ConstInt(_) => "ConstInt",
                 OpKind::ConstUInt(_) => "ConstUInt",
                 OpKind::ConstInt128(_) => "ConstInt128",
@@ -4579,6 +4676,39 @@ pub(crate) fn bh_interior_field_specs_from_array_descr(
         .collect()
 }
 
+/// `cpu.arraydescrof(rffi.CArray(T))` for a raw element access
+/// (`jtransform.py:1156-1171`): no length header, non-GC, item width and
+/// signedness explicit because [`crate::model::ValueType`] collapses widths.
+fn raw_carray_descrof(
+    ty: &crate::model::ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+) -> crate::jitcode::BhDescr {
+    let prefix = match ty {
+        crate::model::ValueType::Float => "f",
+        _ if is_item_signed => "i",
+        _ => "u",
+    };
+    crate::jitcode::BhDescr::Array {
+        base_size: 0,
+        itemsize,
+        len_offset: None,
+        type_id: 0,
+        gc_type_id: 0,
+        item_type: value_type_to_ir_type_for_descr(ty),
+        is_array_of_pointers: false,
+        is_array_of_structs: false,
+        is_item_signed,
+        // Raw memory carries no heapcache bookkeeping, so no EffectInfo
+        // heap-invalidation index applies.
+        ei_index: u32::MAX,
+        // Distinct raw widths must stay on distinct runtime descr slots.
+        array_type_id: Some(format!("majit::raw_carray_{prefix}{}", itemsize * 8)),
+        interior_fields: Vec::new(),
+        is_gc_managed: false,
+    }
+}
+
 /// jtransform.py:773,802 cpu.arraydescrof(ARRAY) equivalent.
 ///
 /// Determines the full ArrayDescr shape from the array element type.
@@ -4852,6 +4982,13 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
     use crate::model::OpKind;
     match kind {
         OpKind::Input { ty, .. } => format!("input_{}", value_type_to_kind(ty)),
+        OpKind::RawLoad { item_ty, .. } => match item_ty {
+            crate::model::ValueType::Float => "raw_load_f".into(),
+            _ => "raw_load_i".into(),
+        },
+        // The insn table carries no `raw_store_f`; the lowering arm only
+        // mints int-valued stores.
+        OpKind::RawStore { .. } => "raw_store_i".into(),
         // RPython: ConstInt is NOT a standalone op; see encode_op comment.
         // Pyre materialises constants as an int_copy from pool-region reg.
         OpKind::ConstInt(_) | OpKind::ConstUInt(_) => "int_copy".into(),

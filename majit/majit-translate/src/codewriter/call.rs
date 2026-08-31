@@ -8960,6 +8960,8 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } | OpKind::ArrayLen { .. } => {
             RaiseClass::No
         }
+        // RPython LL: raw_load, raw_store → cannot raise
+        OpKind::RawLoad { .. } | OpKind::RawStore { .. } => RaiseClass::No,
         // RPython LL: getinteriorfield_gc, setinteriorfield_gc → cannot raise
         OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => RaiseClass::No,
         // RPython LL: int_add, int_sub, int_lt, int_and, etc → cannot raise

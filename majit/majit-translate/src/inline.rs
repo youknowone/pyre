@@ -431,6 +431,34 @@ pub(crate) fn remap_op_kind(
             class_root: class_root.clone(),
         },
         OpKind::ConstInt(v) => OpKind::ConstInt(*v),
+        OpKind::RawLoad {
+            base,
+            offset,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => OpKind::RawLoad {
+            base: remap_var(base),
+            offset: remap_var(offset),
+            item_ty: item_ty.clone(),
+            itemsize: *itemsize,
+            is_item_signed: *is_item_signed,
+        },
+        OpKind::RawStore {
+            base,
+            offset,
+            value,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => OpKind::RawStore {
+            base: remap_var(base),
+            offset: remap_var(offset),
+            value: remap_var(value),
+            item_ty: item_ty.clone(),
+            itemsize: *itemsize,
+            is_item_signed: *is_item_signed,
+        },
         OpKind::ConstUInt(v) => OpKind::ConstUInt(*v),
         OpKind::ConstInt128(v) => OpKind::ConstInt128(*v),
         OpKind::ConstUInt128(v) => OpKind::ConstUInt128(*v),
@@ -915,6 +943,13 @@ pub(crate) fn remap_op_kind(
 pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable> {
     let clone_var = |var: &crate::flowspace::model::Variable| var.clone();
     match kind {
+        OpKind::RawLoad { base, offset, .. } => vec![clone_var(base), clone_var(offset)],
+        OpKind::RawStore {
+            base,
+            offset,
+            value,
+            ..
+        } => vec![clone_var(base), clone_var(offset), clone_var(value)],
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
         | OpKind::ConstUInt(_)
@@ -1155,6 +1190,9 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
 /// (`simplify.py:411-423`) as distinct predicates.
 pub fn is_pure_op(kind: &OpKind) -> bool {
     match kind {
+        // `raw_load` reads mutable raw memory and `raw_store` writes it:
+        // neither is pure.
+        OpKind::RawLoad { .. } | OpKind::RawStore { .. } => false,
         // `new` / `new_with_vtable` / `new_array_clear` heap-allocate fresh
         // objects: NOT pure.  CSE must never coalesce two allocations, or
         // Python `is` object identity would break.

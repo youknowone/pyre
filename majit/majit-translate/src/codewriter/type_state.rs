@@ -130,7 +130,10 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
         }
         OpKind::ArrayRead { item_ty, .. }
         | OpKind::InteriorFieldRead { item_ty, .. }
-        | OpKind::VableArrayRead { item_ty, .. } => {
+        | OpKind::VableArrayRead { item_ty, .. }
+        // `raw_load_i/f` answers the element kind its descr names, the
+        // same projection the GC array reads use.
+        | OpKind::RawLoad { item_ty, .. } => {
             concrete_if_known(valuetype_to_concrete(item_ty))
         }
         OpKind::Call { result_ty, .. }
