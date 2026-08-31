@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=4
+# Run 33384229844 reads dynasm at 0.7x-2.3x across the three hosts; 4x keeps
+# the slow end below the ceiling without deriving a floor above the fast end.
 # pyre-check: skip-cpython
 # cpython >5s (it already timed out) vs pyre 0.20s, and it is not gated on — only pypy is.
 # STORE_ATTR that ADDS an attribute not yet in the instance's map: the

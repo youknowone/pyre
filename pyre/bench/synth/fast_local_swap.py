@@ -1,6 +1,6 @@
-# pyre-check: max-pypy-ratio=4.2
-# Ubuntu run 33279264115: 1.3-2.1x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=3
+# Run 33384229844 reads dynasm at 0.5x-1.5x across the three hosts, so the
+# ceiling is twice the slowest current reading.
 # pyre-check: skip-cpython
 # cpython 1.33s vs pyre 0.24s (5.5x on the ubuntu runner), and it is not
 # gated on — only pypy is.

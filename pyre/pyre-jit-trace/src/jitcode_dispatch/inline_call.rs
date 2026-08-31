@@ -2886,18 +2886,29 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
 /// indistinguishable from `return self.v + o.v` over ints.
 ///
 /// What this filters is a shape that is admissible and still does not survive
-/// being recorded.  A body making a nested Python call inlines into a trace
-/// whose Phase 2 unroll then dies on `phase2 snapshot remap cache miss`
-/// (`unroll.rs`), measured on `synth/inline_freevar_after_mayforce` with a
-/// `Fraction.__gt__`-shaped body -- `return a._richcmp(b, operator.gt)`.  The
-/// same shape was measured once before, dropping five iterations through the
-/// unstaged-reason abort fallback.  Twice is enough to keep the filter and
-/// record what it costs: this entry does not admit a delegating dunder.
-fn dunder_body_admissible_on_rewind(w_code: *const ()) -> bool {
-    let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
-        return false;
-    };
+/// being recorded.  A body making a nested Python call and then returning
+/// inlines into a peeled loop whose Phase 2 can still die on `phase2 snapshot
+/// remap cache miss` (`unroll.rs`), measured on
+/// `synth/inline_freevar_after_mayforce` with a `Fraction.__gt__`-shaped body --
+/// `return a._richcmp(b, operator.gt)`.  Keep that returning shape declined.
+///
+/// A straight-line, handler-free body that raises is different: its nested
+/// call constructs the exception and `raise/r` finishes the inlined MIFrame;
+/// no callee continuation enters the peeled loop.  This is PyPy's ordinary
+/// `perform_call` -> `finishframe_exception` path.  Admit it so each dunder has
+/// its own live frame and exception state instead of compiling a second root
+/// portal.  `BinopRewindInlineGuard` still refuses a nested residual before it
+/// commits, and `has_exception_table == false` excludes a caught raise whose
+/// body could continue to a return.
+pub(crate) fn dunder_body_facts_admissible_on_rewind(
+    facts: crate::pyjitcode::InlineBodyFacts,
+) -> bool {
     !facts.exc_override_has_nested_call
+        || (facts.contains_raise && facts.exc_override_straight_line && !facts.has_exception_table)
+}
+
+fn dunder_body_admissible_on_rewind(w_code: *const ()) -> bool {
+    sub_jitcode_body_facts_for_code(w_code).is_some_and(dunder_body_facts_admissible_on_rewind)
 }
 
 fn callee_body_commits_nothing(w_code: *const ()) -> bool {
