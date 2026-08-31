@@ -78,16 +78,51 @@ def import_value():
     raise ImportError(payload)
 
 
+def module_not_found():
+    raise ModuleNotFoundError
+
+
+def value_error():
+    raise ValueError
+
+
+def attribute_value():
+    raise AttributeError("attr message")
+
+
+def name_value():
+    raise NameError("name message")
+
+
+def import_pair():
+    raise ImportError("import message", "second")
+
+
 # Correctness belongs beside the performance census: the emitted constructor
 # must initialize every flattened slot, and runtime operands must remain live
 # after the trace was recorded with None.
 for _ in range(3000):
-    assert caught(stop_iteration, StopIteration).value is None
-    assert caught(name_error, NameError).name is None
+    stop = caught(stop_iteration, StopIteration)
+    assert stop.value is None and stop.args == ()
+    assert stop.__cause__ is None and stop.__context__ is None
+    assert stop.__suppress_context__ is False and stop.__traceback__ is not None
+    name = caught(name_error, NameError)
+    assert name.name is None and name.args == ()
     attr = caught(attribute_error, AttributeError)
-    assert (attr.name, attr.obj) == (None, None)
+    assert (attr.name, attr.obj, attr.args) == (None, None, ())
     imp = caught(import_error, ImportError)
-    assert (imp.name, imp.path, imp.msg) == (None, None, None)
+    assert (imp.name, imp.path, imp.msg, imp.args) == (None, None, None, ())
+    missing = caught(module_not_found, ModuleNotFoundError)
+    assert (missing.name, missing.path, missing.msg, missing.args) == (None, None, None, ())
+    assert caught(value_error, ValueError).args == ()
+    attr = caught(attribute_value, AttributeError)
+    assert (attr.args, attr.name, attr.obj) == (("attr message",), None, None)
+    name = caught(name_value, NameError)
+    assert (name.args, name.name) == (("name message",), None)
+    imp = caught(import_pair, ImportError)
+    assert (imp.args, imp.name, imp.path, imp.msg) == (
+        ("import message", "second"), None, None, None
+    )
     assert caught(stop_value, StopIteration).value is None
     assert caught(import_value, ImportError).msg is None
 
@@ -98,3 +133,18 @@ for payload in range(3000):
     payload = text
     imp = caught(import_value, ImportError)
     assert imp.msg == text and imp.args == (text,)
+
+cause = ValueError("cause")
+for _ in range(3000):
+    try:
+        raise StopIteration from cause
+    except StopIteration as stop:
+        assert stop.__cause__ is cause and stop.__suppress_context__ is True
+        assert stop.value is None
+    try:
+        raise ValueError("outer")
+    except ValueError as outer:
+        try:
+            raise StopIteration
+        except StopIteration as inner:
+            assert inner.__context__ is outer and inner.value is None

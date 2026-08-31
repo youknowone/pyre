@@ -38,6 +38,18 @@ def object_defaults(a, b="x", c=None):
     return a, b, c
 
 
+def array_defaults(a, b=3, c=5, d=7):
+    return a * 1000 + b * 100 + c * 10 + d
+
+
+def float_defaults(a, b=0.5, c=0.25):
+    return a + b * 10 + c * 100
+
+
+def positional_only(a, /, b=3, c=5):
+    return a * 100 + b * 10 + c
+
+
 def keyword_shapes(a, *rest, p=7, q=11):
     return a, rest, p, q
 
@@ -55,6 +67,13 @@ def argument_shapes(n):
         bad += positional_defaults(1) != 135
         bad += positional_defaults(1, c=7) != 137
         bad += object_defaults(1, c="z") != (1, "x", "z")
+        # Three defaults use the array-backed tuple representation; leaving
+        # holes reaches non-zero element indexes in that block.
+        bad += array_defaults(1, d=8) != 1358
+        bad += array_defaults(1, 4, d=8) != 1458
+        # The specialised float pair deliberately stays residual.
+        bad += float_defaults(1.0, c=0.5) != 56.0
+        bad += positional_only(1, c=7) != 137
         bad += keyword_shapes(i) != (i, (), 7, 11)
         bad += keyword_shapes(i, i + 1, p=9) != (i, (i + 1,), 9, 11)
         bad += holder.method(i) != (i, 13)

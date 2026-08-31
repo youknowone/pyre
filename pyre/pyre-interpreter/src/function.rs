@@ -3719,7 +3719,7 @@ pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
 /// preserve the same identity across execution contexts and OS threads. The
 /// paired `direct_fn` returns the same `(type, value, traceback)` tuple as the
 /// regular closure but skips the builtin-call setup.
-type ExcInfoDirectFn = fn() -> PyObjectRef;
+type ExcInfoDirectFn = fn(&mut crate::pyframe::PyFrame) -> PyObjectRef;
 static SYS_EXC_INFO_CODE: std::sync::atomic::AtomicPtr<PyObject> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static SYS_EXC_INFO_DIRECT_FN: std::sync::OnceLock<ExcInfoDirectFn> = std::sync::OnceLock::new();
@@ -3789,7 +3789,7 @@ pub fn funccall_valuestack(
         && let Some(direct_fn) = sys_exc_info_direct_fn()
     {
         frame.dropvalues(dropvalues);
-        return direct_fn();
+        return direct_fn(frame);
     }
 
     let fast_natural_arity =

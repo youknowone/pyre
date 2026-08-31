@@ -91,6 +91,17 @@ def f_pow_long_int(n):
     return s
 
 
+def check_pow_side_exits(n):
+    big = (1 << 200) + 12345
+    for i in range(n):
+        exponent = 2 if i & 1 else 0
+        value = big ** exponent
+        assert value == (big * big if exponent else 1)
+    assert big ** True == big and big ** False == 1
+    assert 0.0 < big ** -1 < 1e-50
+    assert pow(big, 3, 1000003) == (big * big * big) % 1000003
+
+
 def f_shift_long_int(n):
     big = 1 << 200
     s = 0
@@ -126,6 +137,7 @@ print("zip_strict", f_zip_strict(N_ZIP_STRICT))
 print("cmp_long  ", f_cmp_long_int(N_CMP))
 print("truediv   ", int(round(f_truediv_long(N_TRUEDIV) * 1e6)))
 print("pow       ", f_pow_long_int(N_POW))
+check_pow_side_exits(N_POW)
 print("shift     ", f_shift_long_int(N_SHIFT))
 print("frexp     ", int(round(f_frexp(N_FREXP) * 1e6)))
 print("ldexp     ", int(round(f_ldexp(N_LDEXP) * 1e6)))

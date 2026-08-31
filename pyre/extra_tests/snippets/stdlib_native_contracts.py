@@ -143,6 +143,25 @@ assert format(-0.0, "z") == "0.0"
 assert format(-0.0, "zf") == "0.000000"
 
 
+# A shared builtin formatter is usable only for receivers accepted by the
+# descriptor's owner.  The implementation cannot recognise the shared body
+# alone: subclasses may install another builtin type's descriptor.
+class StrWithIntFormat(str):
+    __format__ = int.__format__
+
+
+class IntWithStrFormat(int):
+    __format__ = str.__format__
+
+
+for value, spec, owner, receiver in (
+    (StrWithIntFormat("x"), ">5", "int", "StrWithIntFormat"),
+    (IntWithStrFormat(3), ">5", "str", "IntWithStrFormat"),
+):
+    message = str(raised(lambda v=value, s=spec: format(v, s), TypeError))
+    assert owner in message and receiver in message, message
+
+
 # Closed I/O layers intentionally carry different spellings.
 PERIOD = "I/O operation on closed file."
 NO_PERIOD = "I/O operation on closed file"
@@ -262,6 +281,22 @@ Renamed.__name__ = tagged
 assert Renamed.__name__ is tagged and type(Renamed.__name__) is TaggedName
 
 
+# A function exposes the real dict used for keyword-only defaults.  Switching
+# it to general-key storage must not detach the compiled/default reader.
+def kwdefault(*, value=5):
+    return value
+
+
+kwdefaults = kwdefault.__kwdefaults__
+assert type(kwdefaults) is dict and kwdefault.__kwdefaults__ is kwdefaults
+kwdefaults[1] = "one"
+kwdefaults[(2, 3)] = "tuple"
+assert list(kwdefaults) == ["value", 1, (2, 3)]
+assert dict(kwdefaults) == {"value": 5, 1: "one", (2, 3): "tuple"}
+kwdefaults["value"] = 8
+assert kwdefault() == 8
+
+
 # CPython's math helpers preserve operation order and reader-specific errors.
 for x, base_value in ((1e300, 10), (8, 2), (1 << 60, 2), (3, 7), (1e-300, 10)):
     assert math.log(x, base_value) == math.log(x) / math.log(base_value)
@@ -269,13 +304,28 @@ for base_value in (1, 1.0, True):
     assert refusal(lambda b=base_value: math.log(2, b), ZeroDivisionError) == "division by zero"
 assert refusal(lambda: math.log(0, -1.0), ValueError) == "expected a positive input"
 assert refusal(lambda: math.log(0.0, -1.0), ValueError) == "expected a positive input, got 0.0"
+assert refusal(lambda: math.log(float("nan"), 0), ValueError) == "expected a positive input"
+assert refusal(lambda: math.log(2, 0.0), ValueError) == "expected a positive input, got 0.0"
+assert refusal(lambda: math.log(2, 0), ValueError) == "expected a positive input"
 assert refusal(lambda: math.log1p(-1.0), ValueError) == (
     "expected argument value > -1, got -1.0"
+)
+assert refusal(lambda: math.log1p(-2), ValueError) == (
+    "expected argument value > -1, got -2.0"
 )
 assert refusal(lambda: math.acosh(0.5), ValueError) == (
     "expected argument value not less than 1, got 0.5"
 )
+assert refusal(lambda: math.acosh(0), ValueError) == (
+    "expected argument value not less than 1, got 0.0"
+)
 assert refusal(lambda: math.lgamma(-1.0), ValueError) == (
+    "expected a noninteger or positive integer, got -1.0"
+)
+assert refusal(lambda: math.lgamma(0.0), ValueError) == (
+    "expected a noninteger or positive integer, got 0.0"
+)
+assert refusal(lambda: math.gamma(-1.0), ValueError) == (
     "expected a noninteger or positive integer, got -1.0"
 )
 for n in [10**k for k in range(1, 300)] + [1 << k for k in range(1, 1000)]:
@@ -297,7 +347,9 @@ assert refusal(lambda: sys.intern(StringSubclass("x"))) == "can't intern StringS
 # POSIX path/string/tokenizer readers distinguish their embedded-NUL errors.
 if sys.platform in ("linux", "darwin"):
     assert refusal(lambda: open("a\0b"), ValueError) == "embedded null byte"
+    assert refusal(lambda: open(b"a\0b"), ValueError) == "embedded null byte"
     assert refusal(lambda: os.putenv("a\0b", "c"), ValueError) == "embedded null byte"
+    assert refusal(lambda: os.system("a\0b"), ValueError) == "embedded null byte"
     assert refusal(lambda: os.stat("a\0b"), ValueError) == (
         "stat: embedded null character in path"
     )
@@ -307,6 +359,12 @@ if sys.platform in ("linux", "darwin"):
     assert refusal(lambda: compile("a\0b", "<s>", "exec"), SyntaxError) == (
         "source code string cannot contain null bytes"
     )
+    try:
+        os.symlink("/tmp", "/tmp")
+    except OSError as exc:
+        assert (exc.filename, exc.filename2) == ("/tmp", "/tmp")
+    else:
+        raise AssertionError("symlink over an existing path succeeded")
 
 
 # Untrusted UTF-8 is checked before it becomes the runtime's string storage.

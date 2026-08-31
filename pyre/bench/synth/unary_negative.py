@@ -42,8 +42,42 @@ def main_int_min():
         if -m == 9223372036854775808:
             acc = acc + 1
         i = i + 1
+    assert acc == N
     print(acc)
+
+
+class Derived(int):
+    def __neg__(self):
+        return "NEG"
+
+    def __pos__(self):
+        return "POS"
+
+    def __invert__(self):
+        return "INV"
+
+
+def check_guard_transitions():
+    int_min = -9223372036854775807 - 1
+    promoted = 0
+    for value in [7] * 3000 + [int_min] * 3000:
+        result = -value
+        promoted += result == 9223372036854775808
+    assert promoted == 3000
+
+    # A subclass arrives after the exact-int trace is hot without a branch at
+    # the operation site; each unary fold must leave through its class guard.
+    for op, expected in (
+        (lambda value: -value, "NEG"),
+        (lambda value: +value, "POS"),
+        (lambda value: ~value, "INV"),
+    ):
+        result = None
+        for value in [7] * 3000 + [Derived(7)]:
+            result = op(value)
+        assert result == expected
 
 
 main()
 main_int_min()
+check_guard_transitions()

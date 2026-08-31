@@ -55,9 +55,23 @@ class MixedStop:
         return self.n
 
 
+def consume_for(stop_type):
+    result = []
+    for value in MixedStop(3, stop_type):
+        result.append(value)
+    return result
+
+
+def collect_args(*args):
+    return args
+
+
 for _ in range(3000):
     for stop_type in (SV, VS):
         assert list(MixedStop(3, stop_type)) == [2, 1, 0]
         assert tuple(MixedStop(3, stop_type)) == (2, 1, 0)
         assert sum(MixedStop(3, stop_type)) == 3
         assert next(MixedStop(0, stop_type), "done") == "done"
+        assert consume_for(stop_type) == [2, 1, 0]
+        assert max(MixedStop(3, stop_type)) == 2
+        assert collect_args(*MixedStop(3, stop_type)) == (2, 1, 0)

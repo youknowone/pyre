@@ -113,6 +113,33 @@ def attribute_identity():
         i += 1
 
 
+def annotation_shapes():
+    # Annotation-only, escaping, and rebound forms exercise the other
+    # SET_FUNCTION_ATTRIBUTE combinations without another hot-loop fixture.
+    escaped = []
+    i = 0
+    while i < 3000:
+        def only(value: int) -> int:
+            return value * 2
+
+        assert only.__defaults__ is None
+        assert only.__annotations__ == {"value": int, "return": int}
+
+        def tagged(value, suffix: str = "s") -> bool:
+            return value, suffix
+
+        assert tagged.__annotations__ == {"suffix": str, "return": bool}
+        if i < 8:
+            escaped.append(tagged)
+        tagged.__annotations__ = {"value": str}
+        assert tagged.__annotations__ == {"value": str}
+        i += 1
+    for tagged in escaped:
+        assert tagged.__defaults__ == ("s",)
+        assert tagged.__annotations__ == {"value": str}
+        assert tagged(1) == (1, "s")
+
+
 def foreign_globals():
     # `exec` with a bare dict: `__builtins__` is inserted as the builtin MODULE
     # here, while a mapping that is not a module declines the fold and keeps
@@ -135,6 +162,7 @@ def main():
     print(escapes())
     print(with_attributes())
     attribute_identity()
+    annotation_shapes()
     print(foreign_globals())
     # The code object owns one realized `co_qualname`, so repeated reads and
     # every function built from it name the same object.
