@@ -8749,24 +8749,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             );
         }
 
-        // interp_posix.py `abort`: send SIGABRT to ourselves.  A caller may
-        // install a handler, so preserve PyPy's kill-and-return control flow
-        // instead of calling libc::abort(), which unconditionally terminates.
+        // [3.14-spec] interp_posix.py `abort` sends SIGABRT with
+        // `rposix.kill`, so a process holding a SIGABRT handler runs it and
+        // the call returns.  `os_abort_impl` calls `abort()`, whose contract
+        // is that it never returns: the signal is unblocked, and the default
+        // disposition is restored and re-raised if a handler does return.
+        // `os.abort` is documented as terminating, so follow that contract.
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
             "abort",
-            crate::make_builtin_function_with_arity(
-                "abort",
-                |_| {
-                    let r = unsafe { libc::kill(libc::getpid(), libc::SIGABRT) };
-                    if r < 0 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
-                    }
-                    Ok(pyre_object::w_none())
-                },
-                0,
-            ),
+            crate::make_builtin_function_with_arity("abort", |_| unsafe { libc::abort() }, 0),
         );
 
         // os.kill(pid, sig) / os.killpg(pgid, sig)
