@@ -604,6 +604,7 @@ fn array_slice_indices(
 }
 
 fn array_getitem(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__getitem__", false)?;
     check_arity(args, 2, "array.__getitem__")?;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
@@ -632,6 +633,7 @@ fn array_getitem(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_setitem(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__setitem__", false)?;
     check_arity(args, 3, "array.__setitem__")?;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
@@ -715,6 +717,7 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_delitem(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__delitem__", false)?;
     check_arity(args, 2, "array.__delitem__")?;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
@@ -769,6 +772,7 @@ fn array_delitem(args: &[PyObjectRef]) -> PyResult {
 // ──────────────────────────────────────────────────────────────────────
 
 fn array_len(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__len__", false)?;
     check_arity(args, 1, "array.__len__")?;
     Ok(pyre_object::w_int_new(
         unsafe { arr::w_array_len(args[0]) } as i64
@@ -776,6 +780,7 @@ fn array_len(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_iter(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__iter__", false)?;
     check_arity(args, 1, "array.__iter__")?;
     let len = unsafe { arr::w_array_len(args[0]) };
     Ok(pyre_object::w_seq_iter_new(args[0], len))
@@ -793,6 +798,45 @@ fn check_arity(args: &[PyObjectRef], expected_total: usize, name: &str) -> Resul
         )));
     }
     Ok(())
+}
+
+/// The receiver check `descr_check` performs before any `array.array`
+/// descriptor runs.  Without it an unbound call such as
+/// `array.array.tolist(1)` reads a foreign object through the `W_Array`
+/// layout: the typecode and itemsize getters hand back whatever bytes sit at
+/// those offsets, and `w_array_len` divides the buffer length by an itemsize
+/// that came from the same foreign memory.
+///
+/// Slot wrappers and method descriptors word both the missing-receiver and
+/// the wrong-receiver message differently, so callers say which surface they
+/// are, as they do for the list and tuple twins in `type_methods`.
+fn require_array_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method array.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'array.array' object needs an argument")
+        };
+        return Err(PyError::type_error(message));
+    };
+    if !unsafe { arr::is_array(receiver) } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for 'array.array' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!(
+                "descriptor '{name}' requires a 'array.array' object but received a '{received}'"
+            )
+        };
+        return Err(PyError::type_error(message));
+    }
+    Ok(receiver)
 }
 
 fn check_arity_range(
@@ -813,6 +857,7 @@ fn check_arity_range(
 }
 
 fn array_append_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "append", true)?;
     crate::type_methods::reject_kwargs_of(Some("array"), args, "append")?;
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
@@ -826,6 +871,7 @@ fn array_append_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "extend", true)?;
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let positional_given = if positional.is_empty() {
         0
@@ -871,6 +917,7 @@ fn array_ssize_index_w(w_index: PyObjectRef) -> Result<i64, PyError> {
 }
 
 fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "insert", true)?;
     crate::type_methods::reject_kwargs_of(Some("array"), args, "insert")?;
     crate::type_methods::arity_exact_unpack(args, "insert", 2)?;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -943,6 +990,7 @@ fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "pop", true)?;
     crate::type_methods::reject_kwargs_of(Some("array"), args, "pop")?;
     crate::type_methods::arity_at_most(args, "pop", 1)?;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -984,6 +1032,7 @@ fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_remove_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "remove", true)?;
     crate::type_methods::reject_kwargs_of(Some("array"), args, "remove")?;
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
@@ -1061,6 +1110,7 @@ fn array_index_count(obj: PyObjectRef, w_value: PyObjectRef, count: bool) -> Res
 }
 
 fn array_index_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "index", true)?;
     // PyPy's `W_ArrayBase.descr_index` keeps the search itself in
     // `index_count_array`, with `start`/`stop` unwrapped as indexes.  Keep
     // that shape below.  [3.14-spec] CPython 3.14's `array.array.index`
@@ -1132,6 +1182,7 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_clear_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "clear", true)?;
     check_arity(args, 1, "array.clear")?;
     // descr_clear — empty the buffer, preserving typecode/itemsize.
     array_check_resize(args[0])?;
@@ -1140,15 +1191,18 @@ fn array_clear_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_release_buffer(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__release_buffer__", false)?;
     crate::builtins::buffer_exporter_release_view(args[0], args[1])
 }
 
 fn array_buffer(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__buffer__", false)?;
     let flags = crate::baseobjspace::c_int_w(args[1])?;
     crate::builtins::w_memoryview_new_native_with_flags(args[0], flags)
 }
 
 fn array_count_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "count", true)?;
     crate::type_methods::reject_kwargs_of(Some("array"), args, "count")?;
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
@@ -1162,6 +1216,7 @@ fn array_count_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_reverse_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "reverse", true)?;
     check_arity(args, 1, "array.reverse")?;
     let obj = args[0];
     let isz = unsafe { arr::w_array_itemsize(obj) };
@@ -1184,6 +1239,7 @@ fn array_reverse_method(args: &[PyObjectRef]) -> PyResult {
 // ──────────────────────────────────────────────────────────────────────
 
 fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "tolist", true)?;
     check_arity(args, 1, "array.tolist")?;
     let obj = args[0];
     let len = unsafe { arr::w_array_len(obj) };
@@ -1195,6 +1251,7 @@ fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_fromlist_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "fromlist", true)?;
     crate::type_methods::reject_kwargs_of(Some("array"), args, "fromlist")?;
     if args.len() != 2 {
         return Err(PyError::type_error(format!(
@@ -1307,12 +1364,14 @@ fn array_restore_fromlist(obj: PyObjectRef, old_bytes: &[u8]) -> Result<(), PyEr
 }
 
 fn array_tobytes_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "tobytes", true)?;
     check_arity(args, 1, "array.tobytes")?;
     let bytes = unsafe { arr::w_array_bytes(args[0]) };
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(bytes))
 }
 
 fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "frombytes", true)?;
     check_arity(args, 2, "array.frombytes")?;
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
@@ -1358,6 +1417,7 @@ fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_fromfile_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "fromfile", true)?;
     check_arity(args, 3, "array.fromfile")?;
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.publish(args);
@@ -1398,6 +1458,7 @@ fn array_fromfile_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_tofile_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "tofile", true)?;
     check_arity(args, 2, "array.tofile")?;
     let w_bytes = array_tobytes_method(&args[..1])?;
     call_method(args[1], "write", &[w_bytes])?;
@@ -1405,6 +1466,7 @@ fn array_tofile_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "tounicode", true)?;
     check_arity(args, 1, "array.tounicode")?;
     let _roots = pyre_object::gc_roots::push_roots();
     let obj = pyre_object::gc_roots::pin_root(args[0]);
@@ -1447,6 +1509,7 @@ fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_fromunicode_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "fromunicode", true)?;
     check_arity(args, 2, "array.fromunicode")?;
     array_fromunicode(args[0], args[1])?;
     Ok(pyre_object::w_none())
@@ -1457,6 +1520,7 @@ fn array_fromunicode_method(args: &[PyObjectRef]) -> PyResult {
 // ──────────────────────────────────────────────────────────────────────
 
 fn array_contains_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__contains__", false)?;
     check_arity(args, 2, "array.__contains__")?;
     Ok(pyre_object::w_bool_from(
         array_index_count(args[0], args[1], false)? >= 0,
@@ -1464,6 +1528,7 @@ fn array_contains_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_buffer_info_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "buffer_info", true)?;
     check_arity(args, 1, "array.buffer_info")?;
     let obj = args[0];
     let addr = unsafe { arr::w_array_buffer_address(obj) } as u64;
@@ -1482,6 +1547,7 @@ fn array_buffer_info_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_byteswap_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "byteswap", true)?;
     check_arity(args, 1, "array.byteswap")?;
     let obj = args[0];
     let isz = unsafe { arr::w_array_itemsize(obj) };
@@ -1499,6 +1565,7 @@ fn array_byteswap_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_copy_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__copy__", true)?;
     check_arity_range(args, 1, 2, "array.__copy__")?;
     let obj = args[0];
     let tc = unsafe { arr::w_array_typecode(obj) };
@@ -1557,6 +1624,7 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
 }
 
 fn array_repr_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__repr__", false)?;
     check_arity(args, 1, "array.__repr__")?;
     Ok(pyre_object::w_str_from_wtf8_managed(array_repr_wtf8(
         args[0],
@@ -1642,32 +1710,39 @@ fn array_richcompare(a: PyObjectRef, b: PyObjectRef, op: u8) -> PyResult {
 }
 
 fn array_eq_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__eq__", false)?;
     check_arity(args, 2, "array.__eq__")?;
     array_richcompare(args[0], args[1], 0)
 }
 fn array_ne_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__ne__", false)?;
     check_arity(args, 2, "array.__ne__")?;
     array_richcompare(args[0], args[1], 1)
 }
 fn array_lt_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__lt__", false)?;
     check_arity(args, 2, "array.__lt__")?;
     array_richcompare(args[0], args[1], 2)
 }
 fn array_le_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__le__", false)?;
     check_arity(args, 2, "array.__le__")?;
     array_richcompare(args[0], args[1], 3)
 }
 fn array_gt_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__gt__", false)?;
     check_arity(args, 2, "array.__gt__")?;
     array_richcompare(args[0], args[1], 4)
 }
 fn array_ge_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__ge__", false)?;
     check_arity(args, 2, "array.__ge__")?;
     array_richcompare(args[0], args[1], 5)
 }
 
 // Arithmetic.
 fn array_add_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__add__", false)?;
     check_arity(args, 2, "array.__add__")?;
     let a = args[0];
     let b = args[1];
@@ -1690,6 +1765,7 @@ fn array_add_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_iadd_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__iadd__", false)?;
     check_arity(args, 2, "array.__iadd__")?;
     let a = args[0];
     array_check_resize(a)?;
@@ -1744,13 +1820,25 @@ fn array_repeat_count(w_count: PyObjectRef) -> Result<i64, PyError> {
     crate::builtins::getindex_w(w_count)
 }
 
+fn array_rmul_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__rmul__", false)?;
+    array_mul_method(args)
+}
+
+fn array_deepcopy_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__deepcopy__", true)?;
+    array_copy_method(args)
+}
+
 fn array_mul_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__mul__", false)?;
     check_arity(args, 2, "array.__mul__")?;
     let count = array_repeat_count(args[1])?;
     array_repeat_bytes(args[0], count)
 }
 
 fn array_imul_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__imul__", false)?;
     check_arity(args, 2, "array.__imul__")?;
     let obj = args[0];
     array_check_resize(obj)?;
@@ -1811,6 +1899,7 @@ fn array_machine_format_code(typecode: u8, itemsize: usize) -> i64 {
 /// list form; newer protocols use the module's canonical reconstructor and
 /// native machine-format bytes.
 fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
+    require_array_receiver(args, "__reduce_ex__", true)?;
     check_arity(args, 2, "array.__reduce_ex__")?;
     let obj = args[0];
     let protocol = crate::baseobjspace::int_w(args[1])?;
@@ -2116,7 +2205,7 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "__add__", array_add_method, 2);
     m(ns, "__iadd__", array_iadd_method, 2);
     m(ns, "__mul__", array_mul_method, 2);
-    m(ns, "__rmul__", array_mul_method, 2);
+    m(ns, "__rmul__", array_rmul_method, 2);
     m(ns, "__imul__", array_imul_method, 2);
     m(ns, "__reduce_ex__", array_reduce_ex_method, 2);
     // `append` owns its CPython 3.14 fixed-owner keyword/arity gateway.
@@ -2189,7 +2278,7 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "buffer_info", array_buffer_info_method, 1);
     m(ns, "byteswap", array_byteswap_method, 1);
     m(ns, "__copy__", array_copy_method, 1);
-    m(ns, "__deepcopy__", array_copy_method, 2);
+    m(ns, "__deepcopy__", array_deepcopy_method, 2);
     // CPython 3.14 arraymodule.c:2471 — Py_GenericAlias with METH_CLASS.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -2218,7 +2307,8 @@ pub fn init_array_type(ns: PyObjectRef) {
                 make_builtin_function_with_arity(
                     "typecode",
                     |args| {
-                        let tc = unsafe { arr::w_array_typecode(args[0]) } as char;
+                        let obj = require_array_receiver(args, "typecode", true)?;
+                        let tc = unsafe { arr::w_array_typecode(obj) } as char;
                         Ok(pyre_object::w_str_new(&tc.to_string()))
                     },
                     1,
@@ -2236,8 +2326,9 @@ pub fn init_array_type(ns: PyObjectRef) {
                 make_builtin_function_with_arity(
                     "itemsize",
                     |args| {
+                        let obj = require_array_receiver(args, "itemsize", true)?;
                         Ok(pyre_object::w_int_new(
-                            unsafe { arr::w_array_itemsize(args[0]) } as i64,
+                            unsafe { arr::w_array_itemsize(obj) } as i64,
                         ))
                     },
                     1,
