@@ -1489,6 +1489,29 @@ impl BlackholeResult {
             _ => None,
         }
     }
+
+    /// [`to_pyresult`] as the hand-off it is: the blackhole activation is over
+    /// and its result now belongs to the Rust caller, so the residual-call
+    /// exception carriers are cleared with it.
+    ///
+    /// `metainterp.last_exc_value` (`pyjitpl.py execute_raised`) and the
+    /// `llmodel.py _store_exception` cells belong to the activation that raised
+    /// into them: upstream drops the first with the MetaInterp instance and
+    /// reads the second back in the same `bh_call_*` that armed it.  Pyre keeps
+    /// one of each per thread, so a raise this activation already turned into
+    /// its own `PyResult` — or one a nested frame absorbed before finishing —
+    /// stays armed for whatever the caller does next, where a compiled
+    /// `GUARD_NO_EXCEPTION` or a blackhole residual reads it as its own pending
+    /// raise.  `ContinueRunningNormally` and `BailToInterpreter` are not
+    /// hand-offs and keep the carriers, which is why this clears only where
+    /// [`to_pyresult`] answers `Some`.
+    ///
+    /// [`to_pyresult`]: Self::to_pyresult
+    pub fn take_pyresult(&self) -> Option<PyResult> {
+        let result = self.to_pyresult()?;
+        clear_residual_call_exception();
+        Some(result)
+    }
 }
 
 /// resume.py rebuild_from_numbering / read_jitcode_pos_pc output.
