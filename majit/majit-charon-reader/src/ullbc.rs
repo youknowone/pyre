@@ -285,6 +285,13 @@ impl TypeLayout {
     /// `discriminator.Branch.int_ty`.  Consumers must use both: reading a
     /// 32-bit tag as an `i64` also reads the first four payload bytes and can
     /// turn a valid variant into a switch miss.
+    ///
+    /// `I128`/`U128` decline. The consumers spell a tag as a field type
+    /// string, and no width above a machine word has an int-bank
+    /// representation there: `get_type_flag` would route `i128` through its
+    /// unknown-type fallback and describe a sixteen-byte integer as an
+    /// eight-byte GC reference. Declining keeps the caller on its existing
+    /// no-discriminator path instead.
     pub fn discriminant_int_type(&self) -> Option<&'static str> {
         let int_ty = self.discriminator.as_ref()?.get("Branch")?.get("int_ty")?;
         let (signed, width) = if let Some(width) = int_ty.get("Signed") {
@@ -297,12 +304,10 @@ impl TypeLayout {
             (true, "I16") => Some("i16"),
             (true, "I32") => Some("i32"),
             (true, "I64") => Some("i64"),
-            (true, "I128") => Some("i128"),
             (false, "U8") => Some("u8"),
             (false, "U16") => Some("u16"),
             (false, "U32") => Some("u32"),
             (false, "U64") => Some("u64"),
-            (false, "U128") => Some("u128"),
             _ => None,
         }
     }
@@ -910,10 +915,12 @@ mod tests {
     #[test]
     fn enum_discriminant_signedness_and_width_are_preserved() {
         for (int_ty, expected) in [
-            (r#"{"Signed":"I16"}"#, "i16"),
-            (r#"{"Signed":"I32"}"#, "i32"),
-            (r#"{"Unsigned":"U64"}"#, "u64"),
-            (r#"{"Unsigned":"U128"}"#, "u128"),
+            (r#"{"Signed":"I16"}"#, Some("i16")),
+            (r#"{"Signed":"I32"}"#, Some("i32")),
+            (r#"{"Unsigned":"U64"}"#, Some("u64")),
+            // Wider than a machine word: no int-bank field type spells it.
+            (r#"{"Signed":"I128"}"#, None),
+            (r#"{"Unsigned":"U128"}"#, None),
         ] {
             let json = format!(
                 r#"{{
@@ -922,7 +929,7 @@ mod tests {
                 }}"#
             );
             let layout: TypeLayout = serde_json::from_str(&json).unwrap();
-            assert_eq!(layout.discriminant_int_type(), Some(expected));
+            assert_eq!(layout.discriminant_int_type(), expected);
         }
     }
 
