@@ -22,7 +22,15 @@
 try:
     import pypyjit
 
-    pypyjit.set_param("trace_limit=240")
+    import sys
+
+    # The 0.8x window is a raw-op-count property and the wasm build records
+    # more raw ops per iteration than the native backends, so the two need
+    # different limits: the sweep put the native window around 220-260 and
+    # the wasm window at 355-360.
+    pypyjit.set_param(
+        "trace_limit=358" if sys.platform == "wasi" else "trace_limit=240"
+    )
     pypyjit.set_param("threshold=20")
 except ImportError:
     pass
