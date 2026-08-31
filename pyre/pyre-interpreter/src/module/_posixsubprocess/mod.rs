@@ -330,9 +330,9 @@ mod imp {
         // rejects this observable unsafe call.  Keep PyPy's fork/exec shape
         // and add only the finalization gate required by that public contract.
         if !is_none_obj(pos[21]) && crate::module::thread::is_finalizing() {
-            return Err(PyError::runtime_error(
+            return Err(crate::builtins::finalization_error(Some(
                 "preexec_fn not supported at interpreter shutdown",
-            ));
+            )));
         }
 
         // Decode everything (and pre-allocate the argv/envp arrays) before
