@@ -588,10 +588,6 @@ pub struct WalkSession {
     pub recording_jitcode_index: i32,
     /// Last opcode executed by the root recording frame.
     pub recording_opcode_position: usize,
-    /// Nested `run_sub_jitcode_walk` activations currently on the host stack.
-    /// Bounded by [`fbw_max_subwalk_depth`]; see that function for why the
-    /// walker needs a bound RPython's heap-allocated framestack does not.
-    pub subwalk_depth: usize,
     /// How many `BINARY_OP` / `COMPARE_OP` dunder inlines admitted on the
     /// entry's rewind are currently descending.
     ///
@@ -629,7 +625,6 @@ impl Default for WalkSession {
             recording_frame_ptr: 0,
             recording_jitcode_index: -1,
             recording_opcode_position: 0,
-            subwalk_depth: 0,
             binop_rewind_depth: 0,
             binop_rewind_refused: false,
         }
@@ -1143,34 +1138,20 @@ fn finish_current_frame_execution<Sym: WalkSym>(
         return;
     }
     if !ctx.is_top_level && (concrete_frame.is_null() || unsafe { !(*concrete_frame).escaped() }) {
-        // RPython records this store on a virtual MIFrame and
+        // RPython records `PyFrame.finish_value` on a virtual MIFrame and
         // optimizeopt.virtualize removes the whole frame when it never
-        // escapes.  The walker has already selected the concrete path and can
-        // make the same distinction before recording: an unescaped inline
-        // frame has no observer after return.  Escaped inline frames and the
-        // portal red frame keep the real store below.
+        // escapes.  The recording-time carrier likewise has no observer.
         return;
     }
 
-    let flags_descr = crate::descr::pyframe_flags_descr();
-    let live_flags = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, frame, flags_descr.clone());
-    let finished_bit = ctx
-        .trace_ctx
-        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED));
-    let new_flags = ctx
-        .trace_ctx
-        .record_op(OpCode::IntOr, &[live_flags, finished_bit]);
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[frame, new_flags],
-        flags_descr.clone(),
-    );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(frame, flags_descr.index(), new_flags);
-
-    if !concrete_frame.is_null() {
-        unsafe { (*concrete_frame).set_frame_finished_execution(true) };
-    }
+    // `PyFrame.finish_value`'s translated graph has already emitted the
+    // read/or/store on this callee's red frame before the return opcode.  Now
+    // that the inline sub-walk threads that frame, recording another store
+    // here duplicates the interpreter graph and can read the graph's
+    // post-store heapcache value against a still-pre-store concrete carrier.
+    // `execute_and_record` would have applied the graph store while tracing;
+    // mirror only that recording-time side effect here.
+    unsafe { (*concrete_frame).set_frame_finished_execution(true) };
 }
 
 fn recording_raise_keeps_existing_traceback<Sym: WalkSym>(
@@ -2419,11 +2400,11 @@ pub enum DispatchError {
         provided: usize,
         callee_num_regs_f: usize,
     },
-    /// A canonical-helper descent would have pushed a `walk()` activation past
-    /// [`fbw_max_subwalk_depth`]. Refused before the callee's register banks
-    /// are allocated and before any of its body runs, so the enclosing frame
-    /// resumes at its own CALL with nothing to undo.
-    SubWalkDepthExceeded { pc: usize, depth: usize },
+    /// Internal yield from one heap-owned sub-walk frame to the explicit
+    /// sub-walk driver.  It is consumed before ordinary abort handling and can
+    /// never escape [`run_sub_jitcode_walk`].  RPython's `_interpret` gets the
+    /// same transition by changing `framestack[-1]` in its single driver loop.
+    SubWalkSuspended { pc: usize },
     /// `inline_call_r_r/dR>r`'s callee surfaced
     /// `SubReturn { result: None }`. RPython parity: the `_r_r` variant
     /// is wired (in `assembler.py:gen_inline_call`) to a callee whose
@@ -2879,7 +2860,7 @@ impl DispatchError {
             Self::InlineCallArityMismatch { .. } => "InlineCallArityMismatch",
             Self::InlineCallIntArityMismatch { .. } => "InlineCallIntArityMismatch",
             Self::InlineCallFloatArityMismatch { .. } => "InlineCallFloatArityMismatch",
-            Self::SubWalkDepthExceeded { .. } => "SubWalkDepthExceeded",
+            Self::SubWalkSuspended { .. } => "SubWalkSuspended",
             Self::UnexpectedVoidSubReturn { .. } => "UnexpectedVoidSubReturn",
             Self::UnexpectedNonVoidSubReturn { .. } => "UnexpectedNonVoidSubReturn",
             Self::ReraiseWithoutLastExcValue { .. } => "ReraiseWithoutLastExcValue",
@@ -2968,7 +2949,7 @@ impl DispatchError {
             | Self::InlineCallArityMismatch { pc, .. }
             | Self::InlineCallIntArityMismatch { pc, .. }
             | Self::InlineCallFloatArityMismatch { pc, .. }
-            | Self::SubWalkDepthExceeded { pc, .. }
+            | Self::SubWalkSuspended { pc, .. }
             | Self::UnexpectedVoidSubReturn { pc, .. }
             | Self::UnexpectedNonVoidSubReturn { pc, .. }
             | Self::ReraiseWithoutLastExcValue { pc, .. }
@@ -3048,7 +3029,6 @@ impl DispatchError {
                 | Self::InlineCallArityMismatch { .. }
                 | Self::InlineCallIntArityMismatch { .. }
                 | Self::InlineCallFloatArityMismatch { .. }
-                | Self::SubWalkDepthExceeded { .. }
                 | Self::LoopBearingCalleeInlineUnsupported {
                     blackhole_required: true,
                     ..
@@ -3523,8 +3503,18 @@ pub fn walk<Sym: WalkSym>(
             let callee = fbw_state::fbw_innermost_inline_callee_key(ctx);
             return Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee));
         }
+        inline_call::note_subwalk_driver_step::<Sym>(
+            ctx.trace_ctx.get_trace_position(),
+            ctx.trace_ctx.heap_cache(),
+        );
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => stepped,
+            // Not an abort: a nested inline_call asked the heap-owned
+            // sub-walk driver to push its callee.  Preserve this frame at the
+            // CALL coordinate and let the driver resume it after the callee
+            // produces SubReturn/SubRaise, matching PyPy's one `_interpret`
+            // loop over `metainterp.framestack`.
+            Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
             Err(error) => {
                 // `pyjitpl.py run_blackhole_interp_to_cancel_tracing`
                 // parity.  Upstream has ONE abort path: every abort inside

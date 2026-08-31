@@ -328,6 +328,12 @@ for source, message, position in (
     ("bu'x' = 1", "'u' and 'b' prefixes are incompatible", (1, 1, 1, 3)),
     ("ub'x' = 1", "'u' and 'b' prefixes are incompatible", (1, 1, 1, 3)),
     ("bu'x' += 1", "'u' and 'b' prefixes are incompatible", (1, 1, 1, 3)),
+    # The tokenizer check precedes every grammar alternative, so the literal
+    # can stand after the token the parser reported as well as before it.
+    ("f() = bu'x'", "'u' and 'b' prefixes are incompatible", (1, 7, 1, 9)),
+    ("f() = ub'x'", "'u' and 'b' prefixes are incompatible", (1, 7, 1, 9)),
+    # The tokenizer does not read a comment, so neither does the scan.
+    ("x = = 1  # bu'z'", "invalid syntax", (1, 5, 1, 6)),
 ):
     error = syntax_error(source)
     assert error.msg == message, (source, error.msg)

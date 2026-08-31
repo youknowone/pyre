@@ -4093,6 +4093,28 @@ pub trait FailDescr: Descr {
         );
     }
 
+    /// Pyre backend adaptation: this guard's bridge was rejected for a
+    /// deterministic structural reason, so later failures must resume in the
+    /// blackhole instead of rebuilding the same bridge forever.
+    ///
+    /// The state belongs to the guard descriptor.  RPython never needs this
+    /// bit because its backends always patch an attached bridge, but the
+    /// nearest upstream owner is `AbstractResumeGuardDescr.status`
+    /// (`compile.py`): retry/busy state lives on the descriptor, not in a
+    /// `MetaInterp` side table keyed by descriptor identity.
+    fn bridge_declined_terminally(&self) -> bool {
+        false
+    }
+
+    /// Mark [`FailDescr::bridge_declined_terminally`].  Default panics because
+    /// only resume-guard descriptors participate in bridge compilation.
+    fn set_bridge_declined_terminally(&self) {
+        panic!(
+            "set_bridge_declined_terminally invoked on a FailDescr that is \
+             not an AbstractResumeGuardDescr"
+        );
+    }
+
     /// `compile.py` `descr.rd_loop_token = clt` line-by-line port.
     ///
     /// Returns the owning `Arc<CompiledLoopToken>` typed as `&dyn Any`

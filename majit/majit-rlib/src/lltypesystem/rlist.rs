@@ -23,16 +23,9 @@ use std::alloc::{Layout, alloc, alloc_zeroed};
 /// Not `0`: `TypeRegistry::register` hands out `entries.len()`, so `0` is a
 /// legitimate slot — whatever the host registers first. A zero sentinel would
 /// read "unset" and "the first registered type" the same way, which is the
-/// very confusion these ids exist to prevent.
+/// very confusion these ids exist to prevent. `TypeRegistry::register`
+/// reserves this value by rejecting an index that cannot fit below it.
 pub const UNSET_GC_TYPE_ID: u32 = u32::MAX;
-
-/// The sentinel has to be a value no registration can produce, or "undeclared"
-/// and "declared as that type" are the same word again — the exact aliasing
-/// the sentinel exists to avoid, just moved to the top of the range.
-const _: () = assert!(
-    UNSET_GC_TYPE_ID as usize >= majit_gc::trace::TypeRegistry::MAX_TYPES,
-    "UNSET_GC_TYPE_ID collides with a slot TypeRegistry::register can return"
-);
 
 /// GC type id for `Ptr(GcArray(Signed))`. This is a distinct ARRAY identity
 /// from `GcArray(Float)` even though the collector trace shape is the same —

@@ -187,6 +187,10 @@ pub struct ResumeGuardDescr {
     pub trace_id: AtomicU64,
     /// Pyre-only: per-trace `fail_index` assigned by `build_guard_metadata`.
     pub fail_index_per_trace: AtomicU32,
+    /// Deterministic structural bridge refusal.  This is descriptor-owned,
+    /// alongside RPython `AbstractResumeGuardDescr.status`; keeping it here
+    /// makes eviction of the guard reclaim the state automatically.
+    pub bridge_declined_terminally: AtomicBool,
     /// Codegen-time trace-op index for the originating guard op
     /// (`pyjitpl._compile_one_block` parity — the live op object passed
     /// at compile time has an implicit index in `loop.operations`).
@@ -345,6 +349,7 @@ impl Descr for ResumeGuardDescr {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -383,6 +388,13 @@ impl FailDescr for ResumeGuardDescr {
     fn set_fail_index_per_trace(&self, fail_index: u32) {
         self.fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
+    }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.bridge_declined_terminally.load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.bridge_declined_terminally
+            .store(true, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.types.get() }
@@ -620,6 +632,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        bridge_declined_terminally: AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: AtomicBool::new(false),
         fail_count: AtomicU32::new(0),

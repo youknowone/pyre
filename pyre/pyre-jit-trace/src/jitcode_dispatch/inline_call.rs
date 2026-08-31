@@ -10346,18 +10346,331 @@ pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
     result
 }
 
-/// Drops one host-stack level claimed by [`run_sub_jitcode_walk`].
-///
-/// A plain decrement at the end of that function would leak the level on every
-/// `?` return inside it, and the count would then only ever grow.
-struct SubWalkLevel<'a> {
-    session: &'a std::cell::RefCell<WalkSession>,
+thread_local! {
+    /// Active explicit sub-walk driver for this OS thread.  The pointer is
+    /// scoped by `SubWalkDriverGuard` and is only dereferenced synchronously by
+    /// a nested `run_sub_jitcode_walk` using the same `Sym` monomorphization.
+    /// It replaces Rust call-stack recursion; semantic state remains on the
+    /// walk session / heap-owned frames, like PyPy's `MetaInterp.framestack`.
+    static SUBWALK_DRIVER: std::cell::Cell<*mut ()> = const {
+        std::cell::Cell::new(std::ptr::null_mut())
+    };
 }
 
-impl Drop for SubWalkLevel<'_> {
-    fn drop(&mut self) {
-        self.session.borrow_mut().subwalk_depth -= 1;
+struct SubWalkDriverGuard {
+    previous: *mut (),
+}
+
+impl SubWalkDriverGuard {
+    fn install<Sym: WalkSym>(exchange: &mut SubWalkExchange<'_, Sym>) -> Self {
+        let pointer = exchange as *mut SubWalkExchange<'_, Sym> as *mut ();
+        let previous = SUBWALK_DRIVER.with(|slot| slot.replace(pointer));
+        debug_assert!(previous.is_null(), "sub-walk drivers must not nest");
+        Self { previous }
     }
+}
+
+impl Drop for SubWalkDriverGuard {
+    fn drop(&mut self) {
+        SUBWALK_DRIVER.with(|slot| slot.set(self.previous));
+    }
+}
+
+struct SubWalkFrame<'a, Sym: WalkSym> {
+    id: usize,
+    caller_pc: usize,
+    pc: usize,
+    body: SubJitCodeBody,
+    seed_from_active_resume: bool,
+    registers_r: Vec<OpRef>,
+    registers_i: Vec<OpRef>,
+    registers_f: Vec<OpRef>,
+    concrete_registers_r: Vec<ConcreteValue>,
+    concrete_registers_i: Vec<ConcreteValue>,
+    callee_shadow: Option<CalleeLocalsShadow>,
+    inline_callee_consts: Option<InlineCalleeConsts>,
+    inline_poison_pcs: Option<std::sync::Arc<[usize]>>,
+    fbw_mode: FbwWalkMode<Sym>,
+    session: &'a std::cell::RefCell<WalkSession>,
+    descr_refs: &'a dyn DescrRefTable,
+    raw_descrs: RawDescrPool<'a>,
+    is_authoritative_executor: bool,
+    sub_jitcode_lookup: &'a SubJitCodeLookup,
+    entry_py_pc: EntryPyPc,
+    outer_resume_marker_jit_pc: Option<usize>,
+    outer_jitcode_index: u32,
+    outer_active_boxes: Vec<OpRef>,
+    pending_guard_snapshot_error: Option<DispatchError>,
+    vstack_boxes: Vec<OpRef>,
+    vstack_depth: usize,
+    vstack_cur_pypc: u32,
+    vstack_valid: bool,
+    vstack_last_ref: OpRef,
+    vstack_reorder_ceiling: u32,
+    vstack_reorder_saved: Option<(u32, usize, Vec<OpRef>, Vec<bool>)>,
+    vstack_handler_landing_py: Option<u32>,
+    live_before_jit_pc: usize,
+    live_after_jit_pc: usize,
+}
+
+impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
+    fn drive(
+        &mut self,
+        trace_ctx: &mut TraceCtx,
+    ) -> Result<(DispatchOutcome, usize), DispatchError> {
+        let mut walk_ctx = WalkContext {
+            callee_shadow: self.callee_shadow.take(),
+            inline_callee_consts: self.inline_callee_consts,
+            inline_poison_pcs: self.inline_poison_pcs.take(),
+            fbw_mode: self.fbw_mode,
+            session: self.session,
+            registers_r: &mut self.registers_r,
+            registers_i: &mut self.registers_i,
+            registers_f: &mut self.registers_f,
+            concrete_registers_r: &mut self.concrete_registers_r,
+            concrete_registers_i: &mut self.concrete_registers_i,
+            descr_refs: self.descr_refs,
+            raw_descrs: self.raw_descrs,
+            is_authoritative_executor: self.is_authoritative_executor,
+            trace_ctx,
+            is_top_level: false,
+            sub_jitcode_lookup: self.sub_jitcode_lookup,
+            entry_py_pc: self.entry_py_pc,
+            outer_resume_marker_jit_pc: self.outer_resume_marker_jit_pc,
+            outer_jitcode_index: self.outer_jitcode_index,
+            outer_active_boxes: std::mem::take(&mut self.outer_active_boxes),
+            pending_guard_snapshot_error: self.pending_guard_snapshot_error.take(),
+            vstack_boxes: std::mem::take(&mut self.vstack_boxes),
+            vstack_depth: self.vstack_depth,
+            vstack_cur_pypc: self.vstack_cur_pypc,
+            vstack_valid: self.vstack_valid,
+            vstack_last_ref: self.vstack_last_ref,
+            vstack_reorder_ceiling: self.vstack_reorder_ceiling,
+            vstack_reorder_saved: self.vstack_reorder_saved.take(),
+            vstack_handler_landing_py: self.vstack_handler_landing_py,
+            live_before_jit_pc: self.live_before_jit_pc,
+            live_after_jit_pc: self.live_after_jit_pc,
+        };
+        if self.seed_from_active_resume {
+            self.seed_from_active_resume = false;
+            if let Some(frame) =
+                ActiveResumeFrame::current(walk_ctx.session, walk_ctx.fbw_mode.snapshot_sym)
+                && frame.body_matches(&self.body)
+            {
+                seed_callee_vstack_mirror(&mut walk_ctx, &frame);
+            }
+        }
+        // The bank is rooted by `SubWalkDriver::push_frame` for this frame's
+        // whole residency, which outlasts this call.
+        let result = walk(self.body.code, self.pc, &mut walk_ctx);
+        self.callee_shadow = walk_ctx.callee_shadow.take();
+        self.inline_callee_consts = walk_ctx.inline_callee_consts;
+        self.inline_poison_pcs = walk_ctx.inline_poison_pcs.take();
+        self.fbw_mode = walk_ctx.fbw_mode;
+        self.entry_py_pc = walk_ctx.entry_py_pc;
+        self.outer_resume_marker_jit_pc = walk_ctx.outer_resume_marker_jit_pc;
+        self.outer_jitcode_index = walk_ctx.outer_jitcode_index;
+        self.outer_active_boxes = std::mem::take(&mut walk_ctx.outer_active_boxes);
+        self.pending_guard_snapshot_error = walk_ctx.pending_guard_snapshot_error.take();
+        self.vstack_boxes = std::mem::take(&mut walk_ctx.vstack_boxes);
+        self.vstack_depth = walk_ctx.vstack_depth;
+        self.vstack_cur_pypc = walk_ctx.vstack_cur_pypc;
+        self.vstack_valid = walk_ctx.vstack_valid;
+        self.vstack_last_ref = walk_ctx.vstack_last_ref;
+        self.vstack_reorder_ceiling = walk_ctx.vstack_reorder_ceiling;
+        self.vstack_reorder_saved = walk_ctx.vstack_reorder_saved.take();
+        self.vstack_handler_landing_py = walk_ctx.vstack_handler_landing_py;
+        self.live_before_jit_pc = walk_ctx.live_before_jit_pc;
+        self.live_after_jit_pc = walk_ctx.live_after_jit_pc;
+        result
+    }
+}
+
+struct CompletedSubWalk {
+    parent_id: usize,
+    caller_pc: usize,
+    result: Result<DispatchOutcome, DispatchError>,
+    class_of_last_exc_is_const: bool,
+}
+
+/// The only state nested `walk()` activations exchange with the outer driver.
+/// Keeping it separate from `SubWalkDriver.frames` matters: the active frame
+/// is already mutably borrowed while `step()` calls back into
+/// `run_sub_jitcode_walk`, so a TLS pointer to the whole driver would create a
+/// second overlapping `&mut SubWalkDriver`.  PyPy's `_interpret` likewise
+/// communicates through framestack operations, not by re-entering an already
+/// borrowed frame object.
+struct SubWalkExchange<'a, Sym: WalkSym> {
+    pending: Option<SubWalkFrame<'a, Sym>>,
+    completed: Option<CompletedSubWalk>,
+    active_frame_id: usize,
+    next_frame_id: usize,
+    step_trace_position: Option<majit_metainterp::recorder::TracePosition>,
+    step_effect_count: usize,
+    step_unjournaled: bool,
+    /// Heap-cache state at the start of the CALL step.  The explicit driver
+    /// replays that one opcode to deliver the child's return, unlike RPython's
+    /// direct continuation, so it must rewind the speculative CALL preamble
+    /// without discarding knowledge accumulated before the CALL.
+    step_heap_cache: Option<majit_metainterp::heapcache::HeapCache>,
+}
+
+struct SubWalkDriver<'a, Sym: WalkSym> {
+    frames: Vec<SubWalkFrame<'a, Sym>>,
+    /// One entry per live frame, pushed and dropped with `frames`.
+    bank_guards: Vec<crate::trace::InlineRegisterBankGuard>,
+    exchange: SubWalkExchange<'a, Sym>,
+}
+
+impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
+    fn new(root: SubWalkFrame<'a, Sym>) -> Self {
+        let next_frame_id = root.id + 1;
+        let mut driver = Self {
+            frames: Vec::new(),
+            bank_guards: Vec::new(),
+            exchange: SubWalkExchange {
+                pending: None,
+                completed: None,
+                active_frame_id: 0,
+                next_frame_id,
+                step_trace_position: None,
+                step_effect_count: 0,
+                step_unjournaled: false,
+                step_heap_cache: None,
+            },
+        };
+        driver.push_frame(root);
+        driver
+    }
+
+    /// Push a frame and root its Ref bank for as long as it stays on
+    /// `frames`.
+    ///
+    /// The bank has to be walkable for the frame's whole residency, not only
+    /// while its own `drive` call is on the host stack: a parent suspended at
+    /// a CALL keeps the `ConstPtr`s its folds minted in `registers_r` while
+    /// the child walks and allocates.  The recursive form this driver replaced
+    /// got that by nesting one guard activation inside the next, so
+    /// `inline_register_banks` already held every live bank at once — its only
+    /// reader walks the whole list (`trace.rs walk_active_sym_register_area`).
+    ///
+    /// `InlineRegisterBankGuard::drop` pops whatever entry is on top, so the
+    /// entries have to retire in reverse order; pairing them with `frames`
+    /// is what gives that.  The address published is the `Vec`'s heap buffer,
+    /// so it survives a `frames` realloc moving the `SubWalkFrame` itself, and
+    /// the walk cannot reallocate the bank because `WalkContext` borrows it as
+    /// `&mut [OpRef]`.
+    fn push_frame(&mut self, frame: SubWalkFrame<'a, Sym>) {
+        self.frames.push(frame);
+        let bank: *mut [OpRef] = self
+            .frames
+            .last_mut()
+            .expect("the frame just pushed")
+            .registers_r
+            .as_mut_slice();
+        self.bank_guards
+            .push(crate::trace::InlineRegisterBankGuard::enter(bank));
+    }
+
+    /// Pop a frame, retiring its bank root first so the two stacks stay in
+    /// step.
+    fn pop_frame(&mut self) -> SubWalkFrame<'a, Sym> {
+        self.bank_guards
+            .pop()
+            .expect("a live sub-walk frame lost its register-bank root");
+        self.frames.pop().expect("completed sub-walk frame missing")
+    }
+
+    fn drive(
+        &mut self,
+        trace_ctx: &mut TraceCtx,
+    ) -> Result<(DispatchOutcome, bool), DispatchError> {
+        loop {
+            let frame = self
+                .frames
+                .last_mut()
+                .expect("sub-walk driver lost its root frame");
+            self.exchange.active_frame_id = frame.id;
+            let driven = frame.drive(trace_ctx);
+            match driven {
+                Err(DispatchError::SubWalkSuspended { pc }) => {
+                    assert_eq!(
+                        fbw_executed_effect_count(),
+                        self.exchange.step_effect_count,
+                        "sub-walk push occurred after a concrete effect"
+                    );
+                    assert_eq!(
+                        fbw_has_unjournaled_effect(),
+                        self.exchange.step_unjournaled,
+                        "sub-walk push occurred after an unjournaled effect"
+                    );
+                    // Re-entering the parent CALL after the child returns is
+                    // the explicit continuation.  Remove any IR preamble the
+                    // first entry emitted so it is recorded exactly once on
+                    // continuation replay.
+                    trace_ctx.cut_trace_with_snapshots(
+                        self.exchange
+                            .step_trace_position
+                            .expect("sub-walk driver missed the parent step boundary"),
+                    );
+                    *trace_ctx.heap_cache_mut() = self
+                        .exchange
+                        .step_heap_cache
+                        .take()
+                        .expect("sub-walk driver missed the parent heap-cache checkpoint");
+                    frame.pc = pc;
+                    let child = self
+                        .exchange
+                        .pending
+                        .take()
+                        .expect("SubWalkSuspended without a pending callee frame");
+                    self.push_frame(child);
+                }
+                result => {
+                    let frame = self.pop_frame();
+                    let class_state = frame.fbw_mode.class_of_last_exc_is_const;
+                    let caller_pc = frame.caller_pc;
+                    let result = result.map(|(outcome, _)| outcome);
+                    let Some(parent) = self.frames.last_mut() else {
+                        return result.map(|outcome| (outcome, class_state));
+                    };
+                    parent.pc = caller_pc;
+                    self.exchange.completed = Some(CompletedSubWalk {
+                        parent_id: parent.id,
+                        caller_pc,
+                        result,
+                        class_of_last_exc_is_const: class_state,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Called by `walk` immediately before each opcode step while an explicit
+/// sub-walk driver is active.  A nested CALL yields and replays that one step;
+/// these marks prove the replay crosses no concrete effect and delimit the IR
+/// preamble to cut.
+pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
+    trace_position: majit_metainterp::recorder::TracePosition,
+    heap_cache: &majit_metainterp::heapcache::HeapCache,
+) {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return;
+        }
+        // SAFETY: `SubWalkDriverGuard` installs only the driver's exchange
+        // object and clears it before the enclosing stack frame returns.
+        // `frames` is a disjoint field and remains exclusively borrowed by
+        // the driver while this callback runs. Nested walks keep the same
+        // `Sym` monomorphization.
+        let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
+        exchange.step_trace_position = Some(trace_position);
+        exchange.step_effect_count = fbw_executed_effect_count();
+        exchange.step_unjournaled = fbw_has_unjournaled_effect();
+        exchange.step_heap_cache = Some(heap_cache.clone());
+    });
 }
 
 /// Seed a callee jitcode's register banks with positional args and walk
@@ -10381,8 +10694,8 @@ impl Drop for SubWalkLevel<'_> {
 /// Only Ref-bank concrete shadows are seeded — matching the
 /// `inline_call_*` handlers, which thread `ref_arg_concretes` but no
 /// Int/Float concrete shadows across the frame boundary.
-pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
+pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
+    ctx: &mut WalkContext<'frame, 'a, Sym>,
     pc: usize,
     sub_body: &SubJitCodeBody,
     int_args: &[OpRef],
@@ -10391,22 +10704,24 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
 ) -> Result<DispatchOutcome, DispatchError> {
-    // Claim a host-stack level before anything is allocated, so a refusal
-    // costs the caller nothing to undo. The guard drops on every exit path,
-    // including the `?` returns below and a panic unwinding through them.
-    let depth = {
-        let mut session = ctx.session.borrow_mut();
-        session.subwalk_depth += 1;
-        session.subwalk_depth
-    };
-    let _level = SubWalkLevel {
-        session: ctx.session,
-    };
-    if depth > fbw_max_subwalk_depth() {
-        if fbw_debug_abort_enabled() {
-            eprintln!("[subwalk-depth] jitcode_pc={pc} depth={depth} declined");
+    // A parent frame re-enters its inline_call opcode after the explicit
+    // driver popped the callee. Consume that result before allocating or
+    // reseeding anything, exactly as PyPy's `_interpret` delivers the value to
+    // the now-top `framestack[-1]`.
+    let driver_pointer = SUBWALK_DRIVER.with(|slot| slot.get());
+    if !driver_pointer.is_null() {
+        // SAFETY: installed by the enclosing invocation of this same generic
+        // function; see `SubWalkDriverGuard`.
+        let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
+        if exchange.completed.as_ref().is_some_and(|completed| {
+            completed.parent_id == exchange.active_frame_id && completed.caller_pc == pc
+        }) {
+            let completed = exchange.completed.take().unwrap();
+            if completed.result.is_ok() {
+                ctx.fbw_mode.class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
+            }
+            return completed.result;
         }
-        return Err(DispatchError::SubWalkDepthExceeded { pc, depth });
     }
 
     let (
@@ -10484,102 +10799,91 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
         }
     }
 
+    let frame_id = if driver_pointer.is_null() {
+        0
+    } else {
+        // SAFETY: same scoped driver cast as the completed-result arm above.
+        let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
+        let id = exchange.next_frame_id;
+        exchange.next_frame_id += 1;
+        id
+    };
+    let frame = SubWalkFrame {
+        id: frame_id,
+        caller_pc: pc,
+        pc: 0,
+        body: sub_body.clone(),
+        seed_from_active_resume: true,
+        registers_r: callee_regs_r,
+        registers_i: callee_regs_i,
+        registers_f: callee_regs_f,
+        concrete_registers_r: callee_concrete_r,
+        concrete_registers_i: callee_concrete_i,
+        callee_shadow: None,
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        // `op_pc` belongs to the callee JitCode.  A canonical helper has no
+        // Python blackhole entry of its own, so it stays transparent while its
+        // actual MIFrame/register state lives in this heap-owned frame.
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            transparent_helper_subwalk: true,
+            ..ctx.fbw_mode
+        },
+        session: ctx.session,
+        descr_refs: ctx.descr_refs,
+        raw_descrs: ctx.raw_descrs,
+        is_authoritative_executor: ctx.is_authoritative_executor,
+        sub_jitcode_lookup: ctx.sub_jitcode_lookup,
+        entry_py_pc: ctx.entry_py_pc,
+        outer_resume_marker_jit_pc: ctx.outer_resume_marker_jit_pc,
+        outer_jitcode_index: ctx.outer_jitcode_index,
+        outer_active_boxes: ctx.outer_active_boxes.clone(),
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    if !driver_pointer.is_null() {
+        // Nested descent: publish the heap frame and yield the parent at its
+        // CALL.  The outer driver pushes it without another Rust `walk()`
+        // activation.
+        let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
+        assert!(exchange.pending.replace(frame).is_none());
+        return Err(DispatchError::SubWalkSuspended { pc });
+    }
+
     let descent_journal_before = fbw_store_journal_len();
     let descent_unjournaled_before = fbw_has_unjournaled_effect();
-    let ((callee_outcome, _callee_end_pc), callee_class_of_last_exc_is_const) = {
-        let mut sub_wc = WalkContext {
-            callee_shadow: None,
-            inline_callee_consts: None,
-            inline_poison_pcs: None,
-            // `op_pc` in this context belongs to the callee JitCode.  Never
-            // project it through the root Python JitCode's pc tables: helper
-            // MIFrames are distinct in RPython, while pyre's blackhole cannot
-            // enter helper jitcodes and therefore collapses their guards to
-            // the carried outer Python boundary.
-            fbw_mode: FbwWalkMode {
-                inline_subwalk: true,
-                // A canonical sub-jitcode body has no blackhole entry point of
-                // its own — the fact the `op_pc` comment above states — so the
-                // whole descent is transparent to the Python MIFrame stack, no
-                // matter whether the caller happens to be another sub-walk.
-                // Left inherited, a root-level descent walked with
-                // `inline_subwalk` set and the framestack empty, which sends
-                // `latch_abort_blackhole` into its multi-frame arm: that arm
-                // declines on the empty framestack, so the abort latched no
-                // image and fell back to entry replay — the outcome the
-                // transparent-helper exclusions at the abort-coordinate claim
-                // and the post-step trace-limit check exist to prevent.
-                transparent_helper_subwalk: true,
-                ..ctx.fbw_mode
-            },
-            session: ctx.session,
-            registers_r: &mut callee_regs_r,
-            registers_i: &mut callee_regs_i,
-            registers_f: &mut callee_regs_f,
-            concrete_registers_r: &mut callee_concrete_r,
-            concrete_registers_i: &mut callee_concrete_i,
-            descr_refs: ctx.descr_refs,
-            raw_descrs: ctx.raw_descrs,
-            is_authoritative_executor: ctx.is_authoritative_executor,
-            trace_ctx: ctx.trace_ctx,
-            is_top_level: false,
-            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
-            entry_py_pc: ctx.entry_py_pc,
-            outer_resume_marker_jit_pc: ctx.outer_resume_marker_jit_pc,
-            outer_jitcode_index: ctx.outer_jitcode_index,
-            outer_active_boxes: ctx.outer_active_boxes.clone(),
-            pending_guard_snapshot_error: None,
-            vstack_boxes: Vec::new(),
-            vstack_depth: 0,
-            vstack_cur_pypc: 0,
-            vstack_valid: false,
-            vstack_last_ref: OpRef::NONE,
-            vstack_reorder_ceiling: u32::MAX,
-            vstack_reorder_saved: None,
-            vstack_handler_landing_py: None,
-            live_before_jit_pc: usize::MAX,
-            live_after_jit_pc: usize::MAX,
-        };
-        if let Some(frame) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) {
-            if frame.body_matches(sub_body) {
-                seed_callee_vstack_mirror(&mut sub_wc, &frame);
-            }
+    let mut driver = SubWalkDriver::new(frame);
+    let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
+    let result = driver.drive(ctx.trace_ctx);
+    match result {
+        Ok((outcome, class_state)) => {
+            // `MetaInterp.class_of_last_exc_is_const` is shared across the
+            // whole explicit framestack.
+            ctx.fbw_mode.class_of_last_exc_is_const = class_state;
+            Ok(outcome)
         }
-        // As above: the callee bank is not `sym.registers_r`, so publish it for
-        // the length of the sub-walk.
-        let callee_bank_guard =
-            crate::trace::InlineRegisterBankGuard::enter(&raw mut *sub_wc.registers_r);
-        let walk_result = walk(sub_body.code, 0, &mut sub_wc);
-        drop(callee_bank_guard);
-        let (outcome, end_pc) = match walk_result {
-            Ok(pair) => pair,
-            Err(error) => {
-                // The error carries a pc in THIS sub-jitcode, and the enclosing
-                // frame resumes at its own CALL instead.  That resume re-enters
-                // the descent, so whether it can re-apply something already
-                // applied is a question about this frame's effect delta —
-                // report it, the way the abort channel already reports every
-                // decline.
-                if fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[subwalk-propagate] jitcode_pc={pc} effects={} unjournaled={} err={error:?}",
-                        fbw_store_journal_len() as i64 - descent_journal_before as i64,
-                        fbw_has_unjournaled_effect() != descent_unjournaled_before,
-                    );
-                }
-                return Err(error);
+        Err(error) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[subwalk-propagate] jitcode_pc={pc} effects={} unjournaled={} err={error:?}",
+                    fbw_store_journal_len() as i64 - descent_journal_before as i64,
+                    fbw_has_unjournaled_effect() != descent_unjournaled_before,
+                );
             }
-        };
-        (
-            (outcome, end_pc),
-            sub_wc.fbw_mode.class_of_last_exc_is_const,
-        )
-    };
-    // `MetaInterp.class_of_last_exc_is_const` is shared across the RPython
-    // framestack.  Preserve the callee's final state when leaving this Rust
-    // sub-context instead of manufacturing a new value at the caller catch.
-    ctx.fbw_mode.class_of_last_exc_is_const = callee_class_of_last_exc_is_const;
-    Ok(callee_outcome)
+            Err(error)
+        }
+    }
 }
 
 /// Operand layout `dR>X`:

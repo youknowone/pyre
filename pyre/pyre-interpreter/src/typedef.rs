@@ -19498,10 +19498,14 @@ fn init_int_type(ns: PyObjectRef) {
             ),
         )
     };
-    // Unary / conversion slots exposed as callable dunders.  These have
-    // no NotImplemented dispatch, so each delegates to the object-space
-    // op, which fast-paths the concrete int (no re-dispatch through the
-    // dunder).  Binary arithmetic dunders are registered separately.
+    // Unary / conversion slots exposed as callable dunders.  These have no
+    // NotImplemented dispatch, and each names the structural half of the
+    // object-space op (`neg_inner`/`pos_inner`), not the op itself:
+    // `neg`/`pos` open with the `__neg__`/`__pos__` override probe, so a
+    // subtype whose override delegates back to the slot would re-enter the
+    // lookup that reached it.  `W_IntObject.descr_invert` is likewise the
+    // arithmetic alone, with the lookup living in `_make_unaryop_impl`.
+    // Binary arithmetic dunders are registered separately.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -19542,22 +19546,14 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__neg__",
-            make_builtin_function_with_arity(
-                "__neg__",
-                |args| crate::objspace::descroperation::neg(args[0]),
-                1,
-            ),
+            make_builtin_function_with_arity("__neg__", crate::builtins::builtin_neg_dunder, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__pos__",
-            make_builtin_function_with_arity(
-                "__pos__",
-                |args| crate::objspace::descroperation::pos(args[0]),
-                1,
-            ),
+            make_builtin_function_with_arity("__pos__", crate::builtins::builtin_pos_dunder, 1),
         )
     };
     unsafe {
@@ -19936,22 +19932,14 @@ fn init_complex_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__neg__",
-            make_builtin_function_with_arity(
-                "__neg__",
-                |args| crate::objspace::descroperation::neg(args[0]),
-                1,
-            ),
+            make_builtin_function_with_arity("__neg__", crate::builtins::builtin_neg_dunder, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__pos__",
-            make_builtin_function_with_arity(
-                "__pos__",
-                |args| crate::objspace::descroperation::pos(args[0]),
-                1,
-            ),
+            make_builtin_function_with_arity("__pos__", crate::builtins::builtin_pos_dunder, 1),
         )
     };
     unsafe {
@@ -20454,22 +20442,14 @@ fn init_float_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__neg__",
-            make_builtin_function_with_arity(
-                "__neg__",
-                |args| crate::objspace::descroperation::neg(args[0]),
-                1,
-            ),
+            make_builtin_function_with_arity("__neg__", crate::builtins::builtin_neg_dunder, 1),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__pos__",
-            make_builtin_function_with_arity(
-                "__pos__",
-                |args| crate::objspace::descroperation::pos(args[0]),
-                1,
-            ),
+            make_builtin_function_with_arity("__pos__", crate::builtins::builtin_pos_dunder, 1),
         )
     };
     unsafe {
@@ -20909,7 +20889,10 @@ fn int_descr_invert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             crate::objspace::descroperation::int_value(w_self)
         }));
     }
-    crate::objspace::descroperation::invert(w_self)
+    // The structural half: an unbound slot must not re-run the `__invert__`
+    // override probe `invert` opens with.  The `is_bool` arm above already
+    // answered bools, so `invert`'s deprecation arm is not wanted here either.
+    crate::objspace::descroperation::invert_inner(w_self)
 }
 
 /// CPython 3.14 `Objects/boolobject.c:bool_invert`.

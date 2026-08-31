@@ -293,42 +293,22 @@ pub struct TypeRegistry {
     /// `(TYPE_INFO, CLASSTYPE)` member array the backend reads at
     /// codegen time via `get_translated_info_for_typeinfo`.
     ///
-    /// Pre-allocated with `MAX_TYPES` capacity at construction so the
-    /// backing storage never reallocates: every `register_type` call
-    /// is in-place, and the base address is stable for the lifetime of
-    /// the registry. RPython's translator places `type_info_group`
-    /// at a fixed C address after translation; majit can't quite do
-    /// that (types are registered at runtime) but the pre-allocated
-    /// `Vec` capacity is the closest local equivalent.
+    /// Mutable build-time rows. RPython's `TypeLayoutBuilder` grows its
+    /// `type_info_group` while `can_add_new_types` is true, then
+    /// `close_table()` makes the completed group immutable. Majit follows the
+    /// same two-phase lifecycle: this Vec may reallocate while registering,
+    /// and `freeze_types` moves it into `frozen_layout_table`.
     layout_table: Vec<TypeEntry>,
+    /// Exact-size, stable-address table published by `freeze_types`. Compiled
+    /// guards may embed this slice's base pointer; a boxed slice cannot grow or
+    /// reallocate and is reclaimed with the registry.
+    frozen_layout_table: Option<Box<[TypeEntry]>>,
     /// `gctypelayout.can_add_new_types` parity. `true` until the
     /// frontend calls `freeze_types`; after that, `register_type`
     /// panics. Mirrors how RPython's translator stops accepting new
     /// types at the end of `make_type_info_group` /
     /// `encode_type_shapes_now` (gctypelayout.py).
     can_add_new_types: bool,
-}
-
-impl TypeRegistry {
-    /// Maximum number of types the backing `layout_table` can hold
-    /// without reallocating; bumps require recompiling majit-gc.
-    ///
-    /// RPython's `type_info_group` is bounded by the half-word width
-    /// of the inline `GROUP_MEMBER_OFFSET` (translator/c/src/llgroup.h)
-    /// — 64KB on 32-bit and 4GB on 64-bit. majit's bound is set by
-    /// the maximum number of distinct GC types we expect to register,
-    /// not by an addressing limit: `Header` gives the type id the whole
-    /// low 32 bits (`header::TYPE_ID_BITS`), so this constant costs
-    /// pre-allocated capacity and nothing else.
-    ///
-    /// It was 1024, sized for "the dozen-or-so types pyre registers".
-    /// Lowering the named-struct transparent constructors to `New`
-    /// (`jtransform`) turns each one into a registered GC type and put
-    /// the count past that: `PYRE_GC_TYPE_COUNT=1` reports 1046 frozen.
-    /// Read that number before choosing the next value rather than
-    /// inferring one from the `register` assert, which names the cap it
-    /// blew and not the total it needed.
-    pub const MAX_TYPES: usize = 4096;
 }
 
 /// Custom trace function type.
@@ -899,8 +879,9 @@ impl TypeInfo {
 impl TypeRegistry {
     pub fn new() -> Self {
         TypeRegistry {
-            entries: Vec::with_capacity(Self::MAX_TYPES),
-            layout_table: Vec::with_capacity(Self::MAX_TYPES),
+            entries: Vec::new(),
+            layout_table: Vec::new(),
+            frozen_layout_table: None,
             can_add_new_types: true,
         }
     }
@@ -910,10 +891,10 @@ impl TypeRegistry {
     /// `gctypelayout.add_vtable_after_typeinfo` parity (gctypelayout.
     /// py:359-374): pushes the `TypeInfo` and reserves a paired
     /// `TypeEntry` slot in the `type_info_group` array. Both the
-    /// `entries` and `layout_table` vectors are pre-allocated to
-    /// `MAX_TYPES`, so this never reallocates and the
-    /// `type_info_table` base address is stable for the lifetime of
-    /// the registry.
+    /// `entries` and `layout_table` grow only during this build phase.
+    /// `freeze_types` publishes an exact-size boxed table afterwards,
+    /// matching `TypeLayoutBuilder.close_table` rather than imposing an
+    /// arbitrary registration cap to keep a build-time pointer stable.
     ///
     /// `subclassrange_{min,max}` are intentionally left at 0 here;
     /// `freeze_types` walks the inheritance tree afterwards and
@@ -927,10 +908,14 @@ impl TypeRegistry {
              (gctypelayout.can_add_new_types == False)"
         );
         let id = self.entries.len();
+        // `T_MEMBER_INDEX` is the low 16 bits of `infobits`, so an id past
+        // `u16::MAX` cannot round-trip through `encode_type_shape` — it would
+        // be masked back to a smaller index and mislabel the row.  The width
+        // is `gctypelayout.py`'s, so the bound belongs here rather than in a
+        // wider field.
         assert!(
-            id < Self::MAX_TYPES,
-            "TypeRegistry exceeded MAX_TYPES = {} — bump trace.rs",
-            Self::MAX_TYPES
+            id <= u16::MAX as usize,
+            "TypeRegistry exhausted the 16-bit T_MEMBER_INDEX field: id {id}"
         );
         if info.custom_trace.is_none()
             && let Some(parent_id) = info.parent
@@ -987,21 +972,14 @@ impl TypeRegistry {
             return;
         }
         self.can_add_new_types = false;
-        // The `register` assert says to bump `MAX_TYPES` but not to what;
-        // this is the number to size it against.
-        if std::env::var_os("PYRE_GC_TYPE_COUNT").is_some() {
-            eprintln!(
-                "[gc-type-count] frozen={} max={}",
-                self.entries.len(),
-                Self::MAX_TYPES
-            );
-        }
         self.assign_inheritance_ids();
         // Refresh layout_table rows for object types whose
         // subclassrange_{min,max} just changed.
         for (i, info) in self.entries.iter().enumerate() {
             self.layout_table[i] = TypeEntry::from_type_info(info, i as u32);
         }
+        self.entries.shrink_to_fit();
+        self.frozen_layout_table = Some(std::mem::take(&mut self.layout_table).into_boxed_slice());
     }
 
     /// `rtyper/normalizecalls.py assign_inheritance_ids` /
@@ -1121,14 +1099,15 @@ impl TypeRegistry {
     /// translator emits a contiguous group at translation time whose
     /// members alternate between `TYPE_INFO` and `CLASSTYPE`
     /// (gctypelayout.py `add_vtable_after_typeinfo`). majit's
-    /// equivalent is the pre-allocated `layout_table` `Vec<TypeEntry>`
-    /// maintained eagerly by `register_type` / `freeze_types`. Its
-    /// `as_ptr()` is stable as long as `MAX_TYPES` is not exceeded,
-    /// matching the post-translation immutability of
-    /// `type_info_group` so that compiled guards can embed the base
-    /// address.
+    /// equivalent is the exact-size boxed table published by
+    /// `freeze_types`.  No address is exposed while the build-time Vec can
+    /// still grow; after freezing, the boxed slice has the same stable,
+    /// immutable shape as RPython's closed `type_info_group` and compiled
+    /// guards may embed its base address.
     pub fn type_info_table(&self) -> &[TypeEntry] {
-        &self.layout_table
+        self.frozen_layout_table
+            .as_deref()
+            .expect("type_info_table requested before freeze_types")
     }
 
     /// Translation-time `framework.py write_typeid_list` metadata.
@@ -1185,6 +1164,31 @@ mod tests {
         assert_eq!(reg.get(id0).size, 16);
         assert_eq!(reg.get(id1).size, 32);
         assert!(!reg.get(id0).has_gc_ptrs);
+    }
+
+    #[test]
+    fn test_type_registry_grows_then_publishes_stable_exact_table() {
+        // `TypeLayoutBuilder.type_info_group` grows while types are being
+        // added; the old fixed reservation of 4096 entries was a pyre-only
+        // limit, not an RPython invariant.
+        let mut reg = TypeRegistry::new();
+        for _ in 0..4097 {
+            reg.register(TypeInfo::simple(16));
+        }
+        reg.freeze_types();
+
+        let first = reg.type_info_table();
+        assert_eq!(first.len(), 4097);
+        let base = first.as_ptr();
+        assert_eq!(reg.type_info_table().as_ptr(), base);
+    }
+
+    #[test]
+    #[should_panic(expected = "type_info_table requested before freeze_types")]
+    fn test_type_registry_does_not_publish_build_time_table() {
+        let mut reg = TypeRegistry::new();
+        reg.register(TypeInfo::simple(16));
+        let _ = reg.type_info_table();
     }
 
     #[test]

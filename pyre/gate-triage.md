@@ -223,9 +223,9 @@ build.
 | PYRE_FBW_INLINE_POISON | admits a callee the replay scan declined and refuses at the scan's poisoned pcs during the walk (`diag.rs fbw_inline_poison_enabled`) | when a refusal that follows an executed effect has a resume leg that neither repeats it nor drops it |
 | PYRE_JD1 | arms the jd1 (`unpackiterable_driver`) compiled-loop experiment — `eval.rs jd1_experiment_enabled` is `PYRE_JD1 == "1"`, so nothing else turns it on.  `PYRE_NO_JD1`, `PYRE_JD1=0` and the master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) each force it back off | the jd1 experiment concludes |
 
-### §6b — VALUE knobs (15): config, not gates
+### §6b — VALUE knobs (14): config, not gates
 
-`PYRE_FBW_MAX_SUBWALK_DEPTH`, `PYRE_FBW_MULTIFRAME_DEPTH`,
+`PYRE_FBW_MULTIFRAME_DEPTH`,
 `PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
 `PYRE_PORTAL_METATRACE_ENTRY`, `PYRE_PORTAL_METATRACE_SKIP`,
@@ -248,14 +248,6 @@ not before them.
 consulted/fired tallies. `PYRE_WASM_SPEC_CENSUS` is that same readout on the
 wasm backend, where the guest reads no environment and the runner has to arm
 it through the `pyre_fbw_spec_census_enable` export instead.
-
-`PYRE_FBW_MAX_SUBWALK_DEPTH` lowers the host-stack budget for canonical-helper
-descent (`fbw_max_subwalk_depth`, default 64). The default is a backstop
-against exhausting the process stack, not a tuning knob — the walker recurses
-one `walk()` activation per descent level where RPython's `MetaInterp` keeps
-its frames on the heap. Lowering it is how the `SubWalkDepthExceeded` decline
-is exercised without building a pathological helper chain; it retires when the
-descent stops recursing on the host stack.
 
 `PYRE_PORTAL_METATRACE_ENTRY` selects where the one-shot jd0 portal probe
 starts: `merge` (the default) seeds the merge-point registers and `start`
@@ -295,7 +287,7 @@ configuration.
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT`, `PYRE_PCMAP_RESIDUAL_CENSUS`,
 `MAJIT_PORTAL_RCA`, `PYRE_PORTAL_METATRACE`, `PYRE_PROBE_BH_STARTUP`,
 `PYRE_PROBE_SNAPSHOT`,
-`MAJIT_PROBE_SUBSCR`, `MAJIT_PROFILE_PIPELINE`, `PYRE_QMUT_MAPDICT_FORCE`,
+`MAJIT_PROBE_SUBSCR`, `MAJIT_PROFILE_PIPELINE`,
 `PYRE_RERAISE_DIAG`, `MAJIT_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
 `PYRE_UNJOURNALED_SITE`,
 `PYRE_VSTACK_EXACT_AUDIT`, `PYRE_VSTACK_KEEP_REORDER`, `PYRE_VSTACK_NO_EXACT`,
@@ -392,7 +384,6 @@ under measurement.
 | gate | default polarity | what it gates / retirement condition |
 |---|---|---|
 | `PYRE_PROBE14` | OFF | reports discarded reference-constant relocations; retire when relocation preservation is covered by ordinary tests |
-| `PYRE_GC_TYPE_COUNT` | OFF | prints `[gc-type-count] frozen=N max=M` when `freeze_types` runs, so the number to size `TypeRegistry::MAX_TYPES` against can be read instead of guessed -- the `register` assert names the cap it blew but not the total it needed; retire when the registry grows on demand rather than pre-allocating a fixed capacity for a stable base address |
 | `PYRE_GC_SIZE_AUDIT` | OFF | panics when a block is stamped with a type id whose declared payload is larger than the block's own extent, at the allocation that stamps it rather than in whichever later collection reads the neighbouring block as a field (varsize types are exempt); retire when every allocator derives the size from the type id it stamps, so the two cannot disagree |
 | `PYRE_GC_GATE_BASE` | VALUE | names the upstream commit `scripts/check-gc-root-brackets.py` measured its numbers over, so a backlog raised by code the baseline never saw is reported rather than charged to the branch; the workflow supplies it because a CI checkout is shallow, holds no `main` ref and has its merge commit's parent list truncated away, leaving nothing in the repository able to answer; retire when the gate's job checks out enough history for `git merge-base` to name the base itself |
 | `PYRE_EXIT_FRAME_DIAG` | OFF | prints one line per `exit_frame_with_exception` delivery to a frame's own exception table, naming the site and the verdict `exit_frame_handler_needs_unwritten_stack` reached there, passes included so a refusal is a share of something; retire when the handler search moves inside the trace and the two delivery sites become one |

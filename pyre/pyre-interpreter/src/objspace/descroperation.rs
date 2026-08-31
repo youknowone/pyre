@@ -3296,7 +3296,12 @@ pub(crate) unsafe fn str_concat_type_error(rhs: PyObjectRef) -> PyError {
     PyError::type_error(format!("can only concatenate str (not \"{name}\") to str"))
 }
 
-pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    add_impl(a, b, "+")
+}
+
+/// `+` and `+=` — one body, see [`binop_type_error`].
+pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__add__", "__radd__");
         if numeric_override
@@ -3387,11 +3392,7 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             }
             // A non-buffer rhs is rejected with the generic operator TypeError
             // (bytes `descr_add` returns NotImplemented), not "can't concat".
-            let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-            let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-            return Err(PyError::type_error(format!(
-                "unsupported operand type(s) for +: '{a_name}' and '{b_name}'"
-            )));
+            return Err(binop_type_error(symbol, a, b));
         }
         // Forward `__add__` + reflected `__radd__` per
         // `descroperation.py:_make_binop_impl` — try_dispatch_binary_special
@@ -3403,31 +3404,32 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for +: '{}' and '{}'",
-            a_name, b_name,
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
-pub fn matmul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn matmul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    matmul_impl(a, b, "@")
+}
+
+/// `@` and `@=` — one body, see [`binop_type_error`].
+pub(crate) fn matmul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         if let Some(result) =
             try_dispatch_binary_special(&mut a, &mut b, "__matmul__", "__rmatmul__")?
         {
             return Ok(result);
         }
-        let a_name = (*ll_type(a)).name;
-        let b_name = (*ll_type(b)).name;
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for @: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
-pub fn sub(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    sub_impl(a, b, "-")
+}
+
+/// `-` and `-=` — one body, see [`binop_type_error`].
+pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override
@@ -3472,15 +3474,16 @@ pub fn sub(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for -: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
-pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    mul_impl(a, b, "*")
+}
+
+/// `*` and `*=` — one body, see [`binop_type_error`].
+pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__mul__", "__rmul__");
         if numeric_override
@@ -3573,17 +3576,18 @@ pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         }
         let a = pyre_object::gc_roots::shadow_stack_get(operands);
         let b = pyre_object::gc_roots::shadow_stack_get(operands + 1);
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
         // `sequence_repeat`: the count goes through `__index__`, and an
         // operand that has none is reported by its own type — the sequence is
         // never the one named.
         if a_seq || b_seq {
-            let (seq_slot, other, other_name) = if a_seq {
-                (operands, b, b_name)
+            let (seq_slot, other) = if a_seq {
+                (operands, b)
             } else {
-                (operands + 1, a, a_name)
+                (operands + 1, a)
             };
+            // Named before the MRO walk below, so the report never reads a
+            // word the lookup could have left behind.
+            let other_name = crate::baseobjspace::object_functionstr_type_name(other);
             if !(a_seq && b_seq) && crate::baseobjspace::lookup(other, "__index__").is_some() {
                 // `__index__` is Python, so the sequence is addressed again
                 // only after the count is in hand.
@@ -3594,13 +3598,16 @@ pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
                 "can't multiply sequence by non-int of type '{other_name}'"
             )));
         }
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for *: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
-pub fn floordiv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    floordiv_impl(a, b, "//")
+}
+
+/// `//` and `//=` — one body, see [`binop_type_error`].
+pub(crate) fn floordiv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__floordiv__", "__rfloordiv__");
         if numeric_override
@@ -3626,11 +3633,7 @@ pub fn floordiv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for //: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
@@ -3655,7 +3658,12 @@ unsafe fn try_subclass_binop_override(
     Ok((!is_not_implemented(result)).then_some(result))
 }
 
-pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    mod_impl(a, b, "%")
+}
+
+/// `%` and `%=` — one body, see [`binop_type_error`].
+pub(crate) fn mod_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__mod__", "__rmod__");
         if numeric_override
@@ -3720,11 +3728,7 @@ pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for %: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
@@ -3736,7 +3740,12 @@ pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
 /// longobject.py `_truediv` catches OverflowError from
 /// `rbigint.truediv` and reissues it as
 /// "integer division result too large for a float".
-pub fn truediv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    truediv_impl(a, b, "/")
+}
+
+/// `/` and `/=` — one body, see [`binop_type_error`].
+pub(crate) fn truediv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__truediv__", "__rtruediv__");
         if numeric_override
@@ -3788,11 +3797,7 @@ pub fn truediv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for /: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
@@ -3832,11 +3837,9 @@ pub fn pow(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     if let Some(result) = pow_binary(&mut a, &mut b)? {
         return Ok(result);
     }
-    let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-    let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-    Err(PyError::type_error(format!(
-        "unsupported operand type(s) for ** or pow(): '{a_name}' and '{b_name}'"
-    )))
+    // `**` names the two-argument builtin alongside the operator, so it does
+    // not take the shared spelling.
+    Err(binop_type_error("** or pow()", a, b))
 }
 
 /// `descroperation.py inplace_pow` — unlike the generated in-place
@@ -4503,6 +4506,22 @@ fn operand_type_name(obj: PyObjectRef) -> String {
     }
 }
 
+/// The `unsupported operand type(s) for <symbol>` TypeError raised once both
+/// the forward and the reflected special have declined.
+///
+/// `_make_binop_impl` and `_make_inplace_impl` generate two families from one
+/// body: the pair differs only in the `symbol` baked into `errormsg`, `&`
+/// against `&=`.  So each operation here is one function taking the symbol,
+/// and the augmented assignment reaches the same dispatch under its own
+/// spelling instead of borrowing the operator's.
+fn binop_type_error(symbol: &str, a: PyObjectRef, b: PyObjectRef) -> PyError {
+    let a_name = crate::baseobjspace::object_functionstr_type_name(a);
+    let b_name = crate::baseobjspace::object_functionstr_type_name(b);
+    PyError::type_error(format!(
+        "unsupported operand type(s) for {symbol}: '{a_name}' and '{b_name}'"
+    ))
+}
+
 pub(crate) fn binary_builtin_type_error(
     opname: &str,
     lhs: PyObjectRef,
@@ -4738,7 +4757,12 @@ fn float_pow_impl(x: f64, y: f64) -> PyResult {
 
 /// Left shift dispatch (`<<` operator).
 
-pub fn lshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    lshift_impl(a, b, "<<")
+}
+
+/// `<<` and `<<=` — one body, see [`binop_type_error`].
+pub(crate) fn lshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__lshift__", "__rlshift__");
         if numeric_override
@@ -4761,17 +4785,18 @@ pub fn lshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for <<: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
 /// Right shift dispatch (`>>` operator).
 
-pub fn rshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    rshift_impl(a, b, ">>")
+}
+
+/// `>>` and `>>=` — one body, see [`binop_type_error`].
+pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__rshift__", "__rrshift__");
         if numeric_override
@@ -4794,17 +4819,18 @@ pub fn rshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for >>: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
 /// Bitwise AND dispatch (`&` operator).
 
-pub fn and_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    and_impl(a, b, "&")
+}
+
+/// `&` and `&=` — one body, see [`binop_type_error`].
+pub(crate) fn and_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override
@@ -4849,11 +4875,7 @@ pub fn and_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for &: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
@@ -4873,6 +4895,11 @@ pub(crate) fn unionable(obj: PyObjectRef) -> bool {
 /// Bitwise OR dispatch (`|` operator).
 
 pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    or_impl(a, b, "|")
+}
+
+/// `|` and `|=` — one body, see [`binop_type_error`].
+pub(crate) fn or_impl(a: PyObjectRef, b: PyObjectRef, symbol: &str) -> PyResult {
     // `pypy/objspace/std/dictproxyobject.py descr_or` /
     // `pypy/objspace/std/dictproxyobject.py descr_ror` —
     // mappingproxy `|` dispatches by copying the proxy's wrapped
@@ -4970,17 +4997,18 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         if unionable(a) && unionable(b) && !(is_none(a) && is_none(b)) {
             return crate::_pypy_generic_alias::create_union(a, b);
         }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for |: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
 /// Bitwise XOR dispatch (`^` operator).
 
-pub fn xor(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    xor_impl(a, b, "^")
+}
+
+/// `^` and `^=` — one body, see [`binop_type_error`].
+pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override
@@ -5024,11 +5052,7 @@ pub fn xor(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        let a_name = crate::baseobjspace::object_functionstr_type_name(a);
-        let b_name = crate::baseobjspace::object_functionstr_type_name(b);
-        Err(PyError::type_error(format!(
-            "unsupported operand type(s) for ^: '{a_name}' and '{b_name}'"
-        )))
+        Err(binop_type_error(symbol, a, b))
     }
 }
 
@@ -5562,7 +5586,9 @@ pub fn pos(a: PyObjectRef) -> PyResult {
 /// operation the body executes.  A caller that has already proven an exact
 /// builtin receiver cannot take it, so entering here records the arm that
 /// receiver selects and nothing else.  Every other caller reaches this through
-/// [`pos`] and is unaffected.
+/// [`pos`] and is unaffected, except the `int`/`float`/`complex` `__pos__`
+/// slots, which name this body directly because an unbound slot must not
+/// dispatch.
 ///
 /// Unlike [`invert_inner`] this keeps the `bool` operand: `+True` is a
 /// rewrapping to a plain int, not a deprecation warning.  Unlike [`neg_inner`]
@@ -5641,7 +5667,9 @@ pub fn neg(a: PyObjectRef) -> PyResult {
 /// operation the body executes.  A caller that has already proven an exact
 /// builtin receiver cannot take it, so entering here records the arm that
 /// receiver selects and nothing else.  Every other caller reaches this through
-/// [`neg`] and is unaffected.
+/// [`neg`] and is unaffected, except the `int`/`float`/`complex` `__neg__`
+/// slots, which name this body directly because an unbound slot must not
+/// dispatch.
 ///
 /// Unlike [`invert_inner`] this keeps the `bool` operand: `neg` has no separate
 /// bool slot to leave behind, and the integer arm below already answers `True`
@@ -5735,7 +5763,8 @@ pub fn invert(a: PyObjectRef) -> PyResult {
 /// reaches `lookup_exc_class`.  A caller that has already proven an exact
 /// `int` receiver takes neither, so entering here records the integer arm
 /// alone.  Every other caller reaches this through [`invert`] and is
-/// unaffected.
+/// unaffected, except `int.__invert__`, which names this body directly
+/// because an unbound slot must not dispatch.
 pub fn invert_inner(a: PyObjectRef) -> PyResult {
     unsafe {
         if is_int(a) {

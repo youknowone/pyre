@@ -1401,29 +1401,19 @@ impl BlackholeInterpreter {
     /// blackhole.py handle_exception_in_frame: check if the current
     /// position has an immediately-following `catch_exception/L`.
     ///
-    /// Upstream inspects exactly one instruction — the resume `-live-` is
-    /// skipped and whatever follows it either is the `catch_exception` or is
-    /// not.  The backward scan below is pyre's, and it is not a fallback for a
-    /// position this interpreter left wrong: every entry from
-    /// [`Self::run_inner`] arrives with `self.position` naming the end of the
-    /// raising instruction, which [`Self::dispatch_step`] stores out of
-    /// [`DispatchError::RaiseException`] exactly as upstream's `_get_method`
-    /// wrapper does, so the direct case answers all of them.
-    ///
-    /// It exists for the OTHER two entries, which do not come from a
-    /// dispatched instruction at all: [`Self::resume_mainloop`]'s prologue and
-    /// the guard-failure chain walk both arrive with a *resume coordinate*
-    /// taken from a guard descr, and pyre's descr for a post-call
-    /// `GUARD_NO_EXCEPTION` names the successor block's entry `-live-` rather
-    /// than the call's own trailing one (`pc_map[fallthrough_pc]`; the catch
-    /// sits between the two and no Python PC resolves onto it).
+    /// Upstream inspects exactly one instruction: the operation-owned resume
+    /// `-live-` is skipped and whatever follows it either is this operation's
+    /// `catch_exception` or is not.  Guard snapshots carry that exact trailing
+    /// marker (`after_residual_guard_marker`, the
+    /// `capture_resumedata(after_residual_call=True)` port), so searching other
+    /// operation startpoints here would only permit a bad resume coordinate to
+    /// steal a later operation's handler.
     pub fn handle_exception_in_frame(&mut self, exc_value: i64) -> bool {
         let code = &self.jitcode.code;
         let mut position = self.position;
         if position >= code.len() {
             return false;
         }
-        let resume_live_pos = position;
         if code[position] == self.op_live {
             position += majit_translate::liveness::OFFSET_SIZE + 1;
             if position >= code.len() {
@@ -1431,23 +1421,10 @@ impl BlackholeInterpreter {
             }
         }
         let opcode = code[position];
-        // Forward case (explicit `raise`, `emit_raise!`): the `catch_exception`
-        // is directly after the resume `-live-` (blackhole.py:396 parity).
+        // `BlackholeInterpreter.handle_exception_in_frame` parity: the catch
+        // is directly after this operation's resume `-live-`.
         if opcode == self.op_catch_exception {
             return self.route_to_catch(position, exc_value);
-        }
-        // Backward case (after-residual-call guard): pyre resumes the post-call
-        // `GUARD_NO_EXCEPTION` at the next opcode's `-live-`
-        // (`pc_map[fallthrough_pc]`, jitcode_dispatch.rs / capture_resumedata),
-        // because the raising op's vable-mirror stores
-        // (`pyre-jit`'s `flatten.rs` `insert_exits`)
-        // sit between the call's own post-call `-live-` and its
-        // `catch_exception` — there is no Python PC that resolves onto the
-        // catch.  The catch therefore lies BEHIND `resume_live_pos`; scan op
-        // boundaries backward, bounded by the call's own post-call `-live-`,
-        // so only the just-executed opcode's catch can match.
-        if let Some(catch_pos) = self.find_catch_before_resume_live(resume_live_pos) {
-            return self.route_to_catch(catch_pos, exc_value);
         }
         if opcode == self.op_rvmprof_code {
             // blackhole.py:412-420: on exception immediately before a
@@ -1548,51 +1525,6 @@ impl BlackholeInterpreter {
                 position,
             ),
         }
-    }
-
-    /// Locate the `catch_exception` op that belongs to the just-executed
-    /// opcode whose post-call guard resumed at `resume_live_pos` (the next
-    /// opcode's `-live-`).  Scans op boundaries (the jitcode's `startpoints`)
-    /// strictly before `resume_live_pos`, newest first.  The caught can-raise
-    /// op's expansion is `[op, -live-, catch_exception, -live-(block entry),
-    /// vable stores…]` (the guessexception split closes the block at the op's
-    /// trailing `-live-`, so the successor block opens with its own `-live-`
-    /// before the moved stores).  The scan therefore hops over exactly one
-    /// `-live-` — the successor's block-entry marker — and accepts the
-    /// `catch_exception` only when it sits immediately before it; any other
-    /// op there is the raising op itself (no catch emitted), and a second
-    /// `-live-` means the raising op sits outside any in-frame try.
-    /// Returns `None` (propagate) in those cases.
-    fn find_catch_before_resume_live(&self, resume_live_pos: usize) -> Option<usize> {
-        let code = &self.jitcode.code;
-        let startpoints = self.jitcode.startpoints.as_ref()?;
-        let mut points: Vec<usize> = startpoints
-            .iter()
-            .copied()
-            .filter(|&q| q < resume_live_pos)
-            .collect();
-        points.sort_unstable_by(|a, b| b.cmp(a));
-        let mut crossed_block_entry_live = false;
-        for q in points {
-            let op = code[q];
-            if op == self.op_catch_exception {
-                return Some(q);
-            }
-            if op == self.op_live {
-                if crossed_block_entry_live {
-                    // Second `-live-`: the raising op has no catch.
-                    return None;
-                }
-                crossed_block_entry_live = true;
-                continue;
-            }
-            if crossed_block_entry_live {
-                // The op immediately before the block-entry `-live-` is not a
-                // `catch_exception` — it is the raising op itself (uncaught).
-                return None;
-            }
-        }
-        None
     }
 
     /// blackhole.py handle_rvmprof_enter.
@@ -5025,23 +4957,23 @@ mod tests {
         }
 
         #[test]
-        fn test_guard_exception_resume_does_not_steal_later_operation_catch() {
+        fn test_guard_exception_resume_uses_operation_owned_trailing_live() {
             let mut asm = majit_translate::codewriter::assembler::Assembler::new();
             let mut b = JitCodeBuilder::default();
             b.load_const_r_value(0, 1);
             b.load_const_i_value(0, 2);
-            let resume_pc = b.current_pos();
             b.live(&mut asm, &[], &[], &[]);
-            // This operation has no adjacent catch.  A later operation does;
-            // blackhole.py handle_exception_in_frame must not route the first
-            // operation's exception to that unrelated handler.
+            // The normal-flow successor mirrors virtualizable state before
+            // the can-raise block's trailing live/catch pair.
             b.vable_setfield_int_with_base(0, 0, 0);
+            let resume_pc = b.current_pos();
             b.live(&mut asm, &[], &[], &[]);
             let handler_lbl = b.new_label();
             b.catch_exception(handler_lbl);
             b.load_const_i_value(2, 99);
             b.int_return(2);
             b.mark_label(handler_lbl);
+            let handler_pc = b.current_pos();
             b.load_const_i_value(2, 42);
             b.int_return(2);
             let jitcode = b.finish();
@@ -5050,8 +4982,32 @@ mod tests {
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), resume_pc);
 
+            assert!(bh.handle_exception_in_frame(0xCAFE_F00D));
+            assert_eq!(bh.position, handler_pc);
+        }
+
+        #[test]
+        fn test_guard_exception_resume_does_not_steal_later_operation_catch() {
+            let mut asm = majit_translate::codewriter::assembler::Assembler::new();
+            let mut b = JitCodeBuilder::default();
+            let resume_pc = b.current_pos();
+            b.live(&mut asm, &[], &[], &[]);
+            b.load_const_i_value(0, 1);
+            b.live(&mut asm, &[], &[], &[]);
+            let handler_lbl = b.new_label();
+            b.catch_exception(handler_lbl);
+            b.mark_label(handler_lbl);
+            let handler_pc = b.current_pos();
+            b.int_return(0);
+            let jitcode = b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition(std::sync::Arc::new(jitcode), resume_pc);
+
             assert!(!bh.handle_exception_in_frame(0xCAFE_F00D));
             assert_eq!(bh.position, resume_pc);
+            assert_ne!(bh.position, handler_pc);
         }
 
         thread_local! {

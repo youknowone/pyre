@@ -498,8 +498,11 @@ pub unsafe fn walk_active_sym_register_area(
             }
         }
         // The open sub-walks' own banks: each entry is the `(address, length)`
-        // of the Ref bank of a frame suspended below this one, published for
-        // the length of its `walk` call. A shared borrow of the list is enough
+        // of the Ref bank of a frame below this one, published for that
+        // frame's whole residency on `SubWalkDriver::frames` -- a parent
+        // suspended at a CALL keeps minted `ConstPtr`s in its bank while the
+        // child walks, so the publication outlives its own `walk` call.
+        // A shared borrow of the list is enough
         // -- every bank it names is a separate allocation, so the `&mut`
         // slices below do not alias it.
         let inline = &*std::ptr::addr_of!((*sym_ptr).inline_register_banks);
@@ -595,7 +598,7 @@ thread_local! {
     /// The current bridge trace's full-body walk hit a deterministic
     /// structural decline.  The walker only knows `(w_code, start_pc)`; the
     /// bridge launcher still has the originating guard descr and consumes this
-    /// bit to populate `MetaInterp::declined_bridge_guards`.
+    /// bit so the bridge launcher marks the originating guard descriptor.
     static FBW_BRIDGE_DECLINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -621,6 +624,15 @@ fn p2_drain_abort() -> TraceAction {
 
 pub fn take_fbw_bridge_declined() -> bool {
     FBW_BRIDGE_DECLINED.with(|c| c.replace(false))
+}
+
+/// Start one bridge-tracing attempt with no decline inherited from a prior
+/// attempt.  A single RPython `MetaInterp.interpret()` can cross several merge
+/// points; pyre re-enters `trace_bytecode` for those segments, so clearing the
+/// bit inside `trace_bytecode` would erase a decline recorded by an earlier
+/// segment of the *same* attempt.
+pub fn reset_fbw_bridge_declined() {
+    FBW_BRIDGE_DECLINED.with(|c| c.set(false));
 }
 
 pub(crate) fn range_foriter_demoted(key: u64) -> bool {
@@ -1375,7 +1387,6 @@ pub fn trace_bytecode<Sym: WalkSym>(
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
     WALK_END_RESTART_PC.with(|c| c.set(None));
-    FBW_BRIDGE_DECLINED.with(|c| c.set(false));
     // A prior walk's opcode-effect-window sample must not alias a same-pc
     // opcode of this walk (the escape-flush latch gate reads it).
     crate::jitcode_dispatch::escape_opcode_window_reset();

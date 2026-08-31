@@ -5287,6 +5287,30 @@ pub fn builtin_abs_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     abs_structural(obj)
 }
 
+/// `int.__neg__` / `float.__neg__` / `complex.__neg__` as gateway functions.
+///
+/// The body is `neg_inner`, the structural half, not `neg`: an unbound slot
+/// must not re-run the `__neg__` override probe that `neg` opens with, or a
+/// subtype override wins over the slot it was reached through and an override
+/// delegating back to it never terminates.
+pub fn builtin_neg_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = match args {
+        [val] => *val,
+        _ => parse_single_required(args, "self", "__neg__")?,
+    };
+    crate::objspace::descroperation::neg_inner(obj)
+}
+
+/// `int.__pos__` / `float.__pos__` / `complex.__pos__` as gateway functions.
+/// Structural half only, for the reason [`builtin_neg_dunder`] gives.
+pub fn builtin_pos_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = match args {
+        [val] => *val,
+        _ => parse_single_required(args, "self", "__pos__")?,
+    };
+    crate::objspace::descroperation::pos_inner(obj)
+}
+
 fn abs_bad_operand(obj: PyObjectRef) -> crate::PyError {
     crate::PyError::type_error(format!(
         "bad operand type for abs(): '{}'",
@@ -9990,6 +10014,20 @@ fn exception_group_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 enum ExceptionGroupCondition {
     Class(PyObjectRef),
     Callable(PyObjectRef),
+    /// `app_group.py _exception_group_projection`'s `resultset`, which upstream
+    /// keeps as an `identity_dict` of the leaf objects.
+    ///
+    /// Addresses stand in for the objects here, and that is sound only because
+    /// every member is an exception: `w_exception_new_empty_impl` allocates one
+    /// through `try_gc_alloc_stable_raw`, the non-moving oldgen, precisely so a
+    /// carrier may hold it as a bare word across allocating code, and
+    /// `check_new_args` refuses a group member that is not a `BaseException`.
+    /// The walk between collecting these and testing the last child runs
+    /// arbitrary Python -- an overridden `derive`, a metaclass
+    /// `__instancecheck__`, a callable condition -- so were a leaf ever
+    /// nursery-allocated, a minor collection there would relocate one not yet
+    /// tested and this set would silently drop it.
+    /// `except_star_projection_gc_roots` is the guard on that invariant.
     Identity(Vec<usize>),
 }
 
@@ -13283,19 +13321,55 @@ fn nonascii_bytes_literal_span(source: &str, raw_index: usize) -> Option<(usize,
 /// CPython 3.14 `Parser/lexer/lexer.c`
 /// `maybe_raise_syntax_error_for_string_prefixes`.  Ruff tokenizes an
 /// incompatible prefix as a NAME followed by a STRING and reports the gap
-/// between simple statements, so recover the prefix immediately before the
-/// quote selected by that parser error and apply CPython's ordered checks.
+/// between simple statements, so recover the prefix around the quote selected
+/// by that parser error and apply CPython's ordered checks.
+///
+/// The quote is looked for on both sides of the reported token.  The check
+/// runs in the tokenizer, ahead of every grammar alternative, so the literal
+/// can stand after that token as well as before it: `invalid_assignment`
+/// names the target and the prefix is written in the value.
 fn incompatible_string_prefix_error(
     source: &str,
     raw_index: usize,
 ) -> Option<(String, usize, usize)> {
     let bytes = source.as_bytes();
-    let mut quote = raw_index.min(bytes.len());
-    if !matches!(bytes.get(quote), Some(b'\'' | b'"')) {
-        quote = bytes[..quote]
-            .iter()
-            .rposition(|byte| matches!(*byte, b'\'' | b'"'))?;
+    let anchor = raw_index.min(bytes.len());
+    // A reported token that is itself a quote is the literal in question, and
+    // stays the only candidate examined.
+    if matches!(bytes.get(anchor), Some(b'\'' | b'"')) {
+        return string_prefix_pair_error(bytes, anchor);
     }
+    let before = bytes[..anchor]
+        .iter()
+        .rposition(|byte| matches!(*byte, b'\'' | b'"'));
+    // The tokenizer does not read a comment, so neither does this walk -- the
+    // quote it stops on has to open a real token.  Starting outside a literal,
+    // the first quote reached is always an opening one.
+    let after = {
+        let mut cursor = anchor;
+        loop {
+            match bytes.get(cursor) {
+                None => break None,
+                Some(b'#') => {
+                    cursor = bytes[cursor..]
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(bytes.len(), |newline| cursor + newline + 1);
+                }
+                Some(b'\'' | b'"') => break Some(cursor),
+                Some(_) => cursor += 1,
+            }
+        }
+    };
+    [before, after]
+        .into_iter()
+        .flatten()
+        .find_map(|quote| string_prefix_pair_error(bytes, quote))
+}
+
+/// The ordered prefix-pair checks applied to the letters written immediately
+/// before `quote`.
+fn string_prefix_pair_error(bytes: &[u8], quote: usize) -> Option<(String, usize, usize)> {
     let mut start = quote;
     while start > 0
         && matches!(
@@ -13305,10 +13379,14 @@ fn incompatible_string_prefix_error(
     {
         start -= 1;
     }
+    // A prefix opens a token, so what stands before it has to close one.  An
+    // identifier running into the letters makes them part of that name, and a
+    // name carries bytes past ASCII too -- which is also what sits behind the
+    // closing quote of a literal whose text ends in those letters.
     if start == quote
         || bytes
             .get(start.wrapping_sub(1))
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .is_some_and(|byte| !byte.is_ascii() || byte.is_ascii_alphanumeric() || *byte == b'_')
     {
         return None;
     }

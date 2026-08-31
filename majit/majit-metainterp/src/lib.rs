@@ -1465,7 +1465,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
-/// entered, 1 = declined_bridge_guards short-circuit, 2 = descr_addr==0 skip,
+/// entered, 1 = guard-descr terminal-decline short-circuit, 2 = descr_addr==0 skip,
 /// 3 = status-busy skip, 4 = jitcounter FIRED (true), 5 = stack_almost_full
 /// returned true, 6 = start_retrace_from_guard entered, 7 = start_retrace bailed
 /// (source loop evicted: compiled_loops miss), 8 = compile_bridge entered (trace

@@ -197,14 +197,12 @@ struct TimingState {
 /// `opimpl_jit_force_quasi_immutable` (`pyjitpl.py`) carries on the
 /// `SwitchToBlackhole` instance it raises.
 ///
-/// The mapdict producer runs only when `PYRE_QMUT_MAPDICT_FORCE` is present in
-/// the environment: `mapdict_qmut_force_enabled` asks `var_os(..).is_some()`,
-/// so an empty value arms it too, and a `PYRE_*` name set by a caller reaches
-/// the child.  Nothing in the tree sets it, and with it unset a run reaches
-/// this tally only through `try_walker_force_quasi_immut_namespace_write`;
-/// that path is live, and — again with the variable unset —
+/// The mapdict producer mirrors `opimpl_jit_force_quasi_immutable` and runs
+/// whenever a traced mapdict write changes a quasi-immutable attribute.  The
+/// namespace producer remains independently live; for example,
 /// `MAJIT_STATS=1 PYRE_MC_DIAG=1` on
-/// `bench/synth/trace_too_long_effect_replay.py` prints `abrt_force_qmut=1`.
+/// `bench/synth/trace_too_long_effect_replay.py` reaches its
+/// `abrt_force_qmut` tally.
 pub const ABORT_COUNTER_KINDS: &[(i32, &str)] = &[
     (counters::ABORT_TOO_LONG, "too_long"),
     (counters::ABORT_BRIDGE, "bridge_or_generic"),

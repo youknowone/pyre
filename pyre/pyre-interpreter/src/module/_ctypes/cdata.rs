@@ -47,6 +47,94 @@ const STORAGE_KEYS: [&str; 7] = [
     OBJECTS_KEY,
 ];
 
+/// `_ctypes/primitive.py GlobalPyobjContainer.objs` — the table a `py_object`
+/// buffer indexes.
+///
+/// A `_SimpleCData` buffer is `malloc_raw` bytes: nothing traces them and
+/// nothing rewrites them, so the buffer cannot hold the object.  It holds the
+/// slot the object was added at, the way `_setvalue` / `_getvalue` spell it
+/// upstream.  The table is an ordinary movable `list`, forwarded by
+/// [`walk_pyobj_container_roots`].
+///
+/// One deviation from upstream, deliberate: the stored word is `num + 1`.
+/// A zero-based `num` would collide with the zero a fresh buffer holds, which
+/// both `_SimpleCData.__repr__`'s `<NULL>` and an unset `.value` read as "no
+/// object".
+static PYOBJ_CONTAINER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Forward the container for the process-global root walk.
+pub fn walk_pyobj_container_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let addr = PYOBJ_CONTAINER.load(Acquire);
+    if addr == 0 {
+        return;
+    }
+    let mut root = majit_ir::GcRef(addr);
+    visitor(&mut root);
+    PYOBJ_CONTAINER.store(root.0, Release);
+}
+
+/// `pyobj_container.add(obj)`, returning the word the buffer stores.
+fn pyobj_container_add(obj: PyObjectRef) -> usize {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    // Both the cell and the append allocate, so `obj` is published before the
+    // first of them and read back out of its slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    // `add` stores a weakref, and the object itself for the operands
+    // `weakref.ref` refuses -- an `int`, which is upstream's own example.
+    let cell = pyre_object::weakref::w_gc_weakref_box_new_or_strong(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    );
+    let cell_slot = pyre_object::gc_roots::pin_roots(&[cell]);
+    // Publish the table with a compare-exchange, not a load/store pair: two
+    // threads adding their first `py_object` can both read zero, and a plain
+    // store lets the second one replace a table the first has already appended
+    // to.  The first thread's buffer keeps an index into the discarded list,
+    // which then resolves against the winner and answers another thread's
+    // object.  The loser's empty list is unreachable and collectable.
+    // The exchange publishes a pointer to a list this thread has just
+    // written, so it releases; every consumer acquires, or the loser can
+    // reach the winner's table before that list's own fields are visible.
+    let mut table = PYOBJ_CONTAINER.load(Acquire);
+    if table == 0 {
+        // Nothing allocates between the list and the exchange, so the
+        // collector cannot run while the table is reachable only from
+        // this local.
+        let fresh = pyre_object::listobject::w_list_new_empty() as usize;
+        table = match PYOBJ_CONTAINER.compare_exchange(0, fresh, AcqRel, Acquire) {
+            Ok(_) => fresh,
+            Err(winner) => winner,
+        };
+    }
+    let table_slot = pyre_object::gc_roots::pin_roots(&[table as PyObjectRef]);
+    unsafe {
+        // Take the slot from the append itself rather than from a following
+        // `w_list_len`: the append drops the list lock before a length call
+        // reacquires it, so a second adder can land in between and both then
+        // read the same length.  Each buffer would keep the same word, and one
+        // `py_object` would resolve to the other thread's object.
+        pyre_object::listobject::w_list_append_returning_index(
+            pyre_object::gc_roots::shadow_stack_get(table_slot),
+            pyre_object::gc_roots::shadow_stack_get(cell_slot),
+        ) + 1
+    }
+}
+
+/// `pyobj_container.get(num)` for the word a `py_object` buffer holds.
+/// `None` for the zero a buffer starts at, and for a weakref whose target has
+/// since died -- upstream's `self.objs[num]()` answers `None` there too.
+pub(super) fn pyobj_container_get(num: usize) -> Option<PyObjectRef> {
+    use std::sync::atomic::Ordering::Acquire;
+    let table = PYOBJ_CONTAINER.load(Acquire) as PyObjectRef;
+    if num == 0 || table.is_null() {
+        return None;
+    }
+    let cell = unsafe { pyre_object::listobject::w_list_getitem(table, num as i64 - 1) }?;
+    let target = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(cell) };
+    (!target.is_null()).then_some(target)
+}
+
 static CDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 static SIMPLECDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
@@ -519,11 +607,7 @@ fn simplecdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
         return Ok(pyre_object::w_str_new(&format!("{name}(<NULL>)")));
     }
-    let value = if tc == "O" {
-        host_ctypes::read_pointer_from_buffer(cdata_bytes(obj).unwrap_or(&[])) as PyObjectRef
-    } else {
-        decode_slot(&tc, cdata_bytes(obj).unwrap_or(&[]))
-    };
+    let value = decode_slot(&tc, cdata_bytes(obj).unwrap_or(&[]));
     let rendered = unsafe { crate::display::py_repr_wtf8(value) }?;
     let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
     Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
@@ -684,18 +768,15 @@ fn value_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let tc = type_code_of(cls).ok_or_else(|| crate::PyError::type_error("abstract class"))?;
     let mut bytes = cdata_bytes(obj)
         .ok_or_else(|| crate::PyError::type_error("ctypes instance has no buffer"))?;
-    if tc == "O" {
-        let address = host_ctypes::read_pointer_from_buffer(bytes);
-        return Ok(if address == 0 {
-            pyre_object::w_none()
-        } else {
-            address as PyObjectRef
-        });
-    }
     // A BSTR carries no swapped spelling — `X` has no entry in the byte-order
     // tables — so it is read before the reversal below could reach it.
     #[cfg(windows)]
     if tc == "X" {
+        return Ok(decode_slot(&tc, bytes));
+    }
+    // Neither does `O`, and its word is a container slot rather than a value:
+    // reversing it would name a different object.
+    if tc == "O" {
         return Ok(decode_slot(&tc, bytes));
     }
     let swapped = unsafe { crate::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some();
@@ -1621,6 +1702,12 @@ pub(super) fn decode_slot(tc: &str, bytes: &[u8]) -> PyObjectRef {
     if tc == "X" {
         return bstr_to_pyobject(bytes);
     }
+    // `O_get` — the buffer holds the container slot, not the object.  An
+    // address stored here would dangle the first time the target moved.
+    if tc == "O" {
+        return pyobj_container_get(host_ctypes::read_pointer_from_buffer(bytes))
+            .unwrap_or_else(pyre_object::w_none);
+    }
     // `P_get` reads a null pointer as `None`, the way `z_get` and `Z_get` read
     // a null string as one; the host's table answers the address either way.
     if tc == "P" && host_ctypes::read_pointer_from_buffer(bytes) == 0 {
@@ -1830,7 +1917,7 @@ pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate:
             // written here — `read_pointer_from_buffer` reads it back.
             return Ok(addr.to_ne_bytes().to_vec());
         }
-        "O" => V::ObjectId(obj as usize),
+        "O" => V::ObjectId(pyobj_container_add(obj)),
         _ => V::Signed(crate::baseobjspace::int_w(obj)? as i128),
     };
     Ok(host_ctypes::simple_storage_value_to_bytes_endian(

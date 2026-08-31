@@ -108,6 +108,14 @@ pub trait Cpu: Send + Sync {
         let sizedescr = parent
             .as_size_descr()
             .ok_or("protect_speculative_field: parent_descr is not a size descr")?;
+        // A raw or headerless struct has no GC type-id word to validate.
+        // RPython reaches this shape through raw field operations; pyre can
+        // still carry the pointer in the Ref bank, so its GETFIELD_GC spelling
+        // must consult the descr's storage shape before asking the collector
+        // for a header that does not exist.
+        if !sizedescr.is_gc_managed() || sizedescr.headerless() {
+            return Ok(());
+        }
         if sizedescr.is_object() {
             if !majit_gc::check_is_object(gcptr) {
                 return Err("protect_speculative_field: gcptr is not an object");

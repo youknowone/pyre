@@ -3378,6 +3378,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
@@ -3471,6 +3472,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
@@ -3618,6 +3620,16 @@ impl FailDescr for ResumeAtPositionDescr {
         self.inner
             .fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
+    }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.inner
+            .bridge_declined_terminally
+            .load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.inner
+            .bridge_declined_terminally
+            .store(true, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
@@ -3792,6 +3804,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -3892,6 +3905,16 @@ impl FailDescr for ResumeGuardForcedDescr {
         self.inner
             .fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
+    }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.inner
+            .bridge_declined_terminally
+            .load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.inner
+            .bridge_declined_terminally
+            .store(true, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
@@ -4066,6 +4089,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -4147,6 +4171,16 @@ impl FailDescr for ResumeGuardExcDescr {
         self.inner
             .fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
+    }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.inner
+            .bridge_declined_terminally
+            .load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.inner
+            .bridge_declined_terminally
+            .store(true, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
@@ -4321,6 +4355,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -4399,6 +4434,9 @@ pub struct ResumeGuardCopiedDescr {
     /// Pyre-only per-trace fail-index — same role as on
     /// `ResumeGuardDescr`. Stamped by `build_guard_metadata`.
     fail_index_per_trace: AtomicU32,
+    /// Deterministic structural bridge refusal, owned by this copied guard
+    /// exactly like its independent `status` word.
+    bridge_declined_terminally: std::sync::atomic::AtomicBool,
     /// Pyre-only per-emission slot: codegen-time trace-op index.
     /// Classified per-emission alongside `history.py:132
     /// AbstractFailDescr._attrs_` `rd_locs` / `adr_jump_offset`
@@ -4562,6 +4600,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -4593,6 +4632,13 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_fail_index_per_trace(&self, fail_index: u32) {
         self.fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
+    }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.bridge_declined_terminally.load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.bridge_declined_terminally
+            .store(true, Ordering::Release);
     }
     /// compile.py `get_resumestorage(): return prev`: reads chase
     /// to the donor.  The `fail_arg_types` slot is shared too —
@@ -4885,6 +4931,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
+                bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
@@ -4917,6 +4964,16 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
         self.inner
             .fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
+    }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.inner
+            .bridge_declined_terminally
+            .load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.inner
+            .bridge_declined_terminally
+            .store(true, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         self.inner.fail_arg_types()
@@ -5089,6 +5146,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
@@ -5129,6 +5187,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -5309,6 +5368,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
+                bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
@@ -5344,6 +5404,16 @@ impl FailDescr for CompileLoopVersionDescr {
         self.inner
             .fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
+    }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.inner
+            .bridge_declined_terminally
+            .load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.inner
+            .bridge_declined_terminally
+            .store(true, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
@@ -5524,6 +5594,7 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -6092,6 +6163,7 @@ mod fail_descr_tests {
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
+                bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),

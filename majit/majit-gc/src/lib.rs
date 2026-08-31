@@ -3124,8 +3124,11 @@ pub fn gc_mark_finalizer_run(addr: usize) {
 /// tagged-pointer setting `is_valid_gc_object` consults.
 ///
 /// `is_nursery_object_start` is `addr != 0 && !tagged && nursery.contains(addr)`
-/// — three loads and two compares against fields that never move for the life
-/// of the GC instance (`reset` rewinds `free`, never `start`/`size`).  Reaching
+/// — three loads and two compares against fields that do not move for the life
+/// of the GC instance (`reset` rewinds `free`, never `size`; the one writer of
+/// `start` is `debug_rotate`, and an allocator that rotates answers
+/// `nursery_bounds` with `None` rather than publish a range a minor collection
+/// will move).  Reaching
 /// them through the hook chain instead costs a thread-local lookup, a `RefCell`
 /// borrow and a trait-object dispatch on every root pin and every root reload,
 /// which is where the query is actually hot.  Publishing them lets the common

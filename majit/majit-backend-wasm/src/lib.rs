@@ -3186,8 +3186,8 @@ fn transfer_call_assembler_target_activity(
 }
 
 /// Mark a CA target whose callee guard was structurally declined.  The host
-/// deopt helper calls this only after `MetaInterp` recorded the exact guard in
-/// `declined_bridge_guards`; invalidating the callers forces a retrace whose
+/// deopt helper calls this only after the exact guard descriptor was marked
+/// terminally declined; invalidating the callers forces a retrace whose
 /// admission check above restores the plain call path.
 pub fn mark_call_assembler_terminal_decline(compiled_ptr: usize) {
     unsafe {
@@ -4074,7 +4074,7 @@ impl majit_backend::Backend for WasmBackend {
         // the arities match, and the label's args are the complete live set of
         // the trace remainder (`label_resume_safe`); otherwise decline — the
         // guard then falls back to blackhole resume and
-        // `declined_bridge_guards` stops the metainterp re-tracing it.
+        // the guard descriptor's terminal bit stops the metainterp re-tracing it.
         // Non-peeled loops (entry == LABEL) re-enter correctly and keep
         // chaining.
         let bridge_is_loop_closing = has_cross_loop_terminal_jump(ops);
@@ -4117,7 +4117,7 @@ impl majit_backend::Backend for WasmBackend {
         // livelock at constant stack depth and heap state). Such a bridge is a
         // guard side-trace that omits the loop body's advancing arithmetic; it
         // has no correct in-module resume, so decline it — the guard falls back
-        // to blackhole resume and `declined_bridge_guards` stops the metainterp
+        // to blackhole resume and the guard descriptor's terminal bit stops the metainterp
         // re-tracing it. A genuinely advancing loop-closing bridge (an `i += 1`
         // counter feeding a JUMP arg) passes and keeps chaining.
         //
