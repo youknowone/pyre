@@ -4799,6 +4799,17 @@ fn run_perfn_walk<Sym: WalkSym>(
         if segment_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] adopted ABORT_SEGMENTED_TRACE forward resume");
         }
+        // The cut latches AT the `jit_merge_point` op, so the blackhole leaves
+        // through `ContinueRunningNormally` without executing a Python opcode
+        // and cannot produce a `DoneWithThisFrame` of its own.  That is why
+        // this leg is absent from `blackhole_terminal_no_replay` below, where
+        // `TraceTooLong` -- which latches mid-body and CAN finish the frame --
+        // belongs.  The census names the invariant so a future latch
+        // coordinate cannot move without the count answering: measured 0 over
+        // 92 adopts.
+        if segment_adopted && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some() {
+            crate::jitcode_dispatch::census_record("SegmentTrace::AdoptedWithFinish");
+        }
         // Every OTHER aborting error is the same situation: the walk executed
         // residuals concretely and then stopped, so replaying the region from
         // the trace entry re-applies those effects.  `convert_and_run_from_

@@ -208,12 +208,17 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         top_regs_i[top_num_regs_i + i] = trace_ctx.const_int(v);
         top_concrete_i[top_num_regs_i + i] = ConcreteValue::Int(v);
     }
+    // A constant-pool slot holds a KNOWN value, so a zero is the known
+    // `PY_NULL` -- `concrete_value_from_slot`'s convention, where
+    // `ConcreteValue::Null` means "untracked" instead.  Withholding the shadow
+    // for a null constant reads back as untracked and declines every consumer
+    // that asks what a `ConstRef(0)` operand is: a plain call's `null_or_self`
+    // arrives spelled that way (`codewriter.rs`'s non-portal PY_NULL self
+    // slot).
     for (i, v) in top_constants_r.iter().enumerate() {
         let v = v.get();
         top_regs_r[top_num_regs_r + i] = trace_ctx.const_ref(v);
-        if v != 0 {
-            top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
-        }
+        top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in top_constants_f.iter().enumerate() {
         top_regs_f[top_num_regs_f + i] = trace_ctx.const_float(v);
@@ -1165,12 +1170,12 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         regs_i[num_regs_i + i] = ctx.const_int(v);
         concrete_i[num_regs_i + i] = ConcreteValue::Int(v);
     }
+    // A null constant is a known `PY_NULL`, not an untracked slot -- same
+    // reading as the top-level seeding above and as `build_callee_banks`.
     for (i, v) in jc.constants_r.iter().enumerate() {
         let v = v.get();
         regs_r[num_regs_r + i] = ctx.const_ref(v);
-        if v != 0 {
-            concrete_r[num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
-        }
+        concrete_r[num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in jc.constants_f.iter().enumerate() {
         regs_f[num_regs_f + i] = ctx.const_float(v);

@@ -7992,6 +7992,10 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
 /// The fused 3.14 `LOAD_SUPER_ATTR` reaches pyre as one opaque may-force
 /// residual; this reconstructs that upstream shape under the same start-class,
 /// receiver-class and type-version guards as the non-Python `super` folds.
+///
+/// The zero-argument spelling is the only one that arrives fused.
+/// [`try_walker_inline_super_proxy_property_get`] takes the two-argument one,
+/// which `codewriter.rs` lowers to a call and an attribute load.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_inline_super_property_get<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -8147,8 +8151,14 @@ pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
     };
     let concrete_cls = unsafe { pyre_object::descriptor::w_super_get_type(concrete_proxy) };
     let concrete_self = unsafe { pyre_object::descriptor::w_super_get_obj(concrete_proxy) };
-    let Some((objtype, _version_tag, w_descr, class_mode)) = (unsafe {
-        pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, name)
+    let objtype = unsafe { pyre_object::descriptor::w_super_get_obj_type(concrete_proxy) };
+    let Some((_version_tag, w_descr, class_mode)) = (unsafe {
+        pyre_interpreter::baseobjspace::super_attr_proxy_fast_path(
+            concrete_cls,
+            objtype,
+            concrete_self,
+            name,
+        )
     }) else {
         return Ok(None);
     };
@@ -8186,6 +8196,7 @@ pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
         proxy_w_class,
         concrete_self,
         concrete_cls,
+        objtype,
     )?;
     super::specialize::walker_emit_super_attr_lookup_guards(
         ctx,

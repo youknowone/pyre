@@ -2906,27 +2906,6 @@ fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Whether `localsplus[0]` itself needs a cell dereference, and the slot the
-/// `__class__` cell occupies in `code`.
-///
-/// This is `pyframe.py _get_self_location` plus
-/// `builtins.rs super_operands_from_frame`: a positional argument is required,
-/// and when its name is also a cellvar the fast-local slot holds the `Cell`
-/// shared with closures rather than the receiver directly.
-fn bare_super_frame_layout(code: &pyre_interpreter::CodeObject) -> Option<(bool, usize)> {
-    if code.arg_count == 0 {
-        return None;
-    }
-    let self_is_cell = code
-        .varnames
-        .first()
-        .is_some_and(|first| code.cellvars.iter().any(|cell| cell == first));
-    let class_freevar = code.freevars.iter().position(|name| name == "__class__")?;
-    let class_slot =
-        code.varnames.len() + pyre_interpreter::pyframe::npure_cellvars(code) + class_freevar;
-    Some((self_is_cell, class_slot))
-}
-
 /// The two operands `builtins.rs super_operands_from_frame` reads off the
 /// frame, resolved as SSA values: `localsplus[0]` and the `__class__` freevar
 /// cell.
@@ -2953,8 +2932,8 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
         }
         // SAFETY: the code object outlives the walk that resolved it; read-only.
         let code = unsafe { shadow.code_ptr.as_ref()? };
-        let (self_is_cell, class_slot) = bare_super_frame_layout(code)?;
-        let class_slot = class_slot as i64;
+        let layout = pyre_interpreter::builtins::bare_super_frame_layout(code)?;
+        let class_slot = layout.class_slot? as i64;
         let slot_op = |slot: i64| -> Option<OpRef> {
             let op = shadow.opref.get(&slot).copied()?;
             // Only an entry recorded through THIS level's frame register
@@ -2962,7 +2941,7 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
             // own-frame vable read applies.
             (shadow.concrete.get(&slot)?.frame_reg == shadow.fold_frame_reg).then_some(op)
         };
-        return Some((slot_op(0)?, slot_op(class_slot)?, self_is_cell));
+        return Some((slot_op(0)?, slot_op(class_slot)?, layout.self_is_cell));
     }
     // A sub-walk that owns no shadow walks a frame the standard virtualizable
     // does not name, and a trace has exactly one of those.
@@ -2985,7 +2964,8 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
     // SAFETY: the frame is the live standard virtualizable; read-only.
     let code_ptr = unsafe { pyre_interpreter::pyframe::pyframe_get_pycode(&*frame) };
     let code = unsafe { code_ptr.as_ref()? };
-    let (self_is_cell, class_slot) = bare_super_frame_layout(code)?;
+    let layout = pyre_interpreter::builtins::bare_super_frame_layout(code)?;
+    let class_slot = layout.class_slot?;
     // `locals_cells_stack_w` is PyFrame's only virtualizable array
     // (`virtualizable_gen.rs arrays`), so array index 0 names it.
     let info = ctx.trace_ctx.virtualizable_info()?;
@@ -3005,7 +2985,7 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
         .trace_ctx
         .virtualizable_entry_at(info.get_index_in_array(0, class_slot, lengths))?
         .0;
-    Some((self_op, cell_op, self_is_cell))
+    Some((self_op, cell_op, layout.self_is_cell))
 }
 
 /// Zero-argument `super()` folded to the proxy itself rather than re-routed to
@@ -3196,46 +3176,49 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
 /// Zero-argument `super()` reached as a call, i.e. the `LOAD_GLOBAL super` +
 /// `CALL` spelling a name binding produces rather than `LOAD_SUPER_ATTR`.
 ///
-/// Both spellings force the virtualizable — `codewriter.rs` binds
-/// `load_super_attr_fn` with `CallFlavor::MayForce`, because a descriptor
-/// `__get__` may run Python — so this is not about removing a force.  What
-/// differs is where the force happens.  `LOAD_SUPER_ATTR` forces inside a
-/// may-force residual that carries the red frame as an operand, which the
-/// walker models.  The call spelling reaches `builtin_super`'s zero-argument
-/// tail, whose `ExecutionContext::gettopframe()` runs `force_frame` INSIDE an
-/// opaque `bh_call_fn`; that clears `TOKEN_TRACING_RESCALL` and
-/// `tracing_after_residual_call` reads it back as
+/// A substitution, not a fold: the call stays a may-force residual, still
+/// guarded and still concrete-executed by the shared tail in
+/// `dispatch_residual_call_iRd_kind`, so the force and exception guards, the
+/// heapcache invalidation and the dst writeback are the ones the generic path
+/// already emits.  What changes is the target.
+///
+/// The generic `bh_call_fn` this replaces reaches `builtin_super`'s
+/// zero-argument tail, whose `ExecutionContext::gettopframe()` runs
+/// `force_frame` INSIDE an opaque residual; that clears
+/// `TOKEN_TRACING_RESCALL` and `tracing_after_residual_call` reads it back as
 /// `VableEscapedDuringResidualCall`.  The frame `gettopframe` answers with is
-/// the one being traced, so that residual always escapes and the loop always
-/// aborts.
+/// the one being traced, so that residual always escapes, the walk always
+/// aborts, and after `MAX_TRACE_ABORT_COUNT` of them the merge point is
+/// stamped `JC_DONT_TRACE_HERE` for the rest of the process.
 ///
-/// So the emission is a re-route: name
-/// [`crate::helpers::jit_bare_super_from_frame`] — the same `descriptor.py
-/// _super_from_frame` half `bh_load_super_attr_fn` calls — as a may-force
-/// residual taking the walk's own frame box.  The force still happens; it moves
-/// to the channel the walker can see, which is the difference between an
-/// escape and an ordinary forced residual.
+/// [`crate::helpers::jit_bare_super_from_frame`] is the same `descriptor.py
+/// _super_from_frame` half `bh_load_super_attr_fn` calls, and it takes the
+/// frame as an operand.  Naming it directly is what lets the name-bound
+/// spelling take the route `LOAD_SUPER_ATTR` already takes: there is nothing
+/// for the callee to rediscover, so nothing forces the way `gettopframe` does.
 ///
-/// Only the receivers `super_check` settles without running Python are folded.
-/// [`pyre_interpreter::builtins::builtin_super_from_frame_python_free`] answers
-/// `None` for the rest, and they keep the generic residual.
+/// Every receiver is admitted, including the ones `_super_check` can only
+/// settle by asking Python.  Restricting it to the settled half is what an
+/// earlier version did, and the decline is what cost the abort — the fall-back
+/// was the escaping residual, so a `__class__` property was paid for with the
+/// whole trace.  The shared tail is what makes the wider admission safe: it
+/// brackets the call with `vable_and_vrefs_before_residual_call`, transcribes a
+/// raise into `last_exc_value` the way `execute_raised` does, and counts the
+/// call on the executed-effect odometer (through
+/// [`majit_ir::RuntimeHelperKind::BareSuperFromFrame`]) so a nested abort
+/// cannot rewind past a property that has already run.  Executing at record
+/// time and THEN declining is the one shape that would double it, and it is
+/// what site E of `bare_super_frame_escape.py` pins.
 ///
-/// The walk executes its residuals concretely, and this one would otherwise run
-/// `super_check`'s `__class__` lookup — arbitrary code, which is free to force
-/// the very virtualizable being recorded against and whose side effects a
-/// decline would then repeat under the generic residual.  Restricting the fold
-/// to the settled half makes the recording-time call a read: it cannot force,
-/// so it owes no `vrefs_before/after_residual_call` bracket around itself, and
-/// it cannot raise, so there is no exception to carry.  The runtime leaf still
-/// runs the whole entry point, which is what the trailing `GuardNotForced` and
-/// `GuardNoException` are for.
+/// The virtual fold ([`try_walker_specialize_bare_super_virtual`]) runs ahead
+/// of this and answers without any call at all where it can; this is what its
+/// declines fall through to.
 pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<Option<DirectResidualSubst>, DispatchError> {
     // `super()` with no user arguments arrives as `[callable, null_or_self]`.
     if r_args.len() != 2 {
         return Ok(None);
@@ -3252,15 +3235,11 @@ pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let Some((frame_box, frame_ptr)) = walker_executing_frame_box(ctx) else {
+    let Some((frame_box, _frame_ptr)) = walker_executing_frame_box(ctx) else {
         return Ok(None);
     };
-    // Ahead of every emission, so a decline leaves the trace untouched.
-    let Some(proxy) = pyre_interpreter::builtins::builtin_super_from_frame_python_free(
-        frame_ptr as *mut pyre_interpreter::PyFrame,
-    ) else {
-        return Ok(None);
-    };
+
+    // ── tentative commit ──
     // Pin the callable the way the constructor folds do, so rebinding the
     // global `super` side-exits instead of keeping this route.
     let callable_op = r_args[0];
@@ -3273,34 +3252,38 @@ pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(callable_op, expected);
     }
-    residual_call::maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
-    // `MOST_GENERAL`, not a fresh `EffectInfo`: the leaf is the whole entry
-    // point, whose `super_check` arm can run a `__class__` property, so no
-    // read/write descr set describes it.  A constructed `EffectInfo` inherits
-    // EMPTY sets, which claims the opposite and lets the optimizer keep cached
-    // fields across the call.  `RandomEffects` outranks
-    // `ForcesVirtualOrVirtualizable`, so this keeps the may-force reading the
-    // `GuardNotForced` below depends on.
-    let result = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallMayForceR,
-        crate::helpers::jit_bare_super_from_frame as *const (),
-        &[frame_box],
-        &[majit_ir::Type::Ref],
-        majit_ir::Type::Ref,
-        majit_ir::EffectInfo::MOST_GENERAL,
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        result,
-        majit_ir::Value::Ref(majit_ir::GcRef(proxy as usize)),
-    );
-    // The dst is written before both guards, the ordering
-    // `_opimpl_residual_call*` keeps so the dst slot's OpRef rides their
-    // snapshots.
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
-    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
-    Ok(Some(()))
+    let funcptr = ctx
+        .trace_ctx
+        .const_int(crate::helpers::jit_bare_super_from_frame as *const () as i64);
+    Ok(Some(DirectResidualSubst {
+        funcptr,
+        descr: bare_super_from_frame_descr(),
+        allboxes: vec![funcptr, frame_box],
+    }))
+}
+
+/// The descr the zero-argument `super()` substitution installs: `(Ref) -> Ref`,
+/// `MOST_GENERAL`, tagged [`majit_ir::RuntimeHelperKind::BareSuperFromFrame`].
+///
+/// `MOST_GENERAL`, not a constructed `EffectInfo`: the leaf is the whole entry
+/// point, whose `_super_check` arm can run a `__class__` property, so no
+/// read/write descr set describes it and an empty one would claim the opposite,
+/// letting the optimizer keep cached fields across the call.  `RandomEffects`
+/// outranks `ForcesVirtualOrVirtualizable`, which is what keeps
+/// `select_residual_call_opcode` on the may-force branch and the trailing
+/// `GuardNotForced` meaningful.
+///
+/// The helper tag on top of it is the executed-effect odometer's only reader
+/// here — see the variant's own documentation.
+pub(crate) fn bare_super_from_frame_descr() -> DescrRef {
+    majit_metainterp::make_call_descr_with_effect(
+        &[Type::Ref],
+        Type::Ref,
+        majit_ir::EffectInfo {
+            runtime_helper: majit_ir::RuntimeHelperKind::BareSuperFromFrame,
+            ..majit_ir::EffectInfo::MOST_GENERAL
+        },
+    )
 }
 
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
@@ -4653,12 +4636,15 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
 /// shape is reached — as
 /// [`try_walker_specialize_load_bound_method_attr`] does for `LOAD_ATTR`.
 ///
-/// The stack operands are authoritative for BOTH oparg forms.  The
-/// zero-argument frame path they stand in for reads `locals_w[0]` and the
-/// `__class__` freevar cell (`super_operands_from_frame`), which are exactly
-/// what the `LOAD_FAST 0` / `LOAD_DEREF __class__` preceding this opcode
-/// pushed; `LOAD_SUPER_ATTR_ATTR` / `LOAD_SUPER_ATTR_METHOD` read the same
-/// two stack entries regardless of `oparg & 2`.
+/// Only the zero-argument oparg form reaches here: `codewriter.rs` lowers
+/// `super(C, self).name` to `simple_call` + `getattr`, which
+/// [`try_walker_specialize_two_arg_super_call`] and
+/// [`try_walker_specialize_load_attr_on_super`] answer between them.
+///
+/// The stack operands are authoritative for that form too.  The frame path
+/// they stand in for reads `locals_w[0]` and the `__class__` freevar cell
+/// (`super_operands_from_frame`), which are exactly what the `LOAD_FAST 0` /
+/// `LOAD_DEREF __class__` preceding this opcode pushed.
 ///
 /// This emits one runtime guard FEWER than the ordinary method load: there is
 /// no instance-map / exception-dict shadow guard, because
@@ -5046,18 +5032,30 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
         }
 
         // Pin the Python-level class exactly: a subclass reaching the same
-        // physical layout has its own MRO suffix after `cls`.
+        // physical layout has its own MRO suffix after `cls`, and the
+        // slot-wrapper binding was settled against this class.  It also decides
+        // instance mode against class mode, whose arm above pins the receiver
+        // to `objtype` itself.
+        //
+        // In the opcode spelling this constant IS `objtype`, because
+        // `super_attr_fast_path` declines a receiver whose `w_class` is
+        // anything else -- there this guard is what proves the class the walk
+        // used.  A proxy proves that from its own `w_objtype` field instead,
+        // and its receiver's class may be unrelated.
+        let self_class_const = ctx
+            .trace_ctx
+            .const_ref(unsafe { (*concrete_self).w_class } as i64);
         let w_class_op =
             walker_record_getfield_gc_r_uncached(ctx, self_obj, crate::descr::w_class_descr());
         walker_emit_fold_guard_with_snapshot(
             ctx,
             op_pc,
             OpCode::GuardValue,
-            &[w_class_op, objtype_const],
+            &[w_class_op, self_class_const],
         )?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .replace_box(w_class_op, objtype_const);
+            .replace_box(w_class_op, self_class_const);
     }
 
     // typeobject.py `promote(self.version_tag())`.  Every class the suffix
@@ -5121,11 +5119,17 @@ pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
     };
     let concrete_cls = unsafe { pyre_object::descriptor::w_super_get_type(concrete_proxy) };
     let concrete_self = unsafe { pyre_object::descriptor::w_super_get_obj(concrete_proxy) };
-    // `super_attr_fast_path` refuses a null receiver (the unbound `super(C)`
-    // proxy), `__class__` / `__dict__`, an uncacheable type and a name no MRO
-    // suffix answers -- every shape this must not emit.
-    let Some((objtype, _version_tag, w_descr, class_mode)) = (unsafe {
-        pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, name)
+    let objtype = unsafe { pyre_object::descriptor::w_super_get_obj_type(concrete_proxy) };
+    // `super_attr_proxy_fast_path` refuses a null receiver (the unbound
+    // `super(C)` proxy), `__class__` / `__dict__`, an uncacheable type and a
+    // name no MRO suffix answers -- every shape this must not emit.
+    let Some((_version_tag, w_descr, class_mode)) = (unsafe {
+        pyre_interpreter::baseobjspace::super_attr_proxy_fast_path(
+            concrete_cls,
+            objtype,
+            concrete_self,
+            name,
+        )
     }) else {
         return Ok(None);
     };
@@ -5140,6 +5144,7 @@ pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
         proxy_w_class,
         concrete_self,
         concrete_cls,
+        objtype,
     )?;
     let value_op = walker_emit_super_attr_result(
         ctx,
@@ -5158,12 +5163,16 @@ pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
 }
 
 /// Guard an already-built `super` proxy as the exact builtin implementation
-/// and expose its two live lookup operands to the trace.
+/// and expose its three live lookup operands to the trace.
 ///
 /// Both the Python-free result fold and the property-getter inline use this
 /// prefix.  Descriptor classification happens before entry, so no caller can
 /// decline after these guards merely because the selected descriptor needs a
 /// different binding path.
+///
+/// `w_objtype` is guarded here and the two returned operands are not, because
+/// the callers pin those through
+/// [`walker_emit_super_attr_lookup_guards`], which the opcode spelling shares.
 pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -5171,6 +5180,7 @@ pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
     proxy_w_class: pyre_object::PyObjectRef,
     concrete_self: pyre_object::PyObjectRef,
     concrete_cls: pyre_object::PyObjectRef,
+    concrete_objtype: pyre_object::PyObjectRef,
 ) -> Result<(OpRef, OpRef), DispatchError> {
     let super_type_addr = &pyre_object::descriptor::SUPER_TYPE as *const _ as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
@@ -5188,6 +5198,29 @@ pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
         concrete_cls,
     );
     let self_op = walker_read_super_field(ctx, obj, crate::descr::super_obj_descr(), concrete_self);
+    // `w_objtype` is the class the suffix walk answers with, and on a proxy it
+    // is a stored word rather than something derived from the receiver, so it
+    // is pinned where it is read.  This is the whole of the proof for the
+    // receivers `_super_check` needs Python to settle: their `w_class` says
+    // nothing about the class the proxy resolved.
+    let objtype_op = walker_read_super_field(
+        ctx,
+        obj,
+        crate::descr::super_obj_type_descr(),
+        concrete_objtype,
+    );
+    if !objtype_op.is_constant() {
+        let objtype_const = ctx.trace_ctx.const_ref(concrete_objtype as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[objtype_op, objtype_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(objtype_op, objtype_const);
+    }
     Ok((self_op, cls_op))
 }
 
@@ -14828,13 +14861,16 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// The substituted residual [`try_walker_specialize_set_add_method`] hands
-/// back: the funcbox, the minted `(Ref, Ref) -> Ref` MayForce call descr, and
-/// the `[funcbox, receiver, value]` arglist.  The generic residual path
-/// records and executes it exactly as it would the call it replaces, so the
+/// The substituted residual a re-routing arm hands back: the funcbox, a minted
+/// MayForce call descr, and the arglist that goes with them (the funcbox
+/// first, as the generic path builds it).  The generic residual path records
+/// and executes it exactly as it would the call it replaces, so the
 /// force/exception guards, the heapcache invalidation and the result
 /// writeback all stay where they are.
-pub(crate) struct SetAddDirectResidual {
+///
+/// Two arms produce one: [`try_walker_specialize_set_add_method`] and
+/// [`try_walker_specialize_bare_super_call`].
+pub(crate) struct DirectResidualSubst {
     pub(crate) funcptr: OpRef,
     pub(crate) descr: DescrRef,
     pub(crate) allboxes: Vec<OpRef>,
@@ -14878,7 +14914,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
-) -> Result<Option<SetAddDirectResidual>, DispatchError> {
+) -> Result<Option<DirectResidualSubst>, DispatchError> {
     if r_args.len() != 3 {
         return Ok(None);
     }
@@ -14961,7 +14997,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     let funcptr = ctx
         .trace_ctx
         .const_int(pyre_interpreter::runtime_ops::jit_set_add_method as *const () as i64);
-    Ok(Some(SetAddDirectResidual {
+    Ok(Some(DirectResidualSubst {
         funcptr,
         descr: set_add_method_descr(),
         allboxes: vec![funcptr, self_ref, r_args[2]],

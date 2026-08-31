@@ -105,8 +105,11 @@ class Portal(Base):
     """Site F's own class: the loop is inside the method that calls `super()`.
 
     A method whose own body carries the loop is the frame the portal traces,
-    not a callee the trace inlines, so the slot shadow the virtual fold reads
-    does not exist here and the re-routed residual owns the call.
+    not a callee the trace inlines, so there is no callee slot shadow here and
+    `walker_bare_super_frame_slots` reads the standard virtualizable instead.
+    Both channels reach the virtual fold -- `PYRE_FBW_SPEC_CENSUS=1` reads
+    `bare_super_virtual fired=1` on this shape as well as on A/B/C -- which is
+    what a fold reading only the shadow would get wrong here.
     """
 
     def run_own_loop(self, n):
@@ -120,9 +123,12 @@ class Portal(Base):
 class Captured(Base):
     """Site G's own class: `self` is a cellvar, shared with slot zero.
 
-    `_get_self_location`'s cellvar branch reads the receiver out of that cell.
-    The virtual fold does not model the second dereference and declines, so
-    this is the shape the re-routed residual still owns.
+    `_get_self_location`'s cellvar branch reads the receiver out of that cell,
+    and the virtual fold performs the same guarded live dereference as
+    LOAD_DEREF before `_super_check` sees the receiver: `PYRE_FBW_SPEC_CENSUS=1`
+    reads `bare_super_virtual fired=1` here.  `Rebound` below is the shape that
+    keeps the re-route, so the two together cover both labels in the
+    `spec-folds` header.
     """
 
     def val(self):

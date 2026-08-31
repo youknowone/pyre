@@ -6277,6 +6277,14 @@ pub extern "C" fn bh_import_from_fn(module: i64, w_code_ptr: i64, name_idx: i64)
 }
 
 /// LOAD_SUPER_ATTR residual (`load_super_attr` HLOp → `residual_call_ir_r`).
+///
+/// The codewriter emits this HLOp for the ZERO-argument oparg form only, so
+/// `is_two_arg` arrives 0; the two-argument form is lowered to `simple_call`
+/// plus `getattr` instead, which is the same two steps spelled as two ops.
+/// The two-argument arm below is kept because it is what the operand means,
+/// and because dropping it would leave the helper's shape disagreeing with the
+/// HLOp's.
+///
 /// Resolves the attribute name from the jitcode's code object via `name_idx`
 /// (same `co_names` invariant as `bh_load_attr_fn`), calls the actual global
 /// `super` value with zero or two arguments, and runs `getattr` (both calls may
