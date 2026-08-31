@@ -1321,7 +1321,7 @@ fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
     crate::module::gc::hook::walk_hook_roots(visitor);
     crate::module::sys::vm::walk_monitoring_tool_roots(visitor);
     crate::module::thread::walk_thread_roots(visitor);
-    #[cfg(all(any(unix, windows), feature = "host_env"))]
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     crate::module::_ctypes::cdata::walk_pyobj_container_roots(visitor);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     crate::module::faulthandler::handler::walk_faulthandler_roots(visitor);
