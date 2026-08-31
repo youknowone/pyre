@@ -1919,7 +1919,13 @@ pub fn mc_diag_summary() -> String {
 ///
 /// Off unless `MAJIT_GUARD_CENSUS` is set: the map write sits on the deopt
 /// path, which is exactly the path under study.
-static GUARD_CENSUS: parking_lot::Mutex<Option<Vec<((u64, u32), u64)>>> =
+///
+/// The key carries `trace_id` beside `fail_index` because an index is
+/// allocated per trace: a bridge's guards re-use the numbers of the loop they
+/// hang off, so without it one row sums the original guard and every bridge
+/// guard that landed on the same number, and the sum reads as a guard that no
+/// bridge ever covered.
+static GUARD_CENSUS: parking_lot::Mutex<Option<Vec<((u64, u64, u32), u64)>>> =
     parking_lot::Mutex::new(None);
 
 /// Turn the census on where `MAJIT_GUARD_CENSUS` cannot be read.
@@ -1945,15 +1951,16 @@ fn guard_census_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("MAJIT_GUARD_CENSUS").is_some())
 }
 
-pub fn guard_census_record(green_key: u64, fail_index: u32) {
+pub fn guard_census_record(green_key: u64, trace_id: u64, fail_index: u32) {
     if !guard_census_enabled() {
         return;
     }
     let mut slot = GUARD_CENSUS.lock();
     let rows = slot.get_or_insert_with(Vec::new);
-    match rows.iter_mut().find(|(k, _)| *k == (green_key, fail_index)) {
+    let key = (green_key, trace_id, fail_index);
+    match rows.iter_mut().find(|(k, _)| *k == key) {
         Some((_, count)) => *count += 1,
-        None => rows.push(((green_key, fail_index), 1)),
+        None => rows.push((key, 1)),
     }
 }
 
@@ -1969,7 +1976,7 @@ pub fn guard_census_summary(top: usize) -> String {
     let heaviest = rows
         .iter()
         .take(top)
-        .map(|((key, fail_index), count)| {
+        .map(|((key, trace_id, fail_index), count)| {
             // `<code name> #<pc>` only: `get_printable_location` continues with
             // the decoded instruction, whose `{ .. }` debug spelling carries
             // spaces and would run two entries of this space-separated list
@@ -1977,7 +1984,7 @@ pub fn guard_census_summary(top: usize) -> String {
             let name = loop_census::name_for(*key)
                 .map(|line| line.split_whitespace().take(2).collect::<Vec<_>>().join(""))
                 .unwrap_or_else(|| key.to_string());
-            format!("{name}/{fail_index}:{count}")
+            format!("{name}/t{trace_id}/{fail_index}:{count}")
         })
         .collect::<Vec<_>>()
         .join(" ");

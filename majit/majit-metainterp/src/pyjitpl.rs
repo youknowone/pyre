@@ -2879,7 +2879,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.stats.guard_failures
         };
         *tally += 1;
-        crate::guard_census_record(green_key, fail_index);
+        crate::guard_census_record(green_key, trace_id, fail_index);
         self.warm_state.log_guard_failure(fail_index);
         if let Some(ref hook) = self.hooks.on_guard_failure {
             hook(green_key, fail_index, 0);
