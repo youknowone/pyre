@@ -91,13 +91,22 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// by the codewriter — the same two populations `hook_access_field` creates
 /// upstream.
 ///
-/// Which gateways carry it is `hook_access_field`'s own condition,
-/// `if self.my_redirected_fields.get(cname.value)`: only a body that reads a
-/// field `interp_jit.py` lists in `_virtualizable_` (`last_instr`, `pycode`,
-/// `valuestackdepth`, `locals_cells_stack_w[*]`, `debugdata`, `w_globals`).
-/// `pyframe.rs` `descr_typecheck_fget_f_back` and `..._fget_f_builtins` read
-/// `f_backref` and `w_builtin`, so they carry none; each says so at its own
-/// definition, with what the extra marker measured.
+/// Which gateways carry it starts from `hook_access_field`'s own condition,
+/// `if self.my_redirected_fields.get(cname.value)` — and the redirected set is
+/// the one `pyre-jit-trace` `virtualizable_gen.rs` declares, not
+/// `interp_jit.py`'s string list: `last_instr`, `pycode`, `valuestackdepth`,
+/// `debugdata` and the `locals_cells_stack_w` array (`w_globals` is skipped;
+/// no `PyFrame` field answers to it).  `pyframe.rs`
+/// `descr_typecheck_fget_f_back` and `..._fget_f_builtins` read `f_backref`
+/// and `w_builtin`, so they carry none.
+///
+/// A hand-placed marker owes one question upstream's injection never has to
+/// ask, because it fires at every access in every graph rather than once per
+/// gateway: can the trace's shadow and the live frame disagree about the field
+/// this body reads?  For `pycode` they cannot — it is written only at frame
+/// construction — so `descr_typecheck_fget_f_code` carries no marker either.
+/// Each of the three says so at its own definition, with what the marker
+/// measured.
 ///
 /// Upstream reaches the rewrite because `hook_access_field` puts the marker
 /// at every redirected FIELD access, which lands it inside graphs the

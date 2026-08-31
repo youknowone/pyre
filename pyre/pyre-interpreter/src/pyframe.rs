@@ -3121,6 +3121,34 @@ register_frame_builtin_wrapper!(
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_code`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_code`.
+///
+/// No force marker, although `pycode` IS one of the redirected fields
+/// `virtualizable_gen.rs` declares — the one exception the sibling gateways'
+/// rule needs, and it turns on what the marker is FOR rather than on the field
+/// list.  Upstream `rvirtualizable.py hook_access_field` injects at every
+/// redirected access in every graph, so it never has to ask; pyre places the
+/// marker by hand at the gateway, so each placement owes the question "can the
+/// trace's shadow and the live frame disagree about this field?".
+///
+/// For `pycode` they cannot.  It is written exactly twice, both at frame
+/// construction (`PyFrame::__init__` and the allocator's field
+/// initialisation), and never again; a trace neither writes it back nor
+/// reseeds it.  [`PyFrame::restore_resume_state_from`] states the same thing
+/// from the other side — it restores `last_instr`, `valuestackdepth` and the
+/// locals array, and calls `pycode` frame-invariant.  So the marker cannot
+/// make this read answer differently, and all it does reach is the escape
+/// flush, which `virtualizable.py force_now` turns into
+/// `TOKEN_TRACING_RESCALL` → `TOKEN_NONE` → `pyjitpl` `ABORT_ESCAPE`.
+///
+/// Measured, with identical output on every fixture: carrying it costs
+/// `synth/exception_raise_caught_same_frame_tb` `guard_failures` 605 -> 803,
+/// `synth/exception_reentry_guard_finally_residual`
+/// 5/1027/0/6 -> 8/1903/2/5 (bridges/guard_failures/aborted/compiled),
+/// `synth/c_call_reports_the_callee_frame_not_the_inliners` its `root:inner`
+/// compile, and `synth/frame_chain_survives_a_recursive_call_assembler`
+/// `loop:hot` and `root:rec` — each of them a `tb_frame.f_code` or
+/// `frame.f_code` read from interpreted code nested inside a residual call,
+/// which is where the marker forces the caller's live virtualizable.
 pub fn __majit_wrap_descr_typecheck_fget_f_code(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -3129,7 +3157,6 @@ pub fn __majit_wrap_descr_typecheck_fget_f_code(
         return Ok(pyre_object::w_none());
     }
     let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
-    crate::executioncontext::jit_force_virtualizable(anchor.live());
     Ok(unsafe { &*anchor.live() }.fget_f_code())
 }
 
