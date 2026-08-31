@@ -106,12 +106,15 @@ fn pyobj_container_add(obj: PyObjectRef) -> usize {
     }
     let table_slot = pyre_object::gc_roots::pin_roots(&[table as PyObjectRef]);
     unsafe {
-        pyre_object::listobject::w_list_append(
+        // Take the slot from the append itself rather than from a following
+        // `w_list_len`: the append drops the list lock before a length call
+        // reacquires it, so a second adder can land in between and both then
+        // read the same length.  Each buffer would keep the same word, and one
+        // `py_object` would resolve to the other thread's object.
+        pyre_object::listobject::w_list_append_returning_index(
             pyre_object::gc_roots::shadow_stack_get(table_slot),
             pyre_object::gc_roots::shadow_stack_get(cell_slot),
-        );
-        // The append is a safepoint, so the table is read back from its slot.
-        pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(table_slot))
+        ) + 1
     }
 }
 

@@ -2551,6 +2551,39 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
     list.sync_allocated(old_size);
 }
 
+/// [`w_list_append`], answering the index the value landed at, read under the
+/// same guard as the append itself.
+///
+/// A caller that needs that index cannot append and then call [`w_list_len`]:
+/// the append releases the lock before the length reacquires it, so a second
+/// appender can land in between, and both callers then read the same length
+/// and claim the same slot.
+///
+/// The body is spelled out rather than shared with [`w_list_append`], whose
+/// exact shape the append fold descends -- routing that wrapper through a
+/// further call resolves `list_append_jitcode()` to `None` and turns every
+/// `list.append` into a `Void` residual.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`.
+pub unsafe fn w_list_append_returning_index(obj: PyObjectRef, value: PyObjectRef) -> usize {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    crate::gc_roots::publish_roots(&[obj, value]);
+    crate::gc_roots::normalize_roots(root_base, 2);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let value = crate::gc_roots::shadow_stack_get(root_base + 1);
+    let list = &mut *(obj as *mut W_ListObject);
+    let old_size = list.live_len();
+    w_list_append_inner(obj, value);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &mut *(obj as *mut W_ListObject);
+    list.sync_allocated(old_size);
+    old_size
+}
+
 /// CPython `list_extend_iter_lock_held`'s direct-store append while its
 /// length-hint reservation still has a free logical slot. The physical
 /// strategy append is identical; only `list_resize` is skipped.
