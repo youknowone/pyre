@@ -64,19 +64,19 @@ static PYOBJ_CONTAINER: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 
 /// Forward the container for the process-global root walk.
 pub fn walk_pyobj_container_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let addr = PYOBJ_CONTAINER.load(Relaxed);
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let addr = PYOBJ_CONTAINER.load(Acquire);
     if addr == 0 {
         return;
     }
     let mut root = majit_ir::GcRef(addr);
     visitor(&mut root);
-    PYOBJ_CONTAINER.store(root.0, Relaxed);
+    PYOBJ_CONTAINER.store(root.0, Release);
 }
 
 /// `pyobj_container.add(obj)`, returning the word the buffer stores.
 fn pyobj_container_add(obj: PyObjectRef) -> usize {
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
     // Both the cell and the append allocate, so `obj` is published before the
     // first of them and read back out of its slot.
     let _roots = pyre_object::gc_roots::push_roots();
@@ -93,13 +93,16 @@ fn pyobj_container_add(obj: PyObjectRef) -> usize {
     // to.  The first thread's buffer keeps an index into the discarded list,
     // which then resolves against the winner and answers another thread's
     // object.  The loser's empty list is unreachable and collectable.
-    let mut table = PYOBJ_CONTAINER.load(Relaxed);
+    // The exchange publishes a pointer to a list this thread has just
+    // written, so it releases; every consumer acquires, or the loser can
+    // reach the winner's table before that list's own fields are visible.
+    let mut table = PYOBJ_CONTAINER.load(Acquire);
     if table == 0 {
         // Nothing allocates between the list and the exchange, so the
         // collector cannot run while the table is reachable only from
         // this local.
         let fresh = pyre_object::listobject::w_list_new_empty() as usize;
-        table = match PYOBJ_CONTAINER.compare_exchange(0, fresh, Relaxed, Relaxed) {
+        table = match PYOBJ_CONTAINER.compare_exchange(0, fresh, AcqRel, Acquire) {
             Ok(_) => fresh,
             Err(winner) => winner,
         };
@@ -122,8 +125,8 @@ fn pyobj_container_add(obj: PyObjectRef) -> usize {
 /// `None` for the zero a buffer starts at, and for a weakref whose target has
 /// since died -- upstream's `self.objs[num]()` answers `None` there too.
 pub(super) fn pyobj_container_get(num: usize) -> Option<PyObjectRef> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let table = PYOBJ_CONTAINER.load(Relaxed) as PyObjectRef;
+    use std::sync::atomic::Ordering::Acquire;
+    let table = PYOBJ_CONTAINER.load(Acquire) as PyObjectRef;
     if num == 0 || table.is_null() {
         return None;
     }
