@@ -72,6 +72,10 @@
     "test.test_winreg": {
       "dynasm": "PASS",
       "reason": "Windows-only module: the shared IMPORTERROR is what a POSIX host sees for import winreg"
+    },
+    "test.test_wmi": {
+      "dynasm": "PASS",
+      "reason": "Windows-only module: _wmi reaches the local WMI service through COM and exists only on Windows. import_module('_wmi', required_on=['win']) re-raises instead of skipping on win32, so the module reports a result only where the extension is built"
     }
   },
   "stdlib_version": "3.14.6"

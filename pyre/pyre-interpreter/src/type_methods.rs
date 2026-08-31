@@ -2919,6 +2919,12 @@ fn format_spec_err(
         )),
         E::UnableToConvert => crate::PyError::value_error("Unable to convert int to float"),
         E::CodeNotInRange => crate::PyError::overflow_error("%c arg not in range(0x110000)"),
+        // A `c` code is read through `PyLong_AsLong`, so a value outside the C
+        // long range is reported as that conversion failing rather than as the
+        // code point range check.
+        E::IntTooLargeForCLong => {
+            crate::PyError::overflow_error("Python int too large to convert to C long")
+        }
         E::ZeroPadding => {
             crate::PyError::value_error("Zero padding is not allowed in complex format specifier")
         }
@@ -3482,15 +3488,18 @@ fn format_char(num: &BigInt, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
             "Alternate form (#) not allowed with integer format specifier 'c'",
         ));
     }
-    if pyre_object::jit_bigint_to_i64_fits(num) == 0 {
+    // The code is read through `PyLong_AsLong`, so it is a C `long` -- 32 bits
+    // on Windows -- that bounds it, and overflowing that is reported as the
+    // conversion failing rather than as a code point out of range.
+    let code = (pyre_object::jit_bigint_to_i64_fits(num) != 0)
+        .then(|| pyre_object::jit_bigint_to_i64_value(num))
+        .filter(|code| core::ffi::c_long::try_from(*code).is_ok());
+    let Some(code) = code else {
         return Err(crate::PyError::overflow_error(
             "Python int too large to convert to C long",
         ));
-    }
-    let cp = match u32::try_from(pyre_object::jit_bigint_to_i64_value(num))
-        .ok()
-        .and_then(CodePoint::from_u32)
-    {
+    };
+    let cp = match u32::try_from(code).ok().and_then(CodePoint::from_u32) {
         Some(cp) => cp,
         None => {
             return Err(crate::PyError::overflow_error(

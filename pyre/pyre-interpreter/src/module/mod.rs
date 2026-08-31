@@ -116,6 +116,8 @@ pub mod _weakref;
 #[allow(non_snake_case)]
 #[cfg(windows)]
 pub mod _winapi;
+#[cfg(all(windows, not(feature = "sandbox")))]
+pub mod _wmi;
 pub mod array;
 pub mod atexit;
 pub mod binascii;

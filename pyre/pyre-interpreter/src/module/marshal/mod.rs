@@ -18,7 +18,15 @@ const MAX_DEPTH: usize = wire::MAX_MARSHAL_STACK_DEPTH;
 
 fn marshal_error(error: wire::MarshalError) -> PyError {
     match error {
-        wire::MarshalError::Eof => eof_error("marshal data too short"),
+        // `r_string`'s buffer path, where fewer bytes are left than the run
+        // being read is long.
+        wire::MarshalError::DataTooShort => eof_error("marshal data too short"),
+        // `r_byte` running out, which is a field's byte rather than the byte an
+        // object starts with.
+        wire::MarshalError::Eof => eof_error("EOF read where not expected"),
+        // `r_object` replaces `r_byte`'s message when it is the type byte that
+        // never came.
+        wire::MarshalError::EofObject => eof_error("EOF read where object expected"),
         _ => PyError::value_error("bad marshal data"),
     }
 }

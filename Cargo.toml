@@ -74,16 +74,20 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # parity fixes from #8550 were merged.  `fix_code_filenames` needs `IndexMut`
 # to edit nested code constants in place, and `loads` relies on the #8552 hook
 # to preserve invalid code bytes, so this pin must not move below either.
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "cb7acec87d4c3e1e7f43b74f228656127008f523" }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "cb7acec87d4c3e1e7f43b74f228656127008f523" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "cb7acec87d4c3e1e7f43b74f228656127008f523" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "cb7acec87d4c3e1e7f43b74f228656127008f523" }
+#
+# Moved up again for the console read-boundary fix from #8621, and now also
+# names `MarshalError::DataTooShort` / `EofObject` and `CFormatType::Bytes`,
+# which arrived with it.
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
 ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "cb7acec87d4c3e1e7f43b74f228656127008f523" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "cb7acec87d4c3e1e7f43b74f228656127008f523" }
-rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "cb7acec87d4c3e1e7f43b74f228656127008f523" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "cb7acec87d4c3e1e7f43b74f228656127008f523" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
@@ -105,7 +109,7 @@ majit-charon-reader = { version = "0.0.2", path = "majit/majit-charon-reader" }
 
 # shared dependencies
 parking_lot = "0.12"
-malachite-bigint = "0.10"
+malachite-bigint = "0.11"
 num-traits = "0.2"
 num-integer = "0.1"
 bit-set = "0.10"

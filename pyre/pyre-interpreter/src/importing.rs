@@ -688,6 +688,10 @@ pub fn install_builtin_modules() {
     // `_winapi` import even though the Windows build installs `posix`.
     #[cfg(windows)]
     pyre_install_module!(_winapi);
+    // CPython's private `_wmi` module reaches the local WMI service through
+    // COM and is therefore present only on an unsandboxed Windows host.
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    pyre_install_module!(_wmi);
     // PyPy's `lib_pypy/_overlapped.py`: asyncio's proactor backend owns one
     // OVERLAPPED record per operation and reaches the Win32/WinSock calls
     // through this Windows-only builtin.
