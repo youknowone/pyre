@@ -3087,6 +3087,42 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> boo
     dunder_overridden(obj, fwd, t) || dunder_overridden(obj, rev, t)
 }
 
+/// `update_one_slot`'s duplicated-slotdef rule.  `slotdefs` names `__add__`
+/// twice — once at `nb_add`, once at `sq_concat` — and `__mul__` twice, at
+/// `nb_multiply` and `sq_repeat`.  A type whose entry for the name is the
+/// sequence wrapper is left with the numeric half NULL, and a subclass that
+/// writes no method of its own inherits that NULL, so `binary_op1` never
+/// offers the sequence as a numeric operand and the other one answers alone:
+/// `SS('a') + IntR(1)` is the `int` subclass's `__radd__` and `SS('a') *
+/// IntR(2)` its `__rmul__`, not a concat refusal and not a repetition.
+///
+/// Only a subclass that writes the dunder in Python installs the generic slot
+/// and takes part, which is what the `dunder_overridden` test below asks.
+///
+/// `dont_look_inside` for the reason its neighbours carry it: the builtin
+/// base type statics are loaded here, and a traced caller would otherwise
+/// carry an unresolvable `LoadStatic`.
+#[majit_macros::dont_look_inside]
+unsafe fn sequence_numeric_slot_is_null(obj: PyObjectRef, dunder: &str) -> bool {
+    let tp: *const pyre_object::PyType = if is_str(obj) {
+        &pyre_object::STR_TYPE
+    } else if is_list(obj) {
+        &pyre_object::LIST_TYPE
+    } else if is_tuple(obj) {
+        &pyre_object::TUPLE_TYPE
+    } else if pyre_object::bytesobject::is_bytes(obj) {
+        &pyre_object::bytesobject::BYTES_TYPE
+    } else if pyre_object::bytearrayobject::is_bytearray(obj) {
+        &pyre_object::bytearrayobject::BYTEARRAY_TYPE
+    } else {
+        return false;
+    };
+    let Some(t) = crate::typedef::gettypefor(tp) else {
+        return false;
+    };
+    !dunder_overridden(obj, dunder, t.as_ptr())
+}
+
 /// `needs_seq_binop_dispatch` for the `sq_repeat` branches of [`mul`], where
 /// only one operand is the sequence: a subclass that overrides the multiply
 /// specials relative to its own builtin base has to run that override instead
@@ -3337,7 +3373,12 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__add__", "__radd__");
+        // A sequence left operand has no `nb_add` to offer, so the numeric
+        // override runs the right operand's alone; the concat branches below
+        // are `PyNumber_Add`'s `sq_concat` fall-through and already reach
+        // `__radd__` before refusing.
         if numeric_override
+            && !sequence_numeric_slot_is_null(a, "__add__")
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
         {
@@ -3553,7 +3594,10 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__mul__", "__rmul__");
+        // As in [`binop_add_impl`]: a sequence operand carries no
+        // `nb_multiply`, so only the other operand's runs here.
         if numeric_override
+            && !sequence_numeric_slot_is_null(a, "__mul__")
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
         {
@@ -3584,31 +3628,41 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         {
             return Ok(result);
         }
-        if is_str(a) && is_int_or_long(b) {
-            return str_repeat(a, b);
-        }
-        if is_int_or_long(a) && is_str(b) {
-            return str_repeat(b, a);
-        }
-        if is_list(a) && is_int_or_long(b) {
-            return list_repeat(a, b);
-        }
-        if is_int_or_long(a) && is_list(b) {
-            return list_repeat(b, a);
-        }
-        // tupleobject.py descr_mul
-        if is_tuple(a) && is_int_or_long(b) {
-            return tuple_repeat(a, b);
-        }
-        if is_int_or_long(a) && is_tuple(b) {
-            return tuple_repeat(b, a);
-        }
-        // bytesobject.py descr_mul / bytearrayobject.py descr_mul
-        if pyre_object::bytesobject::is_bytes_like(a) && is_int_or_long(b) {
-            return bytes_repeat(a, b);
-        }
-        if is_int_or_long(a) && pyre_object::bytesobject::is_bytes_like(b) {
-            return mul(b, a);
+        // `PyNumber_Multiply` reaches `sq_repeat` only once `binary_op1` has
+        // declined, and a builtin sequence contributes nothing to that call,
+        // so a count that is a numeric subclass writing `__mul__`/`__rmul__`
+        // is the only operand offered and answers first.  The repeat runs at
+        // the tail of this function when it declines.
+        let count_answers_first = numeric_override
+            && (sequence_numeric_slot_is_null(a, "__mul__")
+                || sequence_numeric_slot_is_null(b, "__mul__"));
+        if !count_answers_first {
+            if is_str(a) && is_int_or_long(b) {
+                return str_repeat(a, b);
+            }
+            if is_int_or_long(a) && is_str(b) {
+                return str_repeat(b, a);
+            }
+            if is_list(a) && is_int_or_long(b) {
+                return list_repeat(a, b);
+            }
+            if is_int_or_long(a) && is_list(b) {
+                return list_repeat(b, a);
+            }
+            // tupleobject.py descr_mul
+            if is_tuple(a) && is_int_or_long(b) {
+                return tuple_repeat(a, b);
+            }
+            if is_int_or_long(a) && is_tuple(b) {
+                return tuple_repeat(b, a);
+            }
+            // bytesobject.py descr_mul / bytearrayobject.py descr_mul
+            if pyre_object::bytesobject::is_bytes_like(a) && is_int_or_long(b) {
+                return bytes_repeat(a, b);
+            }
+            if is_int_or_long(a) && pyre_object::bytesobject::is_bytes_like(b) {
+                return mul(b, a);
+            }
         }
         // `PyNumber_Multiply`: none of the builtin sequences implements
         // `nb_multiply`, so their `__mul__` / `__rmul__` slot wrappers take no
