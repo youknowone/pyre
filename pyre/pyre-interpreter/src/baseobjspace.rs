@@ -7100,9 +7100,13 @@ pub(crate) unsafe fn object_delattr_surrogate(
         }
         if is_type(obj) {
             // typeobject.py:437 — only heap types may have attributes deleted.
+            // `type_setattro` refuses a set and a delete through the same
+            // message, so a refused deletion is reported with the set wording
+            // and names the attribute.
             if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
-                    "cannot delete attributes on immutable type object '{}'",
+                    "cannot set {} attribute of immutable type '{}'",
+                    crate::display::format_wtf8_repr(name),
                     w_type_get_name(obj)
                 )));
             }
@@ -7503,24 +7507,21 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
         return Ok(value);
     }
 
-    // An explicit class-body __annotate__ is an ordinary visible class-dict
-    // entry and takes precedence over the compiler-facing descriptor slot.
-    let annotate_fn = crate::type_dict_lookup(obj, "__annotate__")
-        .or_else(|| crate::type_dict_lookup(obj, "__annotate_func__"));
-    let annotations = match annotate_fn {
-        Some(callable)
-            if !callable.is_null() && !unsafe { is_none(callable) } && callable_w(callable) =>
-        {
-            let value = crate::call::call_function_impl_result(callable, &[w_int_new(1)])?;
-            if !unsafe { is_dict(value) } {
-                return Err(PyError::type_error(format!(
-                    "__annotate__ returned non-dict of type '{}'",
-                    object_functionstr_type_name(value),
-                )));
-            }
-            value
+    // The callable is reached through `getattr(type, '__annotate__')`, so an
+    // annotation-free class picks up the `__annotate_func__ = None` entry
+    // `type_get_annotate` stamps on the miss.
+    let annotate_fn = type_get_annotate(obj)?;
+    let annotations = if callable_w(annotate_fn) {
+        let value = crate::call::call_function_impl_result(annotate_fn, &[w_int_new(1)])?;
+        if !unsafe { is_dict(value) } {
+            return Err(PyError::type_error(format!(
+                "__annotate__ returned non-dict of type '{}'",
+                object_functionstr_type_name(value),
+            )));
         }
-        _ => pyre_object::w_dict_new(),
+        value
+    } else {
+        pyre_object::w_dict_new()
     };
     crate::type_dict_store(obj, "__annotations_cache__", annotations);
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
@@ -7542,7 +7543,10 @@ pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyRe
     } else {
         crate::type_dict_store(obj, "__annotations_cache__", value);
     }
-    crate::type_dict_store(obj, "__annotate_func__", w_none());
+    // Both bookkeeping keys are popped, not reset: a class whose annotations
+    // were assigned has no lazy thunk left and neither key stays visible in
+    // `cls.__dict__`.
+    crate::type_dict_delete(obj, "__annotate_func__");
     crate::type_dict_delete(obj, "__annotate__");
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
     unsafe { mutated(obj, Some("__annotations__")) };
@@ -7591,7 +7595,14 @@ pub(crate) fn type_get_annotate(obj: PyObjectRef) -> PyResult {
     if let Some(value) = crate::type_dict_lookup(obj, "__annotate__") {
         return Ok(value);
     }
-    Ok(crate::type_dict_lookup(obj, "__annotate_func__").unwrap_or_else(w_none))
+    if let Some(value) = crate::type_dict_lookup(obj, "__annotate_func__") {
+        return Ok(value);
+    }
+    // A class that declared no annotations acquires the slot on the first
+    // read, so `__annotate_func__` becomes visible in `cls.__dict__`.
+    crate::type_dict_store(obj, "__annotate_func__", w_none());
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    Ok(w_none())
 }
 
 /// CPython 3.14 `type_get_type_params` / `type_set_type_params`: parameters
@@ -7631,9 +7642,11 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
     let removed_explicit = crate::type_dict_delete(obj, "__annotations__");
     let removed = removed_cache || removed_explicit;
     if !removed {
-        return Err(raiseattrerror(obj, "__annotations__", None, true));
+        // `type_set_annotations` reports a missing entry with the bare
+        // attribute name, not the receiver-naming type-attribute miss.
+        return Err(PyError::attribute_error("__annotations__"));
     }
-    crate::type_dict_store(obj, "__annotate_func__", w_none());
+    crate::type_dict_delete(obj, "__annotate_func__");
     crate::type_dict_delete(obj, "__annotate__");
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
     unsafe { mutated(obj, Some("__annotations__")) };
@@ -12817,10 +12830,13 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     unsafe {
         if is_type(obj) {
             // typeobject.py — only heap types may have their dict mutated.
+            // The name goes through `%R`, so a non-ASCII or quote-bearing one
+            // is escaped rather than wrapped in hand-written quotes, and the
+            // set and the delete refusal read alike.
             if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
-                    "cannot set '{}' attribute of immutable type '{}'",
-                    name,
+                    "cannot set {} attribute of immutable type '{}'",
+                    crate::display::format_wtf8_repr(Wtf8::new(name)),
                     w_type_get_name(obj)
                 )));
             }
@@ -13653,9 +13669,15 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
         if is_type(obj) {
             // typeobject.py:437 — only heap types may have attributes deleted.
+            // `type_setattro` refuses a set and a delete through the same
+            // message, so a refused deletion is reported with the set wording
+            // and names the attribute.  The name goes through `%R`, so a
+            // non-ASCII or quote-bearing one is escaped rather than wrapped in
+            // hand-written quotes.
             if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
-                    "cannot delete attributes on immutable type object '{}'",
+                    "cannot set {} attribute of immutable type '{}'",
+                    crate::display::format_wtf8_repr(Wtf8::new(name)),
                     w_type_get_name(obj)
                 )));
             }
