@@ -487,9 +487,14 @@ pub mod frame_locals_proxy {
         /// [`Self::mapping`] instead reported the deduplicated dict's size,
         /// and built that dict to do it.
         ///
+        /// Named for what it counts rather than `length`, because
+        /// `REVIEWED_UNROLL_SAFE` in `test_unroll_safe_inventory.rs` matches a
+        /// hint by its leaf and `length` is already the leaf of
+        /// `bufferview::BufferView::length`.
+        ///
         /// `@jit.unroll_safe` for the same reason as [`Self::pin_entries`].
         #[majit_macros::unroll_safe]
-        fn length(&self) -> i64 {
+        fn entry_count(&self) -> i64 {
             let extra = self.frame().get_extra_locals();
             let mut size = if extra.is_null() {
                 0
@@ -719,7 +724,7 @@ pub mod frame_locals_proxy {
         }
 
         fn __len__(&self) -> Result<i64, crate::PyError> {
-            Ok(self.length())
+            Ok(self.entry_count())
         }
 
         fn __iter__(&self) -> Result<PyObjectRef, crate::PyError> {
