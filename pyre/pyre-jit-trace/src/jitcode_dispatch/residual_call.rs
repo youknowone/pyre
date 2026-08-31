@@ -1340,18 +1340,20 @@ impl Drop for InlineConcreteFrameGuard {
 /// would otherwise observe the caller as the running frame and resolve one
 /// level too shallow.  Scoped to the call itself so the walk's own frame
 /// bookkeeping outside it is untouched.
+///
+/// The displaced caller is parked in `frame.f_backref` and nowhere else:
+/// `executioncontext.py enter` writes it there and `leave` reads it back off
+/// the frame it is leaving, so the guard needs no saved copy of its own.  That
+/// is also what keeps the value rooted — `f_backref` is a traced `Type::Ref`
+/// field, so a minor collection inside the residual forwards a nursery
+/// `JitVirtualRef` in place, where a raw copy in this struct would go stale.
+/// Parking it on the shared shadow stack instead, which this guard used to do,
+/// made its restore a LIFO slot the residual could not publish across: the
+/// scope is one residual call, so anything the callee pushed sat above the
+/// guard's own index and was truncated away when the guard exited.
 struct ResidualFrameChainGuard {
     ec: *mut pyre_interpreter::PyExecutionContext,
     frame: *mut pyre_interpreter::PyFrame,
-    /// Shadow-stack index of the caller `topframeref` this guard displaced,
-    /// held there rather than in the struct because the residual runs
-    /// arbitrary user code.  Frames themselves never move — `FrameBox::new`
-    /// allocates old-gen — but once the tracer stores a `JitVirtualRef` in the
-    /// chain the displaced value is a nursery object, and a minor collection
-    /// inside the residual would leave `Drop` writing back a pre-move pointer.
-    /// Rooting lets the collector forward it in place, as `CurrentFrameGuard`
-    /// already does for the same field.
-    saved_root: usize,
     previous_published: *mut pyre_interpreter::PyFrame,
     previous_shadow: Option<(*const super::CalleeLocalsShadow, u16)>,
     /// Whether this guard performed the chain write, so `Drop` restores only
@@ -1398,7 +1400,6 @@ impl ResidualFrameChainGuard {
                 (*ec).topframeref = frame;
             }
         }
-        let saved_root = majit_gc::shadow_stack::push(majit_ir::GcRef(saved_topframeref as usize));
         // Published whether or not this guard wrote the chain: `frame` is the
         // one a force inside the residual must redirect its escape onto
         // (`flush_active_frame_escape`), and the chain already naming it makes
@@ -1408,7 +1409,6 @@ impl ResidualFrameChainGuard {
         Some(Self {
             ec,
             frame,
-            saved_root,
             previous_published,
             previous_shadow,
             entered,
@@ -1425,15 +1425,14 @@ impl Drop for ResidualFrameChainGuard {
             // reference to its caller, so the caller must stay materialised;
             // dropping that propagation would leave the escape recorded only on
             // a frame the walk owns privately.
-            // Read the root back before popping: a collection during the
-            // residual forwards it in place.
-            let saved_topframeref =
-                majit_gc::shadow_stack::get(self.saved_root).0 as *mut pyre_interpreter::PyFrame;
-            majit_gc::shadow_stack::pop_to(self.saved_root);
             PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
             PUBLISHED_INLINE_SHADOW.with(|slot| slot.set(self.previous_shadow));
             if self.entered {
-                (*self.ec).topframeref = saved_topframeref;
+                // The value `enter` displaced, read back off the frame it was
+                // written to, so a collection during the residual forwarded it
+                // in place.  Only the `entered` path wrote `f_backref`, and
+                // only that path has anything to restore.
+                (*self.ec).topframeref = (*self.frame).f_backref;
             }
             if (*self.frame).escaped() {
                 let f_back = (*self.frame).get_f_back();
