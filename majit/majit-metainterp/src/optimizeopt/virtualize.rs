@@ -2631,19 +2631,16 @@ fn field_slot_disagreement(
 
 /// Whether `slot` and `field` name the same field.
 ///
-/// Both halves must agree. `field_key()` is the FIELDNAME half of
-/// `get_field_descr`'s cache key (`descr.py`, `cache[STRUCT][fieldname]`) —
-/// only the half: upstream keys on the owning STRUCT as well, and carries the
-/// owner on the descr itself as `name = '%s.%s' % (STRUCT._name, fieldname)`
-/// plus `get_parent_descr()`. This comparison deliberately drops the owner,
-/// because `field_name()` may retain a different LLBC spelling of the same
-/// StructId (`option::Option.__discriminant` vs
-/// `core::option::Option.__discriminant`) and comparing those answers "apart"
-/// for one class. The cost is that a field of one struct claiming a slot in
-/// another struct's descr is no longer detected when the two share a leaf
-/// name AND an offset. Converging means resolving the owner to a StructId —
-/// the same move `unique_trait_impl_roots` made — and comparing that
-/// alongside the leaf, not restoring the full-name comparison.
+/// All three halves of `get_field_descr`'s identity must agree: the owning
+/// STRUCT, `fieldname`, and byte offset (`descr.py`,
+/// `cache[STRUCT][fieldname]`).  Production field descrs carry the STRUCT as
+/// `get_parent_descr()`.  Pyre can reconstruct the same RPython STRUCT descr
+/// more than once, so compare its stable `cache_key` rather than requiring the
+/// Rust `Arc` itself to be shared.  When that identity is not populated yet,
+/// resolve the qualified display owners through pyre's StructId table; never
+/// collapse two *known* distinct owners merely because their leaf field and
+/// offset happen to agree.  Unnamed dynamic/test descriptors carry no owner
+/// evidence at all and retain the positional fallback.
 ///
 /// The key is not always carried — the flattened inline aggregates
 /// (`ob_header`, an enum's `__pos_0`) reach here under the documented
@@ -2652,10 +2649,118 @@ fn field_slot_disagreement(
 /// absent, and a flattened layout puts an aggregate and its first leaf at one
 /// address (`heaptracker.py:68-69`).
 pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
+    fn display_owner(field: &dyn FieldDescr) -> Option<&str> {
+        let name = field.field_name();
+        let key = field.field_key();
+        if name.is_empty() || key.is_empty() || name == key {
+            return None;
+        }
+        name.strip_suffix(key)?.strip_suffix('.')
+    }
+
+    // `heaptracker.all_fielddescrs(gccache, STRUCT)` walks an embedded base
+    // before the subclass's own fields.  Consequently a subclass SizeDescr
+    // legitimately contains the base's FieldDescr at the same slot even
+    // though their parent STRUCT keys differ (`rclass.InstanceRepr._setup_repr`
+    // creates exactly this `super` edge).  Pyre's explicit Result/Option shell
+    // serializes the flattened row under the variant parent, so recover that
+    // one proven inheritance edge from the qualified owners.  Do not accept a
+    // same-name/same-offset field from an arbitrary different struct.
+    fn explicit_sum_inherits(slot_owner: &str, field_owner: &str) -> bool {
+        fn same_owner(left: &str, right: &str) -> bool {
+            let left = majit_ir::descr::strip_generic_args(left);
+            let right = majit_ir::descr::strip_generic_args(right);
+            // The translated explicit sum shell is deliberately accepted
+            // under both the full standard-library spelling and Charon's
+            // crate-stripped spelling (`core::option::Option` /
+            // `option::Option`, likewise `Result`).  The translator-side
+            // StructId registry proves those aliases while building the
+            // JitCode, but that build-only registry is not serialized into
+            // the generated runtime.  Recover only these two already-gated
+            // shell identities here; a general suffix comparison would merge
+            // an unrelated `mycrate::option::Option` and violate
+            // `descr.py`'s `(STRUCT, fieldname)` identity.
+            fn explicit_sum_template(name: &str) -> Option<&'static str> {
+                let segments: Vec<&str> = name.split("::").collect();
+                match segments.as_slice() {
+                    ["option", "Option"] | ["core" | "std", "option", "Option"] => Some("Option"),
+                    ["result", "Result"] | ["core" | "std", "result", "Result"] => Some("Result"),
+                    _ => None,
+                }
+            }
+            if let (Some(left), Some(right)) = (
+                explicit_sum_template(left.as_ref()),
+                explicit_sum_template(right.as_ref()),
+            ) {
+                return left == right;
+            }
+            match (
+                majit_ir::descr::struct_template_id_for_name(left.as_ref()),
+                majit_ir::descr::struct_template_id_for_name(right.as_ref()),
+            ) {
+                (Some(left), Some(right)) => left == right,
+                _ => {
+                    majit_ir::descr::canonical_struct_name(left.as_ref())
+                        == majit_ir::descr::canonical_struct_name(right.as_ref())
+                }
+            }
+        }
+
+        let slot = majit_ir::descr::strip_generic_args(slot_owner);
+        let Some((base, variant)) = slot.rsplit_once("::") else {
+            return false;
+        };
+        matches!(variant, "Some" | "Ok" | "Err") && same_owner(base, field_owner)
+    }
+
+    let names_name_same_owner = || match (display_owner(slot), display_owner(field)) {
+        (Some(slot_owner), Some(field_owner)) => {
+            match (
+                majit_ir::descr::struct_id_for_name(slot_owner),
+                majit_ir::descr::struct_id_for_name(field_owner),
+            ) {
+                (Some(slot_id), Some(field_id)) => slot_id == field_id,
+                _ => slot_owner == field_owner,
+            }
+        }
+        // Neither descriptor contains an owner spelling.  This is the
+        // flattened/dynamic fallback described above, not evidence that
+        // two differently named owners are equal.
+        (None, None) => true,
+        _ => false,
+    };
+    let same_owner = match (slot.get_parent_descr(), field.get_parent_descr()) {
+        (Some(slot_parent), Some(field_parent)) => {
+            if std::sync::Arc::ptr_eq(&slot_parent, &field_parent) {
+                true
+            } else {
+                let slot_key = slot_parent
+                    .as_size_descr()
+                    .map(|descr| descr.cache_key())
+                    .unwrap_or(0);
+                let field_key = field_parent
+                    .as_size_descr()
+                    .map(|descr| descr.cache_key())
+                    .unwrap_or(0);
+                if slot_key != 0 && field_key != 0 {
+                    slot_key == field_key
+                        || match (display_owner(slot), display_owner(field)) {
+                            (Some(slot_owner), Some(field_owner)) => {
+                                explicit_sum_inherits(slot_owner, field_owner)
+                            }
+                            _ => false,
+                        }
+                } else {
+                    names_name_same_owner()
+                }
+            }
+        }
+        _ => names_name_same_owner(),
+    };
     let named_apart = !field.field_key().is_empty()
         && !slot.field_key().is_empty()
         && slot.field_key() != field.field_key();
-    !named_apart && slot.offset() == field.offset()
+    same_owner && !named_apart && slot.offset() == field.offset()
 }
 
 /// Whether `field_idx` addresses `field` in the struct `descr` describes.
@@ -3516,6 +3621,7 @@ mod tests {
 
     #[test]
     fn slot_identity_uses_field_key_across_owner_spelling_aliases() {
+        let parent = majit_ir::descr::make_size_descr(16);
         let slot = majit_ir::SimpleFieldDescr::new_with_name(
             0,
             0,
@@ -3525,7 +3631,8 @@ mod tests {
             majit_ir::ArrayFlag::Signed,
             "core::option::Option.__discriminant".to_string(),
             "__discriminant".to_string(),
-        );
+        )
+        .with_parent_descr(parent.clone(), 0);
         let alias = majit_ir::SimpleFieldDescr::new_with_name(
             0,
             0,
@@ -3535,12 +3642,14 @@ mod tests {
             majit_ir::ArrayFlag::Signed,
             "option::Option.__discriminant".to_string(),
             "__discriminant".to_string(),
-        );
+        )
+        .with_parent_descr(parent.clone(), 0);
         assert!(
             slot_holds_field(&slot, &alias),
             "display aliases of one STRUCT.fieldname identify one RPython field descr"
         );
 
+        let other_parent = majit_ir::descr::make_size_descr(16);
         let other = majit_ir::SimpleFieldDescr::new_with_name(
             0,
             0,
@@ -3548,10 +3657,65 @@ mod tests {
             Type::Int,
             false,
             majit_ir::ArrayFlag::Signed,
-            "core::option::Option.__pos_0".to_string(),
-            "__pos_0".to_string(),
-        );
+            "other::Option.__discriminant".to_string(),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(other_parent.clone(), 0);
         assert!(!slot_holds_field(&slot, &other));
+    }
+
+    #[test]
+    fn slot_identity_accepts_an_inherited_sum_base_field() {
+        let mut variant_size = majit_ir::descr::SimpleSizeDescr::new(0, 16, 1);
+        variant_size.set_cache_key(0x51);
+        let variant_parent = Arc::new(variant_size) as DescrRef;
+        let mut base_size = majit_ir::descr::SimpleSizeDescr::new(1, 8, 2);
+        base_size.set_cache_key(0x52);
+        let base_parent = Arc::new(base_size) as DescrRef;
+
+        let slot = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "core::option::Option<i64>::Some.__discriminant".to_string(),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(variant_parent.clone(), 0);
+        let inherited = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "core::option::Option<i64>.__discriminant".to_string(),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(base_parent.clone(), 0);
+        assert!(
+            slot_holds_field(&slot, &inherited),
+            "slot name={:?} key={:?} inherited name={:?} key={:?}",
+            slot.field_name(),
+            slot.field_key(),
+            inherited.field_name(),
+            inherited.field_key(),
+        );
+
+        let unrelated = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "other::Option<i64>.__discriminant".to_string(),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(base_parent, 0);
+        assert!(!slot_holds_field(&slot, &unrelated));
     }
 
     fn assign_positions(ops: &mut [Op]) {

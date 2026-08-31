@@ -2306,18 +2306,24 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
             if has_self && idx == 0 {
                 // rlib/jit.py — promote self by identity (guard_value on pointer)
                 Some(quote! {
-                    let _ = majit_metainterp::jit::promote(self as *const _ as usize);
+                    let _ = majit_ir::jit::promote(self as *const _ as usize);
                 })
             } else {
                 let named_idx = if has_self { idx - 1 } else { idx };
                 named_args.get(named_idx).map(|name| {
-                    quote! { let #name = majit_metainterp::jit::promote(#name); }
+                    quote! { let #name = majit_ir::jit::promote(#name); }
                 })
             }
         })
         .collect();
 
     let call_args: Vec<_> = param_names.clone();
+    let orig_call = if has_self {
+        let method_args = call_args.iter().skip(1);
+        quote! { self.#orig_name(#(#method_args),*) }
+    } else {
+        quote! { #orig_name(#(#call_args),*) }
+    };
 
     // Build call_target/policy for the ORIGINAL elidable function
     let orig_sig = syn::Signature {
@@ -2378,7 +2384,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         // rlib/jit.py — elidable(func); original body hidden
         #[inline(never)]
         #[doc(hidden)]
-        #[allow(non_upper_case_globals)]
+        #[allow(non_snake_case, non_upper_case_globals)]
         fn #orig_name(#(#full_params),*) #output {
             #[doc(hidden)]
             #[allow(dead_code)]
@@ -2393,7 +2399,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#attrs)*
         #vis fn #fn_name(#(#full_params),*) #output {
             #(#promote_stmts)*
-            #orig_name(#(#call_args),*)
+            #orig_call
         }
 
         #orig_elidable_const

@@ -181,6 +181,18 @@ enum HostObjectKind {
         members: Mutex<IndexMap<String, ConstValue>>,
         reusable_prebuilt_instance: OnceLock<HostObject>,
     },
+    /// Call-site-only carrier for a Rust aggregate construction
+    /// (`SyntheticTransparentCtor`).  Its `class_obj` is the canonical class
+    /// object used for annotation and field identity, while the wrapper tells
+    /// the rtyper to perform only `rtype_new_instance` — RPython's allocation
+    /// step before optional `__init__` dispatch (`rpbc.py:1020-1067`).
+    ///
+    /// This is not a second class identity.  `Bookkeeper::getdesc` unwraps it
+    /// to `class_obj`, so constructed values retain the same ClassDef as field
+    /// projection and method lookup.  The wrapper exists solely because Rust
+    /// `T { fields }` must not accidentally invoke a same-named Python-level
+    /// `T.__init__` registered on that ClassDef.
+    TransparentClassCtor { class_obj: HostObject },
     /// Python module object. `members` 는 module dict — `getattr` 조회
     /// 대상. `LazyLock` singleton 의 Sync 요구를 만족하려고 `Mutex`.
     Module {
@@ -339,6 +351,13 @@ impl HostObject {
 
     pub fn is_class(&self) -> bool {
         matches!(self.inner.kind, HostObjectKind::Class { .. })
+    }
+
+    pub fn transparent_class_target(&self) -> Option<&HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::TransparentClassCtor { class_obj } => Some(class_obj),
+            _ => None,
+        }
     }
 
     pub fn is_module(&self) -> bool {
@@ -537,7 +556,9 @@ impl HostObject {
     /// know.
     pub fn class_of(&self) -> Option<HostObject> {
         match &self.inner.kind {
-            HostObjectKind::Class { .. } => HOST_ENV.lookup_builtin("type"),
+            HostObjectKind::Class { .. } | HostObjectKind::TransparentClassCtor { .. } => {
+                HOST_ENV.lookup_builtin("type")
+            }
             HostObjectKind::Module { .. } => HOST_ENV.lookup_builtin("module"),
             HostObjectKind::BuiltinCallable => {
                 HOST_ENV.lookup_builtin("builtin_function_or_method")
@@ -596,6 +617,24 @@ impl HostObject {
                     members: Mutex::new(members),
                     reusable_prebuilt_instance: OnceLock::new(),
                 },
+            }),
+        }
+    }
+
+    /// Wrap the canonical class object for one transparent Rust aggregate
+    /// call.  The wrapper is intentionally not interned: ClassDef identity is
+    /// supplied by `class_obj`, while this object's identity denotes the call
+    /// spelling rather than a source-language class.
+    pub fn new_transparent_class_ctor(class_obj: HostObject) -> Self {
+        let qualname = class_obj.qualname().to_string();
+        let name = class_obj.inner.name.clone();
+        let module_name = class_obj.inner.module_name.clone();
+        HostObject {
+            inner: Arc::new(HostObjectInner {
+                qualname,
+                name,
+                module_name,
+                kind: HostObjectKind::TransparentClassCtor { class_obj },
             }),
         }
     }
@@ -1012,6 +1051,7 @@ fn host_object_own_getattr(pyobj: &HostObject, name: &str) -> Option<ConstValue>
         "__class__" => pyobj.class_of().map(ConstValue::HostObject),
         "__name__" => match &pyobj.inner.kind {
             HostObjectKind::Class { .. }
+            | HostObjectKind::TransparentClassCtor { .. }
             | HostObjectKind::Module { .. }
             | HostObjectKind::BuiltinCallable
             | HostObjectKind::UserFunction { .. }
@@ -1028,6 +1068,7 @@ fn host_object_own_getattr(pyobj: &HostObject, name: &str) -> Option<ConstValue>
         "__module__" => match &pyobj.inner.kind {
             HostObjectKind::Module { .. } | HostObjectKind::Property { .. } => None,
             HostObjectKind::Class { .. }
+            | HostObjectKind::TransparentClassCtor { .. }
             | HostObjectKind::BuiltinCallable
             | HostObjectKind::UserFunction { .. }
             | HostObjectKind::BoundMethod { .. }

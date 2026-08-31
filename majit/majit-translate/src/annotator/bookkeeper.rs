@@ -1350,6 +1350,15 @@ impl Bookkeeper {
         if let Some(existing) = self.descs.borrow().get(pyobj) {
             return Ok(existing.clone());
         }
+        // A SyntheticTransparentCtor is a call-site marker around the ONE
+        // canonical class object, not another class.  Reuse the target's
+        // ClassDesc exactly; ClassesPBCRepr later reads the wrapper constant to
+        // select rtype_new_instance without the optional __init__ dispatch.
+        if let Some(class_obj) = pyobj.transparent_class_target() {
+            let entry = self.getdesc(class_obj)?;
+            self.descs.borrow_mut().insert(pyobj.clone(), entry.clone());
+            return Ok(entry);
+        }
         let entry = if pyobj.is_user_function() {
             // upstream `newfuncdesc` already returns a MemoDesc or
             // FunctionDesc per the specializer.
@@ -3697,7 +3706,7 @@ impl Bookkeeper {
         // upstream bookkeeper.py:315-316 — `elif tp is type: result =
         // SomeConstantType(x, self)`. Implemented as a constant
         // SomePBC over the real [`ClassDesc`] returned by [`Self::getdesc`].
-        if obj.is_class() {
+        if obj.is_class() || obj.transparent_class_target().is_some() {
             let entry = self.getdesc(obj)?;
             let mut pbc = SomePBC::new(vec![entry], false);
             pbc.base.const_box = Some(Constant::new(raw.clone()));
@@ -3810,10 +3819,15 @@ impl Default for Bookkeeper {
 /// crate-included `pyre_object::unicodeobject::W_UnicodeObject`,
 /// crate-relative `unicodeobject::W_UnicodeObject`, and a dotted constructor
 /// qualname.  RPython keys all reads and constructors on the one live class
-/// object (`bookkeeper.py:361-363` — `obj_key = Constant(pyobj)`), so strip
-/// exactly one registered local-crate prefix and normalize dots.
+/// object (`bookkeeper.py:361-363` — `obj_key = Constant(pyobj)`), so normalize
+/// dots and strip one crate prefix only when StructId resolution proves that
+/// both spellings denote the same declaration.
 ///
-/// Strip only while a module path survives.  Collapsing
+/// Strip only while a module path survives.  A Rust `::` spelling is stripped
+/// only when the process-wide StructId resolver proves the full and
+/// crate-relative names denote the same declaration; class identity must not
+/// depend on the thread-local call-alias registry or on which pipeline last
+/// ran on this thread. Collapsing
 /// `pyre_object::PyObject` to the bare `PyObject` is what
 /// `harden_duplicate_leaf_metadata` exists to undo — the chain walk needs
 /// `ob_header` / `base` to reach the superclass, and a bare leaf collides
@@ -3822,9 +3836,16 @@ pub(crate) fn normalize_class_qualname(name: &str) -> String {
     let lookup = name.replace('.', "::");
     lookup
         .split_once("::")
-        .filter(|(root, rest)| {
+        .filter(|(_root, rest)| {
             rest.contains("::")
-                && (name.contains('.') || crate::local_crates::is_local_crate_root(root))
+                && (name.contains('.')
+                    || matches!(
+                        (
+                            majit_ir::descr::struct_id_for_name(&lookup),
+                            majit_ir::descr::struct_id_for_name(rest),
+                        ),
+                        (Some(full), Some(relative)) if full == relative
+                    ))
         })
         .map(|(_, rest)| rest.to_string())
         .unwrap_or(lookup)
@@ -4736,6 +4757,135 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn real_merged_llbc_memoryview_closure_tuple_projects_instance_item() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::rmodel::Repr;
+        use majit_charon_reader::Llbc;
+
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/llbc/");
+        let object = Llbc::load(format!("{root}pyre-object.ullbc")).expect("load real object LLBC");
+        let interpreter = Llbc::load(format!("{root}pyre-interpreter.ullbc"))
+            .expect("load real interpreter LLBC");
+        let jit = Llbc::load(format!("{root}pyre-jit.ullbc")).expect("load real jit LLBC");
+        let program = crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[object, interpreter, jit],
+            crate::HostStaticAddrs::default(),
+            &["builtins"],
+            &["memoryview_is_native_release_descr", "call_once"],
+        )
+        .expect("derive merged production metadata");
+        let tuple = "Tuple<*mut PyObject>";
+        let target = program
+            .functions
+            .iter()
+            .find(|function| function.name == "memoryview_is_native_release_descr")
+            .expect("memoryview caller graph");
+        let written = target
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                crate::model::OpKind::FieldWrite { field, value, .. }
+                    if field.owner_root.as_deref() == Some(tuple) =>
+                {
+                    value.as_variable().cloned()
+                }
+                _ => None,
+            })
+            .expect("memoryview closure Args tuple payload write");
+        assert!(
+            target
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    op.result.as_ref() == Some(&written)
+                        && matches!(
+                            &op.kind,
+                            crate::model::OpKind::Call {
+                                target: crate::model::CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments == &[crate::runtime_names::shims::CAST_INSTANCE, "PyObject"]
+                        )
+                }),
+            "the tuple writer must preserve the source PyObject class"
+        );
+        let rows = program.struct_fields.fields.get(tuple).unwrap_or_else(|| {
+            panic!(
+                "missing {tuple}; matching keys: {:?}",
+                program
+                    .struct_fields
+                    .fields
+                    .keys()
+                    .filter(|key| key.contains("Tuple<*mut PyObject"))
+                    .collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(
+            rows,
+            &vec![("__pos_0".to_string(), "*mut PyObject".to_string())]
+        );
+        majit_ir::descr::register_struct_origins(program.struct_origins.clone());
+        for (qualified, fields) in &program.struct_field_attrs {
+            crate::annotator::classdesc::register_struct_fields(qualified, fields);
+        }
+
+        let bk = bk();
+        bk.set_struct_fields(Rc::new(program.struct_fields));
+        let tuple_cd = bk
+            .getuniqueclassdef_for_struct_root(tuple)
+            .expect("closure Args tuple classdef");
+        let item = tuple_cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("closure Args item attr")
+            .s_value
+            .clone();
+        let SomeValue::Instance(item) = item else {
+            panic!("closure Args item must be an instance, got {item:?}")
+        };
+        let item_cd = item
+            .classdef
+            .expect("closure Args item must retain the PyObject classdef");
+
+        let registry = crate::translator::rtyper::call_registry::CallRegistry::new(bk.clone());
+        let (_, rtyper) = registry
+            .ensure_session()
+            .expect("create shared rtyper session");
+        let tuple_repr = crate::translator::rtyper::rclass::getinstancerepr(
+            &rtyper,
+            Some(&tuple_cd),
+            crate::translator::rtyper::rclass::Flavor::Gc,
+        )
+        .expect("closure Args tuple repr");
+        crate::translator::rtyper::rmodel::Repr::setup(tuple_repr.as_ref())
+            .expect("set up closure Args tuple repr");
+        let item_repr = tuple_repr
+            .fields()
+            .get("__pos_0")
+            .expect("closure Args item repr")
+            .1
+            .clone();
+        let expected_repr = crate::translator::rtyper::rclass::getinstancerepr(
+            &rtyper,
+            Some(&item_cd),
+            crate::translator::rtyper::rclass::Flavor::Gc,
+        )
+        .expect("PyObject repr");
+        crate::translator::rtyper::rmodel::Repr::setup(expected_repr.as_ref())
+            .expect("set up PyObject repr");
+        assert_eq!(
+            item_repr.lowleveltype(),
+            expected_repr.lowleveltype(),
+            "closure Args tuple field repr must be the concrete PyObject repr"
+        );
+    }
+
+    #[test]
     fn nonheader_dotted_constructor_reuses_crate_relative_struct_identity() {
         use crate::front::StructFieldRegistry;
 
@@ -4765,9 +4915,6 @@ mod tests {
     fn header_struct_spellings_reuse_one_class_identity_and_base() {
         use crate::front::StructFieldRegistry;
 
-        let previous_roots = crate::local_crates::local_crate_roots();
-        crate::local_crates::register_local_crate_roots(["fixture_crate".to_string()]);
-
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
         let rows = vec![
@@ -4786,10 +4933,7 @@ mod tests {
         bk.set_struct_fields(Rc::new(reg));
 
         let from_field = bk.intern_class_by_qualname("unicodeobject::W_UnicodeObject");
-        let from_full =
-            bk.intern_class_by_qualname("fixture_crate::unicodeobject::W_UnicodeObject");
         let from_ctor = bk.intern_class_by_qualname("fixture_crate.unicodeobject.W_UnicodeObject");
-        assert_eq!(from_field, from_full);
         assert_eq!(from_field, from_ctor);
 
         let classdef = bk.getuniqueclassdef(&from_field).expect("header classdef");
@@ -4797,8 +4941,6 @@ mod tests {
             classdef.borrow().basedef.is_some(),
             "normalizing the class identity must retain its embedded-header base"
         );
-
-        crate::local_crates::register_local_crate_roots(previous_roots);
     }
 
     #[test]
@@ -6884,6 +7026,16 @@ mod tests {
             .getuniqueclassdef_for_enum_variant("Result<Vec<*mut PyObject>,PyErr>", "Ok")
             .expect("Result::Ok");
         for (name, classdef) in [("Option::Some", &some_cd), ("Result::Ok", &ok_cd)] {
+            let payload = classdef.borrow().attrs["__pos_0"].s_value.clone();
+            classdef
+                .borrow_mut()
+                .attrs
+                .get_mut("__pos_0")
+                .expect("variant payload")
+                .modified(Some(classdef))
+                .expect("constructor setattr marks payload mutable");
+            ClassDef::generalize_attr(classdef, "__pos_0", Some(payload))
+                .expect("constructor payload setattr");
             let attrs = classdef.borrow();
             assert!(
                 matches!(

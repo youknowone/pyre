@@ -149,6 +149,74 @@ pub unsafe fn items_block_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef
     unsafe { (block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET) as *mut PyObjectRef }
 }
 
+/// `rgc.ll_arraymove(array, source_start, dest_start, length)` — runtime
+/// target for the `list.ll_arraymove` oopspec (OS_ARRAYMOVE / 9).
+///
+/// RPython's native path calls `gc_writebarrier_before_move` when the array
+/// item contains GC pointers, casts the two item addresses to raw addresses,
+/// and invokes `raw_memmove_no_free`. The residual ABI deliberately keeps
+/// only those same four arguments. For a managed block, the existing GC
+/// TYPE_INFO row supplies the array token and `_contains_gcptr(TYPE.OF)` bit;
+/// a raw fallback block uses the `GcArray(PyObjectRef)` token this adapter
+/// boundary allocates. `ptr::copy` has memmove's overlap contract.
+pub extern "C" fn jit_ll_arraymove(array: i64, source_start: i64, dest_start: i64, length: i64) {
+    if array == 0 || length <= 0 {
+        return;
+    }
+    assert!(
+        source_start >= 0,
+        "ll_arraymove source_start must be non-negative"
+    );
+    assert!(
+        dest_start >= 0,
+        "ll_arraymove dest_start must be non-negative"
+    );
+
+    // A residual call copies its argument out of the jitframe before it
+    // enters host Rust.  A collection which ran at that boundary rewrites the
+    // jitframe/root slot but not this ABI copy, so follow the forwarding word
+    // before the layout query, the barriers and the copy all read the header.
+    // `gc_shrink_array` resolves the same way for the same reason; RPython's
+    // GC transform makes the equivalent reload around `rgc.ll_arraymove`
+    // automatically.
+    let address = crate::gc_hook::try_gc_current_object_address(array as *mut u8) as usize;
+    let layout = majit_gc::gc_varsize_layout(address).unwrap_or(majit_gc::GcVarSizeLayout {
+        base_size: ITEMS_BLOCK_TOKEN.base_size,
+        item_size: ITEMS_BLOCK_TOKEN.item_size,
+        // The admitted unmanaged fallback is GcArray(PyObjectRef). Asking its
+        // barrier hook is harmless when no GC owns the pointer.
+        items_have_gc_ptrs: true,
+    });
+    let source_offset = (source_start as usize)
+        .checked_mul(layout.item_size)
+        .and_then(|offset| layout.base_size.checked_add(offset))
+        .expect("ll_arraymove source address overflow");
+    let dest_offset = (dest_start as usize)
+        .checked_mul(layout.item_size)
+        .and_then(|offset| layout.base_size.checked_add(offset))
+        .expect("ll_arraymove destination address overflow");
+    let byte_length = (length as usize)
+        .checked_mul(layout.item_size)
+        .expect("ll_arraymove byte length overflow");
+
+    if layout.items_have_gc_ptrs {
+        if length == 1 {
+            // rgc.py `ll_arraymove`: the literal `copy_item` head exists for
+            // EffectInfo and performs an ordinary GC-pointer store.
+            crate::gc_hook::try_gc_write_barrier(address as *mut u8);
+        } else {
+            crate::gc_hook::try_gc_write_barrier_before_move(address as *mut u8);
+        }
+    }
+    unsafe {
+        std::ptr::copy(
+            (address as *const u8).add(source_offset),
+            (address as *mut u8).add(dest_offset),
+            byte_length,
+        );
+    }
+}
+
 /// Allocated capacity (GcArray length header) of an `ItemsBlock`.
 /// Returns 0 for a null pointer so "empty list" is represented by
 /// a null `items` field.
@@ -1422,5 +1490,57 @@ mod tests {
     fn gc_typed_array_out_of_range_write_panics() {
         let arr = allocate_array(3, ArrayKind::Ref, true);
         setarrayitem_ref(arr, 3, std::ptr::null_mut());
+    }
+
+    #[test]
+    fn jit_ll_arraymove_preserves_overlap_in_both_directions() {
+        let values = || {
+            [
+                1usize as PyObjectRef,
+                2usize as PyObjectRef,
+                3usize as PyObjectRef,
+                4usize as PyObjectRef,
+            ]
+        };
+        let left = unsafe { alloc_list_items_block(&values()) };
+        jit_ll_arraymove(left as i64, 1, 0, 3);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(items_block_items_base(left), 4) },
+            &[
+                2usize as PyObjectRef,
+                3usize as PyObjectRef,
+                4usize as PyObjectRef,
+                4usize as PyObjectRef,
+            ]
+        );
+        unsafe { dealloc_list_items_block(left) };
+
+        let right = unsafe { alloc_list_items_block(&values()) };
+        jit_ll_arraymove(right as i64, 0, 1, 3);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(items_block_items_base(right), 4) },
+            &[
+                1usize as PyObjectRef,
+                1usize as PyObjectRef,
+                2usize as PyObjectRef,
+                3usize as PyObjectRef,
+            ]
+        );
+        unsafe { dealloc_list_items_block(right) };
+
+        // `rgc.ll_arraymove` keeps this case as an explicit `copy_item`
+        // before entering the barrier-plus-memmove body.
+        let one = unsafe { alloc_list_items_block(&values()) };
+        jit_ll_arraymove(one as i64, 3, 0, 1);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(items_block_items_base(one), 4) },
+            &[
+                4usize as PyObjectRef,
+                2usize as PyObjectRef,
+                3usize as PyObjectRef,
+                4usize as PyObjectRef,
+            ]
+        );
+        unsafe { dealloc_list_items_block(one) };
     }
 }

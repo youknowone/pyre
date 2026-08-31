@@ -101,7 +101,7 @@ impl FunctionPathKey {
     }
 }
 
-/// Whether `name` is one of the residual ABI shims that materialises the
+/// Whether `key` identifies one of the residual ABI shims that materialises the
 /// Python exception object carried by an `OperationError`.
 ///
 /// Their Rust signatures use `*mut PyObject` so the residual trampoline stays
@@ -109,17 +109,42 @@ impl FunctionPathKey {
 /// interpreter is an exception *instance*.  This is the same distinction
 /// RPython's `_signature_` makes between a low-level ABI spelling and the
 /// annotator-level result.
-pub(crate) fn is_exception_object_materializer(name: &str) -> bool {
-    matches!(
-        name,
+pub(crate) fn is_exception_object_materializer(key: &FunctionPathKey) -> bool {
+    let segments = key.segments();
+    let Some(leaf) = segments.last().map(String::as_str) else {
+        return false;
+    };
+    if !matches!(
+        leaf,
         "pyerror_to_exc_object" | "pyerror_type_error_to_exc_object"
-    )
+    ) {
+        return false;
+    }
+    matches!(segments, [root, owner, _]
+        if root == "pyre_interpreter" && owner == "error")
+        // `populate_call_registry_from_call_graphs` canonicalizes local-crate
+        // aliases by stripping the `pyre_interpreter` root, so the same source
+        // function is also keyed as `error::<leaf>`.  This is not a fuzzy leaf
+        // match: `other_module::error::<leaf>` remains a distinct 3-segment
+        // path and is rejected below.
+        || matches!(segments, [owner, _] if owner == "error")
+        || matches!(segments, [root, _] if root == "pyre_interpreter")
 }
 
 /// The annotator-level result shared by the exception materialisers'
 /// `_signature_` and their `dont_look_inside` stub graph.
 pub(crate) fn exception_object_result_annotation() -> SomeValue {
     SomeValue::Instance(SomeInstance::new(None, false, Default::default()))
+}
+
+fn publish_exception_object_result_signature(function_desc: &mut FunctionDesc) {
+    let signature_arg_count = function_desc.signature.argnames.len();
+    function_desc.annsignature = Some(Rc::new(AnnSignature {
+        params: (0..signature_arg_count)
+            .map(|_| ParamType::Marker(TypeMarker::AnyType))
+            .collect(),
+        result: ParamType::Annotation(Box::new(exception_object_result_annotation())),
+    }));
 }
 
 /// Per-path registry entry.  Each entry owns:
@@ -153,6 +178,16 @@ pub struct FunctionEntry {
 }
 
 impl FunctionEntry {
+    /// Publish the annotator-level result of a source-identified exception
+    /// materializer after GraphStore alias deduplication has selected this
+    /// entry.  The source graph identity is the Rust-port equivalent of the
+    /// Python callable identity used by `Bookkeeper.getdesc`; the registry's
+    /// first alias key may legitimately be only the bare leaf and therefore
+    /// cannot establish this semantic fact by itself.
+    pub(crate) fn publish_exception_object_result_signature(&self) {
+        publish_exception_object_result_signature(&mut self.function_desc.borrow_mut());
+    }
+
     /// Pre-fill the entry's `FunctionDesc.cache` for the default
     /// specializer with no `*args` (the lookup key
     /// `Specializer::Default + flatten_star_args(no vararg) ->
@@ -913,8 +948,7 @@ impl CallRegistry {
             Constant::new(ConstValue::Dict(HashMap::new())),
         );
         let host_object = HostObject::new_user_function(graph_func);
-        let exception_object_result = is_exception_object_materializer(key.name());
-        let signature_arg_count = signature.argnames.len();
+        let exception_object_result = is_exception_object_materializer(&key);
         let mut function_desc = FunctionDesc::new(
             self.bookkeeper.clone(),
             Some(host_object.clone()),
@@ -937,12 +971,7 @@ impl CallRegistry {
             // `InstanceRepr.rtype_type`, as it does upstream, without
             // inventing a `PtrRepr.rtype_type` operation that RPython does
             // not have.
-            function_desc.annsignature = Some(Rc::new(AnnSignature {
-                params: (0..signature_arg_count)
-                    .map(|_| ParamType::Marker(TypeMarker::AnyType))
-                    .collect(),
-                result: ParamType::Annotation(Box::new(exception_object_result_annotation())),
-            }));
+            publish_exception_object_result_signature(&mut function_desc);
         }
         let function_desc = Rc::new(RefCell::new(function_desc));
         // Pre-register in bookkeeper.descs so the rtyper's
@@ -1139,35 +1168,70 @@ mod tests {
         let bk = Rc::new(Bookkeeper::new());
         let registry = CallRegistry::new(bk);
         for leaf in ["pyerror_to_exc_object", "pyerror_type_error_to_exc_object"] {
-            let entry = registry.get_or_register(
-                FunctionPathKey::from_segments(["pyre_interpreter", "error", leaf]),
-                signature(&["arg"]),
-            );
-            let fd = entry.function_desc.borrow();
-            let annsig = fd
-                .annsignature
-                .as_ref()
-                .expect("exception materializer needs an annotation signature");
-            assert_eq!(annsig.params.len(), 1);
-            assert!(matches!(
-                annsig.params[0],
-                ParamType::Marker(TypeMarker::AnyType)
-            ));
-            let ParamType::Annotation(result) = &annsig.result else {
-                panic!("exception materializer result must be an explicit annotation");
-            };
-            let SomeValue::Instance(instance) = result.as_ref() else {
-                panic!("exception materializer result must be SomeInstance");
-            };
-            assert!(instance.classdef.is_none());
-            assert!(!instance.can_be_none);
+            for path in [
+                vec!["pyre_interpreter", "error", leaf],
+                vec!["error", leaf],
+                vec!["pyre_interpreter", leaf],
+            ] {
+                let entry = registry
+                    .get_or_register(FunctionPathKey::from_segments(path), signature(&["arg"]));
+                let fd = entry.function_desc.borrow();
+                let annsig = fd
+                    .annsignature
+                    .as_ref()
+                    .expect("exception materializer needs an annotation signature");
+                assert_eq!(annsig.params.len(), 1);
+                assert!(matches!(
+                    annsig.params[0],
+                    ParamType::Marker(TypeMarker::AnyType)
+                ));
+                let ParamType::Annotation(result) = &annsig.result else {
+                    panic!("exception materializer result must be an explicit annotation");
+                };
+                let SomeValue::Instance(instance) = result.as_ref() else {
+                    panic!("exception materializer result must be SomeInstance");
+                };
+                assert!(instance.classdef.is_none());
+                assert!(!instance.can_be_none);
+            }
         }
 
         let ordinary = registry.get_or_register(
-            FunctionPathKey::from_segments(["pyre_interpreter", "other"]),
+            FunctionPathKey::from_segments(["other_module", "pyerror_to_exc_object"]),
             signature(&["arg"]),
         );
         assert!(ordinary.function_desc.borrow().annsignature.is_none());
+        let foreign_error_module = registry.get_or_register(
+            FunctionPathKey::from_segments(["other_module", "error", "pyerror_to_exc_object"]),
+            signature(&["arg"]),
+        );
+        assert!(
+            foreign_error_module
+                .function_desc
+                .borrow()
+                .annsignature
+                .is_none()
+        );
+
+        // GraphStore may select the bare alias as the canonical registry
+        // key.  The key alone must remain non-semantic (a foreign function
+        // may share the leaf), but population can publish the result after
+        // checking the graph's exact `source_identity`.
+        let bare = registry.get_or_register(
+            FunctionPathKey::from_segments(["pyerror_to_exc_object"]),
+            signature(&["arg"]),
+        );
+        assert!(bare.function_desc.borrow().annsignature.is_none());
+        bare.publish_exception_object_result_signature();
+        assert!(matches!(
+            bare.function_desc
+                .borrow()
+                .annsignature
+                .as_ref()
+                .map(|sig| &sig.result),
+            Some(ParamType::Annotation(result))
+                if matches!(result.as_ref(), SomeValue::Instance(_))
+        ));
     }
 
     #[test]

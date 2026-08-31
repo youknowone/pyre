@@ -2031,6 +2031,14 @@ fn analyze_pipeline_from_module_paths(
         "rgc.ll_shrink_array".to_string(),
     );
 
+    // rgc.py `@jit.oopspec('list.ll_arraymove(array, source_start,
+    // dest_start, length)')`. The rtyper mints this generic helper graph,
+    // so its decorator cannot be harvested from a Rust source item above.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["ll_arraymove"]),
+        "list.ll_arraymove(array, source_start, dest_start, length)".to_string(),
+    );
+
     // `collectanalyze.py analyze_simple_operation` answers True for the
     // allocation operations — `malloc` / `malloc_varsize` with `flavor='gc'`,
     // and any LLOp declared `canmallocgc=True`.  Upstream sees them because

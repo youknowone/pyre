@@ -12,6 +12,19 @@ pub use gcreftracer::{GcTable, install_gc_table_walker};
 use majit_ir::{Const, ConstMap, GcRef, Op};
 pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
 
+/// Runtime layout of one registered variable-size GC object.
+///
+/// These are the facts `rgc.ll_arraymove` gets from the array lltype in
+/// RPython. The residual target retains upstream's four-argument ABI and
+/// recovers them from the collector's existing TYPE_INFO row instead of a
+/// pyre-only extra argument or a parallel layout table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GcVarSizeLayout {
+    pub base_size: usize,
+    pub item_size: usize,
+    pub items_have_gc_ptrs: bool,
+}
+
 mod address_dict;
 pub mod collector;
 pub mod gc_sync;
@@ -1133,6 +1146,12 @@ pub trait GcAllocator: Send {
         None
     }
 
+    /// Return the registered variable-size layout for `obj`.
+    /// Fixed-size, foreign, null, and unknown objects return `None`.
+    fn varsize_layout(&self, _obj: GcRef) -> Option<GcVarSizeLayout> {
+        None
+    }
+
     /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Maps a vtable pointer to its registered GC type id. RPython
@@ -1649,6 +1668,9 @@ impl GcAllocator for GcHandle {
     }
     fn type_size(&self, type_id: u32) -> Option<usize> {
         gc_sync::gc_query_reentrant(|gc| gc.type_size(type_id))
+    }
+    fn varsize_layout(&self, obj: GcRef) -> Option<GcVarSizeLayout> {
+        gc_sync::gc_query_reentrant(|gc| gc.varsize_layout(obj))
     }
     fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
         gc_sync::gc_query_reentrant(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
@@ -2962,10 +2984,14 @@ pub type GcOwnsObjectFn = fn(addr: usize) -> bool;
 pub type GcIsNurseryObjectFn = fn(addr: usize) -> bool;
 /// `llop.shrink_array` — see [`GcAllocator::shrink_array`].
 pub type GcShrinkArrayFn = fn(addr: usize, smaller_length: usize) -> bool;
+/// Read-only TYPE_INFO query used by the four-argument `ll_arraymove`
+/// residual target.
+pub type GcVarSizeLayoutFn = fn(addr: usize) -> Option<GcVarSizeLayout>;
 
 global_hook!(static ACTIVE_GC_OWNS_OBJECT: GcOwnsObjectFn);
 global_hook!(static ACTIVE_GC_IS_NURSERY_OBJECT: GcIsNurseryObjectFn);
 global_hook!(static ACTIVE_GC_SHRINK_ARRAY: GcShrinkArrayFn);
+global_hook!(static ACTIVE_GC_VARSIZE_LAYOUT: GcVarSizeLayoutFn);
 
 /// Install the active backend's `is_managed_heap_object` trampoline.
 pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
@@ -2980,6 +3006,11 @@ pub fn set_active_gc_is_nursery_object(hook: Option<GcIsNurseryObjectFn>) {
 /// Install the active backend's in-place array shrink.
 pub fn set_active_gc_shrink_array(hook: Option<GcShrinkArrayFn>) {
     ACTIVE_GC_SHRINK_ARRAY.set(hook);
+}
+
+/// Install the active backend's registered-varsize-layout query.
+pub fn set_active_gc_varsize_layout(hook: Option<GcVarSizeLayoutFn>) {
+    ACTIVE_GC_VARSIZE_LAYOUT.set(hook);
 }
 
 /// minimark.py `id_or_identityhash` hook.
@@ -3029,6 +3060,15 @@ pub fn gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
         Some(f) => f(addr, smaller_length),
         None => false,
     }
+}
+
+/// Return the active collector's existing TYPE_INFO layout for `addr`.
+/// `None` means it is not a registered variable-size GC object.
+pub fn gc_varsize_layout(addr: usize) -> Option<GcVarSizeLayout> {
+    if addr == 0 {
+        return None;
+    }
+    ACTIVE_GC_VARSIZE_LAYOUT.get().and_then(|f| f(addr))
 }
 
 /// Whether the finalizer for the object at `addr` has already run.

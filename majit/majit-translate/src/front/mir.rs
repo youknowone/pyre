@@ -2241,21 +2241,23 @@ pub fn lower_fun_decl_with_static_addrs(
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
-    // Derive the struct field-layout map the boxing-alloc fusion reads
-    // (`fuse_boxing_alloc`).  The whole-program build lowers each function
-    // through the `_with_attrs` variant with a single precomputed map; this
-    // stand-alone entry (used by the reader / tests) derives it per call from
-    // the same source of truth so the fusion fires identically.
-    let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
-    let jitdriver_receiver_roots =
-        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
-    lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
-        llbc,
-        fd,
-        static_addrs,
-        &jitdriver_receiver_roots,
-        &struct_field_attrs,
-    )
+    crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
+        // Derive the struct field-layout map the boxing-alloc fusion reads
+        // (`fuse_boxing_alloc`).  The whole-program build lowers each function
+        // through the `_with_attrs` variant with a single precomputed map; this
+        // stand-alone entry (used by the reader / tests) derives it per call from
+        // the same source of truth so the fusion fires identically.
+        let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
+        let jitdriver_receiver_roots =
+            crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+        lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
+            llbc,
+            fd,
+            static_addrs,
+            &jitdriver_receiver_roots,
+            &struct_field_attrs,
+        )
+    })
 }
 
 /// The `struct_field_attrs` projection of [`derive_program_metadata`] —
@@ -4953,18 +4955,18 @@ impl<'a> Lowering<'a> {
                         Some((owner_root, field_name, _field_ty, owner_id)) => {
                             // Rust type-checks every assignment against the
                             // projected place's substituted field type.  A
-                            // raw pointer to a named ADT is therefore the
-                            // same typed nullable instance slot as a field
+                            // reference or raw pointer to a named ADT is
+                            // therefore the same instance slot as a field
                             // initialized by an aggregate: preserve that
                             // class on ordinary `self.field = value` writes
-                            // too.  Otherwise one classdef-less raw value
+                            // too.  Otherwise one pointer-shaped value
                             // generalizes the session-global ClassDef attr to
-                            // the root object repr before a later getattr is
-                            // rtyped.  RPython's SomeNone union instead keeps
-                            // the declared SomeInstance class and merely sets
-                            // `can_be_None`.
+                            // the raw-pointer repr before a later getattr is
+                            // rtyped.  RPython keeps the declared
+                            // SomeInstance class on every assignment (and a
+                            // nullable pointer merely sets `can_be_None`).
                             value =
-                                self.narrow_typed_nullable_field_value(bb_id, value, Some(dest_ty));
+                                self.narrow_typed_instance_field_value(bb_id, value, Some(dest_ty));
                             (
                                 FieldDescriptor::new(field_name, Some(owner_root))
                                     .with_owner_id(owner_id)
@@ -5012,24 +5014,27 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// Preserve the declared class of a raw-pointer field value.
+    /// Preserve the declared class of an instance-typed field value.
     ///
-    /// RPython represents a nullable instance attribute as
-    /// `SomeInstance(classdef, can_be_None=True)`.  Rust spells the same slot
-    /// as `*mut/*const NamedAdt`, but a producer such as `null_mut()` begins as
-    /// a classdef-less pointer.  The Rust field type-check is the proof needed
-    /// to narrow that producer before `setattr`; this is an identity cast for
-    /// non-null values and a typed null for null values.
-    fn narrow_typed_nullable_field_value(
+    /// RPython represents an instance attribute as `SomeInstance(classdef)`;
+    /// when nullable, the same annotation simply carries `can_be_None=True`.
+    /// Rust spells those slots as `&NamedAdt` or `*mut/*const NamedAdt`, whose
+    /// producer initially has pointer annotation.  The Rust field type-check
+    /// is the proof needed to narrow that producer before `setattr`; this is
+    /// an identity cast for non-null values and a typed null for null values.
+    fn narrow_typed_instance_field_value(
         &mut self,
         bb_id: BlockId,
         value: LinkArg,
         declared_ty: Option<&TyRef>,
     ) -> LinkArg {
         let Some(root) = declared_ty.and_then(|ty| {
-            tyref_node(ty, self.llbc)
-                .and_then(|n| strip_ty_wrappers(n, self.llbc))
-                .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))
+            let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
+            if let Some(reference) = node.as_object()?.get("Ref") {
+                let pointee = reference.as_array()?.get(1)?;
+                return adt_node_class_root(strip_ty_indirections(pointee, self.llbc)?, self.llbc);
+            }
+            raw_ptr_pointee_class_root(node, self.llbc)
         }) else {
             return value;
         };
@@ -5785,7 +5790,7 @@ impl<'a> Lowering<'a> {
                         continue;
                     }
                     let value = self
-                        .narrow_typed_nullable_field_value(
+                        .narrow_typed_instance_field_value(
                             bb_id,
                             LinkArg::Value(value),
                             declared_ty,
@@ -13527,9 +13532,10 @@ impl<'a> Lowering<'a> {
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_sign_positive")
     }
 
-    /// `majit_metainterp::jit::promote(x)` = `hint(x, promote=True)`
-    /// (`rlib/jit.py`), with the `promote_string` (`:118`) and
-    /// `promote_unicode` (`:124`) siblings.  All three wrappers carry their
+    /// `majit_metainterp::jit::promote(x)` / the lower-layer
+    /// `majit_ir::jit::promote(x)` decorator carrier =
+    /// `hint(x, promote=True)` (`rlib/jit.py`), with the `promote_string`
+    /// (`:118`) and `promote_unicode` (`:124`) siblings.  All wrappers carry their
     /// flag by name (each body is a bare `hint(x)`), so the callsite is
     /// recognised by the wrapper path, not the body.  Returns the
     /// synthesised `hint_*` marker leaf for the matched wrapper so the
@@ -13548,7 +13554,7 @@ impl<'a> Lowering<'a> {
             return None;
         };
         match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
-            "majit_metainterp::jit::promote" => Some("hint_promote"),
+            "majit_metainterp::jit::promote" | "majit_ir::jit::promote" => Some("hint_promote"),
             "majit_metainterp::jit::promote_string" => Some("hint_promote_string"),
             "majit_metainterp::jit::promote_unicode" => Some("hint_promote_unicode"),
             _ => None,
@@ -14090,6 +14096,44 @@ impl<'a> Lowering<'a> {
         ))
     }
 
+    /// The RPython instance class carried by an `Option<T>` payload when `T`
+    /// is a raw/reference pointer to a registered GC object.  `ValueType`
+    /// records only the register bank, so a `Ref(None)` payload needs its
+    /// source class recorded on the closure-rewrite site until the synthesized
+    /// writer can emit the ordinary instance-narrowing cast.  This preserves
+    /// the concrete field annotation that RPython's `InstanceRepr._setup_repr`
+    /// consumes (`rpython/rtyper/rclass.py:501-509`).
+    fn option_payload_instance_class_root(&self, option_ty: &TyRef) -> Option<String> {
+        let mut payload = tyref_node(option_ty, self.llbc)?
+            .as_object()?
+            .get("Adt")?
+            .get("generics")?
+            .get("types")?
+            .get(0)?;
+        loop {
+            let obj = payload.as_object()?;
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                payload = self.llbc.dedup_body(id)?;
+                continue;
+            }
+            if let Some(parts) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && parts.len() == 2
+            {
+                payload = &parts[1];
+                continue;
+            }
+            if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
+                return Some(root);
+            }
+            let pointee = obj.get("Ref")?.as_array()?.get(1)?;
+            let pointee = strip_ty_wrappers(pointee, self.llbc)?;
+            return raw_ptr_pointee_class_root(pointee, self.llbc)
+                .or_else(|| adt_node_class_root(pointee, self.llbc));
+        }
+    }
+
     /// The per-instantiation `Option` enum root for a residual-call
     /// destination `dest_ty` that is an `Option<*mut RegisteredStruct>`
     /// (`Option<PyObjectRef>`) or an `Option<SplitEligibleEnum>`
@@ -14165,34 +14209,7 @@ impl<'a> Lowering<'a> {
         if !self.tyref_is_niche_option_ptr(dest_ty) {
             return None;
         }
-        let mut payload = tyref_node(dest_ty, self.llbc)?
-            .as_object()?
-            .get("Adt")?
-            .get("generics")?
-            .get("types")?
-            .get(0)?;
-        loop {
-            let obj = payload.as_object()?;
-            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-                payload = self.llbc.dedup_body(id)?;
-                continue;
-            }
-            if let Some(parts) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
-                && parts.len() == 2
-            {
-                payload = &parts[1];
-                continue;
-            }
-            if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
-                return Some(root);
-            }
-            let pointee = obj.get("Ref")?.as_array()?.get(1)?;
-            let pointee = strip_ty_wrappers(pointee, self.llbc)?;
-            return raw_ptr_pointee_class_root(pointee, self.llbc)
-                .or_else(|| adt_node_class_root(pointee, self.llbc));
-        }
+        self.option_payload_instance_class_root(dest_ty)
     }
 
     /// Resolve the destination `Option` of a `bool::then` / `bool::then_some`
@@ -14764,6 +14781,7 @@ impl<'a> Lowering<'a> {
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let payload_class_root = self.option_payload_instance_class_root(recv_ty);
         // Closure env ADT → its `name_path` is the `call_once` inherent method
         // owner (`resolve_impl_owner_adt_def_id_free` records the same spelling
         // for the closure's transparent `call_once` body).
@@ -14782,6 +14800,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             call_once_owner,
             payload_ty,
+            payload_class_root,
             result_ty,
             args_tuple_suffix,
             niche,
@@ -14864,6 +14883,7 @@ impl<'a> Lowering<'a> {
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let payload_class_root = self.option_payload_instance_class_root(recv_ty);
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let env_td = self.llbc.type_by_id(env_def_id)?;
         let call_once_owner = env_td.item_meta.name_path();
@@ -14931,6 +14951,7 @@ impl<'a> Lowering<'a> {
             result_niche,
             call_once_owner,
             payload_ty,
+            payload_class_root,
             call_result_ty,
             args_tuple_suffix,
             niche,
@@ -16808,7 +16829,17 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: ctor_target,
                 args: Vec::new(),
-                result_ty: ValueType::Ref(Some(owner.to_string())),
+                // The call target is the enum BASE so the annotator constructs
+                // `SomeInstance(enum)` and runtime-tagged values can meet at a
+                // join.  The codewriter's `result_ty` has a separate job: it
+                // is the low-level STRUCT passed to `rewrite_op_malloc`.  That
+                // STRUCT must be the payload-carrying variant, whose flattened
+                // layout contains both the inherited tag and `__pos_0`.
+                // RPython already hands jtransform that concrete malloc type
+                // (`InstanceRepr._setup_repr` / `Transformer.rewrite_op_malloc`);
+                // this split restores the same information across pyre's
+                // synthetic pre-rtyper constructor seam.
+                result_ty: ValueType::Ref(Some(payload_owner.to_string())),
             },
         });
         // The `__discriminant` tag is always an `i64` (matching the
@@ -19949,8 +19980,10 @@ fn tyref_exact_layout_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
 /// ptr` / `ptr → int` resolve the `lltype.cast_*` module attr
 /// (`["rpython", "rtyper", "lltypesystem", "lltype", …]` per
 /// `flowspace_adapter` Branch 3b); `int → float` / `float → int` resolve
-/// the bare `float` / `int` builtins (single-segment `HOST_ENV.\
-/// lookup_builtin`).
+/// the `__builtin__.float` / `__builtin__.int` objects.  Keeping the builtin
+/// owner in the path preserves the callable identity that keys
+/// `rbuiltin.py::BUILTIN_TYPER`; a bare leaf can collide with an unrelated
+/// Rust function named `float` or `int` in the flat call registry.
 fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
     let (s, d) = (value_type_bank(src), value_type_bank(dst));
     let lltype = |name: &str| -> Vec<String> {
@@ -19966,9 +19999,12 @@ fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
         (0, 1) => Some(lltype("cast_int_to_ptr")),
         (1, 0) => Some(lltype("cast_ptr_to_int")),
         // int → float / float → int — `float(v)` / `int(v)`, whose
-        // rtyper delegates to `rtype_float` / `rtype_int`.
-        (0, 2) => Some(vec!["float".to_string()]),
-        (2, 0) => Some(vec!["int".to_string()]),
+        // rtyper delegates to `rtype_float` / `rtype_int`.  The explicit
+        // `__builtin__` owner is the flowspace Constant's host identity, not
+        // a new namespace: `HOST_ENV.import_module("__builtin__")` returns
+        // the same singleton objects that key `BUILTIN_TYPER`.
+        (0, 2) => Some(vec!["__builtin__".to_string(), "float".to_string()]),
+        (2, 0) => Some(vec!["__builtin__".to_string(), "int".to_string()]),
         // No host callable for the remaining pairs (e.g. ref↔float, or any
         // pair touching Void/State/Unknown): alias the operand.
         _ => None,
@@ -26752,14 +26788,26 @@ fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
 mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{
-        DecodedConst, FnPtrFamily, cast_kind_is_raw_ptr, cast_pointer_marker_op,
-        charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
-        fn_ptr_family_for, json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
-        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
-        tyref_is_raw_byte_ptr,
+        DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
+        cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
+        decode_literal, fn_ptr_family_for, json_ty_is_thin_pointer_element,
+        json_ty_scalar_element_spelling, push_ptr_to_unsigned_cast, shaped_array_parts,
+        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
+
+    #[test]
+    fn numeric_bank_crossing_casts_preserve_the_builtin_owner() {
+        assert_eq!(
+            cast_call_segments(&ValueType::Int, &ValueType::Float),
+            Some(vec!["__builtin__".into(), "float".into()])
+        );
+        assert_eq!(
+            cast_call_segments(&ValueType::Float, &ValueType::Int),
+            Some(vec!["__builtin__".into(), "int".into()])
+        );
+    }
 
     /// A block emptied *after* the head `eliminate_empty_blocks` must still
     /// be rewired past, so the values riding the link into it do not survive
@@ -34419,6 +34467,96 @@ mod tests {
             );
         }
         assert!(writes >= 2, "expected both PyError context-field writes");
+    }
+
+    /// `W_DictObject.dstrategy` is PyPy's ordinary instance attribute.  Rust
+    /// carries the singleton strategy through `&'static DictStrategyRef`, but
+    /// assigning that reference must still feed `setattr` a classed instance;
+    /// otherwise the field's constructor annotation and setter annotation meet
+    /// as `SomeInstance(DictStrategyRef) ∪ SomePtr`.
+    #[test]
+    #[ignore]
+    fn dict_strategy_setter_retains_instance_class() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "pyre_object::dictmultiobject::w_dict_set_strategy")
+                .expect("lower w_dict_set_strategy");
+        let value = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, value, .. } if field.name == "dstrategy" => match value
+                {
+                    LinkArg::Value(value) => Some(value.clone()),
+                    LinkArg::Const(_) => None,
+                },
+                _ => None,
+            })
+            .expect("W_DictObject.dstrategy write");
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                op.result.as_ref() == Some(&value)
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments.first().map(String::as_str)
+                            == Some("__cast_instance_intrinsic")
+                            && segments.last().is_some_and(|root| root.ends_with("DictStrategyRef"))
+                    )
+            }),
+            "dstrategy assignment must retain the declared DictStrategyRef class"
+        );
+    }
+
+    /// PyPy's `instantiate(W_IntObject)` is lowered to a real allocation plus
+    /// `intval` store, never left as the Rust helper that accepted the
+    /// stack-built aggregate.  The real LLBC constructor must therefore leave
+    /// this frontend with `NewWithVtable`, not residual `malloc_typed`.
+    #[test]
+    #[ignore]
+    fn w_int_new_fuses_typed_allocation() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "pyre_object::intobject::w_int_new",
+            crate::HostStaticAddrs {
+                pytypes: &[("pyobject::INT_TYPE", 0x1020_3040)],
+                ..crate::HostStaticAddrs::default()
+            },
+        )
+        .expect("lower w_int_new");
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, .. }
+                    if owner.ends_with("W_IntObject"))
+            }),
+            "w_int_new must lower instantiate(W_IntObject) to NewWithVtable: {graph:#?}"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "w_int_new must not retain residual malloc_typed: {graph:#?}"
+        );
     }
 
     /// `split_builtin_kwargs` returns `&args[..args.len() - 1]` after proving

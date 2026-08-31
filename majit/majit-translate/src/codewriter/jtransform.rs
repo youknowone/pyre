@@ -3749,7 +3749,7 @@ impl<'a> Transformer<'a> {
         // the helper address/effect descriptor and unsigned rounding on the
         // upstream path; it is removed when jtransform consumes the rtyped
         // graph directly.
-        if matches!(target, CallTarget::FunctionPath { segments } if segments == &["float"])
+        if matches!(target, CallTarget::FunctionPath { segments } if segments == &["__builtin__", "float"])
             && args.len() == 1
             && matches!(result_ty, ValueType::Float)
             && variable_has_declared_unsigned_type(graph, &args[0])
@@ -4818,6 +4818,25 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
     ) -> Option<RewriteResult> {
         use crate::codewriter::type_state::ConcreteType;
+        // jtransform.py `_handle_list_call`: `list.ll_arraymove` is an OS9
+        // residual call. Descriptor analysis still sees the helper graph —
+        // its per-item `setarrayitem` arms are what populate
+        // `effectinfo.write_descrs_arrays` — through `op`; only the function
+        // address is retargeted to the native barrier+memmove body.
+        if oopspec_name == "list.ll_arraymove" {
+            let move_target = CallTarget::function_path(["jit_ll_arraymove"]);
+            return Some(self._handle_oopspec_call(
+                graph,
+                op,
+                &move_target,
+                args,
+                &ValueType::Void,
+                graph_name,
+                OopSpecIndex::Arraymove,
+                None,
+                None,
+            ));
+        }
         // Field owner for the `W_ListObject` storage struct.  The dotted
         // names address the fused offsets the runtime descr group
         // exposes (`int_items.len` → `list_int_items_len_descr`,
@@ -10653,7 +10672,7 @@ mod tests {
             .push_op_var(
                 graph.startblock,
                 OpKind::Call {
-                    target: CallTarget::function_path(["float"]),
+                    target: CallTarget::function_path(["__builtin__", "float"]),
                     args: vec![arg],
                     result_ty: ValueType::Float,
                 },
@@ -12641,6 +12660,49 @@ mod tests {
         ));
     }
 
+    /// A runtime-tagged Option is annotated at the enum base, but its malloc
+    /// type is the payload-carrying variant: that is the concrete low-level
+    /// struct whose flattened fields are `[base.__discriminant, __pos_0]`.
+    #[test]
+    fn option_base_ctor_allocates_the_payload_variant_layout() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("option_tagged_pair_malloc");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let allocation_owner = "core::option::Option<i64>::Some".to_string();
+        let target = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["core".to_string(), "option".to_string()],
+            "Option<i64>",
+        );
+        let result_ty = ValueType::Ref(Some(allocation_owner.clone()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![],
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "option_tagged_pair_malloc",
+            &mut graph,
+        ) else {
+            panic!("runtime-tagged Option base ctor must lower to its physical shell malloc");
+        };
+        assert!(matches!(
+            ops.as_slice(),
+            [SpaceOperation {
+                result: Some(result),
+                kind: OpKind::New { owner },
+            }] if result == &result_var && owner == &allocation_owner
+        ));
+    }
+
     /// `fold_we_are_jitted_calls` rewrites the `we_are_jitted()`
     /// `direct_call` to the `_we_are_jitted` symbolic constant — the
     /// model-graph counterpart of RPython's rtyper `specialize_call`
@@ -13455,6 +13517,72 @@ mod tests {
             matches!(ops.last().map(|o| &o.kind), Some(OpKind::Live)),
             "CanRaise oopspec call must append a trailing -live-"
         );
+    }
+
+    /// jtransform.py `test_list_ll_arraymove`: one ref plus three integer
+    /// arguments, void result, and OS_ARRAYMOVE (9) callinfo.
+    #[test]
+    fn list_ll_arraymove_lowers_to_os9_residual_call() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("arraymove");
+        let args = vec![
+            variable_with_lltype(
+                "array",
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+                })),
+            ),
+            variable_with_lltype("source_start", LowLevelType::Signed),
+            variable_with_lltype("dest_start", LowLevelType::Signed),
+            variable_with_lltype("length", LowLevelType::Signed),
+        ];
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ll_arraymove"]),
+                args: args.clone(),
+                result_ty: ValueType::Void,
+            },
+        };
+        let rewritten = transformer
+            ._handle_list_call("list.ll_arraymove", &op, &args, &mut graph, "arraymove")
+            .expect("list.ll_arraymove must be handled");
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("expected Replace");
+        };
+        let residual = ops.iter().find_map(|op| match &op.kind {
+            OpKind::CallResidual {
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                ..
+            } => Some((args_i, args_r, args_f, result_kind)),
+            _ => None,
+        });
+        let Some((args_i, args_r, args_f, result_kind)) = residual else {
+            panic!("expected a CallResidual, got {ops:?}");
+        };
+        assert_eq!(args_i.len(), 3);
+        assert_eq!(args_r.len(), 1);
+        assert!(args_f.is_empty());
+        assert_eq!(*result_kind, 'v');
+        let callinfo = &transformer
+            .callcontrol
+            .as_deref()
+            .unwrap()
+            .callinfocollection;
+        assert!(callinfo.has_oopspec(OopSpecIndex::Arraymove));
+        let (_, fnaddr) = callinfo.callinfo_for_oopspec(OopSpecIndex::Arraymove);
+        assert_eq!(callinfo.func_name(fnaddr), Some("jit_ll_arraymove"));
     }
 
     /// Other `rgc.*` spellings are not ported and fall through to the

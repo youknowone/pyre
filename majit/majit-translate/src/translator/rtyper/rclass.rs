@@ -5591,7 +5591,7 @@ mod tests {
     }
 
     #[test]
-    fn preminted_generic_enum_variant_repr_contains_payload_field() {
+    fn generic_enum_variant_repr_contains_payload_after_constructor_setattr() {
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::front::StructFieldRegistry;
         use std::collections::HashMap;
@@ -5640,6 +5640,16 @@ mod tests {
             .bookkeeper
             .getuniqueclassdef_for_enum_variant(root, "Some")
             .expect("resolve preminted Some classdef");
+        let payload = classdef.borrow().attrs["__pos_0"].s_value.clone();
+        classdef
+            .borrow_mut()
+            .attrs
+            .get_mut("__pos_0")
+            .expect("variant payload")
+            .modified(Some(&classdef))
+            .expect("constructor setattr marks payload mutable");
+        crate::annotator::classdesc::ClassDef::generalize_attr(&classdef, "__pos_0", Some(payload))
+            .expect("constructor setattr marks the payload as an instance field");
         let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc)
             .expect("build preminted Some repr");
         Repr::setup(repr.as_ref()).expect("setup preminted Some repr");

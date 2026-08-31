@@ -1018,6 +1018,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
     majit_gc::set_active_gc_shrink_array(Some(wasm_gc_shrink_array));
+    majit_gc::set_active_gc_varsize_layout(Some(wasm_gc_varsize_layout));
     majit_gc::set_active_gc_id_or_identityhash(Some(wasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
     majit_gc::set_active_write_barrier_before_move(Some(wasm_active_gc_write_barrier_before_move));
@@ -1801,6 +1802,18 @@ fn wasm_gc_owns_object(addr: usize) -> bool {
 /// read-only queries made while a collection may already hold `&mut`.
 fn wasm_gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
     with_wasm_active_gc_mut(|gc| gc.shrink_array(addr, smaller_length)).unwrap_or(false)
+}
+
+fn wasm_gc_varsize_layout(addr: usize) -> Option<majit_gc::GcVarSizeLayout> {
+    let obj = GcRef(addr);
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.varsize_layout(obj)) {
+        return r;
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_query_reentrant(|g| g.varsize_layout(obj))
+    } else {
+        None
+    }
 }
 
 pub struct WasmBackend {

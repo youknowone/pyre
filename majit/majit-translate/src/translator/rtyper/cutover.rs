@@ -1974,7 +1974,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     for (path, graph) in function_graphs.iter() {
         let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
         let canonical_strip = canonical_dedup_key(path);
-        // `pyre_object::lltype::malloc[_typed]` are GC allocation intrinsics,
+        // `pyre_object::lltype::malloc[_typed/_stable]` are GC allocation intrinsics,
         // recognised as host builtins (annotator `malloc_typed_alloc`, HOST_ENV
         // `pyre_object.lltype` module). Their real bodies enter the host
         // allocator (`malloc_typed` first reads the un-flowable
@@ -1991,11 +1991,13 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // is still not a residual boundary: it means the frontend could not
         // prove the allocation header/type identity.  The fail-closed guard in
         // `flowspace_adapter::translate_op` therefore rejects every surviving
-        // `malloc`, `malloc_typed`, or `malloc_typed_managed` call instead of
+        // `malloc`, `malloc_typed`, `malloc_typed_managed`, or
+        // `malloc_typed_stable` call instead of
         // emitting an executable symbolic fnaddr.
         if canonical_strip == ["lltype", "malloc"]
             || canonical_strip == ["lltype", "malloc_typed"]
             || canonical_strip == ["lltype", "malloc_typed_managed"]
+            || canonical_strip == ["lltype", "malloc_typed_stable"]
         {
             crate::decline::record(
                 REGISTRY_GATE,
@@ -2085,6 +2087,26 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             by_canonical_path.insert(canonical_strip, key.clone());
             entry
         };
+        // GraphStore aliases are iteration-ordered, so the canonical entry
+        // selected above can be keyed by the bare leaf even though the graph
+        // retains its exact source callable identity.  RPython attaches
+        // `_signature_` to that callable object, not to one spelling of its
+        // import path (`bookkeeper.py:353-409`, `description.py:234-244`).
+        // Recover the same fact from `FunctionGraph.source_identity` here;
+        // this keeps a foreign same-leaf function distinct while ensuring
+        // every alias of the real materializer shares the semantic result.
+        if graph
+            .source_identity
+            .as_deref()
+            .map(|identity| {
+                is_exception_object_materializer(&FunctionPathKey::from_segments(
+                    identity.split("::"),
+                ))
+            })
+            .unwrap_or(false)
+        {
+            entry.publish_exception_object_result_signature();
+        }
         pending.push((key, graph, entry, signature));
     }
     // Lift `pending` in a deterministic order.  `function_graphs.iter()`
@@ -2198,7 +2220,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             }
         }
     }
-    for (_key, graph, entry, signature) in &pending {
+    for (key, graph, entry, signature) in &pending {
         let entry_ptr = Rc::as_ptr(entry);
         if !lifted.insert(entry_ptr) {
             continue;
@@ -2232,10 +2254,13 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             // insert a PtrRepr -> InstanceRepr conversion that upstream never
             // has, then the first failed specialization replaces the shared
             // stub and strands every later caller on an unbound return var.
-            let result_shell = residual_stub_result_shell(
-                entry.function_desc.borrow().name.as_str(),
-                graph.return_type.as_deref(),
-            );
+            let semantic_key = graph
+                .source_identity
+                .as_deref()
+                .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
+                .unwrap_or_else(|| key.clone());
+            let result_shell =
+                residual_stub_result_shell(&semantic_key, graph.return_type.as_deref());
             if let Some(result_shell) = result_shell {
                 let stub = build_stub_pygraph_with_result_shell(
                     graph.name.clone(),
@@ -2598,10 +2623,10 @@ pub(crate) fn residual_return_shell(
 /// exception instance.  The cached stub must agree with that signature, just
 /// as an upstream flow graph constrained by `_signature_` does.
 fn residual_stub_result_shell(
-    function_name: &str,
+    function_key: &FunctionPathKey,
     token: Option<&str>,
 ) -> Option<crate::annotator::model::SomeValue> {
-    if is_exception_object_materializer(function_name) {
+    if is_exception_object_materializer(function_key) {
         Some(exception_object_result_annotation())
     } else {
         residual_return_shell(token)
@@ -6432,7 +6457,8 @@ mod tests {
         use crate::annotator::model::SomeValue;
 
         for name in ["pyerror_to_exc_object", "pyerror_type_error_to_exc_object"] {
-            let shell = residual_stub_result_shell(name, Some(OBJECTPTR_RETURN_TYPE))
+            let key = FunctionPathKey::from_segments(["pyre_interpreter", "error", name]);
+            let shell = residual_stub_result_shell(&key, Some(OBJECTPTR_RETURN_TYPE))
                 .expect("exception materializer must have a result shell");
             let SomeValue::Instance(instance) = shell else {
                 panic!("{name}: raw pointer ABI must not leak into annotation")
@@ -6441,7 +6467,8 @@ mod tests {
             assert!(!instance.can_be_none);
         }
 
-        let ordinary = residual_stub_result_shell("ordinary", Some(OBJECTPTR_RETURN_TYPE))
+        let ordinary_key = FunctionPathKey::from_segments(["other", "pyerror_to_exc_object"]);
+        let ordinary = residual_stub_result_shell(&ordinary_key, Some(OBJECTPTR_RETURN_TYPE))
             .expect("ordinary object-pointer residual must have a result shell");
         assert!(
             matches!(ordinary, SomeValue::Ptr(_)),

@@ -102,9 +102,9 @@ pub(crate) mod artifacts {
 /// `ll_arraymove`, wrapping `rgc.ll_arraymove`), reached here through a
 /// proven adapter boundary because neither `rlist.ll_arraymove` nor its
 /// caller `ll_delitem_nonneg` is built yet. The restoration reaches the
-/// rtyper only: no `list.ll_arraymove` oopspec and no `OS_ARRAYMOVE`
-/// (`jit/codewriter/effectinfo.py`) are emitted, so the codewriter still
-/// produces a residual call where upstream produces the operation.
+/// rtyper, oopspec, and codewriter boundary: the minted helper is marked
+/// `list.ll_arraymove`, and `_handle_list_call` emits OS_ARRAYMOVE (9) while
+/// retaining this adapter only as the source-level restoration seam.
 ///
 /// Registered in `flowspace::model`, given an annotator in
 /// `annotator::builtin`, and resolved in `translator::rtyper`. All three must
