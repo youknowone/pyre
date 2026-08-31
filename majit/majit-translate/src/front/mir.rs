@@ -14327,34 +14327,22 @@ impl<'a> Lowering<'a> {
     /// the concrete field annotation that RPython's `InstanceRepr._setup_repr`
     /// consumes (`rpython/rtyper/rclass.py:501-509`).
     fn option_payload_instance_class_root(&self, option_ty: &TyRef) -> Option<String> {
-        let mut payload = tyref_node(option_ty, self.llbc)?
-            .as_object()?
-            .get("Adt")?
-            .get("generics")?
-            .get("types")?
-            .get(0)?;
-        loop {
-            let obj = payload.as_object()?;
-            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-                payload = self.llbc.dedup_body(id)?;
-                continue;
-            }
-            if let Some(parts) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
-                && parts.len() == 2
-            {
-                payload = &parts[1];
-                continue;
-            }
-            if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
-                return Some(root);
-            }
-            let pointee = obj.get("Ref")?.as_array()?.get(1)?;
-            let pointee = strip_ty_wrappers(pointee, self.llbc)?;
-            return raw_ptr_pointee_class_root(pointee, self.llbc)
-                .or_else(|| adt_node_class_root(pointee, self.llbc));
+        let payload = strip_ty_indirections(
+            tyref_node(option_ty, self.llbc)?
+                .as_object()?
+                .get("Adt")?
+                .get("generics")?
+                .get("types")?
+                .get(0)?,
+            self.llbc,
+        )?;
+        if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
+            return Some(root);
         }
+        let pointee = payload.as_object()?.get("Ref")?.as_array()?.get(1)?;
+        let pointee = strip_ty_wrappers(pointee, self.llbc)?;
+        raw_ptr_pointee_class_root(pointee, self.llbc)
+            .or_else(|| adt_node_class_root(pointee, self.llbc))
     }
 
     /// The per-instantiation `Option` enum root for a residual-call

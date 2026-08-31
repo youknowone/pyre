@@ -5756,44 +5756,7 @@ mod tests {
         );
     }
 
-    /// Publish `table` into the process-global name → `StructId` map and hold
-    /// every other registering test out until the returned guard drops.
-    ///
-    /// `register_struct_ids` REPLACES the whole table (`majit-ir/src/descr.rs`,
-    /// `*guard = table`), which is right for production — the front end
-    /// populates it once per program, and merging would leak one program's
-    /// names into the next — and hostile to `cargo test`'s default
-    /// parallelism, where a second registering test wipes the first one's only
-    /// entry while that test is still running. The victim does not fail where
-    /// it registered: its `fielddescrof` silently takes a different arm and
-    /// returns a wrong `offset`.
-    ///
-    /// Measured, not inferred: the two tests below, run as a pair with default
-    /// threads, failed 9 of 12 runs; in the full 3141-test binary the same race
-    /// surfaced once in 6, because the scheduler rarely puts them adjacent.
-    /// Both pass in isolation and under `--test-threads=1`, so neither the
-    /// isolated run nor the serial run can see this.
-    ///
-    /// Scope is one test BINARY, which is the whole racing population: other
-    /// crates' tests run in their own processes and cannot reach this table.
-    ///
-    /// The lock is poison-tolerant. A test that panics mid-body would
-    /// otherwise convert one real failure into a cascade of unrelated ones.
-    ///
-    /// Bind the result to a NAMED local (`let _registry = …`). A bare
-    /// `let _ = …` drops the guard at once and restores exactly the race this
-    /// exists to remove — while still compiling, and still passing in
-    /// isolation.
-    #[must_use = "the returned guard holds the registry lock for the rest of \
-                  the test; dropping it immediately re-opens the race"]
-    fn register_struct_ids_serialized(
-        table: HashMap<String, Option<majit_ir::descr::StructId>>,
-    ) -> parking_lot::MutexGuard<'static, ()> {
-        static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        let guard = LOCK.lock();
-        majit_ir::descr::register_struct_ids(table);
-        guard
-    }
+    use crate::test_support::register_struct_ids_serialized;
 
     #[test]
     fn fielddescrof_resolves_the_slot_when_the_offset_comes_from_the_layout_registry() {

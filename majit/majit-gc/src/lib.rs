@@ -3096,7 +3096,12 @@ pub fn gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
 }
 
 /// Return the active collector's existing TYPE_INFO layout for `addr`.
-/// `None` means it is not a registered variable-size GC object.
+///
+/// `None` means either that `addr` is not a registered variable-size GC
+/// object, or that no backend has installed the query — the same answer
+/// [`gc_owns_object`] gives for an address no GC owns.  A caller that needs
+/// a layout regardless supplies its own, the way `jit_ll_arraymove` falls
+/// back to the array token of the block it allocates.
 pub fn gc_varsize_layout(addr: usize) -> Option<GcVarSizeLayout> {
     if addr == 0 {
         return None;
