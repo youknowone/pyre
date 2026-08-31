@@ -1004,9 +1004,24 @@ jobs:
       # before it. It reports whatever check.py and the pip run above did; the
       # one case it cannot report on is check.py failing to build the binary,
       # where it goes red naming the same cause a second time.
+      #
+      # `vm.overcommit_memory=1` before the run: a module that spawns a child
+      # does it from a process holding the whole JIT heap -- `test_zipfile`'s
+      # `TestExecutablePrependedZip` runs after the lzma and zip64 classes, so
+      # its `subprocess.check_output` forks at a ~1.9GB peak. Under the default
+      # `OVERCOMMIT_GUESS`, `fork` charges the parent's committed size against
+      # *currently free* memory, so three sibling jobs near their own peaks can
+      # push that below the bar and the call returns ENOMEM even though nothing
+      # is close to exhausting the 16GB runner. The child execs immediately and
+      # touches none of the copied pages, and upstream `fork_exec` takes plain
+      # `os.fork()` while documenting that `allow_vfork` is a no-op, so the
+      # heuristic has nothing real to protect here. Keep it non-fatal: if a
+      # future image refuses the write, the suite should still run and report.
       if: ${{ !cancelled() && runner.os == 'Linux' && matrix.backend == 'dynasm' }}
       shell: bash
-      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 300
+      run: |
+        sudo sysctl -w vm.overcommit_memory=1 || echo "note: could not relax overcommit; fork-heavy modules may report ENOMEM"
+        ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --backend dynasm --baseline pyre/cpython_tests/baseline.json --jobs 3 --timeout 300
 
   pyre-check-macos:
     name: pyre/check.py ${{ matrix.label }} (macos-latest)

@@ -2393,9 +2393,10 @@ pub struct CaParams {
     pub inline: Option<CaInlineParams>,
 }
 
-/// Per-CALL_ASSEMBLER target geometry baked into the corresponding wasm arm.
-/// In particular, `callee_gcmap_ptr` must match the allocated frame's layout:
-/// the moving GC uses it to trace that frame while deeper calls collect.
+/// Per-CALL_ASSEMBLER target dispatch baked into the corresponding wasm arm.
+/// Frame geometry is deliberately not stored here: PyPy permits
+/// `redirect_call_assembler` to replace a temporary callback with a deeper
+/// real loop, so every mutable target field is loaded through the stable entry.
 #[derive(Clone)]
 pub struct CaTarget {
     /// Stable guest-memory [`WasmCaDispatchEntry`](crate::failguard::WasmCaDispatchEntry)
@@ -2403,15 +2404,6 @@ pub struct CaTarget {
     /// through it at runtime so pending->real install and redirects do not
     /// require patching an already-compiled wasm module.
     pub dispatch_entry: u32,
-    /// Bytes to reserve per CA callee frame (the GC `JitFrame`'s data region,
-    /// i.e. its Signed item area). This is the source geometry's prefix through
-    /// the Ref homes, excluding its unused tail call area. The alloc trampoline
-    /// derives the JitFrame item count from this exact byte count.
-    pub callee_frame_bytes: u32,
-    /// Leaked per-bridge `jf_gcmap` (`lib.rs::build_callee_gcmap`) marking the
-    /// callee frame's CA input + home Ref slots; baked into each frame's
-    /// `jf_gcmap` field at alloc time.
-    pub callee_gcmap_ptr: i64,
 }
 
 /// Direct CA fast-path values baked at bridge compilation time.
@@ -3619,17 +3611,18 @@ fn build_function(
     // dispatcher is enabled without parameter entries).
     let ovf_flag_local = value_locals_end + UMULHI_SCRATCH;
     let bridge_slot_local = ovf_flag_local + 1;
-    // The self-recursive CALL_ASSEMBLER arm needs two more i32 scratch locals:
-    // `ca_cfp_local` (the current callee frame pointer) and `ca_fi_local` (the
-    // returned frame[0] fail index). Reserve them only under `emit_ca` so a
-    // flag-off module keeps exactly one i32 local (byte-identical).
+    // The CALL_ASSEMBLER arm needs three more i32 locals: the current callee
+    // frame, its returned fail index, and the immutable runtime-target snapshot
+    // loaded from the stable dispatch cell.  Keeping the snapshot address in a
+    // local makes function/geometry/GC-map selection coherent across redirect.
     let ca_cfp_local = bridge_slot_local + 1;
     let ca_fi_local = ca_cfp_local + 1;
+    let ca_target_local = ca_fi_local + 1;
     // Extra i32 scratches when the inline nursery-bump fast path is armed:
     // one holds the loaded `nursery_free` across the bump/commit sequence;
     // runtime varsize array allocation also needs one for the computed
     // total/new-free word.
-    let base_i32_locals: u32 = 1 + if ca.emit_ca { 2 } else { 0 };
+    let base_i32_locals: u32 = 1 + if ca.emit_ca { 3 } else { 0 };
     let alloc_scratch_local = bridge_slot_local + base_i32_locals;
     let alloc_size_local = alloc_scratch_local + 1;
     // A keyed census must preserve the raw dispatch value until `br_table`.
@@ -3650,6 +3643,7 @@ fn build_function(
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
+    debug_assert_eq!(ca_target_local, ca_fi_local + 1);
     debug_assert_eq!(alloc_scratch_local, bridge_slot_local + base_i32_locals);
     debug_assert_eq!(alloc_size_local, alloc_scratch_local + 1);
     let inline_guards: Vec<InlineGuard<'_>> = inlined_bridges
@@ -5582,6 +5576,13 @@ fn build_function(
                     .get(&op_token)
                     .expect("CA op target must be registered");
                 let dispatch_entry = tgt.dispatch_entry as i32;
+                sink.i32_const(dispatch_entry);
+                sink.i32_load(mem32(crate::failguard::WASM_CA_DISPATCH_TARGET_PTR_OFS));
+                sink.local_tee(ca_target_local);
+                sink.i32_eqz();
+                sink.if_(BlockType::Empty);
+                sink.unreachable();
+                sink.end();
 
                 // A terminally-declined target cannot be restarted from the
                 // CALL_ASSEMBLER reds: these are loop-header live-ins, not a
@@ -5603,102 +5604,18 @@ fn build_function(
                 // `ca_cfp_local = frame_base + FIRST_ITEM_OFFSET` is the
                 // bespoke-layout frame pointer — every `mem64(OFS)` below is
                 // relative to it, exactly as the source loop reads its local 0.
-                let ca_depth = tgt.callee_frame_bytes as usize / std::mem::size_of::<isize>();
-                let ca_payload_size = majit_backend::jitframe::JitFrame::alloc_size(ca_depth);
-                let ca_total_size =
-                    ((GcHeader::SIZE + ca_payload_size).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7)
-                        & !7;
-                if let (Some(base), Some(inline)) = (residual_type_base, ca.inline) {
-                    // rewrite.py's nursery fast path plus assembler.py's inline
-                    // shadow-stack header. The wasm nursery is allocated
-                    // zeroed and its target-specific reset zeroes the complete
-                    // arena before reuse (`Nursery::reset`); the slow born-old
-                    // path also clears its payload. Do not repeat a full-frame
-                    // `memory.fill` on every CALL_ASSEMBLER. The callee prologue
-                    // still explicitly clears its Ref homes, and the fixed
-                    // JitFrame metadata fields are initialized below.
-                    sink.i32_const(inline.nursery_free_addr as i32);
-                    sink.i32_load(mem32(0));
-                    sink.local_tee(alloc_scratch_local);
-                    sink.i32_const(ca_total_size as i32);
-                    sink.i32_add();
-                    sink.i32_const(inline.nursery_top_addr as i32);
-                    sink.i32_load(mem32(0));
-                    sink.i32_gt_u();
-                    sink.i32_const(inline.jf_top_addr as i32);
-                    sink.i32_load(mem32(0));
-                    sink.local_tee(alloc_size_local);
-                    sink.i32_const(8);
-                    sink.i32_add();
-                    sink.i32_const(inline.jf_limit_addr as i32);
-                    sink.i32_load(mem32(0));
-                    sink.i32_gt_u();
-                    sink.i32_or();
-                    sink.if_(BlockType::Result(ValType::I64));
-                    // Slow path collects/allocates and performs init + push.
-                    sink.i64_const(tgt.callee_frame_bytes as i64);
-                    sink.i64_const(tgt.callee_gcmap_ptr);
-                    sink.i32_const(ca.ca_alloc_fn_ptr as i32);
-                    sink.call_indirect(0, base + 2);
-                    sink.else_();
-                    // Commit the nursery bump, then write the exact young
-                    // `GcHeader::new(jitframe_tid)` word (flags are clear).
-                    sink.i32_const(inline.nursery_free_addr as i32);
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(ca_total_size as i32);
-                    sink.i32_add();
-                    sink.i32_store(mem32(0));
-                    sink.local_get(alloc_scratch_local);
-                    sink.i64_const(inline.jitframe_tid as i64);
-                    sink.i64_store(mem64(0));
-                    // Replicate JitFrame::init + jf_gcmap on the already-zero
-                    // payload. Every nonzero metadata field is written below.
-                    for offset in [
-                        majit_backend::jitframe::JF_FRAME_INFO_OFS,
-                        majit_backend::jitframe::JF_DESCR_OFS,
-                        majit_backend::jitframe::JF_FORCE_DESCR_OFS,
-                        majit_backend::jitframe::JF_SAVEDATA_OFS,
-                        majit_backend::jitframe::JF_GUARD_EXC_OFS,
-                        majit_backend::jitframe::JF_FORWARD_OFS,
-                    ] {
-                        sink.local_get(alloc_scratch_local);
-                        sink.i32_const(0);
-                        sink.i32_store(mem32(GcHeader::SIZE as u64 + offset as u64));
-                    }
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(tgt.callee_gcmap_ptr as i32);
-                    sink.i32_store(mem32(
-                        GcHeader::SIZE as u64 + majit_backend::jitframe::JF_GCMAP_OFS as u64,
-                    ));
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(ca_depth as i32);
-                    sink.i32_store(mem32(
-                        GcHeader::SIZE as u64 + majit_backend::jitframe::JF_FRAME_OFS as u64,
-                    ));
-                    // Push `[is_minor=1, jf_ptr]`; the limit check above made
-                    // these stores safe, so the helper's overflow assertion is
-                    // retained only on the slow path.
-                    sink.local_get(alloc_size_local);
-                    sink.i32_const(1);
-                    sink.i32_store(mem32(0));
-                    sink.local_get(alloc_size_local);
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(GcHeader::SIZE as i32);
-                    sink.i32_add();
-                    sink.i32_store(mem32(4));
-                    sink.i32_const(inline.jf_top_addr as i32);
-                    sink.local_get(alloc_size_local);
-                    sink.i32_const(8);
-                    sink.i32_add();
-                    sink.i32_store(mem32(0));
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(GcHeader::SIZE as i32);
-                    sink.i32_add();
-                    sink.i64_extend_i32_u();
-                    sink.end();
-                } else if let Some(base) = residual_type_base {
-                    sink.i64_const(tgt.callee_frame_bytes as i64);
-                    sink.i64_const(tgt.callee_gcmap_ptr);
+                // The tmp callback and the real loop may have different frame
+                // depths.  PyPy updates the old token's frame info during
+                // redirect; wasm mirrors that by loading both allocation
+                // fields from the old token's stable dispatch entry.  Keep the
+                // helper allocation here: the former inline path required a
+                // compile-time size and therefore could not honor a later
+                // depth increase.
+                if let Some(base) = residual_type_base {
+                    sink.local_get(ca_target_local);
+                    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
+                    sink.local_get(ca_target_local);
+                    sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
                     sink.i32_const(ca.ca_alloc_fn_ptr as i32);
                     sink.call_indirect(0, base + 2);
                 } else {
@@ -5711,10 +5628,12 @@ fn build_function(
                     sink.i64_const(2);
                     sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
                     emit_call_area_addr(&mut sink);
-                    sink.i64_const(tgt.callee_frame_bytes as i64);
+                    sink.local_get(ca_target_local);
+                    sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_FRAME_BYTES_OFS, 2));
                     sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
                     emit_call_area_addr(&mut sink);
-                    sink.i64_const(tgt.callee_gcmap_ptr);
+                    sink.local_get(ca_target_local);
+                    sink.i64_load(mem64(crate::failguard::WASM_CA_TARGET_GCMAP_PTR_OFS));
                     sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + SLOT_SIZE));
                     emit_jit_call(&mut sink, jit_call);
                     emit_call_area_addr(&mut sink);
@@ -5748,8 +5667,11 @@ fn build_function(
                 // dispatch key = 0: run the loop from its entry (preamble), not a
                 // LABEL resume — this is a fresh call.
                 sink.local_get(ca_cfp_local);
+                sink.local_get(ca_target_local);
+                sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_DISPATCH_KEY_OFS_OFS));
+                sink.i32_add();
                 sink.i64_const(0);
-                sink.i64_store(mem64(frame.dispatch_key_ofs));
+                sink.i64_store(mem64(0));
                 // Marshal the descriptor's uniform i64 Int/Ref ABI inputs into
                 // the callee's positional frame slots.
                 for (arg_index, arg) in op.getarglist().iter().enumerate() {
@@ -5759,12 +5681,11 @@ fn build_function(
                 }
                 // Run the callee loop on F'; discard the returned frame_ptr.
                 sink.local_get(ca_cfp_local);
-                // The table slot is mutable dispatch state, not an immediate:
-                // a pending self target is filled after this module installs,
-                // and redirect_call_assembler replaces it without patching
-                // this caller. A zero slot must never be dispatched.
-                sink.i32_const(dispatch_entry);
-                sink.i32_load(mem32(crate::failguard::WASM_CA_DISPATCH_FUNC_HANDLE_OFS));
+                // The immutable target snapshot was loaded before allocating
+                // F', so this function is exactly the one whose geometry and
+                // gcmap initialized that frame.
+                sink.local_get(ca_target_local);
+                sink.i32_load(mem32(crate::failguard::WASM_CA_TARGET_FUNC_HANDLE_OFS));
                 sink.local_tee(ca_fi_local);
                 sink.i32_eqz();
                 sink.if_(BlockType::Empty);
@@ -5829,11 +5750,8 @@ fn build_function(
                 // deopt: wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64).
                 sink.local_get(ca_cfp_local);
                 sink.i64_extend_i32_u();
-                sink.i32_const(dispatch_entry);
-                sink.i64_load32_u(memarg(
-                    crate::failguard::WASM_CA_DISPATCH_COMPILED_PTR_OFS,
-                    2,
-                ));
+                sink.local_get(ca_target_local);
+                sink.i64_load32_u(memarg(crate::failguard::WASM_CA_TARGET_COMPILED_PTR_OFS, 2));
                 sink.i32_const(ca.deopt_helper_slot as i32);
                 // call_indirect(table_index, type_index): the shared table is 0.
                 sink.call_indirect(0, ca_helper_type_idx);

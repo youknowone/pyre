@@ -2239,6 +2239,33 @@ mod tests {
     }
 
     #[test]
+    fn remove_repeated_live_moves_labels_before_a_lone_marker() {
+        // RPython `liveness.py remove_repeated_live` collects labels after a
+        // marker and emits them before that marker even when the run contains
+        // only one `-live-`.  An edge entering at L must therefore execute the
+        // marker instead of jumping past it.
+        let l = format_ident!("L");
+        let mut ops = vec![
+            OpMeta::live_marker_with(Register::ints(&[1]), Vec::new()),
+            OpMeta::label_def(l),
+            OpMeta::linear(OpKind::BinopI, Register::ints(&[2]), vec![]),
+        ];
+        let marker_stmt = quote! { let marker = 1; };
+        let label_stmt = quote! { let label = 2; };
+        let linear_stmt = quote! { let linear = 3; };
+        let mut stmts = vec![marker_stmt.clone(), label_stmt.clone(), linear_stmt.clone()];
+
+        remove_repeated_live(&mut ops, &mut stmts);
+
+        assert!(matches!(ops[0].control, ControlFlowClass::LabelDef));
+        assert!(matches!(ops[1].control, ControlFlowClass::LiveMarker));
+        assert!(matches!(ops[2].control, ControlFlowClass::Linear));
+        assert_eq!(stmts[0].to_string(), label_stmt.to_string());
+        assert_eq!(stmts[1].to_string(), marker_stmt.to_string());
+        assert_eq!(stmts[2].to_string(), linear_stmt.to_string());
+    }
+
+    #[test]
     fn remove_repeated_live_collapses_consecutive_markers() {
         // [marker(reads=[1]), marker(reads=[2]), label_def L, marker, reads=[3]]
         // RPython: collapse the run before reads=[3] into a single marker

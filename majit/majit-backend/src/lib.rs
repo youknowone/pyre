@@ -2747,41 +2747,6 @@ pub trait Backend: Send {
         false
     }
 
-    /// Whether CALL_ASSEMBLER may target a `compile_tmp_callback` token
-    /// (compile.py:1101-1150) whose body reaches the portal runner.
-    ///
-    /// The wasm backend admits CALL_ASSEMBLER only against a published
-    /// compiled target with no trampoline calls, and a tmp-callback body
-    /// calls the portal runner through a host trampoline, so it resolves
-    /// pending tokens instead.
-    fn supports_tmp_callback_call_assembler(&self) -> bool {
-        true
-    }
-
-    /// Register a resolvable-but-not-enterable placeholder CALL_ASSEMBLER
-    /// target for a pending token, before the loop body is compiled.
-    ///
-    /// Backends that resolve pending tokens rather than tmp-callback bodies
-    /// (`supports_tmp_callback_call_assembler` false) need the pending
-    /// target's frame geometry and dispatch slot published now so an
-    /// already-emitted caller can enter it and be redirected once the real
-    /// loop compiles. Backends that enter tmp-callback bodies never emit a
-    /// pending target, so the default is a no-op.
-    fn register_pending_target(
-        &mut self,
-        token_number: u64,
-        input_types: Vec<Type>,
-        num_inputs: usize,
-        index_of_virtualizable: i32,
-    ) {
-        let _ = (
-            token_number,
-            input_types,
-            num_inputs,
-            index_of_virtualizable,
-        );
-    }
-
     /// Execute compiled code with integer-only arguments.
     ///
     /// The integer-only signature is what a backend needs in order to hand the

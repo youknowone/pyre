@@ -2847,7 +2847,11 @@ impl UserDelAction {
             }
             return;
         }
-        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        #[cfg(all(
+            feature = "host_env",
+            not(feature = "sandbox"),
+            not(target_arch = "wasm32")
+        ))]
         if let Some(cdata) = crate::module::_cffi_backend::cdataobj::W_CData::from_obj(current())
             && matches!(
                 cdata.flavor,

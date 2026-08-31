@@ -172,7 +172,11 @@ pub(crate) fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
     let _ = pyre_object::gc_roots::pin_root(self_obj);
     // `close_w` closes the C `FILE` a cffi cast opened over this stream
     // before the flush below, the same order it takes upstream.
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
     crate::module::_cffi_backend::ctypeptr::close_cffi_fileobj(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
     );

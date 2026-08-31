@@ -22471,7 +22471,11 @@ pub(crate) fn buffer_as_bytes_like(
             pyre_object::interp_array::w_array_bytes(obj)
         })));
     }
-    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
     if let Some((address, length)) = crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
     {
         // A buffer over a NULL cdata is empty, and no slice may be built from

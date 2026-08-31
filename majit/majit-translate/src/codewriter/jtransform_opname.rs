@@ -316,11 +316,113 @@ fn transduce_op(
                 false,
             );
         }
-        // Integer arithmetic / comparison — `int_add`/`int_lt`/… → `BinOp`
-        // with the bare op name (the assembler re-prefixes `int_`).  Constant
-        // operands materialise as `ConstInt`/`ConstBool` since `BinOp` takes
-        // two Variables.
-        name if name.starts_with("int_") => {
+        // `jtransform.py`'s low-level integer op dispatch is arity-sensitive:
+        // `int_neg` / `int_invert` / `int_is_{true,zero}` are unary blackhole
+        // operations, while the remaining `int_*` family consumed by these
+        // helpers is binary.  The old Spine-B catch-all indexed `args[1]` for
+        // every `int_*` spelling, so the first signed `ll_int2hex` graph
+        // panicked on its orthodox `int_neg(i)` before jtransform could see
+        // it.  Preserve the canonical full opname for unary operations; the
+        // assembler deliberately passes already-prefixed unary names through.
+        name @ ("int_neg" | "int_invert" | "int_is_true" | "int_is_zero" | "int_force_ge_zero"
+        | "bool_not" | "uint_is_true" | "uint_invert") => {
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            // `Transformer` rename table (`jtransform.py`): Bool/Unsigned
+            // aliases share the signed int-bank blackhole implementation.
+            let canonical = match name {
+                "bool_not" => "int_is_zero",
+                "uint_is_true" => "int_is_true",
+                "uint_invert" => "int_invert",
+                _ => name,
+            };
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: canonical.to_string(),
+                    operand,
+                    result_ty,
+                },
+                result,
+            );
+        }
+        // `Transformer`'s generated rename methods.  These old low-level
+        // spellings all re-enter `rewrite_operation` under the corresponding
+        // signed int-bank opname.  Store the bare rich-graph name because the
+        // assembler restores the `int_` prefix.
+        name @ ("uint_add" | "uint_sub" | "uint_mul" | "uint_eq" | "uint_ne" | "uint_and"
+        | "uint_or" | "uint_lshift" | "uint_xor" | "char_lt" | "char_le" | "char_eq"
+        | "char_ne" | "char_gt" | "char_ge" | "unichar_eq" | "unichar_ne" | "adr_add"
+        | "int_add_nonneg_ovf") => {
+            let lhs = materialize(out, block, &op.args[0]);
+            let rhs = materialize(out, block, &op.args[1]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            let canonical = match name {
+                "adr_add" => "add",
+                "int_add_nonneg_ovf" => "add_ovf",
+                _ => name.split_once('_').expect("integer alias has a prefix").1,
+            };
+            out.push_op_with_result_var(
+                block,
+                OpKind::BinOp {
+                    op: canonical.to_string(),
+                    lhs,
+                    rhs,
+                    result_ty,
+                },
+                result,
+            );
+        }
+        // Unlike the aliases above, these unsigned operations have distinct
+        // blackhole opcodes and are passed through unchanged by
+        // `_add_default_ops` in `jtransform.py`.
+        name
+        @ ("uint_rshift" | "uint_lt" | "uint_le" | "uint_gt" | "uint_ge" | "uint_mul_high") => {
+            let lhs = materialize(out, block, &op.args[0]);
+            let rhs = materialize(out, block, &op.args[1]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::BinOp {
+                    op: name.to_string(),
+                    lhs,
+                    rhs,
+                    result_ty,
+                },
+                result,
+            );
+        }
+        // The sole three-input integer blackhole operation.  Keeping this
+        // explicit is load-bearing: the old `int_*` catch-all discarded its
+        // third operand by forcing every spelling through `BinOp`.
+        "int_between" => {
+            let args = op
+                .args
+                .iter()
+                .map(|arg| materialize(out, block, arg))
+                .collect();
+            let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::LoweredBlackholeOp {
+                    opname: "int_between".to_string(),
+                    args,
+                },
+                result,
+            );
+        }
+        // Binary integer operations that survive `Transformer` as direct
+        // blackhole operations.  Spell the accepted surface literally: an
+        // `int_*` prefix is not proof of binary arity (`int_between` has
+        // three operands), nor proof that an operation survives as an opcode
+        // (`rewrite_op_int_abs` uses a builtin call).
+        name @ ("int_add" | "int_sub" | "int_mul" | "int_and" | "int_or" | "int_xor"
+        | "int_rshift" | "int_lshift" | "int_lt" | "int_le" | "int_eq" | "int_ne"
+        | "int_gt" | "int_ge" | "int_signext" | "int_add_ovf" | "int_sub_ovf"
+        | "int_mul_ovf") => {
             let bare = name.strip_prefix("int_").unwrap().to_string();
             let lhs = materialize(out, block, &op.args[0]);
             let rhs = materialize(out, block, &op.args[1]);
@@ -336,6 +438,33 @@ fn transduce_op(
                 },
                 result,
             );
+        }
+        // These two do not survive as direct blackhole operations.  Feed
+        // their bare rich-graph names into the shared `Transformer`, whose
+        // `rewrite_operation` routes them through `_do_builtin_call` parity
+        // to `_ll_2_int_floordiv` / `_ll_2_int_mod` residual calls.
+        name @ ("int_floordiv" | "int_mod") => {
+            let bare = name.strip_prefix("int_").unwrap().to_string();
+            let lhs = materialize(out, block, &op.args[0]);
+            let rhs = materialize(out, block, &op.args[1]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::BinOp {
+                    op: bare,
+                    lhs,
+                    rhs,
+                    result_ty,
+                },
+                result,
+            );
+        }
+        // `Transformer`'s rename table maps `keepalive` to `-live-`; the
+        // operand list is intentionally discarded because flatten computes
+        // the variables live at the marker from control-flow liveness.
+        "keepalive" => {
+            out.push_op_var(block, OpKind::Live, false);
         }
         // `getfield(s, "field")` → `FieldRead`.  The field name is a Void
         // `ByteStr` constant (`void_field_const`); the owning struct identity
@@ -446,19 +575,55 @@ fn transduce_op(
             let result = expect_var(&op.result);
             out.push_op_with_result_var(block, OpKind::New { owner }, result);
         }
-        // `cast_int_to_uint` / `cast_uint_to_int` — identity at LL level
-        // (`getkind(Signed) == getkind(Unsigned) == 'int'`).  RPython
-        // `jtransform.py rewrite_op_cast_*` are explicit no-ops; the
-        // rich-`OpKind` `UnaryOp` carries the cast name so the shared
-        // jtransform tail drops it and aliases the result to the operand.
-        name @ ("cast_int_to_uint" | "cast_uint_to_int") => {
-            let operand = expect_var(&op.args[0]);
+        // `Transformer` rename table: Bool and Signed share the `i` input
+        // bank, so the one backend conversion is `cast_int_to_float`.
+        "cast_bool_to_float" => {
+            let operand = materialize(out, block, &op.args[0]);
             let result = expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "cast_int_to_float".to_string(),
+                    operand,
+                    result_ty: value_type_of(&result),
+                },
+                result,
+            );
+        }
+        // Word-sized integer casts are identity at JitCode level
+        // (`getkind(Signed) == getkind(Unsigned) == getkind(Char) == 'int'`).
+        // `Transformer.rewrite_op_cast_primitive` delegates to
+        // `rewrite_op_force_cast`, whose `_int_to_int_cast` returns `None`
+        // for these same-width cases; the named char cast is also an explicit
+        // no-op method.  Route all of them through the rich graph's
+        // `same_as`, which the shared jtransform tail drops while installing
+        // the result→operand alias.
+        name @ ("cast_bool_to_int"
+        | "cast_bool_to_uint"
+        | "cast_char_to_int"
+        | "cast_unichar_to_int"
+        | "cast_int_to_char"
+        | "cast_int_to_unichar"
+        | "cast_int_to_uint"
+        | "cast_uint_to_int"
+        | "cast_primitive") => {
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            if name == "cast_primitive" {
+                let word_int = |ty: Option<LowLevelType>| {
+                    matches!(ty, Some(LowLevelType::Signed | LowLevelType::Unsigned))
+                };
+                assert!(
+                    word_int(operand.concretetype()) && word_int(result.concretetype()),
+                    "jtransform_opname::lower_graph: cast_primitive is only ported for the \
+                     same-width Signed/Unsigned ll_int2hex shape"
+                );
+            }
             let result_ty = value_type_of(&result);
             out.push_op_with_result_var(
                 block,
                 OpKind::UnaryOp {
-                    op: name.to_string(),
+                    op: "same_as".to_string(),
                     operand,
                     result_ty,
                 },
@@ -936,6 +1101,301 @@ mod tests {
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
     }
 
+    /// The integer fragment in `LLHelpers.ll_int2hex` is not the all-binary
+    /// family the original Spine-B shortcut assumed.  Pin the exact
+    /// `Transformer` normalization: unary `int_neg` remains unary,
+    /// `uint_is_true` and `uint_and` use their signed JitCode spellings, and
+    /// logical `uint_rshift` keeps its distinct unsigned spelling.
+    #[test]
+    fn lower_graph_normalizes_ll_int2hex_integer_ops_like_jtransform() {
+        let signed = variable_with_lltype("signed", LowLevelType::Signed);
+        let unsigned = variable_with_lltype("unsigned", LowLevelType::Unsigned);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(signed.clone()),
+            Hlvalue::Variable(unsigned.clone()),
+        ]);
+        let returned = variable_with_lltype("returned", LowLevelType::Unsigned);
+        let graph = FlowGraph::with_return_var(
+            "ll_int2hex_integer_fragment",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+
+        let negated = variable_with_lltype("negated", LowLevelType::Signed);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_neg",
+            vec![Hlvalue::Variable(signed)],
+            Hlvalue::Variable(negated.clone()),
+        ));
+        let nonnegative = variable_with_lltype("nonnegative", LowLevelType::Signed);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_force_ge_zero",
+            vec![Hlvalue::Variable(negated)],
+            Hlvalue::Variable(nonnegative.clone()),
+        ));
+        let between = variable_with_lltype("between", LowLevelType::Bool);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_between",
+            vec![
+                signed_const(0),
+                Hlvalue::Variable(nonnegative.clone()),
+                signed_const(16),
+            ],
+            Hlvalue::Variable(between.clone()),
+        ));
+        let kept = variable_with_lltype("kept", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "keepalive",
+            vec![Hlvalue::Variable(between)],
+            Hlvalue::Variable(kept),
+        ));
+        let cast_unsigned = variable_with_lltype("cast_unsigned", LowLevelType::Unsigned);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_primitive",
+            vec![Hlvalue::Variable(nonnegative)],
+            Hlvalue::Variable(cast_unsigned.clone()),
+        ));
+        let cast_char = variable_with_lltype("cast_char", LowLevelType::Char);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_int_to_char",
+            // `LLHelpers.ll_int2hex` produces its literal sign/prefix/digit
+            // characters in exactly this constant-operand shape.
+            vec![signed_const(48)],
+            Hlvalue::Variable(cast_char.clone()),
+        ));
+        let truth = variable_with_lltype("truth", LowLevelType::Bool);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "uint_is_true",
+            vec![Hlvalue::Variable(unsigned.clone())],
+            Hlvalue::Variable(truth),
+        ));
+        let masked = variable_with_lltype("masked", LowLevelType::Unsigned);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "uint_and",
+            vec![
+                Hlvalue::Variable(cast_unsigned),
+                Hlvalue::Variable(cast_char),
+            ],
+            Hlvalue::Variable(masked.clone()),
+        ));
+        let shifted = variable_with_lltype("shifted", LowLevelType::Unsigned);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "uint_rshift",
+            vec![Hlvalue::Variable(masked), signed_const(4)],
+            Hlvalue::Variable(shifted.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(shifted)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let mut unary = Vec::new();
+        let mut binary = Vec::new();
+        let mut lowered = Vec::new();
+        let mut live = 0;
+        for op in &model.block(model.startblock).operations {
+            match &op.kind {
+                OpKind::UnaryOp { op, .. } => unary.push(op.as_str()),
+                OpKind::BinOp { op, .. } => binary.push(op.as_str()),
+                OpKind::LoweredBlackholeOp { opname, .. } => lowered.push(opname.as_str()),
+                OpKind::Live => live += 1,
+                OpKind::ConstInt(_) => {}
+                other => panic!("unexpected lowered integer-fragment op: {other:?}"),
+            }
+        }
+        assert_eq!(
+            unary,
+            vec![
+                "int_neg",
+                "int_force_ge_zero",
+                "same_as",
+                "same_as",
+                "int_is_true"
+            ]
+        );
+        assert_eq!(binary, vec!["and", "uint_rshift"]);
+        assert_eq!(lowered, vec!["int_between"]);
+        assert_eq!(live, 1);
+
+        // Do not stop at the transducer shape: the normalized names must
+        // survive the shared Transformer/regalloc/flatten/assembler tail and
+        // become an installed JitCode body, just as the real helper does.
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jtransform::GraphTransformConfig;
+        use crate::parse::CallPath;
+
+        let path = CallPath::from_segments(["ll_int2hex_integer_fragment"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        assert!(
+            !jitcode
+                .try_body()
+                .expect("integer fragment drains to JitCode")
+                .code
+                .is_empty()
+        );
+    }
+
+    /// Pin every explicit integer-bank no-op in
+    /// `Transformer.rewrite_op_cast_*`.  They are aliases, not backend casts:
+    /// Char/UniChar/Bool/Signed/Unsigned all occupy JitCode's `i` bank.
+    #[test]
+    fn lower_graph_ports_the_complete_integer_bank_noop_cast_family() {
+        let boolean = variable_with_lltype("boolean", LowLevelType::Bool);
+        let character = variable_with_lltype("character", LowLevelType::Char);
+        let unichar = variable_with_lltype("unichar", LowLevelType::UniChar);
+        let signed = variable_with_lltype("signed", LowLevelType::Signed);
+        let unsigned = variable_with_lltype("unsigned", LowLevelType::Unsigned);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(boolean.clone()),
+            Hlvalue::Variable(character.clone()),
+            Hlvalue::Variable(unichar.clone()),
+            Hlvalue::Variable(signed.clone()),
+            Hlvalue::Variable(unsigned.clone()),
+        ]);
+        let returned = variable_with_lltype("returned", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "integer_bank_noop_casts",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+
+        let cases = [
+            ("cast_bool_to_int", boolean.clone(), LowLevelType::Signed),
+            ("cast_bool_to_uint", boolean, LowLevelType::Unsigned),
+            ("cast_char_to_int", character, LowLevelType::Signed),
+            ("cast_unichar_to_int", unichar, LowLevelType::Signed),
+            ("cast_int_to_char", signed.clone(), LowLevelType::Char),
+            ("cast_int_to_unichar", signed.clone(), LowLevelType::UniChar),
+            ("cast_int_to_uint", signed, LowLevelType::Unsigned),
+            ("cast_uint_to_int", unsigned, LowLevelType::Signed),
+        ];
+        let mut last = None;
+        for (index, (opname, operand, result_ty)) in cases.into_iter().enumerate() {
+            let result = variable_with_lltype(&format!("cast_{index}"), result_ty);
+            start.borrow_mut().operations.push(SpaceOperation::new(
+                opname,
+                vec![Hlvalue::Variable(operand)],
+                Hlvalue::Variable(result.clone()),
+            ));
+            last = Some(result);
+        }
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(last.expect("cast family is non-empty"))],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let aliases: Vec<_> = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .map(|op| match &op.kind {
+                OpKind::UnaryOp { op, .. } => op.as_str(),
+                other => panic!("integer-bank cast must lower to an alias, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(aliases, vec!["same_as"; 8]);
+
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jtransform::GraphTransformConfig;
+        use crate::parse::CallPath;
+
+        let path = CallPath::from_segments(["integer_bank_noop_casts"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        assert!(
+            !jitcode
+                .try_body()
+                .expect("integer-bank alias graph drains to JitCode")
+                .code
+                .is_empty()
+        );
+    }
+
+    /// `Transformer.rewrite_op_int_{floordiv,mod} = _do_builtin_call`.
+    /// The opname spine must enter the shared rich-graph rewrite as the bare
+    /// BinOp names so it produces `_ll_2_int_*` residual calls; emitting
+    /// `int_floordiv/ii>i` or `int_mod/ii>i` directly would name handlers
+    /// that do not exist in `BlackholeInterpreter`.
+    #[test]
+    fn lower_graph_routes_int_divmod_through_the_builtin_call_rewrite() {
+        let lhs = variable_with_lltype("lhs", LowLevelType::Signed);
+        let rhs = variable_with_lltype("rhs", LowLevelType::Signed);
+        let start = Block::shared(vec![
+            Hlvalue::Variable(lhs.clone()),
+            Hlvalue::Variable(rhs.clone()),
+        ]);
+        let returned = variable_with_lltype("returned", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "lowlevel_int_divmod",
+            start.clone(),
+            Hlvalue::Variable(returned),
+        );
+        let modulo = variable_with_lltype("modulo", LowLevelType::Signed);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_mod",
+            vec![Hlvalue::Variable(lhs), Hlvalue::Variable(rhs.clone())],
+            Hlvalue::Variable(modulo.clone()),
+        ));
+        let quotient = variable_with_lltype("quotient", LowLevelType::Signed);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_floordiv",
+            vec![Hlvalue::Variable(modulo), Hlvalue::Variable(rhs)],
+            Hlvalue::Variable(quotient.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(quotient)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let binary: Vec<_> = model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .map(|op| match &op.kind {
+                OpKind::BinOp { op, .. } => op.as_str(),
+                other => panic!("int div/mod must enter shared jtransform as BinOp, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(binary, vec!["mod", "floordiv"]);
+
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jtransform::GraphTransformConfig;
+        use crate::parse::CallPath;
+
+        let path = CallPath::from_segments(["lowlevel_int_divmod"]);
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, graph);
+        let mut codewriter = CodeWriter::new();
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+        let body = jitcode
+            .try_body()
+            .expect("int div/mod graph drains through builtin residual calls");
+        assert!(!body.code.is_empty());
+    }
+
     #[test]
     fn lower_graph_preserves_bool_branch_control_flow() {
         let flow = build_fusable_str_helper();
@@ -1388,7 +1848,7 @@ mod tests {
         }
         assert_eq!(news, vec!["stringbuilder"]);
         assert_eq!(writes, vec![("current_pos".to_string(), ValueType::Int)]);
-        assert_eq!(casts, vec!["cast_int_to_uint"]);
+        assert_eq!(casts, vec!["same_as"]);
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
     }
 

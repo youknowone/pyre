@@ -5057,24 +5057,6 @@ impl<M: Clone> MetaInterp<M> {
                 // see `setup_tracing` for the contract on raw-pointer
                 // lifetime pinning by MetaInterp ownership.
                 ctx.set_cpu(Some(&self.backend));
-                // compile_tmp_callback parity: mirror `setup_tracing` so both
-                // trace-start entry points register the same pending-token
-                // shape for backends that resolve CALL_ASSEMBLER to the
-                // pending token instead of a tmp-callback body.
-                let pending_target =
-                    (!self.backend.supports_tmp_callback_call_assembler()).then(|| {
-                        let input_types = Self::pending_target_input_types(
-                            ctx.inputarg_types(),
-                            driver_descriptor.as_ref(),
-                        );
-                        let num_inputs = input_types.len();
-                        let index_of_virtualizable: i32 = ctx
-                            .driver_descriptor()
-                            .and_then(|jd| jd.virtualizable_arg_index())
-                            .map(|i| i as i32)
-                            .unwrap_or(-1);
-                        (input_types, num_inputs, index_of_virtualizable)
-                    });
                 self.tracing = Some(ctx);
                 self.arm_portal_trace_positions();
                 // pyjitpl.py:1547-1556 auto-stamp gate inputs — see
@@ -5102,16 +5084,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 let pending_token =
                     self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
-                let pending_num = pending_token.number;
                 self.pending_token = Some((green_key, pending_token));
-                if let Some((input_types, num_inputs, index_of_virtualizable)) = pending_target {
-                    self.backend.register_pending_target(
-                        pending_num,
-                        input_types,
-                        num_inputs,
-                        index_of_virtualizable,
-                    );
-                }
                 if let Some(ref hook) = self.hooks.on_trace_start {
                     hook(green_key);
                 }
@@ -5329,47 +5302,6 @@ impl<M: Clone> MetaInterp<M> {
         }))
     }
 
-    /// Reds-only inputarg shape for a pending CALL_ASSEMBLER target, matching
-    /// the entry contract `patch_new_loop_to_load_virtualizable_fields()`
-    /// later hands to `backend.compile_loop(...)` (compile.py).
-    fn pending_target_input_types(
-        input_types: Vec<Type>,
-        driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
-    ) -> Vec<Type> {
-        let Some(driver) = driver_descriptor else {
-            return input_types;
-        };
-        // A driver that declares a flat entry contract has no red list to
-        // synthesise the shape from — its entry slots ARE the leading
-        // inputargs, in the order `extract_live_values()` emits them, so the
-        // contract is the prefix of the types already in hand. Take it before
-        // the red-list path below, which would answer with a red count that
-        // describes a different model.
-        if let Some(flat) = driver.flat_entry_contract() {
-            let mut input_types = input_types;
-            if input_types.len() > flat.len {
-                input_types.truncate(flat.len);
-            }
-            return input_types;
-        }
-        let Some(_) = driver.virtualizable_arg_index() else {
-            return input_types;
-        };
-        // `extract_live_values()` still emits the expanded
-        // `[frame, last_instr, pycode, valuestackdepth, debugdata, w_globals,
-        //  locals..., stack...]` shape, so the trace's inputarg
-        // types do NOT carry the reds in the leading `num_reds` slots —
-        // truncating to `num_reds` here would register a bogus
-        // `[Ref(frame), Int(last_instr)]` ABI when reds is `[frame, ec]`.
-        // Synthesise the reds-only shape directly from the JitDriver var
-        // table (`JitDriverVar.tp` matches `Box.type`).
-        let red_types: Vec<Type> = driver.reds().iter().map(|red| red.tp).collect();
-        if input_types.len() <= red_types.len() {
-            return input_types;
-        }
-        red_types
-    }
-
     fn setup_tracing(
         &mut self,
         green_key: u64,
@@ -5439,22 +5371,6 @@ impl<M: Clone> MetaInterp<M> {
         // this trace because `self` (MetaInterp) owns both `tracing`
         // and `backend`, and tracing is torn down before `self` moves.
         ctx.set_cpu(Some(&self.backend));
-        // compile_tmp_callback parity: a backend that resolves CALL_ASSEMBLER
-        // to the pending token (rather than a tmp-callback body) needs its
-        // pending target registered with the same red-args-only entry
-        // contract `patch_new_loop_to_load_virtualizable_fields()` later hands
-        // to `backend.compile_loop(...)`.
-        let pending_target = (!self.backend.supports_tmp_callback_call_assembler()).then(|| {
-            let input_types =
-                Self::pending_target_input_types(ctx.inputarg_types(), driver_descriptor.as_ref());
-            let num_inputs = input_types.len();
-            let index_of_virtualizable: i32 = ctx
-                .driver_descriptor()
-                .and_then(|jd| jd.virtualizable_arg_index())
-                .map(|i| i as i32)
-                .unwrap_or(-1);
-            (input_types, num_inputs, index_of_virtualizable)
-        });
         self.tracing = Some(ctx);
         self.arm_portal_trace_positions();
         // pyjitpl.py `opimpl_jit_merge_point` auto-stamp
@@ -5484,16 +5400,7 @@ impl<M: Clone> MetaInterp<M> {
             }));
         }
         let pending_token = self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
-        let pending_num = pending_token.number;
         self.pending_token = Some((green_key, pending_token));
-        if let Some((input_types, num_inputs, index_of_virtualizable)) = pending_target {
-            self.backend.register_pending_target(
-                pending_num,
-                input_types,
-                num_inputs,
-                index_of_virtualizable,
-            );
-        }
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
         }
@@ -17095,6 +17002,11 @@ impl<M: Clone> MetaInterp<M> {
         _descr_ref: majit_ir::DescrRef,
         _descr_view: &dyn majit_ir::descr::CallDescr,
     ) -> Option<OpRef> {
+        // pyjitpl.py `assert self.staticdata.has_libffi_call`.
+        assert!(
+            self.staticdata.has_libffi_call,
+            "direct_libffi_call requires a codewriter-published libffi oopspec"
+        );
         // pyjitpl.py:3622-3624: box_cif_description = argboxes[1];
         //   if not isinstance(box_cif_description, ConstInt): return None
         let box_cif_description = *argboxes.get(1)?;
@@ -17233,16 +17145,6 @@ impl<M: Clone> MetaInterp<M> {
             self.get_loop_token_arc(green_key)
         {
             arc
-        } else if !self.backend.supports_tmp_callback_call_assembler() {
-            // A backend whose CALL_ASSEMBLER admission rejects tmp-callback
-            // bodies (wasm: the body reaches the portal runner through a host
-            // trampoline) resolves the pending token published at trace start
-            // instead; if none exists yet, abort rather than record an
-            // unadmittable tmp-callback target.
-            match self.get_pending_token_arc(green_key) {
-                Some(arc) => std::sync::Arc::clone(arc),
-                None => return (None, None),
-            }
         } else {
             // warmstate.py:714-723 — cell has no procedure_token yet, so
             // synthesise one via `compile_tmp_callback`. If the real loop is
@@ -17331,13 +17233,6 @@ impl<M: Clone> MetaInterp<M> {
         // not need the portal staticdata.
         if let Some(arc) = self.get_loop_token_arc(green_key) {
             return Some(arc);
-        }
-        // A backend that cannot enter tmp-callback bodies (wasm: CA admission
-        // rejects trampoline-calling targets) keeps the pending token — its
-        // self-recursive bootstrap publishes that token and redirects when the
-        // real loop compiles.
-        if !self.backend.supports_tmp_callback_call_assembler() {
-            return self.get_pending_token_arc(green_key).map(Arc::clone);
         }
         // The real portal driver has greens; the empty
         // `ensure_default_driver_sd` placeholder (jitdrivers_sd[0]) has none.
@@ -18834,6 +18729,9 @@ pub struct MetaInterpStaticData {
     /// pyjitpl.py `finish_setup(...)` populates this from
     /// `codewriter.callcontrol.callinfocollection`.
     pub callinfocollection: majit_ir::effectinfo::CallInfoCollection,
+    /// pyjitpl.py `self.has_libffi_call =
+    /// codewriter.callcontrol.has_libffi_call`.
+    pub has_libffi_call: bool,
     /// pyjitpl.py `self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd`.
     ///
     /// Indexed by `JitCode.jitdriver_sd` so `is_main_jitcode(jitcode)`
@@ -19304,9 +19202,7 @@ impl MetaInterpStaticData {
         self.callinfocollection = callcontrol.callinfocollection.clone();
 
         // pyjitpl.py `self.has_libffi_call = codewriter.callcontrol.has_libffi_call`
-        // TODO: pyre's `CallControl` has no
-        // `has_libffi_call` field; libffi handling is currently not
-        // implemented.
+        self.has_libffi_call = callcontrol.has_libffi_call;
 
         // pyjitpl.py:2273-2284
         //     exc_descr = compile.PropagateExceptionDescr()
@@ -23180,6 +23076,19 @@ mod metainterp_static_data_tests {
         // names were registered yet; the staticdata mirror must reflect
         // that empty state.
         assert!(sd.opcode_names.is_empty());
+    }
+
+    #[test]
+    fn finish_setup_copies_has_libffi_call() {
+        use majit_translate::codewriter::call::CallControl;
+        use majit_translate::codewriter::codewriter::CodeWriter;
+
+        let mut callcontrol = CallControl::new();
+        callcontrol.has_libffi_call = true;
+        let mut sd = MetaInterpStaticData::new();
+        sd.finish_setup(&CodeWriter::new(), &callcontrol);
+
+        assert!(sd.has_libffi_call);
     }
 
     #[test]

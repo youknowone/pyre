@@ -1338,6 +1338,12 @@ pub struct CallControl {
     /// metainterp dependency.
     pub virtualref_info: Option<std::sync::Arc<dyn VirtualRefInfoHandle>>,
 
+    /// `CallControl.has_libffi_call` in `call.py`.  `_handle_libffi_call`
+    /// flips this when the codewriter emits an `OS_LIBFFI_CALL` residual;
+    /// `MetaInterpStaticData.finish_setup` copies it to enable the matching
+    /// metainterp dispatch path.
+    pub has_libffi_call: bool,
+
     /// RPython: `CallControl.callinfocollection` (call.py).
     /// Stores oopspec function info for builtin call handling.
     pub callinfocollection: majit_ir::CallInfoCollection,
@@ -1893,6 +1899,7 @@ impl CallControl {
             opname_graphs: HashMap::new(),
             opname_helper_paths: HashSet::new(),
             virtualref_info: None,
+            has_libffi_call: false,
             callinfocollection: majit_ir::CallInfoCollection::new(),
             descr_indices: DescrIndexRegistry::default(),
             known_struct_names: HashSet::new(),

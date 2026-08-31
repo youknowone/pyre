@@ -2018,6 +2018,40 @@ fn analyze_pipeline_from_module_paths(
         );
     }
 
+    // `LLHelpers.ll_str2unicode` owns
+    // `@jit.oopspec("str.str2unicode(str)")` in `rstr.py`.  Pyre's rtyper
+    // synthesizes that helper graph (`build_ll_str2unicode_helper_graph`), so
+    // it has no source-level Rust attribute for the hint harvester above to
+    // see. Attach the upstream function-owned oopspec to the synthesized
+    // graph name, just as the neighboring synthesized list and builder
+    // helpers receive theirs.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["ll_str2unicode"]),
+        "str.str2unicode(str)".to_string(),
+    );
+
+    // `ll_math.sqrt_nonneg` assigns
+    // `sqrt_nonneg.oopspec = "math.sqrt_nonneg(x)"` after the function
+    // definition, so the spec is owner-side there too.
+    //
+    // Unlike the four names above, this one currently matches no call site.
+    // Those are helper graphs the rtyper mints under exactly that name, so
+    // `target_to_path` reproduces the single segment. `sqrt_nonneg` is not
+    // minted: it is an ordinary translator-side function, and the math surface
+    // the rtyper does register is the external `ll_math.ll_math_sqrt`
+    // (`extfuncregistry.rs`), which the codewriter lowers through
+    // `_ll_1_ll_math_ll_math_sqrt` (`INLINE_CALLS_TO`). So this call creates a
+    // graph-less funcobj record nothing resolves to, and the `math.sqrt*` arm
+    // in `handle_builtin_call` fires only for an oopspec registered elsewhere.
+    // Retargeting it at `ll_math.ll_math_sqrt` would be wrong: that one raises,
+    // and the arm asks for `EF_ELIDABLE_CANNOT_RAISE`. Kept at the owner
+    // upstream names so the record is right whenever `sqrt_nonneg` does become
+    // a lowered callee.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["sqrt_nonneg"]),
+        "math.sqrt_nonneg(x)".to_string(),
+    );
+
     // rbuilder.py `ll_shrink_final` calls `rgc.ll_shrink_array(buf, size)`,
     // whose `@jit.oopspec("rgc.ll_shrink_array")` is minted by the rtyper
     // (`rtype_builder_build`'s nested `ll_shrink_array` helper) with a stub

@@ -4347,26 +4347,12 @@ impl<'a> Transformer<'a> {
 
         // jtransform.py:487-511 — oopspec dispatch by prefix.
         if let Some(base) = user_oopspec.as_deref() {
-            // jtransform.py:495-496 — `virtual_ref*` → `_handle_virtual_ref_call`,
-            // whose whole body is
-            // `return SpaceOperation(oopspec_name, list(args), op.result)`:
-            // the call becomes the `virtual_ref` / `virtual_ref_finish`
-            // OPERATION, so it carries no calldescr and therefore no
-            // `oopspecindex` at all.
-            //
-            // majit-translate has no `OpKind` for either opname and no
-            // `insns.rs` byte to assemble one, so the port stops here instead
-            // of continuing down the call path. It used to fall through to
-            // `map_user_oopspec_to_index`, which answered
-            // `JitForceVirtualizable` — the one index whose
-            // `optimizeopt/virtualize.rs` `CALL_N` arm removes the call
-            // unconditionally, whatever `is_virtual` says. Nothing registers
-            // this oopspec today, so the wrong answer was unreachable rather
-            // than wrong on a live trace.
+            // `Transformer._handle_virtual_ref_call` turns the call directly
+            // into the `virtual_ref` / `virtual_ref_finish` blackhole op, with
+            // no calldescr or oopspecindex.
             if base.starts_with("virtual_ref") {
-                unimplemented!(
-                    "_handle_virtual_ref_call: {base:?} has no OpKind (jtransform.py:495)"
-                );
+                let result = self._handle_virtual_ref_call(base, op, args);
+                return prepend_const_prefix(&mut const_prefix_ops, result);
             }
             // jtransform.py:497 — jit.* oopspecs → __handle_jit_call
             if base.starts_with("jit.") {
@@ -4404,6 +4390,27 @@ impl<'a> Transformer<'a> {
                 && let Some(result) =
                     self._handle_stroruni_call(base, op, target, args, result_ty, graph_name, graph)
             {
+                return prepend_const_prefix(&mut const_prefix_ops, result);
+            }
+            // `Transformer.handle_builtin_call` dispatches this exact oopspec
+            // to `_handle_str2unicode_call`.
+            if base == "str.str2unicode" {
+                let result =
+                    self._handle_str2unicode_call(op, target, args, result_ty, graph_name, graph);
+                return prepend_const_prefix(&mut const_prefix_ops, result);
+            }
+            // `Transformer.handle_builtin_call` dispatches libffi oopspecs
+            // to `_handle_libffi_call`.
+            if base.starts_with("libffi_") {
+                let result =
+                    self._handle_libffi_call(base, op, target, args, result_ty, graph_name, graph);
+                return prepend_const_prefix(&mut const_prefix_ops, result);
+            }
+            // `Transformer.handle_builtin_call` dispatches the math.sqrt
+            // oopspec family to `_handle_math_sqrt_call`.
+            if base.starts_with("math.sqrt") {
+                let result =
+                    self._handle_math_sqrt_call(op, target, args, result_ty, graph_name, graph);
                 return prepend_const_prefix(&mut const_prefix_ops, result);
             }
             // jtransform.py — rgc.* oopspecs → _handle_rgc_call.
@@ -4505,6 +4512,124 @@ impl<'a> Transformer<'a> {
         let result =
             self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name);
         prepend_const_prefix(&mut const_prefix_ops, result)
+    }
+
+    /// Port of `Transformer._handle_virtual_ref_call` in `jtransform.py`.
+    ///
+    /// Upstream replaces the oopspec call with a `SpaceOperation` whose name
+    /// is the oopspec itself. `LoweredBlackholeOp` is pyre's generic storage
+    /// for exactly such passthrough operations; assembly derives the typed
+    /// `virtual_ref/r>r` or `virtual_ref_finish/r` instruction from its args
+    /// and result.
+    fn _handle_virtual_ref_call(
+        &mut self,
+        oopspec_name: &str,
+        op: &SpaceOperation,
+        args: &[crate::flowspace::model::Variable],
+    ) -> RewriteResult {
+        RewriteResult::Replace(vec![SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::LoweredBlackholeOp {
+                opname: oopspec_name.to_string(),
+                args: args.to_vec(),
+            },
+        }])
+    }
+
+    /// Port of `Transformer._handle_str2unicode_call` in `jtransform.py`.
+    /// `ll_str2unicode` is elidable but may raise `UnicodeDecodeError`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn _handle_str2unicode_call(
+        &mut self,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[crate::flowspace::model::Variable],
+        result_ty: &ValueType,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        self._handle_oopspec_call(
+            graph,
+            op,
+            target,
+            args,
+            result_ty,
+            graph_name,
+            OopSpecIndex::Str2Unicode,
+            Some(majit_ir::descr::ExtraEffect::ElidableCanRaise),
+            None,
+        )
+    }
+
+    /// Port of `Transformer._handle_math_sqrt_call` in `jtransform.py`.
+    /// The domain check belongs to the caller; `sqrt_nonneg` itself is an
+    /// elidable operation that cannot raise.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn _handle_math_sqrt_call(
+        &mut self,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[crate::flowspace::model::Variable],
+        result_ty: &ValueType,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        self._handle_oopspec_call(
+            graph,
+            op,
+            target,
+            args,
+            result_ty,
+            graph_name,
+            OopSpecIndex::MathSqrt,
+            Some(majit_ir::descr::ExtraEffect::ElidableCannotRaise),
+            None,
+        )
+    }
+
+    /// Port of `Transformer._handle_libffi_call` in `jtransform.py`.
+    /// The only supported spelling is `libffi_call`; it has random GC
+    /// effects and publishes `CallControl.has_libffi_call` for metainterp
+    /// setup.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn _handle_libffi_call(
+        &mut self,
+        oopspec_name: &str,
+        op: &SpaceOperation,
+        target: &CallTarget,
+        args: &[crate::flowspace::model::Variable],
+        result_ty: &ValueType,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        assert_eq!(
+            oopspec_name, "libffi_call",
+            "unsupported libffi oopspec: {oopspec_name}"
+        );
+        self.callcontrol
+            .as_deref_mut()
+            .expect("libffi oopspec lowering requires CallControl")
+            .has_libffi_call = true;
+        self._handle_oopspec_call(
+            graph,
+            op,
+            target,
+            args,
+            result_ty,
+            graph_name,
+            OopSpecIndex::LibffiCall,
+            Some(majit_ir::descr::ExtraEffect::RandomEffects),
+            None,
+        )
     }
 
     /// Port of `jtransform.py _handle_stroruni_call`.
@@ -13194,6 +13319,225 @@ mod tests {
             super::map_user_oopspec_to_index("dict.setitem"),
             OopSpecIndex::None
         );
+    }
+
+    /// `Transformer._handle_str2unicode_call` records the Str2Unicode
+    /// oopspec and appends `-live-` because Unicode decoding can raise.
+    #[test]
+    fn str2unicode_call_lowers_with_can_raise_effect() {
+        use crate::call::CallControl;
+
+        let mut cc = CallControl::new();
+        cc.mark_oopspec(
+            crate::parse::CallPath::from_segments(["ll_str2unicode"]),
+            "str.str2unicode(str)".to_string(),
+        );
+        let mut graph = FunctionGraph::new("str2unicode");
+        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path(["ll_str2unicode"]);
+        let entry = graph.startblock;
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: target.clone(),
+                args: vec![value.clone()],
+                result_ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.block_mut(entry).operations.last_mut().unwrap().result = Some(result);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(entry).operations;
+        let descriptor = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .expect("expected CallResidual");
+        assert_eq!(
+            descriptor.extra_info.oopspecindex,
+            OopSpecIndex::Str2Unicode
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            majit_ir::descr::ExtraEffect::ElidableCanRaise
+        );
+        assert!(matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live)));
+        assert!(
+            transformed
+                .notes
+                .iter()
+                .any(|note| note.detail.contains("Str2Unicode"))
+        );
+    }
+
+    /// `Transformer._handle_math_sqrt_call` marks sqrt as elidable and
+    /// non-raising, so its residual call has no trailing `-live-`.
+    #[test]
+    fn math_sqrt_call_lowers_with_cannot_raise_effect() {
+        use crate::call::CallControl;
+
+        let mut cc = CallControl::new();
+        cc.mark_oopspec(
+            crate::parse::CallPath::from_segments(["sqrt_nonneg"]),
+            "math.sqrt_nonneg(x)".to_string(),
+        );
+        let mut graph = FunctionGraph::new("math_sqrt");
+        let value = graph.alloc_value_var_with_type(ConcreteType::Float);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Float);
+        let target = CallTarget::function_path(["sqrt_nonneg"]);
+        let entry = graph.startblock;
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: target.clone(),
+                args: vec![value.clone()],
+                result_ty: ValueType::Float,
+            },
+            false,
+        );
+        graph.block_mut(entry).operations.last_mut().unwrap().result = Some(result);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(entry).operations;
+        let descriptor = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .expect("expected CallResidual");
+        assert_eq!(descriptor.extra_info.oopspecindex, OopSpecIndex::MathSqrt);
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            majit_ir::descr::ExtraEffect::ElidableCannotRaise
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
+            "ElidableCannotRaise must not append a trailing -live-: {ops:?}"
+        );
+        assert!(
+            transformed
+                .notes
+                .iter()
+                .any(|note| note.detail.contains("MathSqrt"))
+        );
+    }
+
+    /// `Transformer._handle_libffi_call` publishes both the random-effect
+    /// call descriptor and the setup flag consumed by `MetaInterpStaticData`.
+    #[test]
+    fn libffi_call_lowers_with_random_effects_and_publishes_flag() {
+        use crate::call::CallControl;
+
+        let mut cc = CallControl::new();
+        cc.mark_oopspec(
+            crate::parse::CallPath::from_segments(["libffi_call"]),
+            "libffi_call(cif_description,func_addr,exchange_buffer)".to_string(),
+        );
+        let mut graph = FunctionGraph::new("libffi");
+        let cif = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let func = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let buffer = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let entry = graph.startblock;
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path(["libffi_call"]),
+                args: vec![cif, func, buffer],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(entry).operations;
+        let descriptor = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .expect("expected CallResidual");
+        assert_eq!(descriptor.extra_info.oopspecindex, OopSpecIndex::LibffiCall);
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            majit_ir::descr::ExtraEffect::RandomEffects
+        );
+        assert!(matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live)));
+        assert!(cc.has_libffi_call);
+    }
+
+    /// `Transformer._handle_virtual_ref_call` preserves the decoded argument
+    /// and result while replacing the call with the `virtual_ref` operation.
+    #[test]
+    fn virtual_ref_call_lowers_to_blackhole_operation() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("virtual_ref");
+        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Live,
+        };
+
+        let RewriteResult::Replace(ops) =
+            transformer._handle_virtual_ref_call("virtual_ref", &op, &[value.clone()])
+        else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].result, Some(result));
+        match &ops[0].kind {
+            OpKind::LoweredBlackholeOp { opname, args } => {
+                assert_eq!(opname, "virtual_ref");
+                assert_eq!(args, &[value]);
+            }
+            other => panic!("expected LoweredBlackholeOp, got {other:?}"),
+        }
+    }
+
+    /// `rlib.jit.virtual_ref_finish` exposes the one-argument
+    /// `virtual_ref_finish(x)` oopspec and has a void result; the lowerer must
+    /// preserve both details for the `/r` blackhole instruction.
+    #[test]
+    fn virtual_ref_finish_call_lowers_to_void_blackhole_operation() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("virtual_ref_finish");
+        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Live,
+        };
+
+        let RewriteResult::Replace(ops) =
+            transformer._handle_virtual_ref_call("virtual_ref_finish", &op, &[value.clone()])
+        else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        assert!(ops[0].result.is_none());
+        match &ops[0].kind {
+            OpKind::LoweredBlackholeOp { opname, args } => {
+                assert_eq!(opname, "virtual_ref_finish");
+                assert_eq!(args, &[value]);
+            }
+            other => panic!("expected LoweredBlackholeOp, got {other:?}"),
+        }
     }
 
     fn stroruni_copy_contents_args(
