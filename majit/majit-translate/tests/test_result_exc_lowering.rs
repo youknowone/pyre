@@ -382,15 +382,53 @@ fn raise_path_calls(name: &str) -> (usize, usize, usize) {
 
 #[test]
 fn constant_message_raise_sites_fuse_their_constructor() {
-    // A gateway wrapper's receiver and arity checks each raise a TypeError
-    // with a literal message. Every one of them must reach the published
+    // `list_to_tuple_value` refuses a non-list with a literal message, which
+    // is the whole of its raise path. That site must reach the published
     // `pyerror_type_error_to_exc_object`, leaving no `PyError` constructor
     // behind: the constructor is transparent, has no host symbol, and one of
     // them anywhere in the body refuses the whole descent.
-    let (fused, materialise, ctors) = raise_path_calls("__majit_wrap_random");
-    assert!(fused > 0, "the fusion must fire on a gateway wrapper");
+    let (fused, materialise, ctors) =
+        raise_path_calls("pyre_interpreter::opcode_ops::list_to_tuple_value");
+    assert!(fused > 0, "the fusion must fire on a literal-message raise");
     assert_eq!(ctors, 0, "no PyError constructor may survive");
     assert_eq!(materialise, 0, "no unfused materialisation may survive");
+}
+
+#[test]
+fn gateway_wrapper_refusals_all_residualize() {
+    // A generated wrapper words none of its own refusals: the receiver test
+    // and the two arity tests each call a `dont_look_inside` helper, whose
+    // `Result` return carries the refusal out on its own exception link. So
+    // the wrapper is left with no constructor to fuse and nothing to
+    // materialise, and the formatting stays out of its JitCode.
+    //
+    // `receiver_mismatch` is the one that has to be asked for by name: it
+    // reports a runtime receiver type, so unlike its two neighbours it could
+    // never have been a literal, and left transparent it put one
+    // materialisation in the wrapper per call site.
+    for name in ["__majit_wrap_random", "__majit_wrap_getvalue"] {
+        let (fused, materialise, ctors) = raise_path_calls(name);
+        assert_eq!((fused, materialise, ctors), (0, 0, 0), "{name}");
+        let graph = lower_function(interp(), name).expect("lower");
+        let residuals = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if matches!(
+                            segments.last().map(String::as_str),
+                            Some("receiver_mismatch")
+                                | Some("method_arity_failure")
+                                | Some("method_noarg_failure")
+                        )
+                )
+            })
+            .count();
+        assert!(residuals > 0, "{name}: the refusals must survive as calls");
+    }
 }
 
 #[test]

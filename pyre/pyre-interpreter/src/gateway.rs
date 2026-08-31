@@ -893,11 +893,8 @@ pub(crate) unsafe fn builtin_code_check_receiver(
     if accepted {
         return Ok(());
     }
-    Err(receiver_mismatch(
-        owner.type_name,
-        unsafe { (*code).name },
-        receiver,
-    ))
+    receiver_mismatch(owner.type_name, unsafe { (*code).name }, receiver)?;
+    Ok(())
 }
 
 /// Invoke a `BuiltinCode` after applying the receiver and arity checks its
@@ -1249,13 +1246,21 @@ pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
 /// A `getset_descriptor` refuses through `descr_check` as well, and its
 /// property name is not a slot name, so it takes the same two method
 /// wordings rather than the slot-wrapper pair.
+///
+/// `dont_look_inside` for the reason `method_arity_failure` and
+/// `method_noarg_failure` carry it: the four wordings are built here so that
+/// none of the formatting reaches a generated wrapper's JitCode, and the
+/// residual reports its refusal through its own exception link rather than
+/// handing the caller a `PyError` to materialise.  The refusal is the only
+/// answer, so the `Ok` half is unreachable and the callers spell it `?`.
 #[cold]
 #[inline(never)]
+#[majit_macros::dont_look_inside]
 pub(crate) fn receiver_mismatch(
     ty: &str,
     name: &str,
     receiver: Option<PyObjectRef>,
-) -> crate::PyError {
+) -> Result<PyObjectRef, crate::PyError> {
     let slot_wrapper = is_slot_wrapper(ty, name);
     let message = match receiver {
         None if slot_wrapper => format!("descriptor '{name}' of '{ty}' object needs an argument"),
@@ -1274,7 +1279,7 @@ pub(crate) fn receiver_mismatch(
             }
         }
     };
-    crate::PyError::type_error(message)
+    Err(crate::PyError::type_error(message))
 }
 
 /// eval.py:16-23 — read `fast_natural_arity` from a BuiltinCode.

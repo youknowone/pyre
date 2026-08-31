@@ -1913,36 +1913,36 @@ fn expand_pyre_methods(
                 // becomes an aggregate and a `call_once` in every wrapper.
                 let recv_check = quote! {
                     if args.len() < #needed || args[#self_idx].is_null() {
-                        return ::std::result::Result::Err(crate::gateway::receiver_mismatch(
+                        return crate::gateway::receiver_mismatch(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                             #descr_name,
                             ::std::option::Option::None,
-                        ));
+                        );
                     }
                     if <#self_ty>::from_obj(args[#self_idx]).is_none() {
-                        return ::std::result::Result::Err(crate::gateway::receiver_mismatch(
+                        return crate::gateway::receiver_mismatch(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                             #descr_name,
                             ::std::option::Option::Some(args[#self_idx]),
-                        ));
+                        );
                     }
                 };
                 let preamble = quote! {
                     if args.len() < #needed {
-                        return ::std::result::Result::Err(crate::gateway::receiver_mismatch(
+                        return crate::gateway::receiver_mismatch(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                             #descr_name,
                             ::std::option::Option::None,
-                        ));
+                        );
                     }
                     let __pyre_self = match <#self_ty>::from_obj(args[#self_idx]) {
                         ::std::option::Option::Some(s) => #bind_self,
                         ::std::option::Option::None => {
-                            return ::std::result::Result::Err(crate::gateway::receiver_mismatch(
+                            return crate::gateway::receiver_mismatch(
                                 <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                                 #descr_name,
                                 ::std::option::Option::Some(args[#self_idx]),
-                            ));
+                            );
                         }
                     };
                 };

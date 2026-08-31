@@ -723,26 +723,44 @@ fn gateway_positional_count_uses_rpython_signed() {
 fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     let wrapper =
         named_jitcode("__majit_wrap_getrandbits").expect("getrandbits builtin wrapper jitcode");
-    let first = crate::jitcode_runtime::decoded_ops(&wrapper.code)
-        .next()
-        .expect("wrapper first op");
     // `getrandbits` registers with a `Signature`, so the call path resolves
     // keywords into positional PY_NULL-padded slots before the wrapper runs.
-    // The entry counts the leading non-null slots of the wrapper's own
-    // argument array; it does not peel a `split_builtin_kwargs(args)` result
-    // and read that instead.
+    // The argument preamble counts the leading non-null slots of the wrapper's
+    // own argument array; it does not peel a `split_builtin_kwargs(args)`
+    // result and read that instead.
     //
-    // Spelled as the entry callee rather than as "op 0 is not an
-    // `inline_call_*`": no `__majit_wrap_*` jitcode inline-calls the splitter
-    // anywhere, so the negative form holds of every wrapper and separates
-    // nothing, while the opcode form of op 0 only tracks which helpers the
-    // codewriter is currently allowed to descend into.
+    // Asked of the array the count reads rather than of the count's position:
+    // `descr_check` now precedes the preamble, so the count is no longer the
+    // wrapper's first op, and its position tracks only how far ahead of it the
+    // receiver tests sit.  The array is the property that separates the two
+    // readings, and a single `R` operand carries it — the byte after the
+    // one-entry length byte that follows the two descr bytes.
+    let count = crate::jitcode_runtime::decoded_ops(&wrapper.code)
+        .find(|op| inline_call_callee_name(&wrapper.code, op) == Some("leading_non_null_count"))
+        .expect("signature-bound wrapper counts its leading non-null argument slots");
+    assert_eq!(wrapper.code[count.pc + 3], 1, "the count takes one argument");
+    let args_reg = crate::jitcode_runtime::decoded_ops(&wrapper.code)
+        .find(|op| op.key == "arraylen_gc/rd>i")
+        .map(|op| wrapper.code[op.pc + 1])
+        .expect("wrapper reads an array length");
     assert_eq!(
-        inline_call_callee_name(&wrapper.code, &first),
-        Some("leading_non_null_count"),
-        "signature-bound wrapper opens by counting its leading non-null \
-         argument slots, got {}",
-        first.key
+        wrapper.code[count.pc + 4],
+        args_reg,
+        "the count reads the wrapper's own argument array"
+    );
+
+    // `descr_check` runs ahead of the count, and its refusal leaves the
+    // wrapper through `receiver_mismatch` rather than being worded here: the
+    // helper is opaque, so the test it guards reaches the jitcode as a
+    // residual call standing before the preamble.  A wrapper that bound its
+    // receiver after the count would report an argument count for a call with
+    // no receiver to apply the arguments to.  (Which helper the residual
+    // enters is asserted on the lowered graph, where the call still carries
+    // its path: `majit-translate`'s `gateway_wrapper_refusals_all_residualize`.)
+    assert!(
+        crate::jitcode_runtime::decoded_ops(&wrapper.code)
+            .any(|op| op.key.starts_with("residual_call") && op.pc < count.pc),
+        "the receiver tests run before the argument preamble"
     );
 
     let item_descr_index =
@@ -14470,3 +14488,5 @@ fn the_traceback_walk_receivers_pin_their_class_through_the_payload() {
         "list is acceptable as a base class, so its payload does not determine w_class",
     );
 }
+
+
