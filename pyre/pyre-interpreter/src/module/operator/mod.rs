@@ -114,10 +114,22 @@ fn op_compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_bool_from(result == 0))
 }
 
-/// `interp_operator.py concat` — `a + b` for two subscriptable
-/// sequences.  Either operand missing `__getitem__` raises a bare
-/// `TypeError` with no message (`OperationError(space.w_TypeError,
-/// space.w_None)`); otherwise the result is `space.add(a, b)`.
+/// The refusal `PySequence_Concat` and `PySequence_InPlaceConcat` share,
+/// naming the LEFT operand.
+///
+/// `interp_operator.py concat` instead raises `OperationError(space.w_TypeError,
+/// space.w_None)`, a `TypeError` carrying no message at all, while `iconcat`
+/// beside it words this one; 3.14 words both.
+fn concat_type_error(w_obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "'{}' object can't be concatenated",
+        crate::baseobjspace::object_functionstr_type_name(w_obj)
+    ))
+}
+
+/// `interp_operator.py concat` — `a + b` for two subscriptable sequences;
+/// either operand missing `__getitem__` is a TypeError that names the left
+/// operand.
 fn op_concat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 2 {
         return Err(crate::PyError::type_error(format!(
@@ -129,7 +141,7 @@ fn op_concat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         crate::baseobjspace::lookup(args[0], "__getitem__").is_none()
             || crate::baseobjspace::lookup(args[1], "__getitem__").is_none()
     } {
-        return Err(crate::PyError::type_error(String::new()));
+        return Err(concat_type_error(args[0]));
     }
     add(args[0], args[1])
 }
@@ -148,10 +160,7 @@ fn op_iconcat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         crate::baseobjspace::lookup(args[0], "__getitem__").is_none()
             || crate::baseobjspace::lookup(args[1], "__getitem__").is_none()
     } {
-        return Err(crate::PyError::type_error(format!(
-            "'{}' object can't be concatenated",
-            crate::baseobjspace::object_functionstr_type_name(args[0])
-        )));
+        return Err(concat_type_error(args[0]));
     }
     crate::opcode_ops::binary_value(
         args[0],
