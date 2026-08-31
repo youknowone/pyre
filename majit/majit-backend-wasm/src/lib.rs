@@ -623,10 +623,15 @@ fn guard_fail_args_advanced(
     guard_exits
         .iter()
         .map(|g| {
+            let mask = crate::codegen::live_fail_arg_mask(
+                g.meta_descr.as_ref(),
+                g.fail_arg_refs.len(),
+            );
             g.fail_arg_refs
                 .iter()
-                .filter(|r| !r.is_none())
-                .map(|r| !r.is_constant() && advanced_ids.contains(&r.raw()))
+                .zip(mask)
+                .filter(|(_, live)| *live)
+                .map(|(r, _)| !r.is_constant() && advanced_ids.contains(&r.raw()))
                 .collect()
         })
         .collect()
@@ -2761,11 +2766,10 @@ impl WasmBackend {
                         guard_fail_arg_counts: exits
                             .iter()
                             .map(|guard| {
-                                guard
-                                    .fail_arg_refs
-                                    .iter()
-                                    .filter(|arg| !arg.is_none())
-                                    .count()
+                                crate::codegen::live_fail_arg_count(
+                                    guard.meta_descr.as_ref(),
+                                    guard.fail_arg_refs.len(),
+                                )
                             })
                             .collect(),
                         bridge_param_dispatch: inputs.bridge_param_dispatch,
@@ -3725,11 +3729,10 @@ impl majit_backend::Backend for WasmBackend {
             guard_fail_arg_counts: guard_exits
                 .iter()
                 .map(|guard| {
-                    guard
-                        .fail_arg_refs
-                        .iter()
-                        .filter(|arg| !arg.is_none())
-                        .count()
+                    crate::codegen::live_fail_arg_count(
+                        guard.meta_descr.as_ref(),
+                        guard.fail_arg_refs.len(),
+                    )
                 })
                 .collect(),
             bridge_param_dispatch: bridge_params_enabled(),
@@ -4616,11 +4619,10 @@ impl majit_backend::Backend for WasmBackend {
                     guard_fail_arg_counts: guard_exits
                         .iter()
                         .map(|guard| {
-                            guard
-                                .fail_arg_refs
-                                .iter()
-                                .filter(|arg| !arg.is_none())
-                                .count()
+                            crate::codegen::live_fail_arg_count(
+                                guard.meta_descr.as_ref(),
+                                guard.fail_arg_refs.len(),
+                            )
                         })
                         .collect(),
                     bridge_param_dispatch: bridge_params_enabled(),

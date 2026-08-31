@@ -6844,7 +6844,7 @@ fn emit_attached_bridge_dispatch(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
     bridge_cache_addrs: (usize, usize),
-    fail_arg_refs: &[OpRef],
+    bridge_source_slots: &[usize],
     ptr_type: cranelift_codegen::ir::Type,
 ) {
     // dynasm/x86 patches the failing guard's jump to the attached bridge.
@@ -6908,11 +6908,16 @@ fn emit_attached_bridge_dispatch(
     //
     // Load every source before writing any destination.  A late logical slot
     // can be copied onto an earlier slot that is itself still a source.
-    let live_slots: Vec<usize> = fail_arg_refs
-        .iter()
-        .enumerate()
-        .filter_map(|(slot, arg)| (!arg.is_none()).then_some(slot))
-        .collect();
+    //
+    // The sources come from `rd_locs` (`rebuild_faillocs_from_descr`), never
+    // from `fail_arg_refs`: the two carry different hole sets.  `rd_locs` is
+    // the mask `optimizeopt/mod.rs` derives from `inputargs_and_holes`, which
+    // is what `compile_bridge` filtered its inputargs by, while
+    // `fail_arg_refs` holes are this backend's own IR-level view.  Measured on
+    // `jit_recursive_closure_live_set.py`: one guard's `rd_locs` marked
+    // positions 21 and 22 dead where `fail_arg_refs` marked 20 and 21, so
+    // compacting by the latter moved the wrong words into the bridge's inputs.
+    let live_slots = bridge_source_slots;
     if live_slots
         .iter()
         .enumerate()
@@ -7412,7 +7417,7 @@ fn emit_guard_exit(
             jf_ptr,
             info.bridge_cache_addrs
                 .expect("can_have_bridge=true GuardInfo must carry bridge_cache_addrs"),
-            &info.fail_arg_refs,
+            &info.bridge_source_slots,
             ptr_type,
         );
     }
@@ -8381,6 +8386,13 @@ struct GuardInfo {
     /// guard's whole gcmap (`GuardToken.compute_gcmap`), and the slots a
     /// paired CALL_MAY_FORCE / CALL_RELEASE_GIL publishes into before its call.
     failarg_ref_slots: Vec<usize>,
+    /// `llsupport/assembler.py rebuild_faillocs_from_descr`: the physical
+    /// frame slot each of an attached bridge's inputargs is read from, in
+    /// bridge inputarg order.  Decoded from this guard's `rd_locs` — one
+    /// entry per logical resume position, `0xFFFF` for a hole — which
+    /// `optimizeopt/mod.rs` writes as identity-with-holes for this backend.
+    /// Empty when the descr carries no `rd_locs`, i.e. plain identity.
+    bridge_source_slots: Vec<usize>,
     /// Leaked `[length, data...]` gcmap pointer, or 0 for NULLGCMAP.
     /// allocate_gcmap (gcmap.py) parity.
     gcmap: i64,
@@ -16666,6 +16678,22 @@ fn collect_guards(
                 | majit_ir::OpCode::GuardNoException
                 | majit_ir::OpCode::GuardNotForced
         );
+        // `llsupport/assembler.py rebuild_faillocs_from_descr`: walk `rd_locs`,
+        // skip the `0xFFFF` holes, and the k-th survivor is where the bridge's
+        // k-th inputarg lives.  `CraneliftBackend::execute_bridge` decodes the
+        // same table for the re-entry path; the shared-frame tail jump reads it
+        // from here so both dispatches agree on one mapping.
+        let bridge_source_slots: Vec<usize> = descr_arc
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map(|fd| {
+                fd.rd_locs()
+                    .iter()
+                    .filter(|&&loc| loc != 0xFFFF)
+                    .map(|&loc| loc as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
         guard_infos.push(GuardInfo {
             source_op_index: op_idx,
             fail_index,
@@ -16679,6 +16707,7 @@ fn collect_guards(
             // where `before_call` has just refreshed every named slot. dynasm
             // ports the same split (`guard_gcmap_from_faillocs`). Anything a
             // guard exit does not itself write must stay out of this map.
+            bridge_source_slots,
             gcmap: allocate_gcmap(&failarg_ref_slots),
             failarg_ref_slots,
             fail_descr_ptr,

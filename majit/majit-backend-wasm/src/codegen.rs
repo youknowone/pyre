@@ -1725,6 +1725,29 @@ fn lookup_typeid_from_classptr(table: &HashMap<i64, u32>, classptr: usize) -> Op
 }
 
 /// Information about a guard exit collected during pre-scan.
+/// The live-position mask a guard's bridge inputargs were filtered by.
+///
+/// `pyjitpl.rs initialize_state_from_guard_failure` builds the bridge history
+/// from `rd_locs`: a position is live when its entry is not `0xFFFF`, and a
+/// descr whose `rd_locs` has not been sized to the fail-arg list (a synthetic
+/// one that never reached codegen) declares every position live. Any arity a
+/// backend compares against `bridge.inputargs.len()` has to come from that same
+/// table — `OpRef::is_none()` is this backend's own IR-level hole set and is a
+/// different mask, so counting with it refuses bridges whose arity was fine.
+pub fn live_fail_arg_mask(meta_descr: Option<&majit_ir::DescrRef>, n: usize) -> Vec<bool> {
+    match meta_descr.and_then(|d| d.as_fail_descr()) {
+        Some(fd) if fd.rd_locs().len() == n => {
+            fd.rd_locs().iter().map(|&pos| pos != 0xFFFF).collect()
+        }
+        _ => vec![true; n],
+    }
+}
+
+/// How many of a guard's fail-arg positions reach its bridge as inputargs.
+pub fn live_fail_arg_count(meta_descr: Option<&majit_ir::DescrRef>, n: usize) -> usize {
+    live_fail_arg_mask(meta_descr, n).iter().filter(|l| **l).count()
+}
+
 pub struct GuardExit {
     pub fail_index: u32,
     pub fail_arg_refs: Vec<OpRef>,
@@ -2938,11 +2961,10 @@ pub fn build_wasm_module(
                     "wasm backend: inlined bridge source guard is outside the owner stream".into(),
                 )
             })?;
-        let source_args = source_guard
-            .fail_arg_refs
-            .iter()
-            .filter(|arg| !arg.is_none())
-            .count();
+        let source_args = live_fail_arg_count(
+            source_guard.meta_descr.as_ref(),
+            source_guard.fail_arg_refs.len(),
+        );
         if source_args != bridge.inputargs.len() {
             return Err(BackendError::Unsupported(format!(
                 "wasm backend: inlined bridge input arity {} differs from source guard arity {source_args}",
@@ -2984,11 +3006,7 @@ pub fn build_wasm_module(
         let mut arities: Vec<usize> = guards
             .iter()
             .map(|guard| {
-                guard
-                    .fail_arg_refs
-                    .iter()
-                    .filter(|arg| !arg.is_none())
-                    .count()
+                live_fail_arg_count(guard.meta_descr.as_ref(), guard.fail_arg_refs.len())
             })
             .collect();
         arities.sort_unstable();
@@ -7687,6 +7705,22 @@ fn emit_guard_exit(
 /// Tail-call this guard's bridge directly when its cell is armed. The guard's
 /// failure list fixes both the values and the wasm function type, so this path
 /// needs neither an arity tag nor staging locals.
+/// A guard op's fail args restricted to the positions its bridge received.
+///
+/// Same rule as `live_fail_arg_mask`, read off the op's own descr.
+fn live_fail_args_of(op: &Op) -> Vec<OpRef> {
+    let all: Vec<OpRef> = op
+        .getfailargs()
+        .map(|args| args.iter().map(|arg| arg.to_opref()).collect::<Vec<_>>())
+        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect());
+    let descr = op.getdescr();
+    let mask = live_fail_arg_mask(descr.as_ref(), all.len());
+    all.into_iter()
+        .zip(mask)
+        .filter_map(|(arg, live)| live.then_some(arg))
+        .collect()
+}
+
 fn emit_guard_param_tail_call(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -7695,13 +7729,7 @@ fn emit_guard_param_tail_call(
     op: &Op,
     dispatch: BridgeDispatch<'_>,
 ) {
-    let fail_args: Vec<OpRef> = op
-        .getfailargs()
-        .map(|args| args.iter().map(|arg| arg.to_opref()).collect::<Vec<_>>())
-        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect())
-        .into_iter()
-        .filter(|arg| !arg.is_none())
-        .collect();
+    let fail_args: Vec<OpRef> = live_fail_args_of(op);
     let arity = fail_args.len();
     let type_idx = *dispatch
         .param_type_indices
@@ -7741,13 +7769,7 @@ fn emit_guard_inline_bridge_move(
     op: &Op,
     inputargs: &[InputArg],
 ) {
-    let fail_args: Vec<OpRef> = op
-        .getfailargs()
-        .map(|args| args.iter().map(|arg| arg.to_opref()).collect::<Vec<_>>())
-        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect())
-        .into_iter()
-        .filter(|arg| !arg.is_none())
-        .collect();
+    let fail_args: Vec<OpRef> = live_fail_args_of(op);
     assert_eq!(
         fail_args.len(),
         inputargs.len(),
