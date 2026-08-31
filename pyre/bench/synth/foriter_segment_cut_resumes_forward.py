@@ -22,7 +22,14 @@
 try:
     import pypyjit
 
-    pypyjit.set_param("trace_limit=330")
+    # Fit to one traced iteration's cost the same way
+    # `trace_segmenting_over_limit_retry` is: it read 330 while the FOR_ITER
+    # receiver pin was spelled `ptr_eq` + `guard_true`, and `guard_value`
+    # shortened the body out from under it.  The census this file gates on
+    # (`loop loop_genexp`, `loop prefix_next`) is the same at 300, 315 and 330;
+    # 315 is where the cut shape it exercises comes back
+    # (`bridges_compiled=26 loops_aborted=29` against 19/40 at 330).
+    pypyjit.set_param("trace_limit=315")
     pypyjit.set_param("threshold=20")
 except ImportError:
     pass

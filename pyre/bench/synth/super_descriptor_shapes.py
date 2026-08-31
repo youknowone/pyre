@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=name_bound_loop,slot_wrapper_loop,property_loop,class_receiver_loop,name_bound_class_receiver_loop,explicit_class_receiver_loop,method_descriptor_loop
+# pyre-check: selfcheck-compiles=name_bound_loop,slot_wrapper_loop,property_loop,class_receiver_loop,name_bound_class_receiver_loop,explicit_class_receiver_loop,method_descriptor_loop,apparent_fused_loop,apparent_property_loop,apparent_name_bound_loop,apparent_explicit_loop
 # Correctness and compilation coverage for the descriptor shapes selected by
 # `W_Super.getattribute`.  PyPy traces the unrolled MRO suffix walk and then the
 # ordinary descriptor protocol; pyre's fused LOAD_SUPER_ATTR and name-bound
@@ -22,6 +22,10 @@ class Base:
     @property
     def prop(self):
         return self.bias
+
+    @property
+    def fixed(self):
+        return 5
 
 
 class Child(Base):
@@ -59,6 +63,32 @@ class Child(Base):
             total += super().prop
         return total
 
+    def apparent_fused_loop(self, n):
+        total = 0
+        for _ in range(n):
+            total = super().sm(total)
+        return total
+
+    def apparent_property_loop(self, n):
+        total = 0
+        for _ in range(n):
+            total += super().fixed
+        return total
+
+    def apparent_name_bound_loop(self, n):
+        total = 0
+        for _ in range(n):
+            proxy = super()
+            total += proxy.k
+        return total
+
+    def apparent_explicit_loop(self, n):
+        total = 0
+        for _ in range(n):
+            proxy = super(Child, self)
+            total += proxy.k
+        return total
+
     @classmethod
     def class_receiver_loop(cls, n):
         total = 0
@@ -93,6 +123,12 @@ class ListChild(list):
             super().append(5)
             total += super().pop()
         return total
+
+
+class ApparentChild:
+    """Its installed type is unrelated; only the traced attribute says Child."""
+
+    __class__ = Child
 
 
 class Sneaky(Base):
@@ -133,6 +169,7 @@ class Fallback(super):
 
 def main():
     child = Child()
+    apparent = ApparentChild()
     checks = (
         ("name-bound descriptors + cellvar self", child.name_bound_loop(N), 19 * N),
         ("slot wrapper", child.slot_wrapper_loop(N), N),
@@ -141,6 +178,22 @@ def main():
         ("name-bound class receiver", Child.name_bound_class_receiver_loop(N), 3 * N),
         ("explicit class receiver", Child.explicit_class_receiver_loop(N), 3 * N),
         ("method descriptor", ListChild().method_descriptor_loop(N), 5 * N),
+        ("apparent class fused", Child.apparent_fused_loop(apparent, N), N),
+        (
+            "apparent class property",
+            Child.apparent_property_loop(apparent, N),
+            5 * N,
+        ),
+        (
+            "apparent class name-bound",
+            Child.apparent_name_bound_loop(apparent, N),
+            3 * N,
+        ),
+        (
+            "apparent class explicit",
+            Child.apparent_explicit_loop(apparent, N),
+            3 * N,
+        ),
         ("rejected slot wrapper", object.__new__(SneakyChild).reject_loop(N), N),
     )
     for label, got, want in checks:

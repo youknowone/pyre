@@ -2988,6 +2988,78 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
     Some((self_op, cell_op, layout.self_is_cell))
 }
 
+/// The third arm of PyPy's `descriptor.py:_super_check`, when its
+/// `space.getattr(obj, '__class__')` is the ordinary class-attribute read the
+/// mapdict tracer already knows how to fold.
+///
+/// `class_attr_fast_path` is deliberately the whole admission predicate: a
+/// property, custom `__getattribute__`, heap-type descriptor, devolved map or
+/// instance shadow stays on the traceable/residual Python path.  For an
+/// admitted read these four values are exactly the guards an ordinary
+/// `LOAD_ATTR __class__` emits, so super construction can consume the same
+/// answer without inventing a stronger receiver-class equality.
+#[derive(Clone, Copy)]
+pub(crate) struct ApparentSuperClass {
+    pub(crate) objtype: pyre_object::PyObjectRef,
+    receiver_type: pyre_object::PyObjectRef,
+    receiver_version_tag: u64,
+    receiver_map: pyre_interpreter::objspace::std::mapdict::MapRef,
+}
+
+pub(crate) fn walker_apparent_super_class(
+    start_type: pyre_object::PyObjectRef,
+    obj: pyre_object::PyObjectRef,
+) -> Option<ApparentSuperClass> {
+    if start_type.is_null()
+        || obj.is_null()
+        || !unsafe { pyre_object::is_type(start_type) }
+        || unsafe { pyre_object::is_none(obj) }
+    {
+        return None;
+    }
+    let (receiver_type, receiver_version_tag, receiver_map, objtype) = unsafe {
+        pyre_interpreter::objspace::std::mapdict::class_attr_fast_path(obj, "__class__")
+    }?;
+    if !unsafe { pyre_object::is_type(objtype) }
+        || !unsafe { pyre_interpreter::baseobjspace::jit_issubtype_w(objtype, start_type) }
+    {
+        return None;
+    }
+    Some(ApparentSuperClass {
+        objtype,
+        receiver_type,
+        receiver_version_tag,
+        receiver_map,
+    })
+}
+
+/// Emit the proof corresponding to an ordinary traced
+/// `obj.__class__` class-attribute read and return the promoted apparent type.
+pub(crate) fn walker_guard_apparent_super_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj_op: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    apparent: ApparentSuperClass,
+) -> Result<OpRef, DispatchError> {
+    walker_guard_mapdict_instance_shape(
+        ctx,
+        op_pc,
+        obj_op,
+        concrete_obj,
+        apparent.receiver_type,
+        apparent.receiver_version_tag,
+        apparent.receiver_map,
+    )?;
+    let objtype_const = ctx.trace_ctx.const_ref(apparent.objtype as i64);
+    // `_super_check`'s final `issubtype_w(w_type, w_starttype)` is an
+    // elidable MRO query on promoted types.  The receiver-type version pin
+    // above protects which object `__class__` returns; this second pin
+    // protects the returned class's ancestry.
+    walker_pin_type_version_tag(ctx, op_pc, objtype_const)?;
+    Ok(objtype_const)
+}
+
 /// Zero-argument `super()` folded to the proxy itself rather than re-routed to
 /// a may-force residual.
 ///
@@ -3083,16 +3155,27 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     if unsafe { pyre_object::is_none(concrete_self) } {
         return Ok(None);
     }
-    let Some(objtype) =
-        pyre_interpreter::builtins::super_check_python_free(concrete_cls, concrete_self)
-    else {
+    let python_free =
+        pyre_interpreter::builtins::super_check_python_free(concrete_cls, concrete_self);
+    let apparent = if python_free.is_none() {
+        walker_apparent_super_class(concrete_cls, concrete_self)
+    } else {
+        None
+    };
+    let Some(objtype) = python_free.or_else(|| apparent.map(|answer| answer.objtype)) else {
         return Ok(None);
     };
-    let class_mode =
-        unsafe { pyre_object::is_type(concrete_self) } && std::ptr::eq(objtype, concrete_self);
-    // Instance mode reads the receiver class back out of `w_class`; class mode
-    // is `_super_check`'s first arm and pins the class object itself below.
-    if !class_mode && !std::ptr::eq(objtype, unsafe { (*concrete_self).w_class }) {
+    let class_mode = python_free.is_some()
+        && unsafe { pyre_object::is_type(concrete_self) }
+        && std::ptr::eq(objtype, concrete_self);
+    // The first two `_super_check` arms derive instance mode from the live
+    // `w_class` slot.  The third derives it from the separately guarded
+    // `__class__` lookup and must not impose this equality: transparent proxy
+    // objects exist precisely because the two classes differ.
+    if apparent.is_none()
+        && !class_mode
+        && !std::ptr::eq(objtype, unsafe { (*concrete_self).w_class })
+    {
         return Ok(None);
     }
 
@@ -3159,16 +3242,28 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_cls as usize)),
         );
     }
-    let proxy_op = walker_emit_super_proxy(
-        ctx,
-        op.pc,
-        cls_op,
-        self_op,
-        concrete_cls,
-        concrete_self,
-        objtype,
-        class_mode,
-    )?;
+    let proxy_op = if let Some(apparent) = apparent {
+        walker_emit_apparent_super_proxy(
+            ctx,
+            op.pc,
+            cls_op,
+            self_op,
+            concrete_cls,
+            concrete_self,
+            apparent,
+        )?
+    } else {
+        walker_emit_super_proxy(
+            ctx,
+            op.pc,
+            cls_op,
+            self_op,
+            concrete_cls,
+            concrete_self,
+            objtype,
+            class_mode,
+        )?
+    };
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', proxy_op)?;
     Ok(Some(()))
 }
@@ -4685,11 +4780,32 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((objtype, _version_tag, w_descr, class_mode)) = (unsafe {
+    let python_free = unsafe {
         pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, &name)
-    }) else {
-        return Ok(None);
     };
+    let apparent = if python_free.is_none() {
+        walker_apparent_super_class(concrete_cls, concrete_self)
+    } else {
+        None
+    };
+    let (objtype, w_descr, class_mode) =
+        if let Some((objtype, _, w_descr, class_mode)) = python_free {
+            (objtype, w_descr, class_mode)
+        } else if let Some(apparent) = apparent {
+            let Some((_, w_descr, class_mode)) = (unsafe {
+                pyre_interpreter::baseobjspace::super_attr_proxy_fast_path(
+                    concrete_cls,
+                    apparent.objtype,
+                    concrete_self,
+                    &name,
+                )
+            }) else {
+                return Ok(None);
+            };
+            (apparent.objtype, w_descr, class_mode)
+        } else {
+            return Ok(None);
+        };
     let Some(binding) = super_attr_binding(w_descr, concrete_self, class_mode) else {
         return Ok(None);
     };
@@ -4708,18 +4824,32 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(global_super, super_const);
     }
-    let value_op = walker_emit_super_attr_result(
-        ctx,
-        op_pc,
-        self_obj,
-        cls,
-        concrete_self,
-        concrete_cls,
-        objtype,
-        w_descr,
-        class_mode,
-        binding,
-    )?;
+    let value_op = if let Some(apparent) = apparent {
+        walker_emit_apparent_super_attr_result(
+            ctx,
+            op_pc,
+            self_obj,
+            cls,
+            concrete_self,
+            concrete_cls,
+            apparent,
+            w_descr,
+            binding,
+        )?
+    } else {
+        walker_emit_super_attr_result(
+            ctx,
+            op_pc,
+            self_obj,
+            cls,
+            concrete_self,
+            concrete_cls,
+            objtype,
+            w_descr,
+            class_mode,
+            binding,
+        )?
+    };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value_op)?;
     Ok(Some(()))
 }
@@ -4890,6 +5020,30 @@ fn walker_emit_super_attr_result<Sym: WalkSym>(
         class_mode,
     )?;
 
+    walker_emit_super_attr_binding(
+        ctx,
+        op_pc,
+        self_obj,
+        concrete_self,
+        objtype,
+        objtype_const,
+        w_descr,
+        binding,
+    )
+}
+
+/// Bind the descriptor found by the MRO suffix walk after the caller has
+/// emitted the particular `_super_check` proof that supplied `objtype`.
+fn walker_emit_super_attr_binding<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    self_obj: OpRef,
+    concrete_self: pyre_object::PyObjectRef,
+    objtype: pyre_object::PyObjectRef,
+    objtype_const: OpRef,
+    w_descr: pyre_object::PyObjectRef,
+    binding: SuperAttrBinding,
+) -> Result<OpRef, DispatchError> {
     let slot_pin = match &binding {
         SuperAttrBinding::Constant { slot_pin, .. } | SuperAttrBinding::Method { slot_pin, .. } => {
             slot_pin.clone()
@@ -4975,6 +5129,41 @@ fn walker_emit_super_attr_result<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(bound as usize)),
     );
     Ok(method_op)
+}
+
+/// Attribute-binding twin for `_super_check`'s apparent-`__class__` arm.
+/// `walker_emit_super_attr_lookup_guards` assumes `self.w_class == objtype`;
+/// the mapdict lookup is the proof here instead, while the MRO suffix binding
+/// after that point is identical.
+#[allow(clippy::too_many_arguments)]
+fn walker_emit_apparent_super_attr_result<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    self_obj: OpRef,
+    cls: OpRef,
+    concrete_self: pyre_object::PyObjectRef,
+    concrete_cls: pyre_object::PyObjectRef,
+    apparent: ApparentSuperClass,
+    w_descr: pyre_object::PyObjectRef,
+    binding: SuperAttrBinding,
+) -> Result<OpRef, DispatchError> {
+    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
+    if !cls.is_constant() {
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls, cls_const])?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(cls, cls_const);
+    }
+    let objtype_const =
+        walker_guard_apparent_super_class(ctx, op_pc, self_obj, concrete_self, apparent)?;
+    walker_emit_super_attr_binding(
+        ctx,
+        op_pc,
+        self_obj,
+        concrete_self,
+        apparent.objtype,
+        objtype_const,
+        w_descr,
+        binding,
+    )
 }
 
 /// Emit the guards that make a recording-time `super` MRO suffix answer valid
@@ -5323,19 +5512,28 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
     if !unsafe { pyre_object::is_type(concrete_cls) } {
         return Ok(None);
     }
-    let Some(objtype) =
-        pyre_interpreter::builtins::super_check_python_free(concrete_cls, concrete_obj)
-    else {
+    let python_free =
+        pyre_interpreter::builtins::super_check_python_free(concrete_cls, concrete_obj);
+    let apparent = if python_free.is_none() {
+        walker_apparent_super_class(concrete_cls, concrete_obj)
+    } else {
+        None
+    };
+    let Some(objtype) = python_free.or_else(|| apparent.map(|answer| answer.objtype)) else {
         return Ok(None);
     };
-    let class_mode =
-        unsafe { pyre_object::is_type(concrete_obj) } && std::ptr::eq(objtype, concrete_obj);
+    let class_mode = python_free.is_some()
+        && unsafe { pyre_object::is_type(concrete_obj) }
+        && std::ptr::eq(objtype, concrete_obj);
     // In instance mode the receiver's class is read back out of the object
     // below, so the two must be the same word: an exception instance carrying
     // the generic stub resolves its class through the kind registry instead.
     // In class mode `_super_check` returns the receiver class itself and its
     // `w_class` is the metaclass, so identity of `obj_op` is the guard instead.
-    if !class_mode && !std::ptr::eq(objtype, unsafe { (*concrete_obj).w_class }) {
+    if apparent.is_none()
+        && !class_mode
+        && !std::ptr::eq(objtype, unsafe { (*concrete_obj).w_class })
+    {
         return Ok(None);
     }
 
@@ -5355,16 +5553,28 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(callable_op, expected);
     }
-    let proxy_op = walker_emit_super_proxy(
-        ctx,
-        op.pc,
-        cls_op,
-        obj_op,
-        concrete_cls,
-        concrete_obj,
-        objtype,
-        class_mode,
-    )?;
+    let proxy_op = if let Some(apparent) = apparent {
+        walker_emit_apparent_super_proxy(
+            ctx,
+            op.pc,
+            cls_op,
+            obj_op,
+            concrete_cls,
+            concrete_obj,
+            apparent,
+        )?
+    } else {
+        walker_emit_super_proxy(
+            ctx,
+            op.pc,
+            cls_op,
+            obj_op,
+            concrete_cls,
+            concrete_obj,
+            objtype,
+            class_mode,
+        )?
+    };
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', proxy_op)?;
     Ok(Some(()))
 }
@@ -5448,7 +5658,62 @@ fn walker_emit_super_proxy<Sym: WalkSym>(
     // A `__bases__` reassignment anywhere in the selected class's ancestry
     // bumps this tag and can make `issubtype_w(objtype, cls)` stop holding.
     walker_pin_type_version_tag(ctx, op_pc, objtype_const)?;
+    walker_emit_super_proxy_storage(
+        ctx,
+        cls_const,
+        objtype_const,
+        obj_op,
+        concrete_cls,
+        concrete_obj,
+        objtype,
+    )
+}
 
+/// The `_super_check` third-arm twin of [`walker_emit_super_proxy`].  The
+/// ordinary emitter pins `obj.w_class == objtype`, which is the proof supplied
+/// by the normal second arm and exactly the condition an apparent-class proxy
+/// violates.  Here the traced `obj.__class__` read supplies its own mapdict
+/// proof, then both paths share the literal `W_Super` allocation below.
+fn walker_emit_apparent_super_proxy<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    cls_op: OpRef,
+    obj_op: OpRef,
+    concrete_cls: pyre_object::PyObjectRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    apparent: ApparentSuperClass,
+) -> Result<OpRef, DispatchError> {
+    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
+    if !cls_op.is_constant() {
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls_op, cls_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(cls_op, cls_const);
+    }
+    let objtype_const =
+        walker_guard_apparent_super_class(ctx, op_pc, obj_op, concrete_obj, apparent)?;
+    walker_emit_super_proxy_storage(
+        ctx,
+        cls_const,
+        objtype_const,
+        obj_op,
+        concrete_cls,
+        concrete_obj,
+        apparent.objtype,
+    )
+}
+
+/// The field-for-field `W_Super` allocation shared after `_super_check`'s
+/// different proof arms have produced and protected `objtype`.
+fn walker_emit_super_proxy_storage<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    cls_const: OpRef,
+    objtype_const: OpRef,
+    obj_op: OpRef,
+    concrete_cls: pyre_object::PyObjectRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    objtype: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
     let header_w_class = ctx
         .trace_ctx
         .const_ref(pyre_object::get_instantiate(&pyre_object::descriptor::SUPER_TYPE) as i64);

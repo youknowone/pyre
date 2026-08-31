@@ -8062,11 +8062,32 @@ pub(crate) fn try_walker_inline_super_property_get<Sym: WalkSym>(
     let Some(concrete_cls) = walker_concrete_ref_object(ctx, cls) else {
         return Ok(None);
     };
-    let Some((objtype, _version_tag, w_descr, class_mode)) = (unsafe {
+    let python_free = unsafe {
         pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, name)
-    }) else {
-        return Ok(None);
     };
+    let apparent = if python_free.is_none() {
+        super::specialize::walker_apparent_super_class(concrete_cls, concrete_self)
+    } else {
+        None
+    };
+    let (objtype, w_descr, class_mode) =
+        if let Some((objtype, _, w_descr, class_mode)) = python_free {
+            (objtype, w_descr, class_mode)
+        } else if let Some(apparent) = apparent {
+            let Some((_, w_descr, class_mode)) = (unsafe {
+                pyre_interpreter::baseobjspace::super_attr_proxy_fast_path(
+                    concrete_cls,
+                    apparent.objtype,
+                    concrete_self,
+                    name,
+                )
+            }) else {
+                return Ok(None);
+            };
+            (apparent.objtype, w_descr, class_mode)
+        } else {
+            return Ok(None);
+        };
     // Class access asks `property.__get__(None, objtype)` and gets the
     // descriptor itself; the constant result fold owns that arm.
     if class_mode || !unsafe { pyre_object::descriptor::is_exact_property(w_descr) } {
@@ -8112,16 +8133,36 @@ pub(crate) fn try_walker_inline_super_property_get<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(global_super, expected);
     }
-    super::specialize::walker_emit_super_attr_lookup_guards(
-        ctx,
-        op.pc,
-        self_obj,
-        cls,
-        concrete_self,
-        concrete_cls,
-        objtype,
-        false,
-    )?;
+    if let Some(apparent) = apparent {
+        let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
+        if !cls.is_constant() {
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op.pc,
+                OpCode::GuardValue,
+                &[cls, cls_const],
+            )?;
+            ctx.trace_ctx.heap_cache_mut().replace_box(cls, cls_const);
+        }
+        super::specialize::walker_guard_apparent_super_class(
+            ctx,
+            op.pc,
+            self_obj,
+            concrete_self,
+            apparent,
+        )?;
+    } else {
+        super::specialize::walker_emit_super_attr_lookup_guards(
+            ctx,
+            op.pc,
+            self_obj,
+            cls,
+            concrete_self,
+            concrete_cls,
+            objtype,
+            class_mode,
+        )?;
+    }
     walker_pin_descriptor_slot(ctx, op.pc, w_descr, crate::descr::property_fget_descr())?;
 
     let inlined = try_walker_inline_resolved_user_call(
