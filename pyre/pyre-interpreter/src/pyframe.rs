@@ -913,10 +913,7 @@ pub mod frame_locals_proxy {
             let result = self.mapping()?;
             let result_slot = other_slot + 1;
             let _ = roots.pin_root(result);
-            crate::opcode_ops::dict_update_value(
-                roots.get(result_slot),
-                roots.get(other_slot),
-            )?;
+            crate::opcode_ops::dict_update(roots.get(result_slot), roots.get(other_slot))?;
             Ok(roots.get(result_slot))
         }
 
@@ -924,15 +921,26 @@ pub mod frame_locals_proxy {
         /// `wrap_binaryfunc_r` wrapper over it and reaches
         /// `framelocalsproxy_or` with the operands swapped — the type check
         /// then guards the PROXY, which always passes, while `PyDict_Update`
-        /// runs against the other operand.  Both `proxy.__ror__(3)` and the
-        /// operator form `3 | proxy` therefore raise `AttributeError: 'int'
-        /// object has no attribute 'keys'` there.  A distinct `__ror__`
-        /// answering `NotImplemented` reports `TypeError: unsupported operand
-        /// type(s)` for each instead; reproducing the `AttributeError` needs
-        /// the percolating `PyDict_Update`, where `dict_update_value` carries
-        /// `DICT_UPDATE`'s `ismapping_w` gate and rewrites it.
+        /// runs against the other operand.  So there is no gate on this side,
+        /// and `3 | proxy` raises `AttributeError: 'int' object has no
+        /// attribute 'keys'` rather than the generic operator TypeError.
+        ///
+        /// `binary_op1` invokes the slot in `(left, right)` order both ways,
+        /// so the operand is the one filled in first and the proxy's own
+        /// entries win — and the proxy is snapshotted only afterwards,
+        /// because the operand's `keys()` / `__getitem__` may have written to
+        /// the frame.
         fn __ror__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-            self.call_mapping_method("__ror__", &[other])
+            let roots = pyre_object::gc_roots::push_roots();
+            let other_slot = roots.base();
+            let _ = roots.pin_root(other);
+            let result_slot = other_slot + 1;
+            let _ = roots.pin_root(pyre_object::w_dict_new());
+            crate::opcode_ops::dict_update(roots.get(result_slot), roots.get(other_slot))?;
+            let snapshot_slot = result_slot + 1;
+            let _ = roots.pin_root(self.mapping()?);
+            crate::opcode_ops::dict_update(roots.get(result_slot), roots.get(snapshot_slot))?;
+            Ok(roots.get(result_slot))
         }
 
         fn __ior__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -6504,9 +6512,11 @@ pub extern "C" fn jit_locals_dict_snapshot(w_locals: i64) -> i64 {
     let _ = pyre_object::gc_roots::pin_root(w_locals as PyObjectRef);
     let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_dict_new() });
-    // `dict_update_value` walks a mapping's `keys()`, so both sides are
-    // reloaded across it as well as across the `w_dict_new` above.
-    match crate::opcode_ops::dict_update_value(
+    // `dict_update` walks a mapping's `keys()`, so both sides are reloaded
+    // across it as well as across the `w_dict_new` above.  It is the
+    // `PyDict_Update(dct, self)` copy `frame_getlocals` makes, so the update
+    // percolates rather than reporting a non-mapping.
+    match crate::opcode_ops::dict_update(
         pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
         pyre_object::gc_roots::shadow_stack_get(locals_slot),
     ) {

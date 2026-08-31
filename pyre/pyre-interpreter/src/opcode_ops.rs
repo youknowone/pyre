@@ -729,11 +729,12 @@ pub fn map_add_value(
     Ok(())
 }
 
-/// DICT_UPDATE — `dict.update(source)` with the `ismapping` gate.  Shared
-/// by the interpreter's `dict_update` and the JIT residual
-/// `bh_dict_update_fn`.  Non-mapping surfaces "'<T>' object is not a
-/// mapping"; a `keys()`/`__getitem__` may run Python.
-pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
+/// `PyDict_Update` — `dict_merge` with `override`, which takes the generic
+/// branch for a non-dict operand and calls `PyMapping_Keys` on it.  A `source`
+/// with no `keys()` percolates its own `AttributeError` from there, and that
+/// is the error `framelocalsproxy_or` and `_PyNamespace_New` report; the
+/// `DICT_UPDATE` wrapper below is what rewrites it.
+pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_dict(source) {
             // `w_dict_store` allocates when the storage grows or the strategy
@@ -761,16 +762,7 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
             return Ok(());
         }
     }
-    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
-        Ok(m) => m,
-        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let type_name = unsafe { pyre_object::type_name_of(source) };
-            return Err(PyError::type_error(format!(
-                "'{type_name}' object is not a mapping"
-            )));
-        }
-        Err(e) => return Err(e),
-    };
+    let keys_method = crate::baseobjspace::getattr_str(source, "keys")?;
     let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
     let keys = crate::builtins::collect_iterable(keys_obj)?;
     unsafe {
@@ -809,6 +801,31 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
         }
     }
     Ok(())
+}
+
+/// DICT_UPDATE — `PyDict_Update`, then the handler's own rewrite: an
+/// `AttributeError` the update surfaced is reported as `'<T>' object is not a
+/// mapping`.  `inst(DICT_UPDATE)` draws that line *after* the update rather
+/// than before it, so a user `keys()` raising `AttributeError` reads the same
+/// way; `PyFrame.DICT_UPDATE` gates `space.ismapping_w` ahead of the call
+/// instead and lets such an error through.  Shared by the interpreter's
+/// `dict_update` and the JIT residual `bh_dict_update_fn`.
+pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(dict);
+    let _ = roots.pin_root(source);
+    match dict_update(roots.get(base), roots.get(base + 1)) {
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            // The update ran Python, so the operand is named at the address it
+            // has now rather than the one the call was made with.
+            let type_name = unsafe { pyre_object::type_name_of(roots.get(base + 1)) };
+            Err(PyError::type_error(format!(
+                "'{type_name}' object is not a mapping"
+            )))
+        }
+        other => other,
+    }
 }
 
 /// DICT_MERGE — merge `source` into `dict` with duplicate-key checks.

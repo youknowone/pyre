@@ -38,7 +38,8 @@ pub unsafe extern "C" fn _PyNamespace_New(kwds: *mut CPyObject) -> *mut CPyObjec
     let _ = pyre_object::gc_roots::pin_root(dict);
     let source = pyre_object::gc_roots::shadow_stack_get(namespace_slot + 1);
     let dict = pyre_object::gc_roots::shadow_stack_get(namespace_slot + 2);
-    if let Err(error) = crate::opcode_ops::dict_update_value(dict, source) {
+    // `_PyNamespace_New` copies with `PyDict_Update`, which percolates.
+    if let Err(error) = crate::opcode_ops::dict_update(dict, source) {
         super::pyerrors::set_pending_error(error);
         return std::ptr::null_mut();
     }
