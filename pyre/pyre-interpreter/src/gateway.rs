@@ -1022,6 +1022,10 @@ fn no_keyword_arguments(code: &BuiltinCode, receiver: Option<PyObjectRef>) -> cr
 /// callable keep the whole `tp_name` instead — `descriptor 'tolist' for
 /// 'array.array' objects` — so only the qualified-name forms come through
 /// here.  Undotted names pass through unchanged.
+///
+/// Only a `tp_name` is shortened this way.  A class object read off the
+/// receiver already carries its own `__qualname__`, whose dots are part of
+/// the name.
 fn method_qualifier(type_name: &str) -> &str {
     type_name.rsplit('.').next().unwrap_or(type_name)
 }
@@ -1035,13 +1039,16 @@ fn builtin_names(
         None if code.module.is_empty() || code.module == "builtins" => code.name.to_string(),
         None => format!("{}.{}", code.module, code.name),
         Some(owner) => {
+            // `meth_get__qualname__` reads the receiver class's own
+            // `__qualname__`, which keeps every dot a nested or dotted class
+            // name carries; only a static type's `tp_name` is shortened.
             let ty = match receiver {
                 Some(r) if unsafe { pyre_object::typeobject::is_type(r) } => unsafe {
-                    pyre_object::w_type_get_name(r)
+                    pyre_object::w_type_get_qualname(r)
                 },
-                _ => owner.type_name,
+                _ => method_qualifier(owner.type_name),
             };
-            format!("{}.{}", method_qualifier(ty), code.name)
+            format!("{ty}.{}", code.name)
         }
     };
     (owner, qualname)
