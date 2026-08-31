@@ -246,6 +246,23 @@ _INT_DBCONFIGS = {
     if symbol in globals()
 }
 
+_C_INT_MIN = -2 ** 31
+_C_INT_MAX = 2 ** 31 - 1
+
+
+def _dbconfig_op(op):
+    # `setconfig` and `getconfig` declare `op: int`, so the argument goes
+    # through `__index__` and is narrowed to a C int before the body tests it
+    # against the supported set: a float or a list is a TypeError from the
+    # conversion, and an out-of-range int an OverflowError, not the membership
+    # test's ValueError.
+    op = operator.index(op)
+    if not _C_INT_MIN <= op <= _C_INT_MAX:
+        raise OverflowError("Python int too large to convert to C int")
+    if op not in _INT_DBCONFIGS:
+        raise ValueError("unknown config 'op': %d" % op)
+    return op
+
 _SQLITE_TRANSIENT = _lib.SQLITE_TRANSIENT
 
 # error codes
@@ -1261,8 +1278,7 @@ class Connection(object):
     @_check_thread_wrap
     @_check_closed_wrap
     def setconfig(self, op, enable=True, /):
-        if op not in _INT_DBCONFIGS:
-            raise ValueError("unknown config 'op': %d" % op)
+        op = _dbconfig_op(op)
         current = _ffi.new('int *')
         rc = _lib.pypy_sqlite3_db_config_int(
             self._db, op, bool(enable), current)
@@ -1274,8 +1290,7 @@ class Connection(object):
     @_check_thread_wrap
     @_check_closed_wrap
     def getconfig(self, op, /):
-        if op not in _INT_DBCONFIGS:
-            raise ValueError("unknown config 'op': %d" % op)
+        op = _dbconfig_op(op)
         current = _ffi.new('int *')
         rc = _lib.pypy_sqlite3_db_config_int(self._db, op, -1, current)
         if rc != _lib.SQLITE_OK:
