@@ -9080,16 +9080,20 @@ fn dict_view_isdisjoint(
             unsafe { pyre_object::w_int_get_value(n) } == 0,
         ));
     }
+    // `collect_iterable` runs a user `__iter__` and `__next__`, and the
+    // receiver it is not handed is a native copy no root walker updates -- a
+    // dict view is `try_gc_alloc_nursery_raw` and so moves -- which is why the
+    // receiver is published before that call rather than after it.  Its own
+    // scope has popped by the time it returns, so the items sit in an untraced
+    // native Vec while each `contains` runs a user `__eq__`; those are pinned
+    // as well, the shape `dict_view_all_contained_in` above uses.
+    let roots = pyre_object::gc_roots::push_roots();
+    let view_slot = roots.publish(&[self_view]);
+    roots.normalize(view_slot, 1);
     let other_items = crate::builtins::collect_iterable(other)?;
-    // `collect_iterable`'s own scope has popped by the time it returns, so the
-    // items sit in an untraced native Vec while each `contains` runs a user
-    // `__eq__`.  Same shape as `dict_view_all_contained_in` above.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let view_slot = pyre_object::gc_roots::shadow_stack_len();
-    let self_view = pyre_object::gc_roots::pin_root(self_view);
     let item_base = pyre_object::gc_roots::pin_roots(&other_items);
     for index in 0..other_items.len() {
-        let self_view = pyre_object::gc_roots::shadow_stack_get(view_slot);
+        let self_view = roots.get(view_slot);
         let item = pyre_object::gc_roots::shadow_stack_get(item_base + index);
         if crate::baseobjspace::contains(self_view, item)? {
             return Ok(pyre_object::w_bool_from(false));
@@ -9109,19 +9113,30 @@ fn dict_view_as_set_op(
     rhs: pyre_object::PyObjectRef,
     methname: &str,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    // Materialising the left operand hashes every element it stores, which
+    // runs Python, and `rhs` is a native copy no root walker updates.  A dict
+    // view is `try_gc_alloc_nursery_raw` and so moves, and `dict_view_rset_op`
+    // reaches here with one as `rhs` for every reflected operator, so both
+    // operands are published before the materialisation runs.  The set itself
+    // is old-gen and never moves, but nothing else holds it while the named
+    // method runs, so it is pinned rather than read back.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.publish(&[lhs, rhs]);
+    roots.normalize(base, 2);
     let w_set = if methname == "intersection_update" {
-        let w_set = pyre_object::w_set_new();
-        set_init_from_iterable_impl(w_set, lhs, false)?;
+        let w_set = roots.pin_root(pyre_object::w_set_new());
+        set_init_from_iterable_impl(w_set, roots.get(base), false)?;
         w_set
     } else {
         let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
-        crate::call::call_function_impl_result(w_set_type, &[lhs])?
+        let w_set = crate::call::call_function_impl_result(w_set_type, &[roots.get(base)])?;
+        roots.pin_root(w_set)
     };
     // `dictmultiobject.py _as_set_op` — `space.call_method(w_set, methname,
     // w_other)`, which is `callmethod.py call_method_opt`: the in-place set
     // method is a method descriptor on an instance with no dictionary, so the
     // call reaches it without materialising a bound method first.
-    crate::baseobjspace::call_method_result(w_set, methname, &[rhs])?;
+    crate::baseobjspace::call_method_result(w_set, methname, &[roots.get(base + 1)])?;
     Ok(w_set)
 }
 
