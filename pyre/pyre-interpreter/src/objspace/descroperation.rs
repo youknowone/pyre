@@ -2170,7 +2170,12 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
             }
         }
     }
-    items.extend(rooted.take());
+    // Keep the rtyper-visible `args[i]`/ArrayRead shape used throughout the
+    // port; `Vec::extend` has no source-lifted CallRegistry entry.
+    let pinned = rooted.take();
+    for i in 0..pinned.len() {
+        items.push(pinned[i]);
+    }
     Ok(w_list_new(items))
 }
 
