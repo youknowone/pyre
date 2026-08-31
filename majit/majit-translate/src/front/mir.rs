@@ -1116,15 +1116,16 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // (keyed exactly as `merge_hints_from_llbcs`), so the narrow
         // codewriter surface stays restricted to opaque stubs; every
         // other fn keeps the declared-void default.
-        // A trait default body is registered as the `<default methods of
-        // Trait>` family sentinel and picked as the Indirect-dispatch
-        // witness (`getcalldescr`'s indirect arm reads its `return_type` as
-        // `FUNC.RESULT`).  Left `None` it maps to `Void` and mismatches the
-        // caller's `Ref`/`Int` `result_ty`; stamp the same token an opaque
-        // callee gets so the witness reports its real return kind.
+        // Every trait method can be a member of an indirect-call PBC row:
+        // default bodies and concrete overrides alike.  RPython's
+        // `FunctionReprBase.call` gets the row's result from
+        // `FuncType.RESULT`, so each member must carry that type before the
+        // graph analyzers run.  Left `None`, pyre maps it to `Void` and the
+        // first concrete witness can mismatch a real `Ref`/`Int` result.
+        // Stamp the same signature token an opaque callee gets.
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
-            || (trait_root.is_some() && self_ty_root.is_none());
+            || trait_root.is_some();
         let return_type = if gcref_result {
             Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
         } else if stamp_return_token {
@@ -10657,10 +10658,11 @@ impl<'a> Lowering<'a> {
                 // the method fn-ptr straight out of the receiver's vtable
                 // (`(*recv).vtable.method_<name>`), so the operand's
                 // terminal projection is `Field[Adt(vtable_id), slot]`.
-                // Route those through the faithful `CallTarget::Indirect`
-                // vtable pipeline (`rpbc::lower_indirect_calls` →
-                // `VtableMethodPtr` + `IndirectCall`, carrying the full
-                // impl family) instead of the synthetic `__dyn_call`.  The
+                // Preserve that projection as the funcptr operand of an
+                // `IndirectCall`; `rpbc::lower_indirect_calls` supplies the
+                // full impl family, matching `ClassRepr.getclsfield` followed
+                // by `FunctionReprBase.call`, instead of routing through the
+                // synthetic `__dyn_call`.  The
                 // call args already carry the receiver in `args[0]` (the
                 // operand projection's base local), which is exactly the
                 // receiver slot `IndirectCall` expects, so the arg list
@@ -10680,9 +10682,18 @@ impl<'a> Lowering<'a> {
                 let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
                 let indirect = self.dyn_indirect_target(&dyn_operand);
                 if let Some((trait_root, method_name)) = indirect {
-                    OpKind::Call {
-                        target: CallTarget::indirect(trait_root, method_name),
+                    // RPython `ClassRepr.getclsfield` emits the concrete
+                    // vtable field read, then `FunctionReprBase.call` feeds
+                    // that pointer to `indirect_call`.  `resolve_operand`
+                    // already lowers this exact MIR Field projection, so keep
+                    // it instead of replacing it with a blackhole-only
+                    // name-based lookup that has no upstream counterpart.
+                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    OpKind::IndirectCall {
+                        funcptr,
                         args,
+                        graphs: None,
+                        family_key: Some((trait_root, method_name)),
                         result_ty,
                     }
                 } else if let Some(family) = fn_ptr_family {
@@ -10695,6 +10706,7 @@ impl<'a> Lowering<'a> {
                         funcptr,
                         args,
                         graphs,
+                        family_key: None,
                         result_ty,
                     }
                 } else {
@@ -20385,6 +20397,16 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             }
         }
     }
+    // RPython `history.getkind` classifies `Ptr(FuncType)` through the raw
+    // pointer arm, hence as `int`.  Charon's equivalent is a top-level
+    // `FnPtr`: it is the machine address that `FunctionReprBase.call` feeds
+    // to `indirect_call`, not a GC reference.  Keeping it in the Ref bank
+    // makes `jtransform.handle_regular_indirect_call` spell the otherwise
+    // impossible `int_guard_value/r` and gives every following residual call
+    // a Ref funcptr operand (`residual_call_*/r...`).
+    if type_node_is_fn_ptr(value, llbc) {
+        return ValueType::Int;
+    }
     // A densely numbered fieldless enum gives `Option<E>` a scalar niche
     // representation.  The whole Option therefore lives in the Int bank;
     // it is not an aggregate reference.
@@ -27253,7 +27275,7 @@ mod tests {
         cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
         decode_literal, fn_ptr_family_for, json_ty_is_thin_pointer_element,
         json_ty_scalar_element_spelling, push_ptr_to_unsigned_cast, shaped_array_parts,
-        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
+        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr, tyref_to_value_type,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -27380,6 +27402,35 @@ mod tests {
                  fnptr_indirect={fnptr_indirect}"
             );
         }
+    }
+
+    #[test]
+    fn function_pointer_uses_the_raw_pointer_int_bank() {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [], "fun_decls": [], "global_decls": [],
+                "trait_decls": [], "trait_impls": [],
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let ty = TyRef::Other(serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [],
+                    "output": { "Literal": { "Int": "I64" } },
+                    "is_unsafe": false
+                }
+            }
+        }));
+
+        assert_eq!(
+            tyref_to_value_type(&ty, &llbc),
+            ValueType::Int,
+            "RPython history.getkind(Ptr(FuncType)) uses the int bank"
+        );
     }
 
     #[test]
@@ -33753,6 +33804,97 @@ mod tests {
             matches!(returned, LinkArg::Value(value) if value == input),
             "the adapter must return its input GCREF unchanged; graph: {graph:#?}"
         );
+    }
+
+    /// The Rust trait-object spelling of PyPy's
+    /// `W_DictMultiObject.getitem` / `getitem_str` strategy dispatch must
+    /// retain both halves RPython's PBC call carries: the concrete vtable
+    /// field read and the closed `DictStrategy` implementation family.
+    /// This uses the real extracted owner because a hand-written fixture can
+    /// accidentally make the trait leaf and vtable field shape agree.
+    #[test]
+    #[ignore]
+    fn dict_strategy_vtable_call_keeps_its_family_identity() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+        for (function, method) in [
+            ("w_dict_lookup", "getitem"),
+            ("w_dict_getitem_str_hashed", "getitem_str_hashed"),
+        ] {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|error| panic!("lower {function}: {error}"));
+            let calls: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter_map(|op| match &op.kind {
+                    OpKind::IndirectCall {
+                        funcptr,
+                        family_key: Some(family_key),
+                        ..
+                    } => Some((funcptr.clone(), family_key.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                calls.len(),
+                1,
+                "{function} must carry one DictStrategy vtable call: {calls:?}"
+            );
+            assert_eq!(
+                calls[0].1,
+                ("DictStrategy".to_string(), method.to_string()),
+                "{function}'s MIR vtable slot must name the same PBC family as the trait impls"
+            );
+            let funcptr = &calls[0].0;
+            let producers: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter(|op| op.result.as_ref() == Some(funcptr))
+                .collect();
+            assert_eq!(
+                producers.len(),
+                1,
+                "{function}'s indirect funcptr must have one concrete producer"
+            );
+            assert!(
+                matches!(
+                    &producers[0].kind,
+                    OpKind::FieldRead { field, ty: ValueType::Int, .. }
+                        if field.name == format!("method_{method}")
+                ),
+                "{function}'s vtable method pointer must be a raw-pointer/int FieldRead: {:?}",
+                producers[0].kind
+            );
+        }
+
+        let program = super::build_semantic_program_from_llbc(&llbc)
+            .expect("build semantic pyre-object program");
+        for method in ["getitem", "getitem_str_hashed"] {
+            let members: Vec<_> = program
+                .functions
+                .iter()
+                .filter(|function| {
+                    function.name == method
+                        && function.trait_root.as_deref() == Some("DictStrategy")
+                })
+                .map(|function| (function.self_ty_root.clone(), function.return_type.clone()))
+                .collect();
+            assert!(
+                members.iter().any(|(owner, _)| owner.is_some()),
+                "DictStrategy.{method} must retain concrete impl owners: {members:?}"
+            );
+            assert!(
+                members
+                    .iter()
+                    .all(|(_, result)| result.as_deref() == Some("ref")),
+                "every DictStrategy.{method} PBC member must carry FuncType.RESULT: {members:?}"
+            );
+        }
     }
 
     /// The Sized gate: a shared reference to a fat pointee (`&[T]`, spelled

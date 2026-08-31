@@ -1058,6 +1058,12 @@ pub enum OpKind {
         funcptr: crate::flowspace::model::Variable,
         args: Vec<crate::flowspace::model::Variable>,
         graphs: Option<Vec<crate::parse::CallPath>>,
+        /// Pre-rtyping identity of a Rust dyn-trait vtable slot.  The MIR
+        /// frontend preserves the actual `Field[Adt(vtable), slot]` as
+        /// `funcptr`; `rpbc::lower_indirect_calls` consumes this key to fill
+        /// the same `c_graphs` family as `FunctionReprBase.call`, then clears
+        /// it.  Ordinary stored function pointers have no such key.
+        family_key: Option<(String, String)>,
         result_ty: ValueType,
     },
     /// Virtualizable field read → reads from boxes, no heap op.

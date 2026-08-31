@@ -1343,6 +1343,7 @@ mod tests {
                 funcptr: crate::flowspace::model::Variable::new(),
                 args: vec![],
                 graphs: None,
+                family_key: None,
                 result_ty: crate::model::ValueType::Int,
             },
         };

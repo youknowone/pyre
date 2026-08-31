@@ -2687,8 +2687,10 @@ impl BlackholeInterpBuilder {
 )]
 fn handle_jitexception_dispatch(
     exc: JitException,
-    portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
-) -> Result<(BhReturnType, i64), JitException> {
+    portal_runner: Option<
+        &dyn Fn(&JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>,
+    >,
+) -> Result<(BhReturnType, i64), PortalRunnerFailure> {
     match exc {
         // warmspot.py:986-987
         JitException::DoneWithThisFrameVoid => Ok((BhReturnType::Void, 0)),
@@ -2701,9 +2703,11 @@ fn handle_jitexception_dispatch(
             Ok((BhReturnType::Float, result.to_bits() as i64))
         }
         // warmspot.py:998-1005
-        JitException::ExitFrameWithExceptionRef(_) => Err(exc),
+        JitException::ExitFrameWithExceptionRef(_) => Err(PortalRunnerFailure::jit(exc)),
         // Not a result: a portal level has nothing to install for it.
-        JitException::BailToInterpreter => Err(exc),
+        JitException::BailToInterpreter => unreachable!(
+            "a recursive portal bail must cross the callback boundary with its terminal image"
+        ),
         // warmspot.py:970-983
         JitException::ContinueRunningNormally(_) => {
             // warmspot.py:976-978: result = portal_ptr(*args)
@@ -2734,8 +2738,10 @@ fn handle_jitexception_dispatch(
 fn handle_jitexception_in_portal(
     bhcaller: &mut BlackholeInterpreter,
     exc: JitException,
-    portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
-) -> Result<(), JitException> {
+    portal_runner: Option<
+        &dyn Fn(&JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>,
+    >,
+) -> Result<(), PortalRunnerFailure> {
     // warmspot.py handle_jitexception: while True loop.
     // ContinueRunningNormally → portal_runner → may raise JitException → loop.
     let mut current_exc = exc;
@@ -2751,9 +2757,14 @@ fn handle_jitexception_in_portal(
                 }
                 return Ok(());
             }
-            Err(exc @ JitException::ExitFrameWithExceptionRef(_)) => {
+            Err(
+                failure @ PortalRunnerFailure {
+                    exception: JitException::ExitFrameWithExceptionRef(_),
+                    ..
+                },
+            ) => {
                 // warmspot.py:998-1005: raise as regular exception
-                return Err(exc);
+                return Err(failure);
             }
             // A `portal_runner` that re-entered the portal and hit an
             // `abort_permanent` marker or an unresolved callee reports the bail
@@ -2761,12 +2772,24 @@ fn handle_jitexception_in_portal(
             // same reason this arm refuses to redispatch it: dispatching a bail
             // neither invokes the runner nor changes the exception, so looping
             // back would spin on the same value forever.
-            Err(exc @ JitException::BailToInterpreter) => {
-                return Err(exc);
+            Err(
+                failure @ PortalRunnerFailure {
+                    exception: JitException::BailToInterpreter,
+                    ..
+                },
+            ) => {
+                return Err(failure);
             }
-            Err(next_exc) => {
+            Err(PortalRunnerFailure {
+                exception: next_exc,
+                terminal,
+            }) => {
                 // warmspot.py:967-968, 979-980: JitException from portal_runner
                 // or EnterJitAssembler → loop back in handle_jitexception
+                assert!(
+                    terminal.is_none(),
+                    "only BailToInterpreter may carry a terminal blackhole image"
+                );
                 current_exc = next_exc;
                 continue;
             }
@@ -2790,6 +2813,36 @@ pub struct BlackholeTerminalImage {
     pub registers_f: Vec<i64>,
     pub position: usize,
     pub last_opcode_position: usize,
+}
+
+/// Result that escaped a recursive portal runner.
+///
+/// PyPy propagates the live RPython blackhole object with the raised
+/// `JitException`.  Pyre releases that object before crossing the Rust callback
+/// boundary, so a pyre-only interpreter bail must carry the equivalent bank
+/// image explicitly.  Real JitExceptions need no image because the enclosing
+/// blackhole chain consumes them exactly as `_handle_jitexception_in_portal`
+/// does upstream.
+pub struct PortalRunnerFailure {
+    exception: JitException,
+    terminal: Option<BlackholeTerminalImage>,
+}
+
+impl PortalRunnerFailure {
+    pub fn jit(exception: JitException) -> Self {
+        assert!(!matches!(exception, JitException::BailToInterpreter));
+        Self {
+            exception,
+            terminal: None,
+        }
+    }
+
+    pub fn bail(terminal: BlackholeTerminalImage) -> Self {
+        Self {
+            exception: JitException::BailToInterpreter,
+            terminal: Some(terminal),
+        }
+    }
 }
 
 impl BlackholeTerminalImage {
@@ -2819,7 +2872,9 @@ fn handle_jitexception(
     builder: &mut BlackholeInterpBuilder,
     mut bh: Box<BlackholeInterpreter>,
     exc: JitException,
-    portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
+    portal_runner: Option<
+        &dyn Fn(&JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>,
+    >,
     on_leave_level: Option<&dyn Fn(i64)>,
     terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> Result<(Box<BlackholeInterpreter>, i64), JitException> {
@@ -2883,34 +2938,34 @@ fn handle_jitexception(
     let portal_outcome = handle_jitexception_in_portal(caller, exc, portal_runner);
     let current_exc = match portal_outcome {
         Ok(()) => 0,
-        Err(JitException::ExitFrameWithExceptionRef(exc_ref)) => exc_ref.0 as i64,
-        // The bail leaves by the same exit the pre-walk refusal above takes:
-        // no level absorbs it, so the chain is released and it propagates to
-        // `_run_forever`'s caller.
-        //
-        // Unlike that exit, this one publishes no terminal image, and `bh` is
-        // not the image to publish: it is the portal level whose callee chain
-        // stopped, so its stamp names its own CALL rather than where the chain
-        // got to.  The image that would answer belongs to the re-entered
-        // portal, and no channel carries it back -- `portal_runner` returns a
-        // result or a `JitException`, nothing else.
-        //
-        // Reaching this arm at all takes a `portal_runner`, because the only
-        // two ways `handle_jitexception_dispatch` answers with a bail are an
-        // `exc` that already was one -- refused ahead of the walk above -- and
-        // a runner that reported one for a `ContinueRunningNormally`.  Every
-        // caller that runs a program passes `None` there (`run_forever` and
-        // `convert_and_run_from_pyjitpl` both do), so today only this module's
-        // own tests supply one, and they read no terminal image.  Wiring a
-        // real runner is what makes the missing image a resume that repeats
-        // the callee's effects; `trace.rs` already logs that shape as `bail
-        // terminal is not the root frame`.
-        Err(exc @ JitException::BailToInterpreter) => {
+        Err(PortalRunnerFailure {
+            exception: JitException::ExitFrameWithExceptionRef(exc_ref),
+            ..
+        }) => exc_ref.0 as i64,
+        // A recursive runner's bail belongs to the re-entered portal, not to
+        // `bh` (the outer portal level whose CALL is waiting for a result).
+        // PyPy still owns that inner blackhole object while the exception
+        // unwinds; pyre's callback therefore returns its moved bank image and
+        // this level publishes it before releasing the outer chain.  Using
+        // `bh` here would resume at the CALL and replay the inner effects.
+        Err(PortalRunnerFailure {
+            exception: exc @ JitException::BailToInterpreter,
+            terminal: Some(terminal),
+        }) => {
+            if let Some(terminal_out) = terminal_out {
+                *terminal_out = Some(terminal);
+            }
             builder.release_chain(Some(bh));
             return Err(exc);
         }
+        Err(PortalRunnerFailure {
+            exception: JitException::BailToInterpreter,
+            terminal: None,
+        }) => unreachable!("recursive portal runner returned a bail without its terminal image"),
         // `handle_jitexception_in_portal` returns only those two.
-        Err(other) => unreachable!("portal level reported {other:?}"),
+        Err(PortalRunnerFailure {
+            exception: other, ..
+        }) => unreachable!("portal level reported {other:?}"),
     };
     // blackhole.py:1780: return blackholeinterp, lle
     Ok((bh, current_exc))
@@ -2950,7 +3005,9 @@ pub fn run_forever_with_portal(
     builder: &mut BlackholeInterpBuilder,
     mut bh: Box<BlackholeInterpreter>,
     mut current_exc: i64,
-    portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
+    portal_runner: Option<
+        &dyn Fn(&JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>,
+    >,
     on_enter_level: Option<&dyn Fn(i64)>,
     on_leave_level: Option<&dyn Fn(i64)>,
     mut terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
@@ -4177,6 +4234,38 @@ mod tests {
             assert!(bh2.registers_i.is_empty());
         }
 
+        /// `BlackholeInterpreter._get_method` stores the post-op position and
+        /// re-raises every exception from a `bhimpl_*`.  The translated
+        /// `do_malloc_*_clear` helpers use that edge for `MemoryError`; NULL
+        /// must never be installed as an ordinary reference result.
+        #[test]
+        fn allocation_failure_raises_memory_error_at_the_post_op_position() {
+            const MEMORY_ERROR: i64 = 0x5eed_0001;
+            fn memory_error() -> i64 {
+                MEMORY_ERROR
+            }
+            majit_backend::register_memory_error_provider(memory_error);
+
+            let err = super::blackhole_allocation_error(37);
+            assert!(matches!(
+                err,
+                super::DispatchError::RaiseException {
+                    exc: MEMORY_ERROR,
+                    resume_position: 37,
+                }
+            ));
+        }
+
+        #[test]
+        fn obsolete_vtable_method_opcode_bails_instead_of_panicking() {
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut bh = builder.acquire_interp();
+            let err = super::handler_vtable_method_ptr_bail(&mut bh, &[], 0)
+                .expect_err("unsupported named vtable lookup must leave blackhole");
+            assert!(matches!(err, super::DispatchError::LeaveFrame));
+            assert!(bh.aborted);
+        }
+
         /// A pooled interp must not carry the previous run's frame identity.
         ///
         /// `acquire_interp` refreshes only the six builder-shared fields
@@ -4675,6 +4764,72 @@ mod tests {
                 ),
                 "the caller must return the portal runner's result, got {outcome:?}",
             );
+        }
+
+        /// PyPy keeps the re-entered blackhole object live while
+        /// `_handle_jitexception_in_portal` propagates.  Pyre crosses a Rust
+        /// callback after releasing it, so the callback must return the
+        /// terminal banks with a pyre-only interpreter bail.  Publishing the
+        /// recursive portal frame instead would resume at its CALL and replay
+        /// the callee's already-performed effects.
+        #[test]
+        fn recursive_portal_bail_preserves_the_reentered_terminal_image() {
+            let mut sub = JitCodeBuilder::default();
+            sub.jit_merge_point(0, &[], &[], &[], &[], &[], &[]);
+            let sub_jitcode = sub.finish();
+
+            let mut inner_b = JitCodeBuilder::default();
+            let sub_idx = inner_b.add_sub_jitcode(sub_jitcode);
+            inner_b.inline_call_ir_v(sub_idx, &[], &[], None);
+            let inner_jitcode = inner_b.finish();
+            inner_jitcode.set_jitdriver_sd(0);
+
+            let mut caller_b = JitCodeBuilder::default();
+            caller_b.void_return();
+            let caller_jitcode = caller_b.finish();
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut caller = builder.acquire_interp();
+            caller.setposition(std::sync::Arc::new(caller_jitcode), 0);
+            let mut inner = builder.acquire_interp();
+            inner.setposition(std::sync::Arc::new(inner_jitcode), 0);
+            inner.nextblackholeinterp = Some(caller);
+
+            const TERMINAL_JITCODE: usize = 73;
+            const TERMINAL_POSITION: usize = 19;
+            let portal_runner = |_exc: &crate::jitexc::JitException| {
+                Err(super::PortalRunnerFailure::bail(
+                    super::BlackholeTerminalImage {
+                        jitcode_index: TERMINAL_JITCODE,
+                        registers_i: vec![111],
+                        registers_r: vec![222],
+                        registers_f: vec![333],
+                        position: TERMINAL_POSITION,
+                        last_opcode_position: 17,
+                    },
+                ))
+            };
+            let mut terminal = None;
+            let outcome = super::run_forever_with_portal(
+                &mut builder,
+                inner,
+                0,
+                Some(&portal_runner),
+                None,
+                None,
+                Some(&mut terminal),
+            );
+
+            assert!(matches!(
+                outcome,
+                crate::jitexc::JitException::BailToInterpreter
+            ));
+            let terminal = terminal.expect("recursive portal bail lost its terminal frame");
+            assert_eq!(terminal.jitcode_index, TERMINAL_JITCODE);
+            assert_eq!(terminal.position, TERMINAL_POSITION);
+            assert_eq!(terminal.registers_i, vec![111]);
+            assert_eq!(terminal.registers_r, vec![222]);
+            assert_eq!(terminal.registers_f, vec![333]);
         }
 
         /// `blackhole.py:1759` is the single position a returning level leaves
@@ -8016,8 +8171,9 @@ fn handler_new(
 ) -> Result<usize, DispatchError> {
     // @arguments("cpu", "d", returns="r")
     let (descr, pos) = read_descr(bh, code, position);
-    let cpu = bh.cpu();
-    bh.registers_r[code[pos] as usize] = cpu.bh_new(descr);
+    let result = bh.cpu().bh_new(descr);
+    check_blackhole_allocation_after(bh, result, pos + 1)?;
+    bh.registers_r[code[pos] as usize] = result;
     Ok(pos + 1)
 }
 fn handler_new_with_vtable(
@@ -8026,8 +8182,9 @@ fn handler_new_with_vtable(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let (descr, pos) = read_descr(bh, code, position);
-    let cpu = bh.cpu();
-    bh.registers_r[code[pos] as usize] = cpu.bh_new_with_vtable(descr);
+    let result = bh.cpu().bh_new_with_vtable(descr);
+    check_blackhole_allocation_after(bh, result, pos + 1)?;
+    bh.registers_r[code[pos] as usize] = result;
     Ok(pos + 1)
 }
 fn handler_new_array(
@@ -8038,8 +8195,9 @@ fn handler_new_array(
     // @arguments("cpu", "i", "d", returns="r")
     let length = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    bh.registers_r[code[pos] as usize] = cpu.bh_new_array(length, descr);
+    let result = bh.cpu().bh_new_array(length, descr);
+    check_blackhole_allocation_after(bh, result, pos + 1)?;
+    bh.registers_r[code[pos] as usize] = result;
     Ok(pos + 1)
 }
 fn handler_new_array_clear(
@@ -8049,8 +8207,9 @@ fn handler_new_array_clear(
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    bh.registers_r[code[pos] as usize] = cpu.bh_new_array_clear(length, descr);
+    let result = bh.cpu().bh_new_array_clear(length, descr);
+    check_blackhole_allocation_after(bh, result, pos + 1)?;
+    bh.registers_r[code[pos] as usize] = result;
     Ok(pos + 1)
 }
 
@@ -8063,8 +8222,9 @@ fn handler_new_array_clear_c(
 ) -> Result<usize, DispatchError> {
     let length = code[position] as i8 as i64;
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu();
-    bh.registers_r[code[pos] as usize] = cpu.bh_new_array_clear(length, descr);
+    let result = bh.cpu().bh_new_array_clear(length, descr);
+    check_blackhole_allocation_after(bh, result, pos + 1)?;
+    bh.registers_r[code[pos] as usize] = result;
     Ok(pos + 1)
 }
 
@@ -8108,8 +8268,9 @@ fn handler_newstr(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[position] as usize];
-    let cpu = bh.cpu();
-    bh.registers_r[code[position + 1] as usize] = cpu.bh_newstr(length);
+    let result = bh.cpu().bh_newstr(length);
+    check_blackhole_allocation_after(bh, result, position + 2)?;
+    bh.registers_r[code[position + 1] as usize] = result;
     Ok(position + 2)
 }
 fn handler_unicodelen(
@@ -8151,8 +8312,9 @@ fn handler_newunicode(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[position] as usize];
-    let cpu = bh.cpu();
-    bh.registers_r[code[position + 1] as usize] = cpu.bh_newunicode(length);
+    let result = bh.cpu().bh_newunicode(length);
+    check_blackhole_allocation_after(bh, result, position + 2)?;
+    bh.registers_r[code[position + 1] as usize] = result;
     Ok(position + 2)
 }
 
@@ -8282,6 +8444,43 @@ fn check_residual_call_exception_after(
         exc: exc_val,
         resume_position: next_pos,
     })
+}
+
+/// The allocation-specialized edge of blackhole.py `_get_method`.
+///
+/// `GcLLDescr_framework._bh_malloc` / `_bh_malloc_array` call the translated
+/// `do_malloc_*_clear` helpers, which raise `MemoryError` instead of returning
+/// a null GC reference.  Rust backend helpers use NULL as that unwinding edge,
+/// so convert it before a handler writes its result register.  In particular,
+/// NULL is never an ordinary `r` result that the following opcode may consume.
+#[inline]
+fn check_blackhole_allocation_after(
+    bh: &BlackholeInterpreter,
+    result: i64,
+    next_pos: usize,
+) -> Result<(), DispatchError> {
+    if result != 0 {
+        return Ok(());
+    }
+    // String helpers also populate the compiled-code exception cell.  The
+    // blackhole delivers the same singleton through DispatchError, so consume
+    // the backend copy now; otherwise an unrelated later compiled call sees a
+    // stale MemoryError.
+    bh.cpu().clear_stored_exception();
+    Err(blackhole_allocation_error(next_pos))
+}
+
+#[inline]
+fn blackhole_allocation_error(next_pos: usize) -> DispatchError {
+    let exc = majit_backend::memory_error_singleton_ref();
+    assert!(
+        exc != 0,
+        "blackhole allocation failed before the MemoryError provider was installed"
+    );
+    DispatchError::RaiseException {
+        exc,
+        resume_position: next_pos,
+    }
 }
 
 /// Refuse to jump to a `residual_call_*` funcptr that is either null or a
@@ -8992,16 +9191,10 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "abort_permanent/".to_string(),
         majit_translate::insns::BC_ABORT_PERMANENT,
     );
-    // `vtable_method_ptr/rd>i` — the dyn-trait method-pointer reification.
-    // Routing `dyn Trait` calls through `CallTarget::Indirect` is the
-    // default, so the codewriter now emits this byte into real jitcodes and
-    // this builder's dispatch table has to span it: `setup_insns(asm.insns)`
-    // (`blackhole.py:58-59`) resolves every opname the assembler emitted, and
-    // a byte outside the curated set reaches the unwired-opcode placeholder
-    // instead of the handler.  The handler it binds is deliberately
-    // `handler_vtable_method_ptr_unimplemented` — no layer executes this op
-    // yet, so the point of the entry is that a resume landing here says which
-    // op is missing rather than reporting an unwired byte.
+    // The canonical MIR dyn-call path is now a concrete vtable FieldRead plus
+    // IndirectCall (`ClassRepr.getclsfield` / `FunctionReprBase.call`).  Keep
+    // the old pyre-only byte registered for frozen/abstract-trait fallback
+    // jitcodes; its handler safely bails to the source interpreter.
     insns.insert(
         "vtable_method_ptr/rd>i".to_string(),
         majit_translate::insns::BC_VTABLE_METHOD_PTR,
@@ -9863,15 +10056,8 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         "record_quasiimmut_field/rdd",
         handler_record_quasiimmut_field,
     );
-    // TODO op for Rust fat-pointer dispatch — see
-    // `majit/majit-translate/src/model.rs OpKind::VtableMethodPtr`.
-    // No runtime consumer ships yet; the handler panics on dispatch so a
-    // future regression that triggers this path in pyre fails loudly
-    // instead of silently miscompiling.
-    builder.wire_handler(
-        "vtable_method_ptr/rd>i",
-        handler_vtable_method_ptr_unimplemented,
-    );
+    // Compatibility fallback for the obsolete name-based vtable opcode.
+    builder.wire_handler("vtable_method_ptr/rd>i", handler_vtable_method_ptr_bail);
     builder.wire_handler(
         "jit_force_quasi_immutable/rd",
         handler_jit_force_quasi_immutable,
@@ -10171,26 +10357,20 @@ fn handler_guard_class(
     bh.registers_i[code[p + 1] as usize] = typeptr;
     Ok(p + 2)
 }
-/// `vtable_method_ptr` reaches the blackhole only when a `dyn Trait`
-/// indirect call survives unfrozen into a metainterp resume.
+/// Safe fallback for the obsolete pyre-only named vtable lookup.
 ///
-/// The codewriter does emit the op + descriptor (TODO of
-/// `rpython/rtyper/rclass.py getclsfield()`) now that indirect
-/// routing is the default, but no layer consumes it: there is no backend
-/// lowering (`codewriter/assembler.rs`, "backend lowering of the actual
-/// vtable slot read is not yet implemented"), the walker answers
-/// `DispatchError::UnsupportedOpname`, and `PyreVtableMethodDescr` carries
-/// the `(trait_root, method_name)` pair as strings with nothing that
-/// resolves them to an address.  The walker's abort is what keeps this
-/// unreachable in practice — a trace meeting the op never compiles, so no
-/// resume can land past it.  Panic intentionally so that if one ever does,
-/// it is loud rather than a silent miscompile.
-fn handler_vtable_method_ptr_unimplemented(
-    _bh: &mut BlackholeInterpreter,
+/// PyPy's `ClassRepr.getclsfield` emits an ordinary field read; it never tries
+/// to resolve `(trait, method)` strings in the blackhole.  If an old frozen
+/// graph or the still-conservative abstract-trait path reaches this opcode, no
+/// faithful pointer can be manufactured from its descriptor.  Hand execution
+/// back to the source interpreter like the other unsupported-op markers.
+fn handler_vtable_method_ptr_bail(
+    bh: &mut BlackholeInterpreter,
     _code: &[u8],
     _p: usize,
 ) -> Result<usize, DispatchError> {
-    unimplemented!("vtable_method_ptr blackhole consumer (backend epic)");
+    bh.aborted = true;
+    Err(DispatchError::LeaveFrame)
 }
 
 fn handler_record_quasiimmut_field(
@@ -11278,19 +11458,21 @@ fn handler_newlist(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu();
     // blackhole.py:1163: result = cpu.bh_new(structdescr)
-    let result = cpu.bh_new(structdescr);
+    let result = bh.cpu().bh_new(structdescr);
+    check_blackhole_allocation_after(bh, result, p + 1)?;
     // blackhole.py:1164: cpu.bh_setfield_gc_i(result, length, lengthdescr)
-    cpu.bh_setfield_gc_i(result, length, lengthdescr);
+    bh.cpu().bh_setfield_gc_i(result, length, lengthdescr);
     // blackhole.py:1165-1169: bh_new_array_clear when is_array_of_structs or is_array_of_pointers
     let items = if arraydescr.is_array_of_structs() || arraydescr.is_array_of_pointers() {
-        cpu.bh_new_array_clear(length, arraydescr)
+        bh.cpu().bh_new_array_clear(length, arraydescr)
     } else {
-        cpu.bh_new_array(length, arraydescr)
+        bh.cpu().bh_new_array(length, arraydescr)
     };
+    check_blackhole_allocation_after(bh, items, p + 1)?;
     // blackhole.py:1170: cpu.bh_setfield_gc_r(result, items, itemsdescr)
-    cpu.bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
+    bh.cpu()
+        .bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
@@ -11305,12 +11487,14 @@ fn handler_newlist_clear(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu();
-    let result = cpu.bh_new(structdescr);
-    cpu.bh_setfield_gc_i(result, length, lengthdescr);
+    let result = bh.cpu().bh_new(structdescr);
+    check_blackhole_allocation_after(bh, result, p + 1)?;
+    bh.cpu().bh_setfield_gc_i(result, length, lengthdescr);
     // blackhole.py:1178: items = cpu.bh_new_array_clear(length, arraydescr)
-    let items = cpu.bh_new_array_clear(length, arraydescr);
-    cpu.bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
+    let items = bh.cpu().bh_new_array_clear(length, arraydescr);
+    check_blackhole_allocation_after(bh, items, p + 1)?;
+    bh.cpu()
+        .bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
@@ -11325,17 +11509,19 @@ fn handler_newlist_hint(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu();
-    let result = cpu.bh_new(structdescr);
+    let result = bh.cpu().bh_new(structdescr);
+    check_blackhole_allocation_after(bh, result, p + 1)?;
     // blackhole.py:1186: cpu.bh_setfield_gc_i(result, 0, lengthdescr)
-    cpu.bh_setfield_gc_i(result, 0, lengthdescr);
+    bh.cpu().bh_setfield_gc_i(result, 0, lengthdescr);
     // blackhole.py:1187-1191: bh_new_array_clear when is_array_of_structs or is_array_of_pointers
     let items = if arraydescr.is_array_of_structs() || arraydescr.is_array_of_pointers() {
-        cpu.bh_new_array_clear(lengthhint, arraydescr)
+        bh.cpu().bh_new_array_clear(lengthhint, arraydescr)
     } else {
-        cpu.bh_new_array(lengthhint, arraydescr)
+        bh.cpu().bh_new_array(lengthhint, arraydescr)
     };
-    cpu.bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
+    check_blackhole_allocation_after(bh, items, p + 1)?;
+    bh.cpu()
+        .bh_setfield_gc_r(result, majit_ir::GcRef(items as usize), itemsdescr);
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }

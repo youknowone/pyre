@@ -8550,7 +8550,17 @@ impl GcAllocator for MiniMarkGC {
         let Some(total_size) = GcHeader::SIZE.checked_add(size) else {
             return GcRef(0);
         };
-        self.alloc_in_oldgen_clear(type_id, total_size)
+        // `GcLLDescr_framework._bh_malloc` reaches translated
+        // `do_malloc_fixedsize_clear`, whose rawmalloc failure is returned to
+        // the exception transformer as NULL and becomes `MemoryError`.
+        // Blackhole host calls need the same fallible edge; the infallible
+        // `oldgen.alloc()` path aborts the process before `_get_method` can
+        // deliver that exception.
+        let Some(obj) = self.try_alloc_in_oldgen(type_id, total_size) else {
+            return GcRef(0);
+        };
+        Self::raw_memclear(obj, total_size);
+        obj
     }
 
     fn collection_counts(&self) -> (usize, usize) {

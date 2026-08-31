@@ -1493,6 +1493,16 @@ fn analyze_pipeline_from_module_paths(
         }
     }
     prof.mark("  register concrete trait-impl identities");
+    // `rpbc.py FunctionReprBase.call`: the `c_graphs` constant is the full
+    // `row_of_graphs.values()` PBC family, including concrete overrides of a
+    // required trait method.  Concrete impl graphs stay on the
+    // receiver-driven inherent-method registration path below (so
+    // name-based method lookup is unchanged), but their graph identities
+    // must also populate the independent indirect-call family row.
+    for (trait_leaf, _, method_name, owner, _, _, _) in &concrete_trait_methods {
+        call_control.register_trait_family_member(method_name, trait_leaf, owner);
+    }
+    prof.mark("  register concrete indirect-call families");
     // Re-register free functions with their RPython-equivalent hints
     // (`elidable`, `loop_invariant`, `unroll_safe`, `jit_look_inside`)
     // so `JitPolicy::look_inside_graph` sees the same metadata RPython
