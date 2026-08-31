@@ -10618,7 +10618,7 @@ impl<'a> Lowering<'a> {
                         abstract_trait_call_target(&reg, self.llbc)
                     {
                         CallTarget::indirect(trait_root, method_name)
-                    } else if let Some(path) = transparent_inherent_method_path(&reg, self.llbc) {
+                    } else if let Some(path) = scalar_inherent_method_path(&reg, self.llbc) {
                         CallTarget::FunctionPath { segments: path }
                     } else if args.len() == 1
                         && let Some(marker) = promote_marker
@@ -23567,13 +23567,21 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
     trait_method_owner(declaration)
 }
 
-/// Return the static graph path for an inherent method on a transparent type.
+/// Return the static graph path for an inherent method on a scalar type.
 ///
 /// Its receiver is a scalar in the low-level model, so routing through
 /// `CallTarget::Method` would perform an attribute lookup on an integer. The
 /// Rust call is statically resolved already; use the registered impl graph
 /// directly and keep the scalar receiver as its first argument.
-fn transparent_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<String>> {
+///
+/// This covers both `#[repr(transparent)]` wrappers and payload-free enums.
+/// The latter are represented by their integer discriminant in the translated
+/// graph.  PyPy's corresponding buffer requests are integer `BUF_*` flags
+/// (`pypy/interpreter/baseobjspace.py:1650-1683`); Rust packages the same
+/// decisions as inherent helpers on a scalar tag.  Those helpers remain
+/// ordinary statically selected functions, not Python method lookups on the
+/// integer.
+fn scalar_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<String>> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
@@ -23582,7 +23590,12 @@ fn transparent_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Ve
     let receiver = declaration.signature.inputs.first()?;
     let node = strip_ty_wrappers(tyref_node(receiver, llbc)?, llbc)?;
     let owner_id = adt_node_def_id(node)?;
-    if !llbc.type_by_id(owner_id)?.is_repr_transparent() {
+    let owner_decl = llbc.type_by_id(owner_id)?;
+    let is_payload_free_enum = matches!(
+        &owner_decl.kind,
+        TypeDeclKind::Enum(variants) if variants.iter().all(|variant| variant.fields.is_empty())
+    );
+    if !owner_decl.is_repr_transparent() && !is_payload_free_enum {
         return None;
     }
     let mut path = crate::model::split_qualified_path(&owner);
@@ -35115,6 +35128,60 @@ mod tests {
             }),
             "dstrategy assignment must retain the declared DictStrategyRef class"
         );
+    }
+
+    /// `BufferRequest` is a payload-free enum and therefore travels through
+    /// the translated graph as its integer discriminant.  Its inherent
+    /// methods remain statically selected Rust functions; lowering them as
+    /// Python bound-method lookups would ask `SomeInteger` for
+    /// `require_contiguous` / `flags` and block annotation.
+    #[test]
+    #[ignore]
+    fn buffer_request_scalar_methods_keep_direct_graph_paths() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::baseobjspace::buffer_bytes")
+            .expect("lower buffer_bytes");
+
+        for method in ["require_contiguous", "flags"] {
+            assert!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments.last().map(String::as_str) == Some(method)
+                                && segments.iter().any(|part| part == "BufferRequest")
+                        )
+                    }),
+                "BufferRequest::{method} must be a direct static call"
+            );
+            assert!(
+                !graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::Method { name, .. },
+                                ..
+                            } if name == method
+                        )
+                    }),
+                "BufferRequest::{method} must not become an integer getattr"
+            );
+        }
     }
 
     /// `mini_buffer_params` constructs `Option<(*mut u8, usize)>`.  The Rust
