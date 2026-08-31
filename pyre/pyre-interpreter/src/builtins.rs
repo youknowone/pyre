@@ -19720,7 +19720,14 @@ fn eintr_retry(e: std::io::Error) -> Result<(), crate::PyError> {
 /// already readable.
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 fn fd_read(fd: i32, n: usize) -> Result<Option<Vec<u8>>, crate::PyError> {
-    let mut out = vec![0u8; n];
+    // `n` is the Python-level `read(size)` argument, so `read(sys.maxsize)`
+    // reaches here as a request the allocator cannot meet.  `os.read` sizes
+    // its buffer through `rffi.scoped_alloc_buffer`, which raises
+    // `MemoryError`; an infallible `vec![0; n]` would abort the process.
+    let mut out = Vec::new();
+    out.try_reserve_exact(n)
+        .map_err(|_| crate::PyError::memory_error("out of memory"))?;
+    out.resize(n, 0);
     loop {
         let got = match fd_read_into(fd, &mut out) {
             Ok(got) => got,
