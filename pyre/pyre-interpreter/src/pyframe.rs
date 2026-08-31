@@ -544,7 +544,10 @@ pub mod frame_locals_proxy {
                     _ => pyre_object::w_not_implemented(),
                 });
             }
-            if unsafe { pyre_object::is_dict(other) } {
+            // The gate is `PyDict_Check`, which admits a subclass, so the
+            // materialized mapping is what answers the comparison; `is_dict`
+            // is the exact-layout test and would decline it.
+            if unsafe { crate::baseobjspace::isinstance_dict_w(other) } {
                 let roots = pyre_object::gc_roots::push_roots();
                 let other_slot = roots.base();
                 let _ = roots.pin_root(other);
@@ -889,18 +892,45 @@ pub mod frame_locals_proxy {
             }
         }
 
+        /// `framelocalsproxy_or` — build a fresh dict, fill it from the
+        /// proxy, then `PyDict_Update` it from the operand.  The gate admits
+        /// another proxy as well as a `dict`, and reading the operand through
+        /// `keys()` / `__getitem__` is what lets one in.  Delegating to
+        /// `dict.__or__` declined a proxy on the right, and because both
+        /// operands then share a type the reflected slot is never tried, so
+        /// `p | q` raised a `TypeError`.
         fn __or__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-            self.call_mapping_method("__or__", &[other])
+            if !unsafe { crate::baseobjspace::isinstance_dict_w(other) }
+                && viewed_frame(other).is_none()
+            {
+                return Ok(pyre_object::w_not_implemented());
+            }
+            let roots = pyre_object::gc_roots::push_roots();
+            let other_slot = roots.base();
+            let _ = roots.pin_root(other);
+            // `PyDict_New` then `PyDict_Update(result, self)`: the snapshot is
+            // already a fresh dict holding exactly the proxy's entries.
+            let result = self.mapping()?;
+            let result_slot = other_slot + 1;
+            let _ = roots.pin_root(result);
+            crate::opcode_ops::dict_update_value(
+                roots.get(result_slot),
+                roots.get(other_slot),
+            )?;
+            Ok(roots.get(result_slot))
         }
 
         /// `nb_or` serves both directions upstream, so `__ror__` is the
         /// `wrap_binaryfunc_r` wrapper over it and reaches
         /// `framelocalsproxy_or` with the operands swapped — the type check
-        /// then guards the PROXY while `PyDict_Update` runs against the other
-        /// operand, so `proxy.__ror__(3)` raises `AttributeError: 'int' object
-        /// has no attribute 'keys'`.  A distinct `__ror__` cannot reproduce
-        /// that and answers `NotImplemented`, which is what the operator form
-        /// `3 | proxy` reaches either way.  Deliberate.
+        /// then guards the PROXY, which always passes, while `PyDict_Update`
+        /// runs against the other operand.  Both `proxy.__ror__(3)` and the
+        /// operator form `3 | proxy` therefore raise `AttributeError: 'int'
+        /// object has no attribute 'keys'` there.  A distinct `__ror__`
+        /// answering `NotImplemented` reports `TypeError: unsupported operand
+        /// type(s)` for each instead; reproducing the `AttributeError` needs
+        /// the percolating `PyDict_Update`, where `dict_update_value` carries
+        /// `DICT_UPDATE`'s `ismapping_w` gate and rewrites it.
         fn __ror__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
             self.call_mapping_method("__ror__", &[other])
         }
@@ -914,9 +944,10 @@ pub mod frame_locals_proxy {
             // A merge that fails AFTER that type check propagates its real
             // exception here.  `framelocalsproxy_inplace_or` instead returns
             // `NotImplemented` with the exception still set, and the binary-op
-            // machinery reports that as `SystemError: <method 'keys' of
-            // 'FrameLocalsProxy' objects> returned a result with an exception
-            // set` — measured with a `dict` subclass whose `keys()` raises.
+            // machinery reports that as `SystemError: <slot wrapper
+            // '__ior__' of 'FrameLocalsProxy' objects> returned a result with
+            // an exception set` — measured with a `dict` subclass whose
+            // `keys()` raises.
             // Reporting the operand's own error is deliberate; do not
             // "restore" the SystemError.
             if !self.merge(other)? {
