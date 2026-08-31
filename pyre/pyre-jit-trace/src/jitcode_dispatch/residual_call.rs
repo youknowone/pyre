@@ -8693,6 +8693,28 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
+                // A bare `g = o.m` read, which `space.getattr` answers with a
+                // `Method` exactly as the fused method-call shape does.  That
+                // shape is left to the block below, where `load_method_attr`
+                // reaches the same receiver by pushing `[w_descr, w_obj]`
+                // without allocating at all; only a read with no
+                // `load_method_self` after it is answered here.
+                if !next_op_is_load_method_self_for_attr(code, op, ctx, dst)
+                    && spec_gate(SpecFold::LoadBoundMethodAttr, || {
+                        try_walker_specialize_load_bound_method_attr(
+                            ctx,
+                            op.pc,
+                            obj_opref,
+                            w_code_ptr,
+                            namei as usize,
+                            dst,
+                            dst_bank,
+                        )
+                    })?
+                    .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
             }
         }
     }

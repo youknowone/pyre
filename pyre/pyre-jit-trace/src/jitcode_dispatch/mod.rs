@@ -9929,6 +9929,30 @@ fn walker_pin_descriptor_slot<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
+/// Pin whatever the class-MRO value's `space.get` arm depends on beyond the
+/// receiver type's version tag, as [`pyre_interpreter::type_attr_value_fast_path`]
+/// reported it.
+fn walker_pin_type_attr_binding<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    binding: pyre_interpreter::TypeAttrBinding,
+) -> Result<(), DispatchError> {
+    match binding {
+        // Neither arm reads a field of the value, so the version tag that
+        // covers rebinding the name is already the whole precondition.
+        pyre_interpreter::TypeAttrBinding::Unbound
+        | pyre_interpreter::TypeAttrBinding::Function => Ok(()),
+        pyre_interpreter::TypeAttrBinding::StaticMethod { w_wrapper } => {
+            walker_pin_descriptor_slot(
+                ctx,
+                op_pc,
+                w_wrapper,
+                crate::descr::staticmethod_w_function_quasi_descr(),
+            )
+        }
+    }
+}
+
 /// The `function.py:47 _immutable_fields_ = ['code?', 'w_func_globals?',
 /// 'closure?[*]', 'defs_w?[*]']` twin of [`walker_pin_descriptor_slot`]: pin
 /// the callee's code slot when the inline lever cannot re-prove it per

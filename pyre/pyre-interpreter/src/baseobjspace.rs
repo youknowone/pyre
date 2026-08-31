@@ -10708,17 +10708,15 @@ pub unsafe fn type_name_obj_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef
 /// `:814-819` one: a name the metatype answers with a data descriptor — which
 /// is what `__name__` is — is refused here and folded there instead.
 ///
-/// The value type must additionally be a non-heap builtin type.  Its namespace
-/// cannot be mutated from Python and it cannot be the target of a `__class__`
-/// assignment, so an absent `__get__` remains absent for the life of the trace.
-/// Consequently the fold needs only the receiver type's one version pin.
+/// Three bindings reach here, reported as [`TypeAttrBinding`] so the tracer
+/// knows what else to pin; every other value declines.
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
 pub unsafe fn type_attr_value_fast_path(
     w_obj: PyObjectRef,
     name: &Wtf8,
-) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+) -> Option<(PyObjectRef, u64, PyObjectRef, TypeAttrBinding)> {
     if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
         return None;
     }
@@ -10743,15 +10741,66 @@ pub unsafe fn type_attr_value_fast_path(
         return None;
     }
     let w_value = lookup_in_type_where_wtf8(w_type, name)?;
-    // typeobject.py:822 calls `space.get(w_value, w_None, self)`.  Only a
-    // value with no descriptor protocol is returned unchanged.
+    // typeobject.py:822 calls `space.get(w_value, w_None, self)`; `get`'s arms
+    // for a null instance decide what that answers.
     let value_type = crate::typedef::r#type(w_value)?.as_ptr();
+    // `gateway.py descr_function_get` with no instance returns the function
+    // itself.  Exact types only: those two are the layouts `get` binds through
+    // that arm, and neither is subclassable, so no override can reach it.
+    // Read the physical `ob_type` the way `get` does, so the two agree on
+    // which values take the arm.
+    let value_ob_type = (*w_value).ob_type;
+    if std::ptr::eq(value_ob_type, &crate::FUNCTION_TYPE as *const _)
+        || std::ptr::eq(value_ob_type, &crate::METHOD_DESCRIPTOR_TYPE as *const _)
+    {
+        return Some((w_type, version_tag, w_value, TypeAttrBinding::Function));
+    }
+    // `function.py descr_staticmethod_get` returns the wrapped callable,
+    // ignoring both arguments.  Exact type only: a `staticmethod` subclass may
+    // override `__get__`.
+    if pyre_object::is_exact_type(w_value, &pyre_object::function::STATICMETHOD_TYPE) {
+        let w_function = pyre_object::w_staticmethod_get_func(w_value);
+        if w_function.is_null() {
+            return None;
+        }
+        return Some((
+            w_type,
+            version_tag,
+            w_function,
+            TypeAttrBinding::StaticMethod { w_wrapper: w_value },
+        ));
+    }
+    // Everything else must have no descriptor protocol at all to be returned
+    // unchanged.  The value type is additionally required to be a non-heap
+    // builtin type: its namespace cannot be mutated from Python and it cannot
+    // be the target of a `__class__` assignment, so an absent `__get__`
+    // remains absent for the life of the trace, and the fold needs only the
+    // receiver type's one version pin.
     if lookup_in_type(value_type, "__get__").is_some()
         || pyre_object::w_type_is_heaptype(value_type)
     {
         return None;
     }
-    Some((w_type, version_tag, w_value))
+    Some((w_type, version_tag, w_value, TypeAttrBinding::Unbound))
+}
+
+/// Which arm of `space.get(w_value, w_None, w_type)`
+/// [`type_attr_value_fast_path`] resolved, and what the trace owes because of
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeAttrBinding {
+    /// The value carries no descriptor protocol; `get` returns it unchanged
+    /// and the receiver's version tag is the whole precondition.
+    Unbound,
+    /// `gateway.py descr_function_get`: the function itself, unbound.  The
+    /// answer does not depend on any field of the function, so this pins
+    /// nothing beyond the version tag either.
+    Function,
+    /// `function.py descr_staticmethod_get`: the wrapper's `w_function?` slot.
+    /// Re-initialising the wrapper in place moves that slot while leaving the
+    /// class dict, the wrapper's address and every version tag alone, so the
+    /// quasi-immutable field is pinned separately.
+    StaticMethod { w_wrapper: PyObjectRef },
 }
 
 /// `callmethod.py`'s `w_obj.getdictvalue(space, name)` shadowing check,
@@ -10818,10 +10867,14 @@ unsafe fn instance_dict_does_not_shadow(w_obj: PyObjectRef, name: &str) -> Optio
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
+/// The fourth element is `true` when the receiver was admitted on
+/// `callmethod.py`'s weaker terms — a mapdict instance whose dictionary
+/// currently has no entry of this name — and the caller therefore owes the
+/// map guard that makes a later store of it side-exit.
 pub unsafe fn bound_method_attr_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+) -> Option<(PyObjectRef, u64, PyObjectRef, bool)> {
     if w_obj.is_null() {
         return None;
     }
@@ -10842,30 +10895,37 @@ pub unsafe fn bound_method_attr_fast_path(
     if !has_object_getattribute(w_type) {
         return None;
     }
-    // No instance dict => the type lookup cannot be shadowed, so the
-    // non-data-descriptor branch of `object.__getattribute__` is the only
-    // reachable one.  This is stricter than `callmethod.py:60-64`, which
-    // admits a dict-bearing receiver and merely checks that `name` is absent
-    // from it: the emitted fold carries no dict-shape guard, so a later store
-    // of `name` into the dict would not side-exit.  Admitting those receivers
-    // means emitting that guard first.
     // `Local.getdict` runs app-level code (os_local.py), which a fold
-    // precondition must not; such a receiver always carries a dict and is
-    // declined by the check below either way.
+    // precondition must not.
     if crate::module::thread::is_local(w_obj) {
         return None;
     }
-    if !getdict_backing_native(w_obj).is_null() {
+    // `callmethod.py:60-64` admits a dict-bearing receiver and merely checks
+    // that `name` is absent from it.  A mapdict instance is admitted on those
+    // terms because the caller has a guard for the precondition — pinning the
+    // map makes a later `obj.<name> = ...` grow the chain and side-exit — and
+    // is reported as owing it.  Every other layout keeps its instance
+    // attributes where no such guard reaches, so a receiver with no dictionary
+    // at all is the only other admission: nothing can shadow the type lookup,
+    // and the non-data-descriptor branch of `object.__getattribute__` is the
+    // only reachable one.
+    let owes_shadow_guard = is_instance(w_obj);
+    if owes_shadow_guard {
+        instance_dict_does_not_shadow(w_obj, name)?;
+    } else if !getdict_backing_native(w_obj).is_null() {
         return None;
     }
     let w_descr = lookup_in_type(w_type, name)?;
-    // The exact shape `get()` binds through `w_method_new`: a `function` OR a
-    // `method_descriptor` whose code is builtin.  Both take the SAME arm there
-    // (the `FUNCTION_TYPE || METHOD_DESCRIPTOR_TYPE` test above `w_method_new`),
+    // The exact shape `get()` binds through `w_method_new`: a `function` or a
+    // `method_descriptor`.  Both take the SAME arm there (the
+    // `FUNCTION_TYPE || METHOD_DESCRIPTOR_TYPE` test above `w_method_new`),
     // so admitting only one of them declines a receiver the fold reproduces
     // exactly — `list.append` and every other `TypeDef` method are
-    // `method_descriptor`.  `BuiltinFunction` is excluded because `get()`
-    // returns it unbound, i.e. no `Method` to emit.  Neither kind is a data
+    // `method_descriptor`, an ordinary `def` in a class body is a `function`.
+    // The code object the descriptor carries does not enter it:
+    // `gateway.py descr_function_get` is installed on the typedef
+    // unconditionally.  `BuiltinFunction` is excluded because `get()` returns
+    // it unbound, i.e. no `Method` to emit.  Neither kind is a data
     // descriptor, so the data-descriptor arm above cannot fire either.
     if !crate::is_function(w_descr) {
         return None;
@@ -10876,10 +10936,7 @@ pub unsafe fn bound_method_attr_fast_path(
     {
         return None;
     }
-    if !crate::is_builtin_code(crate::function_get_code(w_descr) as PyObjectRef) {
-        return None;
-    }
-    Some((w_type, version_tag, w_descr))
+    Some((w_type, version_tag, w_descr, owes_shadow_guard))
 }
 
 /// The Python-free prefix of `super(C, self).name`: validate the pair and find
@@ -11933,9 +11990,16 @@ pub(crate) unsafe fn get(
         if std::ptr::eq(ob_type, &crate::BUILTIN_FUNCTION_TYPE as *const _) {
             return Ok(Some(descr));
         }
-        if (std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
-            || std::ptr::eq(ob_type, &crate::METHOD_DESCRIPTOR_TYPE as *const _))
-            && crate::is_builtin_code(crate::function_get_code(descr) as pyre_object::PyObjectRef)
+        // `gateway.py descr_function_get` IS the whole of `function.__get__`:
+        // no instance returns the function unbound, an instance wraps it in a
+        // `Method`.  `typedef.py:811` installs it on `Function.typedef`
+        // unconditionally and `FunctionWithFixedCode` inherits it, so the code
+        // object the function carries does not select the arm.  Reaching the
+        // same body through `lookup_in_type_where(descr_type, "__get__")` and
+        // a call answers identically and costs an MRO walk plus an
+        // interp-level call on every attribute read.
+        if std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
+            || std::ptr::eq(ob_type, &crate::METHOD_DESCRIPTOR_TYPE as *const _)
         {
             if obj.is_null() {
                 return Ok(Some(descr));
@@ -12035,14 +12099,24 @@ pub(crate) unsafe fn get(
         return Ok(found);
     }
 
-    // `function.py StaticMethod.descr_staticmethod_get` and
-    // `function.py ClassMethod.descr_classmethod_get` are
-    // bound through their typedef `__get__` entries
-    // (`typedef.py:866, 883`) in `init_staticmethod_type` /
-    // `init_classmethod_type`.  The previous hardcoded fast-path here
-    // pre-dated the typedef registration; the generic fallback below
-    // now reaches them through `lookup_in_type_where(descr_type,
-    // '__get__')`.
+    // `function.py descr_staticmethod_get` ignores both arguments and returns
+    // the wrapped callable, which `_immutable_fields_ = ['w_function?']`
+    // declares quasi-immutable.  Exact type only, on the licence the
+    // `property` arm above cites: a subclass may have overridden `__get__`,
+    // and falls through to the general lookup at the end of this function,
+    // which finds either that override or `staticmethod`'s own typedef entry.
+    //
+    // `function.py descr_classmethod_get` is NOT given an arm here: it binds
+    // through a nested `space.get(w_func, w_klass, w_klass)` and allocates a
+    // `Method`, so the generic entry stays its only route.
+    if pyre_object::is_exact_type(descr, &pyre_object::function::STATICMETHOD_TYPE) {
+        let w_function = pyre_object::w_staticmethod_get_func(descr);
+        // An uninitialised wrapper has no callable to hand back; report that
+        // as absence rather than surfacing a null.
+        if !w_function.is_null() {
+            return Ok(Some(w_function));
+        }
+    }
 
     // General __get__: look up __get__ on the descriptor's own type MRO
     if let Some(descr_type) = crate::typedef::r#type(descr)
