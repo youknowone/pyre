@@ -264,7 +264,7 @@ enters at pc 0 with the portal's declared arguments.  The numeric
 probe passes before firing; it defaults to zero.  Neither has an effect unless
 the probe in §6c is enabled.
 
-### §6c — Default-OFF diagnostics, censuses and probes (75): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (76): keep, cost nothing
 
 Deleting one of these environment reads does not change behavior when the
 variable is unset. They remain listed so diagnostics are not mistaken for dead
@@ -284,7 +284,7 @@ configuration.
 `PYRE_FIELD_IDENTITY_CENSUS`,
 `PYRE_FORITER_INFLIGHT_CENSUS`, `PYRE_FOR_ITER_GATE_DIAG`,
 `PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GC_SIZE_AUDIT`,
-`PYRE_GEN_ENTRY_DIAG`,
+`PYRE_GEN_CENSUS`, `PYRE_GEN_ENTRY_DIAG`,
 `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
 `PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LOOP_CENSUS`,
 `PYRE_M73_BACKXLAT_TWIN_AUDIT`, `PYRE_M73_EMPTYTWIN_CENSUS`,

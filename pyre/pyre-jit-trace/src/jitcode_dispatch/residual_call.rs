@@ -7006,6 +7006,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })? {
             return Ok(inlined);
         }
+        // A suspended generator is neither a C-level iterator nor a user-class
+        // instance, so neither route above sees it and the residual advances
+        // it by calling back into the interpreter.
+        if let Some(resumed) = spec_gate(SpecFold::GeneratorNext, || {
+            try_walker_specialize_generator_next(ctx, op, &r_args, dst_bank)
+        })? {
+            return Ok(resumed);
+        }
     }
 
     // Emit MAKE_FUNCTION's `Function.__init__` as New + SetField so a `def` in a

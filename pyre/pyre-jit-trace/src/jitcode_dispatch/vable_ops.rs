@@ -74,6 +74,23 @@ pub(super) fn vable_effective_value_concrete<Sym: WalkSym>(
     }
 }
 
+/// `frame` when this walk is a generator resume writing its OWN suspended
+/// frame — the one case where a walk-time store lands on a frame the walk did
+/// not create.
+///
+/// Every other frame these stores reach was built by the walk that is writing
+/// it, so a decline discards the frame and only `last_instr` (which the caller
+/// reads back) needs an undo.  A resumed generator's frame is the object the
+/// generator will next be resumed from, so a declined walk has to hand it back
+/// byte for byte.
+fn durable_resume_frame<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    frame: usize,
+) -> Option<usize> {
+    let resume = ctx.fbw_mode.generator_resume?;
+    (frame != 0 && frame == resume.frame).then_some(frame)
+}
+
 /// A push writes at the current `valuestackdepth`; a pop/clear decrements its
 /// target index first and updates `valuestackdepth` afterward.  This ordering is
 /// emitted by `emit_pushvalue_ref_const!` / `emit_popvalue_ref!` and lets the
@@ -308,6 +325,9 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
                 .and_then(|info| info.static_field_by_descr(&descr)),
             ctx.callee_shadow.as_ref(),
         ) {
+            if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
+                fbw_arm_durable_frame_undo(frame);
+            }
             crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, value);
         }
         return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -347,6 +367,9 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
         concrete,
         inline_field_index,
     ) {
+        if let Some(frame) = durable_resume_frame(ctx, frame) {
+            fbw_arm_durable_frame_undo(frame);
+        }
         crate::state::store_live_frame_static_int(frame, field_index, value);
     }
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, write)?;
@@ -809,6 +832,14 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             if matches!(concrete, majit_ir::Value::Ref(_))
                 && let Some(shadow) = ctx.callee_shadow.as_ref()
             {
+                if let Some(frame) = durable_resume_frame(ctx, shadow.concrete_frame) {
+                    fbw_arm_durable_frame_undo(frame);
+                    fbw_note_generator_stack_store(GeneratorStackStore {
+                        frame,
+                        slot: slot as usize,
+                        value,
+                    });
+                }
                 crate::state::store_live_frame_array_slot(
                     shadow.concrete_frame,
                     slot as usize,
@@ -904,6 +935,14 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if index_value >= 0
         && let Some(frame) = current_inline_vable_target(ctx, vable)
     {
+        if let Some(frame) = durable_resume_frame(ctx, frame) {
+            fbw_arm_durable_frame_undo(frame);
+            fbw_note_generator_stack_store(GeneratorStackStore {
+                frame,
+                slot: index_value as usize,
+                value,
+            });
+        }
         crate::state::store_live_frame_array_slot(frame, index_value as usize, concrete);
     }
     // Keep the inline concrete-locals shadow current so a later read of this
