@@ -304,6 +304,13 @@ configuration.
 `PYRE_WASM_NO_CACHE`, `PYRE_WASM_SPEC_CENSUS`, `PYRE_WASM_STARTUP_TRACE`,
 `PYRE_WASM_TRACE_ENTRY_CENSUS`.
 
+`PYRE_WASM_JIT_STATS` prints its readout for any value. The one value it
+reads is `nofuel`, which asks for the readout without wasmtime's fuel metering.
+Metering charges every guest instruction, which makes the host cranelift
+compile that `compile_ms` and `compile_bytes` measure slower than it is in a
+production run; `nofuel` is how those two fields are read. `wasm_ops` is the
+fuel subtraction and reports -1 under it.
+
 `PYRE_FBW_DESCENT_SCAN_OFF` turns off the descent's un-lowered-helper scan
 (`descent_unlowered_helper_scan_enabled`), so the walker descends into a
 builtin body that holds a symbolic-fnaddr residual call and aborts at the call

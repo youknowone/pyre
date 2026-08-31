@@ -92,6 +92,11 @@ struct Host {
     /// modules), in nanoseconds. Isolates host-compile latency — the warmup
     /// tax — from steady-state execution.
     jit_compile_time_ns: u128,
+    /// Bytes of trace-module wasm handed to `Module::new`. With
+    /// `jit_compile_count` and `jit_compile_time_ns` it separates the fixed
+    /// per-module cost of a cranelift compile from the part that scales with
+    /// the emitted body.
+    jit_compile_bytes: u64,
     jit_execute_count: u64,
     /// Diagnostic: per-op residual-call host crossings (`env.jit_call`
     /// trampoline invocations). Compare against `jit_execute_count` to test
@@ -321,8 +326,17 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // compare a codegen change against. Metering costs time on every
     // instruction, so it stays confined to the two diagnostic modes that ask
     // for it — a timed run sets neither and pays nothing.
+    //
+    // `PYRE_WASM_JIT_STATS=nofuel` asks for the readout without the metering.
+    // Every other counter on that line is measured the same way with or
+    // without fuel, but `compile_ms` is host wall time around a cranelift
+    // compile that fuel instrumentation itself makes slower — so the metered
+    // run cannot say what trace compilation costs a production run. That
+    // reading is what this spelling exists for; `wasm_ops` reports -1 under it.
+    let jit_stats_value = std::env::var("PYRE_WASM_JIT_STATS").ok();
     let jit_stats = std::env::var_os("PYRE_WASM_JIT_STATS").is_some();
-    let meter_fuel = fuel_limit.is_some() || jit_stats;
+    let meter_fuel = fuel_limit.is_some()
+        || (jit_stats && jit_stats_value.as_deref().map(str::trim) != Some("nofuel"));
     if meter_fuel {
         config.consume_fuel(true);
     }
@@ -1084,12 +1098,13 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             .ok();
         let host = store.data();
         eprintln!(
-            "[jit-stats] compiles={} compile_ms={:.1} executes={} jit_calls={} jit_call_ms={:.1} \
+            "[jit-stats] compiles={} compile_ms={:.1} compile_bytes={} executes={} jit_calls={} jit_call_ms={:.1} \
              jit_call_nested={} jit_call_depth_max={} \
              wasm_ops={} linear_mem={} gc_oldgen={} gc_nursery={} \
              gc_minors={} gc_majors={} heap_live_bytes={} heap_live_count={}",
             host.jit_compile_count,
             host.jit_compile_time_ns as f64 / 1.0e6,
+            host.jit_compile_bytes,
             guest_jit_execute_count.unwrap_or(host.jit_execute_count),
             host.jit_call_count,
             host.jit_call_time_ns as f64 / 1.0e6,
@@ -2079,6 +2094,7 @@ fn jit_compile_trace(
         .context("read trace module bytes")?;
 
     let engine = caller.engine().clone();
+    caller.data_mut().jit_compile_bytes += bytes.len() as u64;
     let compile_start = std::time::Instant::now();
     let module_result = Module::new(&engine, &bytes);
     caller.data_mut().jit_compile_time_ns += compile_start.elapsed().as_nanos();
