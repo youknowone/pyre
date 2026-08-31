@@ -16,6 +16,7 @@ const VERSION_EXPORT: usize = 0x0a03;
 /// replaces `p[0]` with its ABI version and `p[1]` with its immutable type
 /// context.  The Python-visible objects remain interpreter-owned; native code
 /// only supplies declarations and function addresses.
+#[majit_macros::dont_look_inside]
 pub fn load_cffi1_module(
     name: &str,
     path: &Path,
