@@ -1074,10 +1074,15 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // like a free function to the canonical registration loop and
         // the impl-key return-type / hint registrations get dropped.
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
+        let trait_impl_id = trait_impl_id_for_fundecl(fd);
         let graph = if let Some(owner) = &self_ty_root {
+            let source_identity = match trait_impl_id {
+                Some(impl_id) => format!("{module_path}::{owner}::<Impl#{impl_id}>::{name}"),
+                None => format!("{module_path}::{owner}::{name}"),
+            };
             graph
                 .with_owner_root(owner.clone())
-                .with_source_identity(format!("{module_path}::{owner}::{name}"))
+                .with_source_identity(source_identity)
         } else {
             graph.with_source_identity(fn_path.clone())
         };
@@ -1132,6 +1137,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             graph,
             return_type,
             self_ty_root,
+            trait_impl_id,
             module_path,
             hints: Vec::new(),
             trait_root,
@@ -1334,15 +1340,42 @@ fn register_synthetic_positional_metadata(
         if items.is_empty() && majit_ir::descr::is_shaped_tuple_name(&shape) {
             continue;
         }
-        let rows: Vec<(String, String)> = items
-            .iter()
-            .enumerate()
-            .map(|(index, ty)| (format!("__pos_{index}"), (*ty).to_string()))
-            .collect();
         let attrs: Vec<(String, ValueType)> = items
             .iter()
             .enumerate()
             .map(|(index, ty)| (format!("__pos_{index}"), tuple_field_value_type(ty)))
+            .collect();
+        // `TupleRepr` stores an instance-valued item as one GC pointer.  The
+        // type renderer strips Rust references for nominal class lookup, so a
+        // shaped tuple can arrive as `Tuple<Union,Union>` even when its two
+        // SSA items are refs.  Do not then reinterpret those rows as two
+        // embedded 16-byte structs: the FORCE attribute already records the
+        // translated item repr as `Ref`, and the low-level tuple field must
+        // use that same pointer repr.  Scalar/float/string rows keep their
+        // existing specialized spelling.
+        let rows: Vec<(String, String)> = items
+            .iter()
+            .zip(&attrs)
+            .enumerate()
+            .map(|(index, (ty, (_, value_type)))| {
+                let ty = ty.trim();
+                let field_ty = if matches!(value_type, ValueType::Ref(_))
+                    && !ty.starts_with('&')
+                    && !ty.starts_with("*mut ")
+                    && !ty.starts_with("*const ")
+                    && !ty.starts_with("Box<")
+                    && !ty.starts_with("Arc<")
+                    && !ty.starts_with("Rc<")
+                    && !ty.starts_with("Vec<")
+                    && !ty.starts_with("Option<")
+                    && ty != "String"
+                {
+                    format!("&{ty}")
+                } else {
+                    ty.to_string()
+                };
+                (format!("__pos_{index}"), field_ty)
+            })
             .collect();
         let sid = majit_ir::descr::StructId::from_canonical(&shape);
         known_struct_names.insert(shape.clone());
@@ -1707,10 +1740,21 @@ fn derive_program_metadata(
                 // switch-arm discr→name mapping — both independent of the
                 // base ClassDef.
                 let fieldless = type_decl_is_fieldless_enum(td, llbc);
+                let enum_layout = td.layout_for_target(&target);
                 let base_sid = majit_ir::descr::StructId::from_canonical(&canon_base);
                 if !fieldless {
+                    // The tag is an int-bank value, but its physical width is
+                    // not necessarily a machine word. Charon records the
+                    // exact `Branch.int_ty`; using `i64` for a u8/u16/u32 tag
+                    // reads adjacent payload bytes and can select an
+                    // unreachable switch arm.
+                    let discr_ty = enum_layout
+                        .as_ref()
+                        .and_then(|layout| layout.discriminant_int_type())
+                        .unwrap_or("i64")
+                        .to_string();
                     let rows: Vec<(String, String)> =
-                        vec![("__discriminant".to_string(), "i64".to_string())];
+                        vec![("__discriminant".to_string(), discr_ty)];
                     struct_fields.fields.insert(name.clone(), rows.clone());
                     struct_fields.fields.insert(leaf.clone(), rows.clone());
                     struct_fields.fields.insert(canon_base.clone(), rows);
@@ -1730,7 +1774,6 @@ fn derive_program_metadata(
                 // because `resolve_adt_field` emits `owner_root` =
                 // `{enum_leaf}::{variant}`.  No cross-variant dedup: each
                 // variant owns its field namespace.
-                let enum_layout = td.layout_for_target(&target);
                 // `Result<T, E>` and `Option<T>` are not materialised as
                 // Rust's native enums in translated code.  The inverse
                 // exception transform removes ordinary `?` paths; a
@@ -2551,6 +2594,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::front::checked_arith::rewire_checked_arith_call_sites(
                 &mut lo.graph,
                 &lo.checked_arith_call_results,
+                &lo.checked_arith_ok_or_else_sites,
             )
         };
         // The unsigned checked-arith rewrite (`front::checked_arith_uint`) runs
@@ -3399,6 +3443,11 @@ struct Lowering<'a> {
     /// (`front::checked_arith`) that runs after the body lowering
     /// completes, rewriting each into an `*_ovf` op + OverflowError edge.
     checked_arith_call_results: Vec<Variable>,
+    /// `Option::ok_or_else` continuations that may directly consume one of
+    /// the signed checked-arith results above.  Type-owned closure/Result
+    /// metadata is captured here so `front::checked_arith` can fuse that
+    /// continuation into the `*_ovf` normal/overflow edges.
+    checked_arith_ok_or_else_sites: Vec<crate::front::checked_arith::CheckedArithOkOrElseSite>,
     /// Unsigned `usize::checked_{add,mul}()` call sites (`Option<usize>`-
     /// typed) recorded for the native-overflow rewiring pass
     /// (`front::checked_arith_uint`) that runs after `front::checked_arith`,
@@ -3739,6 +3788,7 @@ impl<'a> Lowering<'a> {
             option_ok_or_else_try_sites: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
+            checked_arith_ok_or_else_sites: Vec::new(),
             checked_arith_uint_sites: Vec::new(),
             from_size_align_sites: Vec::new(),
             from_size_align_expect_sites: Vec::new(),
@@ -5585,6 +5635,32 @@ impl<'a> Lowering<'a> {
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     return Ok((Some(OpKind::ConstInt(tag)), res));
                 }
+                // `Option<E>` over a dense fieldless enum E is the same
+                // scalar plus one reserved `None` value.  Constructing
+                // `Some(e)` therefore aliases e; constructing `None` emits
+                // the reserved niche.  No aggregate allocation or tag write
+                // exists in Rust's physical representation.
+                if let Some(niche) = tyref_option_fieldless_niche(dest_ty, self.llbc) {
+                    return match operands.as_slice() {
+                        [] => {
+                            let res = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            Ok((Some(OpKind::ConstInt(niche.none_tag)), res))
+                        }
+                        [_] => {
+                            let value = self.resolve_operand(
+                                mir_bb,
+                                operands.into_iter().next().expect("one Some payload"),
+                            )?;
+                            Ok((None, value))
+                        }
+                        _ => Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: Option<fieldless-enum> aggregate has {} operands",
+                            operands.len()
+                        ))),
+                    };
+                }
                 // A one-word niche `Option` is represented by its payload
                 // pointer, so
                 // constructing it names either the null pointer (`None`) or
@@ -5952,6 +6028,34 @@ impl<'a> Lowering<'a> {
                             op: "ne".to_string(),
                             lhs: base,
                             rhs: nullc,
+                            result_ty: ValueType::Int,
+                        }),
+                        res,
+                    ));
+                }
+                // `Option<E>` where `E` is a densely numbered fieldless enum
+                // is also a one-word niche value.  Rust stores `Some(e)` as
+                // `e` and reserves the first value after E's dense range for
+                // `None`; there is no aggregate whose `__discriminant` can be
+                // read.  Keep the physical scalar in the graph and turn the
+                // source-level discriminant into the same boolean shape as
+                // the nullable-pointer Option above (`Some` = scalar != niche).
+                if let Some(niche) = tyref_option_fieldless_niche(&place.ty, self.llbc) {
+                    let base = self.resolve_place(mir_bb, place)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let none = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(none.clone()),
+                        kind: OpKind::ConstInt(niche.none_tag),
+                    });
+                    self.niche_disc_vars.insert(res.id());
+                    return Ok((
+                        Some(OpKind::BinOp {
+                            op: "ne".to_string(),
+                            lhs: base,
+                            rhs: none,
                             result_ty: ValueType::Int,
                         }),
                         res,
@@ -6339,6 +6443,15 @@ impl<'a> Lowering<'a> {
                     // mirroring the fieldless-enum discriminant collapse and the
                     // `Discriminant` niche fold above.
                     if field_name == "__pos_0" && self.tyref_is_niche_option_ptr(&inner.ty) {
+                        return self.resolve_place(mir_bb, *inner);
+                    }
+                    // The payload of `Option<fieldless-enum>` is likewise the
+                    // niche scalar itself.  A `Some.__pos_0` projection must
+                    // therefore alias the Option value instead of treating
+                    // that byte as an aggregate pointer and dereferencing it.
+                    if field_name == "__pos_0"
+                        && tyref_option_fieldless_niche(&inner.ty, self.llbc).is_some()
+                    {
                         return self.resolve_place(mir_bb, *inner);
                     }
                     // A zero-sized field has no runtime representation, so a
@@ -8082,6 +8195,54 @@ impl<'a> Lowering<'a> {
         let op_kind = match (class, call.func) {
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
+                // A boundary the consumer declared as one scalar field
+                // store ([`crate::ScalarFieldStore`]).  Emit the
+                // `setfield_gc_<bank>` its body performs instead of
+                // descending into the `&mut i64/f64` borrow the body takes
+                // into that field, which has no pointer-to-primitive repr
+                // here, or rebuilding the container around a field that is
+                // inline.  The owner/id are the same keys
+                // `derive_program_metadata` installs from Charon's layouts,
+                // so the write carries the descr an ordinary
+                // `target.field = value` assignment would.
+                if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                    && let Some(store) = self
+                        .static_addrs
+                        .scalar_field_stores
+                        .iter()
+                        .find(|store| fd.item_meta.name_path() == store.function_path)
+                {
+                    if args.len() != 2 {
+                        return Err(LowerError::Schema(format!(
+                            "bb{mir_bb}: {} expects target and scalar",
+                            store.function_path
+                        )));
+                    }
+                    let field_ty = match store.bank {
+                        crate::ScalarBank::Int => ValueType::Int,
+                        crate::ScalarBank::Float => ValueType::Float,
+                    };
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::FieldWrite {
+                            base: args[0].clone(),
+                            field: FieldDescriptor::new(
+                                store.field,
+                                Some(store.owner_root.to_string()),
+                            )
+                            .with_owner_id(Some(
+                                majit_ir::descr::StructId::from_canonical(store.owner_root),
+                            )),
+                            value: LinkArg::Value(args[1].clone()),
+                            ty: field_ty,
+                        },
+                    });
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Fold an inline `core::mem::size_of::<T>()` /
                 // `align_of::<T>()` call with a layout-resolvable ADT type
                 // argument to its build-time byte size / alignment — the same
@@ -11309,6 +11470,33 @@ impl<'a> Lowering<'a> {
         {
             self.checked_arith_call_results.push(result_var.clone());
         }
+        // Capture `Option::ok_or_else(opt, closure)` as a possible immediate
+        // continuation of signed checked arithmetic.  The post-pass still
+        // validates the producer/consumer CFG adjacency; this site only keeps
+        // the closure and Result type ownership that is unavailable after MIR
+        // lowering.
+        if let OpKind::Call {
+            target:
+                CallTarget::Method {
+                    name,
+                    receiver_root,
+                    ..
+                },
+            args,
+            ..
+        } = &op_kind
+            && name == "ok_or_else"
+            && receiver_root.as_deref() == Some("Option")
+            && args.len() == 2
+            && let Some(site) = self.recognize_checked_arith_ok_or_else_site(
+                first_arg_ty.as_ref(),
+                second_arg_ty.as_ref(),
+                &call.dest.ty,
+                &result_var,
+            )
+        {
+            self.checked_arith_ok_or_else_sites.push(site);
+        }
         // Capture UNSIGNED `usize::checked_{add,mul}()` results
         // (`Option<usize>`) for the native-overflow rewiring pass
         // (`front::checked_arith_uint`).  Signed arithmetic stays on
@@ -13575,12 +13763,13 @@ impl<'a> Lowering<'a> {
     ///   whole conversion is a `T -> T` identity —
     ///   [`IntoDevirt::Identity`].
     /// - Otherwise the impl's `methods` table binds the single `From`
-    ///   method to the concrete `from` FunDecl, whose path is the
-    ///   devirtualized call target — [`IntoDevirt::Target`].  `from`
-    ///   is an associated function (no `self` receiver), so the
-    ///   caller must keep the `FunctionPath` shape (a
-    ///   `CallTarget::Method` hint would bind the *argument* as a
-    ///   receiver).
+    ///   method to the concrete `from` FunDecl. Its owner, trait-impl id,
+    ///   and method form the devirtualized call target —
+    ///   [`IntoDevirt::Target`]. The id is load-bearing: several
+    ///   `impl From<_> for Dynamic` bodies share the same owner/method pair.
+    ///   `from` is an associated function (no `self` receiver), so the caller
+    ///   must keep the `FunctionPath` shape (a `CallTarget::Method` hint would
+    ///   bind the *argument* as a receiver).
     ///
     /// Returns `None` (caller keeps the blanket-into path) when the
     /// obligation is unresolved (`kind` is a clause/builtin rather
@@ -13641,13 +13830,9 @@ impl<'a> Lowering<'a> {
                 m.get("skip_binder")?.get("id")?.as_u64()
             })?;
             let fd = self.llbc.fn_by_id(fn_id)?;
-            let segments: Vec<String> = fd
-                .item_meta
-                .name_path()
-                .split("::")
-                .map(|s| s.to_string())
-                .collect();
-            return Some(IntoDevirt::Target(segments));
+            let (owner, method) = impl_method_owner_for_fundecl(self.llbc, fd)?;
+            let path = crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, &method);
+            return Some(IntoDevirt::Target(path.segments));
         }
         None
     }
@@ -14487,6 +14672,8 @@ impl<'a> Lowering<'a> {
         // `Result<T, E>`.
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
+        let fieldless_none_tag =
+            tyref_option_fieldless_niche(recv_ty, self.llbc).map(|niche| niche.none_tag);
         // An `Option` payload read keys the per-instantiation classdef its
         // producer wrote (bare for the `Int`/`Unsigned`/niche carve-out); a
         // plain-error `Result` has no suffixed producers here, so its `Ok`/`Err`
@@ -14508,6 +14695,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             payload_on_disc_true,
             niche,
+            fieldless_none_tag,
         })
     }
 
@@ -14624,6 +14812,38 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+        })
+    }
+
+    /// Resolve the type-owned parts of an `Option::ok_or_else` continuation
+    /// that `front::checked_arith` may fuse into a signed `*_ovf` edge.  The
+    /// receiver and destination gates keep unrelated same-named methods out;
+    /// the post-pass proves that this receiver is the checked result.
+    fn recognize_checked_arith_ok_or_else_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        env_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::checked_arith::CheckedArithOkOrElseSite> {
+        if !crate::front::result_exc::tyref_is_option(recv_ty?, self.llbc)
+            || !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc)
+        {
+            return None;
+        }
+        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
+        let call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+        let result_suffix =
+            crate::front::result_exc::tyref_result_instantiation_suffix(dest_ty, self.llbc)
+                .unwrap_or_default();
+        let ok_ty = self.tyref_adt_type_arg(dest_ty, 0)?;
+        let err_ty = self.tyref_adt_type_arg(dest_ty, 1)?;
+        Some(crate::front::checked_arith::CheckedArithOkOrElseSite {
+            result_var: result_var.clone(),
+            call_once_owner,
+            result_suffix,
+            ok_payload_ty: tyref_enum_payload_value_type(&ok_ty, self.llbc),
+            err_payload_ty: tyref_enum_payload_value_type(&err_ty, self.llbc),
         })
     }
 
@@ -14924,6 +15144,8 @@ impl<'a> Lowering<'a> {
             (suffix, payload_ty)
         });
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
+        let fieldless_none_tag =
+            tyref_option_fieldless_niche(recv_ty, self.llbc).map(|niche| niche.none_tag);
         // `map`/`and_then` BUILD their result `Option<U>`; the other combinators
         // build none.  `U` is the dest payload, not the receiver's `T`, so the
         // built variant must key the dest's own classdef — otherwise two `map`s
@@ -14941,6 +15163,12 @@ impl<'a> Lowering<'a> {
             }
             _ => (option_owner.clone(), some_owner.clone(), niche),
         };
+        let result_fieldless_none_tag = match kind {
+            ClosureCombinator::Map | ClosureCombinator::AndThen => {
+                tyref_option_fieldless_niche(dest_ty, self.llbc).map(|niche| niche.none_tag)
+            }
+            _ => fieldless_none_tag,
+        };
         Some(crate::front::option_closure_select::ClosureSelectSite {
             kind,
             result_var: result_var.clone(),
@@ -14949,12 +15177,14 @@ impl<'a> Lowering<'a> {
             result_option_owner,
             result_some_owner,
             result_niche,
+            result_fieldless_none_tag,
             call_once_owner,
             payload_ty,
             payload_class_root,
             call_result_ty,
             args_tuple_suffix,
             niche,
+            fieldless_none_tag,
             call_once_result_exc,
         })
     }
@@ -14984,7 +15214,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// `true` when `ty` is represented as a one-word nullable `Option`:
-    /// `Option<NonNull<T>>`, `Option<fn(..)>`, `Option<&mut T>`,
+    /// `Option<NonNull<T>>`, `Option<Box<T>>`, `Option<fn(..)>`, `Option<&mut T>`,
     /// `Option<&T>` with a thin (Sized) ADT pointee, or a raw pointer to a
     /// thin nominal ADT.
     /// The JIT models each in ONE pointer word (`None` = null, `Some(p)` =
@@ -15065,6 +15295,15 @@ impl<'a> Lowering<'a> {
             return false;
         };
         if type_node_is_mut_ref(payload, self.llbc) {
+            return true;
+        }
+        // `Box<T>` is a non-null owning pointer, so `Option<Box<T>>` uses the
+        // same null niche as `Option<&T>`.  Keep the same concrete-layout gate
+        // as the reference/raw-pointer arms: `Box<dyn Trait>` and `Box<[T]>`
+        // are fat pointers, while a boxed nominal ADT such as the interpreter's
+        // error object is one word.  RPython's owning GC pointer has this same
+        // nullable `SomeInstance` shape; there is no separate Option object.
+        if type_node_is_thin_box(payload, self.llbc) {
             return true;
         }
         // A function pointer is one word, and `Option<fn(..)>` represents
@@ -19516,6 +19755,22 @@ fn trait_impl_trait_path_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
     Some(trait_path)
 }
 
+/// Return the concrete Charon trait-impl id carried by an impl-owned
+/// function's penultimate name segment. Inherent impls and free functions do
+/// not carry this identity.
+fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u64> {
+    let last_idx = fd
+        .item_meta
+        .name
+        .iter()
+        .rposition(|segment| matches!(segment, NameSeg::Ident { .. }))?;
+    let impl_payload = match fd.item_meta.name.get(last_idx.checked_sub(1)?)? {
+        NameSeg::Other(value) => value.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    impl_payload.as_object()?.get("Trait")?.as_u64()
+}
+
 /// Detect a trait-default body — a function whose penultimate NameSeg
 /// is a bare `Ident` matching a known trait leaf (no `Impl` segment).
 /// Charon emits trait default impls inline in the trait's namespace,
@@ -20130,6 +20385,12 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             }
         }
     }
+    // A densely numbered fieldless enum gives `Option<E>` a scalar niche
+    // representation.  The whole Option therefore lives in the Int bank;
+    // it is not an aggregate reference.
+    if tyref_option_fieldless_niche(ty, llbc).is_some() {
+        return ValueType::Int;
+    }
     // Non-`Literal` (ADT / pointer / tuple) shapes only. Atomic wrappers
     // type as their inner value, including signedness. Checked after the
     // cheap `Literal` fast-path so primitive operands never pay the lookup.
@@ -20435,6 +20696,82 @@ fn tyref_primitive_node<'l>(
         }
         return obj.contains_key("Literal").then_some(v);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FieldlessOptionNiche {
+    none_tag: i64,
+    storage_ty: &'static str,
+}
+
+/// Physical scalar representation of `Option<E>` when `E` is a densely
+/// numbered fieldless enum.
+///
+/// rustc uses E's first invalid scalar as the `None` niche, while every valid
+/// E value is `Some(E)`.  Charon does not serialize a separate layout for a
+/// generic `core::option::Option<T>` declaration, but it does serialize E's
+/// exact tag width and discriminants.  Restricting this projection to the
+/// dense `0..N` shape makes the inferred niche unique and rejects enums with
+/// explicit gaps, negative tags, or a full scalar range.
+fn tyref_option_fieldless_niche(ty: &TyRef, llbc: &Llbc) -> Option<FieldlessOptionNiche> {
+    if !crate::front::result_exc::tyref_is_option(ty, llbc) {
+        return None;
+    }
+    let option = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let payload = option
+        .get("Adt")?
+        .get("generics")?
+        .get("types")?
+        .as_array()?
+        .first()?;
+    let payload = strip_ty_indirections(payload, llbc)?;
+    let td = llbc.type_by_id(adt_node_def_id(payload)?)?;
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return None;
+    };
+    if variants.is_empty() || variants.iter().any(|variant| !variant.fields.is_empty()) {
+        return None;
+    }
+    for (index, variant) in variants.iter().enumerate() {
+        if variant.discriminant_i64()? != index as i64 {
+            return None;
+        }
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let storage_ty = td.layout_for_target(&target)?.discriminant_int_type()?;
+    let none_tag = fieldless_option_none_tag(variants.len(), storage_ty)?;
+    Some(FieldlessOptionNiche {
+        none_tag,
+        storage_ty,
+    })
+}
+
+/// The value the compiler reserved for `None` in an `Option<E>` over a
+/// fieldless enum with `variants` densely numbered variants stored in
+/// `storage_ty` — `None` when this layer cannot know it, which is every
+/// case today.
+///
+/// MEASURED, and the measurement refutes `variants` itself as the tag. On
+/// this toolchain a dense fieldless enum in a `u8` puts `None` at `2` with
+/// two variants but at `255` — the storage maximum, not the variant count —
+/// with three, four, five and eight, a 300-variant enum in a `u16` puts it
+/// at `65535`, and a single-variant enum is inverted outright (`None` is
+/// `0`, `Some` is `1`). So a derived `variants` tag names a value the
+/// compiler never writes, the `ne` against it misclassifies every `Some`,
+/// and a constructed `None` is indistinguishable from a live variant.
+///
+/// The tag that would be right is the niche the compiler actually reserved,
+/// and this artefact does not carry it: Charon spells a discriminant only as
+/// `Branch { offset, int_ty }` or `Known`, with no niche encoding, and runs
+/// with `monomorphize: false`, so there is no `Option<E>` layout to read one
+/// off either. Rust does not specify the placement, so it is not derivable
+/// by rule. Declining here leaves every `Option<fieldless enum>` on the
+/// ordinary aggregate lowering; the tag threading the combinators carry
+/// ([`crate::front::option_unwrap_or::UnwrapOrSite::fieldless_none_tag`])
+/// stays exercised by its own tests and is ready for a niche encoding that
+/// reaches the artefact.
+fn fieldless_option_none_tag(_variants: usize, _storage_ty: &str) -> Option<i64> {
+    None
 }
 
 /// The `TypeDecl` behind `ty` when it resolves to a fieldless (C-like)
@@ -21400,6 +21737,62 @@ fn type_node_raw_ptr_pointee<'l>(
     None
 }
 
+/// The pointee of Charon's builtin `Box<T>` node, after peeling serialized
+/// dedup/hash-cons wrappers.  References are deliberately not peeled: a
+/// `&Box<T>` is a reference niche in its own right and belongs to the shared
+/// reference arm, not to the owning-box arm.
+fn type_node_box_pointee<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(parts) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && parts.len() == 2
+        {
+            node = &parts[1];
+            continue;
+        }
+        let adt = obj.get("Adt")?.as_object()?;
+        let id = adt.get("id")?.as_object()?;
+        let is_box = id.get("Builtin").is_some_and(|builtin| {
+            builtin.as_str() == Some("Box")
+                || builtin
+                    .as_object()
+                    .is_some_and(|value| value.contains_key("Box"))
+        }) || id
+            .get("Adt")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|def_id| llbc.type_by_id(def_id))
+            .is_some_and(|td| td.item_meta.name_path() == "alloc::boxed::Box");
+        if !is_box {
+            return None;
+        }
+        return adt.get("generics")?.get("types")?.as_array()?.first();
+    }
+    None
+}
+
+/// Whether a Charon type node is an owning `Box<T>` whose pointee has a
+/// concrete sized layout, and is therefore one pointer word rather than a fat
+/// pointer.  Kept separate from the Option recognizer so real-artefact tests
+/// can pin Charon's Box spelling directly.
+fn type_node_is_thin_box(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    type_node_box_pointee(node, llbc)
+        .and_then(|pointee| strip_ty_wrappers(pointee, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|def_id| llbc.type_by_id(def_id))
+        .and_then(|td| td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()))
+        .and_then(|layout| layout.size)
+        .is_some()
+}
+
 /// Strip the indirection wrappers a Charon type node can carry —
 /// `{"Deduplicated": id}` / `{"HashConsedValue": [id, ty]}` /
 /// `{"Ref": [region, ty, kind]}` — and return the underlying type node
@@ -22044,6 +22437,15 @@ fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
 }
 
 fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
+    // A reference field is one pointer repr, not an inline copy of its
+    // referent.  `tyref_to_ast_string` intentionally erases `&T` for nominal
+    // annotation lookup, but feeding that erased spelling to the physical
+    // layout registry makes `&Engine` recursively enumerate every `Engine`
+    // field inside the containing struct.  RPython's lltype row here is
+    // `Ptr(T)`, so retain the reference constructor at the layout boundary.
+    if let Some(reference) = tyref_reference_layout_string(ty, llbc) {
+        return reference;
+    }
     // An atomic wrapper is layout-transparent over its inner scalar, and the
     // typed side already models a field of one as that inner value
     // (`tyref_atomic_inner_value_type`).  Spell the field with the scalar so
@@ -22053,6 +22455,28 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
     // `Ref` field descr against the runtime's `Int` publish.
     if let Some(scalar) = tyref_atomic_inner_scalar_str(ty, llbc) {
         return scalar.to_string();
+    }
+    // `Option<E>` over a densely numbered fieldless E uses E's scalar tag
+    // plus one reserved value for `None`.  Preserve that physical width in
+    // the containing struct's descriptor instead of treating it as a Ref.
+    if let Some(niche) = tyref_option_fieldless_niche(ty, llbc) {
+        return niche.storage_ty.to_string();
+    }
+    // A fieldless enum is the tag scalar itself.  Do this before the generic
+    // named-ADT path: `known_struct_names` contains the enum declaration for
+    // switch/debug metadata, but treating an inline field of that declaration
+    // as a nested Struct makes `all_fielddescrs` drop it (there are no payload
+    // fields) and the fallback mints an eight-byte Ref descriptor.  Charon's
+    // branching discriminator is the physical low-level type RPython would
+    // put in this field.
+    if let Some(decl) = tyref_fieldless_enum_def(ty, llbc) {
+        let target = std::env::var("TARGET").unwrap_or_default();
+        if let Some(discr_ty) = decl
+            .layout_for_target(&target)
+            .and_then(|layout| layout.discriminant_int_type())
+        {
+            return discr_ty.to_string();
+        }
     }
     let Some(node) = tyref_node(ty, llbc) else {
         return tyref_to_ast_string(ty, llbc);
@@ -22101,6 +22525,43 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
         (majit_charon_reader::TransparentScalarKind::Float, 4) => "f32".to_string(),
         (majit_charon_reader::TransparentScalarKind::Float, _) => "f64".to_string(),
     }
+}
+
+/// The physical type spelling of a top-level Rust reference field.
+fn tyref_reference_layout_string(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    fn visit(value: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<String> {
+        if depth > 24 {
+            return None;
+        }
+        let obj = value.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            return visit(llbc.dedup_body(id)?, llbc, depth + 1);
+        }
+        if let Some(pair) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && pair.len() == 2
+        {
+            return visit(&pair[1], llbc, depth + 1);
+        }
+        let reference = obj.get("Ref")?.as_array()?;
+        let inner = charon_type_value_to_ast_string(reference.get(1)?, llbc, depth + 1);
+        let mutable = reference
+            .get(2)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("Mut"));
+        Some(if mutable {
+            format!("&mut {inner}")
+        } else {
+            format!("&{inner}")
+        })
+    }
+
+    let value = match ty {
+        TyRef::Inline { value: (_, value) } | TyRef::Other(value) => value,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    visit(value, llbc, 0)
 }
 
 /// Concrete ARRAY metadata for a Charon `ProjectionElem::Index`.
@@ -30019,6 +30480,23 @@ mod tests {
         assert!(!thin(uint("U8")));
     }
 
+    #[test]
+    fn field_layout_keeps_reference_repr_instead_of_embedding_the_referent() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let shared = super::TyRef::Other(serde_json::json!({
+            "Ref": ["_", {"Literal": {"Int": "I64"}}, "Shared"]
+        }));
+        let mutable = super::TyRef::Other(serde_json::json!({
+            "Ref": ["_", {"Literal": {"Int": "I64"}}, "Mut"]
+        }));
+
+        assert_eq!(super::tyref_to_field_layout_string(&shared, &llbc), "&i64");
+        assert_eq!(
+            super::tyref_to_field_layout_string(&mutable, &llbc),
+            "&mut i64"
+        );
+    }
+
     /// `[T]`, `str` and `dyn Trait` each have two Charon spellings — a
     /// top-level `{"Slice": elem}` and the `{"Adt": {"id": {"Builtin":
     /// "Slice"}}}` form.  A pointer to any of them is fat, and the width proof
@@ -30068,10 +30546,10 @@ mod tests {
     }
 
     #[test]
-    fn fixed_array_shapes_register_distinct_struct_layouts() {
+    fn positional_shapes_register_distinct_pointer_aware_struct_layouts() {
         let mut graph = FunctionGraph::new("array_shapes");
         let entry = graph.startblock;
-        for owner in ["Array<i64;1>", "Array<bool;2>"] {
+        for owner in ["Array<i64;1>", "Array<bool;2>", "Tuple<Union,Union>"] {
             graph.push_op_var(
                 entry,
                 OpKind::Call {
@@ -30087,6 +30565,7 @@ mod tests {
             graph,
             return_type: None,
             self_ty_root: None,
+            trait_impl_id: None,
             module_path: String::new(),
             hints: Vec::new(),
             trait_root: None,
@@ -30115,6 +30594,21 @@ mod tests {
                 ("__pos_0".into(), "bool".into()),
                 ("__pos_1".into(), "bool".into())
             ]
+        );
+        assert_eq!(
+            fields.fields["Tuple<Union,Union>"],
+            vec![
+                ("__pos_0".into(), "&Union".into()),
+                ("__pos_1".into(), "&Union".into())
+            ],
+            "instance-valued tuple items use the pointer repr recorded by their FORCE attrs",
+        );
+        assert_eq!(
+            attrs["Tuple<Union,Union>"],
+            vec![
+                ("__pos_0".into(), ValueType::Ref(None)),
+                ("__pos_1".into(), ValueType::Ref(None))
+            ],
         );
         assert_ne!(ids["Array<i64;1>"], ids["Array<bool;2>"]);
     }
@@ -30688,6 +31182,73 @@ mod tests {
         assert_eq!(
             crate::codewriter::call::get_type_flag(&ptr_str).1,
             majit_ir::value::Type::Ref
+        );
+    }
+
+    #[test]
+    fn fieldless_enum_field_layout_is_its_discriminant_scalar() {
+        let type_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["AccessMode", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 32}
+                }},
+                "source_text": "enum AccessMode { ReadWrite, ReadOnly }",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "kind": {"Enum": [
+                {"name": "ReadWrite", "fields": [], "discriminant": 0, "attr_info": null},
+                {"name": "ReadOnly", "fields": [], "discriminant": 1, "attr_info": null}
+            ]},
+            "layout": [{
+                "key": "x86_64-unknown-linux-gnu",
+                "value": {
+                    "size": 1,
+                    "align": 1,
+                    "discriminator": {"Branch": {
+                        "offset": 0,
+                        "int_ty": {"Unsigned": "U8"}
+                    }},
+                    "variant_layouts": [
+                        {"field_offsets": []},
+                        {"field_offsets": []}
+                    ],
+                    "repr": {"repr_algo": "Rust", "transparent": false}
+                }
+            }]
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [null, type_decl],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let enum_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "HashConsedValue": [8, {
+                "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
+            }]
+        }))
+        .expect("fixture TyRef parses");
+
+        assert_eq!(super::tyref_to_field_layout_string(&enum_ty, &llbc), "u8");
+        assert_eq!(
+            crate::codewriter::call::get_type_flag("u8"),
+            (
+                majit_ir::descr::ArrayFlag::Unsigned,
+                majit_ir::value::Type::Int,
+                1,
+            )
         );
     }
 
@@ -32194,6 +32755,46 @@ mod tests {
         assert_eq!(
             transparent_ctors, 0,
             "Some(raw nominal pointer) must be the payload identity, with no Option aggregate"
+        );
+    }
+
+    #[test]
+    fn niche_option_boxed_nominal_none_is_null_some_is_identity() {
+        // Charon represents Box as alloc::boxed::Box's ordinary ADT on the
+        // real extraction route (the Builtin spelling is accepted too).
+        let corpus = Llbc::load(crate::runtime_names::artifacts::CHARON_CORPUS_ULLBC)
+            .expect("load checked-in corpus LLBC");
+        let box_def_id = corpus
+            .iter_type_decls()
+            .find(|td| td.item_meta.name_path() == "alloc::boxed::Box")
+            .map(|td| td.def_id)
+            .expect("Box type declaration in corpus");
+        // A Box of the corpus's sized `HostRegistry` struct is one non-null
+        // owning pointer. Rust stores Option<Box<_>> in that same word.
+        let payload = serde_json::json!({
+            "Adt": {
+                "id": { "Adt": box_def_id },
+                "generics": {
+                    "regions": [],
+                    "types": [{
+                        "Adt": {
+                            "id": { "Adt": 4 },
+                            "generics": {
+                                "regions": [], "types": [],
+                                "const_generics": [], "trait_refs": []
+                            }
+                        }
+                    }],
+                    "const_generics": [], "trait_refs": []
+                }
+            }
+        });
+        let graph = lower_option_source_with_payload(payload);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert_eq!(null_muts, 1, "None must lower to one null owning pointer");
+        assert_eq!(
+            transparent_ctors, 0,
+            "Some(Box<nominal>) must be the payload identity, with no Option aggregate"
         );
     }
 

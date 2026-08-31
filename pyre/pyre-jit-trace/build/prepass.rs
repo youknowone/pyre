@@ -1134,6 +1134,10 @@ fn real_main() {
         refs: &static_ref_addrs,
         int_values: &static_int_values,
         error_carrier: PYRE_ERROR_CARRIER,
+        // This interpreter mutates a scalar field through an ordinary
+        // assignment the lowering already reaches, so it declares no store
+        // boundary.
+        scalar_field_stores: &[],
     };
     // Per-source crate-stripped module paths — the analyzer-side
     // metadata (`front::mir`) records

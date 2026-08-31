@@ -4125,7 +4125,9 @@ where
                     // on the container so a young value survives a minor
                     // collection triggered later in the walk (mirrors
                     // `bh_setfield_gc_r` and the setarrayitem case below).
-                    if bytecode == jitcode::insns::BC_SETFIELD_GC_R {
+                    if bytecode == jitcode::insns::BC_SETFIELD_GC_R
+                        && majit_gc::gc_owns_object(struct_ptr as usize)
+                    {
                         majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
                     }
                 }
@@ -4976,7 +4978,9 @@ where
                     // A ref store adds a heap edge array→value; notify the GC on
                     // the container so a young value survives a minor collection
                     // triggered later in the walk (mirrors bh_setarrayitem_gc_r).
-                    if bytecode == jitcode::insns::BC_SETARRAYITEM_GC_R {
+                    if bytecode == jitcode::insns::BC_SETARRAYITEM_GC_R
+                        && majit_gc::gc_owns_object(array_addr as usize)
+                    {
                         majit_gc::gc_write_barrier(majit_ir::GcRef(array_addr as usize));
                     }
                 }
@@ -9277,7 +9281,9 @@ where
                 ctx.heapcache_setfield_cached(sbox_op, items_field_index, abox_op);
                 if struct_ptr != 0 {
                     unsafe { *((struct_ptr as *mut u8).add(items_offset) as *mut i64) = array_ptr };
-                    majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+                    if majit_gc::gc_owns_object(struct_ptr as usize) {
+                        majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+                    }
                 }
 
                 // ── 5. bind the list header to the destination ref register. ──
@@ -10381,7 +10387,62 @@ where
     if refuse_reachable_symbolic_residuals(jitcode) {
         return TraceAction::Abort;
     }
-    let jitcode_arc = Arc::new(jitcode.clone());
+    let green_args = [(JitArgKind::Ref, green_ref)];
+    let red_args: Vec<_> = red_refs
+        .iter()
+        .map(|&(opref, value)| (JitArgKind::Ref, opref, value))
+        .collect();
+    let frame = setup_frame_from_merge_point(
+        ctx,
+        Arc::new(jitcode.clone()),
+        header_pc,
+        &green_args,
+        &red_args,
+    );
+
+    let mut standalone = StandaloneFrameStack::new();
+    standalone.frames.push(frame);
+    let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
+    machine.set_outer_program_pc(header_pc);
+    machine.run_to_end(ctx, sym, runtime)
+}
+
+/// Write one merge-point argument into the register and value slot its bank
+/// owns. Greens and reds differ only in where the `OpRef` came from — a
+/// freshly minted constant for a green, the caller's live box for a red — so
+/// the write itself is shared.
+fn seed_register(frame: &mut MIFrame, kind: JitArgKind, reg: usize, opref: OpRef, value: i64) {
+    match kind {
+        JitArgKind::Int => {
+            frame.int_regs[reg] = Some(opref);
+            frame.int_values[reg] = Some(value);
+        }
+        JitArgKind::Ref => {
+            frame.ref_regs[reg] = Some(opref);
+            frame.ref_values[reg] = Some(value);
+        }
+        JitArgKind::Float => {
+            frame.float_regs[reg] = Some(opref);
+            frame.float_values[reg] = Some(value);
+        }
+    }
+}
+
+/// Build an [`MIFrame`] whose first instruction is a JitDriver merge point.
+///
+/// `MIFrame::setup_call` is the ordinary callee-entry path and resets the
+/// bytecode cursor to the function prologue.  A warm-loop entry instead owns
+/// the values named by the marker itself; replaying the prologue both records
+/// work outside the loop and can read inputs the marker does not carry.  This
+/// is the typed generalization of [`trace_jitcode_from_merge_point`]'s
+/// one-green-ref setup, preserving declaration order within each i/r/f bank.
+pub fn setup_frame_from_merge_point(
+    ctx: &mut TraceCtx,
+    jitcode_arc: Arc<JitCode>,
+    header_pc: usize,
+    green_args: &[(JitArgKind, i64)],
+    red_args: &[(JitArgKind, OpRef, i64)],
+) -> MIFrame {
     // Decode the six register lists of the `jit_merge_point` op at
     // `header_pc`: opcode(1) + jdindex(1), then `[len:u8][reg:u8 * len]` per
     // slot in (green I, green R, green F, red I, red R, red F) order.
@@ -10398,33 +10459,55 @@ where
             }
         }
     }
-    let green_r = std::mem::take(&mut slot_regs[1]);
-    let red_r = std::mem::take(&mut slot_regs[4]);
-
     let mut frame = MIFrame::setup(jitcode_arc, header_pc, None, Some(ctx));
-    // The green ref must be a Const at trace time (verify_green_args).
-    if let Some(&greg) = green_r.first() {
-        let gconst = ctx.const_ref(green_ref);
-        frame.ref_regs[greg] = Some(gconst);
-        frame.ref_values[greg] = Some(green_ref);
+    for (bank, kind) in [JitArgKind::Int, JitArgKind::Ref, JitArgKind::Float]
+        .into_iter()
+        .enumerate()
+    {
+        let args: Vec<_> = green_args
+            .iter()
+            .filter(|(arg_kind, _)| *arg_kind == kind)
+            .map(|(_, value)| *value)
+            .collect();
+        assert_eq!(
+            slot_regs[bank].len(),
+            args.len(),
+            "merge-point green {kind:?} register count disagrees with its typed arguments",
+        );
+        for (&reg, value) in slot_regs[bank].iter().zip(args) {
+            let opref = match kind {
+                JitArgKind::Int => ctx.const_int(value),
+                JitArgKind::Ref => ctx.const_ref(value),
+                JitArgKind::Float => ctx.const_float(value),
+            };
+            seed_register(&mut frame, kind, reg, opref, value);
+        }
     }
-    // Each loop-carried red into the register the op names, paired
-    // positionally with the driver's `collect_jump_args` red order.
-    for (&reg, &(opref, value)) in red_r.iter().zip(red_refs.iter()) {
-        frame.ref_regs[reg] = Some(opref);
-        frame.ref_values[reg] = Some(value);
+    for (bank, kind) in [JitArgKind::Int, JitArgKind::Ref, JitArgKind::Float]
+        .into_iter()
+        .enumerate()
+    {
+        let args: Vec<_> = red_args
+            .iter()
+            .filter(|(arg_kind, _, _)| *arg_kind == kind)
+            .map(|(_, opref, value)| (*opref, *value))
+            .collect();
+        let regs = &slot_regs[bank + 3];
+        assert_eq!(
+            regs.len(),
+            args.len(),
+            "merge-point red {kind:?} register count disagrees with its typed arguments",
+        );
+        for (&reg, (opref, value)) in regs.iter().zip(args) {
+            seed_register(&mut frame, kind, reg, opref, value);
+        }
     }
     // The walker reads from `code_cursor`; `pc` is only the portal anchor.
     // Start both at the merge point so the first executed op is the loop
     // header itself.
     frame.code_cursor = header_pc;
     frame.pc = header_pc;
-
-    let mut standalone = StandaloneFrameStack::new();
-    standalone.frames.push(frame);
-    let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
-    machine.set_outer_program_pc(header_pc);
-    machine.run_to_end(ctx, sym, runtime)
+    frame
 }
 
 /// `b1 is b2` crude fastpath result for comparison opcodes —
@@ -11555,6 +11638,55 @@ mod tests {
         fn fail_args(&self) -> Option<Vec<OpRef>> {
             None
         }
+    }
+
+    #[test]
+    fn merge_point_setup_starts_at_marker_and_seeds_every_typed_bank() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(2, -1);
+        builder.load_const_r_value(1, -1);
+        builder.load_const_f_value(1, -1);
+        builder.jit_merge_point(0, &[0, 1], &[0], &[1], &[2], &[1], &[0]);
+        let jitcode = Arc::new(builder.finish());
+        let header_pc = jitcode
+            .exec
+            .jit_merge_point_offset
+            .expect("builder recorded the marker offset");
+
+        let recorder = crate::recorder::Trace::new();
+        let mut ctx = TraceCtx::new(recorder, 0, Arc::new(crate::MetaInterpStaticData::new()));
+        let red_i = OpRef::input_arg_typed(0, Type::Int);
+        let red_r = OpRef::input_arg_typed(1, Type::Ref);
+        let red_f = OpRef::input_arg_typed(2, Type::Float);
+        let frame = setup_frame_from_merge_point(
+            &mut ctx,
+            jitcode,
+            header_pc,
+            &[
+                (JitArgKind::Ref, 30),
+                (JitArgKind::Int, 10),
+                (JitArgKind::Float, 20),
+                (JitArgKind::Int, 11),
+            ],
+            &[
+                (JitArgKind::Float, red_f, 50),
+                (JitArgKind::Ref, red_r, 40),
+                (JitArgKind::Int, red_i, 60),
+            ],
+        );
+
+        assert_eq!(frame.code_cursor, header_pc);
+        assert_eq!(frame.pc, header_pc);
+        assert_eq!(frame.int_values[0], Some(10));
+        assert_eq!(frame.int_values[1], Some(11));
+        assert_eq!(frame.ref_values[0], Some(30));
+        assert_eq!(frame.float_values[1], Some(20));
+        assert_eq!(frame.int_regs[2], Some(red_i));
+        assert_eq!(frame.ref_regs[1], Some(red_r));
+        assert_eq!(frame.float_regs[0], Some(red_f));
+        assert_eq!(frame.int_values[2], Some(60));
+        assert_eq!(frame.ref_values[1], Some(40));
+        assert_eq!(frame.float_values[0], Some(50));
     }
 
     /// Test `JitCodeRuntime` that opts a synthetic portal into the

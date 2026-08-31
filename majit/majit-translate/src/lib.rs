@@ -453,6 +453,47 @@ impl Default for ErrorCarrierSpec<'_> {
     }
 }
 
+/// The value bank a [`ScalarFieldStore`] writes.
+///
+/// Only the two scalar banks are spellable: this boundary exists for a field
+/// the callee borrows as a Rust `&mut` primitive, and a reference is not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarBank {
+    Int,
+    Float,
+}
+
+/// A consumer function whose whole effect is one scalar field store —
+/// `(target, value) -> ()`, writing `value` into one field of the object
+/// `target` points at.
+///
+/// The lowering cannot reach such a store by descending into the callee: the
+/// body borrows a Rust `&mut i64` / `&mut f64` into the field, and a pointer
+/// to a primitive has no low-level repr here, while rebuilding the container
+/// around it would allocate over a field that is inline. So the consumer
+/// names the boundary and the call lowers to the `setfield_gc_<bank>` the
+/// body performs.
+///
+/// Declared here rather than matched by name inside the lowering for the
+/// reason [`ErrorCarrierSpec`] gives: naming one interpreter's functions in
+/// this layer is what the spec exists to undo. This layer ships none.
+#[derive(Debug, Clone, Copy)]
+pub struct ScalarFieldStore<'a> {
+    /// The function's qualified path, spelled as `item_meta.name_path()`
+    /// does — the same string the callee-side gates compare against.
+    pub function_path: &'a str,
+    /// Crate-stripped owner root of the written field: the
+    /// variant-qualified `module::Enum::Variant` for a variant payload, or
+    /// `module::Struct` for a plain field. The same key the layout pass
+    /// installs, so the emitted descr matches the one a `target.field = v`
+    /// assignment in the consumer's own source would carry.
+    pub owner_root: &'a str,
+    /// The field's name within that owner, `__pos_<N>` for a positional one.
+    pub field: &'a str,
+    /// Which bank the stored scalar belongs to.
+    pub bank: ScalarBank,
+}
+
 /// Host-supplied addresses of prebuilt object-space singletons that pyre
 /// source carries through the flowgraph as opaque `LOAD_GLOBAL`
 /// constants (the static `PyType` pointers and dict-strategy refs).
@@ -484,6 +525,10 @@ pub struct HostStaticAddrs<'a> {
     /// `lower_unstructured_with_static_addrs_and_attrs` and the caller
     /// capture on `Lowering` — so no consumer grows a parameter for it.
     pub error_carrier: ErrorCarrierSpec<'a>,
+    /// Boundaries the consumer declares as one scalar field store each.
+    /// Empty (the `Default`) declares none, which leaves every call to be
+    /// lowered by descending into its callee as usual.
+    pub scalar_field_stores: &'a [ScalarFieldStore<'a>],
 }
 
 /// Multi-file analysis with explicit per-source module paths.
@@ -1425,6 +1470,29 @@ fn analyze_pipeline_from_module_paths(
         call_control.register_function_graph(path.clone(), graph.as_ref().clone());
     }
     prof.mark("  register_function_graph (free fns)");
+    // RPython `CallControl.graphs_from` obtains the graph from the concrete
+    // function pointer, distinguishing same-named methods from distinct trait
+    // impls. The string-keyed Rust registry needs that identity explicitly:
+    // `impl From<bool> for Dynamic` and `impl From<FnPtr> for Dynamic` both
+    // otherwise collapse onto `[types, dynamic, Dynamic, from]`. Charon's
+    // trait-impl id is already carried on the SemanticFunction; register the
+    // exact path that `front::mir::blanket_into_devirt` emits.
+    for func in &program.functions {
+        let (Some(owner), Some(impl_id)) = (&func.self_ty_root, func.trait_impl_id) else {
+            continue;
+        };
+        let path = crate::parse::CallPath::for_trait_impl_method(owner, impl_id, &func.name);
+        let graph = match &func.return_type {
+            Some(return_type) => func.graph.clone().with_return_type(return_type),
+            None => func.graph.clone(),
+        };
+        if func.hints.is_empty() {
+            call_control.register_function_graph(path, graph);
+        } else {
+            call_control.register_function_graph_with_hints(path, graph, func.hints.clone());
+        }
+    }
+    prof.mark("  register concrete trait-impl identities");
     // Re-register free functions with their RPython-equivalent hints
     // (`elidable`, `loop_invariant`, `unroll_safe`, `jit_look_inside`)
     // so `JitPolicy::look_inside_graph` sees the same metadata RPython
@@ -1905,10 +1973,16 @@ fn analyze_pipeline_from_module_paths(
         // AND the hints (elidable/loopinvariant/cannot_collect/oopspec).
         let paths = if let Some(ref owner) = func.self_ty_root {
             // impl method: ["owner", "method"]
-            vec![crate::parse::CallPath::from_segments([
+            let mut paths = vec![crate::parse::CallPath::from_segments([
                 owner.as_str(),
                 func.name.as_str(),
-            ])]
+            ])];
+            if let Some(impl_id) = func.trait_impl_id {
+                paths.push(crate::parse::CallPath::for_trait_impl_method(
+                    owner, impl_id, &func.name,
+                ));
+            }
+            paths
         } else {
             // Same alias-spelling set as the graph-registration loop
             // above so every spelling the call-site might canonicalise

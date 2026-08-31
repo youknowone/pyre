@@ -4043,6 +4043,69 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
+        // RPython's rtyper materialises every heap-carried enum variant as
+        // `malloc(GcStruct)` plus a tag store and payload stores. Charon gives
+        // us the same pre-rtyper shape for user enums: a niladic synthetic
+        // variant ctor followed by `FieldWrite`s, while the enum's exact
+        // discriminant table is already registered on CallControl. Restore
+        // that general lowering here instead of residualising a constructor
+        // that has no callable address.
+        //
+        // Result/Option have already taken their explicit-shell arms above;
+        // this path uses the native variant layout and only accepts an owner
+        // whose final segment is exactly the constructor's variant name.
+        if args.is_empty()
+            && let CallTarget::SyntheticTransparentCtor { name, .. } = target
+            && let ValueType::Ref(Some(owner)) = result_ty
+            && let Some(result_base) = owner.strip_suffix(&format!("::{name}"))
+            && let Some(cc) = self.callcontrol.as_deref()
+        {
+            let base_leaf = result_base.rsplit("::").next().unwrap_or(result_base);
+            let variants = cc
+                .enum_variant_by_discriminant()
+                .get(result_base)
+                .or_else(|| cc.enum_variant_by_discriminant().get(base_leaf));
+            let tag = variants.and_then(|variants| {
+                variants
+                    .iter()
+                    .find_map(|(tag, variant)| (variant == name).then_some(*tag))
+            });
+            let allocatable =
+                crate::codewriter::assembler::bh_size_spec_from_callcontrol(cc, owner)
+                    .is_some_and(|spec| !spec.all_fielddescrs.is_empty());
+            if let Some(tag) = tag
+                && allocatable
+            {
+                let result = op
+                    .result
+                    .clone()
+                    .expect("synthetic enum variant ctor must produce a value");
+                return RewriteResult::Replace(vec![
+                    SpaceOperation {
+                        result: Some(result.clone()),
+                        kind: OpKind::New {
+                            owner: owner.clone(),
+                        },
+                    },
+                    SpaceOperation {
+                        result: None,
+                        kind: OpKind::FieldWrite {
+                            base: result,
+                            field: crate::model::FieldDescriptor::new(
+                                "__discriminant",
+                                Some(result_base.to_string()),
+                            ),
+                            value: crate::model::LinkArg::Const(
+                                crate::flowspace::model::Constant::new(
+                                    crate::flowspace::model::ConstValue::Int(tag),
+                                ),
+                            ),
+                            ty: ValueType::Int,
+                        },
+                    },
+                ]);
+            }
+        }
         // `rbuiltin.py rtype_const_result` /
         // `translator/rtyper/rbuiltin.rs::rtype_ptr_null`: by the time
         // jtransform runs, `ptr::null[_mut]()` is a typed null pointer

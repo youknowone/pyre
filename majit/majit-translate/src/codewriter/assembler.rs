@@ -3696,20 +3696,19 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     }
     let canonical_owner = majit_ir::descr::canonical_struct_name(owner);
     let owner = canonical_owner.as_str();
-    // RPython keys SizeDescrs on the low-level STRUCT object, not on an
-    // annotation-side generic instantiation. Charon registers one physical
-    // layout for a nominal generic TypeDecl, so `Result<T>::Ok` and
-    // `Result<U>::Ok` converge on the template variant. Positional aggregates
-    // are different: their item types and arity define the low-level layout,
-    // so preserve the full `Tuple<T,...>` / `Array<T;N>` identity.
-    let layout_owner = if majit_ir::descr::is_shaped_tuple_name(owner)
-        || majit_ir::descr::is_shaped_array_name(owner)
-    {
-        std::borrow::Cow::Borrowed(owner)
+    // RPython keys SizeDescrs on the concrete low-level STRUCT object. A Rust
+    // generic TypeDecl is only a template: `Option<usize>::Some` and
+    // `Option<BinOpKind>::Some` can have different payload banks and therefore
+    // cannot share a field-descr cache entry. Prefer Charon's concrete
+    // instantiation layout and fall back to the nominal template only for the
+    // layout lookup; descriptor identity remains the full concrete owner.
+    let template_owner = majit_ir::descr::strip_generic_args(owner);
+    let template_owner = template_owner.as_ref();
+    let layout_owner = if cc.struct_layout_for(owner).is_some() {
+        owner
     } else {
-        majit_ir::descr::strip_generic_args(owner)
+        template_owner
     };
-    let layout_owner = layout_owner.as_ref();
     let mut size = cc
         .struct_layout_for(layout_owner)
         .map(|layout| layout.size)
@@ -3726,7 +3725,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     // blackhole must reconstruct the same inherited tag slot or the payload
     // takes slot 0 here while living at byte 8 there.  `None` carries no
     // payload row, so it needs no reconstruction.
-    let result_variant = is_explicit_shell_variant_owner(layout_owner);
+    let result_variant = is_explicit_shell_variant_owner(template_owner);
     // The bare Charon variant can contain only the inherited enum tag while
     // the annotator keeps the payload row on the concrete instantiation
     // (`Result<PyObjectRef, PyError>::Ok`).  RPython has one concrete low-level
@@ -3737,12 +3736,17 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     let mut all_fielddescrs = if result_variant {
         let instantiated = bh_result_variant_field_specs(cc, owner);
         if instantiated.is_empty() {
-            bh_result_variant_field_specs(cc, layout_owner)
+            bh_result_variant_field_specs(cc, template_owner)
         } else {
             instantiated
         }
     } else {
-        bh_all_field_specs_for_struct(cc, layout_owner)
+        let instantiated = bh_all_field_specs_for_struct(cc, owner);
+        if instantiated.is_empty() {
+            bh_all_field_specs_for_struct(cc, template_owner)
+        } else {
+            instantiated
+        }
     };
     if result_variant {
         size = size.max(16);
@@ -3760,7 +3764,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
             0,
             bh_field_spec_from_parts(
                 0,
-                layout_owner,
+                template_owner,
                 "__discriminant",
                 0,
                 8,
@@ -3814,7 +3818,10 @@ pub(crate) fn bh_size_spec_from_callcontrol(
             );
         }
     }
-    let (is_gc_managed, headerless) = cc.struct_storage_for(layout_owner).unwrap_or((true, false));
+    let (is_gc_managed, headerless) = cc
+        .struct_storage_for(owner)
+        .or_else(|| cc.struct_storage_for(template_owner))
+        .unwrap_or((true, false));
     Some(crate::jitcode::BhSizeSpec {
         size,
         is_gc_managed,

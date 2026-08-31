@@ -4,7 +4,7 @@ mod frame;
 pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
-    StandaloneFrameStack, residual_write_effect_info, trace_jitcode,
+    StandaloneFrameStack, residual_write_effect_info, setup_frame_from_merge_point, trace_jitcode,
     trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point, trace_jitcode_with_args,
     trace_jitcode_with_args_and_runtime,
 };
@@ -5272,7 +5272,7 @@ impl<M: Clone> MetaInterp<M> {
     /// [`Self::on_back_edge`]), which keep the legacy u64 hash path. On
     /// install, `ensure_cell_for_key` clones the key into the cell's
     /// `comparekey`, so reuse is safe.
-    fn with_typed_decision_key<R>(
+    pub(crate) fn with_typed_decision_key<R>(
         green_key: u64,
         green_key_raw: (usize, usize),
         f: impl FnOnce(&majit_ir::GreenKey) -> R,

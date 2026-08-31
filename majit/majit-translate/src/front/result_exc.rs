@@ -2690,7 +2690,7 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
 /// `block`, mirroring the front lowering's Aggregate shape
 /// (`front/mir.rs` `Rvalue::Aggregate`: niladic transparent ctor + one
 /// FieldWrite per operand, `result: None` on the write).
-fn build_shell(
+pub(crate) fn build_shell(
     graph: &mut FunctionGraph,
     block: crate::model::BlockId,
     variant: &str,

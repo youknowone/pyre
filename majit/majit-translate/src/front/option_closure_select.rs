@@ -89,6 +89,9 @@ pub(crate) struct ClosureSelectSite {
     /// True when the BUILT result is a niche `Option` — `Some(x)` is then `x`
     /// itself and `None` is null, the produce-side mirror of `niche`.
     pub result_niche: bool,
+    /// `None` tag when the built result is `Option<E>` over a densely
+    /// numbered fieldless enum.  `Some(e)` is the scalar `e` itself.
+    pub result_fieldless_none_tag: Option<i64>,
     /// The closure env ADT `name_path` — the `call_once` inherent-method owner.
     pub call_once_owner: String,
     /// The receiver `Option`'s payload `T` projected to a [`ValueType`] — the
@@ -116,6 +119,8 @@ pub(crate) struct ClosureSelectSite {
     /// itself (identity), not a `__pos_0` field read.  (The closure `Args`
     /// tuple `__pos_0` write is unaffected — that is a real `Tuple` field.)
     pub niche: bool,
+    /// Receiver-side counterpart of `result_fieldless_none_tag`.
+    pub fieldless_none_tag: Option<i64>,
     /// A closure whose declared result is `Result<T, PyError>` is translated
     /// uniformly to the graph exception ABI: it returns `T` and raises for
     /// `Err`.  These combinators retain that Result as data, so their
@@ -320,7 +325,7 @@ fn rewire_one_closure_select_site(
                 // that a niche `Option` is a one-word pointer with no aggregate
                 // `__discriminant` / `__pos_0`, where `Some(x)` is `x` itself.
                 ClosureCombinator::Map => {
-                    if site.result_niche {
+                    if site.result_niche || site.result_fieldless_none_tag.is_some() {
                         call_result
                     } else {
                         emit_option_variant(
@@ -363,6 +368,14 @@ fn rewire_one_closure_select_site(
             if site.result_niche {
                 (
                     graph.push_null_mut_ptr(else_bb),
+                    else_bb,
+                    else_inputs.clone(),
+                )
+            } else if let Some(none_tag) = site.result_fieldless_none_tag {
+                (
+                    graph
+                        .push_op_var(else_bb, OpKind::ConstInt(none_tag), true)
+                        .expect("ConstInt produces a value"),
                     else_bb,
                     else_inputs.clone(),
                 )
@@ -449,6 +462,19 @@ fn rewire_one_closure_select_site(
                 result_ty: ValueType::Int,
             },
         });
+    } else if let Some(none_tag) = site.fieldless_none_tag {
+        let none = graph
+            .push_op_var(a_id, OpKind::ConstInt(none_tag), true)
+            .expect("ConstInt produces a value");
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: opt.clone(),
+                rhs: none,
+                result_ty: ValueType::Int,
+            },
+        });
     } else {
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
@@ -482,7 +508,7 @@ fn read_some_payload(
 ) -> Variable {
     // A niche `Option<NonNull>` has no aggregate `__pos_0`; the payload IS the
     // base pointer, so the read is the identity on it.
-    if site.niche {
+    if site.niche || site.fieldless_none_tag.is_some() {
         return opt;
     }
     let payload = graph.alloc_value_var();
@@ -602,9 +628,11 @@ mod tests {
             call_result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
+            fieldless_none_tag: None,
             result_option_owner: RESULT_OPTION.into(),
             result_some_owner: RESULT_SOME.into(),
             result_niche,
+            result_fieldless_none_tag: None,
             call_once_result_exc: None,
         }
     }
@@ -912,6 +940,42 @@ mod tests {
             "a niche Option has no discriminant field to write"
         );
         assert_eq!(count_null_mut(&g), 1, "the None arm is the null pointer");
+    }
+
+    #[test]
+    fn map_with_fieldless_enum_result_builds_scalar_none_tag() {
+        let mut g = FunctionGraph::new("test_closure_select_fieldless_result");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map", Some(RECV_OPTION.into())),
+                    args: vec![opt, env],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+        let mut site = site(ClosureCombinator::Map, result);
+        site.result_fieldless_none_tag = Some(5);
+
+        assert_eq!(
+            rewire_closure_select_call_sites(&mut g, &[site]).rewritten,
+            1
+        );
+        assert_eq!(count_ctors(&g), 0);
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::ConstInt(5)))
+        );
     }
 
     #[test]

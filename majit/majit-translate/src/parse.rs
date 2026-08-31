@@ -53,6 +53,22 @@ impl CallPath {
         Self { segments }
     }
 
+    /// Build the direct-call identity for one concrete trait-impl method.
+    ///
+    /// RPython `CallControl.graphs_from` obtains the callee graph from the
+    /// function pointer, so two `impl From<_> for Dynamic` methods never
+    /// collide even though their owner and method names are equal. Charon
+    /// gives each concrete impl a stable id within the LLBC; keep that id as
+    /// its own synthetic path segment so name-keyed registration preserves
+    /// the same distinction.
+    pub fn for_trait_impl_method(impl_type_joined: &str, impl_id: u64, method: &str) -> Self {
+        let mut path = Self::for_impl_method(impl_type_joined, method);
+        let leaf = path.segments.pop().expect("method segment");
+        path.segments.push(format!("<Impl#{impl_id}>"));
+        path.segments.push(leaf);
+        path
+    }
+
     pub fn last_segment(&self) -> Option<&str> {
         self.segments.last().map(String::as_str)
     }
@@ -114,4 +130,21 @@ pub struct InherentMethodInfo {
     pub return_type: Option<String>,
     /// RPython: function-level JIT hints (elidable, close_stack, etc.).
     pub hints: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CallPath;
+
+    #[test]
+    fn concrete_trait_impl_paths_keep_same_named_methods_distinct() {
+        let bool_from = CallPath::for_trait_impl_method("types::dynamic::Dynamic", 1105, "from");
+        let fnptr_from = CallPath::for_trait_impl_method("types::dynamic::Dynamic", 835, "from");
+
+        assert_eq!(
+            bool_from.segments,
+            ["types", "dynamic", "Dynamic", "<Impl#1105>", "from"]
+        );
+        assert_ne!(bool_from, fnptr_from);
+    }
 }

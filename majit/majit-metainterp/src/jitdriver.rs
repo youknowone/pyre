@@ -7076,13 +7076,21 @@ impl<S: JitState> JitDriver<S> {
         // nothing about any of them.
         crate::mc_diag_bump(61); // mst_entered
         // warmstate.py `maybe_compile_and_run` consults the cell before
-        // `bound_reached` builds tracing state.  Pyre's abort ceiling is the
-        // equivalent permanent refusal: `back_edge_internal` has already
-        // resolved the bucket hash to this one cell key, so the latch can be
-        // answered without constructing frontend state.  Keep slot 81 on the
-        // same population as the mirrored refusal in
+        // `bound_reached` builds tracing state. Pyre's abort ceiling is the
+        // equivalent permanent refusal. Resolve it through the same typed-key
+        // helper as `on_back_edge_typed_decision` below; the public
+        // hash-only doors fall back through the same u64 arm as that decision.
+        // Keep slot 81 on the same population as the mirrored refusal in
         // `maybe_compile_decision_with_meta`.
-        if self.meta.warm_state.is_ceiling_latched(green_key) {
+        let ceiling_latched = match MetaInterp::<S::Meta>::with_typed_decision_key(
+            green_key,
+            (state.code_ptr(), target_pc),
+            |key| self.meta.warm_state.is_ceiling_latched_for_key(key),
+        ) {
+            Some(latched) => latched,
+            None => self.meta.warm_state.is_ceiling_latched(green_key),
+        };
+        if ceiling_latched {
             crate::mc_diag_bump(81); // abort_ceiling_refused
             return false;
         }
@@ -9212,6 +9220,7 @@ mod tests {
     struct CountingDoorState {
         build_meta_calls: std::cell::Cell<usize>,
         extract_live_values_calls: std::cell::Cell<usize>,
+        code_ptr: usize,
     }
 
     #[derive(Default)]
@@ -9295,6 +9304,10 @@ mod tests {
         }
 
         fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
+
+        fn code_ptr(&self) -> usize {
+            self.code_ptr
+        }
 
         fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
             Vec::new()
@@ -9698,6 +9711,61 @@ mod tests {
         );
         assert_eq!(state.build_meta_calls.get(), 0);
         assert_eq!(state.extract_live_values_calls.get(), 0);
+    }
+
+    #[test]
+    fn chained_ceiling_latch_does_not_refuse_the_typed_sibling() {
+        use crate::warmstate::MAX_TRACE_ABORT_COUNT;
+
+        let mut driver = JitDriver::<CountingDoorState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let target_pc = 7usize;
+        let code_ptr = 0x1234usize;
+        let key = GreenKey::with_types(
+            vec![target_pc as i64, 0, code_ptr as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        let green_key = key.get_uhash();
+
+        // The hash-only route owns the bucket key and reaches its ceiling.
+        driver
+            .meta
+            .warm_state_mut()
+            .disable_noninlinable_function(green_key);
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            driver.meta.warm_state_mut().abort_tracing(green_key, false);
+        }
+        // The typed route cannot match that comparator-less cell, so it owns
+        // a fresh sibling in the same bucket.
+        driver.meta.warm_state_mut().ensure_cell_for_key(&key);
+        assert_eq!(
+            driver.meta.warm_state.get_stats().num_cells,
+            2,
+            "fixture must contain the hash-only cell and its typed sibling",
+        );
+        assert!(driver.meta.warm_state.is_ceiling_latched(green_key));
+        assert!(
+            driver.meta.warm_state.lookup_chain_with_key(&key).is_some(),
+            "the typed decision must resolve its own cell in the chain",
+        );
+        assert!(
+            !driver.meta.warm_state.is_ceiling_latched_for_key(&key),
+            "the typed sibling must not inherit the raw cell's ceiling latch",
+        );
+
+        let mut state = CountingDoorState {
+            code_ptr,
+            ..Default::default()
+        };
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(green_key, target_pc, &mut state, &(), || {},)
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "the early ceiling check and typed decision must select the same cell",
+        );
     }
 
     #[test]

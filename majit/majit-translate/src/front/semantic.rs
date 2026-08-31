@@ -53,6 +53,11 @@ pub struct SemanticFunction {
     /// Owner type for impl methods (e.g. "MyStruct" for `impl MyStruct { fn foo() }`).
     /// Used to construct the full CallPath for return_type registration.
     pub self_ty_root: Option<String>,
+    /// Charon's concrete trait-impl identity when this function comes from an
+    /// `Impl { Trait: id }` name segment. RPython `CallControl.graphs_from`
+    /// obtains the graph from the function object; the Rust port uses this id
+    /// to keep same-named impl methods distinct in `CallPath`.
+    pub trait_impl_id: Option<u64>,
     /// Module path of the defining file, crate-stripped (e.g.
     /// `"pyframe"` for `pyre-interpreter/src/pyframe.rs`), populated by
     /// `front::mir` from the module portion of Charon's `name_path()`.
@@ -1083,6 +1088,7 @@ mod tests {
             graph: FunctionGraph::new(name),
             return_type: None,
             self_ty_root: None,
+            trait_impl_id: None,
             module_path: String::new(),
             hints: Vec::new(),
             trait_root: None,
