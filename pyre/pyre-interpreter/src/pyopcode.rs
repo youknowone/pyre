@@ -1918,6 +1918,13 @@ fn op_arg_as_usize(arg: OpArg) -> usize {
 /// body still emits a residual_call to the third-party helpers, but
 /// the OUTER call site is tagged elidable so the walker's
 /// `try_fold_pure_call_via_executor` fold path runs end-to-end.
+///
+/// Every handler that resolves an `Arg<VarNum>` to a localsplus index
+/// goes through here, not only the `LOAD_FAST` family it is named for:
+/// `STORE_FAST`, `DELETE_FAST`, `LOAD_FAST_AND_CLEAR`, `MAKE_CELL` and
+/// the `*_DEREF` handlers all carry the same field type, and each raw
+/// `var_num.get(op_arg).as_usize()` left in a handler body is one
+/// unbindable third-party residual on that opcode's walked path.
 #[inline]
 #[majit_macros::elidable_cannot_raise]
 pub fn load_fast_var_num_to_index(
@@ -2797,7 +2804,7 @@ where
     let Instruction::StoreFast { var_num } = instruction else {
         unreachable!()
     };
-    executor.store_fast(var_num.get(op_arg).as_usize())?;
+    executor.store_fast(load_fast_var_num_to_index(var_num, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2809,7 +2816,7 @@ pub fn execute_delete_fast<E: OpcodeStepExecutor>(
     let Instruction::DeleteFast { var_num } = instruction else {
         unreachable!()
     };
-    executor.delete_fast(var_num.get(op_arg).as_usize())?;
+    executor.delete_fast(load_fast_var_num_to_index(var_num, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -3213,7 +3220,7 @@ pub fn execute_make_cell<E: OpcodeStepExecutor>(
     let Instruction::MakeCell { i } = instruction else {
         unreachable!()
     };
-    executor.make_cell(i.get(op_arg).as_usize())?;
+    executor.make_cell(load_fast_var_num_to_index(i, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -3237,7 +3244,7 @@ pub fn execute_load_deref<E: OpcodeStepExecutor>(
     let Instruction::LoadDeref { i } = instruction else {
         unreachable!()
     };
-    executor.load_deref(i.get(op_arg).as_usize())?;
+    executor.load_deref(load_fast_var_num_to_index(i, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -3249,7 +3256,7 @@ pub fn execute_store_deref<E: OpcodeStepExecutor>(
     let Instruction::StoreDeref { i } = instruction else {
         unreachable!()
     };
-    executor.store_deref(i.get(op_arg).as_usize())?;
+    executor.store_deref(load_fast_var_num_to_index(i, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -3261,7 +3268,7 @@ pub fn execute_delete_deref<E: OpcodeStepExecutor>(
     let Instruction::DeleteDeref { i } = instruction else {
         unreachable!()
     };
-    executor.delete_deref(i.get(op_arg).as_usize())?;
+    executor.delete_deref(load_fast_var_num_to_index(i, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -3297,7 +3304,7 @@ pub fn execute_load_fast_and_clear<E: OpcodeStepExecutor>(
     let Instruction::LoadFastAndClear { var_num } = instruction else {
         unreachable!()
     };
-    executor.load_fast_and_clear(var_num.get(op_arg).as_usize())?;
+    executor.load_fast_and_clear(load_fast_var_num_to_index(var_num, op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -3570,7 +3577,7 @@ pub fn execute_load_from_dict_or_deref<E: OpcodeStepExecutor>(
     let Instruction::LoadFromDictOrDeref { i } = instruction else {
         unreachable!()
     };
-    let idx = i.get(op_arg).as_usize();
+    let idx = load_fast_var_num_to_index(i, op_arg);
     // `idx` is a localsplus offset (cell / free var), not a `co_names` index.
     let name = crate::pyframe::deref_name_and_kind(code, idx).0;
     executor.load_from_dict_or_deref(idx, name)?;
