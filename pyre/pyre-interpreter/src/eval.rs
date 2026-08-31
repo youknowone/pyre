@@ -262,7 +262,7 @@ impl FrameAnchor {
     /// null slot, so anchoring one costs a push and answers null from
     /// [`Self::live`].
     pub unsafe fn from_raw(frame: *mut PyFrame) -> Self {
-        let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(frame as usize));
+        let depth = frame_anchor_push(frame);
         Self {
             depth,
             _not_send: std::marker::PhantomData,
@@ -270,14 +270,37 @@ impl FrameAnchor {
     }
 
     pub fn live(&self) -> *mut PyFrame {
-        majit_gc::shadow_stack::get(self.depth).0 as *mut PyFrame
+        frame_anchor_live(self.depth)
     }
 }
 
 impl Drop for FrameAnchor {
     fn drop(&mut self) {
-        majit_gc::shadow_stack::try_pop_to(self.depth);
+        frame_anchor_release(self.depth);
     }
+}
+
+/// Shadow-stack slot publication behind [`FrameAnchor`].  The slot ops live
+/// in `majit_gc`, which has no jitcode graphs, so a walked handler graph
+/// reaching them found only a symbolic path hash.  First-party
+/// `dont_look_inside` wrappers with word-sized signatures keep each op a
+/// bound residual the tracer can execute (`jit_trace_fnaddrs()` rows).
+#[majit_macros::dont_look_inside]
+pub fn frame_anchor_push(frame: *mut PyFrame) -> usize {
+    majit_gc::shadow_stack::push(majit_ir::GcRef(frame as usize))
+}
+
+/// Read the anchored frame back from its shadow-stack slot; a collection
+/// between push and read leaves the forwarded address here.
+#[majit_macros::dont_look_inside]
+pub fn frame_anchor_live(depth: usize) -> *mut PyFrame {
+    majit_gc::shadow_stack::get(depth).0 as *mut PyFrame
+}
+
+/// Release the anchor's slot (and any deeper ones) on drop.
+#[majit_macros::dont_look_inside]
+pub fn frame_anchor_release(depth: usize) {
+    majit_gc::shadow_stack::try_pop_to(depth);
 }
 
 /// rpython/memory/gctransform/framework.py `root_walker.walk_roots` parity:

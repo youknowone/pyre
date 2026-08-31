@@ -2847,6 +2847,24 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::executioncontext::space_decrement_ticker",
         ec_space_decrement_ticker,
     );
+    let eval_frame_anchor_push: fn(*mut crate::PyFrame) -> usize = crate::eval::frame_anchor_push;
+    p1(
+        &mut entries,
+        "pyre_interpreter::eval::frame_anchor_push",
+        eval_frame_anchor_push,
+    );
+    let eval_frame_anchor_live: fn(usize) -> *mut crate::PyFrame = crate::eval::frame_anchor_live;
+    p1(
+        &mut entries,
+        "pyre_interpreter::eval::frame_anchor_live",
+        eval_frame_anchor_live,
+    );
+    let eval_frame_anchor_release: fn(usize) = crate::eval::frame_anchor_release;
+    p1(
+        &mut entries,
+        "pyre_interpreter::eval::frame_anchor_release",
+        eval_frame_anchor_release,
+    );
     pa1(
         &mut entries,
         "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
