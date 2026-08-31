@@ -1130,6 +1130,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         .enumerate()
         .map(|(i, d)| match d {
             RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+            RuntimeBhDescr::ResolvedDescr { .. } => d
+                .as_optimizer_descr()
+                .expect("resolved field descriptor")
+                .clone(),
             RuntimeBhDescr::JitCode(_)
             | RuntimeBhDescr::JitCodeBackEdge(_)
             | RuntimeBhDescr::Call(_)

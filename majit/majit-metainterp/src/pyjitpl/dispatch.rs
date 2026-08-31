@@ -4064,7 +4064,13 @@ where
                         crate::blackhole::BhDescr::Field { field_size, .. } => *field_size,
                         _ => 8,
                     };
-                    let (offset, fielddescr) = field_descr_ref_from_bh(bh);
+                    let offset = match bh {
+                        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
+                        other => panic!("BC_SETFIELD_GC: descriptor is not a Field: {other:?}"),
+                    };
+                    let fielddescr = frame
+                        .runtime_optimizer_descr(descr_idx)
+                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
                     (offset, field_size, fielddescr)
                 };
                 let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
@@ -4350,7 +4356,13 @@ where
                         } => (*field_size, *is_field_signed),
                         _ => (8, false),
                     };
-                    let (offset, fielddescr) = field_descr_ref_from_bh(bh);
+                    let offset = match bh {
+                        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
+                        other => panic!("BC_GETFIELD_GC: descriptor is not a Field: {other:?}"),
+                    };
+                    let fielddescr = frame
+                        .runtime_optimizer_descr(descr_idx)
+                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
                     (offset, field_size, is_field_signed, fielddescr)
                 };
                 let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
@@ -4435,7 +4447,16 @@ where
                     let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                         panic!("BC_GETFIELD_GC_F: descrs[{descr_idx}] is not a BhDescr entry")
                     });
-                    field_descr_ref_from_bh(bh)
+                    let offset = match bh {
+                        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
+                        other => panic!("BC_GETFIELD_GC_F: descriptor is not a Field: {other:?}"),
+                    };
+                    (
+                        offset,
+                        frame
+                            .runtime_optimizer_descr(descr_idx)
+                            .unwrap_or_else(|| field_descr_ref_from_bh(bh).1),
+                    )
                 };
                 let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
                 let loaded = if struct_ptr != 0 {
@@ -9134,14 +9155,32 @@ where
                             "BC_NEWLIST_CLEAR: descrs[{length_descr_idx}] is not a BhDescr entry"
                         )
                     });
-                    field_descr_ref_from_bh(bh)
+                    let offset = match bh {
+                        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
+                        other => {
+                            panic!("BC_NEWLIST_CLEAR: length descriptor is not a Field: {other:?}")
+                        }
+                    };
+                    let descr = frame
+                        .runtime_optimizer_descr(length_descr_idx)
+                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
+                    (offset, descr)
                 };
                 let (items_offset, items_fielddescr) = {
                     let frame = self.frames.current_mut();
                     let bh = frame.runtime_bh_descr(items_descr_idx).unwrap_or_else(|| {
                         panic!("BC_NEWLIST_CLEAR: descrs[{items_descr_idx}] is not a BhDescr entry")
                     });
-                    field_descr_ref_from_bh(bh)
+                    let offset = match bh {
+                        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
+                        other => {
+                            panic!("BC_NEWLIST_CLEAR: items descriptor is not a Field: {other:?}")
+                        }
+                    };
+                    let descr = frame
+                        .runtime_optimizer_descr(items_descr_idx)
+                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
+                    (offset, descr)
                 };
                 // arraydescr: geometry for the live items-block allocation
                 // (`base_size + length*itemsize` bytes, cleared, length word

@@ -1112,6 +1112,14 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn is_const(&self, opref: OpRef) -> bool {
+        // `ResumeDataLoopMemo._number_boxes` in resume.py tests
+        // `isinstance(box, Const)` on the object it already holds.  An inline
+        // Const OpRef is that complete object on pyre's flattened boundary;
+        // rebuilding an `Operand::Const` merely to ask its class allocated an
+        // Rc for every live constant in every guard.
+        if opref.is_constant() {
+            return true;
+        }
         if self
             .ctx
             .get_box_replacement_operand_opt(opref)
@@ -1130,6 +1138,17 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn get_const(&self, opref: OpRef) -> (i64, majit_ir::Type) {
+        // resume.py `getconst` reads the carried Const directly. Preserve that
+        // zero-allocation path for the inline representation just recognized
+        // by `is_const` above.
+        if let Some(value) = self.ctx.get_constant(opref) {
+            return match value {
+                Value::Int(v) => (v, majit_ir::Type::Int),
+                Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
+                Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
+                Value::Void => (0, majit_ir::Type::Int),
+            };
+        }
         match self
             .ctx
             .get_box_replacement_operand_opt(opref)

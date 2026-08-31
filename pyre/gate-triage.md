@@ -85,13 +85,17 @@ Kept as-is; listed for completeness.
   `MAJIT_RTYPER_VERBOSE`, `MAJIT_JTRANSFORM_SHADOW`, `PYRE_DIAG124C`, `_51C`,
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `MAJIT_NBODY_DEBUG`,
-  `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`, `PYRE_DESCR_DEMAND`.
+  `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`, `PYRE_DESCR_DEMAND`,
+  `PYRE_CENSUS_HISTOGRAM`.
   `PYRE_DESCR_DEMAND` records the distinct dense descriptor indices a run
   actually resolves, so the per-index pool loader can be measured against the
   pool size; the resolve path reads it through a `OnceLock` and pays nothing
   when it is unset. It is a measurement probe with no ON behaviour to graduate,
   so it has no epic — delete it with the demand counter itself once the pool's
   working set is settled.
+  `PYRE_CENSUS_HISTOGRAM` prints the regex allocation census by exact request
+  size. It is disabled by default and retires with the regex deopt-allocation
+  investigation that consumes the histogram.
 - **Default-OFF experiments (0)** — every gate this bucket once held has had
   its reader and its ON path deleted, the last of them when the `LIST_APPEND`
   admission it gated became unconditional. The live default-OFF arms left in

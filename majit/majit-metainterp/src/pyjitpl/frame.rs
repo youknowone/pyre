@@ -263,6 +263,17 @@ impl MIFrame {
             .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
     }
 
+    /// Return the optimizer descriptor stored beside the canonical `d`
+    /// operand.  `Assembler.descrs` upstream stores the one descriptor object
+    /// both blackhole and tracing dispatch consume; this is the tracing view
+    /// of pyre's split serialized/runtime representation.
+    pub fn runtime_optimizer_descr(&self, descr_idx: usize) -> Option<majit_ir::DescrRef> {
+        self.jitcode
+            .descr_at(descr_idx)
+            .and_then(crate::jitcode::RuntimeBhDescr::as_optimizer_descr)
+            .cloned()
+    }
+
     /// Read the static-field index from a canonical `VableField` descr
     /// pool entry at `pos`. Stage 3c-3 dropped the dual-mode
     /// auto-detect, so the bytes must already be canonical

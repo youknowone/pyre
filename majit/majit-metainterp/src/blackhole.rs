@@ -16,15 +16,7 @@ use majit_ir::{GcRef, OpCode};
 ///
 /// Corresponds to ContinueRunningNormally(gi, gr, gf, ri, rr, rf)
 /// in jitexc.py:53 — the typed portal args, NOT live locals.
-#[derive(Debug, Clone, Default)]
-pub struct MergePointArgs {
-    pub green_int: Vec<i64>,
-    pub green_ref: Vec<i64>,
-    pub green_float: Vec<i64>,
-    pub red_int: Vec<i64>,
-    pub red_ref: Vec<i64>,
-    pub red_float: Vec<i64>,
-}
+pub type MergePointArgs = crate::jitexc::ContinueRunningNormallyArgs;
 
 /// Exception state tracked during blackhole execution.
 ///
@@ -178,7 +170,7 @@ pub enum DispatchError {
     RaiseException { exc: i64, resume_position: usize },
     /// blackhole.py:1068-1069: raise ContinueRunningNormally(*args)
     /// Bottommost blackhole reached the merge point — restart portal.
-    ContinueRunningNormally(Box<MergePointArgs>),
+    ContinueRunningNormally(MergePointArgs),
 }
 
 /// Jitcode-based blackhole interpreter.
@@ -398,6 +390,14 @@ pub struct BlackholeInterpreter {
     pub(crate) native_inline_args_i_scratch: Vec<i64>,
     pub(crate) native_inline_args_r_scratch: Vec<i64>,
     pub(crate) native_inline_args_f_scratch: Vec<i64>,
+    /// Backing stores for the six lists decoded by `bhimpl_jit_merge_point`.
+    /// RPython creates those lists in the GC nursery, where each allocation is
+    /// a bump-pointer advance. Rust `Vec` uses the process allocator instead;
+    /// retain its capacity on the already-pooled blackhole frame and recover
+    /// it after the `ContinueRunningNormally` handoff has been consumed. The
+    /// list values and lifetime remain per handoff; only disposable backing
+    /// capacity survives, like the native-inline argument scratch above.
+    merge_point_args_scratch: MergePointArgs,
     /// State-field JIT register layout (`StateFieldLayout`).  Set on the
     /// root resume frame from `JitState::state_field_layout` so the
     /// `state_field` handlers can map a logical field/array index to the
@@ -531,12 +531,26 @@ impl Default for BlackholeInterpreter {
             native_inline_args_i_scratch: Vec::new(),
             native_inline_args_r_scratch: Vec::new(),
             native_inline_args_f_scratch: Vec::new(),
+            merge_point_args_scratch: MergePointArgs::default(),
             state_field_layout: StateFieldLayout::default(),
         }
     }
 }
 
 impl BlackholeInterpreter {
+    /// Return a consumed `ContinueRunningNormally` payload to this pooled
+    /// frame. Values are cleared immediately; only the six Vec capacities are
+    /// retained for the next merge-point decode.
+    pub(crate) fn recycle_merge_point_args(&mut self, mut args: MergePointArgs) {
+        args.green_int.clear();
+        args.green_ref.clear();
+        args.green_float.clear();
+        args.red_int.clear();
+        args.red_ref.clear();
+        args.red_float.clear();
+        self.merge_point_args_scratch = args;
+    }
+
     /// The `self.position = position` that closes `blackhole.py setposition`,
     /// plus the two pyre-only diagnostic cursors derived from the same
     /// coordinate.
@@ -1071,16 +1085,7 @@ impl BlackholeInterpreter {
         // ContinueRunningNormally; it propagates out to `_run_forever`
         // and then to `handle_jitexception` (warmspot.py).
         if let Some(args) = self.run() {
-            return Err(JitException::ContinueRunningNormally(Box::new(
-                crate::jitexc::ContinueRunningNormallyArgs {
-                    green_int: args.green_int,
-                    green_ref: args.green_ref,
-                    green_float: args.green_float,
-                    red_int: args.red_int,
-                    red_ref: args.red_ref,
-                    red_float: args.red_float,
-                },
-            )));
+            return Err(JitException::ContinueRunningNormally(args));
         }
 
         // Check for exception during execution
@@ -1214,9 +1219,10 @@ impl BlackholeInterpreter {
     /// is caught at the read.  Substituting `0` instead turned a codewriter
     /// bug — a list built against a different register allocation — into a
     /// call made with a zero argument.
-    fn _get_list_of_values_i(&mut self) -> Vec<i64> {
+    fn _get_list_of_values_i_into(&mut self, values: &mut Vec<i64>) {
         let length = self.next_u8() as usize;
-        let mut values = Vec::with_capacity(length);
+        values.clear();
+        values.reserve(length);
         for _ in 0..length {
             let index = self.next_reg() as usize;
             if crate::bh_debug_enabled() {
@@ -1224,28 +1230,27 @@ impl BlackholeInterpreter {
             }
             values.push(self.registers_i[index]);
         }
-        values
     }
 
     /// blackhole.py _get_list_of_values(self, code, position, 'R')
-    fn _get_list_of_values_r(&mut self) -> Vec<i64> {
+    fn _get_list_of_values_r_into(&mut self, values: &mut Vec<i64>) {
         let length = self.next_u8() as usize;
-        let mut values = Vec::with_capacity(length);
+        values.clear();
+        values.reserve(length);
         for _ in 0..length {
             let index = self.next_reg() as usize;
             values.push(self.registers_r[index]);
         }
-        values
     }
 
-    fn _get_list_of_values_f(&mut self) -> Vec<i64> {
+    fn _get_list_of_values_f_into(&mut self, values: &mut Vec<i64>) {
         let length = self.next_u8() as usize;
-        let mut values = Vec::with_capacity(length);
+        values.clear();
+        values.reserve(length);
         for _ in 0..length {
             let index = self.next_reg() as usize;
             values.push(self.registers_f[index]);
         }
-        values
     }
 
     /// blackhole.py `bhimpl_jit_merge_point`. Decodes
@@ -1268,32 +1273,29 @@ impl BlackholeInterpreter {
         } else {
             self.registers_i[jdindex_byte as usize] as usize
         };
-        let gi = self._get_list_of_values_i();
-        let gr = self._get_list_of_values_r();
-        let gf = self._get_list_of_values_f();
-        let ri = self._get_list_of_values_i();
-        let rr = self._get_list_of_values_r();
-        let rf = self._get_list_of_values_f();
+        let mut args = std::mem::take(&mut self.merge_point_args_scratch);
+        self._get_list_of_values_i_into(&mut args.green_int);
+        self._get_list_of_values_r_into(&mut args.green_ref);
+        self._get_list_of_values_f_into(&mut args.green_float);
+        self._get_list_of_values_i_into(&mut args.red_int);
+        self._get_list_of_values_r_into(&mut args.red_ref);
+        self._get_list_of_values_f_into(&mut args.red_float);
         if nbody_debug {
             eprintln!(
                 "[nbody-debug][bh-jmp] pos={} jdindex={} gi={:?} gr={:?} ri={:?} rr={:#x?}",
-                self.last_opcode_position, jdindex, gi, gr, ri, rr,
+                self.last_opcode_position,
+                jdindex,
+                args.green_int,
+                args.green_ref,
+                args.red_int,
+                args.red_ref,
             );
         }
 
         if self.nextblackholeinterp.is_none() {
             // blackhole.py:1068-1069: bottommost level.
             //   raise ContinueRunningNormally(*args)
-            return Err(DispatchError::ContinueRunningNormally(Box::new(
-                MergePointArgs {
-                    green_int: gi,
-                    green_ref: gr,
-                    green_float: gf,
-                    red_int: ri,
-                    red_ref: rr,
-                    red_float: rf,
-                },
-            )));
+            return Err(DispatchError::ContinueRunningNormally(args));
         }
         // blackhole.py:1074-1093: recursive portal level.
         //   sd = self.builder.metainterp_sd
@@ -1345,21 +1347,53 @@ impl BlackholeInterpreter {
         let post_call_position = self.position;
         match result_type {
             BhReturnType::Void => {
-                self.bhimpl_recursive_call_v(jdindex, gi, gr, gf, ri, rr, rf);
+                self.bhimpl_recursive_call_v(
+                    jdindex,
+                    args.green_int,
+                    args.green_ref,
+                    args.green_float,
+                    args.red_int,
+                    args.red_ref,
+                    args.red_float,
+                );
                 self.return_type = BhReturnType::Void;
             }
             BhReturnType::Int => {
-                let x = self.bhimpl_recursive_call_i(jdindex, gi, gr, gf, ri, rr, rf);
+                let x = self.bhimpl_recursive_call_i(
+                    jdindex,
+                    args.green_int,
+                    args.green_ref,
+                    args.green_float,
+                    args.red_int,
+                    args.red_ref,
+                    args.red_float,
+                );
                 self.tmpreg_i = x;
                 self.return_type = BhReturnType::Int;
             }
             BhReturnType::Ref => {
-                let x = self.bhimpl_recursive_call_r(jdindex, gi, gr, gf, ri, rr, rf);
+                let x = self.bhimpl_recursive_call_r(
+                    jdindex,
+                    args.green_int,
+                    args.green_ref,
+                    args.green_float,
+                    args.red_int,
+                    args.red_ref,
+                    args.red_float,
+                );
                 self.tmpreg_r = x.0 as i64;
                 self.return_type = BhReturnType::Ref;
             }
             BhReturnType::Float => {
-                let x = self.bhimpl_recursive_call_f(jdindex, gi, gr, gf, ri, rr, rf);
+                let x = self.bhimpl_recursive_call_f(
+                    jdindex,
+                    args.green_int,
+                    args.green_ref,
+                    args.green_float,
+                    args.red_int,
+                    args.red_ref,
+                    args.red_float,
+                );
                 self.tmpreg_f = x.to_bits() as i64;
                 self.return_type = BhReturnType::Float;
             }
@@ -1810,7 +1844,7 @@ impl BlackholeInterpreter {
                             &format!("ContinueRunningNormally at pos={pos_before}"),
                         );
                     }
-                    return Some(*args);
+                    return Some(args);
                 }
                 Err(DispatchError::RaiseException { exc, .. }) => {
                     // blackhole.py: except Exception → handle_exception_in_frame
@@ -4258,13 +4292,30 @@ mod tests {
         fn test_bh_interp_builder_pool() {
             let mut builder = BlackholeInterpBuilder::new();
 
-            let bh1 = builder.acquire_interp();
+            let mut bh1 = builder.acquire_interp();
             assert!(bh1.registers_i.is_empty());
+            let allocation = std::ptr::from_ref(&*bh1);
+
+            let mut merge_args = MergePointArgs::default();
+            merge_args.green_int.extend(0..7);
+            merge_args.red_ref.extend(0..11);
+            let green_int_capacity = merge_args.green_int.capacity();
+            let red_ref_capacity = merge_args.red_ref.capacity();
+            bh1.recycle_merge_point_args(merge_args);
 
             builder.release_interp(bh1);
             let bh2 = builder.acquire_interp();
-            // Reused from pool
+            // `blackhole.py BlackholeInterpBuilder.acquire_interp` returns
+            // the same object from its intrusive `back` list.  Keeping the
+            // Box allocation is the Rust equivalent; unboxing here and
+            // re-boxing in release made every nominal pool hit one free plus
+            // one malloc.
+            assert_eq!(std::ptr::from_ref(&*bh2), allocation);
             assert!(bh2.registers_i.is_empty());
+            assert!(bh2.merge_point_args_scratch.green_int.is_empty());
+            assert!(bh2.merge_point_args_scratch.red_ref.is_empty());
+            assert!(bh2.merge_point_args_scratch.green_int.capacity() >= green_int_capacity);
+            assert!(bh2.merge_point_args_scratch.red_ref.capacity() >= red_ref_capacity);
         }
 
         /// A pooled interp must not carry the previous run's frame identity.
@@ -12186,7 +12237,7 @@ fn handler_inline_call_nested_ext(
     let outcome = 'callee: {
         if let Some(args) = callee.run() {
             bh.position = p;
-            break 'callee Err(DispatchError::ContinueRunningNormally(Box::new(args)));
+            break 'callee Err(DispatchError::ContinueRunningNormally(args));
         }
 
         // RPython `blackhole.py` invariant: after the handler has

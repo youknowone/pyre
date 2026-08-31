@@ -482,20 +482,55 @@ What it says about the three rows, at 1,048,576 characters:
 |---|---:|---:|---:|
 | Rust interp, no JIT | 0.0 | 0 | 0 |
 | majit `&`/`\|` — `jit_interp.rs` | 0.0 | 4 | 0.1 |
-| majit `and`/`or` — `shortcircuit.rs` | **19.9** | **1,900** | 7.8 |
+| majit `and`/`or` — `shortcircuit.rs` | **11.4** | **1,360** | 7.8 |
 
 The masking row and plain matcher round to zero allocations per character. The
-branching row still calls the process allocator about **twenty times per input
-character**. That is the remaining 4.1x against RPython's own `--opt=jit`, in a
+branching row still calls the process allocator about **eleven times per input
+character**. That is the remaining gap against RPython's own `--opt=jit`, in a
 unit that can be measured while the machine is doing something else — every
 character deopts, and majit's deopt round trip still owns vectors and `Rc<Op>`s
 that upstream takes from a nursery or encodes into flat storage.
 
 The current 1 MiB row is the combined result of persistent driver ownership,
-pre-flatten helper coloring and the smaller ordinary `Op`: 19.9 allocations and
-1,900 bytes per character, versus the previously recorded 52.1 and 6,520. At
-4 KiB it reads 44.8 / 4,766 because fixed tracing and initial bridge compilation
-are divided by far fewer characters; that slope is now expected and explicit.
+pre-flatten helper coloring, the smaller ordinary `Op`, and the deopt-storage
+fixes below: 11.4 allocations and 1,360 bytes per character, versus the
+previously recorded 52.1 and 6,520. Fixed tracing and initial bridge compilation
+are divided by fewer characters at short lengths, so the slope is expected and
+explicit.
+
+#### The third: preserve ownership across a deopt
+
+Four Rust ownership conversions were allocating where the upstream object was
+already stable:
+
+* `BlackholeInterpBuilder.acquire_interp` returned an unboxed interpreter and
+  `release_interp` boxed it again. The intrusive free list now carries the same
+  `Box`, matching the object identity of upstream's pooled
+  `BlackholeInterpreter`.
+* Runtime field bytecodes rebuilt an optimizer descriptor from the blackhole
+  descriptor on every execution. `RuntimeBhDescr` now resolves and retains the
+  canonical optimizer descriptor once, after field-parent patching.
+* constant queries converted a constant operand through a fresh `Rc<Op>` merely
+  to ask `is_const` or obtain its value. `OptBoxEnv` and `force_box` now answer
+  directly from the resolved operand, and `TraceIterator` preserves an already
+  decoded constant.
+* `bhimpl_jit_merge_point` allocated six new `Vec` backings and boxed the
+  144-byte `ContinueRunningNormallyArgs` payload on every deopt. The pooled
+  blackhole frame retains the cleared backing capacities, while the control
+  payload moves inline through `DispatchError` and `JitException` and then back
+  into that frame.
+
+At 65,536 characters these changes move the measured row from 45.6 allocations
+and 7,517 bytes per character to 21.6 and 2,891 (−52.6% and −61.5%). At the
+published 1 MiB length, against the immediately preceding 19.9 / 1,900 row,
+they read 11.4 / 1,360. The peeled trace remains exactly
+`0 / 24 / 93 / 2` (`getfield_gc_r / getfield_gc_i / setfield_gc / int_eq`).
+
+This does not turn the allocator census into a speed measurement. A clean
+non-census release run after the change read 102,076 chars/s, but its five runs
+spanned 44,677 to 128,912; that spread cannot establish either a speedup or a
+regression against the older 135,690 row. The allocation reduction is the
+result this instrument can establish.
 
 #### The first one it caught
 
@@ -589,7 +624,8 @@ nursery bump again and the dead ones are reclaimed.
 | off-GC frame, no collector | 54.0 | 6,948 |
 | collector installed, no-collect frame | 54.0 | 7,000 |
 | collector installed, collecting frame | **52.1** | **6,520** |
-| current: persistent driver + compact helper/Op | **19.9** | **1,900** |
+| persistent driver + compact helper/Op | **19.9** | **1,900** |
+| current: deopt ownership preserved too | **11.4** | **1,360** |
 
 The middle row is why the census is worth having: it is the fix applied and not
 working, and nothing else in the run says so. The final row combines the later

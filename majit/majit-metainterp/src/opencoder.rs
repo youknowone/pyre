@@ -203,9 +203,9 @@ pub trait BaseTrace {}
 // makes `_index`'s dual use safe.
 
 /// opencoder.py class TraceIterator(BaseTrace).
-pub struct TraceIterator<'a> {
+pub struct TraceIterator<'a, T = majit_ir::OpRc> {
     /// opencoder.py:252 self.trace
-    pub trace: &'a [majit_ir::OpRc],
+    pub trace: &'a [T],
     /// opencoder.py:255 self._cache: per-iterator map from raw trace
     /// position to the fresh box OBJECT materialized for this iteration.
     /// In RPython this is `[None] * trace._index` holding the fresh
@@ -244,9 +244,12 @@ pub struct TraceIterator<'a> {
     pub _fresh: u32,
 }
 
-impl BaseTrace for TraceIterator<'_> {}
+impl<T> BaseTrace for TraceIterator<'_, T> where T: std::borrow::Borrow<majit_ir::Op> {}
 
-impl<'a> TraceIterator<'a> {
+impl<'a, T> TraceIterator<'a, T>
+where
+    T: std::borrow::Borrow<majit_ir::Op>,
+{
     /// opencoder.py TraceIterator.__init__.
     ///
     /// `force_inputargs` corresponds to the same RPython parameter
@@ -257,7 +260,7 @@ impl<'a> TraceIterator<'a> {
     /// ranges. RPython does not need this because each iteration's
     /// `cls()` allocation produces distinct Python objects.
     pub fn new(
-        trace: &'a [majit_ir::OpRc],
+        trace: &'a [T],
         start: usize,
         end: usize,
         force_inputargs: Option<&[OpRef]>,
@@ -289,7 +292,7 @@ impl<'a> TraceIterator<'a> {
     /// the original coordinate space while `History.set_inputargs` filters
     /// dead boxes.  This entry point preserves those sparse positions.
     pub fn new_with_inputargs(
-        trace: &'a [majit_ir::OpRc],
+        trace: &'a [T],
         start: usize,
         end: usize,
         force_inputargs: Option<&[OpRef]>,
@@ -310,7 +313,7 @@ impl<'a> TraceIterator<'a> {
     }
 
     fn new_with_input_layout(
-        trace: &'a [majit_ir::OpRc],
+        trace: &'a [T],
         start: usize,
         end: usize,
         force_inputargs: Option<&[OpRef]>,
@@ -327,6 +330,7 @@ impl<'a> TraceIterator<'a> {
         let num_inputargs = inputarg_types.len();
         let max_pos = trace[start..end]
             .iter()
+            .map(std::borrow::Borrow::borrow)
             .flat_map(|op| {
                 std::iter::once(op.pos.get())
                     .chain(op.getarglist_copy().into_iter().map(|a| a.to_opref()))
@@ -480,17 +484,25 @@ impl<'a> TraceIterator<'a> {
         if self.done() {
             return None;
         }
-        let src = &self.trace[self.pos];
+        let src: &majit_ir::Op = self.trace[self.pos].borrow();
         self.pos += 1;
-        let mut res: majit_ir::Op = (**src).clone();
+        let mut res: majit_ir::Op = src.clone();
         // opencoder.py:379-387: for i in range(argnum):
         //     res.setarg(i, self._untag(self._next()))
         for i in 0..res.num_args() {
-            res.setarg(i, self._untag(res.arg(i).to_opref()));
+            // The legacy adapter already carries the decoded Const object in
+            // the source op. RPython's byte iterator creates it once while
+            // decoding `_untag`; keep that object instead of flattening it to
+            // OpRef and allocating a second Const wrapper immediately.
+            if !res.arg(i).is_constant() {
+                res.setarg(i, self._untag(res.arg(i).to_opref()));
+            }
         }
         if let Some(fa) = res.fail_args_mut() {
             for arg in fa.iter_mut() {
-                *arg = self._untag(arg.to_opref());
+                if !arg.is_constant() {
+                    *arg = self._untag(arg.to_opref());
+                }
             }
         }
         // RPython opencoder.py:399-401:
@@ -3086,6 +3098,21 @@ mod tests {
         let finish = iter.next().unwrap();
         assert_eq!(finish.arg(0).to_opref(), iop(3));
         assert!(iter.done());
+    }
+
+    #[test]
+    fn trace_iterator_keeps_an_already_decoded_const_operand() {
+        let constant = majit_ir::operand::Operand::const_from_value(majit_ir::Value::Int(7));
+        let ops = vec![majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[constant.clone(), constant.clone()],
+        )];
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &[], 0);
+
+        let decoded = iter.next().expect("one encoded operation");
+
+        assert!(decoded.arg(0).same_box(&constant));
+        assert!(decoded.arg(1).same_box(&constant));
     }
 
     #[test]

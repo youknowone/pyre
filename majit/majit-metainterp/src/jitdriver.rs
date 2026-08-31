@@ -6666,7 +6666,7 @@ impl<S: JitState> JitDriver<S> {
                         // Next merge point reached (loop back-edge): flush the
                         // register file into the live state and resume the
                         // interpreter at the merge point's green pc.
-                        crate::jitexc::JitException::ContinueRunningNormally(ref args) => {
+                        crate::jitexc::JitException::ContinueRunningNormally(args) => {
                             let green_int = &args.green_int;
                             // PyPy re-enters the portal with the CRN greens
                             // (warmspot.py:970-983), so the interpreter
@@ -6769,7 +6769,9 @@ impl<S: JitState> JitDriver<S> {
                             // dispatch key does not change the guard's resume
                             // snapshot, so label-entered runs resume at the
                             // green pc like every other run.
-                            Some(green_pc.unwrap_or(target_pc))
+                            let resume_pc = Some(green_pc.unwrap_or(target_pc));
+                            bh.recycle_merge_point_args(args);
+                            resume_pc
                         }
                         // The interpreted frame ran to completion inside the
                         // blackhole: flush, then force the generated mainloop's
@@ -6829,6 +6831,17 @@ impl<S: JitState> JitDriver<S> {
                         }
                     };
                     bh_builder.release_interp(bh);
+                    // `start_bridge_tracing` below executes the portal while
+                    // this call is still on the stack.  Return the builder to
+                    // its pool first: otherwise that re-entrant execution sees
+                    // an empty `BACK_EDGE_BH_BUILDER`, constructs a second
+                    // builder, and then drops its blackhole frames (including
+                    // their merge-point Vec capacities) when the nested lease
+                    // cannot be re-pooled.  RPython's
+                    // `BlackholeInterpBuilder.release_interp` makes the frame
+                    // reusable as soon as `_run_forever` is done; bridge
+                    // tracing does not retain the builder.
+                    drop(bh_builder);
                     if let Some(pc) = resume_pc {
                         // compile.py _trace_and_compile_from_bridge,
                         // deferred to here so the bridge records from the GREEN

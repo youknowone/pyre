@@ -884,32 +884,6 @@ struct PreparedBridgeTrace {
     runtime_boxes: Vec<OpRef>,
 }
 
-/// Wrap a recorded `&[Op]` bridge trace into the `Vec<OpRc>` the
-/// `prepare_bridge_trace_for_optimizer` boundary consumes, preserving each
-/// result box's observed runtime value across the clone.
-///
-/// `Op::clone` resets the result box's value (`_resint`/`_resref`,
-/// resoperation.py:243-247 fresh-identity reset), which is correct for the
-/// trace ops the optimizer re-mints. But the bridge's `runtime_boxes` (the
-/// closing JUMP's live boxes) carry observed values that the IntBound runtime
-/// fallback reads un-forwarded (`runtime_box.getint()`, virtualstate.py);
-/// RPython keeps them because `runtime_boxes` are the separate original history
-/// boxes (pyjitpl.py:3213). Pyre resolves a runtime box's value through its
-/// producing op, so this carries the observed value onto the cloned snapshot op
-/// to expose the same un-forwarded value on the runtime-box channel.
-fn clone_bridge_ops_preserving_value(bridge_ops: &[majit_ir::Op]) -> Vec<majit_ir::OpRc> {
-    bridge_ops
-        .iter()
-        .map(|op| {
-            let cloned = op.clone();
-            if let Some(value) = op.get_value() {
-                cloned.set_value(value);
-            }
-            std::rc::Rc::new(cloned)
-        })
-        .collect()
-}
-
 #[cfg(feature = "jit-audits")]
 thread_local! {
     /// Scope key for the `translate_trace_iter` OpRef-variant audit: one value
@@ -1033,8 +1007,8 @@ fn translate_trace_iter_box_map(
 /// fresh OpRefs in `[bridge_inputarg_base..)`, and rewrites every
 /// reference (op args, fail_args, snapshot boxes, vable boxes,
 /// `pending_bridge_rd.liveboxes`) through the iterator's `_cache`.
-fn prepare_bridge_trace_for_optimizer(
-    bridge_ops: &[OpRc],
+fn prepare_bridge_trace_for_optimizer<T>(
+    bridge_ops: &[T],
     bridge_inputargs: &[InputArg],
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
@@ -1044,7 +1018,10 @@ fn prepare_bridge_trace_for_optimizer(
     pending_bridge_rd: Option<PendingBridgeRd>,
     runtime_boxes: Vec<OpRef>,
     bridge_inputarg_base: u32,
-) -> PreparedBridgeTrace {
+) -> PreparedBridgeTrace
+where
+    T: std::borrow::Borrow<majit_ir::Op>,
+{
     // Open this bridge's audit scope before anything reads it. Every caller of
     // `translate_trace_iter_opref` and `translate_trace_iter_box_map` is below
     // this line, so the keys they file all carry this call's generation and no
@@ -1079,7 +1056,11 @@ fn prepare_bridge_trace_for_optimizer(
     // (`get_virtual_runtime_field` / virtualstate.py:493-498). The source/
     // re-minted op lists are 1:1 (one `next()` per recorded op), so copy each
     // observed value across.
-    for (src, dst) in bridge_ops.iter().zip(ops.iter()) {
+    for (src, dst) in bridge_ops
+        .iter()
+        .map(std::borrow::Borrow::borrow)
+        .zip(ops.iter())
+    {
         if let Some(value) = src.get_value() {
             dst.set_value(value);
         }
@@ -13199,12 +13180,8 @@ impl<M: Clone> MetaInterp<M> {
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
-        // Wrap `&[Op]` into `Vec<OpRc>` for the prepare_bridge_trace_for_optimizer
-        // boundary (history.py:528 identity at trace level), keeping the
-        // runtime-box channel's observed values intact across the clone.
-        let bridge_ops_rc = clone_bridge_ops_preserving_value(bridge_ops);
         let prepared = prepare_bridge_trace_for_optimizer(
-            &bridge_ops_rc,
+            bridge_ops,
             bridge_inputargs,
             snapshot_boxes,
             snapshot_frame_sizes,
@@ -13931,11 +13908,8 @@ impl<M: Clone> MetaInterp<M> {
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`),
-        // keeping the runtime-box channel's observed values intact across the
-        // clone.
-        let bridge_ops_rc = clone_bridge_ops_preserving_value(bridge_ops);
         let prepared = prepare_bridge_trace_for_optimizer(
-            &bridge_ops_rc,
+            bridge_ops,
             bridge_inputargs,
             snapshot_boxes,
             snapshot_frame_sizes,
@@ -23839,12 +23813,11 @@ mod tests {
             cpu: crate::cpu::default_cpu(),
         };
 
-        let bridge_ops_rc = clone_bridge_ops_preserving_value(&bridge_ops);
         // The closing JUMP's args are the bridge `runtime_boxes`; they must be
         // rewritten into the fresh-iterator namespace like the snapshot feeds.
         let bridge_runtime_boxes = vec![OpRef::ref_op(2), OpRef::int_op(3)];
         let prepared = prepare_bridge_trace_for_optimizer(
-            &bridge_ops_rc,
+            &bridge_ops,
             &bridge_inputargs,
             snapshot_boxes,
             Vec::new(),
@@ -23935,7 +23908,7 @@ mod tests {
         bridge_inputargs[0].set_value(Value::Int(42));
 
         let prepared = prepare_bridge_trace_for_optimizer(
-            &[],
+            &[] as &[majit_ir::Op],
             &bridge_inputargs,
             Vec::new(),
             Vec::new(),

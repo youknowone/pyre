@@ -53,6 +53,31 @@ const REPEATS: usize = 5;
 /// can be compared to each other or to anybody else.
 const LENGTHS: [usize; 3] = [1 << 12, 1 << 16, 1 << 20];
 
+/// Keep the published benchmark's three-length sweep by default, but let the
+/// allocation census select a short, deterministic diagnostic input.  The
+/// latter counts per character and does not gain information by spending
+/// minutes repeating the same allocation pattern at 1 MiB.
+fn lengths() -> Vec<usize> {
+    let Some(value) = std::env::var_os("PYRE_REGEX_LENGTHS") else {
+        return LENGTHS.to_vec();
+    };
+    let value = value.to_string_lossy();
+    let parsed: Vec<usize> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<usize>()
+                .unwrap_or_else(|_| panic!("PYRE_REGEX_LENGTHS contains a non-usize: {part:?}"))
+        })
+        .collect();
+    assert!(
+        !parsed.is_empty() && parsed.iter().all(|&length| length > 0),
+        "PYRE_REGEX_LENGTHS must contain one or more positive comma-separated lengths"
+    );
+    parsed
+}
+
 /// The `{N}` of the post's benchmark regex `(a|b)*a(a|b){20}a(a|b)*`.
 const N: usize = 20;
 
@@ -138,6 +163,10 @@ struct Row {
     /// machine under load. See [`alloc_census`].
     #[cfg(feature = "alloc-census")]
     alloc: alloc_census::Census,
+    /// Exact-size allocation fingerprints for this row.  Kept empty unless
+    /// explicitly requested so the ordinary census remains one compact line.
+    #[cfg(feature = "alloc-census")]
+    alloc_sizes: Vec<String>,
 }
 
 impl Row {
@@ -194,6 +223,8 @@ fn bench(
     let before = counter.map_or(0, |c| c.load(Ordering::Relaxed));
     #[cfg(feature = "alloc-census")]
     let alloc_before = alloc_census::read();
+    #[cfg(feature = "alloc-census")]
+    let sizes_before = alloc_census::read_sizes();
     let mut rates = Vec::with_capacity(REPEATS);
     for _ in 0..REPEATS {
         let t0 = Instant::now();
@@ -204,6 +235,15 @@ fn bench(
     }
     #[cfg(feature = "alloc-census")]
     let alloc = alloc_before.since(alloc_census::read());
+    #[cfg(feature = "alloc-census")]
+    let alloc_sizes = if std::env::var_os("PYRE_CENSUS_HISTOGRAM").is_some() {
+        let sizes_after = alloc_census::read_sizes();
+        let oversize = sizes_before.oversize_since(&sizes_after);
+        let rows = sizes_before.since(&sizes_after);
+        alloc_census::report_rows(&rows, oversize, s.len(), REPEATS, 16)
+    } else {
+        Vec::new()
+    };
     let compiles = counter.map_or(0, |c| c.load(Ordering::Relaxed) - before);
     rates.sort_by(f64::total_cmp);
     Row {
@@ -212,6 +252,8 @@ fn bench(
         compiles,
         #[cfg(feature = "alloc-census")]
         alloc,
+        #[cfg(feature = "alloc-census")]
+        alloc_sizes,
     }
 }
 
@@ -300,7 +342,7 @@ fn main() {
     println!("must read every character and no early exit can hide the per-character cost.");
 
     let mut sweep: Vec<(usize, [Row; 3])> = Vec::new();
-    for len in LENGTHS {
+    for len in lengths() {
         let s = nonmatching(len, N, SEED);
         assert!(
             !interp::matches(balanced, &s),
@@ -345,6 +387,10 @@ fn main() {
             );
             #[cfg(feature = "alloc-census")]
             println!("    {:<32}  {}", "", row.alloc.per_char(len, REPEATS));
+            #[cfg(feature = "alloc-census")]
+            for size in &row.alloc_sizes {
+                println!("    {:<32}  {size}", "");
+            }
         }
         sweep.push((len, rows));
     }
@@ -426,7 +472,7 @@ fn main() {
     }
 
     // ── the summary, in the post's shape ───────────────────────────────────
-    let (len, rows) = sweep.last().expect("LENGTHS is not empty");
+    let (len, rows) = sweep.last().expect("lengths() is not empty");
     let slowest = rows
         .iter()
         .min_by(|a, b| a.median().total_cmp(&b.median()))

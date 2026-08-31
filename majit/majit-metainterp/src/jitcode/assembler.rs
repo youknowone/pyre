@@ -5722,6 +5722,9 @@ impl JitCodeBuilder {
         {
             panic!("{disagreement}");
         }
+        for descr in &mut self.descrs {
+            descr.resolve_optimizer_descr();
+        }
         self.patch_const_u8_refs();
         // RPython `jitcode.py JitCode.setup self._resulttypes = resulttypes`.
         // Upstream `assembler.py:217-219` records the result-kind
@@ -6948,6 +6951,31 @@ mod tests {
                  (`heaptracker.py:60-72` / `:96-112` share one walker upstream)",
             );
         }
+    }
+
+    #[test]
+    fn field_descr_runtime_entry_reuses_one_optimizer_identity() {
+        const TID: u64 = 0x5254_4649_454c_44;
+        let mut builder = JitCodeBuilder::new();
+        builder.register_struct_layout(16, TID, false, false, &[(8, false, "value", 8, true)], "");
+        builder.getfield_gc_i(0, 1, 8, TID, "value");
+        let jitcode = builder.finish();
+        let entry = jitcode
+            .exec
+            .descrs
+            .iter()
+            .find(|entry| matches!(entry.as_bh_descr(), Some(CanonicalBhDescr::Field { .. })))
+            .expect("getfield descriptor");
+
+        let first = entry
+            .as_optimizer_descr()
+            .expect("field pool entry is resolved once")
+            .clone();
+        let second = entry
+            .as_optimizer_descr()
+            .expect("the resolved identity remains on the pool entry")
+            .clone();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
 
     /// Two fields at one offset — a flattened inline aggregate and its first

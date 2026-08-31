@@ -1917,6 +1917,14 @@ impl Optimizer {
                 }
             }
         }
+        // `optimizer.py Optimizer.force_box` returns a Const unchanged after
+        // the potential-extra-op lookup: Const carries no PtrInfo and cannot
+        // be virtual.  The flattened OpRef already carries its whole value,
+        // so resolving it back to an `Operand::Const` for the two impossible
+        // tests below only allocates an Rc that is immediately discarded.
+        if resolved.is_constant() {
+            return resolved;
+        }
         // optimizer.py:361-362: if op.type == 'i' and info.is_constant():
         //     return ConstInt(info.get_constant_int())
         // A forced operand whose IntBound is already constant materializes as a
