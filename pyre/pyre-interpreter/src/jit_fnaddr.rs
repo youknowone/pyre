@@ -55,6 +55,10 @@ impl<T: rustpython_compiler_core::bytecode::OpArgType> ResidualSlot
 {
 }
 
+/// `FrameAnchor` is one machine word: a `usize` shadow-stack depth plus a
+/// zero-sized `PhantomData` marker, returned in a single register.
+impl ResidualRet for crate::eval::FrameAnchor {}
+
 impl<T> ResidualSlot for &T {}
 impl<T> ResidualSlot for &mut T {}
 impl<T> ResidualSlot for *const T {}
@@ -2846,6 +2850,26 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         &mut entries,
         "pyre_interpreter::executioncontext::space_decrement_ticker",
         ec_space_decrement_ticker,
+    );
+    // The `anchor` handler graph residualizes `FrameAnchor::new` itself
+    // (its aggregate return keeps it out of inlining), and `push_anchored`
+    // reads back through `FrameAnchor::live`; bind both under the exact
+    // path spellings the codewriter hashes for method targets.
+    let eval_frame_anchor_new: fn(&mut crate::PyFrame) -> crate::eval::FrameAnchor =
+        crate::eval::FrameAnchor::new;
+    pa1(
+        &mut entries,
+        "eval::FrameAnchor::new",
+        "pyre_interpreter::eval::FrameAnchor::new",
+        eval_frame_anchor_new,
+    );
+    let eval_frame_anchor_live_method: fn(&crate::eval::FrameAnchor) -> *mut crate::PyFrame =
+        crate::eval::FrameAnchor::live;
+    pa1(
+        &mut entries,
+        "eval::FrameAnchor::live",
+        "pyre_interpreter::eval::FrameAnchor::live",
+        eval_frame_anchor_live_method,
     );
     let eval_frame_anchor_push: fn(*mut crate::PyFrame) -> usize = crate::eval::frame_anchor_push;
     p1(
