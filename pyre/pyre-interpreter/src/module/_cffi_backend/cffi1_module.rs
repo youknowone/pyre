@@ -83,14 +83,15 @@ pub fn load_cffi1_module(
 
     let module_slot = lib_slot + 1;
     let _ = roots.pin_root(pyre_object::w_module_new_managed(name));
-    let dict = unsafe { pyre_object::w_module_get_w_dict(roots.get(module_slot)) };
-    crate::module_ns_store(
-        dict,
-        "__file__",
-        crate::gateway::fsdecode_os_str(path.as_os_str()),
-    );
-    crate::module_ns_store(dict, "ffi", roots.get(ffi_slot));
-    crate::module_ns_store(dict, "lib", roots.get(lib_slot));
+    let file_slot = module_slot + 1;
+    let _ = roots.pin_root(crate::gateway::fsdecode_os_str(path.as_os_str()));
+    // `module_ns_store` allocates, so neither the decoded pathname nor the
+    // dictionary read off the module survives one as a native local: publish
+    // the pathname, and take the dictionary off the rooted module each time.
+    let dict = || unsafe { pyre_object::w_module_get_w_dict(roots.get(module_slot)) };
+    crate::module_ns_store(dict(), "__file__", roots.get(file_slot));
+    crate::module_ns_store(dict(), "ffi", roots.get(ffi_slot));
+    crate::module_ns_store(dict(), "lib", roots.get(lib_slot));
     crate::importing::set_sys_module(name, roots.get(module_slot));
     crate::importing::set_sys_module(&format!("{name}.lib"), roots.get(lib_slot));
     Ok(roots.get(module_slot))

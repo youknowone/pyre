@@ -246,6 +246,23 @@ _INT_DBCONFIGS = {
     if symbol in globals()
 }
 
+_C_INT_MIN = -2 ** 31
+_C_INT_MAX = 2 ** 31 - 1
+
+
+def _dbconfig_op(op):
+    # `setconfig` and `getconfig` declare `op: int`, so the argument goes
+    # through `__index__` and is narrowed to a C int before the body tests it
+    # against the supported set: a float or a list is a TypeError from the
+    # conversion, and an out-of-range int an OverflowError, not the membership
+    # test's ValueError.
+    op = operator.index(op)
+    if not _C_INT_MIN <= op <= _C_INT_MAX:
+        raise OverflowError("Python int too large to convert to C int")
+    if op not in _INT_DBCONFIGS:
+        raise ValueError("unknown config 'op': %d" % op)
+    return op
+
 _SQLITE_TRANSIENT = _lib.SQLITE_TRANSIENT
 
 # error codes
@@ -310,11 +327,13 @@ LEGACY_TRANSACTION_CONTROL = -1
 
 def _check_autocommit(value):
     # `autocommit_converter` takes True and False by identity, then requires an
-    # int equal to the sentinel.  A float -1.0, or an object whose `__eq__`
-    # answers True, is rejected: the type test is part of the contract.
+    # int whose *value* is the sentinel: it reads the value with
+    # `PyLong_AsLong`.  So a float -1.0, an object whose `__eq__` answers True,
+    # and an int subclass that overrides `__eq__` to spoof -1 are all rejected
+    # -- hence `int.__eq__` rather than `==`.
     if (value is not True and value is not False and
             not (isinstance(value, int) and
-                 value == LEGACY_TRANSACTION_CONTROL)):
+                 int.__eq__(value, LEGACY_TRANSACTION_CONTROL) is True)):
         raise ValueError(
             "autocommit must be True, False, or "
             "sqlite3.LEGACY_TRANSACTION_CONTROL")
@@ -1259,8 +1278,7 @@ class Connection(object):
     @_check_thread_wrap
     @_check_closed_wrap
     def setconfig(self, op, enable=True, /):
-        if op not in _INT_DBCONFIGS:
-            raise ValueError("unknown config 'op': %d" % op)
+        op = _dbconfig_op(op)
         current = _ffi.new('int *')
         rc = _lib.pypy_sqlite3_db_config_int(
             self._db, op, bool(enable), current)
@@ -1272,8 +1290,7 @@ class Connection(object):
     @_check_thread_wrap
     @_check_closed_wrap
     def getconfig(self, op, /):
-        if op not in _INT_DBCONFIGS:
-            raise ValueError("unknown config 'op': %d" % op)
+        op = _dbconfig_op(op)
         current = _ffi.new('int *')
         rc = _lib.pypy_sqlite3_db_config_int(self._db, op, -1, current)
         if rc != _lib.SQLITE_OK:
