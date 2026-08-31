@@ -108,6 +108,11 @@ pub mod _tokenize;
 pub mod _types;
 #[allow(non_snake_case)]
 pub mod _typing;
+// `uuid.py` reaches a MAC-derived node only through this module; a build
+// without it answers `getnode()` from `os.urandom`.
+#[cfg(all(windows, not(feature = "sandbox")))]
+#[allow(non_snake_case)]
+pub mod _uuid;
 pub mod _warnings;
 pub mod _weakref;
 #[allow(non_snake_case)]
