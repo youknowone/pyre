@@ -3203,6 +3203,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "majit_ir::eval_breaker_word::take_memory_error",
         majit_ir::eval_breaker_word::take_memory_error_jit_abi,
     );
+    // The portal's prologue arms this bit before the dispatch loop, so it is
+    // the first residual an `ENTRY=start` walk of `eval_loop_jit` meets.
+    let eval_breaker_set_gc_interp: fn() = majit_ir::eval_breaker_word::set_gc_interp;
+    p0(
+        &mut entries,
+        "majit_ir::eval_breaker_word::set_gc_interp",
+        eval_breaker_set_gc_interp,
+    );
     let gc_safepoint_poll: fn() = majit_gc::gc_sync::safepoint_poll;
     p0(
         &mut entries,
