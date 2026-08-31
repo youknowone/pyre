@@ -311,6 +311,20 @@ impl TypeLayout {
             _ => None,
         }
     }
+
+    /// `true` iff a `Branch` discriminator is recorded, whatever its width.
+    ///
+    /// The question [`Self::discriminant_int_type`] cannot answer on its own:
+    /// it returns `None` both for a layout that records no discriminator at
+    /// all — a single-variant enum, or a `Known` discriminator — and for one
+    /// whose width has no field-type spelling. A consumer that falls back to a
+    /// default tag model owes those two cases different answers.
+    pub fn has_branch_discriminant(&self) -> bool {
+        self.discriminator
+            .as_ref()
+            .and_then(|discriminator| discriminator.get("Branch"))
+            .is_some()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -930,7 +944,14 @@ mod tests {
             );
             let layout: TypeLayout = serde_json::from_str(&json).unwrap();
             assert_eq!(layout.discriminant_int_type(), expected);
+            // A declined width is still a recorded tag: the two `None`s a
+            // consumer sees from `discriminant_int_type` are distinguishable.
+            assert!(layout.has_branch_discriminant());
         }
+        let no_discriminator: TypeLayout =
+            serde_json::from_str(r#"{"variant_layouts": [{"field_offsets": []}]}"#).unwrap();
+        assert!(!no_discriminator.has_branch_discriminant());
+        assert_eq!(no_discriminator.discriminant_int_type(), None);
     }
 
     /// Target selection: exact-match wins; a sole entry is chosen even

@@ -1742,17 +1742,25 @@ fn derive_program_metadata(
                 let fieldless = type_decl_is_fieldless_enum(td, llbc);
                 let enum_layout = td.layout_for_target(&target);
                 let base_sid = majit_ir::descr::StructId::from_canonical(&canon_base);
-                if !fieldless {
-                    // The tag is an int-bank value, but its physical width is
-                    // not necessarily a machine word. Charon records the
-                    // exact `Branch.int_ty`; using `i64` for a u8/u16/u32 tag
-                    // reads adjacent payload bytes and can select an
-                    // unreachable switch arm.
-                    let discr_ty = enum_layout
+                // The tag is an int-bank value, but its physical width is
+                // not necessarily a machine word. Charon records the exact
+                // `Branch.int_ty`; using `i64` for a u8/u16/u32 tag reads
+                // adjacent payload bytes and can select an unreachable switch
+                // arm.  `i64` remains the model only where NO tag width was
+                // recorded at all.  A tag that was recorded and declined is a
+                // width no field type spells (`I128`/`U128`), and modelling it
+                // as `i64` would name half of it: register no base at all
+                // there, so a discriminant read declines instead of resolving
+                // to a descriptor that reads eight of sixteen bytes.
+                let discr_ty = enum_layout
+                    .as_ref()
+                    .and_then(|layout| layout.discriminant_int_type());
+                let tag_recorded_but_unspellable = discr_ty.is_none()
+                    && enum_layout
                         .as_ref()
-                        .and_then(|layout| layout.discriminant_int_type())
-                        .unwrap_or("i64")
-                        .to_string();
+                        .is_some_and(|layout| layout.has_branch_discriminant());
+                if !fieldless && !tag_recorded_but_unspellable {
+                    let discr_ty = discr_ty.unwrap_or("i64").to_string();
                     let rows: Vec<(String, String)> =
                         vec![("__discriminant".to_string(), discr_ty)];
                     struct_fields.fields.insert(name.clone(), rows.clone());
@@ -11459,14 +11467,26 @@ impl<'a> Lowering<'a> {
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
         // typed) for the checked-arith rewiring pass
         // (`front::checked_arith`), which rewrites each into the native
-        // `*_ovf` op + OverflowError edge.  Recognition is liberal — any
-        // `core::num::<Impl>::checked_*` call returning `Option` — because
-        // the rewrite itself validates the surrounding overflow-fallback
-        // match and declines (leaving the residual call) on any other
-        // shape.
+        // `*_ovf` op + OverflowError edge.  Recognition is liberal about the
+        // SHAPE — any `core::num::<Impl>::checked_*` call returning `Option`
+        // — because the rewrite itself validates the surrounding
+        // overflow-fallback match and declines (leaving the residual call) on
+        // any other shape.  It is not liberal about the WIDTH: the operand
+        // atoms are only in hand here (Charon renders every inherent integer
+        // impl as `<Impl>`, and `tyref_to_value_type` colors every signed
+        // width `Int`), and the emitted `*_ovf` tests the machine-word bound,
+        // so a narrower operand would answer the wrong question.  Same
+        // placement rationale as the unsigned pass's signedness gate below.
         if let OpKind::Call { target, .. } = &op_kind
             && crate::front::checked_arith::is_checked_arith_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+            && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
+                .into_iter()
+                .all(|operand| {
+                    operand
+                        .and_then(|ty| self.tyref_literal_int_atom(ty))
+                        .is_some_and(crate::front::checked_arith::is_ovf_width_int_atom)
+                })
         {
             self.checked_arith_call_results.push(result_var.clone());
         }
