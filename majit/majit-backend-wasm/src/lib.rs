@@ -623,10 +623,8 @@ fn guard_fail_args_advanced(
     guard_exits
         .iter()
         .map(|g| {
-            let mask = crate::codegen::live_fail_arg_mask(
-                g.meta_descr.as_ref(),
-                g.fail_arg_refs.len(),
-            );
+            let mask =
+                crate::codegen::live_fail_arg_mask(g.meta_descr.as_ref(), g.fail_arg_refs.len());
             g.fail_arg_refs
                 .iter()
                 .zip(mask)
