@@ -3294,11 +3294,39 @@ unsafe fn try_reflected_binary_special(
 }
 
 pub(crate) unsafe fn str_concat_type_error(rhs: PyObjectRef) -> PyError {
-    let name = crate::typedef::r#type(rhs).map_or_else(
+    let name = unsafe { concat_operand_name(rhs) };
+    PyError::type_error(format!("can only concatenate str (not \"{name}\") to str"))
+}
+
+/// The operand name every `sq_concat` refusal below spells.
+unsafe fn concat_operand_name(obj: PyObjectRef) -> String {
+    crate::typedef::r#type(obj).map_or_else(
         || "object".to_owned(),
         |w_type| crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
-    );
-    PyError::type_error(format!("can only concatenate str (not \"{name}\") to str"))
+    )
+}
+
+/// `list_concat`'s refusal.  It names the base rather than the receiver's own
+/// type, so a `list` subclass still reports `list` on the left.
+unsafe fn list_concat_type_error(rhs: PyObjectRef) -> PyError {
+    let name = unsafe { concat_operand_name(rhs) };
+    PyError::type_error(format!("can only concatenate list (not \"{name}\") to list"))
+}
+
+/// `tuple_concat`'s refusal, the same shape as `list_concat`'s.
+unsafe fn tuple_concat_type_error(rhs: PyObjectRef) -> PyError {
+    let name = unsafe { concat_operand_name(rhs) };
+    PyError::type_error(format!("can only concatenate tuple (not \"{name}\") to tuple"))
+}
+
+/// `bytes_concat`'s refusal, which it raises when either operand fails
+/// `PyObject_GetBuffer`.  Unlike the two above it names both operands by
+/// their own `tp_name`, so a `bytes` subclass reports itself on the right of
+/// `to`.
+unsafe fn bytes_concat_type_error(lhs: PyObjectRef, rhs: PyObjectRef) -> PyError {
+    let lhs_name = unsafe { concat_operand_name(lhs) };
+    let rhs_name = unsafe { concat_operand_name(rhs) };
+    PyError::type_error(format!("can't concat {rhs_name} to {lhs_name}"))
 }
 
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -3365,6 +3393,26 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             }
             return list_concat(a, b);
         }
+        if is_list(a) {
+            // [3.14-spec] `PyNumber_Add` reaches the left operand's
+            // `sq_concat` once `nb_add` has declined both ways, and
+            // `list_concat` refuses a non-list by name there.  PyPy
+            // `W_ListObject.descr_add` returns NotImplemented instead and
+            // `_make_binop_impl` emits its generic operator error.
+            //
+            // A subclass that writes its own `__add__` keeps the generic
+            // wording either way: its `slot_nb_add` stands in for the base's
+            // `sq_concat`, so nothing reaches this refusal.
+            let list_type = crate::typedef::gettypefor(&pyre_object::LIST_TYPE);
+            let uses_builtin_add = list_type
+                .is_some_and(|list_type| !dunder_overridden(a, "__add__", list_type.as_ptr()));
+            if uses_builtin_add {
+                if let Some(result) = try_reflected_binary_special(&mut a, &mut b, "__radd__")? {
+                    return Ok(result);
+                }
+                return Err(list_concat_type_error(b));
+            }
+        }
         if is_tuple(a) && is_tuple(b) {
             if needs_seq_binop_dispatch(a, b, SeqBase::Tuple, "__add__", "__radd__")
                 && let Some(result) =
@@ -3373,6 +3421,18 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
                 return Ok(result);
             }
             return tuple_concat(a, b);
+        }
+        if is_tuple(a) {
+            // `tuple_concat`, the same shape as the list branch above.
+            let tuple_type = crate::typedef::gettypefor(&pyre_object::TUPLE_TYPE);
+            let uses_builtin_add = tuple_type
+                .is_some_and(|tuple_type| !dunder_overridden(a, "__add__", tuple_type.as_ptr()));
+            if uses_builtin_add {
+                if let Some(result) = try_reflected_binary_special(&mut a, &mut b, "__radd__")? {
+                    return Ok(result);
+                }
+                return Err(tuple_concat_type_error(b));
+            }
         }
         // `bytes`/`bytearray` `__add__` accepts any buffer on the right (a
         // memoryview included), and the result type follows the left operand:
@@ -3395,9 +3455,11 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             {
                 return Ok(result);
             }
-            // A non-buffer rhs is rejected with the generic operator TypeError
-            // (bytes `descr_add` returns NotImplemented), not "can't concat".
-            return Err(binop_type_error(symbol, a, b));
+            // [3.14-spec] `bytes_concat` reaches its own refusal when
+            // `PyObject_GetBuffer` fails on the right operand.  PyPy
+            // `W_BytesObject.descr_add` returns NotImplemented and
+            // `_make_binop_impl` emits the generic operator error instead.
+            return Err(bytes_concat_type_error(a, b));
         }
         // Forward `__add__` + reflected `__radd__` per
         // `descroperation.py:_make_binop_impl` — try_dispatch_binary_special
