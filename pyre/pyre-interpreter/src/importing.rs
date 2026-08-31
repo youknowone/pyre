@@ -4318,7 +4318,7 @@ fn load_source_module(
     // tokenizer boundary through `decode_file_source_bytes`.
     let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
 
-    let _root = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::push_roots();
     // The two importlib bootstrap sources are imported by the native importer
     // before `SourceFileLoader` exists, so they never reach the `.pyc` cache and
     // otherwise recompile on every startup.  `_frozen_importlib._cached_compile`:
@@ -4348,9 +4348,10 @@ fn load_source_module(
     unsafe { crate::pycode::set_compilation_unit_filename_bytes(w_code, filename_bytes) };
     // Root before any allocation (fresh_module_globals, the cache write) can
     // collect the freshly boxed code out from under us.
-    let w_code = pyre_object::gc_roots::pin_root(w_code);
+    let code_slot = roots.base();
+    let _ = roots.pin_root(w_code);
     if let (true, Some(key)) = (store, cache_key) {
-        crate::module::imp::interp_imp::frozen_cache_store(key, &source, w_code);
+        crate::module::imp::interp_imp::frozen_cache_store(key, &source, roots.get(code_slot));
     }
 
     // Create a fresh namespace for the module, seeded with builtins.
@@ -4358,7 +4359,8 @@ fn load_source_module(
     // then exec_code_module sets __builtins__ and runs code in w_dict.
     let ctx = unsafe { &*execution_context };
     let w_globals = ctx.fresh_module_globals();
-    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+    let globals_slot = code_slot + 1;
+    let _ = roots.pin_root(w_globals);
     // PyPy `interpreter/module.py:Module.__init__` seeds `__name__` on
     // the module's w_dict.  `w_module_new_aliasing_dict` below does that
     // via `w_dict_setitem_str("__name__", ...)`, so an explicit store
@@ -4381,8 +4383,9 @@ fn load_source_module(
     } else {
         modulename
     };
+    let package_name = pyre_object::w_str_new(pkg);
     unsafe {
-        pyre_object::w_dict_setitem_str(w_globals, "__package__", pyre_object::w_str_new(pkg));
+        pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__package__", package_name);
     }
 
     // Seed `__path__` BEFORE executing the package body so relative imports
@@ -4391,22 +4394,21 @@ fn load_source_module(
     // `exec_module`; setting it afterwards lets those imports fall through to
     // sys.path and pick up a same-leaf module from an unrelated package.
     if let Some(dir) = package_dir {
-        let path_str = crate::gateway::fsdecode_os_str(dir.as_os_str());
+        let mut path_str = crate::gateway::fsdecode_os_str(dir.as_os_str());
+        let path_list = pyre_object::with_roots!(path_str =>
+            pyre_object::w_list_new(vec![path_str])
+        );
         unsafe {
-            pyre_object::w_dict_setitem_str(
-                w_globals,
-                "__path__",
-                pyre_object::w_list_new(vec![path_str]),
-            );
+            pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__path__", path_list);
         }
     }
 
     // Create the module object BEFORE execution and register in sys.modules.
     // PyPy: load_source_module → set_sys_modules BEFORE exec_code_module.
     // This prevents infinite recursion on circular imports.
-    let canonical = w_globals;
-    let module = pyre_object::w_module_new_aliasing_dict(modulename, canonical);
-    set_sys_module(modulename, module);
+    let canonical = roots.get(globals_slot);
+    let mut module = pyre_object::w_module_new_aliasing_dict(modulename, canonical);
+    pyre_object::with_roots!(module => set_sys_module(modulename, module));
 
     // `_frozen_importlib`'s install() (moduledef.py:17-49) executes the two
     // bootstrap sources under their frozen names, so classes defined in them
@@ -4421,7 +4423,8 @@ fn load_source_module(
     };
     if let Some(frozen) = frozen_exec_name {
         unsafe {
-            pyre_object::w_dict_setitem_str(w_globals, "__name__", pyre_object::w_str_new(frozen));
+            let frozen_name = pyre_object::w_str_new(frozen);
+            pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__name__", frozen_name);
         }
     }
 
@@ -4433,7 +4436,13 @@ fn load_source_module(
     // On exec failure drop the pre-registered module from sys.modules
     // (`_bootstrap._load`) so a retried import re-runs the body instead of
     // observing a half-built module.
-    if let Err(e) = exec_code_module(w_code, w_globals, execution_context, Some(&path_text), None) {
+    if let Err(e) = exec_code_module(
+        roots.get(code_slot),
+        roots.get(globals_slot),
+        execution_context,
+        Some(&path_text),
+        None,
+    ) {
         remove_sys_module(modulename);
         return Err(e);
     }
@@ -4442,11 +4451,8 @@ fn load_source_module(
     // `__module__`; `module.__name__` resolves from this dict entry.
     if frozen_exec_name.is_some() {
         unsafe {
-            pyre_object::w_dict_setitem_str(
-                w_globals,
-                "__name__",
-                pyre_object::w_str_new(modulename),
-            );
+            let public_name = pyre_object::w_str_new(modulename);
+            pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__name__", public_name);
         }
     }
 
@@ -4749,26 +4755,25 @@ fn load_namespace_package(
     // package.
     let ctx = unsafe { &*execution_context };
     let w_globals = ctx.fresh_module_globals();
-    let _root = pyre_object::gc_roots::push_roots();
-    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+    let roots = pyre_object::gc_roots::push_roots();
+    let globals_slot = roots.base();
+    let _ = roots.pin_root(w_globals);
+    let package_name = pyre_object::w_str_new(modulename);
     unsafe {
-        pyre_object::w_dict_setitem_str(
-            w_globals,
-            "__package__",
-            pyre_object::w_str_new(modulename),
-        );
+        pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__package__", package_name);
     }
 
-    let path_items: Vec<PyObjectRef> = dirs
-        .iter()
-        .map(|d| crate::gateway::fsdecode_os_str(d.as_os_str()))
-        .collect();
+    let mut path_items = pyre_object::gc_roots::RootedItems::new();
+    for d in dirs {
+        path_items.push(crate::gateway::fsdecode_os_str(d.as_os_str()));
+    }
     unsafe {
-        pyre_object::w_dict_setitem_str(w_globals, "__path__", pyre_object::w_list_new(path_items));
+        let path_list = pyre_object::w_list_new(path_items.take());
+        pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__path__", path_list);
     }
 
-    let module = pyre_object::w_module_new_aliasing_dict(modulename, w_globals);
-    set_sys_module(modulename, module);
+    let mut module = pyre_object::w_module_new_aliasing_dict(modulename, roots.get(globals_slot));
+    pyre_object::with_roots!(module => set_sys_module(modulename, module));
     Ok(module)
 }
 
