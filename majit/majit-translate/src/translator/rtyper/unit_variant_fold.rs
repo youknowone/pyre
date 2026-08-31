@@ -51,7 +51,7 @@ use crate::model::{CallTarget, FunctionGraph, OpKind};
 /// set is closed and small (~11 entries in
 /// [`is_synthetic_unit_variant_path`]), so linear
 /// scan is both cheap and PyPy-orthodox.
-static UNIT_VARIANT_PREBUILT_INSTANCES: LazyLock<Mutex<Vec<(String, HostObject)>>> =
+static UNIT_VARIANT_PREBUILT_INSTANCES: LazyLock<Mutex<Vec<(String, Option<i64>, HostObject)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Find-or-mint the prebuilt singleton instance for an allowlisted
@@ -65,15 +65,37 @@ static UNIT_VARIANT_PREBUILT_INSTANCES: LazyLock<Mutex<Vec<(String, HostObject)>
 /// so `reusable_prebuilt_instance()` always materialises the
 /// `OnceLock` instance — see
 /// `majit-translate/src/flowspace/model.rs`).
-pub(crate) fn intern_unit_variant_prebuilt_instance(qualname: &str) -> Option<HostObject> {
+pub(crate) fn intern_unit_variant_prebuilt_instance(
+    qualname: &str,
+    tag: Option<i64>,
+) -> Option<HostObject> {
     let mut cache = UNIT_VARIANT_PREBUILT_INSTANCES.lock();
-    if let Some((_, instance)) = cache.iter().find(|(q, _)| q == qualname) {
+    if let Some((_, stored_tag, instance)) = cache.iter_mut().find(|(q, _, _)| q == qualname) {
+        // Both gate arms derive the tag from the same `CallTarget`, so a
+        // recorded value never conflicts; a `Some` fills in an entry a
+        // tag-less caller interned first.
+        if stored_tag.is_none() {
+            *stored_tag = tag;
+        }
         return Some(instance.clone());
     }
     let class_obj = HostObject::new_class(qualname, Vec::new());
     let instance = class_obj.reusable_prebuilt_instance()?;
-    cache.push((qualname.to_string(), instance.clone()));
+    cache.push((qualname.to_string(), tag, instance.clone()));
     Some(instance)
+}
+
+/// Reverse lookup for the assembler: whether `identity` (an interned
+/// instance's `identity_id`) names a unit-variant singleton with a
+/// recorded discriminant.  Returns the interned qualname and tag; a
+/// tag-less entry (a zero-length shaped aggregate, whose value carries
+/// no discriminant) stays on the identity-id constant path.
+pub(crate) fn unit_variant_const_by_identity(identity: usize) -> Option<(String, i64)> {
+    let cache = UNIT_VARIANT_PREBUILT_INSTANCES.lock();
+    cache
+        .iter()
+        .find(|(_, tag, instance)| tag.is_some() && instance.identity_id() == identity)
+        .and_then(|(q, tag, _)| Some((q.clone(), (*tag)?)))
 }
 
 /// Pyre-side `Class::Variant` unit-variant ctors.  These are valid
@@ -136,7 +158,10 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
             let OpKind::Call {
                 target:
                     CallTarget::SyntheticTransparentCtor {
-                        name, owner_path, ..
+                        name,
+                        owner_path,
+                        variant_tag,
+                        ..
                     },
                 args,
                 ..
@@ -180,7 +205,7 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
             // `UnregisteredNewGcType` after the descent has already run.
             if owner_path.is_empty()
                 && is_zero_length_shaped_aggregate(name)
-                && let Some(instance) = intern_unit_variant_prebuilt_instance(name)
+                && let Some(instance) = intern_unit_variant_prebuilt_instance(name, None)
             {
                 op.kind = OpKind::ConstRef(instance);
                 continue;
@@ -191,7 +216,8 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
                 continue;
             }
             let qualname = segments.join(".");
-            let Some(instance) = intern_unit_variant_prebuilt_instance(&qualname) else {
+            let Some(instance) = intern_unit_variant_prebuilt_instance(&qualname, *variant_tag)
+            else {
                 continue;
             };
             op.kind = OpKind::ConstRef(instance);
@@ -267,9 +293,9 @@ mod tests {
     /// `InstanceRepr.get_reusable_prebuilt_instance` caches per classdef.
     #[test]
     fn one_prebuilt_instance_per_shape() {
-        let a = intern_unit_variant_prebuilt_instance("Array<*mut PyObject;0>").unwrap();
-        let b = intern_unit_variant_prebuilt_instance("Array<*mut PyObject;0>").unwrap();
-        let other = intern_unit_variant_prebuilt_instance("Array<u8;0>").unwrap();
+        let a = intern_unit_variant_prebuilt_instance("Array<*mut PyObject;0>", None).unwrap();
+        let b = intern_unit_variant_prebuilt_instance("Array<*mut PyObject;0>", None).unwrap();
+        let other = intern_unit_variant_prebuilt_instance("Array<u8;0>", None).unwrap();
         assert_eq!(a.identity_id(), b.identity_id());
         assert_ne!(a.identity_id(), other.identity_id());
     }

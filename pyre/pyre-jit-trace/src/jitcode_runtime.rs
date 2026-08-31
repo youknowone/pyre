@@ -144,6 +144,12 @@ fn load_jitcode(index: usize) -> Arc<JitCode> {
     // sentinels here, while refcount is still 1 — before any consumer can
     // observe a sentinel as a forged GCREF.
     crate::runtime_fnaddr_patch::materialize_str_consts(std::slice::from_mut(&mut jitcode));
+    // Deferred unit-variant singleton constants follow the same contract:
+    // materialize each variant's immortal discriminant cell and overwrite
+    // the sentinel while refcount is still 1.
+    crate::runtime_fnaddr_patch::materialize_unit_variant_consts(std::slice::from_mut(
+        &mut jitcode,
+    ));
     // RPython codewriter.py:80: `all_jitcodes[jitcode.index] is jitcode`.
     // Check per entry so any regression in
     // `collect_jitcodes_in_alloc_order` is caught immediately.

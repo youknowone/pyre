@@ -6856,6 +6856,7 @@ impl<'a> Transformer<'a> {
             name,
             owner_path: _,
             is_struct: _,
+            variant_tag: _,
         } = target
         else {
             return false;

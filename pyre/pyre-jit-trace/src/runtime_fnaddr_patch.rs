@@ -345,6 +345,59 @@ pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
     }
 }
 
+/// Materialize every deferred unit-variant singleton constant
+/// ([`materialize_str_consts`]' sibling).  Each descriptor names a
+/// `constants_r` slot holding a non-canonical sentinel; the cell minted
+/// here is one immortal leaked `i64` holding the variant's declaration
+/// index — the entire layout of a payload-less variant class is its
+/// `__discriminant` word at offset 0, so `getfield_gc_i(_pure)` reads
+/// on the singleton resolve against real memory.  The cell never enters
+/// the GC heap: `walk_jitcode_constants_refs`' visitor relocates only
+/// nursery object starts, so the address passes through every
+/// collection unchanged.  One cell per qualname process-wide, mirroring
+/// the build-side interner's identity sharing.
+pub fn materialize_unit_variant_consts(jitcodes: &mut [Arc<JitCode>]) {
+    static CELLS: LazyLock<std::sync::Mutex<Vec<(String, i64)>>> =
+        LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+    for arc in jitcodes.iter_mut() {
+        if arc
+            .try_body()
+            .is_none_or(|b| b.unit_variant_consts.is_empty())
+        {
+            continue;
+        }
+        let jc = Arc::get_mut(arc).expect(
+            "materialize_unit_variant_consts: Arc<JitCode> already shared before patch — \
+             every caller must run this before publishing the table to consumers",
+        );
+        let body = jc.body_mut();
+        for i in 0..body.unit_variant_consts.len() {
+            let idx = body.unit_variant_consts[i].constants_r_index;
+            let qualname = body.unit_variant_consts[i].qualname.clone();
+            let tag = body.unit_variant_consts[i].tag;
+            let addr = {
+                let mut cells = CELLS.lock().unwrap();
+                if let Some((_, a)) = cells.iter().find(|(q, _)| *q == qualname) {
+                    *a
+                } else {
+                    let a = Box::leak(Box::new(tag)) as *const i64 as i64;
+                    cells.push((qualname, a));
+                    a
+                }
+            };
+            // The slot must still hold its non-canonical sentinel — never
+            // a real address (which has the high bits clear).
+            assert_eq!(
+                (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
+                (majit_translate::assembler::UNIT_VARIANT_CONST_SENTINEL_BASE as u64)
+                    & SENTINEL_HIGH_MASK,
+                "constants_r[{idx}] did not hold a unit-variant sentinel",
+            );
+            body.constants_r[idx] = addr.into();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

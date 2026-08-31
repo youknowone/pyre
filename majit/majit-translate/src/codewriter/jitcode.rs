@@ -67,6 +67,24 @@ pub struct StrConstDescriptor {
     pub precomputed_hash: i64,
 }
 
+/// A payload-less enum-variant singleton constant whose runtime cell is
+/// materialized at jitcode-load time, exactly like
+/// [`StrConstDescriptor`]: the build-time translator cannot allocate
+/// runtime memory, so the `constants_r` slot holds a non-canonical
+/// sentinel until the load pass writes the cell's address.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct UnitVariantConstDescriptor {
+    /// Position in [`JitCodeBody::constants_r`] holding the sentinel that
+    /// the runtime load pass overwrites with the cell's address.
+    pub constants_r_index: usize,
+    /// The variant's interned qualname (`Owner.Variant`), the runtime
+    /// dedup key: one immortal cell per qualname process-wide.
+    pub qualname: String,
+    /// The variant's declaration index, written to the cell's
+    /// `__discriminant` word at offset 0.
+    pub tag: i64,
+}
+
 /// Body of a `JitCode` — populated once by the assembler after
 /// `transform_graph_to_jitcode` runs the full codewriter pipeline.
 ///
@@ -192,6 +210,13 @@ pub struct JitCodeBody {
     /// empty: existing jitcodes carry no deferred strings.
     #[serde(default)]
     pub str_consts: Vec<StrConstDescriptor>,
+    /// Payload-less enum-variant singleton constants deferred to runtime
+    /// materialization — [`Self::str_consts`]' shape for unit variants:
+    /// each entry names a `constants_r` slot holding a non-canonical
+    /// sentinel the load pass overwrites with an immortal one-word cell
+    /// carrying the variant's discriminant.  Default empty.
+    #[serde(default)]
+    pub unit_variant_consts: Vec<UnitVariantConstDescriptor>,
     /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
     /// RPython packs into a single chr (`assert num_regs_i < 256`); pyre
     /// uses `u16` to keep CPython 3.13 codes that legitimately exceed 255

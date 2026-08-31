@@ -306,6 +306,15 @@ pub enum CallTarget {
         /// [`sum_variant_ctor`]: crate::codewriter::jtransform
         #[serde(default)]
         is_struct: bool,
+        /// The variant's declaration index (Charon `AggregateKind::Adt`
+        /// `variant_idx`), recorded where the frontend resolved a
+        /// `TypeDeclKind::Enum` variant.  A payload-less variant folded
+        /// to a prebuilt singleton carries its discriminant from here to
+        /// runtime materialization
+        /// (`JitCodeBody::unit_variant_consts`).  `None` for struct
+        /// ctors, positional aggregates, and hand-built targets.
+        #[serde(default)]
+        variant_tag: Option<i64>,
     },
     /// RPython: `indirect_call` opname. Receiver's static type is a
     /// `dyn Trait` (Rust fat pointer); at JIT time the actual callee
@@ -370,6 +379,7 @@ impl CallTarget {
             name: name.into(),
             owner_path: Vec::new(),
             is_struct: false,
+            variant_tag: None,
         }
     }
 
@@ -385,6 +395,26 @@ impl CallTarget {
             name: name.into(),
             owner_path,
             is_struct: false,
+            variant_tag: None,
+        }
+    }
+
+    /// [`synthetic_transparent_ctor_with_owner`] for a resolved enum
+    /// variant, carrying the variant's declaration index so a
+    /// payload-less variant folded to a prebuilt singleton keeps its
+    /// discriminant value.
+    ///
+    /// [`synthetic_transparent_ctor_with_owner`]: Self::synthetic_transparent_ctor_with_owner
+    pub fn synthetic_transparent_enum_variant_ctor(
+        owner_path: Vec<String>,
+        name: impl Into<String>,
+        variant_tag: i64,
+    ) -> Self {
+        Self::SyntheticTransparentCtor {
+            name: name.into(),
+            owner_path,
+            is_struct: false,
+            variant_tag: Some(variant_tag),
         }
     }
 
@@ -404,6 +434,7 @@ impl CallTarget {
             name: name.into(),
             owner_path,
             is_struct: true,
+            variant_tag: None,
         }
     }
 
