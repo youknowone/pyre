@@ -1,9 +1,9 @@
 //! zlib module — PyPy: `pypy/module/zlib/`.
 //!
 //! CRC-32 / Adler-32 checksums plus the DEFLATE compress/decompress surface.
-//! The DEFLATE machinery is a deliberate duplication of RustPython's zlib
-//! implementation, ported into `pyre_native::zlib` (flate2 / zlib-rs) and kept
-//! outside the LLBC extraction; this module is the W_Root object glue.
+//! The DEFLATE machinery is shared with RustPython through
+//! `rustpython_common::compression::zlib`.  `pyre_native::zlib` keeps an opaque
+//! adapter outside LLBC extraction; this module is the W_Root object glue.
 //!
 //! `Compress` / `Decompress` / `_ZlibDecompressor` own their native stream
 //! directly, matching `interp_zlib.py`'s `self.stream`.  Each stream also owns
