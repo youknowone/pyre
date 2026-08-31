@@ -21,15 +21,11 @@ try:
     # ops here than on main (where the direct list-iterator fold closes at 306
     # and the limit sits there), so the 0.8x segmenting cut needs a lower
     # limit to be crossed at all.  See foriter_bridge_walk_keeps_the_iteration.
-    import sys
 
-    # The 0.8x window is a raw-op-count property and the wasm build records
-    # more raw ops per iteration than the native backends.  On wasm the list
-    # and tuple arms' windows only overlap at 362-363 (list closes at 363,
-    # tuple opens at 362), measured over three runs each.
-    pypyjit.set_param(
-        "trace_limit=362" if sys.platform == "wasi" else "trace_limit=240"
-    )
+    # The 0.8x window is a raw-op-count property; every backend records the
+    # same raw op count for this body, and the list and tuple arms' windows
+    # overlap around 240.
+    pypyjit.set_param("trace_limit=240")
     pypyjit.set_param("threshold=20")
 except ImportError:
     pass
