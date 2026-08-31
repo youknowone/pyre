@@ -6397,22 +6397,31 @@ fn type_descr_new_with_metaclass(
         let w_namespace_dict = args[2];
         // typeobject.py:_check_new_args — validate the three public
         // arguments before attempting to copy or normalise any of them.
+        //
+        // `type_new` spells the same three checks as a single
+        // `PyArg_ParseTuple(args, "UO!O!:type.__new__", ...)`, and it is the
+        // `:type.__new__` suffix that names the callable in the messages
+        // getargs builds, so they say `type.__new__()` on every entry point —
+        // a bare `type(...)` call, `type.__new__` invoked directly, and a
+        // metaclass such as `ABCMeta`.  The `O!` checks are `PyObject_
+        // TypeCheck`, so a tuple subclass is an accepted `bases` and a dict
+        // subclass an accepted namespace; neither is silently coerced.
         if !unsafe { crate::baseobjspace::isinstance_str_w(name_obj) } {
             return Err(crate::PyError::type_error(format!(
-                "type() argument 1 must be string, not {}",
+                "type.__new__() argument 1 must be str, not {}",
                 unsafe { pyre_object::type_name_of(name_obj) }
             )));
         }
         if !unsafe { is_tuple(bases) } {
             return Err(crate::PyError::type_error(format!(
-                "type() argument 2 must be tuple, not {}",
+                "type.__new__() argument 2 must be tuple, not {}",
                 unsafe { pyre_object::type_name_of(bases) }
             )));
         }
         let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
         if !unsafe { crate::baseobjspace::isinstance_w(w_namespace_dict, w_dict_type) } {
             return Err(crate::PyError::type_error(format!(
-                "type() argument 3 must be dict, not {}",
+                "type.__new__() argument 3 must be dict, not {}",
                 unsafe { pyre_object::type_name_of(w_namespace_dict) }
             )));
         }
@@ -6426,24 +6435,6 @@ fn type_descr_new_with_metaclass(
                     "type name must not contain null characters",
                 ));
             }
-        }
-        // typeobject.py `type.__new__` — `isinstance_w(w_bases, w_tuple)` and
-        // `isinstance_w(w_dict, w_dict)`: bases must be a tuple and the
-        // namespace a dict (subclasses of each are accepted, e.g. a dict
-        // subclass namespace); neither is silently coerced.
-        let w_tuple_type = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
-        if !unsafe { crate::baseobjspace::isinstance_w(bases, w_tuple_type) } {
-            return Err(crate::PyError::type_error(format!(
-                "type() argument 2 must be tuple, not {}",
-                crate::baseobjspace::object_functionstr_type_name(bases)
-            )));
-        }
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { crate::baseobjspace::isinstance_w(w_namespace_dict, w_dict_type) } {
-            return Err(crate::PyError::type_error(format!(
-                "type() argument 3 must be dict, not {}",
-                crate::baseobjspace::object_functionstr_type_name(w_namespace_dict)
-            )));
         }
         let name = crate::baseobjspace::str_utf8_w(name_obj)?;
 
