@@ -1628,7 +1628,22 @@ proxy_binary_reflected!(proxy_rmod, crate::baseobjspace::mod_);
 // `space.pow`, whose forward/reverse dance lets `__rpow__` answer; the
 // three-arg form hands off to `space.pow3`, which consults only the
 // forward `__pow__` (descroperation.py:450) and never the reflected slot.
+/// `wrap_ternaryfunc`'s count check, written here rather than declared at the
+/// registration: the modulo operand is optional, so the slice is two or three
+/// long and there is no single arity for the gateway to enforce.  Without it
+/// the reads below ran off the end of a short slice.
+fn proxy_pow_arity(args: &[PyObjectRef]) -> Result<(), PyError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(PyError::type_error(format!(
+            "expected 1 or 2 arguments, got {}",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(())
+}
+
 pub fn proxy_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    proxy_pow_arity(args)?;
     let w_obj0 = force(args[0])?;
     let w_obj1 = force(args[1])?;
     let has_modulo =
@@ -1641,6 +1656,7 @@ pub fn proxy_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 pub fn proxy_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    proxy_pow_arity(args)?;
     // interp__weakref.py:382-385 — reflected wrapper swaps the first
     // two operands; the modulo argument keeps its slot.
     let w_obj0 = force(args[0])?;

@@ -134,7 +134,9 @@ cached_type!(CFIELD, cfield_type, || {
         type_ns_store(
             ns,
             "__set__",
-            crate::make_builtin_function("__set__", cfield_set),
+            // `cfield_set` reads its value out of the slice, so the arity is
+            // declared rather than left to the body.
+            crate::make_builtin_function_with_arity("__set__", cfield_set, 3),
         );
         type_ns_store(
             ns,
@@ -336,15 +338,19 @@ fn init_array_base(ns: PyObjectRef) {
         "__len__",
         crate::make_builtin_function("__len__", array_len),
     );
+    // These two read their key and value straight out of the slice, so the
+    // declared arity is what stands between a short call and an
+    // out-of-bounds read: `(c_int * 3).__getitem__(1)` aborted the
+    // interpreter rather than raising.
     type_ns_store(
         ns,
         "__getitem__",
-        crate::make_builtin_function("__getitem__", array_getitem),
+        crate::make_builtin_function_with_arity("__getitem__", array_getitem, 2),
     );
     type_ns_store(
         ns,
         "__setitem__",
-        crate::make_builtin_function("__setitem__", array_setitem),
+        crate::make_builtin_function_with_arity("__setitem__", array_setitem, 3),
     );
 }
 
@@ -355,15 +361,17 @@ fn init_pointer_base(ns: PyObjectRef) {
         "__init__",
         crate::make_builtin_function("__init__", pointer_init),
     );
+    // Indexed the same way `_ctypes.Array`'s pair is, and unguarded the same
+    // way before the arity was declared.
     type_ns_store(
         ns,
         "__getitem__",
-        crate::make_builtin_function("__getitem__", pointer_getitem),
+        crate::make_builtin_function_with_arity("__getitem__", pointer_getitem, 2),
     );
     type_ns_store(
         ns,
         "__setitem__",
-        crate::make_builtin_function("__setitem__", pointer_setitem),
+        crate::make_builtin_function_with_arity("__setitem__", pointer_setitem, 3),
     );
     type_ns_store(
         ns,
