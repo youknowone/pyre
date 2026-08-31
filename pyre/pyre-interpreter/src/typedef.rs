@@ -11173,6 +11173,70 @@ fn readonly_attribute(descr: pyre_object::PyObjectRef) -> crate::PyError {
     }
 }
 
+/// `descr_check` — the receiver a getset was published for has to be an
+/// instance of the owning type.  `getset_get` and `getset_set` both run it
+/// ahead of the accessor, and ahead of the missing-accessor refusal, so a
+/// receiver of the wrong type answers for itself however the descriptor is
+/// reached.
+///
+/// The accessors registered against a builtin type read the receiver's
+/// payload without re-testing it, so this is what stands between a foreign
+/// receiver and a wild read: `memoryview.__dict__['format'].__get__(1)` was
+/// walking an `int` as a view.
+///
+/// `GetSetProperty` carries no such gate — `descr_property_get` reaches
+/// `fget` directly and leaves the test to whichever accessor declares a
+/// `reqcls` — which is why the hand-built descriptors, the ones with no
+/// `reqcls`, were unguarded.  `w_objclass`, stamped for exactly those by
+/// `copy_for_type`, is the `d_type` the check needs.
+unsafe fn getset_descr_check(
+    w_self: PyObjectRef,
+    w_obj: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let owner = unsafe { getset_descriptor_owner(w_self) };
+    if owner.is_null()
+        || (!w_obj.is_null() && unsafe { crate::baseobjspace::isinstance_w(w_obj, owner) })
+    {
+        return Ok(());
+    }
+    Err(getset_descr_mismatch(w_self, w_obj, owner))
+}
+
+/// The refusal `getset_set` and `getset_get` raise for a getset that carries
+/// no accessor: `attribute '{name}' of '{owner}' objects is not writable`,
+/// and `readable` on the read side.  The type named is the descriptor's
+/// owner, not the receiver's own; a delete of a setter-less getset reaches
+/// `getset_set` with a null value, so it reports `writable` as well.
+///
+/// `readonly_attribute` stays the fallback for a descriptor that was never
+/// bound to an owner and so cannot name one.
+fn getset_missing_accessor(
+    descr: pyre_object::PyObjectRef,
+    owner: pyre_object::PyObjectRef,
+    verb: &str,
+) -> crate::PyError {
+    let name_obj = read_descr_name(descr);
+    let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
+        unsafe { pyre_object::w_str_get_value(name_obj) }
+    } else {
+        "?"
+    };
+    let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
+    crate::PyError::attribute_error(format!(
+        "attribute '{name}' of '{owner_name}' objects is not {verb}"
+    ))
+}
+
+/// Either refusal above, chosen by whether the descriptor names an owner.
+fn getset_no_accessor(descr: pyre_object::PyObjectRef, verb: &str) -> crate::PyError {
+    let owner = unsafe { getset_descriptor_owner(descr) };
+    if owner.is_null() {
+        readonly_attribute(descr)
+    } else {
+        getset_missing_accessor(descr, owner, verb)
+    }
+}
+
 /// CPython 3.14 `slotdefs[]`'s single `tp_descr_get` wrapper definition.
 /// Every builtin descriptor type below publishes the same positional-only
 /// surface; keeping it here mirrors the one `TPSLOT(__get__, ...)` row rather
@@ -11218,6 +11282,10 @@ pub(crate) fn getset_property_get(
         // typedef.py return self
         return Ok(w_self);
     }
+    // `getset_get` runs `descr_check` before it reads `d_getset->get`; the
+    // `w_obj is None` hack above is what stands in for `descr_get_trampoline`
+    // handing a null receiver straight back.
+    unsafe { getset_descr_check(w_self, w_obj) }?;
     // typedef.py try: return self.fget(self, space, w_obj)
     //                    except DescrMismatch: descr_call_mismatch(...)
     let reqcls = read_reqcls(w_self);
@@ -11234,7 +11302,7 @@ pub(crate) fn getset_property_get(
     }
     let fget = read_fget(w_self);
     if fget.is_null() {
-        return Err(readonly_attribute(w_self));
+        return Err(getset_no_accessor(w_self, "readable"));
     }
     // typedef.py calls the getter as `self.fget(self, space, w_obj)` — an
     // interp-level call, not `space.call_function`.  Every `GetSetProperty`
@@ -11344,9 +11412,13 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                     let w_self = args[0];
                     let w_obj = args[1];
                     let w_value = args[2];
+                    // `getset_set` runs `descr_setcheck` ahead of the
+                    // missing-setter refusal, so a receiver that is wrong in
+                    // both respects reports itself rather than the setter.
+                    unsafe { getset_descr_check(w_self, w_obj) }?;
                     let fset = read_fset(w_self);
                     if fset.is_null() || unsafe { pyre_object::is_none(fset) } {
-                        return Err(readonly_attribute(w_self));
+                        return Err(getset_no_accessor(w_self, "writable"));
                     }
                     let reqcls = read_reqcls(w_self);
                     if !reqcls.is_null()
@@ -11393,8 +11465,18 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                 |args| {
                     let w_self = args[0];
                     let w_obj = args[1];
+                    unsafe { getset_descr_check(w_self, w_obj) }?;
                     let fdel = read_fdel(w_self);
                     if fdel.is_null() || unsafe { pyre_object::is_none(fdel) } {
+                        // A delete reaches `getset_set` with a null value, so
+                        // a getset with no setter either refuses as one that
+                        // is not writable...
+                        let fset = read_fset(w_self);
+                        if fset.is_null() || unsafe { pyre_object::is_none(fset) } {
+                            return Err(getset_no_accessor(w_self, "writable"));
+                        }
+                        // ...or runs the setter, whose own refusal for a null
+                        // value is the setter's to word.
                         // typedef.py:404-405:
                         //   raise oefmt(space.w_AttributeError,
                         //       "cannot delete '%s' attribute of immutable type '%N'",
@@ -29037,18 +29119,6 @@ fn async_generator_set_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     generator_set_name_common(args, true, 2)
 }
 
-/// Python 3.14 `PyObject_GenericSetAttr` error for the read-only members in
-/// `gen_getsetlist`. PyPy's `GetSetProperty` reports `readonly attribute
-/// 'name'`; the selected 3.14 surface includes the owning type as well.
-fn generator_readonly_attribute(args: &[PyObjectRef]) -> crate::PyResult {
-    let descr = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let name_obj = read_descr_name(descr);
-    let name = unsafe { pyre_object::w_str_get_value_opt(name_obj) }.unwrap_or("<unknown>");
-    Err(crate::PyError::attribute_error(format!(
-        "attribute '{name}' of 'generator' objects is not writable"
-    )))
-}
-
 /// CPython 3.14 `gen_sizeof`, over PyPy's generator-owned `pycode`.
 fn generator_descr_sizeof(args: &[PyObjectRef]) -> crate::PyResult {
     crate::type_methods::arity_no_args(args, "__sizeof__")?;
@@ -29233,18 +29303,17 @@ fn init_generator_type(ns: PyObjectRef) {
         ("gi_code", generator_get_code as DunderFn),
         ("gi_yieldfrom", generator_get_yieldfrom as DunderFn),
     ] {
-        let setter =
-            make_builtin_function_with_arity(name, generator_readonly_attribute as DunderFn, 3);
-        let deleter =
-            make_builtin_function_with_arity(name, generator_readonly_attribute as DunderFn, 2);
+        // The read-only members of `gen_getsetlist` carry no setter at all:
+        // `getset_set` words their refusal from the descriptor, and reaches
+        // it only once the receiver has answered `descr_setcheck`.
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
                 make_getset_property_named(
                     make_builtin_function_with_arity(name, getter, 2),
-                    setter,
-                    deleter,
+                    pyre_object::PY_NULL,
+                    pyre_object::PY_NULL,
                     name,
                 ),
             )
