@@ -26,6 +26,7 @@ import sys
 import atexit
 import collections
 import contextvars
+import _contextvars
 import hashlib
 import typing
 import _io
@@ -57,6 +58,7 @@ def an_accelerated_class_names_the_module_it_is_reached_through():
         (collections.defaultdict, 'collections'),
         (hashlib.blake2b, '_blake2'),
         (contextvars.ContextVar, '_contextvars'),
+        (contextvars.Context, '_contextvars'),
         (typing.TypeVar, 'typing'),
         (_io.IncrementalNewlineDecoder, '_io'),
     ]
@@ -77,6 +79,7 @@ def the_reported_owner_is_the_one_pickle_resolves():
         collections.defaultdict,
         hashlib.blake2b,
         contextvars.ContextVar,
+        contextvars.Context,
         typing.TypeVar,
         _io.IncrementalNewlineDecoder,
     ):
@@ -84,6 +87,12 @@ def the_reported_owner_is_the_one_pickle_resolves():
         assert restored is obj, (obj, restored)
         module = sys.modules[obj.__module__]
         assert getattr(module, obj.__name__) is obj, (obj, module)
+
+    assert contextvars.Context is _contextvars.Context
+    assert repr(contextvars.Context) == "<class '_contextvars.Context'>"
+    assert repr(contextvars.copy_context()).startswith(
+        '<_contextvars.Context object at 0x'
+    )
 
 
 a_nameless_namespace_answers_two_different_ways()

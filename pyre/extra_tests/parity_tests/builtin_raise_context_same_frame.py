@@ -2,16 +2,7 @@
 # parity-tests reason: this guards pyre's JIT builtin raising path when the
 # raise and its handler share one frame, so no callee frame is unwound.
 
-"""A compiled builtin raise retains the active exception context.
-
-`builtin_raise_context_specialization` raises inside a called leaf; here the
-raising op and its handler share the loop frame, which is the shape where the
-compiled arm delivers the exception with a traceback entry already stamped.
-
-The counts are compared only after the loop: reading `__context__` inside an
-`assert` keeps the loop from compiling at all (`loops_compiled=0`), which would
-leave the compiled path untested.
-"""
+"""Compiled builtin raises retain context both in-frame and through a leaf."""
 
 ROUNDS = 20000
 
@@ -62,12 +53,36 @@ def count_attribute():
     return lost
 
 
+def float_leaf():
+    return 1.0 / 0.0
+
+
+def int_leaf():
+    return 7 // 0
+
+
+def count_leaf(leaf):
+    outer = KeyError("outer")
+    lost = 0
+    try:
+        raise outer
+    except KeyError:
+        for _ in range(ROUNDS):
+            try:
+                leaf()
+            except ZeroDivisionError as exc:
+                lost += exc.__context__ is not outer
+    return lost
+
+
 subscript = count_subscript()
 floordiv = count_floordiv(0)
 attribute = count_attribute()
+leaf = count_leaf(float_leaf) + count_leaf(int_leaf)
 
 assert subscript == 0, f"subscript lost {subscript}/{ROUNDS}"
 assert floordiv == 0, f"floordiv lost {floordiv}/{ROUNDS}"
 assert attribute == 0, f"attribute lost {attribute}/{ROUNDS}"
+assert leaf == 0, f"leaf calls lost {leaf}/{ROUNDS * 2}"
 
 print("OK")

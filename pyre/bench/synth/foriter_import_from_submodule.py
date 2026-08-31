@@ -24,6 +24,8 @@
 # three times the slowest of them, the headroom `import_from_hot` carries for
 # the same reason.
 import encodings
+import sys
+import types
 
 N = 40000
 
@@ -40,3 +42,20 @@ def main():
 
 
 main()
+
+
+# IMPORT_FROM's fallback reads `<parent.__name__>.<child>` from sys.modules;
+# the parent need not itself be a module, and the opcode must not bind the
+# answer back onto it.
+class Stand:
+    __slots__ = ("__name__",)
+
+
+stand = Stand()
+stand.__name__ = "pyre_stand"
+piece = types.ModuleType("pyre_stand.piece")
+sys.modules["pyre_stand"] = stand
+sys.modules["pyre_stand.piece"] = piece
+from pyre_stand import piece as got_piece
+assert got_piece is piece
+assert not hasattr(stand, "piece")

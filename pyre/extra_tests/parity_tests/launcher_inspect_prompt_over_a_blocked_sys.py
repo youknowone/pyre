@@ -1,28 +1,10 @@
 # pyre-check: platforms=linux,darwin
-# pyre-check: pypy-diverges: `app_main.py` reaches its prompt through an
-# app-level `import sys`, so the sentinel the program left behind reaches the
-# launcher itself: pypy3 leaves `run_command_line` through an unhandled
-# `ModuleNotFoundError`, prints an interpreter-level `debug: OperationError`
-# dump and exits 1 without opening the prompt.  Its control row -- the same
-# program without `-i` -- agrees at 0, which places the divergence in the
-# prompt rather than in the assignment.
-#
-# CPython-suite gap: the suite pins the `None` sentinel as an import failure
-# (`test_importlib.import_.test_api` `test_blocked_fromlist`) and it pairs `-i`
-# with a program exactly once (`test_cmd_line.test_run_module_bug1764407`,
-# which asserts a name, not what the prompt could still reach).  Nothing puts
-# the two together, so nothing covers whether a program can block the prompt
-# that follows it.
-#
-# parity-tests reason: `sys.modules["name"] = None` is the documented way to
-# stop everything downstream from importing that name, and code reaches for it
-# on `sys` as readily as on anything else.  The prompt `-i` opens is not
-# downstream of the program in that sense: it belongs to the launcher, and
-# `_PySys_GetOptionalAttr` reads `sys.ps1`/`ps2` off `PyInterpreterState`'s own
-# `sys` rather than through the mapping the program just rebound.  So the
-# assignment is the program's to make and the prompt still opens over it -- a
-# runtime that routes its prompt through an ordinary import instead answers the
-# program's sentinel and ends the session the program asked to keep.
+# pyre-check: pypy-diverges: `app_main.py` imports the blocked `sys` name, prints an OperationError and exits 1 without opening the prompt
+# CPython-suite gap: import tests cover the `None` sentinel and command-line
+# tests cover `-i`, but never combine them.
+# parity-tests reason: the launcher reads `sys.ps1`/`ps2` from
+# `PyInterpreterState` through `_PySys_GetOptionalAttr`; a program's blocked
+# `sys.modules['sys']` entry must not prevent the requested prompt.
 import subprocess
 import sys
 

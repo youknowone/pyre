@@ -56,6 +56,22 @@ def the_object_reduce_helpers_are_not_frames():
         lambda: obj.__reduce_ex__(2)
     )
 
+    # Bundled app-level source resolves its own sys module without consulting
+    # a program's blocked import entry.
+    class Slotted:
+        __slots__ = ('value',)
+
+    slotted = Slotted()
+    slotted.value = 1
+    saved = sys.modules['sys']
+    sys.modules['sys'] = None
+    try:
+        reduction = slotted.__reduce_ex__(2)
+    finally:
+        sys.modules['sys'] = saved
+    assert reduction[1] == (Slotted,)
+    assert reduction[2] == (None, {'value': 1})
+
 
 def the_defaultdict_factory_is_not_a_frame():
     d = collections.defaultdict(int)

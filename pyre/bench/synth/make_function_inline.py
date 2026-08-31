@@ -95,6 +95,24 @@ def with_attributes():
     return out[-1], grab.__defaults__, grab.__kwdefaults__, len(grab.__closure__)
 
 
+def attribute_identity():
+    # SET_FUNCTION_ATTRIBUTE must retain the exact default objects and expose
+    # a live kwdefaults mapping on each fresh function.
+    i = 0
+    while i < 3000:
+        marker = (i, i + 1)
+
+        def grab(value: tuple = marker, *, offset=i) -> tuple:
+            return value, offset
+
+        assert grab.__defaults__[0] is marker
+        assert grab()[0] is marker
+        assert grab.__annotations__ == {"value": tuple, "return": tuple}
+        grab.__kwdefaults__["offset"] = i + 1
+        assert grab()[1] == i + 1
+        i += 1
+
+
 def foreign_globals():
     # `exec` with a bare dict: `__builtins__` is inserted as the builtin MODULE
     # here, while a mapping that is not a module declines the fold and keeps
@@ -116,6 +134,7 @@ def main():
     print(hot())
     print(escapes())
     print(with_attributes())
+    attribute_identity()
     print(foreign_globals())
     # The code object owns one realized `co_qualname`, so repeated reads and
     # every function built from it name the same object.

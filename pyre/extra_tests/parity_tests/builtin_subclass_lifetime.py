@@ -5,6 +5,7 @@
 
 import gc
 import itertools
+import weakref
 from types import ModuleType
 
 
@@ -70,4 +71,49 @@ del objects
 gc.collect()
 
 assert sorted(finalized, key=repr) == sorted(expected, key=repr), (finalized, expected)
+
+
+class DictList(list):
+    pass
+
+
+class DictStr(str):
+    pass
+
+
+def churn_dead(count):
+    for index in range(count):
+        value = DictList([1, 2, 3])
+        value.foo = index
+        weakref.ref(value)
+
+
+def inherited_dicts(count):
+    inherited = 0
+    for index in range(count):
+        for value, key in ((DictList(), "foo"), (DictStr("x"), "tag")):
+            inherited += bool(value.__dict__)
+            setattr(value, key, index)
+            inherited += value.__dict__ != {key: index}
+    return inherited
+
+
+# A new owner must not inherit an address-keyed dict or weakref lifeline from
+# a collected builtin-subclass instance.
+inherited = 0
+for _ in range(40):
+    churn_dead(300)
+    inherited += inherited_dicts(300)
+assert inherited == 0, inherited
+
+alive = []
+for _ in range(20):
+    churn_dead(300)
+    for _ in range(300):
+        value = DictList()
+        reference = weakref.ref(value)
+        assert reference() is value
+        alive.append((value, reference))
+    alive.clear()
+
 print("OK")

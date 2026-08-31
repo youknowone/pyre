@@ -1356,6 +1356,72 @@ pub fn exc_info_direct() -> PyObjectRef {
     }
 }
 
+/// The `BuiltinCode.func` behind `sys.exc_info`.
+///
+/// Named rather than a closure so it has a symbol path: source translation
+/// discovers a `BuiltinCode.func` PBC member through
+/// `BUILTIN_WRAPPER_DESCRIPTORS` and codewrites its graph, and
+/// `jit_fnaddr` binds the same path to the runtime address.  A closure has
+/// neither, so the tracer had no jitcode for the target and left the whole
+/// call an opaque `CallMayForceR` -- the shape an unfolded builtin pays 700+
+/// instructions per call for, on top of the tuple.
+///
+/// The gateway Signature binds arity 0, so `args` is empty on every call that
+/// reaches here; it is threaded through to `exc_info_direct` unread, as
+/// `__majit_wrap_builtin_len` threads its own.
+pub fn __majit_wrap_exc_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    debug_assert!(args.is_empty(), "exc_info takes no arguments");
+    let _ = args;
+    Ok(exc_info_direct())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_exc_info_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_exc_info"),
+        func: __majit_wrap_exc_info,
+    };
+
+/// pypy/module/sys/vm.py `exception` — the exception instance currently being
+/// handled, or None outside an `except` block: the value half of
+/// `exc_info_direct`'s tuple.
+pub fn sys_exception_direct() -> PyObjectRef {
+    let exc = crate::eval::get_sys_exception();
+    unsafe {
+        if exc.is_null() || !pyre_object::is_exception(exc) {
+            w_none()
+        } else {
+            exc
+        }
+    }
+}
+
+/// The `BuiltinCode.func` behind `sys.exception`.
+///
+/// Named rather than a closure for the reason spelled out on
+/// [`__majit_wrap_exc_info`]: a closure has no symbol path, so neither
+/// `BUILTIN_WRAPPER_DESCRIPTORS` nor `jit_fnaddr` can name it and the tracer
+/// has no jitcode for the call.
+///
+/// The gateway Signature binds arity 0, so `args` is empty on every call that
+/// reaches here.
+pub fn __majit_wrap_sys_exception(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    debug_assert!(args.is_empty(), "exception takes no arguments");
+    let _ = args;
+    Ok(sys_exception_direct())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_wrap_sys_exception_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__majit_wrap_sys_exception"),
+        func: __majit_wrap_sys_exception,
+    };
+
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     module_ns_store(ns, "maxsize", w_int_new(i64::MAX));
     module_ns_store(ns, "maxunicode", w_int_new(0x10FFFF));
@@ -1668,8 +1734,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     //
     // Tuple construction is shared with `exc_info_direct` (the JIT fast-path
     // entry registered below), so the regular call path and the JIT bypass
-    // observe the same value.
-    let exc_info_fn = make_builtin_function_with_arity("exc_info", |_| Ok(exc_info_direct()), 0);
+    // observe the same value.  The `BuiltinCode.func` is the named
+    // `__majit_wrap_exc_info` rather than a closure so the tracer can descend
+    // into it.
+    let exc_info_fn = make_builtin_function_with_arity("exc_info", __majit_wrap_exc_info, 0);
     module_ns_store(ns, "exc_info", exc_info_fn);
     // baseobjspace.py: register `space._code_of_sys_exc_info` so
     // `function.funccall_valuestack` can take the JIT direct path
@@ -2791,20 +2859,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         ns,
         "exception",
-        make_builtin_function_with_arity(
-            "exception",
-            |_| {
-                let exc = crate::eval::get_sys_exception();
-                Ok(unsafe {
-                    if exc.is_null() || !pyre_object::is_exception(exc) {
-                        w_none()
-                    } else {
-                        exc
-                    }
-                })
-            },
-            0,
-        ),
+        make_builtin_function_with_arity("exception", __majit_wrap_sys_exception, 0),
     );
     module_ns_store(
         ns,

@@ -2,6 +2,7 @@
 # parity-tests reason: this guards call-bearing comprehension trace admission.
 
 import random
+from operator import itemgetter
 
 # A comprehension whose body calls a user Python function accumulates through
 # LIST_APPEND. `randrange` executes `_operator.index` on its bound, and while
@@ -23,5 +24,38 @@ for trial in range(200):
     for _ in range(size):
         collected.append(random.randrange(25))
     assert len(collected) == size, (trial, size, len(collected))
+
+
+class Payload:
+    def __init__(self, value):
+        self.value = value
+
+
+def handled(items):
+    out = []
+    seen = []
+    for index in items:
+        try:
+            items[index + 100]
+        except IndexError:
+            out.extend([str(Payload(value * 3 + 1)) for value in range(1)])
+        seen.append(len(range(index)))
+        out.append(index)
+    return len(out), len(seen)
+
+
+items = [index % 5 for index in range(60)]
+for _ in range(400):
+    assert handled(items) == (120, 60)
+
+# A guard switching itemgetter from its scalar arm to its internal
+# comprehension must retain the item already consumed by FOR_ITER.
+single = itemgetter(0)
+value = ("B", -260)
+for _ in range(20_000):
+    single(value)
+multiple = itemgetter(1, 0)
+for _ in range(20_000):
+    assert multiple(value) == (-260, "B")
 
 print("OK")

@@ -44,7 +44,10 @@ works.  `testutils.py` is the helper module shipped with the snippets
   here. Each parity script states both the missing CPython-suite coverage and
   the JIT/GC/PyPy-internal reason it remains here; the runner rejects missing
   header fields. Cite upstream by symbol, not a line number. Passing requires
-  `exit 0` and a final stdout line of `OK`. Runner:
+  `exit 0` and a final stdout line of `OK`; the runner does not compare the
+  preceding stdout, so every observable must be asserted in the script. A
+  transcript whose value is graded by the synth runner stays in `bench/synth/`
+  instead of being copied here. Runner:
   `pyre/extra_tests/parity_tests/run.py`.
 - `pip/` — one stateful end-to-end sequence rather than a corpus: a release
   binary is driven through `-m venv`, `ensurepip`, a wheel install, a PEP 517

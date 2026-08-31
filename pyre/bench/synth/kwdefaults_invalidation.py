@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot,missing_window
+# pyre-check: selfcheck-compiles=argument_shapes,hot,missing_window
 # pyre-check: spec-folds=kwonly_defaults_inline
 # Self-checking guard for the pins under an inlined callee's keyword-only
 # defaults.
@@ -28,6 +28,37 @@
 #      the resolve declines and the callee seeds through the ordinary path --
 #      which must still see a later in-place mutation.
 N = 20000
+
+
+def positional_defaults(a, b=3, c=5):
+    return a * 100 + b * 10 + c
+
+
+def object_defaults(a, b="x", c=None):
+    return a, b, c
+
+
+def keyword_shapes(a, *rest, p=7, q=11):
+    return a, rest, p, q
+
+
+class Holder:
+    def method(self, a, *, p=13):
+        return a, p
+
+
+def argument_shapes(n):
+    """All positional/keyword default slot shapes at one compiled owner."""
+    bad = 0
+    holder = Holder()
+    for i in range(n):
+        bad += positional_defaults(1) != 135
+        bad += positional_defaults(1, c=7) != 137
+        bad += object_defaults(1, c="z") != (1, "x", "z")
+        bad += keyword_shapes(i) != (i, (), 7, 11)
+        bad += keyword_shapes(i, i + 1, p=9) != (i, (i + 1,), 9, 11)
+        bad += holder.method(i) != (i, 13)
+    return bad
 
 
 def g(x, *, step=1, tag="a"):
@@ -62,6 +93,10 @@ def hot(n, want_step, want_tag):
 
 
 def main():
+    if argument_shapes(N):
+        print("FAIL argument default shapes disagreed")
+        return 1
+
     # Warm first so the sites below mutate a compiled loop rather than an
     # interpreted one.
     if hot(N, 1, "a"):

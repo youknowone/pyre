@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: startup SystemExit and hook failure reporting differ
 # CPython-suite gap: `test_cmd_line` is the only module that reaches these, and
 # it sits at IMPORTERROR in the baseline, so none of it runs.  Even restored,
 # `test_run_startup` there checks that a startup file is executed and nothing
@@ -85,6 +86,13 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "ValueError: from startup" in err, (out, err)
     assert "PROMPT REACHED" in out, (out, err)
 
+    exiter = os.path.join(tmp, "exiter.py")
+    with open(exiter, "w") as f:
+        f.write("raise SystemExit(3)\n")
+    out, err, code = run(["-i"], {"PYTHONSTARTUP": exiter})
+    assert "PROMPT REACHED" not in out, (out, err)
+    assert code == 3, (code, out, err)
+
 # Every prompt calls the hook, including the one that opens over a program.
 HOOK = """
 import sys
@@ -103,6 +111,7 @@ out, err, code = run(
     {},
 )
 assert "ZeroDivisionError" in err, (out, err)
+assert "Failed calling sys.__interactivehook__" in err, (out, err)
 assert "PROMPT REACHED" in out, (out, err)
 
 # A `sys` with no hook at all is the ordinary `-S` shape, not a failure.
