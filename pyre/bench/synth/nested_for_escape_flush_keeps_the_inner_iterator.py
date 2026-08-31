@@ -3,17 +3,23 @@
 # The multi-frame escape flush publishes frame 0's LOCALS; this guards the
 # operand stack published with them.
 #
-# `sys._getframe(1)` read from an inlined callee forces the CALLER's
+# A redirected frame field read from an inlined callee forces the CALLER's
 # virtualizable, so the walk aborts as an inline sub-walk and a multi-frame
-# blackhole image resumes the two frames. The walk keeps that virtualizable
-# symbolic, so nothing it pushed or popped ever reached the live frame's slot
-# array. When the abort lands on a walk that crossed the inner `FOR_ITER`'s
-# exhaust, the outer `FOR_ITER` has already run and `GET_ITER` has built a
-# FRESH inner iterator that exists only in the walk: resuming without
-# publishing the stack leaves the PREVIOUS pass's exhausted iterator on TOS,
-# the inner loop ends one iteration in, and every later `i` runs one pass ahead
-# of the `j` beside it. The values the body reads stay intact, which is why
-# this reads as a loop-control error and not a lost item.
+# blackhole image resumes the two frames. `sys._getframe(1)` only names the
+# frame: the force sits at the field, where `rvirtualizable.py
+# hook_access_field` places it, and `f_lasti` reads `last_instr` -- one of the
+# five `virtualizable_gen.rs` declares. The `f_code` the caller-identity check
+# reads is not a lever; its gateway carries no marker.
+#
+# The walk keeps that virtualizable symbolic, so nothing it pushed or popped
+# ever reached the live frame's slot array. When the abort lands on a walk
+# that crossed the inner `FOR_ITER`'s exhaust, the outer `FOR_ITER` has
+# already run and `GET_ITER` has built a FRESH inner iterator that exists only
+# in the walk: resuming without publishing the stack leaves the PREVIOUS
+# pass's exhausted iterator on TOS, the inner loop ends one iteration in, and
+# every later `i` runs one pass ahead of the `j` beside it. The values the
+# body reads stay intact, which is why this reads as a loop-control error and
+# not a lost item.
 #
 # Measured before the stack was published: `k=1041 i=209 j=0`, where `k` says
 # the body is at `i=208 j=1` -- the first abort lands at the default hotness
@@ -34,7 +40,9 @@ wrong = []
 
 
 def leaf(x):
-    name = _gf(1).f_code.co_name
+    fr = _gf(1)
+    _ = fr.f_lasti
+    name = fr.f_code.co_name
     if name != "main":
         wrong.append(name)
     return x + 1

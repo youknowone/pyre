@@ -16,7 +16,12 @@
 #
 # One frame down, depth 1 lands on the portal frame, and that is the whole
 # shape: `peek()` inlines into the rare arm and its `_gf(1)` is a `CallFn`
-# residual that hands `main`'s own virtualizable to Python.
+# residual that hands `main`'s own virtualizable to Python, where the `f_lasti`
+# read forces it.  The read is the lever, not the call: `sys._getframe` takes no
+# virtualizable force of its own, and `rvirtualizable.py hook_access_field`
+# places one at each REDIRECTED field access -- `f_lasti` reads `last_instr`,
+# one of the five `virtualizable_gen.rs` declares.  The `f_code.co_name` `peek`
+# also reads is not a second one.
 #
 # Each clause is load-bearing:
 #   * the `for` loop compiles on the common arm;
@@ -55,8 +60,11 @@ _gf = sys._getframe
 
 def peek():
     # Depth 1 from inside the inlined callee names `main` -- the traced
-    # virtualizable -- so this stays a residual and forces the token.
-    return _gf(1).f_code.co_name
+    # virtualizable -- so this stays a residual, and the `f_lasti` read off the
+    # frame it returns forces the token.
+    fr = _gf(1)
+    _ = fr.f_lasti
+    return fr.f_code.co_name
 
 
 def main():

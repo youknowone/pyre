@@ -33,12 +33,17 @@
 # the escape has happened, a `sys._getframe(1)` executed inside the blackhole was
 # always correct, because the chain publishes each level's frame as it runs.
 #
-# Both reads still escape — `_gf()` names `leaf_a`'s published frame and
-# `_gf(1)` names `part_b`'s portal — but only once per call now that
-# `sys._getframe` forces the frame it RETURNS and not also the top of the stack.
-# The multi-frame adoption count this file exists for is unmoved at 10.  What
-# the duplicate escape carried was the single-frame count, 5 -> 0, alongside
-# `part_a`'s loop compiling.
+# The escape is `leaf_b`'s `f_lasti` read, and it is the only one in the file.
+# `sys._getframe` takes no virtualizable force of its own; `rvirtualizable.py
+# hook_access_field` places one at each REDIRECTED field access, and `f_lasti`
+# reads `last_instr`, one of the five `virtualizable_gen.rs` declares.  The
+# `f_code.co_name` both oracles read is not a second escape — `pyframe.rs
+# descr_typecheck_fget_f_code` carries no marker and says at its own definition
+# why `pycode` needs none — and `leaf_a`'s call is at depth 0, which
+# `try_walker_specialize_sys_getframe` answers out of the portal virtualizable
+# the walk already holds, so the same read there moves no counter (measured).
+# `part_a` therefore keeps its identity oracle over compiled code while the
+# adopt this file exists for is reached through `part_b`.
 import sys
 
 _gf = sys._getframe
@@ -64,7 +69,9 @@ def part_a():
 
 
 def leaf_b(x):
-    name = _gf(1).f_code.co_name
+    fr = _gf(1)
+    _ = fr.f_lasti
+    name = fr.f_code.co_name
     if name != "part_b":
         wrong_b.append(name)
     return x + 1

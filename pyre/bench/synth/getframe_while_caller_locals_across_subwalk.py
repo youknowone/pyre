@@ -5,12 +5,16 @@
 # Caller locals that are live ACROSS the inlined call, exercised at a vable
 # escape inside an inline sub-walk.
 #
-# The escape is `_gf(1)`, the CALLER's frame, and the depth is load-bearing:
-# `try_walker_specialize_sys_getframe` answers depth 0 at the top walk level out
-# of the portal virtualizable, so a zero-argument call -- which is what this
-# fixture used to carry -- forces nothing and the baselines went to
-# `fbw_blackhole_adopted_multi_frame=0`.  Depth 1 names a frame the
-# specialization refuses, so the call stays residual and forces.
+# The escape is the `f_lasti` read on `_gf(1)`, the CALLER's frame, and both
+# halves are load-bearing.  The depth: `try_walker_specialize_sys_getframe`
+# answers depth 0 at the top walk level out of the portal virtualizable, so a
+# zero-argument call forces nothing and the baselines went to
+# `fbw_blackhole_adopted_multi_frame=0`; depth 1 names a frame the
+# specialization refuses, so the call stays residual.  The read: `getframe`
+# takes no virtualizable force of its own, `rvirtualizable.py
+# hook_access_field` places one at each REDIRECTED field access, and `f_lasti`
+# reads `last_instr` -- one of the five `virtualizable_gen.rs` declares.  A bare
+# call, or a read of `f_code` or `f_back`, escapes nothing.
 #
 # The multi-frame chain gives each level its own frame as the virtualizable, so
 # the walked frame's level writes its `setfield_vable` stores to the LIVE frame,
@@ -26,7 +30,7 @@ _gf = sys._getframe
 
 
 def leaf(x):
-    _gf(1)
+    _ = _gf(1).f_lasti
     return x + 1
 
 
