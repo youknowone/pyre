@@ -4877,6 +4877,16 @@ fn decode_utf16_impl(
     final_: bool,
 ) -> Result<(Wtf8Buf, usize, i32), crate::PyError> {
     let (big_endian, mut pos, byteorder) = resolve_bom(data, false, fixed_be);
+    // [3.14-spec] PyPy `str_decode_utf_16_helper` reports its caller-supplied
+    // `public_encoding_name` (normally `utf16`).
+    // `PyUnicode_DecodeUTF16Stateful` at v3.14.6 selects the effective
+    // `utf-16-le` / `utf-16-be` name from the byte order it settled on, the way
+    // the utf-32 sibling below does.
+    let codec = if matches!(codec, "utf16" | "utf-16") {
+        if big_endian { "utf-16-be" } else { "utf-16-le" }
+    } else {
+        codec
+    };
     // A custom error handler may replace exc.object; the loop then resumes
     // from the new bytes (`buf`), re-evaluating `len` each iteration.
     let mut buf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
@@ -4952,9 +4962,11 @@ fn decode_utf32_impl(
     // [3.14-spec] PyPy `str_decode_utf_32_helper` reports its caller-supplied
     // `public_encoding_name` (normally `utf32`).
     // `PyUnicode_DecodeUTF32Stateful` at v3.14.6 selects the effective
-    // `utf-32-le` / `utf-32-be` name after BOM resolution; that name is
-    // observable as `UnicodeDecodeError.encoding`.
-    let codec = if fixed_be.is_none() && matches!(codec, "utf32" | "utf-32") {
+    // `utf-32-le` / `utf-32-be` name from the byte order it settled on —
+    // whether that came from a BOM, from the caller's `byteorder` argument,
+    // or from the platform default — and that name is observable as
+    // `UnicodeDecodeError.encoding`.
+    let codec = if matches!(codec, "utf32" | "utf-32") {
         if big_endian { "utf-32-be" } else { "utf-32-le" }
     } else {
         codec

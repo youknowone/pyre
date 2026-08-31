@@ -2533,7 +2533,7 @@ crate::py_module! {
                 final_,
                 false,
                 Some(true),
-                "utf16-be",
+                "utf-16-be",
                 "utf_16_be_decode",
             )
         }
@@ -2554,7 +2554,7 @@ crate::py_module! {
                 final_,
                 false,
                 Some(false),
-                "utf16-le",
+                "utf-16-le",
                 "utf_16_le_decode",
             )
         }
@@ -2596,7 +2596,7 @@ crate::py_module! {
                 final_,
                 true,
                 Some(true),
-                "utf32-be",
+                "utf-32-be",
                 "utf_32_be_decode",
             )
         }
@@ -2617,7 +2617,7 @@ crate::py_module! {
                 final_,
                 true,
                 Some(false),
-                "utf32-le",
+                "utf-32-le",
                 "utf_32_le_decode",
             )
         }
