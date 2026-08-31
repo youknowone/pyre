@@ -6,7 +6,7 @@
 # stale fold keeps returning the old value. Exercises an int global, a len() of
 # a global set, a str-prefix global, and a rebound global function. Output is
 # verified against CPython/PyPy.
-N = 9000
+N = 18000
 
 CFG = 1
 S = {1, 2, 3}

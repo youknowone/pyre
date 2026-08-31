@@ -19,7 +19,7 @@
 # `d_while_nonmatching` cover the other two cleanup shapes that reach the same
 # RERAISE, and `d_no_mid` pins that neither an inlined intermediate frame nor
 # a compiled exception-edge bridge is needed to trigger it.
-N = 20000
+N = 40000
 
 
 def names(e):

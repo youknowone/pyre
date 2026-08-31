@@ -2,7 +2,7 @@
 # complex() falls back to __index__ when a value defines neither __complex__
 # nor __float__, matching float()'s coercion. Output verified against
 # CPython/PyPy.
-N = 40000
+N = 80000
 
 
 class Idx:

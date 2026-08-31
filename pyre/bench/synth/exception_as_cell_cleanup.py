@@ -5,7 +5,7 @@
 # traced DELETE_DEREF dereferences the cell to raise if unbound, then clears
 # its contents; this bench pins that a captured-exception handler in a hot
 # loop compiles and returns byte-identically.
-N = 60000
+N = 120000
 
 
 def run(n):

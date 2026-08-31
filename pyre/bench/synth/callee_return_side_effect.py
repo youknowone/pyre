@@ -2,7 +2,7 @@
 # gh#495 guard: a callee's mutation must not be replayed or dropped, for a
 # constant-int and for a float return value.  Each return kind keeps its own
 # driver so the call stays a direct global call rather than an indirect one.
-N = 30000
+N = 60000
 
 
 class C:

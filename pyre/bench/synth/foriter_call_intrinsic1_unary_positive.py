@@ -1,6 +1,6 @@
 # CALL_INTRINSIC_1/UnaryPositive in a hot FOR_ITER body. This is one of the two
 # variants with a codewriter residual; the other variants remain gate declines.
-N = 20000
+N = 40000
 
 
 def main():

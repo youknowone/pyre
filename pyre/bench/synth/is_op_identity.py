@@ -21,7 +21,7 @@
 # and leave the residual in place.  A `GuardClass` pins only the layout, and an
 # `int` subclass instance shares `INT_TYPE` with a plain `int`, so folding
 # those to `ptr_eq` would answer `False` where the interpreter answers `True`.
-N = 200000
+N = 400000
 
 
 class Plain:

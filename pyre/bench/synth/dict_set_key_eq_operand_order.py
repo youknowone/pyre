@@ -3,7 +3,7 @@
 # one, in that order (`ll_dict_lookup` runs `keyeq(checkingkey, key)`).  The
 # order decides whose `__eq__` the comparison protocol reaches first, so it is
 # observable for any key whose `__eq__` is asymmetric or records that it ran.
-N = 20000
+N = 40000
 
 
 class Recorded:

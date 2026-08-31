@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=12
 # N/ITERS are sized to prove the opcode compiles and to drive the compiled
 # loop thousands of times, not to race pypy.
-N = 300
+N = 600
 ITERS = 500
 
 

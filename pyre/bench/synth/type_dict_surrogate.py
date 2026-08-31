@@ -6,7 +6,7 @@
 # ceiling is three times the slowest of them. The unfolded band reached 2.13x
 # the unfolded local reading, which puts a folded CI worst case near 15x, so
 # the ceiling carries roughly 1.4x of headroom over it.
-N = 200000
+N = 400000
 
 S = '\udcff'                  # lone low surrogate
 H = 'a' + chr(0xd800) + 'b'   # embedded high surrogate

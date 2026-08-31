@@ -22,7 +22,7 @@ def hook(event, args):
 obj = [1, 2, 3]
 sys.addaudithook(hook)
 
-N = 2000
+N = 4000
 before = count[0]
 last_returned = 0
 for _ in range(N):

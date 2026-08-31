@@ -10,7 +10,7 @@
 # No FOR_ITER: this is the shape that reaches the defect with no opcode gate
 # involved, so it stays a witness independently of what the FOR_ITER body scan
 # admits. Kept at module scope, where it was first reproduced.
-N = 20000
+N = 40000
 
 
 class Context:

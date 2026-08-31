@@ -4,7 +4,7 @@
 # Arguments keeps keyword names as byte-ish str (argument.py keywords: [str]),
 # so unpacking a `**{'\udc80': v}` dict must not drop or mangle the key.
 
-N = 50000
+N = 100000
 
 S1 = '\udc81'            # lone surrogate keyword name
 S2 = '\udc84\udc85'      # multi-surrogate keyword name
