@@ -1051,7 +1051,14 @@ impl ExecutionContext {
         // action_dispatcher do NOT run.  Use `?` so a tracer error
         // short-circuits before touching actionflag.
         frame = self.bytecode_only_trace(frame)?;
-        if self.actionflag.decrement_ticker(decr_by as isize) < 0 {
+        // Copy the one-word wrapper out before the call: `&mut self.actionflag`
+        // is a GC-interior address, which rewrite_op_getsubstruct refuses (an
+        // abort is baked before the residual). The wrapper is Copy and points
+        // at the process-global flag, so a local copy reaches the same state —
+        // upstream's `self.space.actionflag` is likewise a plain reference
+        // read, never an interior pointer.
+        let mut actionflag = self.actionflag;
+        if actionflag.decrement_ticker(decr_by as isize) < 0 {
             // executioncontext.py — `actionflag.action_dispatcher`.
             // Routed through a residual (dont_look_inside) boundary so the
             // tracer never sees the action machinery's trait-object
