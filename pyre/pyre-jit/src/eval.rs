@@ -7482,9 +7482,7 @@ fn drive_portal_metatrace(
             },
         );
 
-        if meta.is_tracing() {
-            meta.abort_trace(false);
-        }
+        driver.abort_current_trace(false);
 
         match walked {
             Some((action, before, after, depth, stop_jitcode, stop_cursor, stop_pc)) => {
@@ -7507,10 +7505,7 @@ fn drive_portal_metatrace(
     }));
 
     if let Err(payload) = result {
-        let meta = driver.meta_interp_mut();
-        if meta.is_tracing() {
-            meta.abort_trace(false);
-        }
+        driver.abort_current_trace(false);
         let message = if let Some(message) = payload.downcast_ref::<&str>() {
             (*message).to_owned()
         } else if let Some(message) = payload.downcast_ref::<String>() {

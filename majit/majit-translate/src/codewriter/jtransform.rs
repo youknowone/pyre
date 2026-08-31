@@ -3821,16 +3821,21 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
-        // Root pins and reloads are GC-transformer-level operations that
-        // upstream's codewriter never sees: `framework.py` `push_roots` /
-        // `pop_roots` run after jtransform. The JIT does not distinguish an
-        // object from its post-move address, so both operations are aliases of
-        // the object they publish or reload and emit no jitcode op.
+        // `reload_top_root` re-reads the top shadow-stack slot and carries the
+        // value that slot was published with as its argument; the JIT does not
+        // distinguish an object from its post-move address, so the call is an
+        // alias of its operand and emits no jitcode op.  `pin_root` is NOT
+        // folded: it PUBLISHES its operand to a fresh root-stack slot, and
+        // hand-written brackets read those slots back positionally through
+        // bound `shadow_stack_len` / `shadow_stack_get` residuals
+        // (`w_slice_new`: three pins, then `shadow_stack_get(save_point + i)`
+        // after a collecting allocation).  Eliding the pin drops the slots the
+        // retained reads index into.
         if let CallTarget::FunctionPath { segments } = target
             && let [.., crate_name, module, leaf] = segments.as_slice()
             && crate_name == crate::runtime_names::crates::OBJECT
             && module == "gc_roots"
-            && matches!(leaf.as_str(), "pin_root" | "reload_top_root")
+            && leaf == "reload_top_root"
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
@@ -12560,10 +12565,11 @@ mod tests {
         }
     }
 
-    /// Root pins/reloads are inserted below the codewriter upstream, so both
-    /// source-level spellings alias their operand and contribute no operation.
+    /// `reload_top_root` aliases its operand and contributes no operation;
+    /// `pin_root` keeps its call, because it publishes a root-stack slot that
+    /// bound `shadow_stack_get` residuals read back positionally.
     #[test]
-    fn gc_root_pin_and_reload_elide_to_operand_alias() {
+    fn gc_root_reload_elides_but_pin_root_keeps_its_publication() {
         for leaf in ["pin_root", "reload_top_root"] {
             let config = GraphTransformConfig::default();
             let mut transformer = Transformer::new(&config);
@@ -12591,7 +12597,15 @@ mod tests {
                 &format!("gc_roots_{leaf}"),
                 &mut graph,
             );
-            assert!(matches!(rewritten, RewriteResult::Identity(alias) if alias == arg));
+            let elides = leaf == "reload_top_root";
+            if elides {
+                assert!(matches!(rewritten, RewriteResult::Identity(alias) if alias == arg));
+            } else {
+                assert!(
+                    !matches!(rewritten, RewriteResult::Identity(_)),
+                    "pin_root must keep its publication"
+                );
+            }
 
             graph.blocks[entry.0].operations.push(op);
             let exceptblock = graph.exceptblock;
@@ -12601,9 +12615,10 @@ mod tests {
                 &format!("gc_roots_{leaf}"),
                 exceptblock,
             );
-            assert!(
+            assert_eq!(
                 graph.blocks[entry.0].operations.is_empty(),
-                "{leaf} must emit no operation"
+                elides,
+                "reload_top_root elides; pin_root stays"
             );
         }
     }
