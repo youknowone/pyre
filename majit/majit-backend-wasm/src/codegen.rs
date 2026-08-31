@@ -1215,7 +1215,7 @@ fn normal_frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     let max_fail_args = guards
         .iter()
-        .map(|g| g.fail_arg_refs.len())
+        .map(|g| live_fail_arg_extent(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
         .max()
         .unwrap_or(0);
     let value_area = max_fail_args.max(inputargs.len());
@@ -1233,7 +1233,7 @@ fn counter_slot(inputargs: &[InputArg], ops: &[Op]) -> Option<usize> {
     }
     let max_fail_args = guards
         .iter()
-        .map(|g| g.fail_arg_refs.len())
+        .map(|g| live_fail_arg_extent(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
         .max()
         .unwrap_or(0);
     Some(max_fail_args.max(inputargs.len()))
@@ -1745,7 +1745,36 @@ pub fn live_fail_arg_mask(meta_descr: Option<&majit_ir::DescrRef>, n: usize) -> 
 
 /// How many of a guard's fail-arg positions reach its bridge as inputargs.
 pub fn live_fail_arg_count(meta_descr: Option<&majit_ir::DescrRef>, n: usize) -> usize {
-    live_fail_arg_mask(meta_descr, n).iter().filter(|l| **l).count()
+    live_fail_arg_mask(meta_descr, n)
+        .iter()
+        .filter(|l| **l)
+        .count()
+}
+
+/// One past a guard's highest LIVE fail-arg position: the frame slots its exit
+/// has to write, and therefore the width the frozen layout has to hold.
+///
+/// A guard keeps its fail arguments in their *logical* resume positions here —
+/// `optimizeopt/mod.rs` hands this backend an identity-with-holes `rd_locs` and
+/// `emit_guard_fail_args_spill` writes position `i` into slot `i` — so the
+/// width is a property of the numbering, not of how many values are live.
+/// `optimizer.py:732` keeps one `ResumeDataLoopMemo` per `Optimizer`, so a
+/// guard numbered late in a trace carries positions every earlier guard filled;
+/// `resume.py:511 _invalidation_needed` only clears that cache once a guard
+/// passes `failargs_limit // 2` live boxes, which a trace can stay under while
+/// its logical width keeps growing.
+///
+/// Nothing reads a hole: its `rd_locs` entry is `0xFFFF`, so
+/// `initialize_state_from_guard_failure` never asks for the slot, and
+/// `emit_resolve` only spills a zero placeholder into it. Holes past the last
+/// live position therefore cost slots that no reader can observe, which on this
+/// backend is not free — a frame's offsets freeze when its token is compiled
+/// and `compile_bridge` declines a later bridge that does not fit them.
+pub fn live_fail_arg_extent(meta_descr: Option<&majit_ir::DescrRef>, n: usize) -> usize {
+    live_fail_arg_mask(meta_descr, n)
+        .iter()
+        .rposition(|&live| live)
+        .map_or(0, |i| i + 1)
 }
 
 pub struct GuardExit {
@@ -2293,7 +2322,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
     if guards.iter().any(|g| g.counter_value_spill.is_some()) {
         let value_area = guards
             .iter()
-            .map(|g| g.fail_arg_refs.len())
+            .map(|g| live_fail_arg_extent(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
             .max()
             .unwrap_or(0)
             .max(inputargs.len());
@@ -3005,9 +3034,7 @@ pub fn build_wasm_module(
     let bridge_param_arities: Vec<usize> = if *bridge_param_dispatch && bridge_dispatch {
         let mut arities: Vec<usize> = guards
             .iter()
-            .map(|guard| {
-                live_fail_arg_count(guard.meta_descr.as_ref(), guard.fail_arg_refs.len())
-            })
+            .map(|guard| live_fail_arg_count(guard.meta_descr.as_ref(), guard.fail_arg_refs.len()))
             .collect();
         arities.sort_unstable();
         arities.dedup();
@@ -7875,7 +7902,15 @@ fn emit_force_arm(
 ) {
     // `counter_value_spill` answers `None` for anything but a GUARD_VALUE, so
     // the counter slot has nothing to contribute to a force bracket.
-    for (i, &arg_ref) in exit_fail_args(guard_op).iter().enumerate() {
+    //
+    // Same range `emit_guard_fail_args_spill` writes and
+    // `normal_frame_value_slots` reserves: one past the last live position.
+    let mut force_args = exit_fail_args(guard_op);
+    force_args.truncate(live_fail_arg_extent(
+        guard_op.getdescr().as_ref(),
+        force_args.len(),
+    ));
+    for (i, &arg_ref) in force_args.iter().enumerate() {
         sink.local_get(0);
         if undefined == Some(arg_ref.raw()) {
             sink.i64_const(0);
@@ -7926,7 +7961,13 @@ fn emit_guard_fail_args_spill(
     op: &Op,
     counter_slot: Option<u64>,
 ) {
-    let fail_args = exit_fail_args(op);
+    // Only through the last live position: `normal_frame_value_slots` sizes the
+    // value area the same way, so writing past it would write past the frame.
+    let mut fail_args = exit_fail_args(op);
+    fail_args.truncate(live_fail_arg_extent(
+        op.getdescr().as_ref(),
+        fail_args.len(),
+    ));
 
     for (i, &arg_ref) in fail_args.iter().enumerate() {
         let offset = FRAME_SLOT_BASE + i as u64 * SLOT_SIZE;
