@@ -86,11 +86,18 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 ///
 /// Manual frame getset gateways publish their bodies through
 /// `gateway::BUILTIN_WRAPPER_DESCRIPTORS`, the Rust counterpart of
-/// `BuiltinCode.func`'s SomePBC family.  Each gateway carries this marker next
-/// to its redirected access.  The untranslated interpreter therefore retains
+/// `BuiltinCode.func`'s SomePBC family.  The untranslated interpreter retains
 /// the force, while `jtransform` deletes it from every gateway graph admitted
 /// by the codewriter — the same two populations `hook_access_field` creates
 /// upstream.
+///
+/// Which gateways carry it is `hook_access_field`'s own condition,
+/// `if self.my_redirected_fields.get(cname.value)`: only a body that reads a
+/// field `interp_jit.py` lists in `_virtualizable_` (`last_instr`, `pycode`,
+/// `valuestackdepth`, `locals_cells_stack_w[*]`, `debugdata`, `w_globals`).
+/// `pyframe.rs` `descr_typecheck_fget_f_back` and `..._fget_f_builtins` read
+/// `f_backref` and `w_builtin`, so they carry none; each says so at its own
+/// definition, with what the extra marker measured.
 ///
 /// Upstream reaches the rewrite because `hook_access_field` puts the marker
 /// at every redirected FIELD access, which lands it inside graphs the

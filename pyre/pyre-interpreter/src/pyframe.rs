@@ -3166,6 +3166,20 @@ register_frame_builtin_wrapper!(
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_back`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_back`.
+///
+/// No force marker.  `rvirtualizable.py hook_access_field` emits
+/// `jit_force_virtualizable` only under
+/// `if self.my_redirected_fields.get(cname.value)`, and the field this reads —
+/// `f_backref` — is not one: `interp_jit.py` declares `_virtualizable_` as
+/// `last_instr`, `pycode`, `valuestackdepth`, `locals_cells_stack_w[*]`,
+/// `debugdata`, `w_globals`.  [`PyFrame::fget_f_back`] states what a marker
+/// here costs instead — `f_backref` holds a `jit.virtual_ref`, so reading it
+/// IS the force, and it is the foldable one.
+///
+/// Measured on `synth/getframe_inlined_callee_own_frame`: with the marker,
+/// `frame.f_back` raised `VableEscapedDuringResidualCall` 35 times and the
+/// fixture compiled no loop; `frame.f_code`, whose field IS redirected, raised
+/// none because the walker folds that read instead of residualizing it.
 pub fn __majit_wrap_descr_typecheck_fget_f_back(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -3174,7 +3188,6 @@ pub fn __majit_wrap_descr_typecheck_fget_f_back(
         return Ok(pyre_object::w_none());
     }
     let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
-    crate::executioncontext::jit_force_virtualizable(anchor.live());
     let back = unsafe { &*anchor.live() }.fget_f_back();
     Ok(if back.is_null() {
         pyre_object::w_none()
@@ -3308,6 +3321,11 @@ register_frame_builtin_wrapper!(
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_builtins`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_builtins`.
+///
+/// No force marker, for the reason
+/// [`__majit_wrap_descr_typecheck_fget_f_back`] gives:
+/// [`PyFrame::fget_f_builtins`] reads `w_builtin` and the module's `w_dict`,
+/// and `_virtualizable_` names neither.
 pub fn __majit_wrap_descr_typecheck_fget_f_builtins(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -3316,7 +3334,6 @@ pub fn __majit_wrap_descr_typecheck_fget_f_builtins(
         return Ok(pyre_object::w_none());
     }
     let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
-    crate::executioncontext::jit_force_virtualizable(anchor.live());
     let w = unsafe { &*anchor.live() }.fget_f_builtins();
     Ok(if w.is_null() {
         pyre_object::w_none()
