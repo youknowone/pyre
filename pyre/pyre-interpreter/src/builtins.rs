@@ -16462,30 +16462,72 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(dict)
 }
 
-/// util.py `_classdir` — union `getattr(klass, '__dict__')`'s keys with,
-/// recursively, `_classdir(base)` for each base in `getattr(klass,
-/// '__bases__')`.  Both attributes are read through the attribute protocol so
-/// a metaclass that customizes `__dict__`/`__bases__` access participates.
-unsafe fn classdir_into(
-    w_cls: PyObjectRef,
-    names: &mut Vec<Wtf8Buf>,
-) -> Result<(), crate::PyError> {
-    unsafe { classdir_recurse(w_cls, names) }
+/// The `dir()` accumulator: the dict `merge_class_dict` merges into.
+///
+/// Names are collected as the key objects they are, whatever their type —
+/// filtering non-strings out here is what would keep `dir()` from raising the
+/// `TypeError` its final sort owes for a class namespace holding one.  The
+/// dict is what dedups them, and it is reached through a shadow-stack slot
+/// because a store hashes its key (arbitrary Python for a non-string one) and
+/// may grow the accumulator.
+fn dir_names_new() -> usize {
+    let names = pyre_object::w_dict_new();
+    let names_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(names);
+    names_slot
+}
+
+/// `PyDict_Update(dict, classdict)` — add every key `keys` yields.
+fn dir_names_update(names_slot: usize, keys: Vec<PyObjectRef>) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let keys_slot = pyre_object::gc_roots::pin_roots(&keys);
+    for index in 0..keys.len() {
+        let key = pyre_object::gc_roots::shadow_stack_get(keys_slot + index);
+        let names = pyre_object::gc_roots::shadow_stack_get(names_slot);
+        unsafe { pyre_object::w_dict_store(names, key, pyre_object::w_none()) };
+    }
+}
+
+/// `PyDict_Keys(dict)` — the collected names in first-seen order.  `dir()`
+/// sorts them afterwards; `object.__dir__` / `type.__dir__` hand them back as
+/// they stand.
+fn dir_names_list(names_slot: usize) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let names = pyre_object::gc_roots::shadow_stack_get(names_slot);
+    let collected: Vec<PyObjectRef> = unsafe { pyre_object::w_dict_items(names) }
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    let keys_slot = pyre_object::gc_roots::pin_roots(&collected);
+    let keys = (0..collected.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(keys_slot + index))
+        .collect();
+    w_list_new(keys)
+}
+
+/// util.py `_classdir` / `merge_class_dict` — union `getattr(klass,
+/// '__dict__')`'s keys with, recursively, `_classdir(base)` for each base in
+/// `getattr(klass, '__bases__')`.  Both attributes are read through the
+/// attribute protocol so a metaclass that customizes `__dict__`/`__bases__`
+/// access participates.
+unsafe fn classdir_into(w_cls: PyObjectRef, names_slot: usize) -> Result<(), crate::PyError> {
+    unsafe { classdir_recurse(w_cls, names_slot) }
 }
 
 unsafe fn classdir_recurse(
     w_cls: PyObjectRef,
-    names: &mut Vec<Wtf8Buf>,
+    names_slot: usize,
 ) -> Result<(), crate::PyError> {
+    // The class and its bases are read across calls that run Python, so the
+    // receiver is published rather than carried in a Rust local.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_cls);
     // getattr(klass, '__dict__', None): names.update(ns).  This is deliberately
     // iterable-driven, not dict-only: app-level PyPy accepts any iterable here.
     match crate::baseobjspace::getattr_str(w_cls, "__dict__") {
         Ok(w_ns) if !w_ns.is_null() && !unsafe { pyre_object::is_none(w_ns) } => {
-            for k in collect_iterable(w_ns)? {
-                if unsafe { pyre_object::is_str(k) } {
-                    names.push(unsafe { pyre_object::w_str_get_wtf8(k) }.to_owned());
-                }
-            }
+            dir_names_update(names_slot, collect_iterable(w_ns)?);
         }
         Ok(_) => {}
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {}
@@ -16493,10 +16535,15 @@ unsafe fn classdir_recurse(
     }
 
     // getattr(klass, '__bases__', None): for base in bases.
+    let w_cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
     match crate::baseobjspace::getattr_str(w_cls, "__bases__") {
         Ok(bases) if !bases.is_null() && !unsafe { pyre_object::is_none(bases) } => {
-            for base in collect_iterable(bases)? {
-                unsafe { classdir_recurse(base, names) }?;
+            let bases = collect_iterable(bases)?;
+            let _base_roots = pyre_object::gc_roots::push_roots();
+            let bases_slot = pyre_object::gc_roots::pin_roots(&bases);
+            for index in 0..bases.len() {
+                let base = pyre_object::gc_roots::shadow_stack_get(bases_slot + index);
+                unsafe { classdir_recurse(base, names_slot) }?;
             }
         }
         Ok(_) => {}
@@ -16512,7 +16559,8 @@ unsafe fn classdir_recurse(
 /// class namespace.  `dir(obj)` sorts the result after invoking this special
 /// method; `object.__dir__(obj)` itself only promises a list.
 pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let mut names: Vec<Wtf8Buf> = Vec::new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let names_slot = dir_names_new();
     unsafe {
         let mut w_dict = crate::baseobjspace::getdict(obj)?;
         // `method.__dir__` forwards the underlying function's instance
@@ -16525,26 +16573,21 @@ pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate:
             }
         }
         if !w_dict.is_null() && pyre_object::is_dict(w_dict) {
-            for (key, _) in pyre_object::w_dict_items(w_dict) {
-                if pyre_object::is_str(key) {
-                    names.push(pyre_object::w_str_get_wtf8(key).to_owned());
-                }
-            }
+            dir_names_update(
+                names_slot,
+                pyre_object::w_dict_items(w_dict)
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect(),
+            );
         }
         if let Some(w_type) = crate::typedef::r#type(obj)
             && pyre_object::is_type(w_type.as_ptr())
         {
-            classdir_into(w_type.as_ptr(), &mut names)?;
+            classdir_into(w_type.as_ptr(), names_slot)?;
         }
     }
-    names.sort();
-    names.dedup();
-    Ok(w_list_new(
-        names
-            .into_iter()
-            .map(pyre_object::w_str_from_wtf8)
-            .collect(),
-    ))
+    Ok(dir_names_list(names_slot))
 }
 
 /// util.py `_classdir` / typeobject.py:1234 `descr__dir__`.
@@ -16554,16 +16597,10 @@ pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate:
 /// not part of the result.  Keep this as the direct `type.__dir__` target so
 /// installing that descriptor does not make `dir()` redispatch recursively.
 pub(crate) fn type_dir_default(w_type: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let mut names: Vec<Wtf8Buf> = Vec::new();
-    unsafe { classdir_into(w_type, &mut names) }?;
-    names.sort();
-    names.dedup();
-    Ok(w_list_new(
-        names
-            .into_iter()
-            .map(pyre_object::w_str_from_wtf8)
-            .collect(),
-    ))
+    let _roots = pyre_object::gc_roots::push_roots();
+    let names_slot = dir_names_new();
+    unsafe { classdir_into(w_type, names_slot) }?;
+    Ok(dir_names_list(names_slot))
 }
 
 /// The tail of no-argument `dir()`: a locals mapping's sorted key set.
@@ -16679,7 +16716,8 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if unsafe { pyre_object::is_generic_alias(obj) } {
         return crate::_pypy_generic_alias::dir_list(obj);
     }
-    let mut names: Vec<Wtf8Buf> = Vec::new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let names_slot = dir_names_new();
     unsafe {
         if pyre_object::is_module(obj) {
             // Route through `w_module.w_dict` so dict-subclass-backed
@@ -16689,8 +16727,8 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // `pypy/interpreter/module.py Module.getdict()` returns
             // the dict directly regardless of subclass; pyre branches
             // on the underlying shape:
-            //   - exact `W_DictObject` → `w_dict_str_entries_wtf8` returns
-            //     the storage-proxy union view in one call, keeping
+            //   - exact `W_DictObject` → `w_dict_items` returns the
+            //     storage-proxy union view in one call, keeping
             //     lone-surrogate global names.
             //   - dict subclass instance → iterate keys via the
             //     standard `iter()` protocol so the subclass's
@@ -16708,24 +16746,24 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     return builtin_sorted(&[result]);
                 }
                 if pyre_object::is_dict(w_dict) {
-                    for (name, _) in pyre_object::dictmultiobject::w_dict_str_entries_wtf8(w_dict) {
-                        names.push(name);
-                    }
+                    dir_names_update(
+                        names_slot,
+                        pyre_object::w_dict_items(w_dict)
+                            .into_iter()
+                            .map(|(key, _)| key)
+                            .collect(),
+                    );
                 } else if let Ok(keys_iter) = crate::baseobjspace::iter(w_dict)
                     && let Ok(keys) = crate::builtins::collect_iterable(keys_iter)
                 {
-                    for k in keys {
-                        if pyre_object::is_str(k) {
-                            names.push(pyre_object::w_str_get_wtf8(k).to_owned());
-                        }
-                    }
+                    dir_names_update(names_slot, keys);
                 }
             }
         } else if pyre_object::is_type(obj) {
             // util.py `_classdir` (`type.__dir__`, typeobject.py:1234) —
             // the class's `__dict__` keys unioned with `_classdir` of each
             // base, recursively.
-            classdir_into(obj, &mut names)?;
+            classdir_into(obj, names_slot)?;
         } else if pyre_object::is_instance(obj) {
             // util.py `_objectdir` (`object.__dir__`) — use ordinary
             // `getattr(obj, '__dict__'/'__class__', None)`, not raw layout
@@ -16739,11 +16777,13 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 Err(e) => return Err(e),
             };
             if let Some(w_dict) = w_dict {
-                for (k, _) in pyre_object::w_dict_items(w_dict) {
-                    if pyre_object::is_str(k) {
-                        names.push(pyre_object::w_str_get_wtf8(k).to_owned());
-                    }
-                }
+                dir_names_update(
+                    names_slot,
+                    pyre_object::w_dict_items(w_dict)
+                        .into_iter()
+                        .map(|(key, _)| key)
+                        .collect(),
+                );
             }
             let w_class = match crate::baseobjspace::getattr_str(obj, "__class__") {
                 Ok(w_class) => Some(w_class),
@@ -16753,7 +16793,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if let Some(w_class) = w_class
                 && pyre_object::is_type(w_class)
             {
-                classdir_into(w_class, &mut names)?;
+                classdir_into(w_class, names_slot)?;
             }
         } else {
             // Fallback `_objectdir` (util.py) for builtin W_Root types
@@ -16761,16 +16801,13 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // W_Root subclasses own a typed dictionary field even though
             // `is_instance()` is false, so use W_Root.getdict + _classdir
             // rather than assuming this whole branch has no instance dict.
-            return object_dir_default(obj);
+            return builtin_sorted(&[object_dir_default(obj)?]);
         }
     }
-    names.sort();
-    names.dedup();
-    let items: Vec<_> = names
-        .into_iter()
-        .map(pyre_object::w_str_from_wtf8)
-        .collect();
-    Ok(w_list_new(items))
+    // `_dir_object` sorts what `__dir__` returned, so a namespace holding a
+    // key that does not order against a `str` raises from the comparison
+    // rather than being filtered away.
+    builtin_sorted(&[dir_names_list(names_slot)])
 }
 
 /// `operation.py id(space, w_object)` — `space.id`, then the
