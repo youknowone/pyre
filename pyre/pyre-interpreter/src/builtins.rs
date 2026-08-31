@@ -6312,40 +6312,19 @@ pub(crate) fn type_new_set_hash_if_eq(ns: PyObjectRef) {
     }
 }
 
-/// CPython `type_new_set_classdict`: every new class owns a `__doc__` entry,
-/// using None when its namespace has no docstring. A declared `__doc__` slot
-/// is the sole exception because the class variable would collide with its
-/// member descriptor.
-pub(crate) fn type_new_set_doc(ns: PyObjectRef) -> crate::PyResult {
-    // Each lookup interns its key, and the caller's root slot tracks the
-    // caller's own copy of the moving namespace rather than this by-value
-    // parameter, so the word is pinned here and read back at every use.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(ns);
-    if unsafe {
-        pyre_object::w_dict_getitem_str(pyre_object::gc_roots::shadow_stack_get(ns_slot), "__doc__")
+/// `type_dict_set_doc` (`type_ready_fill_dict`): every new class owns a
+/// `__doc__` entry, using None when its namespace supplied no docstring.
+///
+/// This runs on the finished type, after the slot descriptors and the
+/// `__dict__` / `__weakref__` getsets have been installed, so a defaulted
+/// entry lands behind them in `cls.__dict__`.  A `__doc__` declared in
+/// `__slots__` therefore already owns the name by the time this looks, and
+/// its member descriptor stands.
+pub(crate) fn type_dict_set_doc(w_type: PyObjectRef) {
+    if crate::type_dict_contains(w_type, "__doc__") {
+        return;
     }
-    .is_some()
-    {
-        return Ok(pyre_object::w_none());
-    }
-    // `create_all_slots` owns iteration of `__slots__`.  In particular, it
-    // must consume a one-shot iterator exactly once.  Defer the default doc
-    // entry whenever slots are present; `create_all_slots` installs it after
-    // collecting the complete slot-name sequence if `__doc__` was not among
-    // those names.
-    if unsafe {
-        pyre_object::w_dict_getitem_str(
-            pyre_object::gc_roots::shadow_stack_get(ns_slot),
-            "__slots__",
-        )
-    }
-    .is_none()
-    {
-        type_ns_store(ns_slot, "__doc__", pyre_object::w_none());
-    }
-    Ok(pyre_object::w_none())
+    crate::type_dict_store(w_type, "__doc__", pyre_object::w_none());
 }
 
 /// PyPy `typeobject.py:223-235 W_TypeObject.__init__`: consume the compiler's
@@ -6384,6 +6363,21 @@ pub(crate) fn type_new_take_qualname(w_type: PyObjectRef, ns: PyObjectRef) -> cr
     Ok(pyre_object::w_none())
 }
 
+/// `type_new_set_classcell` / `type_new_set_classdictcell` refuse a namespace
+/// entry that is not a cell.  The offending type is spelled with `%.200R`,
+/// i.e. the repr of the type object rather than its bare name.
+pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyError {
+    let name = match crate::typedef::r#type(value) {
+        Some(w_valtype) => unsafe {
+            crate::baseobjspace::type_repr_qualified_name(w_valtype.as_ptr())
+        },
+        None => crate::error::type_name_of(value),
+    };
+    crate::PyError::type_error(format!(
+        "{key} must be a nonlocal cell, not <class '{name}'>"
+    ))
+}
+
 fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
@@ -6409,20 +6403,20 @@ fn type_descr_new_with_metaclass(
         if !unsafe { crate::baseobjspace::isinstance_str_w(name_obj) } {
             return Err(crate::PyError::type_error(format!(
                 "type.__new__() argument 1 must be str, not {}",
-                unsafe { pyre_object::type_name_of(name_obj) }
+                crate::error::type_name_of(name_obj)
             )));
         }
         if !unsafe { is_tuple(bases) } {
             return Err(crate::PyError::type_error(format!(
                 "type.__new__() argument 2 must be tuple, not {}",
-                unsafe { pyre_object::type_name_of(bases) }
+                crate::error::type_name_of(bases)
             )));
         }
         let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
         if !unsafe { crate::baseobjspace::isinstance_w(w_namespace_dict, w_dict_type) } {
             return Err(crate::PyError::type_error(format!(
                 "type.__new__() argument 3 must be dict, not {}",
-                unsafe { pyre_object::type_name_of(w_namespace_dict) }
+                crate::error::type_name_of(w_namespace_dict)
             )));
         }
         let w_ns_backing = unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
@@ -6506,6 +6500,11 @@ fn type_descr_new_with_metaclass(
         // (CPython consumes them here rather than storing them).
         let mut classcell_root = None;
         let mut classdictcell_root = None;
+        // `_PyDict_HasOnlyStringKeys(type->tp_dict)` decides the
+        // `RuntimeWarning` reported once the type is ready.  Only this copy
+        // can introduce such a key; every later pass installs descriptors
+        // under interned names.
+        let mut has_non_string_key = false;
         // `type.__new__` accepts any `dict` subclass as the namespace
         // (the check is `PyDict_Check`, not `PyDict_CheckExact`); resolve
         // the dict backing so e.g. an `enum._EnumDict` class body is
@@ -6520,7 +6519,6 @@ fn type_descr_new_with_metaclass(
                 let _ = pyre_object::gc_roots::pin_root(key);
                 let _ = pyre_object::gc_roots::pin_root(value);
             }
-            let mut has_non_string_key = false;
             for index in 0..items.len() {
                 let key = pyre_object::gc_roots::shadow_stack_get(item_root + index * 2);
                 let value = pyre_object::gc_roots::shadow_stack_get(item_root + index * 2 + 1);
@@ -6535,15 +6533,7 @@ fn type_descr_new_with_metaclass(
                     .is_some_and(|key| key.as_str() == Ok("__classcell__"))
                 {
                     if !unsafe { pyre_object::is_cell(value) } {
-                        let tp_name = match unsafe { crate::typedef::r#type(value) } {
-                            Some(tp) => {
-                                unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string()
-                            }
-                            None => "object".to_string(),
-                        };
-                        return Err(crate::PyError::type_error(format!(
-                            "__classcell__ must be a nonlocal cell, not {tp_name}"
-                        )));
+                        return Err(cell_slot_type_error("__classcell__", value));
                     }
                     let root = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(value);
@@ -6554,22 +6544,16 @@ fn type_descr_new_with_metaclass(
                     .as_ref()
                     .is_some_and(|key| key.as_str() == Ok("__classdictcell__"))
                 {
-                    if unsafe { pyre_object::is_cell(value) } {
-                        let root = pyre_object::gc_roots::shadow_stack_len();
-                        let _ = pyre_object::gc_roots::pin_root(value);
-                        classdictcell_root = Some(root);
+                    if !unsafe { pyre_object::is_cell(value) } {
+                        return Err(cell_slot_type_error("__classdictcell__", value));
                     }
+                    let root = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(value);
+                    classdictcell_root = Some(root);
                     continue;
                 }
                 let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
                 unsafe { pyre_object::w_dict_store(class_ns, key, value) };
-            }
-            if has_non_string_key {
-                crate::warn::warn_category(
-                    &format!("type '{}' has a non-string key in its dictionary", name),
-                    "RuntimeWarning",
-                    1,
-                )?;
             }
         }
         // typeobject.py:ensure_common_attributes / ensure_module_attr.  Direct
@@ -6623,11 +6607,9 @@ fn type_descr_new_with_metaclass(
         {
             return Err(crate::PyError::type_error(format!(
                 "type __qualname__ must be a str, not {}",
-                unsafe { pyre_object::type_name_of(qualname) }
+                crate::error::type_name_of(qualname)
             )));
         }
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        type_new_set_doc(class_ns)?;
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         type_new_set_hash_if_eq(class_ns);
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
@@ -6737,6 +6719,9 @@ fn type_descr_new_with_metaclass(
         type_new_take_qualname(w_type, pyre_object::gc_roots::shadow_stack_get(dict_root))?;
         // typeobject.py create_all_slots parity.
         unsafe { crate::call::create_all_slots(w_type, w_effective_bases)? };
+        // `type_ready_fill_dict` defaults the doc entry once the slot and
+        // instance descriptors own their names.
+        type_dict_set_doc(w_type);
         // rclass.py:739-743 — set w_class (typeptr) at allocation time.
         // For type objects, w_class is the metaclass (type(C) → Meta).
         // baseobjspace.py getclass() returns the metatype.
@@ -6771,6 +6756,17 @@ fn type_descr_new_with_metaclass(
             }
         }
 
+        // `type_new_impl` reports a namespace the class body filled with a
+        // key that is not a string once the type is ready, and before
+        // `type_new_set_names` runs.
+        if has_non_string_key {
+            crate::warn::warn_category(
+                &format!("non-string key in the __dict__ of class {name}"),
+                "RuntimeWarning",
+                1,
+            )?;
+        }
+
         // _set_names (typeobject.py) — call `__set_name__(owner, name)`
         // on each descriptor in the type's FINAL `__dict__` (`w_type.dict_w`),
         // i.e. the filtered namespace with `__classcell__`/`__classdictcell__`
@@ -6797,12 +6793,12 @@ fn type_descr_new_with_metaclass(
                 .flat_map(|&(key, value)| [key, value]),
         );
         let owner_slot = pyre_object::gc_roots::pin_roots(&livevars);
+        // `PyDict_Next` walks every entry, so a descriptor stored under a
+        // non-string key gets its `__set_name__` call too.
         for index in 0..set_name_entries.len() {
             let key = pyre_object::gc_roots::shadow_stack_get(owner_slot + 1 + index * 2);
-            if unsafe { pyre_object::is_str(key) } {
-                let value = pyre_object::gc_roots::shadow_stack_get(owner_slot + 2 + index * 2);
-                unsafe { crate::baseobjspace::set_name(w_type, key, value) }?;
-            }
+            let value = pyre_object::gc_roots::shadow_stack_get(owner_slot + 2 + index * 2);
+            unsafe { crate::baseobjspace::set_name(w_type, key, value) }?;
         }
 
         // type_new_init_subclass — fire __init_subclass__ with the

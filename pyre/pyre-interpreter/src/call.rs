@@ -5347,10 +5347,7 @@ fn build_class_inner(
         && classcell.is_some_and(|value| unsafe { !pyre_object::is_cell(value) })
     {
         let value = classcell.unwrap();
-        return Err(PyError::type_error(format!(
-            "__classcell__ must be a nonlocal cell, not {}",
-            unsafe { pyre_object::type_name_of(value) },
-        )));
+        return Err(crate::builtins::cell_slot_type_error("__classcell__", value));
     }
     // CPython 3.14 type_new_set_classdict: compiler-generated annotation
     // functions and comprehensions capture `__classdict__` through this
@@ -5359,6 +5356,17 @@ fn build_class_inner(
     let classdictcell_root = {
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         let cell = unsafe { pyre_object::w_dict_getitem_str(class_ns, "__classdictcell__") };
+        // `type_new_set_classdictcell` refuses a non-cell value; only the
+        // default shortcut has to spell it here, because a custom metaclass
+        // reaches `type.__new__` and is refused there.
+        if w_metaclass.is_none()
+            && cell.is_some_and(|value| unsafe { !pyre_object::is_cell(value) })
+        {
+            return Err(crate::builtins::cell_slot_type_error(
+                "__classdictcell__",
+                cell.unwrap(),
+            ));
+        }
         cell.filter(|value| unsafe { pyre_object::is_cell(*value) })
             .map(|cell| {
                 let _ = pyre_object::gc_roots::pin_root(cell);
@@ -5504,13 +5512,6 @@ fn build_class_inner(
         // type.__new__ must not be repaired or overwritten here.
         result
     } else {
-        // typeobject.py `ensure_common_attributes` belongs to type
-        // construction, not to `__build_class__` namespace preparation.  A
-        // custom non-type metaclass must observe the compiler-produced
-        // namespace without an invented `__doc__` key; the default shortcut
-        // performs type.__new__'s step here before copying the type dict.
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        crate::builtins::type_new_set_doc(class_ns)?;
         // No metaclass observes the namespace on the default path, so
         // consume the explicit class cells here (type_new_classcell leaves
         // them out of the class `__dict__`); the captured `classcell` is
@@ -5521,10 +5522,10 @@ fn build_class_inner(
         if let Some(w_classcell) = classcell
             && !unsafe { pyre_object::is_cell(w_classcell) }
         {
-            return Err(PyError::type_error(format!(
-                "__classcell__ must be a nonlocal cell, not {}",
-                crate::baseobjspace::object_functionstr_type_name(w_classcell),
-            )));
+            return Err(crate::builtins::cell_slot_type_error(
+                "__classcell__",
+                w_classcell,
+            ));
         }
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classcell__") };
@@ -5537,27 +5538,32 @@ fn build_class_inner(
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
         let dict_obj = pyre_object::w_dict_new();
         let dict_obj = pyre_object::gc_roots::pin_root(dict_obj);
+        // `PyDict_Copy(ctx->orig_dict)` — the class dict is the namespace as
+        // the body left it, keys of every type included.  The pairs sit in a
+        // native Vec the collector does not walk while each store hashes its
+        // own key and may grow the destination, so they are rooted and read
+        // back one at a time.
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        let keys: Vec<Wtf8Buf> = unsafe {
-            pyre_object::w_dict_str_entries_wtf8(class_ns)
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect()
-        };
-        for key in keys {
-            let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-            let Some(value) = (unsafe { pyre_object::w_dict_getitem_wtf8(class_ns, &key) }) else {
-                continue;
-            };
-            if value.is_null() {
-                continue;
+        let entries = unsafe { pyre_object::w_dict_items(class_ns) };
+        let mut has_non_string_key = false;
+        {
+            let _entry_roots = pyre_object::gc_roots::push_roots();
+            let entry_root = pyre_object::gc_roots::shadow_stack_len();
+            for &(key, value) in &entries {
+                let _ = pyre_object::gc_roots::pin_root(key);
+                let _ = pyre_object::gc_roots::pin_root(value);
             }
-            let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
-            match key.as_str() {
-                Ok(s) => unsafe { pyre_object::w_dict_setitem_str_no_proxy(dict_obj, s, value) },
-                Err(_) => unsafe {
-                    pyre_object::w_dict_setitem_wtf8_no_proxy(dict_obj, &key, value)
-                },
+            for index in 0..entries.len() {
+                let key = pyre_object::gc_roots::shadow_stack_get(entry_root + index * 2);
+                let value = pyre_object::gc_roots::shadow_stack_get(entry_root + index * 2 + 1);
+                if value.is_null() {
+                    continue;
+                }
+                if !unsafe { pyre_object::is_str(key) } {
+                    has_non_string_key = true;
+                }
+                let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
+                unsafe { pyre_object::w_dict_store(dict_obj, key, value) };
             }
         }
         let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
@@ -5575,6 +5581,9 @@ fn build_class_inner(
         crate::builtins::type_new_take_qualname(w, dict_obj)?;
         // typeobject.py create_all_slots parity.
         unsafe { create_all_slots(w, pyre_object::gc_roots::shadow_stack_get(bases_root))? };
+        // `type_ready_fill_dict` defaults the doc entry once the slot and
+        // instance descriptors own their names.
+        crate::builtins::type_dict_set_doc(pyre_object::gc_roots::shadow_stack_get(w_root));
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
         let w = pyre_object::gc_roots::shadow_stack_get(w_root);
         unsafe {
@@ -5610,6 +5619,16 @@ fn build_class_inner(
                 unsafe { pyre_object::w_cell_set(classdictcell, type_dict) };
             }
         }
+        // `type_new_impl` reports a namespace the class body filled with a
+        // key that is not a string once the type is ready, and before
+        // `type_new_set_names` runs.
+        if has_non_string_key {
+            crate::warn::warn_category(
+                &format!("non-string key in the __dict__ of class {name}"),
+                "RuntimeWarning",
+                1,
+            )?;
+        }
         // __set_name__ protocol — type_new_set_names
         // Only needed here because w_type_new is a raw Rust call that
         // bypasses the type() builtin (builtins.rs) which already calls
@@ -5620,12 +5639,14 @@ fn build_class_inner(
             let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
             let entries = unsafe { pyre_object::w_dict_items(dict_obj) };
             // Every `__set_name__` runs Python, so the snapshot cannot stay in
-            // an untraced Vec across the loop.
+            // an untraced Vec across the loop.  `PyDict_Next` walks every
+            // entry, so a descriptor stored under a non-string key gets its
+            // `__set_name__` call too.
             let _entry_roots = pyre_object::gc_roots::push_roots();
             let entries_root = pyre_object::gc_roots::shadow_stack_len();
             let mut pinned = 0;
             for (w_name, value) in entries {
-                if !value.is_null() && unsafe { pyre_object::is_str(w_name) } {
+                if !value.is_null() {
                     let _ = pyre_object::gc_roots::pin_root(w_name);
                     let _ = pyre_object::gc_roots::pin_root(value);
                     pinned += 1;
@@ -6119,11 +6140,6 @@ pub unsafe fn create_all_slots(
                     "nonempty __slots__ not supported for subtype of '{}'",
                     pyre_object::w_type_get_name(w_bestbase)
                 )));
-            }
-            if !all_names.iter().any(|name| name == "__doc__")
-                && !crate::type_dict_contains(w_type, "__doc__")
-            {
-                crate::runtime_ops::type_dict_store(w_type, "__doc__", pyre_object::w_none());
             }
             for slot_name in &all_names {
                 match slot_name.as_str() {

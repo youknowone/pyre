@@ -1627,10 +1627,15 @@ pub(crate) unsafe fn set_name(
             let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
             let w_owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
             let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+            // `%R` on the key: a namespace entry stored under a non-string
+            // key is named in the note by its own repr.
             let name_repr = if unsafe { is_str(w_name) } {
                 crate::display::format_wtf8_repr(unsafe { w_str_get_wtf8(w_name) })
             } else {
-                String::new()
+                unsafe { crate::display::py_repr_wtf8(w_name) }
+                    .ok()
+                    .and_then(|repr| repr.as_str().ok().map(str::to_owned))
+                    .unwrap_or_default()
             };
             let val_type_name = match crate::typedef::r#type(w_value) {
                 Some(t) => unsafe { pyre_object::w_type_get_name(t.as_ptr()) }.to_string(),
