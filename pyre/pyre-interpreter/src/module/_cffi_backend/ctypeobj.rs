@@ -85,12 +85,10 @@ pub const F_WITH_PACKED_CHANGE: i64 = 1 << 15;
 
 /// `ctypeobj.py W_CType` and the RPython subclasses that share its typedef.
 ///
-/// `UniqueCache` caches every ctype and reaches the derived ones through weak
-/// references (`W_CType._pointer_type`, `W_CTypePointer._array_types`), so a
-/// ctype dies once the last user does.  pyre holds them strongly and roots
-/// them for the process instead: the memo has to survive because
-/// `convert_from_object` decides pointer compatibility by object identity,
-/// and a ctype is a small, bounded population that a program declares once.
+/// `UniqueCache` keeps primitive/singleton ctypes strongly and reaches derived
+/// ctypes through weak references (`W_CType._pointer_type`,
+/// `W_CTypePointer._array_types`).  Thus a derived ctype dies with its last
+/// user while a repeated constructor still returns the live memoized object.
 #[crate::pyre_class("_cffi_backend.CType")]
 pub struct W_CType {
     /// `W_CType.size` — the size of an instance, or -1 when unknown.
@@ -108,9 +106,13 @@ pub struct W_CType {
     /// `W_CTypePtrOrArray.ctitem` — what a pointer points to, what an array
     /// holds.  `PY_NULL` on every other kind.
     pub ctitem: PyObjectRef,
-    /// `W_CType._pointer_type` — the pointer *to* this type, which
-    /// `new_pointer_type` memoises here.  `PY_NULL` until one is asked for.
+    /// `W_CType._pointer_type` — the GC weakref box for the pointer *to* this
+    /// type.  `PY_NULL` until one is asked for.
     pub pointer_type: PyObjectRef,
+    /// `W_CTypePointer._array_types` — the pointer-owned weak-value mapping
+    /// from lengths to array ctypes.  `PY_NULL` on non-pointers and before the
+    /// first array type is requested.
+    pub array_types: PyObjectRef,
     /// `W_CTypeArray.ctptr` — the pointer this array was built from, whose
     /// `ctitem` is the array's item type.  `PY_NULL` on every other kind.
     /// It is not `pointer_type`: the pointer to an `int[5]` is `int(*)[5]`,
@@ -341,19 +343,21 @@ pub fn ctype_of(cdata: &W_CData) -> Option<&'static mut W_CType> {
 
 /// `@unwrap_spec(w_ctype=ctypeobj.W_CType)`.
 pub fn ctype_arg(w_ctype: PyObjectRef) -> Result<&'static mut W_CType, PyError> {
-    ctype_at(w_ctype).ok_or_else(|| {
-        PyError::type_error(format!(
+    // A `match`, not `Option::ok_or_else`: the combinator's closure is a
+    // callee a traced caller would stop at.
+    match ctype_at(w_ctype) {
+        Some(ct) => Ok(ct),
+        None => Err(PyError::type_error(format!(
             "expected a ctype object, got '{}'",
             crate::type_methods::arg_type_name(w_ctype)
-        ))
-    })
+        ))),
+    }
 }
 
 // ── construction ────────────────────────────────────────────────────────
 
-/// Build a ctype and root it for the process.  Every ctype is memoised, so
-/// none of them is ever garbage: rooting once at birth is what lets the
-/// caches hold plain addresses.
+/// Build a GC-managed ctype.  `UniqueCache` roots only its strong primitive
+/// and singleton entries; derived caches retain weakref boxes instead.
 pub fn new_ctype(
     kind: i64,
     size: i64,
@@ -375,12 +379,12 @@ pub fn new_ctype(
         align,
         ctitem: roots.get(ctitem_slot),
         pointer_type: pyre_object::PY_NULL,
+        array_types: pyre_object::PY_NULL,
         ctptr: pyre_object::PY_NULL,
         length,
         flags,
         ..Default::default()
     });
-    root_forever(obj);
     obj
 }
 
@@ -398,6 +402,7 @@ impl Default for W_CType {
             align: -1,
             ctitem: pyre_object::PY_NULL,
             pointer_type: pyre_object::PY_NULL,
+            array_types: pyre_object::PY_NULL,
             ctptr: pyre_object::PY_NULL,
             length: -1,
             flags: 0,
@@ -414,19 +419,29 @@ impl Default for W_CType {
     }
 }
 
-/// The rooted slots the ctype caches name.  A ctype is born through
-/// `allocate_stable`, so it never relocates and the cache can hold its plain
-/// address; the slot exists so the collector sees the object as live.
+/// Strong roots owned by `UniqueCache`: primitive/singleton ctypes and the
+/// weakref boxes held by process-global weak-value cache containers.  Ctypes
+/// are born through `allocate_stable`, so cached addresses never relocate.
 static ROOTED_CTYPES: std::sync::Mutex<Vec<Box<usize>>> = std::sync::Mutex::new(Vec::new());
 
 pub fn root_forever(obj: PyObjectRef) {
+    let _ = root_forever_slot(obj);
+}
+
+/// Register a process-lifetime root and return the stable address of its slot.
+/// The collector rewrites the value in this slot when `obj` moves; native
+/// cache containers must read through this address instead of retaining the
+/// object's original address.
+pub fn root_forever_slot(obj: PyObjectRef) -> *const usize {
     let mut slot = Box::new(obj as usize);
     let root_slot = (&raw mut *slot) as *mut *mut u8;
     unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
+    let stable_slot = (&raw const *slot) as *const usize;
     ROOTED_CTYPES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(slot);
+    stable_slot
 }
 
 // ── the dispatchers the RPython hierarchy spells as overrides ───────────
