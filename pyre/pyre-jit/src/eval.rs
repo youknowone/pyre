@@ -6026,13 +6026,24 @@ unsafe fn jitcode_constants_root_walker_area(
 /// The `code_ptr -> wrapper` half of the population the comment above
 /// describes, registered separately so a failing root names it.
 ///
-/// PyCode is an ordinary nursery object, so this area participates in every
-/// minor collection and writes the forwarded wrapper address back into the
-/// raw-CodeObject compatibility registry.
+/// Skipped on a minor collection: `w_code_new_owned` places the wrapper with
+/// `malloc_typed_stable`, so it is born in oldgen and never relocates, and its
+/// managed children are reached through the wrapper's own trace and write
+/// barrier.  The walk is not free -- it iterates every
+/// `MetaInterpStaticData.jitcodes` entry and takes the `LIVE_CODE_WRAPPERS`
+/// lock once per entry -- so running it per nursery cycle would cost a whole
+/// registry scan for nothing.  `PYRE_PROBE14=1` tests the placement claim
+/// directly rather than by its relocation consequence.
 unsafe fn jitcode_code_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
+    if !pyre_object::tagged_int::CAN_BE_TAGGED
+        && majit_gc::shadow_stack::extra_root_walk_kind()
+            == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
+    {
+        return;
+    }
     unsafe { pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor) };
 }
 
