@@ -3070,7 +3070,14 @@ impl PyFrame {
     /// pyframe.py getdebug → self.debugdata
     #[inline]
     fn getdebug_data(&self) -> Option<&FrameDebugData> {
-        (!self.debugdata.is_null()).then(|| unsafe { &*self.debugdata })
+        // Spelled without a closure: a closure aggregate lowers to a
+        // synthetic ctor call the walker cannot bind, and upstream's
+        // `getdebug` is a plain None-checked field read.
+        if self.debugdata.is_null() {
+            None
+        } else {
+            Some(unsafe { &*self.debugdata })
+        }
     }
 
     /// pyframe.py getorcreatedebug
@@ -3181,16 +3188,22 @@ impl PyFrame {
     /// pyframe.py get_w_f_trace
     #[inline]
     pub fn get_w_f_trace(&self) -> PyObjectRef {
-        self.getdebug_data()
-            .and_then(|data| (!data.w_f_trace.is_null()).then_some(data.w_f_trace))
-            .unwrap_or(pyre_object::PY_NULL)
+        // Closure-free for the walker; upstream reads `debugdata.w_f_trace`
+        // behind two None checks.
+        match self.getdebug_data() {
+            Some(data) if !data.w_f_trace.is_null() => data.w_f_trace,
+            _ => pyre_object::PY_NULL,
+        }
     }
 
     /// pyframe.py get_is_being_profiled
     #[inline]
     pub fn get_is_being_profiled(&self) -> bool {
-        self.getdebug_data()
-            .is_some_and(|data| data.is_being_profiled)
+        // Closure-free for the walker (see `getdebug_data`).
+        match self.getdebug_data() {
+            Some(data) => data.is_being_profiled,
+            None => false,
+        }
     }
 
     /// `getorcreatedebug().w_locals` — the STORE_NAME / DELETE_NAME target
