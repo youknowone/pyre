@@ -2673,10 +2673,15 @@ fn build_ll_arraycopy_helper_graph(
 /// Unlike [`build_ll_arraycopy_helper_graph`] (specialised to
 /// `source_start == dest_start == 0` for the append/resize grow copy), this
 /// general form offsets both ends — `ll_extend` copies the source into
-/// `l1.items[len1 ..]`, so `dest_start = len1`. The write-barrier / split
-/// fast-path machinery of upstream `rgc.ll_arraycopy` is a translation-time
-/// concern; the lowered body is the bare element loop (`getarrayitem` +
-/// `setarrayitem`).
+/// `l1.items[len1 ..]`, so `dest_start = len1`.
+///
+/// The element loop below IS upstream's `rpython/rlib/rgc.py:398-403`, the
+/// arm reached when `gc_writebarrier_before_copy` answers False and the
+/// bulk `raw_memcopy` is therefore not expressible.  Upstream emits no
+/// barrier on that arm either — the call exists only to decide between the
+/// two — so none is owed here.  What is missing is the other arm: no
+/// `raw_memcopy` fast path is emitted, and the minted helper carries no
+/// `list.ll_arraycopy` oopspec (`OS_ARRAYCOPY`).
 pub(crate) fn build_ll_arraycopy_general_helper_graph(
     name: &str,
     item_lltype: LowLevelType,
@@ -2858,75 +2863,30 @@ pub(crate) fn build_ll_arraycopy_general_helper_graph(
     ))
 }
 
-/// Synthesise the `delta < 0` branch of `rgc.ll_arraymove`
-/// (`rpython/rlib/rgc.py`, `ll_arraymove`) with the upstream four-argument
-/// shape.
-///
-/// The caller proves `source_start > dest_start`, which is upstream's
-/// `delta < 0` case.  Copying from low to high indices is therefore the
-/// overlap-safe direction, and upstream spells it:
-///
-/// ```python
-/// delta = dest_start - source_start
-/// if delta < 0:
-///     i = source_start
-///     stop = source_start + length
-///     while i < stop:
-///         copy_item(array, array, i, i + delta)
-///         i += 1
-/// ```
-///
-/// The emitted loop rebases that induction variable to zero — `i` runs
-/// `0..length` and both ends are offset — instead of carrying `delta` and
-/// `stop`.  The two are equal at every index; the rebase exists because the
-/// caller already reconstructed `(source_start, dest_start, length)` from
-/// MIR and never materialised a `delta`.
-///
-/// Three parts of `ll_arraymove` are NOT emitted, and each is a named gap
-/// rather than a simplification:
-///
-/// * The `length <= 1` head.  Upstream's own comment says it is there "to
-///   ensure that we get a proper effectinfo.write_descrs_arrays", not for
-///   speed, and the minted helper carries no `list.ll_arraymove` oopspec
-///   either — the same pairing `ll_arraycopy` is still missing.
-/// * The `delta > 0` arm and the `raw_memmove_no_free` fast path.  Only the
-///   left move exists, which is why the helper is minted as
-///   `ll_arraymove_left`: the rtyper caches low-level helpers on
-///   `(name, args, result)`, and a right-move producer — `insert`'s
-///   `ll_arraymove(l, index, index + 1, length - index)` — would have the
-///   identical key and silently receive this graph.
-/// * The `must_split_gc_address_space()` / `_contains_gcptr` dispatch.  The
-///   body below IS upstream's split-address-space branch, taken
-///   unconditionally; note that this is exactly the branch in which upstream
-///   does not emit `gc_writebarrier_before_move`, since that call is the
-///   `elif`.  Per-item `setarrayitem` marks its own cards, so no card can go
-///   stale here, but the barrier llop does exist
-///   (`lltypesystem::lloperation`) and emitting the dispatch is the
-///   convergence path.
-pub(crate) fn build_ll_arraymove_left_helper_graph(
-    name: &str,
-    item_lltype: LowLevelType,
-) -> Result<PyGraph, TyperError> {
-    let items_ptr = items_array_ptr_lltype(&item_lltype);
+/// Which way `rgc.ll_arraymove`'s element loop walks the overlap.
+#[derive(Clone, Copy)]
+enum ArraymoveDirection {
+    /// Upstream's `delta < 0`: `i` runs `0..length`, low indices first.
+    Ascending,
+    /// Upstream's `delta > 0`: `i` runs `length - 1` down to `0`, high
+    /// indices first.  `delta == 0` also lands here, where source and
+    /// destination coincide and either order is correct.
+    Descending,
+}
 
-    let array = variable_with_lltype("array", items_ptr.clone());
-    let src_start = variable_with_lltype("source_start", LowLevelType::Signed);
-    let dst_start = variable_with_lltype("dest_start", LowLevelType::Signed);
-    let length = variable_with_lltype("length", LowLevelType::Signed);
-    let startblock = Block::shared(vec![
-        Hlvalue::Variable(array.clone()),
-        Hlvalue::Variable(src_start.clone()),
-        Hlvalue::Variable(dst_start.clone()),
-        Hlvalue::Variable(length.clone()),
-    ]);
-    let return_var = variable_with_lltype("result", LowLevelType::Void);
-    let mut graph = FunctionGraph::with_return_var(
-        name.to_string(),
-        startblock.clone(),
-        Hlvalue::Variable(return_var),
-    );
-
-    // Loop blocks carry (array, source_start, dest_start, length, i).
+/// Emit one arm of `ll_arraymove`'s element loop: a condition block testing
+/// the induction variable and a body block copying
+/// `array[source_start + i]` into `array[dest_start + i]` before stepping
+/// it.  Returns the condition block, which is the arm's entry.
+///
+/// Both arms carry `(array, source_start, dest_start, length, i)` and differ
+/// only in their loop bound and their step.
+fn build_ll_arraymove_arm(
+    returnblock: &BlockRef,
+    items_ptr: &LowLevelType,
+    item_lltype: &LowLevelType,
+    direction: ArraymoveDirection,
+) -> BlockRef {
     let array_c = variable_with_lltype("array", items_ptr.clone());
     let src_start_c = variable_with_lltype("source_start", LowLevelType::Signed);
     let dst_start_c = variable_with_lltype("dest_start", LowLevelType::Signed);
@@ -2953,28 +2913,14 @@ pub(crate) fn build_ll_arraymove_left_helper_graph(
         Hlvalue::Variable(i_b.clone()),
     ]);
 
-    startblock.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(array),
-                Hlvalue::Variable(src_start),
-                Hlvalue::Variable(dst_start),
-                Hlvalue::Variable(length),
-                signed_const(0),
-            ],
-            Some(block_cond.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
-
+    let (bound_opname, bound_rhs) = match direction {
+        ArraymoveDirection::Ascending => ("int_lt", Hlvalue::Variable(length_c.clone())),
+        ArraymoveDirection::Descending => ("int_ge", signed_const(0)),
+    };
     let cond = variable_with_lltype("cond", LowLevelType::Bool);
     block_cond.borrow_mut().operations.push(SpaceOperation::new(
-        "int_lt",
-        vec![
-            Hlvalue::Variable(i_c.clone()),
-            Hlvalue::Variable(length_c.clone()),
-        ],
+        bound_opname,
+        vec![Hlvalue::Variable(i_c.clone()), bound_rhs],
         Hlvalue::Variable(cond.clone()),
     ));
     block_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
@@ -2993,7 +2939,7 @@ pub(crate) fn build_ll_arraymove_left_helper_graph(
         .into_ref(),
         Link::new(
             vec![none_void_const()],
-            Some(graph.returnblock.clone()),
+            Some(returnblock.clone()),
             Some(bool_const(false)),
         )
         .into_ref(),
@@ -3017,7 +2963,7 @@ pub(crate) fn build_ll_arraymove_left_helper_graph(
         ],
         Hlvalue::Variable(dest_index.clone()),
     ));
-    let item = variable_with_lltype("item", item_lltype);
+    let item = variable_with_lltype("item", item_lltype.clone());
     block_body.borrow_mut().operations.push(SpaceOperation::new(
         "getarrayitem",
         vec![
@@ -3036,9 +2982,13 @@ pub(crate) fn build_ll_arraymove_left_helper_graph(
         ],
         Hlvalue::Variable(store_void),
     ));
+    let step_opname = match direction {
+        ArraymoveDirection::Ascending => "int_add",
+        ArraymoveDirection::Descending => "int_sub",
+    };
     let i_next = variable_with_lltype("i", LowLevelType::Signed);
     block_body.borrow_mut().operations.push(SpaceOperation::new(
-        "int_add",
+        step_opname,
         vec![Hlvalue::Variable(i_b), signed_const(1)],
         Hlvalue::Variable(i_next.clone()),
     ));
@@ -3051,8 +3001,143 @@ pub(crate) fn build_ll_arraymove_left_helper_graph(
                 Hlvalue::Variable(length_b),
                 Hlvalue::Variable(i_next),
             ],
-            Some(block_cond),
+            Some(block_cond.clone()),
             None,
+        )
+        .into_ref(),
+    ]);
+
+    block_cond
+}
+
+/// Synthesise `rgc.ll_arraymove` (`rpython/rlib/rgc.py`, `ll_arraymove`)
+/// with the upstream four-argument shape.
+///
+/// Upstream's manual-loop path picks its direction from the sign of `delta`
+/// at runtime:
+///
+/// ```python
+/// delta = dest_start - source_start
+/// if delta < 0:
+///     i = source_start
+///     stop = source_start + length
+///     while i < stop:
+///         copy_item(array, array, i, i + delta)
+///         i += 1
+/// elif delta > 0:
+///     i = source_start + length
+///     while i > source_start:
+///         i -= 1
+///         copy_item(array, array, i, i + delta)
+/// ```
+///
+/// The emitted loops rebase that induction variable to zero — `i` runs over
+/// `0..length` and both ends are offset — instead of carrying `delta` and
+/// `stop`.  The two are equal at every index; the rebase exists because the
+/// caller reconstructed `(source_start, dest_start, length)` from MIR and
+/// never materialised a `delta`.  Because the dispatch is a runtime test,
+/// one helper serves both directions and the rtyper's
+/// `(name, args, result)` helper cache cannot hand a right-move producer a
+/// left-only loop.
+///
+/// Two parts of `ll_arraymove` are NOT emitted, and each is a named gap
+/// rather than a simplification:
+///
+/// * The `length <= 1` head.  Upstream's own comment says it is there "to
+///   ensure that we get a proper effectinfo.write_descrs_arrays", not for
+///   speed, and the minted helper carries no `list.ll_arraymove` oopspec
+///   either — the same pairing `ll_arraycopy` is still missing.
+/// * The `must_split_gc_address_space()` dispatch and the
+///   `raw_memmove_no_free` fast path it guards.  The body below IS
+///   upstream's split-address-space branch, taken unconditionally.  That is
+///   also the branch on which upstream does not emit
+///   `gc_writebarrier_before_move`: the barrier sits on the `elif` that
+///   guards the memmove, and here each per-item `setarrayitem` marks its
+///   own card.  Emitting the barrier would only mean something alongside a
+///   memmove arm for it to gate.
+pub(crate) fn build_ll_arraymove_helper_graph(
+    name: &str,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let items_ptr = items_array_ptr_lltype(&item_lltype);
+
+    let array = variable_with_lltype("array", items_ptr.clone());
+    let src_start = variable_with_lltype("source_start", LowLevelType::Signed);
+    let dst_start = variable_with_lltype("dest_start", LowLevelType::Signed);
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(array.clone()),
+        Hlvalue::Variable(src_start.clone()),
+        Hlvalue::Variable(dst_start.clone()),
+        Hlvalue::Variable(length.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let ascending = build_ll_arraymove_arm(
+        &graph.returnblock,
+        &items_ptr,
+        &item_lltype,
+        ArraymoveDirection::Ascending,
+    );
+    let descending = build_ll_arraymove_arm(
+        &graph.returnblock,
+        &items_ptr,
+        &item_lltype,
+        ArraymoveDirection::Descending,
+    );
+
+    let delta = variable_with_lltype("delta", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![
+            Hlvalue::Variable(dst_start.clone()),
+            Hlvalue::Variable(src_start.clone()),
+        ],
+        Hlvalue::Variable(delta.clone()),
+    ));
+    let goes_up = variable_with_lltype("goes_up", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![Hlvalue::Variable(delta), signed_const(0)],
+        Hlvalue::Variable(goes_up.clone()),
+    ));
+    // The descending arm enters at `length - 1`.  Its start index is
+    // computed here because exit links carry arguments, not operations.
+    let last_index = variable_with_lltype("last_index", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![Hlvalue::Variable(length.clone()), signed_const(1)],
+        Hlvalue::Variable(last_index.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(goes_up));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(array.clone()),
+                Hlvalue::Variable(src_start.clone()),
+                Hlvalue::Variable(dst_start.clone()),
+                Hlvalue::Variable(length.clone()),
+                signed_const(0),
+            ],
+            Some(ascending),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(array),
+                Hlvalue::Variable(src_start),
+                Hlvalue::Variable(dst_start),
+                Hlvalue::Variable(length),
+                Hlvalue::Variable(last_index),
+            ],
+            Some(descending),
+            Some(bool_const(false)),
         )
         .into_ref(),
     ]);
@@ -9598,6 +9683,57 @@ mod tests {
             }
         }
         (count, all_ops)
+    }
+
+    /// `ll_arraymove` must dispatch on the sign of `delta` and carry both
+    /// element loops, so a right move — `ll_insert_nonneg`'s
+    /// `ll_arraymove(l, index, index + 1, length - index)` — walks descending
+    /// instead of smearing the first element across the overlap.
+    ///
+    /// The single name matters as much as the shape: the rtyper caches
+    /// low-level helpers on `(name, args, result)`, and both directions
+    /// present the identical key, so a direction-specialised graph would be
+    /// served to whichever producer minted second.
+    #[test]
+    fn build_ll_arraymove_dispatches_on_delta_and_carries_both_directions() {
+        let helper = build_ll_arraymove_helper_graph("ll_arraymove", LowLevelType::Signed)
+            .expect("build_ll_arraymove_helper_graph");
+        assert_eq!(helper.func.name, "ll_arraymove");
+        let inner = helper.graph.borrow();
+
+        // start: delta = dest_start - source_start; goes_up = delta < 0;
+        // last_index = length - 1, then a two-way switch on `goes_up`.
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["int_sub", "int_lt", "int_sub"]);
+        assert_eq!(startblock.inputargs.len(), 4); // array, source_start, dest_start, length
+        assert_eq!(startblock.exits.len(), 2);
+        drop(startblock);
+
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, two cond blocks, two body blocks, returnblock.
+        assert_eq!(count, 6);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        // One `int_lt` picks the direction, one bounds the ascending loop; the
+        // descending loop bounds on `int_ge(i, 0)`.
+        assert_eq!(n("int_lt"), 2);
+        assert_eq!(n("int_ge"), 1);
+        // `delta`, `last_index`, and the descending step.
+        assert_eq!(n("int_sub"), 3);
+        // Two index offsets per arm, plus the ascending step.
+        assert_eq!(n("int_add"), 5);
+        // One copy per arm.
+        assert_eq!(n("getarrayitem"), 2);
+        assert_eq!(n("setarrayitem"), 2);
+        // The body is upstream's split-address-space arm, on which
+        // `rgc.ll_arraymove` emits no move barrier — that call is the `elif`
+        // guarding the `raw_memmove_no_free` fast path, which is not emitted.
+        assert_eq!(n("gc_writebarrier_before_move"), 0);
+        assert_eq!(n("raw_memmove_no_free"), 0);
     }
 
     fn dummy_funcptr_const() -> Constant {
