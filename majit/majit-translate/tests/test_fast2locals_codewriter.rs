@@ -134,29 +134,34 @@ fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
     );
 }
 
-/// Every hand-written frame getset is an interp2app gateway on the same terms
-/// as `f_locals`: the untranslated interpreter keeps the residual force, and
-/// the codewriter deletes it before lowering the redirected field access.
+/// Every frame getset whose body reaches a REDIRECTED field is an interp2app
+/// gateway on the same terms as `f_locals`: the untranslated interpreter keeps
+/// the residual force, and the codewriter deletes it before lowering the field
+/// access.
 ///
 /// Keeping this as one census is deliberate.  The bug this guards was a
 /// structural split where only `f_locals` published a candidate graph; a set
 /// of independent happy-path tests would let the next manually-added frame
-/// descriptor fall outside the family again.
+/// descriptor fall outside the family again.  Its other half is
+/// [`the_gateways_outside_the_redirected_set_carry_no_force`], which closes the
+/// complement so that neither list can grow by accident.
 #[test]
 fn every_redirected_frame_getter_carries_a_deletable_force() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
     for leaf in [
-        "__majit_wrap_descr_typecheck_fget_f_code",
         "__majit_wrap_descr_typecheck_get_w_globals",
-        "__majit_wrap_descr_typecheck_fget_f_back",
         "__majit_wrap_descr_typecheck_fget_f_lasti",
-        "__majit_wrap_descr_typecheck_fget_f_builtins",
         "__majit_wrap_descr_typecheck_fget_f_lineno",
+        "__majit_wrap_descr_typecheck_fset_f_lineno",
         "__majit_wrap_descr_typecheck_fget_f_trace",
+        "__majit_wrap_descr_typecheck_fset_f_trace",
+        "__majit_wrap_descr_typecheck_fdel_f_trace",
         "__majit_wrap_descr_typecheck_fget_f_trace_lines",
+        "__majit_wrap_descr_typecheck_fset_f_trace_lines",
         "__majit_wrap_descr_typecheck_fget_f_trace_opcodes",
+        "__majit_wrap_descr_typecheck_fset_f_trace_opcodes",
     ] {
         let gateway = lower_named(&llbc, leaf);
         let before = call_leafs(&gateway);
@@ -173,6 +178,43 @@ fn every_redirected_frame_getter_carries_a_deletable_force() {
                 .iter()
                 .all(|callee| callee != "jit_force_virtualizable"),
             "{leaf}: rewrite_op_jit_force_virtualizable left the marker in jitcode: {after:?}",
+        );
+    }
+}
+
+/// The complement of [`every_redirected_frame_getter_carries_a_deletable_force`]:
+/// these four gateways carry no marker at all, and the reason is per gateway.
+///
+/// `rvirtualizable.py hook_access_field` injects only under
+/// `if self.my_redirected_fields.get(cname.value)`, and `f_back`
+/// (`f_backref`), `f_builtins` (`w_builtin`) and `get_generator`
+/// (`f_generator_nowref`) read no field in that set.  `f_code` reads `pycode`,
+/// which IS in it, and is here for the second question a HAND-placed marker
+/// owes and the injection never has to ask, because it fires at every access in
+/// every graph rather than once per gateway: can the trace and the live frame
+/// disagree about the field this body reads?  For `pycode` they cannot -- it is
+/// written only at frame construction -- so the force reaches nothing but the
+/// escape flush.  Each of the four says so at its own definition in
+/// `pyframe.rs`.
+#[test]
+fn the_gateways_outside_the_redirected_set_carry_no_force() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    for leaf in [
+        "__majit_wrap_descr_typecheck_fget_f_code",
+        "__majit_wrap_descr_typecheck_fget_f_back",
+        "__majit_wrap_descr_typecheck_fget_f_builtins",
+        "__majit_wrap_descr_typecheck_get_generator",
+    ] {
+        let gateway = lower_named(&llbc, leaf);
+        let before = call_leafs(&gateway);
+        assert!(
+            before
+                .iter()
+                .all(|callee| callee != "jit_force_virtualizable"),
+            "{leaf} reads no field a trace can disagree about, so it must carry \
+             no force: {before:?}",
         );
     }
 }
