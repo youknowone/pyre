@@ -5015,8 +5015,7 @@ impl<'a> Lowering<'a> {
                             // rtyped.  RPython keeps the declared
                             // SomeInstance class on every assignment (and a
                             // nullable pointer merely sets `can_be_None`).
-                            value =
-                                self.narrow_typed_instance_field_value(bb_id, value, Some(dest_ty));
+                            value = self.narrow_typed_ref_field_value(bb_id, value, Some(dest_ty));
                             (
                                 FieldDescriptor::new(field_name, Some(owner_root))
                                     .with_owner_id(owner_id)
@@ -5064,15 +5063,18 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// Preserve the declared class of an instance-typed field value.
+    /// Preserve the declared RPython reference repr of a typed field value.
     ///
     /// RPython represents an instance attribute as `SomeInstance(classdef)`;
     /// when nullable, the same annotation simply carries `can_be_None=True`.
     /// Rust spells those slots as `&NamedAdt` or `*mut/*const NamedAdt`, whose
-    /// producer initially has pointer annotation.  The Rust field type-check
-    /// is the proof needed to narrow that producer before `setattr`; this is
-    /// an identity cast for non-null values and a typed null for null values.
-    fn narrow_typed_instance_field_value(
+    /// producer initially has pointer annotation.  A pointer to an RPython
+    /// array is the same boundary: `rutf8.UTF8_INDEX_STORAGE` is a `GcArray`,
+    /// while Rust carries the exact owner as `*mut Vec<Utf8LocElem>`.  The
+    /// Rust field type-check is the proof needed to narrow that producer
+    /// before `setattr`; this is an identity cast for non-null values and a
+    /// typed null for null values.
+    fn narrow_typed_ref_field_value(
         &mut self,
         bb_id: BlockId,
         value: LinkArg,
@@ -5085,6 +5087,7 @@ impl<'a> Lowering<'a> {
                 return adt_node_class_root(strip_ty_indirections(pointee, self.llbc)?, self.llbc);
             }
             raw_ptr_pointee_class_root(node, self.llbc)
+                .or_else(|| raw_ptr_pointee_container_root(node, self.llbc))
         }) else {
             return value;
         };
@@ -5866,11 +5869,7 @@ impl<'a> Lowering<'a> {
                         continue;
                     }
                     let value = self
-                        .narrow_typed_instance_field_value(
-                            bb_id,
-                            LinkArg::Value(value),
-                            declared_ty,
-                        )
+                        .narrow_typed_ref_field_value(bb_id, LinkArg::Value(value), declared_ty)
                         .as_variable()
                         .expect("aggregate field operand stays materialized")
                         .clone();
@@ -21510,6 +21509,26 @@ fn raw_ptr_pointee_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<S
     adt_node_class_root(strip_ty_wrappers(raw.first()?, llbc)?, llbc)
 }
 
+/// The projected list root of a raw pointer onto a Rust container.
+///
+/// RPython keeps pointers to `GcArray` values typed, including null pointers
+/// (`lltype.nullptr(ARRAY)`).  Rust's corresponding owner can be a
+/// `*mut Vec<T>` field, which otherwise enters the annotator as a
+/// classdef-less pointer and cannot union with the `SomeList` produced when
+/// the array is allocated.  Return the same rendered container spelling
+/// `Bookkeeper::project_struct_field_type` consumes at the cast boundary.
+fn raw_ptr_pointee_container_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
+    let pointee = node
+        .as_object()?
+        .get("RawPtr")?
+        .as_array()?
+        .first()
+        .and_then(|node| strip_ty_wrappers(node, llbc))?;
+    let rendered = charon_type_value_to_ast_string(pointee, llbc, 0);
+    (rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") || rendered.starts_with('['))
+        .then_some(rendered)
+}
+
 /// Whether `ty` is a raw pointer onto a byte-sized integer literal —
 /// `*mut u8` / `*const u8` / the `i8` spellings.  This is the
 /// type-erased "opaque memory address" pointer: `llmemory.Address`
@@ -34538,6 +34557,57 @@ mod tests {
                 "missing builder marker {marker}"
             );
         }
+    }
+
+    /// PyPy initializes `W_UnicodeObject._index_storage` with
+    /// `lltype.nullptr(UTF8_INDEX_STORAGE)`, where the storage is a typed
+    /// `GcArray`.  Rust spells the same slot `*mut Vec<Utf8LocElem>`; its null
+    /// constructor value must therefore be narrowed to the projected list
+    /// repr before the field write, not left as a classdef-less pointer that
+    /// later conflicts with `create_utf8_index_storage`'s list value.
+    #[test]
+    #[ignore]
+    fn unicode_index_storage_null_keeps_gcarray_repr() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "w_str_from_wtf8").expect("lower w_str_from_wtf8");
+        let value = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, value, .. } if field.name == "index_storage" => {
+                    match value {
+                        LinkArg::Value(value) => Some(value.clone()),
+                        LinkArg::Const(_) => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("W_UnicodeObject.index_storage write");
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    op.result.as_ref() == Some(&value)
+                        && matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments.first().map(String::as_str)
+                                == Some("__cast_instance_intrinsic")
+                                && segments.get(1).is_some_and(|root| root.starts_with("Vec<"))
+                        )
+                }),
+            "index_storage null must narrow to the Vec/GcArray list repr"
+        );
     }
 
     /// `Wtf8::as_str` is fallible for a lone surrogate.  PyPy keeps the
