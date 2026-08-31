@@ -613,8 +613,9 @@ jobs:
       # workflow-level `contents: read` alone does not grant one.
       id-token: write
     # Simulation mode runs each benchmark under Valgrind, which costs roughly
-    # two orders of magnitude over native. The May 2026 measurement of the six
-    # benchmarks was 9 min end to end.
+    # two orders of magnitude over native. The six embedded benchmarks it
+    # replaced measured 9 min end to end in May 2026; the ten real scripts are
+    # 4.10s of user CPU between them, so the same ~100x lands near 10 min.
     timeout-minutes: 60
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
@@ -659,13 +660,12 @@ jobs:
           # where the cause is still visible.
           test -s "build/llbc/${crate}.ullbc.readfiles"
         done
-    - name: Install cargo-codspeed
-      # `--locked` so the installed tool is resolved from its own published
-      # lockfile: this job's verdict is a measurement, and a transitive
-      # dependency picked up on the day would change the harness under it.
-      run: cargo install cargo-codspeed --locked
-    - name: Build the benchmarks
-      run: cargo codspeed build -p pyre-bench
+    - name: Build pyre-dynasm
+      # Through check.py rather than a bare cargo line so the feature set the
+      # benchmarks measure is the one check.py scores, named in one place.
+      # `--build=only` also stamps the artefact, so what CodSpeed measures is
+      # provably built from this tree.
+      run: python3 pyre/check.py --backend dynasm --build=only
     - name: Run the benchmarks
       uses: CodSpeedHQ/action@3194d9a39c4d46684cb44bf7207fc56626aad8fd # v4
       with:
@@ -675,7 +675,10 @@ jobs:
         # dominated by neighbour noise. See
         # https://codspeed.io/docs/instruments/walltime#usage-on-personal-github-accounts
         mode: simulation
-        run: cargo codspeed run -p pyre-bench
+        # No `run:` -- the targets come from codspeed.yml, which spends one
+        # process per benchmark so the JIT state one builds cannot reach the
+        # next. See that file for why the harness is `exec` and not cargo.
+        config: codspeed.yml
 
   pyre-check-linux:
     name: pyre/check.py ${{ matrix.label }} (ubuntu-24.04)
