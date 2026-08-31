@@ -22845,7 +22845,7 @@ mod tests {
         assert_eq!(error.kind, crate::PyErrorKind::TypeError);
         assert_eq!(
             error.message_text(),
-            "instance layout conflicts in multiple inheritance"
+            "multiple bases have instance lay-out conflict"
         );
 
         let arithmetic = lookup_exc_class("ArithmeticError").unwrap();
@@ -22861,7 +22861,7 @@ mod tests {
         assert_eq!(error.kind, crate::PyErrorKind::TypeError);
         assert_eq!(
             error.message_text(),
-            "instance layout conflicts in multiple inheritance"
+            "multiple bases have instance lay-out conflict"
         );
     }
 

@@ -6494,8 +6494,13 @@ pub(crate) unsafe fn check_and_find_best_base(
                     if !layout.is_null()
                         && (!(*best_layout).issublayout(layout) || native_layout_conflict)
                     {
+                        // [3.14-spec] `best_base` words the refusal
+                        // `multiple bases have instance lay-out conflict`;
+                        // `_calculate_best_base` writes `instance layout
+                        // conflicts in multiple inheritance`.  Measured
+                        // against 3.14.2.
                         return Err(crate::PyError::type_error(
-                            "instance layout conflicts in multiple inheritance".to_string(),
+                            "multiple bases have instance lay-out conflict".to_string(),
                         ));
                     }
                 }
