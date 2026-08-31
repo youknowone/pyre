@@ -1120,12 +1120,12 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// constructor — a `PyObjectRef` GCREF modelled by signature. Code objects are
 /// built at import/compile time, never on a traced hot path.
 ///
-/// `pycode.py` makes `PyCode` an ordinary GC object. Allocate it through the
-/// movable path as RPython does: `MiniMarkGC.identityhash` reserves the
-/// nursery object's old-gen shadow via `_find_shadow`, keeping identity stable
-/// across moves for the object's lifetime. A later major may reclaim both a
-/// dead wrapper and that shadow, just as upstream does.
-/// Bootstrap wrappers created before GC installation still fall back to the
+/// `pycode.py` makes `PyCode` an ordinary GC object. Pyre's current JIT seam,
+/// however, still carries raw wrapper addresses alongside `CodeObject*` in
+/// compiled and resume metadata. Keep the wrapper collector-owned but
+/// stable-address until those remaining raw couriers are replaced with GC
+/// references; the collector can still reclaim it and its namespace cycle.
+/// Bootstrap wrappers created before GC installation fall back to the
 /// prebuilt family and use the explicit root walkers.
 #[majit_macros::dont_look_inside]
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
@@ -1295,15 +1295,11 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
             std::sync::atomic::AtomicI64::new(ADDR2LINE_MEMO_EMPTY)
         }),
     };
-    // `pycode.py class PyCode(W_Root)` is a normal nursery allocation. In
-    // particular, `warmstate.py hash_whatever` reaches
-    // `MiniMarkGC.identityhash`, whose `_find_shadow` gives a young PyCode a
-    // stable identity without forcing every code object to be born old. The
-    // Function/Frame/code-constant fields that own this wrapper are GC refs
-    // and their registered traces forward it when a minor collection moves
-    // the object. Before GC installation `malloc_typed_managed` falls back to
-    // the prebuilt family and the explicit root registry remains necessary.
-    let obj = pyre_object::lltype::malloc_typed_managed(obj) as PyObjectRef;
+    // The raw-address JIT compatibility seam described above requires a
+    // stable wrapper address. `malloc_typed_stable` is still a managed
+    // allocation: unlike the prebuilt allocator it can be reclaimed by a
+    // major collection, but it is born in oldgen and never relocates.
+    let obj = pyre_object::lltype::malloc_typed_stable(obj) as PyObjectRef;
     // PyPy's ast compiler has already wrapped every entry before PyCode.__init__
     // (`assemble.py add_const`). Pin the freshly allocated wrapper while
     // recursive code constants and managed scalar constants allocate, then
