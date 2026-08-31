@@ -11061,19 +11061,21 @@ fn portal_slot_binder(
 /// unconditionally on a detected force — so this removes the boundary and
 /// leaves the barrier live for every shape it declines.
 ///
-/// Emitted shape, mirroring `pyframe.py:555-574` line by line:
-/// `guard_value(callable)`; the frame's own mapping, read as
+/// Emitted shape, mirroring `pyframe.py:555-574`: `guard_value(callable)`;
 /// `getorcreatedebug()` (the `debugdata` virtualizable field, answered from
-/// `virtualizable_boxes`) followed by `getfield_gc_r(w_locals)` under a
-/// non-null and exact-dict guard; one `getarrayitem_vable_r(frame,
-/// ConstInt(i))` per localsplus slot (the same lowering `emit_load_fast_ref!`
-/// already emits for LOAD_FAST); for a cell slot a `guard_class(Cell)` and one
-/// `getfield_gc_r(contents)` on top of it, which is the whole of
-/// `fast2locals`' cell half (pyframe.py:576-598); a `guard_isnull` /
-/// `guard_nonnull` pinning the bound-ness of whichever of the two the key
-/// takes; and a plain non-forcing `Call` per slot — `setitem_str` when bound,
-/// `delitem` when not.  None of those ops can reach
-/// `force_frame`, so nothing arms the vable protocol.
+/// `virtualizable_boxes`) followed by `getfield_gc_r(w_locals)` under the
+/// guard that pins which of the two mapping arms this is; one
+/// `getarrayitem_vable_r(frame, ConstInt(i))` per localsplus slot (the same
+/// lowering `emit_load_fast_ref!` already emits for LOAD_FAST); for a cell
+/// slot a `guard_class(Cell)` and one `getfield_gc_r(contents)` on top of it,
+/// which is the whole of `fast2locals`' cell half (pyframe.py:576-598); a
+/// `guard_isnull` / `guard_nonnull` pinning the bound-ness of whichever of the
+/// two the key takes; THEN the mapping itself, under its exact-dict guard on
+/// the frame-owned arm; and a plain non-forcing `Call` per slot —
+/// `setitem_str` when bound, `delitem` when not.  Every read and every guard
+/// precedes the mapping, so a guard that fails allocates nothing and leaves no
+/// half-rewritten mapping for the residual to redo.  None of those ops can
+/// reach `force_frame`, so nothing arms the vable protocol.
 ///
 /// The mapping is the FRAME's whenever the frame already carries one:
 /// `fast2locals` rewrites only the varname keys, so a foreign key — one an
@@ -11542,40 +11544,14 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[extra_op])?;
         }
     }
-    let mut dict_op = match field_op.filter(|_| frame_owned) {
-        Some(op_ref) => op_ref,
-        // pyframe.py `self.space.newdict(instance=True)` — the mapping
-        // `fast2locals` would have materialised, built here instead of
-        // modelling the store back into the debug payload.
-        None => ctx.trace_ctx.call_ref_typed_with_effect(
-            pyre_interpreter::pyframe::jit_locals_dict_new as *const (),
-            &[],
-            &[],
-            majit_ir::EffectInfo::new(
-                majit_ir::ExtraEffect::CannotRaise,
-                majit_ir::OopSpecIndex::None,
-            ),
-        ),
-    };
-    ctx.trace_ctx
-        .set_opref_concrete(dict_op, concrete_locals_value);
-    if frame_owned {
-        walker_guard_class(
-            ctx,
-            op.pc,
-            dict_op,
-            &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
-        )?;
-        walker_guard_exact_w_class(
-            ctx,
-            op.pc,
-            dict_op,
-            // Re-derived rather than reusing the gate's binding: the
-            // record-time rewrite above allocates, so this takes the address
-            // `dict` has NOW.
-            pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE),
-        )?;
-    }
+    // `w_cell_get` per cell slot, and every slot's own boundness guard, BEFORE
+    // the mapping is built: a guard that fails after a `newdict` side exits to
+    // a residual that allocates a second mapping, and one that fails after a
+    // store has already rewritten the frame's own mapping leaves the residual
+    // to redo the part that landed.  The reads touch no frame, so none of them
+    // can re-arm the escape this expansion exists to remove.
+    let mut value_ops: Vec<OpRef> = Vec::with_capacity(slots.len());
+    let mut index_consts: Vec<OpRef> = Vec::with_capacity(slots.len());
     for (i, modelled) in slots.iter().enumerate() {
         locals_expansion_cut_if_too_long(ctx, op.pc)?;
         // `self.locals_cells_stack_w[i]` — `jtransform.py:1877
@@ -11583,6 +11559,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         // emits for LOAD_FAST.  On the standard virtualizable this resolves to
         // `virtualizable_boxes[index]` and records no op.
         let index_const = ctx.trace_ctx.const_int(i as i64);
+        index_consts.push(index_const);
         let (slot_op, _) = ctx.trace_ctx.vable_getarrayitem_ref_indexed(
             op.pc,
             vable_op,
@@ -11609,9 +11586,8 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[slot_op])?;
         }
         // `w_cell_get` -- `Cell.contents`, the whole of `fast2locals`' cell
-        // half.  It touches no frame, so it cannot re-arm the escape this
-        // expansion exists to remove.  The compiled loop re-reads the slot, so
-        // the class the walk saw is stated rather than assumed.
+        // half.  The compiled loop re-reads the slot, so the class the walk saw
+        // is stated rather than assumed.
         let value_op = if modelled.cell {
             let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
             if !ctx.trace_ctx.heap_cache().is_class_known(slot_op) {
@@ -11648,6 +11624,53 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         } else {
             slot_op
         };
+        value_ops.push(value_op);
+    }
+    // The last read's guard lands after that loop's own check, so the mapping
+    // and the chain below would otherwise reach the opcode-level check in
+    // `mod.rs` unweighed.
+    locals_expansion_cut_if_too_long(ctx, op.pc)?;
+    let mut dict_op = match field_op.filter(|_| frame_owned) {
+        Some(op_ref) => op_ref,
+        // pyframe.py `self.space.newdict(instance=True)` — the mapping
+        // `fast2locals` would have materialised, built here instead of
+        // modelling the store back into the debug payload.
+        None => ctx.trace_ctx.call_ref_typed_with_effect(
+            pyre_interpreter::pyframe::jit_locals_dict_new as *const (),
+            &[],
+            &[],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        ),
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(dict_op, concrete_locals_value);
+    if frame_owned {
+        walker_guard_class(
+            ctx,
+            op.pc,
+            dict_op,
+            &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
+        )?;
+        walker_guard_exact_w_class(
+            ctx,
+            op.pc,
+            dict_op,
+            // Re-derived rather than reusing the gate's binding: the
+            // record-time rewrite above allocates, so this takes the address
+            // `dict` has NOW.
+            pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE),
+        )?;
+    }
+    for ((i, modelled), (&index_const, &value_op)) in slots
+        .iter()
+        .enumerate()
+        .zip(index_consts.iter().zip(&value_ops))
+    {
+        locals_expansion_cut_if_too_long(ctx, op.pc)?;
+        let bound = !modelled.value.is_null();
         // `pyframe.py:566-574` — a bound slot is stored, an unbound one
         // deleted.  The delete is what keeps a key from a since-unbound local
         // out of a mapping the frame carries across calls; on the fresh arm
