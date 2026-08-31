@@ -16,22 +16,45 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::hash::BuildHasherDefault;
 use std::sync::OnceLock;
 
-pub const METH_VARARGS: c_int = 0x0001;
-pub const METH_KEYWORDS: c_int = 0x0002;
-pub const METH_NOARGS: c_int = 0x0004;
-pub const METH_O: c_int = 0x0008;
-pub const METH_CLASS: c_int = 0x0010;
-pub const METH_STATIC: c_int = 0x0020;
-pub const METH_COEXIST: c_int = 0x0040;
-pub const METH_FASTCALL: c_int = 0x0080;
-pub const METH_METHOD: c_int = 0x0200;
+bitflags::bitflags! {
+    /// The `methodobject.h` flags a `PyMethodDef` row carries in `ml_flags`.
+    ///
+    /// Two places spell this table: the header an extension compiles against
+    /// and this declaration.  `every_meth_flag_is_the_bit_the_header_gives_it`
+    /// compares the two, walking `Flags::FLAGS` rather than a list somebody
+    /// has to remember to extend.
+    ///
+    /// Four of them name a calling convention rather than a property --
+    /// `METH_VARARGS`, `METH_NOARGS`, `METH_O`, `METH_FASTCALL` -- and a row
+    /// may name exactly one; the rest modify it.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct MethFlags: c_int {
+        const METH_VARARGS = 0x0001;
+        const METH_KEYWORDS = 0x0002;
+        const METH_NOARGS = 0x0004;
+        const METH_O = 0x0008;
+        const METH_CLASS = 0x0010;
+        const METH_STATIC = 0x0020;
+        const METH_COEXIST = 0x0040;
+        const METH_FASTCALL = 0x0080;
+        /// The method is handed the class defining it beside its receiver, and
+        /// so carries a `PyCMethodObject` rather than a `PyCFunctionObject`.
+        const METH_METHOD = 0x0200;
+    }
+}
+
+/// C writes `ml_flags` through its own `int` declaration, so the field the
+/// mirror hands it has to be that word and nothing wider or narrower.
+const _: () = assert!(size_of::<MethFlags>() == size_of::<c_int>());
+const _: () = assert!(align_of::<MethFlags>() == align_of::<c_int>());
 
 /// One row of a `PyMethodDef` table.
 #[repr(C)]
 pub struct CPyMethodDef {
     pub ml_name: *const c_char,
     pub ml_meth: *const c_void,
-    pub ml_flags: c_int,
+    pub ml_flags: MethFlags,
     pub ml_doc: *const c_char,
 }
 
@@ -276,7 +299,7 @@ pub unsafe extern "C" fn PyCFunction_GetFunction(object: *mut CPyObject) -> *mut
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCFunction_GetFlags(object: *mut CPyObject) -> c_int {
     match checked_method_def(object) {
-        Some(definition) => unsafe { (*definition).ml_flags },
+        Some(definition) => unsafe { (*definition).ml_flags }.bits(),
         None => -1,
     }
 }
@@ -288,7 +311,7 @@ pub unsafe extern "C" fn PyCFunction_GetSelf(object: *mut CPyObject) -> *mut CPy
     let Some(definition) = checked_method_def(object) else {
         return std::ptr::null_mut();
     };
-    if unsafe { (*definition).ml_flags } & METH_STATIC != 0 {
+    if unsafe { (*definition).ml_flags }.contains(MethFlags::METH_STATIC) {
         return std::ptr::null_mut();
     }
     let carrier = unsafe { pyobject::from_ref(object) };
@@ -477,7 +500,7 @@ pub unsafe extern "C" fn PyCMethod_GetClass(
     let Some(definition) = checked_method_def(object) else {
         return std::ptr::null_mut();
     };
-    if unsafe { (*definition).ml_flags } & METH_METHOD == 0 {
+    if !unsafe { (*definition).ml_flags }.contains(MethFlags::METH_METHOD) {
         return std::ptr::null_mut();
     }
     let carrier = unsafe { pyobject::from_ref(object) };
@@ -554,7 +577,7 @@ pub fn new_pycfunction_in_class(
     // a module table reaches this with no class, which is what makes a
     // `METH_METHOD` row in one an error at module creation.
     let message = match (
-        unsafe { (*method).ml_flags } & METH_METHOD != 0,
+        unsafe { (*method).ml_flags }.contains(MethFlags::METH_METHOD),
         w_class.is_some(),
     ) {
         (true, false) => {
@@ -892,7 +915,8 @@ pub(super) fn call_method_def_in_class(
     kwargs: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
     let name = text_or_empty(unsafe { (*method).ml_name });
-    let flags = unsafe { (*method).ml_flags } & !(METH_CLASS | METH_STATIC | METH_COEXIST);
+    let flags = unsafe { (*method).ml_flags }
+        & !(MethFlags::METH_CLASS | MethFlags::METH_STATIC | MethFlags::METH_COEXIST);
     let keywords: Vec<(String, PyObjectRef)> = match kwargs {
         Some(dict) if crate::builtins::has_real_kwargs(kwargs) => unsafe {
             pyre_object::w_dict_str_entries(dict)
@@ -902,18 +926,18 @@ pub(super) fn call_method_def_in_class(
         },
         _ => Vec::new(),
     };
-    if !keywords.is_empty() && flags & METH_KEYWORDS == 0 {
+    if !keywords.is_empty() && !flags.contains(MethFlags::METH_KEYWORDS) {
         return Err(crate::PyError::type_error(format!(
             "{name}() takes no keyword arguments"
         )));
     }
-    if flags & METH_NOARGS != 0 && !positional.is_empty() {
+    if flags.contains(MethFlags::METH_NOARGS) && !positional.is_empty() {
         return Err(crate::PyError::type_error(format!(
             "{name}() takes no arguments ({} given)",
             positional.len()
         )));
     }
-    if flags & METH_O != 0 && positional.len() != 1 {
+    if flags.contains(MethFlags::METH_O) && positional.len() != 1 {
         return Err(crate::PyError::type_error(format!(
             "{name}() takes exactly one argument ({} given)",
             positional.len()
@@ -923,7 +947,15 @@ pub(super) fn call_method_def_in_class(
     // `ml_meth` has, so a table declaring two of them names no signature at
     // all and would otherwise be dispatched through whichever this layer
     // happens to test for first.
-    if (flags & (METH_NOARGS | METH_O | METH_VARARGS | METH_FASTCALL)).count_ones() != 1 {
+    if (flags
+        & (MethFlags::METH_NOARGS
+            | MethFlags::METH_O
+            | MethFlags::METH_VARARGS
+            | MethFlags::METH_FASTCALL))
+        .bits()
+        .count_ones()
+        != 1
+    {
         return Err(crate::PyError::runtime_error(format!(
             "{name}() uses an unknown calling convention"
         )));
@@ -932,15 +964,16 @@ pub(super) fn call_method_def_in_class(
     // argument rather than naming a signature of its own, so it is the only
     // combination it may appear in; in any other it would select a transmute
     // whose arity the callee does not have.
-    if flags & METH_METHOD != 0
-        && flags & (METH_FASTCALL | METH_KEYWORDS) != (METH_FASTCALL | METH_KEYWORDS)
+    if flags.contains(MethFlags::METH_METHOD)
+        && flags & (MethFlags::METH_FASTCALL | MethFlags::METH_KEYWORDS)
+            != (MethFlags::METH_FASTCALL | MethFlags::METH_KEYWORDS)
     {
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,
             format!("{name}() method: bad call flags"),
         ));
     }
-    let defining_class = match (flags & METH_METHOD != 0, defining_class) {
+    let defining_class = match (flags.contains(MethFlags::METH_METHOD), defining_class) {
         (false, _) => None,
         (true, Some(class)) => Some(class),
         (true, None) => {
@@ -967,4 +1000,66 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyDescr_NewClassMethod as *const ());
     std::hint::black_box(PyClassMethod_New as *const ());
     std::hint::black_box(PyStaticMethod_New as *const ());
+}
+
+#[cfg(test)]
+mod tests {
+    /// `ml_flags` is one word two places spell: an extension compiled against
+    /// `include/pyre3.14t/methodobject.h` puts bits into it, and this file
+    /// reads them.  Nothing tied the two together -- upstream has no such
+    /// pair, because `api.py` reads each value out of the real header with
+    /// `rffi_platform.ConstantInteger` -- so this walks the header and rejects
+    /// any flag whose bit the Rust side spells differently.
+    ///
+    /// `MethFlags::FLAGS` is what makes the walk complete: it carries every
+    /// constant the `bitflags!` block declares, so a flag added there is
+    /// compared here without anyone remembering to list it.
+    #[test]
+    fn every_meth_flag_is_the_bit_the_header_gives_it() {
+        use bitflags::Flags as _;
+
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/methodobject.h");
+
+        let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define METH_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Some(digits) = body.trim().strip_prefix("0x") else {
+                continue;
+            };
+            let Ok(value) = std::ffi::c_int::from_str_radix(digits, 16) else {
+                continue;
+            };
+            header.push((name, value));
+        }
+
+        // A parser that read nothing would agree with every flag below, so the
+        // floor comes first.  The header declares nine.
+        assert_eq!(
+            header.len(),
+            9,
+            "methodobject.h declares {} METH_ flags, not the 9 this read",
+            header.len()
+        );
+
+        for flag in super::MethFlags::FLAGS {
+            let name = flag
+                .name()
+                .strip_prefix("METH_")
+                .expect("every flag is declared under the header's own name");
+            let ours = flag.value().bits();
+            let (_, theirs) = header
+                .iter()
+                .find(|(known, _)| *known == name)
+                .unwrap_or_else(|| panic!("methodobject.h declares no METH_{name}"));
+            assert_eq!(
+                ours, *theirs,
+                "METH_{name} is {theirs:#x} in methodobject.h and {ours:#x} here"
+            );
+        }
+    }
 }

@@ -5,10 +5,27 @@ use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
 use std::ffi::c_int;
 
-/// `PySendResult`.
-const PYGEN_RETURN: c_int = 0;
-const PYGEN_ERROR: c_int = -1;
-const PYGEN_NEXT: c_int = 1;
+/// The `PySendResult` values `PyIter_Send` answers with.
+///
+/// A result is one of the three rather than a set of bits, so these stay
+/// numbers.  Declaring each once mints the table
+/// `every_send_result_is_the_number_the_header_gives_it` walks, so a value
+/// added here is compared against the header without anyone remembering to
+/// list it.
+macro_rules! send_results {
+    ($($name:ident = $value:expr,)*) => {
+        $(const $name: c_int = $value;)*
+
+        #[cfg(test)]
+        const ALL_SEND_RESULTS: &[(&str, c_int)] = &[$((stringify!($name), $value),)*];
+    };
+}
+
+send_results! {
+    PYGEN_RETURN = 0,
+    PYGEN_ERROR = -1,
+    PYGEN_NEXT = 1,
+}
 
 /// Does `object`'s type carry `name`?
 fn has_method(object: *mut CPyObject, name: &str) -> c_int {
@@ -216,4 +233,55 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyIter_NextItem as *const ());
     std::hint::black_box(PyObject_GetAIter as *const ());
     std::hint::black_box(PyIter_Send as *const ());
+}
+
+#[cfg(test)]
+mod tests {
+    /// `PyIter_Send` answers the number an extension compiled against
+    /// `include/pyre3.14t/object.h` switches on, so the values are one
+    /// enumeration in two places.  This walks the header and rejects any value
+    /// the Rust side numbers differently, or does not spell at all.
+    #[test]
+    fn every_send_result_is_the_number_the_header_gives_it() {
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+
+        // The three sit between `typedef enum {` and `} PySendResult;`, one to
+        // a line, and nothing else in the header is named `PYGEN_`.
+        let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.trim().strip_prefix("PYGEN_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once('=') else {
+                continue;
+            };
+            let Ok(value) = body.trim().trim_end_matches(',').parse::<std::ffi::c_int>() else {
+                continue;
+            };
+            header.push((name.trim(), value));
+        }
+
+        assert_eq!(
+            header.len(),
+            super::ALL_SEND_RESULTS.len(),
+            "object.h declares {} PySendResult values and this file declares {}",
+            header.len(),
+            super::ALL_SEND_RESULTS.len()
+        );
+
+        for (name, theirs) in &header {
+            let found = super::ALL_SEND_RESULTS
+                .iter()
+                .find(|(known, _)| known.strip_prefix("PYGEN_") == Some(name));
+            let Some((_, ours)) = found else {
+                panic!(
+                    "object.h defines PYGEN_{name} = {theirs}, and this file has no PYGEN_{name}"
+                );
+            };
+            assert_eq!(
+                ours, theirs,
+                "PYGEN_{name} is {theirs} in object.h and {ours} here"
+            );
+        }
+    }
 }

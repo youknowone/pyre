@@ -9,6 +9,86 @@
 
 use crate::pyobject::*;
 
+bitflags::bitflags! {
+    /// The `object.h` type flags -- the one `unsigned long` word a type
+    /// carries as `tp_flags`.
+    ///
+    /// Two places spell this table: the header an extension compiles against
+    /// (`include/pyre3.14t/object.h`) and this declaration.  Upstream keeps no
+    /// such pair -- `cpyext/api.py` reads each value out of the real header
+    /// with `rffi_platform.ConstantInteger` -- so
+    /// `every_tp_flag_is_the_bit_the_header_gives_it` compares the two,
+    /// walking `Flags::FLAGS` rather than a list somebody has to remember to
+    /// extend.
+    ///
+    /// The names are the header's, prefix and all.  A leading underscore marks
+    /// a flag the interpreter keeps to itself: the header an extension
+    /// compiles against does not ship it, and the comparison expects to find
+    /// no counterpart.
+    ///
+    /// The word is `c_ulong` because cpyext's `CPyTypeObject` mirror is
+    /// written through C's own `tp_flags` declaration.  `w_type_get_flags`
+    /// publishes the same bits as the integer `type.__flags__` returns.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct TpFlags: std::ffi::c_ulong {
+        const PY_TPFLAGS_DEFAULT = 0;
+        const _PY_TPFLAGS_STATIC_BUILTIN = 1 << 1;
+        const PY_TPFLAGS_INLINE_VALUES = 1 << 2;
+        const PY_TPFLAGS_MANAGED_WEAKREF = 1 << 3;
+        const PY_TPFLAGS_MANAGED_DICT = 1 << 4;
+        const PY_TPFLAGS_SEQUENCE = 1 << 5;
+        const PY_TPFLAGS_MAPPING = 1 << 6;
+        const PY_TPFLAGS_DISALLOW_INSTANTIATION = 1 << 7;
+        const PY_TPFLAGS_IMMUTABLETYPE = 1 << 8;
+        const PY_TPFLAGS_HEAPTYPE = 1 << 9;
+        const PY_TPFLAGS_BASETYPE = 1 << 10;
+        /// PEP 590 -- the type lends its instances a `vectorcallfunc`, stored
+        /// in each of them at `tp_vectorcall_offset`.  A type carrying the bit
+        /// is readied with `tp_call` filled and the offset positive, so the
+        /// two are read together and never apart.
+        const PY_TPFLAGS_HAVE_VECTORCALL = 1 << 11;
+        const PY_TPFLAGS_READY = 1 << 12;
+        const PY_TPFLAGS_READYING = 1 << 13;
+        const PY_TPFLAGS_HAVE_GC = 1 << 14;
+        const PY_TPFLAGS_METHOD_DESCRIPTOR = 1 << 17;
+        const PY_TPFLAGS_IS_ABSTRACT = 1 << 20;
+        const _PY_TPFLAGS_MATCH_SELF = 1 << 22;
+        const PY_TPFLAGS_ITEMS_AT_END = 1 << 23;
+        /// The fast-subclass flags -- `inherit_special`'s "Setup fast subclass
+        /// flags".
+        ///
+        /// A `Py*_Check` written for C is a flag test rather than a call, so a
+        /// type whose bit is clear reads as not being one.
+        const PY_TPFLAGS_LONG_SUBCLASS = 1 << 24;
+        const PY_TPFLAGS_LIST_SUBCLASS = 1 << 25;
+        const PY_TPFLAGS_TUPLE_SUBCLASS = 1 << 26;
+        const PY_TPFLAGS_BYTES_SUBCLASS = 1 << 27;
+        const PY_TPFLAGS_UNICODE_SUBCLASS = 1 << 28;
+        const PY_TPFLAGS_DICT_SUBCLASS = 1 << 29;
+        const PY_TPFLAGS_BASE_EXC_SUBCLASS = 1 << 30;
+        const PY_TPFLAGS_TYPE_SUBCLASS = 1 << 31;
+    }
+}
+
+/// C writes `tp_flags` through its own `unsigned long` declaration, so
+/// cpyext's `CPyTypeObject` field has to be that word and nothing wider or
+/// narrower.
+const _: () = assert!(size_of::<TpFlags>() == size_of::<std::ffi::c_ulong>());
+const _: () = assert!(align_of::<TpFlags>() == align_of::<std::ffi::c_ulong>());
+
+impl TpFlags {
+    /// The bits as `type.__flags__` publishes them.
+    pub const fn as_int(self) -> i64 {
+        self.bits() as i64
+    }
+}
+
+/// `typeobject.py PATMA_SEQUENCE`.
+pub const PATMA_SEQUENCE: i64 = TpFlags::PY_TPFLAGS_SEQUENCE.as_int();
+/// `typeobject.py PATMA_MAPPING`.
+pub const PATMA_MAPPING: i64 = TpFlags::PY_TPFLAGS_MAPPING.as_int();
+
 /// `pypy/interpreter/typedef.py TypeDef` metadata used by
 /// `objspace/std/typeobject.py Layout`.
 ///
@@ -1627,38 +1707,14 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     if obj.is_null() || !is_type(obj) {
         return 0;
     }
-    const STATIC_BUILTIN: i64 = 1 << 1;
-    const HEAPTYPE: i64 = 1 << 9; // copy_reg._HEAPTYPE
-    const INLINE_VALUES: i64 = 1 << 2;
-    const MANAGED_WEAKREF: i64 = 1 << 3;
-    const MANAGED_DICT: i64 = 1 << 4;
-    const IMMUTABLETYPE: i64 = 1 << 8;
-    const DISALLOW_INSTANTIATION: i64 = 1 << 7;
-    const BASETYPE: i64 = 1 << 10;
-    const READY: i64 = 1 << 12;
-    const READYING: i64 = 1 << 13;
-    const ABSTRACT: i64 = 1 << 20;
-    const MATCH_SELF: i64 = 1 << 22;
-    const HAVE_GC: i64 = 1 << 14;
-    const PATMA_SEQUENCE: i64 = 1 << 5;
-    const PATMA_MAPPING: i64 = 1 << 6;
-    const METHOD_DESCRIPTOR: i64 = 1 << 17;
-    const LONG_SUBCLASS: i64 = 1 << 24;
-    const LIST_SUBCLASS: i64 = 1 << 25;
-    const TUPLE_SUBCLASS: i64 = 1 << 26;
-    const BYTES_SUBCLASS: i64 = 1 << 27;
-    const UNICODE_SUBCLASS: i64 = 1 << 28;
-    const DICT_SUBCLASS: i64 = 1 << 29;
-    const BASE_EXC_SUBCLASS: i64 = 1 << 30;
-    const TYPE_SUBCLASS: i64 = 1 << 31;
 
     let t = &*(obj as *const W_TypeObject);
-    let mut flags = 0;
+    let mut flags = TpFlags::empty();
     if t.flag_cpython_static_builtin {
-        flags |= STATIC_BUILTIN;
+        flags |= TpFlags::_PY_TPFLAGS_STATIC_BUILTIN;
     }
     if t.flag_cpython_heaptype {
-        flags |= HEAPTYPE;
+        flags |= TpFlags::PY_TPFLAGS_HEAPTYPE;
     }
 
     if t.flag_cpython_heaptype {
@@ -1672,16 +1728,16 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         let layout = t.layout;
         let typedef_hasdict = !layout.is_null() && (*(*layout).typedef).hasdict;
         if t.hasdict && !typedef_hasdict {
-            flags |= MANAGED_DICT;
+            flags |= TpFlags::PY_TPFLAGS_MANAGED_DICT;
             // CPython's `type_ready_managed_dict` adds INLINE_VALUES only to
             // fixed-size managed-dict types.  This projection shares the
             // layout typedef used by `type.__itemsize__`.
             if !w_type_cpython_has_variable_items(obj) {
-                flags |= INLINE_VALUES;
+                flags |= TpFlags::PY_TPFLAGS_INLINE_VALUES;
             }
         }
         if w_type_has_cpython_managed_weakref(obj) {
-            flags |= MANAGED_WEAKREF;
+            flags |= TpFlags::PY_TPFLAGS_MANAGED_WEAKREF;
         }
     }
     if t.flag_cpython_immutabletype
@@ -1692,10 +1748,10 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         // PyPy's `descr__flags__` reports neither axis for builtin TypeDefs;
         // this field publishes CPython's observable split without changing
         // PyPy's internal type ownership.
-        flags |= IMMUTABLETYPE;
+        flags |= TpFlags::PY_TPFLAGS_IMMUTABLETYPE;
     }
     if t.flag_abstract.load(std::sync::atomic::Ordering::Acquire) {
-        flags |= ABSTRACT;
+        flags |= TpFlags::PY_TPFLAGS_IS_ABSTRACT;
     }
     // [3.14-spec] CPython `type_ready` exposes READYING while a custom
     // metaclass's `mro()` is running, then replaces it with READY when the MRO
@@ -1703,9 +1759,9 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     // partially initialized `W_TypeObject` likewise has `mro_w is None`
     // (`typeobject.py:1080-1084`), which is pyre's canonical readiness state.
     if t.mro_w.is_null() {
-        flags |= READYING;
+        flags |= TpFlags::PY_TPFLAGS_READYING;
     } else {
-        flags |= READY;
+        flags |= TpFlags::PY_TPFLAGS_READY;
     }
     if t.flag_disallow_instantiation
         .load(std::sync::atomic::Ordering::Acquire)
@@ -1716,7 +1772,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         // PyPy `typeobject.py:990-1004` publishes a smaller computed subset.
         // Preserve that field-by-field shape while exposing the canonical
         // flag that pyre's `type.__call__` already enforces.
-        flags |= DISALLOW_INSTANTIATION;
+        flags |= TpFlags::PY_TPFLAGS_DISALLOW_INSTANTIATION;
     }
     if w_type_get_acceptable_as_base_class(obj) && !t.flag_cpython_suppress_basetype {
         // [3.14-spec] CPython v3.14.6 `Include/object.h:549` assigns bit 10
@@ -1726,7 +1782,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         // `typeobject.py:1116-1118` enforces the canonical
         // `layout.typedef.acceptable_as_base_class` value. Keep PyPy's
         // field-by-field shape and publish that existing value.
-        flags |= BASETYPE;
+        flags |= TpFlags::PY_TPFLAGS_BASETYPE;
     }
     if t.flag_have_gc {
         // [3.14-spec] CPython v3.14.6 exposes the complete `tp_flags` word
@@ -1735,13 +1791,13 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         // PyPy `typeobject.py:990-1004` computes a deliberately smaller
         // public subset. Keep its field-by-field `descr__flags__` shape, but
         // publish pyre's canonical per-type GC flag for the 3.14 surface.
-        flags |= HAVE_GC;
+        flags |= TpFlags::PY_TPFLAGS_HAVE_GC;
     }
     if t.flag_method_descriptor {
-        flags |= METHOD_DESCRIPTOR;
+        flags |= TpFlags::PY_TPFLAGS_METHOD_DESCRIPTOR;
     }
     match t.flag_map_or_seq.load(std::sync::atomic::Ordering::Acquire) {
-        b'M' => flags |= PATMA_MAPPING,
+        b'M' => flags |= TpFlags::PY_TPFLAGS_MAPPING,
         // CPython deliberately omits the sequence-pattern flag from str,
         // bytes and bytearray (`unicodeobject.c:15805`,
         // `bytesobject.c:3118`, `bytearrayobject.c:2867`). Pyre keeps PyPy's
@@ -1754,7 +1810,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
                 get_instantiate(&crate::bytearrayobject::BYTEARRAY_TYPE),
             ) =>
         {
-            flags |= PATMA_SEQUENCE
+            flags |= TpFlags::PY_TPFLAGS_SEQUENCE
         }
         _ => {}
     }
@@ -1764,7 +1820,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         // observable class-pattern rule with its builtin atomic-type test;
         // `w_type_has_match_self` centralizes that MRO classification for the
         // opcode and this public flag.
-        flags |= MATCH_SELF;
+        flags |= TpFlags::_PY_TPFLAGS_MATCH_SELF;
     }
     // [3.14-spec] CPython v3.14.6 `Objects/typeobject.c:8175-8200`
     // computes these mutually exclusive fast-subclass flags from the base
@@ -1776,25 +1832,43 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
             crate::interp_exceptions::lookup_exc_class_for_kind(
                 crate::interp_exceptions::ExcKind::BaseException,
             ),
-            BASE_EXC_SUBCLASS,
+            TpFlags::PY_TPFLAGS_BASE_EXC_SUBCLASS,
         ),
-        (get_instantiate(&TYPE_TYPE), TYPE_SUBCLASS),
-        (get_instantiate(&INT_TYPE), LONG_SUBCLASS),
+        (
+            get_instantiate(&TYPE_TYPE),
+            TpFlags::PY_TPFLAGS_TYPE_SUBCLASS,
+        ),
+        (
+            get_instantiate(&INT_TYPE),
+            TpFlags::PY_TPFLAGS_LONG_SUBCLASS,
+        ),
         (
             get_instantiate(&crate::bytesobject::BYTES_TYPE),
-            BYTES_SUBCLASS,
+            TpFlags::PY_TPFLAGS_BYTES_SUBCLASS,
         ),
-        (get_instantiate(&STR_TYPE), UNICODE_SUBCLASS),
-        (get_instantiate(&TUPLE_TYPE), TUPLE_SUBCLASS),
-        (get_instantiate(&LIST_TYPE), LIST_SUBCLASS),
-        (get_instantiate(&DICT_TYPE), DICT_SUBCLASS),
+        (
+            get_instantiate(&STR_TYPE),
+            TpFlags::PY_TPFLAGS_UNICODE_SUBCLASS,
+        ),
+        (
+            get_instantiate(&TUPLE_TYPE),
+            TpFlags::PY_TPFLAGS_TUPLE_SUBCLASS,
+        ),
+        (
+            get_instantiate(&LIST_TYPE),
+            TpFlags::PY_TPFLAGS_LIST_SUBCLASS,
+        ),
+        (
+            get_instantiate(&DICT_TYPE),
+            TpFlags::PY_TPFLAGS_DICT_SUBCLASS,
+        ),
     ] {
         if !base.is_null() && w_type_issubtype(obj, base) {
             flags |= bit;
             break;
         }
     }
-    flags
+    flags.as_int()
 }
 
 /// `TypeDef.__init__` owns `acceptable_as_base_class`; TypeDef identity is
@@ -2218,9 +2292,9 @@ mod tests {
 
     #[test]
     fn type_flags_project_managed_dict_and_inline_values_from_layout_owner() {
-        const INLINE_VALUES: i64 = 1 << 2;
-        const MANAGED_DICT: i64 = 1 << 4;
-        const BASETYPE: i64 = 1 << 10;
+        const INLINE_VALUES: i64 = TpFlags::PY_TPFLAGS_INLINE_VALUES.as_int();
+        const MANAGED_DICT: i64 = TpFlags::PY_TPFLAGS_MANAGED_DICT.as_int();
+        const BASETYPE: i64 = TpFlags::PY_TPFLAGS_BASETYPE.as_int();
         const MASK: i64 = INLINE_VALUES | MANAGED_DICT;
 
         unsafe fn heap_type_with_layout(
@@ -2279,7 +2353,7 @@ mod tests {
 
     #[test]
     fn type_flags_project_managed_weakref_through_the_best_base_owner() {
-        const MANAGED_WEAKREF: i64 = 1 << 3;
+        const MANAGED_WEAKREF: i64 = TpFlags::PY_TPFLAGS_MANAGED_WEAKREF.as_int();
         let layout = leak_layout(Layout {
             typedef: leak_interpreter_typedef(&INSTANCE_TYPE, true, false),
             nslots: 0,
@@ -2325,9 +2399,9 @@ mod tests {
 
     #[test]
     fn type_flags_keep_cpython_owner_and_immutability_orthogonal() {
-        const STATIC_BUILTIN: i64 = 1 << 1;
-        const IMMUTABLETYPE: i64 = 1 << 8;
-        const HEAPTYPE: i64 = 1 << 9;
+        const STATIC_BUILTIN: i64 = TpFlags::_PY_TPFLAGS_STATIC_BUILTIN.as_int();
+        const IMMUTABLETYPE: i64 = TpFlags::PY_TPFLAGS_IMMUTABLETYPE.as_int();
+        const HEAPTYPE: i64 = TpFlags::PY_TPFLAGS_HEAPTYPE.as_int();
         const MASK: i64 = STATIC_BUILTIN | IMMUTABLETYPE | HEAPTYPE;
 
         unsafe {
@@ -2501,5 +2575,97 @@ mod tests {
         // Every thread removed everything it added, and no entry outlived it.
         let leftover = unsafe { w_type_get_subclasses(w_parent, false) };
         assert!(leftover.is_empty(), "{} entries leaked", leftover.len());
+    }
+
+    /// `tp_flags` is one word two places spell: an extension compiled against
+    /// `include/pyre3.14t/object.h` puts bits into it, and this file publishes
+    /// them.  Nothing ties the two together -- upstream has no such pair,
+    /// because `api.py` reads each value out of the real header with
+    /// `rffi_platform.ConstantInteger` -- so this walks the header and rejects
+    /// any flag whose bit the Rust side spells differently.
+    ///
+    /// `TpFlags::FLAGS` is what makes the walk complete: it carries every
+    /// constant the `bitflags!` block declares, so a flag added there is
+    /// compared here without anyone remembering to list it.
+    #[test]
+    fn every_tp_flag_is_the_bit_the_header_gives_it() {
+        use bitflags::Flags as _;
+
+        const HEADER: &str = include_str!("../../../include/pyre3.14t/object.h");
+
+        // `(1UL << N)`, and the bare `0UL` that `DEFAULT` and the Stackless
+        // extension carry.  A composite body names other flags rather than a
+        // number -- `Py_TPFLAGS_PREHEADER` is the only one -- and is skipped.
+        let mut header: Vec<(&str, std::ffi::c_ulong)> = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define Py_TPFLAGS_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let value = if let Some(shift) = body
+                .strip_prefix("(1UL <<")
+                .and_then(|body| body.strip_suffix(')'))
+            {
+                let Ok(bit) = shift.trim().parse::<u32>() else {
+                    continue;
+                };
+                1 << bit
+            } else if let Some(digits) = body.strip_suffix("UL") {
+                let Ok(value) = digits.parse::<std::ffi::c_ulong>() else {
+                    continue;
+                };
+                value
+            } else {
+                continue;
+            };
+            header.push((name, value));
+        }
+
+        // A parser that read nothing would agree with every flag below, so the
+        // floor comes first.  The header carries 29 flags a number can be read
+        // off; the bound is loose enough to survive one being added.
+        assert!(
+            header.len() >= 25,
+            "object.h declares more type flags than the {} this read",
+            header.len()
+        );
+
+        let mut shipped = 0;
+        let mut internal = 0;
+        for flag in TpFlags::FLAGS {
+            // A leading underscore is the claim that the header an extension
+            // compiles against does not ship this flag; the walk holds the
+            // claim to it either way.
+            let Some(name) = flag.name().strip_prefix("PY_TPFLAGS_") else {
+                let name = flag
+                    .name()
+                    .strip_prefix("_PY_TPFLAGS_")
+                    .expect("every flag is declared under the header's own name");
+                assert!(
+                    !header.iter().any(|(known, _)| *known == name),
+                    "object.h ships Py_TPFLAGS_{name}, so it is not internal"
+                );
+                internal += 1;
+                continue;
+            };
+            let ours = flag.value().bits();
+            let (_, theirs) = header
+                .iter()
+                .find(|(known, _)| *known == name)
+                .unwrap_or_else(|| panic!("object.h declares no Py_TPFLAGS_{name}"));
+            assert_eq!(
+                ours, *theirs,
+                "Py_TPFLAGS_{name} is {theirs:#x} in object.h and {ours:#x} here"
+            );
+            shipped += 1;
+        }
+
+        assert_eq!(
+            shipped + internal,
+            TpFlags::FLAGS.len(),
+            "the walk reached {shipped} shipped and {internal} internal flags"
+        );
     }
 }

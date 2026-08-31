@@ -83,91 +83,104 @@ pub(crate) fn invoke_after_minor_collection_hook() {
     }
 }
 
-/// GC flags stored in object headers.
-///
-/// incminimark.py `GCFLAG_*`, spelled the same here: a flag test and the
-/// RPython line it came from read alike, so the `GCFLAG_` prefix marks
-/// membership of that set and a constant without it is one this GC adds
-/// (`FINALIZER_REGISTERED`, `FINALIZER_RUN` below).
-pub mod flags {
-    // Bit positions must match RPython exactly. Upstream sets
-    // `first_gcflag = 1 << 32` and writes `first_gcflag << N`; the header keeps
-    // flags in the high half already, so each constant is the unshifted index N.
-
-    /// Something must be done to track the young pointers this object may
-    /// hold. Not set on young objects — any young object may point to any
-    /// other — except large arrays, where `GCFLAG_HAS_CARDS` does the tracking
-    /// and this is set anyway to shorten the write barrier. On old and prebuilt
-    /// objects it is usually set, and writing a pointer clears it.
-    pub const GCFLAG_TRACK_YOUNG_PTRS: u64 = 1 << 0;
-    /// Set on a prebuilt object unless it is already listed in
-    /// `prebuilt_root_objects`.
+bitflags::bitflags! {
+    /// The `GCFLAG_*` bits an object header carries.
     ///
-    /// A state, not a claim about the payload's shape. While it is set the
-    /// object holds no heap pointer, and the write barrier keeps that true: the
-    /// first pointer written into the object clears this flag and appends the
-    /// object to `prebuilt_root_objects`. That is what lets marking skip an
-    /// object still carrying it (incminimark.py:2782-2798) and lets
-    /// `_rrc_major_free` read it as "immortal, never traced so far".
+    /// incminimark.py declares each as `first_gcflag << N`, with
+    /// `first_gcflag = 1 << (LONG_BIT//2)`; the position here is N and
+    /// `GcHeader` applies `FLAG_SHIFT` when it writes the word, whose lower
+    /// half is the type id.  `every_gcflag_is_the_bit_incminimark_gives_it`
+    /// reads the positions back out of `incminimark.py`.
     ///
-    /// The invariant holds only where *every* pointer store into such an object
-    /// runs the barrier. Upstream gets that from the GC transform; a hand-
-    /// written store that skips it leaves a heap pointer behind a set flag, and
-    /// marking then walks past a live object.
-    pub const GCFLAG_NO_HEAP_PTRS: u64 = 1 << 1;
-    /// The object survived a major collection.
-    pub const GCFLAG_VISITED: u64 = 1 << 2;
-    /// Set on a nursery object whose id or identityhash was asked for: space
-    /// the size of the object is already reserved in the non-movable part.
-    pub const GCFLAG_HAS_SHADOW: u64 = 1 << 3;
-    /// Set temporarily during a major collection to order finalizers.
-    pub const GCFLAG_FINALIZATION_ORDERING: u64 = 1 << 4;
-    /// Reserved for RPython.
-    pub const GCFLAG_EXTRA: u64 = 1 << 5;
-    /// Set on an externally raw-malloced array of pointers: it carries extra
-    /// space in front for a bitfield, one bit per `card_page_indices` indices.
-    pub const GCFLAG_HAS_CARDS: u64 = 1 << 6;
-    /// At least one card bit is set. This is the most significant bit of the
-    /// byte holding `GCFLAG_TRACK_YOUNG_PTRS`, which the x86 backend requires.
-    pub const GCFLAG_CARDS_SET: u64 = 1 << 7;
-    /// Set on a raw-malloced young object that survived a minor collection.
-    pub const GCFLAG_VISITED_RMY: u64 = 1 << 8;
-    /// Keep this nursery object in the nursery: a young object carrying it is
-    /// not moved out by a minor collection. See `pin()` / `unpin()`.
-    pub const GCFLAG_PINNED: u64 = 1 << 9;
-    /// The same bit as [`GCFLAG_PINNED`], reused on objects outside the
-    /// nursery, where pinning cannot apply. Set means the object is already an
-    /// element of `old_objects_pointing_to_pinned` and need not be added again.
-    pub const GCFLAG_PINNED_OBJECT_PARENT_KNOWN: u64 = GCFLAG_PINNED;
-    /// `ignore_finalizer()` has been called on the object.
-    pub const GCFLAG_IGNORE_FINALIZER: u64 = 1 << 10;
-    /// A shadow object whose memory was initialized as it was created, so
-    /// tracing out needs no additional copy.
-    pub const GCFLAG_SHADOW_INITIALIZED: u64 = 1 << 11;
-    /// The `ll_dummy_value` from `rpython.rtyper.rmodel`.
-    pub const GCFLAG_DUMMY: u64 = 1 << 12;
-    /// The object is already on a finalizer queue (bit 13).
-    ///
-    /// Not an incminimark flag — bit 13 is `_GCFLAG_FIRST_UNUSED`
-    /// (incminimark.py:169) there, so this claims the first free bit and
-    /// disturbs no RPython position. incminimark keeps the registered set
-    /// purely in its two deques and never asks the question, because
-    /// `register_finalizer` is contracted to be called at most once per
-    /// object. That contract is checked only untranslated (`rgc.py:648-649`
-    /// `assert not self._already_registered(obj)`); translated, a second
-    /// registration silently appends a second deque entry and the finalizer
-    /// runs again on the following major collection. This flag lets the
-    /// queue enforce the contract for callers that cannot establish single
-    /// registration statically.
-    pub const FINALIZER_REGISTERED: u64 = 1 << 13;
-    /// The object's finalizer has already run (bit 14).
-    ///
-    /// Not an incminimark flag either — the queue delivers an object once and
-    /// incminimark never asks the question afterwards. `gc.is_finalized` does
-    /// ask it: an object its own finalizer resurrected reports
-    /// `_PyGC_FINALIZED`, and with nothing recorded the answer could only be a
-    /// constant `false`.
-    pub const FINALIZER_RUN: u64 = 1 << 14;
+    /// The names are incminimark's own, so a flag test and the RPython line it
+    /// came from read alike: a constant carrying the `GCFLAG_` prefix is one
+    /// incminimark declares, at the position it declares, and the two without
+    /// it are this GC's own.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct GcFlags: u64 {
+        /// Something must be done to track the young pointers this object may
+        /// hold. Not set on young objects -- any young object may point to any
+        /// other -- except large arrays, where `GCFLAG_HAS_CARDS` does the
+        /// tracking and this is set anyway to shorten the write barrier. On old
+        /// and prebuilt objects it is usually set, and writing a pointer clears
+        /// it.
+        const GCFLAG_TRACK_YOUNG_PTRS = 1 << 0;
+        /// Set on a prebuilt object unless it is already listed in
+        /// `prebuilt_root_objects`.
+        ///
+        /// A state, not a claim about the payload's shape. While it is set the
+        /// object holds no heap pointer, and the write barrier keeps that true:
+        /// the first pointer written into the object clears this flag and
+        /// appends the object to `prebuilt_root_objects`. That is what lets
+        /// marking skip an object still carrying it
+        /// (`IncrementalMiniMarkGC.visit`) and lets `_rrc_major_free` read it as
+        /// "immortal, never traced so far".
+        ///
+        /// The invariant holds only where *every* pointer store into such an
+        /// object runs the barrier. Upstream gets that from the GC transform; a
+        /// hand-written store that skips it leaves a heap pointer behind a set
+        /// flag, and marking then walks past a live object.
+        const GCFLAG_NO_HEAP_PTRS = 1 << 1;
+        /// The object survived a major collection.
+        const GCFLAG_VISITED = 1 << 2;
+        /// Set on a nursery object whose id or identityhash was asked for:
+        /// space the size of the object is already reserved in the non-movable
+        /// part.
+        const GCFLAG_HAS_SHADOW = 1 << 3;
+        /// Set temporarily during a major collection to order finalizers.
+        const GCFLAG_FINALIZATION_ORDERING = 1 << 4;
+        /// Reserved for RPython.
+        const GCFLAG_EXTRA = 1 << 5;
+        /// Set on an externally raw-malloced array of pointers: it carries
+        /// extra space in front for a bitfield, one bit per
+        /// `card_page_indices` indices.
+        const GCFLAG_HAS_CARDS = 1 << 6;
+        /// At least one card bit is set. This is the most significant bit of
+        /// the byte holding `GCFLAG_TRACK_YOUNG_PTRS`, which the x86 backend
+        /// requires.
+        const GCFLAG_CARDS_SET = 1 << 7;
+        /// Set on a raw-malloced young object that survived a minor collection.
+        const GCFLAG_VISITED_RMY = 1 << 8;
+        /// Keep this nursery object in the nursery: a young object carrying it
+        /// is not moved out by a minor collection. See `pin()` / `unpin()`.
+        const GCFLAG_PINNED = 1 << 9;
+        /// The same bit as [`GcFlags::GCFLAG_PINNED`], reused on objects
+        /// outside the nursery, where pinning cannot apply. Set means the
+        /// object is already an element of `old_objects_pointing_to_pinned`
+        /// and need not be added again.
+        const GCFLAG_PINNED_OBJECT_PARENT_KNOWN = Self::GCFLAG_PINNED.bits();
+        /// `ignore_finalizer()` has been called on the object.
+        const GCFLAG_IGNORE_FINALIZER = 1 << 10;
+        /// A shadow object whose memory was initialized as it was created, so
+        /// tracing out needs no additional copy.
+        const GCFLAG_SHADOW_INITIALIZED = 1 << 11;
+        /// The `ll_dummy_value` from `rpython.rtyper.rmodel`.
+        const GCFLAG_DUMMY = 1 << 12;
+        /// The object is already on a finalizer queue.
+        ///
+        /// Not an incminimark flag -- bit 13 is `_GCFLAG_FIRST_UNUSED`
+        /// (`_GCFLAG_FIRST_UNUSED`) there, so this claims the first free bit and
+        /// disturbs no RPython position.  incminimark keeps the registered set
+        /// purely in its two deques and never asks the question, because
+        /// `register_finalizer` is contracted to be called at most once per
+        /// object.  That contract is checked only untranslated
+        /// (`FinalizerQueue._untranslated_register_finalizer`,
+        /// `assert not self._already_registered(obj)`); translated, a second
+        /// registration silently appends a second deque entry and the finalizer
+        /// runs again on the following major collection.  This flag lets the
+        /// queue enforce the contract for callers that cannot establish single
+        /// registration statically.
+        const FINALIZER_REGISTERED = 1 << 13;
+        /// The object's finalizer has already run.
+        ///
+        /// Not an incminimark flag either -- the queue delivers an object once
+        /// and incminimark never asks the question afterwards.  `gc.is_finalized`
+        /// does ask it: an object its own finalizer resurrected reports
+        /// `_PyGC_FINALIZED`, and with nothing recorded the answer could only be
+        /// a constant `false`.
+        const FINALIZER_RUN = 1 << 14;
+    }
 }
 
 /// Low-level trigger stored in an RPython finalizer handler.  It must only
@@ -392,9 +405,9 @@ impl WriteBarrierDescr {
     /// header layout. gc.py:259-293 WriteBarrierDescr.__init__.
     pub fn for_current_gc() -> Self {
         let (if_flag_byteofs, if_flag_singlebyte) =
-            Self::extract_flag_byte(flags::GCFLAG_TRACK_YOUNG_PTRS);
+            Self::extract_flag_byte(GcFlags::GCFLAG_TRACK_YOUNG_PTRS.bits());
         let (cards_set_byteofs, cards_set_singlebyte) =
-            Self::extract_flag_byte(flags::GCFLAG_CARDS_SET);
+            Self::extract_flag_byte(GcFlags::GCFLAG_CARDS_SET.bits());
         // gc.py:280-281: the x86 backend relies on these two facts
         // to avoid one instruction in _write_barrier_fastpath.
         debug_assert_eq!(
@@ -406,10 +419,10 @@ impl WriteBarrierDescr {
             "CARDS_SET must be the MSB of its byte (-0x80)"
         );
         WriteBarrierDescr {
-            jit_wb_if_flag: flags::GCFLAG_TRACK_YOUNG_PTRS,
+            jit_wb_if_flag: GcFlags::GCFLAG_TRACK_YOUNG_PTRS.bits(),
             jit_wb_if_flag_byteofs: if_flag_byteofs,
             jit_wb_if_flag_singlebyte: if_flag_singlebyte as u8,
-            jit_wb_cards_set: flags::GCFLAG_CARDS_SET,
+            jit_wb_cards_set: GcFlags::GCFLAG_CARDS_SET.bits(),
             jit_wb_card_page_shift: crate::collector::DEFAULT_CARD_PAGE_SHIFT,
             jit_wb_cards_set_byteofs: cards_set_byteofs,
             jit_wb_cards_set_singlebyte: cards_set_singlebyte,
@@ -427,17 +440,37 @@ pub struct GcStepTransition {
     pub new_state: u8,
 }
 
-impl GcStepTransition {
-    pub const SCANNING: u8 = 0;
-    pub const MARKING: u8 = 1;
-    pub const SWEEPING: u8 = 2;
-    pub const FINALIZING: u8 = 3;
+/// The `incminimark.py` collection states, under the names it declares.
+///
+/// A step reports one state rather than a set of bits, so these stay numbers.
+/// Declaring each once mints the table
+/// `every_gc_state_is_the_number_incminimark_gives_it` walks, so a state added
+/// here is compared without anyone remembering to list it.
+macro_rules! gc_states {
+    ($($name:ident = $value:expr,)*) => {
+        impl GcStepTransition {
+            $(pub const $name: u8 = $value;)*
+        }
 
+        #[cfg(test)]
+        const ALL_GC_STATES: &[(&str, u8)] = &[$((stringify!($name), $value),)*];
+    };
+}
+
+gc_states! {
+    STATE_SCANNING = 0,
+    STATE_MARKING = 1,
+    STATE_SWEEPING = 2,
+    STATE_FINALIZING = 3,
+}
+
+impl GcStepTransition {
     /// `rgc.py is_done__states`: a major collection is done when the
     /// step ended in the starting state *and* did not begin there. A step that
-    /// found no work reports `(SCANNING, SCANNING)`, which completes nothing.
+    /// found no work reports `(STATE_SCANNING, STATE_SCANNING)`, which
+    /// completes nothing.
     pub const fn is_done(self) -> bool {
-        self.old_state != Self::SCANNING && self.new_state == Self::SCANNING
+        self.old_state != Self::STATE_SCANNING && self.new_state == Self::STATE_SCANNING
     }
 }
 
@@ -798,8 +831,8 @@ pub trait GcAllocator: Send {
     fn collect_step(&mut self) -> GcStepTransition {
         self.collect_full();
         GcStepTransition {
-            old_state: GcStepTransition::MARKING,
-            new_state: GcStepTransition::SCANNING,
+            old_state: GcStepTransition::STATE_MARKING,
+            new_state: GcStepTransition::STATE_SCANNING,
         }
     }
 
@@ -1486,7 +1519,7 @@ impl GcAllocator for GcHandle {
         // No root bracket: the barrier neither allocates nor collects, so
         // nothing inside it can move `obj`.  `do_write_barrier` /
         // `remember_young_pointer` (collector.rs) read headers, append to the
-        // host-allocated `old_objects_pointing_to_young`, and clear a tid flag — which is why
+        // host-allocated `remembered_set`, and clear a tid flag — which is why
         // upstream inlines the barrier at the store (framework.py:533-537) and
         // publishes no shadow-stack root anywhere in it.  Restore the bracket
         // if the remembered set ever becomes GC-managed.
@@ -2653,8 +2686,8 @@ pub fn set_active_collect_step(hook: Option<CollectStepFn>) {
 pub fn collect_step() -> GcStepTransition {
     ACTIVE_COLLECT_STEP.get().map_or(
         GcStepTransition {
-            old_state: GcStepTransition::MARKING,
-            new_state: GcStepTransition::SCANNING,
+            old_state: GcStepTransition::STATE_MARKING,
+            new_state: GcStepTransition::STATE_SCANNING,
         },
         |step| step(),
     )
@@ -3077,13 +3110,13 @@ pub fn gc_varsize_layout(addr: usize) -> Option<GcVarSizeLayout> {
 /// answer [`GcAllocator::register_finalizer`] already implies for one: it
 /// declines to register a finalizer for such a pointer at all.
 pub fn gc_finalizer_has_run(addr: usize) -> bool {
-    gc_owns_object(addr) && unsafe { (*header::header_of(addr)).has_flag(flags::FINALIZER_RUN) }
+    gc_owns_object(addr) && unsafe { (*header::header_of(addr)).has_flag(GcFlags::FINALIZER_RUN) }
 }
 
 /// Record that the finalizer for the object at `addr` has run.
 pub fn gc_mark_finalizer_run(addr: usize) {
     if gc_owns_object(addr) {
-        unsafe { (*header::header_of(addr)).set_flag(flags::FINALIZER_RUN) };
+        unsafe { (*header::header_of(addr)).set_flag(GcFlags::FINALIZER_RUN) };
     }
 }
 
@@ -3387,7 +3420,7 @@ pub fn gc_registered_finalizer_count() -> usize {
 }
 
 /// Whether the object at `addr` is itself one the finalizer queue still owes a
-/// delivery — `flags::FINALIZER_REGISTERED` set by
+/// delivery — `GcFlags::FINALIZER_REGISTERED` set by
 /// [`GcAllocator::register_finalizer`], minus the two flags that retire it.
 ///
 /// This is the whole of `hasuserdel` and more: `allocate_instance` registers
@@ -3401,9 +3434,9 @@ pub fn gc_object_finalizer_pending(addr: usize) -> bool {
     }
     let hdr = unsafe { header::header_of(addr) };
     unsafe {
-        (*hdr).has_flag(flags::FINALIZER_REGISTERED)
-            && !(*hdr).has_flag(flags::FINALIZER_RUN)
-            && !(*hdr).has_flag(flags::GCFLAG_IGNORE_FINALIZER)
+        (*hdr).has_flag(GcFlags::FINALIZER_REGISTERED)
+            && !(*hdr).has_flag(GcFlags::FINALIZER_RUN)
+            && !(*hdr).has_flag(GcFlags::GCFLAG_IGNORE_FINALIZER)
     }
 }
 
@@ -3940,7 +3973,7 @@ pub fn bh_probe_scan(reason: &str) {
             // remembered set, so a young field in it is legal and will be
             // traced.  Only a flagged object naming the nursery is a lost edge.
             let hdr = (addr - crate::header::GcHeader::SIZE) as *const crate::header::GcHeader;
-            if unsafe { !(*hdr).has_flag(crate::flags::GCFLAG_TRACK_YOUNG_PTRS) } {
+            if unsafe { !(*hdr).has_flag(crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
                 continue;
             }
             for offset in (0..payload_size).step_by(std::mem::size_of::<usize>()) {
@@ -4093,5 +4126,170 @@ mod headerless_no_collect_tests {
 
         set_active_alloc_nursery_headerless_no_collect(None);
         assert_eq!(alloc_nursery_headerless_no_collect(16), GcRef(0));
+    }
+
+    /// incminimark.py names each `GCFLAG_*` at a position, and so does
+    /// `GcFlags`.  Nothing tied the two together, so a bit corrected upstream
+    /// and not here -- or the reverse -- would leave the collector reading a
+    /// different bit than the one it means, with nothing noticing.
+    ///
+    /// `GcFlags::FLAGS` is what makes the walk complete: it carries every
+    /// constant the `bitflags!` block declares, so a flag added there is
+    /// compared here without anyone remembering to list it.
+    #[test]
+    fn every_gcflag_is_the_bit_incminimark_gives_it() {
+        use bitflags::Flags as _;
+
+        const INCMINIMARK: &str = include_str!("../../../rpython/memory/gc/incminimark.py");
+
+        // `GCFLAG_X = first_gcflag << N`, and `GCFLAG_X = GCFLAG_Y` for the one
+        // that names another flag rather than a shift.  `_GCFLAG_FIRST_UNUSED`
+        // marks the end rather than a bit and does not reach either arm.
+        let mut upstream: Vec<(&str, u64)> = Vec::new();
+        let mut shifts = 0;
+        for line in INCMINIMARK.lines() {
+            let Some(rest) = line.strip_prefix("GCFLAG_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once('=') else {
+                continue;
+            };
+            let (name, body) = (name.trim_end(), body.trim_start());
+            if let Some(shift) = body.strip_prefix("first_gcflag <<") {
+                let digits: String = shift
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                let Ok(bit) = digits.parse::<u32>() else {
+                    continue;
+                };
+                upstream.push((name, 1 << bit));
+                shifts += 1;
+            } else if let Some(alias) = body.strip_prefix("GCFLAG_") {
+                let alias = alias.split_whitespace().next().unwrap_or_default();
+                let (_, bit) = upstream
+                    .iter()
+                    .find(|(known, _)| *known == alias)
+                    .unwrap_or_else(|| {
+                        panic!("GCFLAG_{name} names GCFLAG_{alias}, which is declared later")
+                    });
+                upstream.push((name, *bit));
+            }
+        }
+
+        // A parser that read nothing would agree with every flag below, so the
+        // floor comes first.  incminimark declares 13 flags as a shift and one
+        // as another flag's name.
+        assert_eq!(
+            (shifts, upstream.len()),
+            (13, 14),
+            "incminimark.py declares {shifts} flags as a shift and {} in all, \
+             not the 13 and 14 this read",
+            upstream.len()
+        );
+
+        let mut ported = 0;
+        let mut ours = 0;
+        for flag in GcFlags::FLAGS {
+            // The prefix is the claim that incminimark declares this flag; the
+            // walk holds the claim to it either way.
+            let Some(name) = flag.name().strip_prefix("GCFLAG_") else {
+                assert!(
+                    !upstream.iter().any(|(known, _)| *known == flag.name()),
+                    "incminimark.py declares GCFLAG_{}, so it is not this GC's own",
+                    flag.name()
+                );
+                ours += 1;
+                continue;
+            };
+            let bits = flag.value().bits();
+            let (_, theirs) = upstream
+                .iter()
+                .find(|(known, _)| *known == name)
+                .unwrap_or_else(|| panic!("incminimark.py declares no GCFLAG_{name}"));
+            assert_eq!(
+                bits, *theirs,
+                "GCFLAG_{name} is {theirs:#x} in incminimark.py and {bits:#x} here"
+            );
+            ported += 1;
+        }
+
+        assert_eq!(
+            ported + ours,
+            GcFlags::FLAGS.len(),
+            "the walk reached {ported} ported and {ours} local flags"
+        );
+    }
+
+    /// The state a `collect_step` reports is incminimark's number, and the
+    /// `gc` module publishes it to Python as `STATE_*` and `GC_STATES`.  This
+    /// walks the same file the flags are walked in and rejects any state this
+    /// GC numbers differently, or does not spell at all.
+    #[test]
+    fn every_gc_state_is_the_number_incminimark_gives_it() {
+        const INCMINIMARK: &str = include_str!("../../../rpython/memory/gc/incminimark.py");
+
+        // `STATE_X = N`, at column zero; the file has no other assignment
+        // spelled that way.
+        let mut upstream: Vec<(&str, u8)> = Vec::new();
+        for line in INCMINIMARK.lines() {
+            let Some(rest) = line.strip_prefix("STATE_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once('=') else {
+                continue;
+            };
+            let Ok(value) = body.trim().parse::<u8>() else {
+                continue;
+            };
+            upstream.push((name.trim_end(), value));
+        }
+
+        assert_eq!(
+            upstream.len(),
+            ALL_GC_STATES.len(),
+            "incminimark.py declares {} states and this GC declares {}",
+            upstream.len(),
+            ALL_GC_STATES.len()
+        );
+
+        for (name, theirs) in &upstream {
+            let found = ALL_GC_STATES
+                .iter()
+                .find(|(known, _)| known.strip_prefix("STATE_") == Some(name));
+            let Some((_, ours)) = found else {
+                panic!(
+                    "incminimark.py declares STATE_{name} = {theirs}, and this GC has no STATE_{name}"
+                );
+            };
+            assert_eq!(
+                ours, theirs,
+                "STATE_{name} is {theirs} in incminimark.py and {ours} here"
+            );
+        }
+
+        // `GC_STATES` is the same four in the order the numbers give, and it
+        // is what the `gc` module answers with.
+        let listed = INCMINIMARK
+            .lines()
+            .find_map(|line| line.strip_prefix("GC_STATES = ["))
+            .and_then(|body| body.split_once(']'))
+            .expect("incminimark.py declares GC_STATES")
+            .0;
+        let listed: Vec<&str> = listed
+            .split(',')
+            .map(|name| name.trim().trim_matches('\''))
+            .collect();
+        let mut ordered = ALL_GC_STATES.to_vec();
+        ordered.sort_by_key(|(_, value)| *value);
+        let ordered: Vec<&str> = ordered
+            .iter()
+            .map(|(name, _)| name.strip_prefix("STATE_").unwrap())
+            .collect();
+        assert_eq!(
+            listed, ordered,
+            "incminimark.py's GC_STATES is {listed:?} and this GC's states are {ordered:?}"
+        );
     }
 }

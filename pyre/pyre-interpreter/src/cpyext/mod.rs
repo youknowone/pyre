@@ -411,6 +411,13 @@ fn lookup_init(handle: usize, name: &str) -> Result<Option<(InitProtocol, usize)
     Ok(None)
 }
 
+/// PyPy `cpyext.api.load_extension_module` looks for the generated CFFI entry
+/// point before either cpyext protocol.
+fn lookup_cffi_init(handle: usize, name: &str) -> Option<usize> {
+    let basename = name.rsplit('.').next().unwrap_or(name);
+    lookup_init_address(handle, &format!("_cffi_pypyinit_{basename}"))
+}
+
 /// What the lookup reports when neither entry point is there.
 fn missing_init_error(name: &str, path: &Path) -> crate::PyError {
     let symbol = match init_basename(name) {
@@ -468,10 +475,15 @@ pub fn load_extension_module(
     // the one library owned by `EXTENSIONS`, so resolve PyPy's cache before
     // opening on this host abstraction.
     if let Some(handle) = cached_extension_handle(path) {
-        if lookup_init(handle, name)?.is_none() {
+        // `create_extension_module` takes the CFFI branch before it reaches the
+        // extension cache, so a generated module is rebuilt on every import.
+        // Serving one from the cache restores `name` alone and leaves the
+        // `name.lib` entry the initializer also registers missing.
+        let cffi = lookup_cffi_init(handle, name).is_some();
+        if !cffi && lookup_init(handle, name)?.is_none() {
             return Err(missing_init_error(name, path));
         }
-        if let Some(module) = cached_extension(name, path) {
+        if !cffi && let Some(module) = cached_extension(name, path) {
             let roots = pyre_object::gc_roots::push_roots();
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(module);
@@ -508,7 +520,14 @@ pub fn load_extension_module(
     // live.  Their types' `tp_traverse` is then a pointer into text nobody has
     // mapped, which the next minor collection walks.  Upstream keeps the
     // library on both of these failures.
+    let cffi_address = lookup_cffi_init(handle, name);
     let found = lookup_init(handle, name)?;
+    if let Some(address) = cffi_address {
+        let module =
+            crate::module::_cffi_backend::cffi1_module::load_cffi1_module(name, path, address)?;
+        fixup_extension(module, name, path, handle);
+        return Ok(module);
+    }
     let Some((protocol, address)) = found else {
         return Err(missing_init_error(name, path));
     };
@@ -680,7 +699,7 @@ pub fn create_dynamic(spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
 #[majit_macros::dont_look_inside]
 pub(super) fn call_cfunction(
     function: *const std::ffi::c_void,
-    flags: c_int,
+    flags: methodobject::MethFlags,
     w_self: PyObjectRef,
     positional: &[PyObjectRef],
     keywords: &[(String, PyObjectRef)],
@@ -693,13 +712,13 @@ pub(super) fn call_cfunction(
 /// arguments.
 pub(super) fn call_cfunction_in_class(
     function: *const std::ffi::c_void,
-    flags: c_int,
+    flags: methodobject::MethFlags,
     w_self: PyObjectRef,
     defining_class: Option<PyObjectRef>,
     positional: &[PyObjectRef],
     keywords: &[(String, PyObjectRef)],
 ) -> Result<PyObjectRef, crate::PyError> {
-    use methodobject::{METH_FASTCALL, METH_KEYWORDS, METH_NOARGS, METH_O};
+    use methodobject::MethFlags;
 
     if function.is_null() {
         return Err(crate::PyError::new(
@@ -720,7 +739,7 @@ pub(super) fn call_cfunction_in_class(
     }
     let value_slot = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + 1 + index);
 
-    let fastcall = flags & METH_FASTCALL != 0;
+    let fastcall = flags.contains(MethFlags::METH_FASTCALL);
     let mut arguments = std::ptr::null_mut();
     let mut keywords_arg = std::ptr::null_mut();
     let mut fastcall_slots: Vec<*mut CPyObject> = Vec::new();
@@ -728,19 +747,19 @@ pub(super) fn call_cfunction_in_class(
         for index in 0..positional.len() + keywords.len() {
             fastcall_slots.push(pyobject::make_ref(value_slot(index)));
         }
-        if flags & METH_KEYWORDS != 0 && !keywords.is_empty() {
+        if flags.contains(MethFlags::METH_KEYWORDS) && !keywords.is_empty() {
             let names: Vec<PyObjectRef> = keywords
                 .iter()
                 .map(|(name, _)| pyre_object::w_str_new(name))
                 .collect();
             keywords_arg = pyobject::make_ref(pyre_object::tupleobject::w_tuple_new(names));
         }
-    } else if flags & (METH_NOARGS | METH_O) == 0 {
+    } else if !flags.intersects(MethFlags::METH_NOARGS | MethFlags::METH_O) {
         let items: Vec<PyObjectRef> = (0..positional.len()).map(value_slot).collect();
         let tuple = pyre_object::tupleobject::w_tuple_new(items);
         let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(tuple);
-        if flags & METH_KEYWORDS != 0 && !keywords.is_empty() {
+        if flags.contains(MethFlags::METH_KEYWORDS) && !keywords.is_empty() {
             let dict = pyre_object::dictmultiobject::w_dict_new();
             let dict_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(dict);
@@ -756,7 +775,7 @@ pub(super) fn call_cfunction_in_class(
             keywords_arg = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(dict_slot));
         }
         arguments = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(tuple_slot));
-    } else if flags & METH_O != 0 {
+    } else if flags.contains(MethFlags::METH_O) {
         arguments = pyobject::make_ref(value_slot(0));
     }
 
@@ -784,7 +803,7 @@ pub(super) fn call_cfunction_in_class(
                 positional.len() as isize,
                 keywords_arg,
             )
-        } else if fastcall && flags & METH_KEYWORDS != 0 {
+        } else if fastcall && flags.contains(MethFlags::METH_KEYWORDS) {
             let call: unsafe extern "C" fn(
                 *mut CPyObject,
                 *const *mut CPyObject,
@@ -804,7 +823,7 @@ pub(super) fn call_cfunction_in_class(
                 isize,
             ) -> *mut CPyObject = std::mem::transmute(function);
             call(receiver, fastcall_slots.as_ptr(), positional.len() as isize)
-        } else if flags & METH_KEYWORDS != 0 {
+        } else if flags.contains(MethFlags::METH_KEYWORDS) {
             let call: unsafe extern "C" fn(
                 *mut CPyObject,
                 *mut CPyObject,

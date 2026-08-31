@@ -1624,6 +1624,8 @@ mod ssl_socket_methods {
         Read(usize),
         /// Put every record rustls has queued on the wire.
         Flush,
+        /// Exchange close_notify records until the peer has answered ours.
+        Shutdown,
     }
 
     /// Why a released run gave the interpreter back.
@@ -1657,6 +1659,10 @@ mod ssl_socket_methods {
     /// Nothing here may touch a Python object.  The states that need one - a
     /// server context to choose, a signal to deliver, an error to raise - end
     /// the run and are answered by the caller.
+    /// A TLS record's header: the content type, the two protocol version
+    /// bytes, and the two that hold the body's length.
+    const TLS_RECORD_HEADER_LEN: usize = 5;
+
     fn pump(
         backend: *mut pyre_native::ssl::TlsConnection,
         fd: crate::module::_socket::rsocket_rffi::Socket,
@@ -1667,6 +1673,18 @@ mod ssl_socket_methods {
         use crate::module::_socket::rsocket_rffi::error_is_interrupted;
 
         let _blocked = crate::module::thread::before_external_block();
+        // The shutdown exchange stops at a record boundary.  What follows the
+        // peer's close_notify is the plaintext `unwrap()` hands back with the
+        // socket, so a read that crossed the boundary would lift those bytes
+        // out of the kernel and drop them into the TLS stream, where nothing
+        // can return them.  OpenSSL's record layer reads a header and then the
+        // body its length names, which is why a socket-backed `SSL_shutdown`
+        // leaves the caller's bytes alone; track the same two-step here.  A
+        // short read is fed on as it arrives -- the receiver buffers a partial
+        // record -- and only the byte count is carried across.
+        let mut header = [0u8; TLS_RECORD_HEADER_LEN];
+        let mut header_read = 0usize;
+        let mut body_left = 0usize;
         loop {
             loop {
                 let data = match unsafe { pyre_native::ssl::connection_peek_tls(backend) } {
@@ -1707,10 +1725,34 @@ mod ssl_socket_methods {
                         Err(error) => return PumpExit::Rejected(error),
                     }
                 }
+                PumpGoal::Shutdown => {
+                    if unsafe { pyre_native::ssl::connection_peer_closed(backend) } {
+                        return PumpExit::Done(Vec::new());
+                    }
+                }
             }
-            match socket_recv_raw(fd, buf, 0) {
+            let want = match goal {
+                PumpGoal::Shutdown if body_left > 0 => body_left.min(buf.len()),
+                PumpGoal::Shutdown => TLS_RECORD_HEADER_LEN - header_read,
+                _ => buf.len(),
+            };
+            match socket_recv_raw(fd, &mut buf[..want], 0) {
                 Ok(0) => return PumpExit::Eof,
                 Ok(read) => {
+                    if matches!(goal, PumpGoal::Shutdown) {
+                        if body_left > 0 {
+                            body_left -= read;
+                        } else {
+                            header[header_read..header_read + read].copy_from_slice(&buf[..read]);
+                            header_read += read;
+                            if header_read == TLS_RECORD_HEADER_LEN {
+                                // The record's length is the header's last two
+                                // bytes, big-endian.
+                                body_left = u16::from_be_bytes([header[3], header[4]]) as usize;
+                                header_read = 0;
+                            }
+                        }
+                    }
                     if let Err(error) =
                         unsafe { pyre_native::ssl::connection_receive_tls(backend, &buf[..read]) }
                     {
@@ -2154,14 +2196,23 @@ mod ssl_socket_methods {
             };
             let size = if let Some(buffer) = writable.as_mut() {
                 let capacity = unsafe { buffer.as_mut_slice() }.len();
-                if requested < 0 {
+                // `_read_buf`: a length that is not positive, or larger than
+                // the buffer, is the buffer's own length.
+                if requested <= 0 || requested as usize > capacity {
                     capacity
                 } else {
-                    capacity.min(requested as usize)
+                    requested as usize
                 }
             } else {
                 requested as usize
             };
+            // `_read_buf` answers a zero-length buffer with 0 before reaching
+            // `SSL_read`, so an empty request never observes the connection --
+            // a plaintext read of no bytes would otherwise report the peer's
+            // EOF and, after a local shutdown, raise `SSLZeroReturnError`.
+            if size == 0 {
+                return Ok(w_int_new(0));
+            }
             let data = if let Some((transport, fd)) = pump_transport(self)? {
                 // `SSL_read` under one `PySSL_BEGIN_ALLOW_THREADS`: the
                 // plaintext drain, the transport read and the record parsing
@@ -2211,6 +2262,20 @@ mod ssl_socket_methods {
                     }
                 }
             };
+            // PyPy `_cffi_ssl._stdssl._SSLSocket._read` distinguishes the
+            // two clean-close states through `SSL_get_shutdown`: a peer-only
+            // `SSL_RECEIVED_SHUTDOWN` is stream EOF and returns zero bytes,
+            // while a read after our own `shutdown()` has also sent
+            // close_notify sees `SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN`
+            // and falls through to `pyssl_error`, which raises
+            // `SSLZeroReturnError`.  rustls reports both as `Ok(0)`, so retain
+            // the same distinction with the object-owned shutdown flag.
+            if data.is_empty() && self.shutdown_started {
+                return Err(tls_error(
+                    pyre_native::ssl::TLS_ERROR_ZERO_RETURN,
+                    "TLS/SSL connection has been closed (EOF)".to_string(),
+                ));
+            }
             if let Some(buffer) = writable.as_mut() {
                 let target = unsafe { buffer.as_mut_slice() };
                 target[..data.len()].copy_from_slice(&data);
@@ -2393,12 +2458,58 @@ mod ssl_socket_methods {
             // reported.  Until the peer's close-notify has been fed in, that
             // is `WANT_READ`.
             if !unsafe { is_none(self.incoming) } {
+                // PyPy `_cffi_ssl._stdssl._SSLSocket.shutdown` calls
+                // `SSL_shutdown` before `_ssl_select`: once OpenSSL has
+                // latched `SSL_RECEIVED_SHUTDOWN`, it succeeds without
+                // consulting an empty MemoryBIO.  Check rustls' equivalent
+                // sticky state before asking the transport for another
+                // record, or a second `unwrap()` incorrectly reports
+                // `SSLWantReadError` after `read()` saw close_notify.
+                if unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
+                    return Ok(w_none());
+                }
                 receive_transport(self)?;
                 if !unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
                     return Err(tls_error(
                         pyre_native::ssl::TLS_ERROR_WANT_READ,
                         "The operation did not complete (read)".to_string(),
                     ));
+                }
+            }
+            // PyPy `_cffi_ssl._stdssl._SSLSocket.shutdown` loops
+            // `SSL_shutdown` and `_ssl_select` until the peer's close_notify
+            // arrives.  A socket-backed connection must do the same: merely
+            // flushing our close_notify lets the caller close the TCP socket
+            // before the peer can send its answer.  Drive this through the
+            // same released transport loop as SSL_read/SSL_do_handshake.
+            if let Some((transport, fd)) = pump_transport(self)? {
+                let mut buf = vec![0u8; 32 * 1024];
+                loop {
+                    match pump(self.backend, fd, &mut buf, PumpGoal::Shutdown) {
+                        PumpExit::Done(_) => {
+                            settle_received_tls(self)?;
+                            break;
+                        }
+                        PumpExit::Interrupted => {
+                            crate::module::signal::interp_signal::checksignals_now()?
+                        }
+                        PumpExit::Failed { write, code }
+                            if wait_for_transport(transport, fd, write, code)? => {}
+                        PumpExit::Rejected(error) => {
+                            let _ = flush_transport(self);
+                            return tls_result(Err(error));
+                        }
+                        exit => return Err(pump_error(transport, exit)),
+                    }
+                }
+            } else if unsafe { is_none(self.incoming) } {
+                // A message callback requires returning to the interpreter
+                // after every record.  Keep PyPy's shutdown loop in that
+                // case too, but use the callback-aware transport helpers
+                // instead of the released pump.
+                while !unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
+                    receive_transport(self)?;
+                    flush_transport(self)?;
                 }
             }
             if unsafe { is_none(self.socket) } {

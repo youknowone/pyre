@@ -1045,7 +1045,7 @@ impl FixedObjectArray {
         // the same array is a plain write.  Nursery arrays and StdAlloc
         // fallback arrays also carry a zero flag word and take this arm.
         let header = unsafe { majit_gc::header::header_of(self as *mut Self as usize) };
-        if unsafe { !(*header).has_flag(majit_gc::flags::GCFLAG_TRACK_YOUNG_PTRS) } {
+        if unsafe { !(*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
             unsafe { self.items_mut_ptr().add(index).write(value) };
             return;
         }

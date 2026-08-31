@@ -15,5 +15,5 @@ pub use crate::pyjitpl::{
     MetaInterpGlobalData, MetaInterpStaticData,
 };
 pub use crate::warmstate::{
-    BaseJitCell, BaseJitCellState, CellJitState, HotResult, WarmEnterState, jc_flags,
+    BaseJitCell, BaseJitCellState, CellJitState, HotResult, JcFlags, WarmEnterState,
 };

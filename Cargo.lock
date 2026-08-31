@@ -2197,6 +2197,7 @@ dependencies = [
 name = "majit-gc"
 version = "0.0.2"
 dependencies = [
+ "bitflags 2.13.0",
  "indexmap",
  "libc",
  "majit-ir",
@@ -2231,6 +2232,7 @@ name = "majit-metainterp"
 version = "0.0.2"
 dependencies = [
  "bit-set",
+ "bitflags 2.13.0",
  "indexmap",
  "majit-backend",
  "majit-backend-cranelift",
@@ -2966,6 +2968,7 @@ name = "pyre-interpreter"
 version = "0.0.2"
 dependencies = [
  "base64",
+ "bitflags 2.13.0",
  "cc",
  "crc32fast",
  "flate2",
@@ -3110,6 +3113,7 @@ dependencies = [
 name = "pyre-object"
 version = "0.0.2"
 dependencies = [
+ "bitflags 2.13.0",
  "indexmap",
  "linkme",
  "majit-gc",

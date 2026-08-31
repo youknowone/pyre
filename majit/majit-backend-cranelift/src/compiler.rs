@@ -1730,8 +1730,8 @@ fn collect_generation_via_active_runtime(generation: i64) {
 fn collect_step_via_active_runtime() -> majit_gc::GcStepTransition {
     with_cranelift_gc(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
         // `rgc.py:20-31`: SCANNING on both sides would never report completion.
-        old_state: majit_gc::GcStepTransition::MARKING,
-        new_state: majit_gc::GcStepTransition::SCANNING,
+        old_state: majit_gc::GcStepTransition::STATE_MARKING,
+        new_state: majit_gc::GcStepTransition::STATE_SCANNING,
     })
 }
 
@@ -18395,8 +18395,8 @@ impl majit_backend::Backend for CraneliftBackend {
 mod tests {
     use super::*;
     use majit_backend::Backend;
+    use majit_gc::GcFlags;
     use majit_gc::collector::{GcConfig, MiniMarkGC};
-    use majit_gc::flags;
     use majit_gc::header::{GcHeader, header_of};
     use majit_gc::trace::TypeInfo;
     use majit_ir::descr::{Descr, EffectInfo, ExtraEffect, SizeDescr};
@@ -18886,7 +18886,7 @@ mod tests {
         }
 
         let tracks_young =
-            |addr: usize| unsafe { (*header_of(addr)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) };
+            |addr: usize| unsafe { (*header_of(addr)).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) };
         let in_nursery = |addr: usize| with_cranelift_gc_required(|gc| gc.is_nursery_object(addr));
 
         assert!(
@@ -24977,9 +24977,9 @@ mod tests {
         let token = JitCellToken::new(1503);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
-        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(obj.0)).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) });
         backend.execute_token(&token, &[Value::Ref(obj)]);
-        assert!(!unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
+        assert!(!unsafe { (*header_of(obj.0)).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) });
     }
 
     /// test_gc_integration.py test_malloc_1:

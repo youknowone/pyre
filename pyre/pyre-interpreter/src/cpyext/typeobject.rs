@@ -106,7 +106,7 @@ pub struct CPyMemberDef {
     pub name: *const c_char,
     pub type_code: c_int,
     pub offset: isize,
-    pub flags: c_int,
+    pub flags: MemberFlags,
     pub doc: *const c_char,
 }
 
@@ -201,7 +201,7 @@ pub struct CPyTypeObject {
     pub tp_getattro: *const c_void,
     pub tp_setattro: *const c_void,
     pub tp_as_buffer: *mut CPyBufferProcs,
-    pub tp_flags: std::ffi::c_ulong,
+    pub tp_flags: TpFlags,
     pub tp_doc: *const c_char,
     pub tp_traverse: *const c_void,
     pub tp_clear: *const c_void,
@@ -257,59 +257,46 @@ pub struct CPyHeapTypeObject {
     pub ht_module: *mut CPyObject,
 }
 
-pub const PY_TPFLAGS_DEFAULT: std::ffi::c_ulong = 0;
-pub const PY_TPFLAGS_STATIC_BUILTIN: std::ffi::c_ulong = 1 << 1;
-pub const PY_TPFLAGS_DISALLOW_INSTANTIATION: std::ffi::c_ulong = 1 << 7;
-pub const PY_TPFLAGS_HEAPTYPE: std::ffi::c_ulong = 1 << 9;
-pub const PY_TPFLAGS_BASETYPE: std::ffi::c_ulong = 1 << 10;
-/// PEP 590 -- the type lends its instances a `vectorcallfunc`, stored in
-/// each of them at `tp_vectorcall_offset`.  A type carrying the bit is
-/// readied with `tp_call` filled and the offset positive, so the two are
-/// read together and never apart.
-pub const PY_TPFLAGS_HAVE_VECTORCALL: std::ffi::c_ulong = 1 << 11;
-pub const PY_TPFLAGS_READY: std::ffi::c_ulong = 1 << 12;
-pub const PY_TPFLAGS_READYING: std::ffi::c_ulong = 1 << 13;
-pub const PY_TPFLAGS_HAVE_GC: std::ffi::c_ulong = 1 << 14;
-pub const PY_TPFLAGS_IMMUTABLETYPE: std::ffi::c_ulong = 1 << 8;
-pub const PY_TPFLAGS_ITEMS_AT_END: std::ffi::c_ulong = 1 << 23;
-
-/// The fast-subclass flags -- `inherit_special`'s "Setup fast subclass flags".
-///
-/// A `Py*_Check` written for C is a flag test rather than a call, so a type
-/// whose bit is clear reads as not being one.
-pub const PY_TPFLAGS_LONG_SUBCLASS: std::ffi::c_ulong = 1 << 24;
-pub const PY_TPFLAGS_LIST_SUBCLASS: std::ffi::c_ulong = 1 << 25;
-pub const PY_TPFLAGS_TUPLE_SUBCLASS: std::ffi::c_ulong = 1 << 26;
-pub const PY_TPFLAGS_BYTES_SUBCLASS: std::ffi::c_ulong = 1 << 27;
-pub const PY_TPFLAGS_UNICODE_SUBCLASS: std::ffi::c_ulong = 1 << 28;
-pub const PY_TPFLAGS_DICT_SUBCLASS: std::ffi::c_ulong = 1 << 29;
-pub const PY_TPFLAGS_BASE_EXC_SUBCLASS: std::ffi::c_ulong = 1 << 30;
-pub const PY_TPFLAGS_TYPE_SUBCLASS: std::ffi::c_ulong = 1 << 31;
+/// The `tp_flags` word, declared with the rest of the type object in
+/// `pyre_object::typeobject` and compared against the header there.
+pub use pyre_object::typeobject::TpFlags;
 
 /// The fast-subclass flags, in the order `inherit_special` tests them
 /// (`typeobject.py:492-509`): the first base that matches wins, so a type is
 /// only ever marked as one of these.
-const FAST_SUBCLASS_FLAGS: [(&pyre_object::pyobject::PyType, std::ffi::c_ulong); 8] = [
+const FAST_SUBCLASS_FLAGS: [(&pyre_object::pyobject::PyType, TpFlags); 8] = [
     (
         &pyre_object::interp_exceptions::EXCEPTION_TYPE,
-        PY_TPFLAGS_BASE_EXC_SUBCLASS,
+        TpFlags::PY_TPFLAGS_BASE_EXC_SUBCLASS,
     ),
-    (&pyre_object::pyobject::TYPE_TYPE, PY_TPFLAGS_TYPE_SUBCLASS),
-    (&pyre_object::pyobject::INT_TYPE, PY_TPFLAGS_LONG_SUBCLASS),
+    (
+        &pyre_object::pyobject::TYPE_TYPE,
+        TpFlags::PY_TPFLAGS_TYPE_SUBCLASS,
+    ),
+    (
+        &pyre_object::pyobject::INT_TYPE,
+        TpFlags::PY_TPFLAGS_LONG_SUBCLASS,
+    ),
     (
         &pyre_object::bytesobject::BYTES_TYPE,
-        PY_TPFLAGS_BYTES_SUBCLASS,
+        TpFlags::PY_TPFLAGS_BYTES_SUBCLASS,
     ),
     (
         &pyre_object::pyobject::STR_TYPE,
-        PY_TPFLAGS_UNICODE_SUBCLASS,
+        TpFlags::PY_TPFLAGS_UNICODE_SUBCLASS,
     ),
     (
         &pyre_object::pyobject::TUPLE_TYPE,
-        PY_TPFLAGS_TUPLE_SUBCLASS,
+        TpFlags::PY_TPFLAGS_TUPLE_SUBCLASS,
     ),
-    (&pyre_object::pyobject::LIST_TYPE, PY_TPFLAGS_LIST_SUBCLASS),
-    (&pyre_object::pyobject::DICT_TYPE, PY_TPFLAGS_DICT_SUBCLASS),
+    (
+        &pyre_object::pyobject::LIST_TYPE,
+        TpFlags::PY_TPFLAGS_LIST_SUBCLASS,
+    ),
+    (
+        &pyre_object::pyobject::DICT_TYPE,
+        TpFlags::PY_TPFLAGS_DICT_SUBCLASS,
+    ),
 ];
 
 /// Mark `tp` with the one fast-subclass flag its base chain earns it.
@@ -355,7 +342,7 @@ const fn immortal_type() -> CPyTypeObject {
         tp_getattro: std::ptr::null(),
         tp_setattro: std::ptr::null(),
         tp_as_buffer: std::ptr::null_mut(),
-        tp_flags: PY_TPFLAGS_DEFAULT,
+        tp_flags: TpFlags::PY_TPFLAGS_DEFAULT,
         tp_doc: std::ptr::null(),
         tp_traverse: std::ptr::null(),
         tp_clear: std::ptr::null(),
@@ -775,24 +762,24 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
     // this pointer valid.
     let pointer = name.as_ptr();
     let heaptype = match unsafe { pyre_object::w_type_is_cpython_heaptype(w_type) } {
-        true => PY_TPFLAGS_HEAPTYPE,
-        false => 0,
+        true => TpFlags::PY_TPFLAGS_HEAPTYPE,
+        false => TpFlags::empty(),
     };
     let static_builtin = match unsafe { pyre_object::w_type_is_cpython_static_builtin(w_type) } {
-        true => PY_TPFLAGS_STATIC_BUILTIN,
-        false => 0,
+        true => TpFlags::_PY_TPFLAGS_STATIC_BUILTIN,
+        false => TpFlags::empty(),
     };
     let immutabletype = match unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
-        true => PY_TPFLAGS_IMMUTABLETYPE,
-        false => 0,
+        true => TpFlags::PY_TPFLAGS_IMMUTABLETYPE,
+        false => TpFlags::empty(),
     };
     unsafe {
         (*mirror).tp_name = pointer;
         (*mirror).tp_basicsize = mirror_basicsize(w_type);
         (*mirror).tp_itemsize = mirror_itemsize(w_type);
-        (*mirror).tp_flags = PY_TPFLAGS_DEFAULT
-            | PY_TPFLAGS_READY
-            | PY_TPFLAGS_BASETYPE
+        (*mirror).tp_flags = TpFlags::PY_TPFLAGS_DEFAULT
+            | TpFlags::PY_TPFLAGS_READY
+            | TpFlags::PY_TPFLAGS_BASETYPE
             | heaptype
             | static_builtin
             | immutabletype;
@@ -2276,7 +2263,7 @@ pub(super) fn finish_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyObje
     // written in Python, which is `object`'s own `tp_new` and nothing else.
     if unsafe { (*mirror).tp_new.is_null() } && !base.is_null() {
         let derived = !std::ptr::eq(base, &raw mut PyBaseObject_Type)
-            || unsafe { (*mirror).tp_flags } & PY_TPFLAGS_HEAPTYPE != 0;
+            || unsafe { (*mirror).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) };
         if derived {
             unsafe { (*mirror).tp_new = (*base).tp_new };
         }
@@ -2408,8 +2395,12 @@ fn inherit_mirror_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         // filled by the base's `tp_new`.  `fill_interpreter_slots` runs after
         // this and installs the trampoline in `tp_call`, so the test for a
         // `tp_call` of the subclass's own has to happen here.
-        if (*tp).tp_call.is_null() && (*base).tp_flags & PY_TPFLAGS_HAVE_VECTORCALL != 0 {
-            (*tp).tp_flags |= PY_TPFLAGS_HAVE_VECTORCALL;
+        if (*tp).tp_call.is_null()
+            && (*base)
+                .tp_flags
+                .contains(TpFlags::PY_TPFLAGS_HAVE_VECTORCALL)
+        {
+            (*tp).tp_flags |= TpFlags::PY_TPFLAGS_HAVE_VECTORCALL;
         }
     }
 }
@@ -2418,7 +2409,7 @@ fn inherit_mirror_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
 /// the predicate `type_dealloc` and `_dealloc` both branch on
 /// (`typeobject.py:716`, `object.py:72`).
 pub(super) fn is_heap_type(tp: *mut CPyTypeObject) -> bool {
-    !tp.is_null() && unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE != 0
+    !tp.is_null() && unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) }
 }
 
 /// `true` when a mirror is a `PyModuleDef` rather than a linked object.
@@ -2460,7 +2451,8 @@ pub fn type_vectorcall(
     }
     super::call_cfunction(
         unsafe { (*tp).tp_vectorcall },
-        super::methodobject::METH_FASTCALL | super::methodobject::METH_KEYWORDS,
+        super::methodobject::MethFlags::METH_FASTCALL
+            | super::methodobject::MethFlags::METH_KEYWORDS,
         w_type,
         positional,
         keywords,
@@ -2817,7 +2809,7 @@ fn defining_class(
     carrier: PyObjectRef,
     method: *mut super::methodobject::CPyMethodDef,
 ) -> Option<PyObjectRef> {
-    if unsafe { (*method).ml_flags } & super::methodobject::METH_METHOD == 0 {
+    if !unsafe { (*method).ml_flags }.contains(super::methodobject::MethFlags::METH_METHOD) {
         return None;
     }
     carrier_objclass(carrier)
@@ -3046,42 +3038,76 @@ fn method_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 // ── `tp_members` ────────────────────────────────────────────────────────
 
-/// `structmember.h` type codes.
-pub const T_SHORT: c_int = 0;
-pub const T_INT: c_int = 1;
-pub const T_LONG: c_int = 2;
-pub const T_FLOAT: c_int = 3;
-pub const T_DOUBLE: c_int = 4;
-pub const T_STRING: c_int = 5;
-/// The string is the storage itself rather than a pointer to it.
-pub const T_STRING_INPLACE: c_int = 13;
-pub const T_OBJECT: c_int = 6;
-pub const T_CHAR: c_int = 7;
-pub const T_BYTE: c_int = 8;
-pub const T_UBYTE: c_int = 9;
-pub const T_USHORT: c_int = 10;
-pub const T_UINT: c_int = 11;
-pub const T_ULONG: c_int = 12;
-pub const T_BOOL: c_int = 14;
-pub const T_OBJECT_EX: c_int = 16;
-pub const T_LONGLONG: c_int = 17;
-pub const T_ULONGLONG: c_int = 18;
-pub const T_PYSSIZET: c_int = 19;
-pub const T_NONE: c_int = 20;
-/// `READONLY`.
-pub const MEMBER_READONLY: c_int = 1;
-/// `Py_AUDIT_READ` -- reading the member emits `object.__getattr__`.
-pub const MEMBER_AUDIT_READ: c_int = 2;
-/// `Py_RELATIVE_OFFSET` -- `offset` counts from the extra data a negative
-/// `basicsize` asked for, not from the block.  [`from_spec`] resolves it.
-pub const MEMBER_RELATIVE_OFFSET: c_int = 8;
+/// The `structmember.h` type codes.
+///
+/// A code is not a flag -- a member names exactly one -- and C writes the
+/// field, so these stay numbers rather than becoming an `enum` a stray value
+/// could not inhabit.  Declaring each once mints the table
+/// `every_member_type_code_is_the_number_the_header_gives_it` walks, so a code
+/// added here is compared without anyone remembering to list it.
+macro_rules! member_type_codes {
+    ($($(#[$doc:meta])* $name:ident = $value:expr,)*) => {
+        $($(#[$doc])* pub const $name: c_int = $value;)*
 
-/// A member still carrying [`MEMBER_RELATIVE_OFFSET`] has an `offset` its
+        #[cfg(test)]
+        const ALL_MEMBER_TYPE_CODES: &[(&str, c_int)] = &[$((stringify!($name), $value),)*];
+    };
+}
+
+member_type_codes! {
+    T_SHORT = 0,
+    T_INT = 1,
+    T_LONG = 2,
+    T_FLOAT = 3,
+    T_DOUBLE = 4,
+    T_STRING = 5,
+    /// The string is the storage itself rather than a pointer to it.
+    T_STRING_INPLACE = 13,
+    T_OBJECT = 6,
+    T_CHAR = 7,
+    T_BYTE = 8,
+    T_UBYTE = 9,
+    T_USHORT = 10,
+    T_UINT = 11,
+    T_ULONG = 12,
+    T_BOOL = 14,
+    T_OBJECT_EX = 16,
+    T_LONGLONG = 17,
+    T_ULONGLONG = 18,
+    T_PYSSIZET = 19,
+    T_NONE = 20,
+}
+bitflags::bitflags! {
+    /// The `object.h` flags a `PyMemberDef` row carries.
+    ///
+    /// Two places spell this table: the header an extension compiles against
+    /// and this declaration.  `every_member_flag_is_the_bit_the_header_gives_it`
+    /// compares the two, walking `Flags::FLAGS` rather than a list somebody
+    /// has to remember to extend.  The names are the header's, uppercased;
+    /// `structmember.h` spells the first one `READONLY` as well.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct MemberFlags: c_int {
+        const PY_READONLY = 1;
+        /// Reading the member emits `object.__getattr__`.
+        const PY_AUDIT_READ = 2;
+        /// `offset` counts from the extra data a negative `basicsize` asked
+        /// for, not from the block.  [`from_spec`] resolves it.
+        const PY_RELATIVE_OFFSET = 8;
+    }
+}
+
+/// C writes a member's `flags` through its own `int` declaration, so the
+/// mirror's field has to be that word and nothing wider or narrower.
+const _: () = assert!(size_of::<MemberFlags>() == size_of::<c_int>());
+const _: () = assert!(align_of::<MemberFlags>() == align_of::<c_int>());
+
+/// A member still carrying [`MemberFlags::PY_RELATIVE_OFFSET`] has an `offset` its
 /// reader cannot use: nothing but the type it was built for knows where the
 /// extra data starts.  A table declared statically has no extra data at all,
 /// so one that sets the flag is a declaration error.
 fn reject_relative_offset(member: *mut CPyMemberDef, entry: &str) -> Result<(), crate::PyError> {
-    if unsafe { (*member).flags } & MEMBER_RELATIVE_OFFSET == 0 {
+    if !unsafe { (*member).flags }.contains(MemberFlags::PY_RELATIVE_OFFSET) {
         return Ok(());
     }
     Err(crate::PyError::new(
@@ -3180,7 +3206,7 @@ fn write_member(
             .to_string_lossy()
             .into_owned()
     };
-    if unsafe { (*member).flags } & MEMBER_READONLY != 0 {
+    if unsafe { (*member).flags }.contains(MemberFlags::PY_READONLY) {
         return Err(crate::PyError::attribute_error("readonly attribute"));
     }
     let type_code = unsafe { (*member).type_code };
@@ -3298,7 +3324,7 @@ fn audit_member_read(
     instance: PyObjectRef,
     member: *mut CPyMemberDef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if unsafe { (*member).flags } & MEMBER_AUDIT_READ == 0
+    if !unsafe { (*member).flags }.contains(MemberFlags::PY_AUDIT_READ)
         || !crate::module::sys::vm::audit_hooks_armed()
     {
         return Ok(instance);
@@ -3472,7 +3498,8 @@ fn slot_new(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     }
     super::call_cfunction(
         slot,
-        super::methodobject::METH_VARARGS | super::methodobject::METH_KEYWORDS,
+        super::methodobject::MethFlags::METH_VARARGS
+            | super::methodobject::MethFlags::METH_KEYWORDS,
         cls,
         &positional,
         &keywords,
@@ -3528,11 +3555,13 @@ fn slot_call(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, c
     let (function, flags) = match vectorcall {
         Some(function) => (
             function as *const c_void,
-            super::methodobject::METH_FASTCALL | super::methodobject::METH_KEYWORDS,
+            super::methodobject::MethFlags::METH_FASTCALL
+                | super::methodobject::MethFlags::METH_KEYWORDS,
         ),
         None => (
             slot,
-            super::methodobject::METH_VARARGS | super::methodobject::METH_KEYWORDS,
+            super::methodobject::MethFlags::METH_VARARGS
+                | super::methodobject::MethFlags::METH_KEYWORDS,
         ),
     };
     super::call_cfunction(function, flags, w_self, &positional, &keywords)
@@ -4589,8 +4618,12 @@ fn inherit_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         if (*tp).tp_vectorcall_offset == 0 {
             (*tp).tp_vectorcall_offset = (*base).tp_vectorcall_offset;
         }
-        if (*tp).tp_call.is_null() && (*base).tp_flags & PY_TPFLAGS_HAVE_VECTORCALL != 0 {
-            (*tp).tp_flags |= PY_TPFLAGS_HAVE_VECTORCALL;
+        if (*tp).tp_call.is_null()
+            && (*base)
+                .tp_flags
+                .contains(TpFlags::PY_TPFLAGS_HAVE_VECTORCALL)
+        {
+            (*tp).tp_flags |= TpFlags::PY_TPFLAGS_HAVE_VECTORCALL;
         }
     }
     macro_rules! inherit {
@@ -4679,9 +4712,10 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         // each naming a different receiver.  A row carrying both is refused
         // before the type is built.
         let flags = unsafe { (*method).ml_flags };
-        let carrier_type = match flags & super::methodobject::METH_CLASS {
-            0 => method_descriptor_type(),
-            _ => classmethod_descriptor_type(),
+        let carrier_type = if flags.contains(super::methodobject::MethFlags::METH_CLASS) {
+            classmethod_descriptor_type()
+        } else {
+            method_descriptor_type()
         };
         let descriptor = new_carrier(
             carrier_type,
@@ -4695,26 +4729,25 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         // A static row is a function bound to the type, wrapped so that
         // reading it through the class or an instance yields the function
         // itself rather than binding a receiver a second time.
-        let descriptor = match flags & super::methodobject::METH_STATIC {
-            0 => pyre_object::gc_roots::shadow_stack_get(descriptor_slot),
-            _ => {
-                let owner = reload();
-                match super::methodobject::new_pycfunction(method, owner, owner) {
-                    Ok(function) => {
-                        let function_slot = pyre_object::gc_roots::shadow_stack_len();
-                        let _ = roots.pin_root(function);
-                        pyre_object::function::w_staticmethod_new(
-                            pyre_object::gc_roots::shadow_stack_get(function_slot),
-                        )
-                    }
-                    // The name is left unbound rather than bound to something
-                    // that would take its first argument as a receiver.
-                    Err(error) => {
-                        super::pyerrors::set_pending_error(error);
-                        continue;
-                    }
+        let descriptor = if flags.contains(super::methodobject::MethFlags::METH_STATIC) {
+            let owner = reload();
+            match super::methodobject::new_pycfunction(method, owner, owner) {
+                Ok(function) => {
+                    let function_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = roots.pin_root(function);
+                    pyre_object::function::w_staticmethod_new(
+                        pyre_object::gc_roots::shadow_stack_get(function_slot),
+                    )
+                }
+                // The name is left unbound rather than bound to something
+                // that would take its first argument as a receiver.
+                Err(error) => {
+                    super::pyerrors::set_pending_error(error);
+                    continue;
                 }
             }
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(descriptor_slot)
         };
         let descriptor_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(descriptor);
@@ -5169,20 +5202,20 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     // fills the rest: what the metaclass check asks is whether the extension
     // *declared* one, which the field stops answering a few lines from here.
     record_declared_tp_new(tp);
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_READY != 0 {
+    if unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_READY) } {
         return Ok(());
     }
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_READYING != 0 {
+    if unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_READYING) } {
         return Err(crate::PyError::runtime_error(
             "PyType_Ready(): circular type hierarchy",
         ));
     }
-    unsafe { (*tp).tp_flags |= PY_TPFLAGS_READYING };
+    unsafe { (*tp).tp_flags |= TpFlags::PY_TPFLAGS_READYING };
     // CPython 3.14 `PyType_Ready`: legacy non-heap extension statics are
     // immutable, but do not receive the private STATIC_BUILTIN bit reserved
     // for interpreter-core `_PyStaticType_InitBuiltin` owners.
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0 {
-        unsafe { (*tp).tp_flags |= PY_TPFLAGS_IMMUTABLETYPE };
+    if !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) } {
+        unsafe { (*tp).tp_flags |= TpFlags::PY_TPFLAGS_IMMUTABLETYPE };
     }
 
     let base = unsafe { (*tp).tp_base };
@@ -5206,12 +5239,16 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     // against, so the type refuses instantiation instead.  A heap type is the
     // runtime's own and does inherit, as does one derived from any other base.
     if !declares_tp_new(tp)
-        && unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0
+        && !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) }
         && base_is_object(base)
     {
-        unsafe { (*tp).tp_flags |= PY_TPFLAGS_DISALLOW_INSTANTIATION };
+        unsafe { (*tp).tp_flags |= TpFlags::PY_TPFLAGS_DISALLOW_INSTANTIATION };
     }
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_DISALLOW_INSTANTIATION != 0 {
+    if unsafe {
+        (*tp)
+            .tp_flags
+            .contains(TpFlags::PY_TPFLAGS_DISALLOW_INSTANTIATION)
+    } {
         // `inherit_slots` copies a base's `tp_new` for every slot alike, and
         // this is the one slot a type carrying the flag must not have.
         unsafe { (*tp).tp_new = std::ptr::null() };
@@ -5264,8 +5301,8 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
         let method = unsafe { (*tp).tp_methods.offset(index) };
         index += 1;
         let flags = unsafe { (*method).ml_flags };
-        if flags & super::methodobject::METH_CLASS == 0
-            || flags & super::methodobject::METH_STATIC == 0
+        if !flags.contains(super::methodobject::MethFlags::METH_CLASS)
+            || !flags.contains(super::methodobject::MethFlags::METH_STATIC)
         {
             continue;
         }
@@ -5307,9 +5344,9 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     unsafe {
         pyre_object::w_type_set_cpython_type_flags(
             w_type,
-            (*tp).tp_flags & PY_TPFLAGS_HEAPTYPE != 0,
+            (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE),
             false,
-            (*tp).tp_flags & PY_TPFLAGS_IMMUTABLETYPE != 0,
+            (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_IMMUTABLETYPE),
         );
     }
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -5327,7 +5364,7 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
         // behaviour the PyPy cpyext oracle exposes.
         pyre_object::typeobject::w_type_set_weakrefable(
             pyre_object::gc_roots::shadow_stack_get(type_slot),
-            (*tp).tp_weaklistoffset != 0 || (*tp).tp_flags & PY_TPFLAGS_HEAPTYPE != 0,
+            (*tp).tp_weaklistoffset != 0 || (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE),
         );
         // `type_call`'s own test, which is the slot rather than the flag: a
         // subtype of a type that carries the flag inherits the empty slot
@@ -5383,7 +5420,8 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
         let metatype = pyobject::type_mirror(pyre_object::gc_roots::shadow_stack_get(type_slot));
         (*tp).ob_base.ob_base.ob_type = metatype;
         pyobject::own_heap_type(metatype);
-        (*tp).tp_flags = ((*tp).tp_flags & !PY_TPFLAGS_READYING) | PY_TPFLAGS_READY;
+        (*tp).tp_flags =
+            ((*tp).tp_flags & !TpFlags::PY_TPFLAGS_READYING) | TpFlags::PY_TPFLAGS_READY;
     }
     set_fast_subclass_flags(tp, pyre_object::gc_roots::shadow_stack_get(type_slot));
     Ok(())
@@ -5533,7 +5571,7 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut CPyTypeObject) -> c_int {
         Ok(()) => 0,
         Err(error) => {
             if !tp.is_null() {
-                unsafe { (*tp).tp_flags &= !PY_TPFLAGS_READYING };
+                unsafe { (*tp).tp_flags &= !TpFlags::PY_TPFLAGS_READYING };
             }
             super::pyerrors::set_pending_error(error);
             -1
@@ -5846,7 +5884,7 @@ fn special_offset(member: *mut CPyMemberDef) -> Result<isize, crate::PyError> {
     };
     let complaint = if unsafe { (*member).type_code } != T_PYSSIZET {
         format!("type of {} must be Py_T_PYSSIZET", name())
-    } else if unsafe { (*member).flags } != MEMBER_READONLY {
+    } else if unsafe { (*member).flags } != MemberFlags::PY_READONLY {
         format!(
             "flags for {} must be Py_READONLY or (Py_READONLY | Py_RELATIVE_OFFSET)",
             name()
@@ -5886,13 +5924,13 @@ unsafe fn resolve_relative_members(
     while !unsafe { (*members.offset(index)).name }.is_null() {
         let mut member = unsafe { std::ptr::read(members.offset(index)) };
         index += 1;
-        if member.flags & MEMBER_RELATIVE_OFFSET != 0 {
+        if member.flags.contains(MemberFlags::PY_RELATIVE_OFFSET) {
             let complaint = if declared > 0 {
                 "With Py_RELATIVE_OFFSET, basicsize must be negative."
             } else if member.offset < 0 || member.offset >= -declared {
                 "Member offset out of range (0..-basicsize)"
             } else {
-                member.flags &= !MEMBER_RELATIVE_OFFSET;
+                member.flags &= !MemberFlags::PY_RELATIVE_OFFSET;
                 member.offset += type_data_offset;
                 ""
             };
@@ -5911,7 +5949,7 @@ unsafe fn resolve_relative_members(
         name: std::ptr::null(),
         type_code: 0,
         offset: 0,
-        flags: 0,
+        flags: MemberFlags::empty(),
         doc: std::ptr::null(),
     });
     unsafe { (*tp).tp_members = Box::leak(table.into_boxed_slice()).as_mut_ptr() };
@@ -5995,7 +6033,8 @@ fn from_spec(
     unsafe {
         (*tp).tp_name = (*spec).name;
         (*tp).tp_itemsize = (*spec).itemsize as isize;
-        (*tp).tp_flags = (*spec).flags as std::ffi::c_ulong | PY_TPFLAGS_HEAPTYPE;
+        (*tp).tp_flags = TpFlags::from_bits_retain((*spec).flags as std::ffi::c_ulong)
+            | TpFlags::PY_TPFLAGS_HEAPTYPE;
         (*tp).tp_base = single_base(pyobject::from_ref(bases))?;
     }
     let mut token: *mut c_void = std::ptr::null_mut();
@@ -6094,8 +6133,23 @@ pub struct CPySlot {
     pub sl_value: u64,
 }
 
-/// `PySlot.sl_flags`: an entry the reader may skip rather than refuse.
-pub(super) const SLOT_OPTIONAL: u16 = 0x01;
+bitflags::bitflags! {
+    /// The `object.h` flags a `PySlot` entry carries in `sl_flags`.
+    ///
+    /// `OPTIONAL` is the one the readers act on -- an entry they may skip
+    /// rather than refuse.  The names are the header's, prefix and all; the
+    /// test at the foot of this file compares the two, walking `Flags::FLAGS`.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) struct SlotFlags: u16 {
+        const PYSLOT_OPTIONAL = 0x01;
+        const PYSLOT_STATIC = 0x02;
+        const PYSLOT_INTPTR = 0x04;
+    }
+}
+
+const _: () = assert!(size_of::<SlotFlags>() == size_of::<u16>());
+const _: () = assert!(align_of::<SlotFlags>() == align_of::<u16>());
 
 /// The identifiers `PyType_FromSlots` reads for itself; every other one is
 /// left to the `Py_tp_slots` array, which is the `PyType_Spec` vocabulary.
@@ -6147,7 +6201,8 @@ pub unsafe extern "C" fn PyType_FromSlots(slots: *mut CPySlot) -> *mut CPyObject
             from_slots_id::TP_ITEMSIZE => spec.itemsize = value as isize as c_int,
             from_slots_id::TP_SLOTS => spec.slots = value as *mut CPyTypeSlot,
             unknown => {
-                if slot.sl_flags & SLOT_OPTIONAL == 0 {
+                if !SlotFlags::from_bits_retain(slot.sl_flags).contains(SlotFlags::PYSLOT_OPTIONAL)
+                {
                     super::pyerrors::set_pending_error(crate::PyError::new(
                         crate::PyErrorKind::SystemError,
                         format!("PyType_FromSlots(): unrecognised slot {unknown}"),
@@ -6516,7 +6571,7 @@ pub unsafe extern "C" fn PyType_GetFlags(tp: *mut CPyTypeObject) -> std::ffi::c_
     if tp.is_null() {
         return 0;
     }
-    unsafe { (*tp).tp_flags }
+    unsafe { (*tp).tp_flags }.bits()
 }
 
 // ── what a type reports about its module, its token and its data ────────
@@ -6552,7 +6607,7 @@ pub unsafe extern "C" fn PyType_GetModule(tp: *mut CPyTypeObject) -> *mut CPyObj
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0 {
+    if !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) } {
         super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
             "PyType_GetModule: Type '{}' is not a heap type",
             type_name_of(tp)
@@ -6626,7 +6681,7 @@ pub unsafe extern "C" fn PyType_GetBaseByToken(
         return -1;
     }
     // A static type has no heap-type superclass, so the walk cannot find one.
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0 {
+    if !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) } {
         return 0;
     }
     let wanted = token as usize;
@@ -6689,7 +6744,7 @@ pub unsafe extern "C" fn PyObject_GetItemData(object: *mut CPyObject) -> *mut c_
         return std::ptr::null_mut();
     }
     let tp = unsafe { (*object).ob_type };
-    if tp.is_null() || unsafe { (*tp).tp_flags } & PY_TPFLAGS_ITEMS_AT_END == 0 {
+    if tp.is_null() || !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_ITEMS_AT_END) } {
         super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
             "type '{}' does not have Py_TPFLAGS_ITEMS_AT_END",
             type_name_of(tp)
@@ -6757,7 +6812,7 @@ pub unsafe extern "C" fn PyType_Freeze(tp: *mut CPyTypeObject) -> c_int {
         // Freezing changes CPython's immutable axis but not its HEAPTYPE owner.
         pyre_object::w_type_set_cpython_immutabletype(w_type, true);
         if !tp.is_null() {
-            (*tp).tp_flags |= PY_TPFLAGS_IMMUTABLETYPE;
+            (*tp).tp_flags |= TpFlags::PY_TPFLAGS_IMMUTABLETYPE;
         }
         crate::baseobjspace::mutated(w_type, None);
     }
@@ -7099,5 +7154,184 @@ mod tests {
             "the header defines {checked} slot identifiers and slot_id has {}",
             super::slot_id::ALL.len()
         );
+    }
+
+    /// A member's `flags` word is one thing two places spell: an extension
+    /// compiled against `include/pyre3.14t/object.h` builds it, and this file
+    /// reads it.  Nothing tied the two together, so this walks the header and
+    /// rejects any flag whose bit the Rust side spells differently.
+    #[test]
+    fn every_member_flag_is_the_bit_the_header_gives_it() {
+        use bitflags::Flags as _;
+
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+
+        // `Py_READONLY`, `Py_AUDIT_READ`, `Py_RELATIVE_OFFSET` -- decimal, and
+        // the only `Py_` macros that are.  The type codes beside them are
+        // `Py_T_*`, which this leaves alone.
+        let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define Py_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            if name.starts_with("T_") || name.starts_with("TPFLAGS_") {
+                continue;
+            }
+            let Ok(value) = body.trim().parse::<std::ffi::c_int>() else {
+                continue;
+            };
+            header.push((name, value));
+        }
+
+        // A parser that read nothing would agree with every flag below, so the
+        // floor comes first.
+        assert!(
+            header.len() >= 3,
+            "object.h declares more plain Py_ constants than the {} this read",
+            header.len()
+        );
+
+        for flag in super::MemberFlags::FLAGS {
+            let name = flag
+                .name()
+                .strip_prefix("PY_")
+                .expect("every flag is declared under the header's own name");
+            let ours = flag.value().bits();
+            let (_, theirs) = header
+                .iter()
+                .find(|(known, _)| known.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("object.h declares no Py_{name}"));
+            assert_eq!(
+                ours, *theirs,
+                "Py_{name} is {theirs} in object.h and {ours} here"
+            );
+        }
+    }
+
+    /// A `PySlot`'s `sl_flags` is one thing two places spell: an extension
+    /// compiled against `include/pyre3.14t/object.h` builds it, and the two
+    /// slot-array readers test it.  This walks the header and rejects any flag
+    /// whose bit the Rust side spells differently.
+    #[test]
+    fn every_slot_flag_is_the_bit_the_header_gives_it() {
+        use bitflags::Flags as _;
+
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+
+        let mut header: Vec<(&str, u16)> = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define PySlot_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let body = body.trim();
+            let Some(digits) = body.strip_prefix("0x") else {
+                continue;
+            };
+            let Ok(value) = u16::from_str_radix(digits, 16) else {
+                continue;
+            };
+            header.push((name, value));
+        }
+
+        assert_eq!(
+            header.len(),
+            super::SlotFlags::FLAGS.len(),
+            "object.h declares {} PySlot_ flags and this file declares {}",
+            header.len(),
+            super::SlotFlags::FLAGS.len()
+        );
+
+        for flag in super::SlotFlags::FLAGS {
+            let name = flag
+                .name()
+                .strip_prefix("PYSLOT_")
+                .expect("every flag is declared under the header's own name");
+            let ours = flag.value().bits();
+            let (_, theirs) = header
+                .iter()
+                .find(|(known, _)| known.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("object.h declares no PySlot_{name}"));
+            assert_eq!(
+                ours, *theirs,
+                "PySlot_{name} is {theirs} in object.h and {ours} here"
+            );
+        }
+    }
+
+    /// A member's `type` is the other half of the same ABI: `object.h` numbers
+    /// the codes as `Py_T_*`, `structmember.h` gives each the bare spelling an
+    /// extension still writes, and this file switches on the number that
+    /// arrives.  This resolves the header pair and rejects any code the Rust
+    /// side numbers differently, or does not spell at all.
+    #[test]
+    fn every_member_type_code_is_the_number_the_header_gives_it() {
+        const OBJECT_H: &str = include_str!("../../../../include/pyre3.14t/object.h");
+        const STRUCTMEMBER_H: &str = include_str!("../../../../include/pyre3.14t/structmember.h");
+
+        // `Py_T_SHORT 0` and the two the interpreter keeps to itself,
+        // `_Py_T_OBJECT` and `_Py_T_NONE`.
+        let mut numbered: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        for line in OBJECT_H.lines() {
+            let rest = line
+                .strip_prefix("#define Py_T_")
+                .or_else(|| line.strip_prefix("#define _Py_T_"));
+            let Some(rest) = rest else { continue };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Ok(value) = body.trim().parse::<std::ffi::c_int>() else {
+                continue;
+            };
+            numbered.push((name, value));
+        }
+
+        // Each bare spelling names one of those, so the number an extension
+        // compiles reaches this file through two headers.
+        let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        for line in STRUCTMEMBER_H.lines() {
+            let Some(rest) = line.strip_prefix("#define T_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let body = body.trim();
+            let alias = body
+                .strip_prefix("Py_T_")
+                .or_else(|| body.strip_prefix("_Py_T_"))
+                .unwrap_or_else(|| panic!("T_{name} is defined as {body}, not a Py_T_ code"));
+            let (_, value) = numbered
+                .iter()
+                .find(|(known, _)| *known == alias)
+                .unwrap_or_else(|| panic!("T_{name} names Py_T_{alias}, which object.h lacks"));
+            header.push((name, *value));
+        }
+
+        assert_eq!(
+            header.len(),
+            super::ALL_MEMBER_TYPE_CODES.len(),
+            "the headers declare {} type codes and this file declares {}",
+            header.len(),
+            super::ALL_MEMBER_TYPE_CODES.len()
+        );
+
+        for (name, theirs) in &header {
+            let found = super::ALL_MEMBER_TYPE_CODES
+                .iter()
+                .find(|(known, _)| known.strip_prefix("T_") == Some(name));
+            let Some((_, ours)) = found else {
+                panic!("structmember.h defines T_{name} = {theirs}, and this file has no T_{name}");
+            };
+            assert_eq!(
+                ours, theirs,
+                "T_{name} is {theirs} in the headers and {ours} here"
+            );
+        }
     }
 }

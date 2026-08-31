@@ -395,28 +395,50 @@ pub unsafe extern "C" fn PyLong_AsVoidPtr(object: *mut CPyObject) -> *mut c_void
     bits as usize as *mut c_void
 }
 
-/// The endianness half of an `AsNativeBytes`/`FromNativeBytes` flag word.
-const AS_NATIVE_BYTES_LITTLE_ENDIAN: c_int = 1;
-const AS_NATIVE_BYTES_NATIVE_ENDIAN: c_int = 3;
-/// The buffer holds an unsigned value.
-const AS_NATIVE_BYTES_UNSIGNED_BUFFER: c_int = 4;
-/// A negative input is an error rather than a two's-complement copy.
-const AS_NATIVE_BYTES_REJECT_NEGATIVE: c_int = 8;
-/// A non-`int` may be asked for its `__index__`.
-const AS_NATIVE_BYTES_ALLOW_INDEX: c_int = 16;
+bitflags::bitflags! {
+    /// The `longobject.h` flags word an `AsNativeBytes`/`FromNativeBytes` call
+    /// carries.
+    ///
+    /// The low two bits are the byte order rather than two independent flags,
+    /// which is why `NATIVE_ENDIAN` is `LITTLE_ENDIAN` and the bit above it,
+    /// and `BIG_ENDIAN` is the absence of both.  The names are the header's,
+    /// prefix and all; the test at the foot of this file compares the two,
+    /// walking `Flags::FLAGS`.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct NativeBytesFlags: c_int {
+        /// Every bit set, which the header spells `-1`.
+        const PY_ASNATIVEBYTES_DEFAULTS = -1;
+        const PY_ASNATIVEBYTES_BIG_ENDIAN = 0;
+        const PY_ASNATIVEBYTES_LITTLE_ENDIAN = 1;
+        const PY_ASNATIVEBYTES_NATIVE_ENDIAN = 3;
+        /// The buffer holds an unsigned value.
+        const PY_ASNATIVEBYTES_UNSIGNED_BUFFER = 4;
+        /// A negative input is an error rather than a two's-complement copy.
+        const PY_ASNATIVEBYTES_REJECT_NEGATIVE = 8;
+        /// A non-`int` may be asked for its `__index__`.
+        const PY_ASNATIVEBYTES_ALLOW_INDEX = 16;
+    }
+}
 
-/// The byte order a flag word selects.  `-1` — every bit set — is the default,
-/// and it names the native order.
-fn byte_order(flags: c_int) -> &'static str {
+const _: () = assert!(size_of::<NativeBytesFlags>() == size_of::<c_int>());
+const _: () = assert!(align_of::<NativeBytesFlags>() == align_of::<c_int>());
+
+/// The byte order a flag word selects.  The defaults — every bit set — name
+/// the native order.
+fn byte_order(flags: NativeBytesFlags) -> &'static str {
     let native = if cfg!(target_endian = "little") {
         "little"
     } else {
         "big"
     };
-    match flags & AS_NATIVE_BYTES_NATIVE_ENDIAN {
-        AS_NATIVE_BYTES_NATIVE_ENDIAN => native,
-        AS_NATIVE_BYTES_LITTLE_ENDIAN => "little",
-        _ => "big",
+    let order = flags.intersection(NativeBytesFlags::PY_ASNATIVEBYTES_NATIVE_ENDIAN);
+    if order == NativeBytesFlags::PY_ASNATIVEBYTES_NATIVE_ENDIAN {
+        native
+    } else if order == NativeBytesFlags::PY_ASNATIVEBYTES_LITTLE_ENDIAN {
+        "little"
+    } else {
+        "big"
     }
 }
 
@@ -443,8 +465,10 @@ pub unsafe extern "C" fn PyLong_AsNativeBytes(
     let Some(w_object) = argument(object) else {
         return -1;
     };
-    if flags != -1
-        && flags & AS_NATIVE_BYTES_ALLOW_INDEX == 0
+    let flags = NativeBytesFlags::from_bits_retain(flags);
+    let defaults = flags == NativeBytesFlags::PY_ASNATIVEBYTES_DEFAULTS;
+    if !defaults
+        && !flags.contains(NativeBytesFlags::PY_ASNATIVEBYTES_ALLOW_INDEX)
         && !unsafe { pyre_object::is_int(w_object) }
         && !unsafe { pyre_object::is_long(w_object) }
     {
@@ -454,8 +478,9 @@ pub unsafe extern "C" fn PyLong_AsNativeBytes(
         )));
         return -1;
     }
-    let signed = flags == -1 || flags & AS_NATIVE_BYTES_UNSIGNED_BUFFER == 0;
-    let reject_negative = flags != -1 && flags & AS_NATIVE_BYTES_REJECT_NEGATIVE != 0;
+    let signed = defaults || !flags.contains(NativeBytesFlags::PY_ASNATIVEBYTES_UNSIGNED_BUFFER);
+    let reject_negative =
+        !defaults && flags.contains(NativeBytesFlags::PY_ASNATIVEBYTES_REJECT_NEGATIVE);
     let big_endian = byte_order(flags) == "big";
     let count = count as usize;
     let Some(copied) = as_bigint(object, |value| {
@@ -552,6 +577,7 @@ unsafe fn from_native_bytes(
         return std::ptr::null_mut();
     }
     let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, count) };
+    let flags = NativeBytesFlags::from_bits_retain(flags);
     match BigInt::frombytes(bytes, byte_order(flags), signed) {
         Ok(value) => pyobject::make_ref(from_bigint(value)),
         Err(_) => {
@@ -768,4 +794,56 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyLong_CheckExact as *const ());
     std::hint::black_box(PyNumber_Long as *const ());
     std::hint::black_box(PyBool_FromLong as *const ());
+}
+
+#[cfg(test)]
+mod tests {
+    /// An `AsNativeBytes` flags word is one thing two places spell: an
+    /// extension compiled against `include/pyre3.14t/longobject.h` builds it,
+    /// and this file reads it.  This walks the header and rejects any flag
+    /// whose bit the Rust side spells differently.
+    #[test]
+    fn every_native_bytes_flag_is_the_bit_the_header_gives_it() {
+        use bitflags::Flags as _;
+
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/longobject.h");
+
+        let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define Py_ASNATIVEBYTES_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Ok(value) = body.trim().parse::<std::ffi::c_int>() else {
+                continue;
+            };
+            header.push((name, value));
+        }
+
+        for flag in super::NativeBytesFlags::FLAGS {
+            let name = flag
+                .name()
+                .strip_prefix("PY_ASNATIVEBYTES_")
+                .expect("every flag is declared under the header's own name");
+            let ours = flag.value().bits();
+            let (_, theirs) = header
+                .iter()
+                .find(|(known, _)| known.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("longobject.h declares no Py_ASNATIVEBYTES_{name}"));
+            assert_eq!(
+                ours, *theirs,
+                "Py_ASNATIVEBYTES_{name} is {theirs} in longobject.h and {ours} here"
+            );
+        }
+
+        assert_eq!(
+            header.len(),
+            super::NativeBytesFlags::FLAGS.len(),
+            "longobject.h declares {} flags and this file declares {}",
+            header.len(),
+            super::NativeBytesFlags::FLAGS.len()
+        );
+    }
 }

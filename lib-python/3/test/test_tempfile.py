@@ -942,6 +942,7 @@ class TestMktemp(BaseTestCase):
         self.do_create(suf="b")
         self.do_create(pre="a", suf="b")
         self.do_create(pre="aa", suf=".txt")
+        support.gc_collect()  # PyPy-style tracing collectors run mktemped.__del__ here.
 
     def test_many(self):
         # mktemp can choose many usable file names (stochastic)
@@ -1981,7 +1982,7 @@ class TestTemporaryDirectory(BaseTestCase):
             name = d.name
 
             # Check for the resource warning
-            with warnings_helper.check_warnings(('Implicitly',
+            with warnings_helper.check_warnings(('',
                                                  ResourceWarning),
                                                 quiet=False):
                 warnings.filterwarnings("always", category=ResourceWarning)

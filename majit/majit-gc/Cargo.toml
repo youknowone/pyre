@@ -39,10 +39,11 @@ bh_probe = []
 gc_box = []
 
 [dependencies]
-parking_lot = { workspace = true }
+bitflags = { workspace = true }
 indexmap = { workspace = true }
 libc = { workspace = true }
 majit-ir = { workspace = true }
+parking_lot = { workspace = true }
 
 # `llarena.arena_protect` is posix `mprotect` and nt `VirtualProtect`;
 # `llarena.has_protect` is false everywhere else, which is why this is not a

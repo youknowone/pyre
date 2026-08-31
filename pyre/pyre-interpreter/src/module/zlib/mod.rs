@@ -967,8 +967,9 @@ mod tests {
     #[test]
     fn stream_type_owner_flags_and_module_match_cpython_314() {
         crate::typedef::init_typeobjects();
-        const IMMUTABLETYPE: i64 = 1 << 8;
-        const HEAPTYPE: i64 = 1 << 9;
+        const IMMUTABLETYPE: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_IMMUTABLETYPE.as_int();
+        const HEAPTYPE: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_HEAPTYPE.as_int();
         const MASK: i64 = IMMUTABLETYPE | HEAPTYPE;
         for (name, ty, expected) in [
             ("Compress", compress_type(), HEAPTYPE),

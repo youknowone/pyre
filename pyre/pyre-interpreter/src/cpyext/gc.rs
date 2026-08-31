@@ -19,7 +19,7 @@
 //! fields `methodobject.py cfunction_attach` owns, and type-mirror fields.
 
 use super::pyobject::CPyObject;
-use super::typeobject::{CPyTypeObject, PY_TPFLAGS_HAVE_GC};
+use super::typeobject::{CPyTypeObject, TpFlags};
 use std::ffi::{c_int, c_void};
 
 /// The blocks the collector may ask about.
@@ -110,7 +110,7 @@ pub(super) fn run_claimed_finalizer(raw: *mut CPyObject) {
 
 /// `true` when `tp` declares the cyclic-collection protocol.
 pub(super) fn has_gc(tp: *mut CPyTypeObject) -> bool {
-    !tp.is_null() && unsafe { (*tp).tp_flags } & PY_TPFLAGS_HAVE_GC != 0
+    !tp.is_null() && unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HAVE_GC) }
 }
 
 /// Enter a block in the tracked set, if its type asked to be collected.

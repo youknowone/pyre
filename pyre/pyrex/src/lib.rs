@@ -1689,7 +1689,7 @@ fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
 ///   with its queues empty a sweep can free memory but cannot run a line of
 ///   Python. Re-asked per name because a `__del__` this loop runs can register
 ///   one (`test_start_new_thread_at_finalization`'s starts a thread).
-/// * Is *this* object one it owes? `flags::FINALIZER_REGISTERED` is set by
+/// * Is *this* object one it owes? `GcFlags::FINALIZER_REGISTERED` is set by
 ///   `allocate_instance` for every instance of a `hasuserdel` class and by
 ///   `_io`, coroutine and weakref-lifeline construction for objects whose type
 ///   carries no such flag, so it is the whole of PyPy's `hasuserdel` test and

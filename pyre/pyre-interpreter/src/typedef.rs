@@ -15077,16 +15077,16 @@ fn init_builtin_code_type(ns: PyObjectRef) {
     let flags_getter = make_builtin_function_with_arity(
         "co_flags",
         |args| {
-            let mut flags = 0i64;
+            let mut flags = crate::CodeFlags::empty();
             if let Some(s) = code_sig(args) {
                 if s.has_vararg() {
-                    flags |= 0x04; // CO_VARARGS
+                    flags |= crate::CodeFlags::VARARGS;
                 }
                 if s.has_kwarg() {
-                    flags |= 0x08; // CO_VARKEYWORDS
+                    flags |= crate::CodeFlags::VARKEYWORDS;
                 }
             }
-            Ok(pyre_object::w_int_new(flags))
+            Ok(pyre_object::w_int_new(flags.bits() as i64))
         },
         2,
     );
@@ -31824,7 +31824,7 @@ mod tests {
     #[test]
     fn type_flags_publish_cpython_314_have_gc_from_the_canonical_field() {
         crate::typedef::init_typeobjects();
-        const HAVE_GC: i64 = 1 << 14;
+        const HAVE_GC: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_HAVE_GC.as_int();
         let cases = [
             ("object", crate::typedef::w_object(), false),
             ("type", crate::typedef::w_type(), true),
@@ -31885,7 +31885,8 @@ mod tests {
     #[test]
     fn type_flags_publish_cpython_314_disallow_instantiation() {
         crate::typedef::init_typeobjects();
-        const DISALLOW_INSTANTIATION: i64 = 1 << 7;
+        const DISALLOW_INSTANTIATION: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_DISALLOW_INSTANTIATION.as_int();
         let cases = [
             ("object", crate::typedef::w_object(), false),
             ("type", crate::typedef::w_type(), false),
@@ -32011,7 +32012,7 @@ mod tests {
     #[test]
     fn type_flags_publish_cpython_314_basetype_from_the_canonical_field() {
         crate::typedef::init_typeobjects();
-        const BASETYPE: i64 = 1 << 10;
+        const BASETYPE: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_BASETYPE.as_int();
         let cases = [
             ("object", crate::typedef::w_object(), true),
             ("type", crate::typedef::w_type(), true),
@@ -32166,14 +32167,22 @@ mod tests {
     fn type_flags_publish_cpython_314_fast_subclass_family_from_the_mro() {
         crate::typedef::init_typeobjects();
         let _builtins = crate::builtins::new_builtin_module_dict();
-        const LONG_SUBCLASS: i64 = 1 << 24;
-        const LIST_SUBCLASS: i64 = 1 << 25;
-        const TUPLE_SUBCLASS: i64 = 1 << 26;
-        const BYTES_SUBCLASS: i64 = 1 << 27;
-        const UNICODE_SUBCLASS: i64 = 1 << 28;
-        const DICT_SUBCLASS: i64 = 1 << 29;
-        const BASE_EXC_SUBCLASS: i64 = 1 << 30;
-        const TYPE_SUBCLASS: i64 = 1 << 31;
+        const LONG_SUBCLASS: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_LONG_SUBCLASS.as_int();
+        const LIST_SUBCLASS: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_LIST_SUBCLASS.as_int();
+        const TUPLE_SUBCLASS: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_TUPLE_SUBCLASS.as_int();
+        const BYTES_SUBCLASS: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_BYTES_SUBCLASS.as_int();
+        const UNICODE_SUBCLASS: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_UNICODE_SUBCLASS.as_int();
+        const DICT_SUBCLASS: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_DICT_SUBCLASS.as_int();
+        const BASE_EXC_SUBCLASS: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_BASE_EXC_SUBCLASS.as_int();
+        const TYPE_SUBCLASS: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_TYPE_SUBCLASS.as_int();
         const FAMILY_MASK: i64 = LONG_SUBCLASS
             | LIST_SUBCLASS
             | TUPLE_SUBCLASS
@@ -32256,10 +32265,10 @@ mod tests {
     #[test]
     fn type_flags_publish_cpython_314_ready_match_self_and_collection_bits() {
         crate::typedef::init_typeobjects();
-        const SEQUENCE: i64 = 1 << 5;
-        const MAPPING: i64 = 1 << 6;
-        const READY: i64 = 1 << 12;
-        const MATCH_SELF: i64 = 1 << 22;
+        const SEQUENCE: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_SEQUENCE.as_int();
+        const MAPPING: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_MAPPING.as_int();
+        const READY: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_READY.as_int();
+        const MATCH_SELF: i64 = pyre_object::typeobject::TpFlags::_PY_TPFLAGS_MATCH_SELF.as_int();
         const MASK: i64 = SEQUENCE | MAPPING | READY | MATCH_SELF;
         let cases = [
             ("object", crate::typedef::w_object(), READY),
@@ -32341,9 +32350,11 @@ mod tests {
     #[test]
     fn type_flags_keep_pypy_storage_and_cpython_owner_axes_orthogonal() {
         crate::typedef::init_typeobjects();
-        const STATIC_BUILTIN: i64 = 1 << 1;
-        const IMMUTABLETYPE: i64 = 1 << 8;
-        const HEAPTYPE: i64 = 1 << 9;
+        const STATIC_BUILTIN: i64 =
+            pyre_object::typeobject::TpFlags::_PY_TPFLAGS_STATIC_BUILTIN.as_int();
+        const IMMUTABLETYPE: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_IMMUTABLETYPE.as_int();
+        const HEAPTYPE: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_HEAPTYPE.as_int();
         const OWNER_MASK: i64 = STATIC_BUILTIN | IMMUTABLETYPE | HEAPTYPE;
 
         let cases = [

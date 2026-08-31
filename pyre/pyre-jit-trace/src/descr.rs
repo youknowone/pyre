@@ -5705,6 +5705,13 @@ pub fn pyframe_f_backref_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
 }
 
+/// `pyframe.py PyFrame.get_builtin` — the per-frame builtin module selected
+/// when the frame is created.  IMPORT_NAME traces this ordinary field read
+/// before looking up `__import__` in the module dict.
+pub fn pyframe_w_builtin_descr() -> DescrRef {
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 9)
+}
+
 /// `PyFrame.flags` — the byte carrying `FLAG_ESCAPED`.  Read-or-written by the
 /// traced `tb_frame` fold to reproduce the getter's `mark_as_escaped()`.
 /// Located by offset, so appending another field cannot repoint it.

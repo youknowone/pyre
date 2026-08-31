@@ -33,18 +33,45 @@ pub struct CPyBuffer {
     pub internal: *mut c_void,
 }
 
-const PY_BUF_WRITABLE: c_int = 0x0001;
-const PY_BUF_FORMAT: c_int = 0x0004;
-const PY_BUF_ND: c_int = 0x0008;
-const PY_BUF_STRIDES: c_int = 0x0010 | PY_BUF_ND;
-const PY_BUF_C_CONTIGUOUS: c_int = 0x0020 | PY_BUF_STRIDES;
-const PY_BUF_F_CONTIGUOUS: c_int = 0x0040 | PY_BUF_STRIDES;
-const PY_BUF_ANY_CONTIGUOUS: c_int = 0x0080 | PY_BUF_STRIDES;
-const PY_BUF_INDIRECT: c_int = 0x0100 | PY_BUF_STRIDES;
+bitflags::bitflags! {
+    /// The `object.h` request flags a caller hands `PyObject_GetBuffer`.
+    ///
+    /// Two places spell this table: the header an extension compiles against
+    /// and this declaration.  `every_buffer_flag_is_the_bit_the_header_gives_it`
+    /// compares the two, walking `Flags::FLAGS` rather than a list somebody
+    /// has to remember to extend.
+    ///
+    /// The names are the header's, uppercased.  Four of them ask for a whole
+    /// shape rather than a single property and carry `PYBUF_ND` or
+    /// `PYBUF_STRIDES` inside them, which is why the tests below read
+    /// `contains` rather than a single bit.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct BufFlags: c_int {
+        const PYBUF_SIMPLE = 0;
+        const PYBUF_WRITABLE = 0x0001;
+        const PYBUF_FORMAT = 0x0004;
+        const PYBUF_ND = 0x0008;
+        const PYBUF_STRIDES = 0x0010 | Self::PYBUF_ND.bits();
+        const PYBUF_C_CONTIGUOUS = 0x0020 | Self::PYBUF_STRIDES.bits();
+        const PYBUF_F_CONTIGUOUS = 0x0040 | Self::PYBUF_STRIDES.bits();
+        const PYBUF_ANY_CONTIGUOUS = 0x0080 | Self::PYBUF_STRIDES.bits();
+        const PYBUF_INDIRECT = 0x0100 | Self::PYBUF_STRIDES.bits();
+    }
+}
+
+/// C hands `PyObject_GetBuffer` its own `int`, so the word this file reads has
+/// to be that word and nothing wider or narrower.
+const _: () = assert!(size_of::<BufFlags>() == size_of::<c_int>());
+const _: () = assert!(align_of::<BufFlags>() == align_of::<c_int>());
+
 /// `PyBUF_MAX_NDIM` — the dimension count a `Py_buffer` may declare.
-const PY_BUF_MAX_NDIM: i64 = 64;
-const PY_BUF_READ: c_int = 0x100;
-const PY_BUF_WRITE: c_int = 0x200;
+const PYBUF_MAX_NDIM: i64 = 64;
+/// `PyBUF_READ` and `PyBUF_WRITE` name which way a `PyMemoryView_FromMemory`
+/// buffer runs.  They are their own argument, not bits in the request word,
+/// which is why they share `PyBUF_INDIRECT`'s value without colliding.
+const PYBUF_READ: c_int = 0x100;
+const PYBUF_WRITE: c_int = 0x200;
 
 /// Unsigned bytes — the format `PyBuffer_FillInfo` reports and the fallback for
 /// an exporter that leaves `format` NULL.
@@ -252,13 +279,13 @@ pub fn buffer_view(
     if slot.is_null() {
         return None;
     }
-    Some(acquire(w_obj, slot, flags))
+    Some(acquire(w_obj, slot, BufFlags::from_bits_retain(flags)))
 }
 
 fn acquire(
     w_obj: PyObjectRef,
     slot: *const c_void,
-    flags: c_int,
+    flags: BufFlags,
 ) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::buffer::Buffer;
     use pyre_object::bufferview::BufferView;
@@ -271,7 +298,7 @@ fn acquire(
     let status = unsafe {
         let call: unsafe extern "C" fn(*mut CPyObject, *mut CPyBuffer, c_int) -> c_int =
             std::mem::transmute(slot);
-        call(receiver, view, flags)
+        call(receiver, view, flags.bits())
     };
     unsafe { pyobject::decref(receiver) };
     if status < 0 {
@@ -318,7 +345,7 @@ fn acquire(
         Err(crate::PyError::new(kind, message.to_string()))
     };
     let suboffsets = dims(unsafe { (*view).suboffsets }, ndim);
-    if ndim > PY_BUF_MAX_NDIM {
+    if ndim > PYBUF_MAX_NDIM {
         return refuse(
             crate::PyErrorKind::ValueError,
             "memoryview: number of dimensions must not exceed 64",
@@ -561,34 +588,34 @@ static GEOMETRIES: super::ForkMutex<BufferSet> =
 /// `contiguous` is whether the export is contiguous in C and in Fortran
 /// order, and `indirect` whether any of its dimensions carries a suboffset.
 fn contiguity_refusal(
-    flags: c_int,
+    flags: BufFlags,
     contiguous: (bool, bool),
     indirect: bool,
 ) -> Option<&'static str> {
-    let requires = |mask| flags & mask == mask;
+    let requires = |mask: BufFlags| flags.contains(mask);
     let (c_order, fortran) = contiguous;
-    if requires(PY_BUF_C_CONTIGUOUS) && !c_order {
+    if requires(BufFlags::PYBUF_C_CONTIGUOUS) && !c_order {
         return Some("memoryview: underlying buffer is not C-contiguous");
     }
-    if requires(PY_BUF_F_CONTIGUOUS) && !fortran {
+    if requires(BufFlags::PYBUF_F_CONTIGUOUS) && !fortran {
         return Some("memoryview: underlying buffer is not Fortran contiguous");
     }
-    if requires(PY_BUF_ANY_CONTIGUOUS) && !(c_order || fortran) {
+    if requires(BufFlags::PYBUF_ANY_CONTIGUOUS) && !(c_order || fortran) {
         return Some("memoryview: underlying buffer is not contiguous");
     }
     // A request that does not ask to follow pointers cannot read a view whose
     // elements are behind them.
-    if !requires(PY_BUF_INDIRECT) && indirect {
+    if !requires(BufFlags::PYBUF_INDIRECT) && indirect {
         return Some("memoryview: underlying buffer requires suboffsets");
     }
     // A request with no strides in it reads the address as one contiguous
     // run, which a strided export is not.
-    if !requires(PY_BUF_STRIDES) && !c_order {
+    if !requires(BufFlags::PYBUF_STRIDES) && !c_order {
         return Some("memoryview: underlying buffer is not C-contiguous");
     }
     // A request with no shape in it reads the bytes as unsigned chars, which
     // leaves nothing for a format to describe.
-    if !requires(PY_BUF_ND) && requires(PY_BUF_FORMAT) {
+    if !requires(BufFlags::PYBUF_ND) && requires(BufFlags::PYBUF_FORMAT) {
         return Some("memoryview: cannot cast to unsigned bytes if the format flag is present");
     }
     None
@@ -605,6 +632,7 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
     view: *mut CPyBuffer,
     flags: c_int,
 ) -> c_int {
+    let request = BufFlags::from_bits_retain(flags);
     // A request with no structure to fill asks for nothing.
     if view.is_null() {
         return 0;
@@ -626,7 +654,7 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
     let indirect = unsafe {
         !pyre_object::memoryview::w_memoryview_native_suboffsets(reload(view_slot)).is_empty()
     };
-    if let Some(message) = contiguity_refusal(flags, contiguous, indirect) {
+    if let Some(message) = contiguity_refusal(request, contiguous, indirect) {
         release_acquired(reload(view_slot));
         super::pyerrors::set_pending_error(crate::PyError::new(
             crate::PyErrorKind::BufferError,
@@ -671,24 +699,24 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
         (*view).readonly = carrier.readonly() as c_int;
         // `memory_getbuf`: a request with no shape in it reads the whole
         // export as one run of unsigned chars, whatever its own rank.
-        (*view).ndim = match flags & PY_BUF_ND == PY_BUF_ND {
+        (*view).ndim = match request.contains(BufFlags::PYBUF_ND) {
             true => carrier.ndim() as c_int,
             false => 1,
         };
-        (*view).format = match flags & PY_BUF_FORMAT == PY_BUF_FORMAT {
+        (*view).format = match request.contains(BufFlags::PYBUF_FORMAT) {
             true => export.format.as_mut_ptr() as *mut c_char,
             false => std::ptr::null_mut(),
         };
-        (*view).shape = match axes && flags & PY_BUF_ND == PY_BUF_ND {
+        (*view).shape = match axes && request.contains(BufFlags::PYBUF_ND) {
             true => export.shape.as_mut_ptr(),
             false => std::ptr::null_mut(),
         };
-        (*view).strides = match axes && flags & PY_BUF_STRIDES == PY_BUF_STRIDES {
+        (*view).strides = match axes && request.contains(BufFlags::PYBUF_STRIDES) {
             true => export.strides.as_mut_ptr(),
             false => std::ptr::null_mut(),
         };
         (*view).suboffsets =
-            match !export.suboffsets.is_empty() && flags & PY_BUF_INDIRECT == PY_BUF_INDIRECT {
+            match !export.suboffsets.is_empty() && request.contains(BufFlags::PYBUF_INDIRECT) {
                 true => export.suboffsets.as_mut_ptr(),
                 false => std::ptr::null_mut(),
             };
@@ -777,7 +805,7 @@ pub unsafe extern "C" fn PyObject_GetBuffer(
             call(object, view, flags)
         };
     }
-    if flags & PY_BUF_WRITABLE != 0 {
+    if BufFlags::from_bits_retain(flags).contains(BufFlags::PYBUF_WRITABLE) {
         super::pyerrors::set_pending_error(crate::PyError::new(
             crate::PyErrorKind::BufferError,
             "an interpreter object exports a read-only snapshot to C",
@@ -809,7 +837,7 @@ pub unsafe extern "C" fn PyObject_GetBuffer(
             block as *mut c_void,
             length as isize,
             1,
-            flags,
+            BufFlags::from_bits_retain(flags),
         )
     }
 }
@@ -824,9 +852,9 @@ unsafe fn fill_info(
     buf: *mut c_void,
     length: isize,
     readonly: c_int,
-    flags: c_int,
+    flags: BufFlags,
 ) -> c_int {
-    if flags & PY_BUF_WRITABLE != 0 && readonly != 0 {
+    if flags.contains(BufFlags::PYBUF_WRITABLE) && readonly != 0 {
         super::pyerrors::set_pending_error(crate::PyError::value_error("Object is not writable"));
         return -1;
     }
@@ -837,19 +865,19 @@ unsafe fn fill_info(
         (*view).itemsize = 1;
         (*view).readonly = readonly;
         (*view).ndim = 1;
-        (*view).format = if flags & PY_BUF_FORMAT == PY_BUF_FORMAT {
+        (*view).format = if flags.contains(BufFlags::PYBUF_FORMAT) {
             DEFAULT_FORMAT.as_ptr() as *mut c_char
         } else {
             std::ptr::null_mut()
         };
         // The one-dimensional geometry is the structure's own `len` and
         // `itemsize`, so no separate storage has to outlive the call.
-        (*view).shape = if flags & PY_BUF_ND == PY_BUF_ND {
+        (*view).shape = if flags.contains(BufFlags::PYBUF_ND) {
             &raw mut (*view).len
         } else {
             std::ptr::null_mut()
         };
-        (*view).strides = if flags & PY_BUF_STRIDES == PY_BUF_STRIDES {
+        (*view).strides = if flags.contains(BufFlags::PYBUF_STRIDES) {
             &raw mut (*view).itemsize
         } else {
             std::ptr::null_mut()
@@ -873,7 +901,16 @@ pub unsafe extern "C" fn PyBuffer_FillInfo(
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return -1;
     }
-    unsafe { fill_info(view, object, buf, length, readonly, flags) }
+    unsafe {
+        fill_info(
+            view,
+            object,
+            buf,
+            length,
+            readonly,
+            BufFlags::from_bits_retain(flags),
+        )
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1146,11 +1183,17 @@ pub unsafe extern "C" fn PyObject_CopyData(
     super::object::realize_all([destination, source]);
     let mut target = unsafe { std::mem::zeroed::<CPyBuffer>() };
     let mut origin = unsafe { std::mem::zeroed::<CPyBuffer>() };
-    if unsafe { PyObject_GetBuffer(destination, &raw mut target, PY_BUF_WRITABLE | PY_BUF_ND) } < 0
+    if unsafe {
+        PyObject_GetBuffer(
+            destination,
+            &raw mut target,
+            (BufFlags::PYBUF_WRITABLE | BufFlags::PYBUF_ND).bits(),
+        )
+    } < 0
     {
         return -1;
     }
-    if unsafe { PyObject_GetBuffer(source, &raw mut origin, PY_BUF_ND) } < 0 {
+    if unsafe { PyObject_GetBuffer(source, &raw mut origin, BufFlags::PYBUF_ND.bits()) } < 0 {
         unsafe { PyBuffer_Release(&raw mut target) };
         return -1;
     }
@@ -1260,7 +1303,7 @@ pub unsafe extern "C" fn PyObject_AsWriteBuffer(
     size: *mut isize,
 ) -> c_int {
     let mut view = unsafe { std::mem::zeroed::<CPyBuffer>() };
-    if unsafe { PyObject_GetBuffer(object, &raw mut view, PY_BUF_WRITABLE) } < 0 {
+    if unsafe { PyObject_GetBuffer(object, &raw mut view, BufFlags::PYBUF_WRITABLE.bits()) } < 0 {
         return -1;
     }
     unsafe {
@@ -1314,7 +1357,7 @@ pub unsafe extern "C" fn PyMemoryView_FromMemory(
         size as i64,
         1,
         "B",
-        flags != PY_BUF_WRITE,
+        flags != PYBUF_WRITE,
     )))
 }
 
@@ -1338,7 +1381,7 @@ pub unsafe extern "C" fn PyMemoryView_FromBuffer(view: *const CPyBuffer) -> *mut
     }
     let (shape, strides, suboffsets, itemsize, length) = unsafe { geometry(view) };
     let ndim = unsafe { (*view).ndim } as i64;
-    if ndim > PY_BUF_MAX_NDIM {
+    if ndim > PYBUF_MAX_NDIM {
         super::pyerrors::set_pending_error(crate::PyError::value_error(
             "memoryview: number of dimensions must not exceed 64",
         ));
@@ -1379,7 +1422,7 @@ pub unsafe extern "C" fn PyMemoryView_GetContiguous(
     buffertype: c_int,
     order: c_char,
 ) -> *mut CPyObject {
-    if buffertype != PY_BUF_READ && buffertype != PY_BUF_WRITE {
+    if buffertype != PYBUF_READ && buffertype != PYBUF_WRITE {
         super::pyerrors::set_pending_error(crate::PyError::value_error(
             "buffertype must be PyBUF_READ or PyBUF_WRITE",
         ));
@@ -1405,7 +1448,7 @@ pub unsafe extern "C" fn PyMemoryView_GetContiguous(
         super::pyerrors::set_pending_error(crate::PyError::new(kind, message.to_string()));
         std::ptr::null_mut()
     };
-    if buffertype == PY_BUF_WRITE && view.readonly() {
+    if buffertype == PYBUF_WRITE && view.readonly() {
         return refuse(
             crate::PyErrorKind::BufferError,
             "underlying buffer is not writable",
@@ -1421,7 +1464,7 @@ pub unsafe extern "C" fn PyMemoryView_GetContiguous(
     if laid_out {
         return pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(slot));
     }
-    if buffertype == PY_BUF_WRITE {
+    if buffertype == PYBUF_WRITE {
         return refuse(
             crate::PyErrorKind::BufferError,
             "writable contiguous buffer requested for a non-contiguous object.",
@@ -1550,4 +1593,95 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyMemoryView_FromMemory as *const ());
     std::hint::black_box(PyMemoryView_FromBuffer as *const ());
     std::hint::black_box(PyMemoryView_GetContiguous as *const ());
+}
+
+#[cfg(test)]
+mod tests {
+    /// A request word is one thing two places spell: an extension compiled
+    /// against `include/pyre3.14t/object.h` builds it, and this file reads it.
+    /// Nothing tied the two together -- upstream has no such pair, because
+    /// `api.py` reads each value out of the real header with
+    /// `rffi_platform.ConstantInteger` -- so this walks the header and rejects
+    /// any flag whose bits the Rust side spells differently.
+    ///
+    /// Half the header's `PyBUF_` macros name other macros rather than a
+    /// number, so the walk resolves them: it keeps what it has read and
+    /// evaluates an `A | B` body against that.
+    #[test]
+    fn every_buffer_flag_is_the_bit_the_header_gives_it() {
+        use bitflags::Flags as _;
+
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+
+        let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        let lookup = |known: &Vec<(&str, std::ffi::c_int)>, name: &str| {
+            known
+                .iter()
+                .find(|(spelt, _)| *spelt == name)
+                .map(|(_, value)| *value)
+        };
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define PyBUF_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let body = body.trim().trim_start_matches('(').trim_end_matches(')');
+            let mut value = Some(0);
+            for term in body.split('|') {
+                let term = term.trim();
+                let read = if let Some(digits) = term.strip_prefix("0x") {
+                    std::ffi::c_int::from_str_radix(digits, 16).ok()
+                } else if let Some(named) = term.strip_prefix("PyBUF_") {
+                    lookup(&header, named)
+                } else {
+                    term.parse::<std::ffi::c_int>().ok()
+                };
+                value = value.zip(read).map(|(a, b)| a | b);
+            }
+            if let Some(value) = value {
+                header.push((name, value));
+            }
+        }
+
+        // A parser that read nothing would agree with every flag below, so the
+        // floor comes first.  The header declares 21 `PyBUF_` macros, all of
+        // which resolve.
+        assert_eq!(
+            header.len(),
+            21,
+            "object.h declares {} PyBUF_ macros this could resolve, not 21",
+            header.len()
+        );
+
+        for flag in super::BufFlags::FLAGS {
+            let name = flag
+                .name()
+                .strip_prefix("PYBUF_")
+                .expect("every flag is declared under the header's own name");
+            let ours = flag.value().bits();
+            let theirs = lookup(&header, name)
+                .unwrap_or_else(|| panic!("object.h declares no PyBUF_{name}"));
+            assert_eq!(
+                ours, theirs,
+                "PyBUF_{name} is {theirs:#x} in object.h and {ours:#x} here"
+            );
+        }
+
+        // The three that are not request bits: a dimension bound and the two
+        // directions `PyMemoryView_FromMemory` takes.
+        for (name, ours) in [
+            ("MAX_NDIM", super::PYBUF_MAX_NDIM as std::ffi::c_int),
+            ("READ", super::PYBUF_READ),
+            ("WRITE", super::PYBUF_WRITE),
+        ] {
+            let theirs = lookup(&header, name)
+                .unwrap_or_else(|| panic!("object.h declares no PyBUF_{name}"));
+            assert_eq!(
+                ours, theirs,
+                "PyBUF_{name} is {theirs} in object.h and {ours} here"
+            );
+        }
+    }
 }

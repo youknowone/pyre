@@ -165,9 +165,38 @@ mod imp {
     }
 
     fn collect_gids(o: PyObjectRef) -> Result<Vec<u32>, PyError> {
-        seq_items(o, "gids")?
-            .into_iter()
-            .map(|x| try_from_id(x, "gid"))
+        let gids = seq_items(o, "gids")?;
+        // `interp_subprocess.fork_exec` rejects the sequence before allocating
+        // its raw gid_t array.  POSIX permits sysconf to be indeterminate;
+        // PyPy's configure-time fallback for that case is 64.
+        let configured_max = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
+        let max_groups = if configured_max < 0 {
+            64
+        } else {
+            configured_max as usize
+        };
+        if gids.len() > max_groups {
+            return Err(PyError::value_error("too many groups"));
+        }
+        gids.into_iter()
+            .map(|x| {
+                // PyPy `fork_exec` converts supplementary groups separately
+                // from the uid/gid fields: `-1` is not an unset sentinel here.
+                // CPython `_Py_Gid_Converter` likewise exposes negative and
+                // over-gid_t entries as ValueError for `extra_groups`.
+                let value = match crate::baseobjspace::int_w(x) {
+                    Ok(value) => value,
+                    Err(error) if error.kind == crate::PyErrorKind::OverflowError => {
+                        return Err(PyError::value_error("group id is greater than maximum"));
+                    }
+                    Err(error) => return Err(error),
+                };
+                if value < 0 {
+                    return Err(PyError::value_error("group id is negative"));
+                }
+                u32::try_from(value)
+                    .map_err(|_| PyError::value_error("group id is greater than maximum"))
+            })
             .collect()
     }
 
@@ -293,6 +322,16 @@ mod imp {
             return Err(PyError::type_error(format!(
                 "fork_exec() takes exactly 22 arguments ({} given)",
                 pos.len()
+            )));
+        }
+
+        // [3.14-spec] PyPy `interp_subprocess.fork_exec` permits preexec_fn
+        // during shutdown, but CPython 3.14 `_posixsubprocess.fork_exec`
+        // rejects this observable unsafe call.  Keep PyPy's fork/exec shape
+        // and add only the finalization gate required by that public contract.
+        if !is_none_obj(pos[21]) && crate::module::thread::is_finalizing() {
+            return Err(crate::builtins::finalization_error(Some(
+                "preexec_fn not supported at interpreter shutdown",
             )));
         }
 

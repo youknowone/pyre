@@ -44,7 +44,7 @@ fn carries_items(ob_type: *mut CPyTypeObject) -> bool {
         return false;
     }
     let flags = unsafe { (*ob_type).tp_flags };
-    flags & super::typeobject::PY_TPFLAGS_TUPLE_SUBCLASS != 0
+    flags.contains(super::typeobject::TpFlags::PY_TPFLAGS_TUPLE_SUBCLASS)
         && unsafe { (*ob_type).tp_basicsize } == size_of::<CPyVarObject>() as isize
 }
 

@@ -15,6 +15,7 @@ pub mod ccallback;
 pub mod cdataobj;
 pub mod cdlopen;
 pub mod cerrno;
+pub mod cffi1_module;
 pub mod cglob;
 pub mod ctypearray;
 pub mod ctypeenum;

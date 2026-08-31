@@ -101,7 +101,7 @@ pub(crate) fn ffi_error(message: impl Into<String>) -> PyError {
 }
 
 /// `W_FFIObject.__init__`.
-fn initialize_ffi(
+pub(crate) fn initialize_ffi(
     w_ffitype: PyObjectRef,
     src_ctx: *const parse_c_type::TypeContextS,
 ) -> Result<PyObjectRef, PyError> {
@@ -634,8 +634,22 @@ fn ffi_callback(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
     // `space.appexec`: keep the decorator as an app-level function with the
     // ctype and the two policy values in its globals.
-    let w_module = crate::importing::get_sys_module("_cffi_backend")
-        .ok_or_else(|| PyError::system_error("_cffi_backend is not loaded"))?;
+    // PyPy `W_FFIObject.descr_callback`'s app-level decorator starts with
+    // `import _cffi_backend`.  Do not replace that with a sys.modules-only
+    // lookup: generated CFFI modules are loaded by cpyext without first
+    // importing the backend module itself, and their first callback must make
+    // the builtin visible exactly as the app-level import does.
+    let w_module = match crate::importing::get_sys_module("_cffi_backend") {
+        Some(module) => module,
+        None => crate::importing::dunder_import(
+            "_cffi_backend",
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            0,
+            crate::call::getexecutioncontext(),
+        )?,
+    };
     let module_slot = onerror_slot + 1;
     let _ = roots.pin_root(w_module);
     let globals_slot = module_slot + 1;

@@ -164,7 +164,7 @@ impl OpRef {
     /// High bit distinguishes constant-namespace OpRefs from operation OpRefs.
     /// opencoder.py: TAGINT/TAGCONSTPTR/TAGCONSTOTHER/TAGBOX use 2-bit tags;
     /// here a single high bit suffices (op vs const).
-    const CONST_BIT: u32 = 1 << 31;
+    pub(crate) const CONST_BIT: u32 = 1 << 31;
     /// Top of the u32 range reserved for `TempVar` (regalloc scratch)
     /// OpRefs. RPython `TempVar()` (`backend/llsupport/regalloc.py`,
     /// `__init__` body is `pass`, `__repr__` keys off `id(self)`) only
@@ -5503,8 +5503,8 @@ mod tests {
     /// namespace and `raw_const_index` strips it.
     #[test]
     fn test_raw_is_constant_matches_opref_path() {
-        // High bit set ↔ constant-namespace pool key (see `CONST_BIT`).
-        const CONST_BIT: u32 = 1 << 31;
+        // High bit set ↔ constant-namespace pool key.
+        const CONST_BIT: u32 = OpRef::CONST_BIT;
         for idx in [0u32, 1, 7, 100, 0x0FFF_FFFF] {
             let raw = idx | CONST_BIT;
             assert!(OpRef::raw_is_constant(raw));

@@ -3333,6 +3333,11 @@ class POSIXProcessTestCase(BaseTestCase):
         pid = p.pid
         with warnings_helper.check_warnings(('', ResourceWarning)):
             p = None
+            if support.check_impl_detail(cpython=False):
+                # PyPy-style tracing collectors run Popen.__del__ when the
+                # unreachable object is collected, rather than immediately
+                # when this local reference is cleared.
+                gc.collect()
 
         if mswindows:
             # subprocess._active is not used on Windows and is set to None.

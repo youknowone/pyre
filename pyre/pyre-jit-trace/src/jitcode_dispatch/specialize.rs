@@ -19410,6 +19410,203 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     emit_builtins_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, w_builtin, &name)
 }
 
+/// Trace the three frame reads at the head of `pyopcode.py IMPORT_NAME`.
+///
+/// PyPy does not leave calls for `get_builtin`, `getdebug`, or
+/// `get_w_globals` in the optimized loop: they are ordinary reads from the
+/// live red frame.  Pyre's bytecode frontend spells them as three residual
+/// helpers, so recognize those helpers here and emit the same field/cell
+/// shape.  Only the standard virtualizable is handled; an inlined callee has
+/// its own red frame and stays on the residual path until the generic
+/// nonstandard-virtualizable field descent can represent it directly.
+pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    helper: majit_ir::RuntimeHelperKind,
+    frame_op: OpRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<bool, DispatchError> {
+    if dst_bank != 'r'
+        || ctx.trace_ctx.standard_virtualizable_box() != Some(frame_op)
+        || ctx.trace_ctx.standard_virtualizable_ptr().is_none()
+    {
+        return Ok(false);
+    }
+    let frame_ptr = ctx
+        .trace_ctx
+        .standard_virtualizable_ptr()
+        .expect("standard virtualizable pointer was checked above");
+    let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
+
+    if helper == majit_ir::RuntimeHelperKind::LoadImport {
+        // `PyFrame.get_builtin` returns this field directly on every normal
+        // frame.  The null/EC fallback is uncommon and remains residual.
+        let w_builtin = frame.w_builtin;
+        if w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } {
+            return Ok(false);
+        }
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        if w_dict.is_null() {
+            return Ok(false);
+        }
+        let Some(slot) = crate::state::module_dict_cell_slot_direct(w_dict, "__import__") else {
+            return Ok(false);
+        };
+        let Some(stored) = crate::state::module_dict_cell_value_direct(w_dict, slot) else {
+            return Ok(false);
+        };
+        if stored.is_null() {
+            return Ok(false);
+        }
+
+        // The cell fold below bakes the builtin module's dict, so pin the
+        // frame field that owns that choice.  A custom per-frame builtin (or
+        // any future rebinding of the field) side-exits before using the old
+        // dict.  Rebinding builtins.__import__ itself is covered by the module
+        // dict's quasi-immutable version and mutable-cell read.
+        let live_builtin = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            frame_op,
+            crate::descr::pyframe_w_builtin_descr(),
+        );
+        let expected = ctx.trace_ctx.const_ref(w_builtin as i64);
+        if !live_builtin.is_constant() {
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[live_builtin, expected],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(live_builtin, expected);
+        } else if ctx.trace_ctx.const_value(live_builtin) != Some(w_builtin as i64) {
+            return Ok(false);
+        }
+        return emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false);
+    }
+
+    if !matches!(
+        helper,
+        majit_ir::RuntimeHelperKind::LoadImportLocals
+            | majit_ir::RuntimeHelperKind::LoadImportGlobals
+    ) {
+        return Ok(false);
+    }
+
+    // `debugdata` is a virtualizable field.  Read its shadow entry rather
+    // than the heap field, which may be stale while compiled code owns the
+    // frame.  The nullity guard is exactly PyPy's `d is None` branch.
+    let Some((debugdata_op, majit_ir::Value::Ref(debugdata_ref))) = ctx
+        .trace_ctx
+        .virtualizable_entry_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+    else {
+        return Ok(false);
+    };
+    if debugdata_ref == majit_ir::GcRef::NO_CONCRETE {
+        return Ok(false);
+    }
+    let debugdata_present = debugdata_ref.as_usize() != 0;
+    if !debugdata_op.is_constant() {
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            if debugdata_present {
+                OpCode::GuardNonnull
+            } else {
+                OpCode::GuardIsnull
+            },
+            &[debugdata_op],
+        )?;
+    } else if ctx.trace_ctx.const_value(debugdata_op) != Some(debugdata_ref.as_usize() as i64) {
+        return Ok(false);
+    }
+
+    let result = match helper {
+        majit_ir::RuntimeHelperKind::LoadImportLocals => {
+            if !debugdata_present {
+                ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
+            } else {
+                let shadow =
+                    debugdata_ref.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
+                let w_locals = unsafe { (*shadow).w_locals };
+                let live = crate::state::opimpl_getfield_gc_r(
+                    ctx.trace_ctx,
+                    debugdata_op,
+                    crate::descr::frame_debug_data_w_locals_descr(),
+                );
+                if w_locals.is_null() {
+                    if !live.is_constant() {
+                        walker_emit_fold_guard_with_snapshot(
+                            ctx,
+                            op_pc,
+                            OpCode::GuardIsnull,
+                            &[live],
+                        )?;
+                    } else if ctx.trace_ctx.const_value(live) != Some(0) {
+                        return Ok(false);
+                    }
+                    ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
+                } else {
+                    if live.is_constant()
+                        && ctx.trace_ctx.const_value(live) != Some(w_locals as i64)
+                    {
+                        return Ok(false);
+                    }
+                    ctx.trace_ctx.set_opref_concrete(
+                        live,
+                        majit_ir::Value::Ref(majit_ir::GcRef(w_locals as usize)),
+                    );
+                    live
+                }
+            }
+        }
+        majit_ir::RuntimeHelperKind::LoadImportGlobals => {
+            if debugdata_present {
+                let shadow =
+                    debugdata_ref.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
+                let w_globals = unsafe { (*shadow).w_globals };
+                if w_globals.is_null() {
+                    return Ok(false);
+                }
+                let live = crate::state::opimpl_getfield_gc_r(
+                    ctx.trace_ctx,
+                    debugdata_op,
+                    crate::descr::frame_debug_data_w_globals_descr(),
+                );
+                if live.is_constant() && ctx.trace_ctx.const_value(live) != Some(w_globals as i64) {
+                    return Ok(false);
+                }
+                ctx.trace_ctx.set_opref_concrete(
+                    live,
+                    majit_ir::Value::Ref(majit_ir::GcRef(w_globals as usize)),
+                );
+                live
+            } else {
+                let live = crate::state::frame_get_globals_obj(ctx.trace_ctx, frame_op);
+                let w_globals = frame.get_w_globals();
+                if w_globals.is_null() {
+                    return Ok(false);
+                }
+                if live.is_constant() && ctx.trace_ctx.const_value(live) != Some(w_globals as i64) {
+                    return Ok(false);
+                }
+                ctx.trace_ctx.set_opref_concrete(
+                    live,
+                    majit_ir::Value::Ref(majit_ir::GcRef(w_globals as usize)),
+                );
+                live
+            }
+        }
+        _ => unreachable!("helper was filtered above"),
+    };
+
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    ctx.clear_last_exc_value();
+    Ok(true)
+}
+
 /// Builtins-fallback half of the LOAD_GLOBAL and module-scope LOAD_NAME cell
 /// folds: the name resolves through the frame's builtin module rather than the
 /// module dict.  Mirrors `_load_global`'s second leg,
