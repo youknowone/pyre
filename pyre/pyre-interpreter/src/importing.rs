@@ -631,6 +631,10 @@ pub fn builtin_module_names() -> Vec<&'static str> {
 /// the alias arms (`"builtins"` → `__builtin__`), explicit-path arms
 /// (`importlib.machinery` → a non-default init fn), or the
 /// `#[cfg(unix)]` gating that `resource` / `fcntl` / `syslog` require.
+// PyPy `baseobjspace.py:626-683 make_builtins` is `@not_rpython`: this table
+// and each MixedModule constructor are assembled while the object space is
+// initialised, before translated execution begins.
+#[majit_macros::not_rpython]
 pub fn install_builtin_modules() {
     macro_rules! pyre_install_module {
         // `module` — `register_builtin_module("module", crate::module::module::init)`.
@@ -703,6 +707,9 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_immutables_map);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
+    // PyPy `_codecs/moduledef.py:87-100 Module.__init__` performs this beside
+    // MixedModule installation, not inside the translated CodecState ctor.
+    crate::module::_codecs::register_builtin_error_handlers();
     pyre_install_module!(_codecs_cn);
     pyre_install_module!(_codecs_jp);
     pyre_install_module!(_codecs_iso2022);
@@ -2084,6 +2091,10 @@ fn canonical_startup_dir(dir: &Path) -> Wtf8Buf {
 /// directory); `path0` is the literal entry `add_sys_path_0` later prepends to
 /// `sys.path` — `""` for `-c` / stdin / the REPL, the cwd for `-m`, the
 /// script's directory for a script.
+// Startup-only caller of `install_builtin_modules`, matching PyPy's
+// `ObjSpace.make_builtins` / `setup_builtin_modules` host phase.  User code
+// can mutate `sys.path` later, but never re-enters this process bootstrap.
+#[majit_macros::not_rpython]
 pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
     // Register builtin modules (PyPy: make_builtins / setup_builtin_modules)
     install_builtin_modules();
