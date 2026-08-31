@@ -19313,15 +19313,19 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             } else {
                 generator_frame_is_finished(gen_obj, &mut *frame_ptr, prompt_finalizers);
             }
-            generator_close_finalizer_boundary(take_pending_close_finalizer());
+            let released_graph_has_finalizer = take_pending_close_finalizer();
+            generator_close_finalizer_boundary(prompt_finalizers && released_graph_has_finalizer);
             return Ok(w_none());
         }
     }
     let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
     let sent = generator_send_ex(gen_obj, w_none(), Some(err), None, true);
     // Taken unconditionally, so a census no arm below spends cannot be read by
-    // a later close.
-    let released_graph_has_finalizer = take_pending_close_finalizer();
+    // a later close.  `generator_send_ex` records one whenever it closes,
+    // while only an explicit app-level `close()` may spend it: inside
+    // `_finalize_`'s queue drain the boundary would re-enter the finalizer
+    // queue once per unreachable generator chain.
+    let released_graph_has_finalizer = take_pending_close_finalizer() && prompt_finalizers;
     // The boundary collection runs `__del__`, so only an arm that has already
     // consumed the propagation root may take it. `Ok(_)` and the trailing
     // `Err(e)` leave their exception in flight in this native local, which the
