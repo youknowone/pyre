@@ -9187,6 +9187,93 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
+/// End a generator-resume sub-walk at the marker its own `yield` lowered to,
+/// with the value the generator is suspending on.
+///
+/// `Instruction::YieldValue` has no residual a trace can carry — the opcode
+/// suspends the frame and resumes it in a different stack context — so the
+/// codewriter lowers it to `abort_permanent`, and every walk that reaches one
+/// gives up on the location for good.  For the walk that is RESUMING that same
+/// generator the marker is not a failure: it is the suspension the resume was
+/// walked to reach, and the value it suspends with is the `FOR_ITER` item.
+///
+/// Nothing has to be reconstructed to read that value.  `emit_abort_permanent!`
+/// already materializes the pre-opcode operand stack into the virtualizable —
+/// one `setarrayitem_vable_r` per live slot, ascending — and syncs
+/// `valuestackdepth`, precisely so the interpreter it bails to resumes on a
+/// real stack.  The top slot of that stack is what `YIELD_VALUE` pops, so the
+/// last of those stores is the yielded value, and the store site latched it
+/// ([`fbw_note_generator_stack_store`]).
+///
+/// `Ok(None)` means "not a yield this walk can take", and the caller falls
+/// through to the permanent abort the marker has always raised.  That is the
+/// disposition for every precondition below, so a resume that cannot read its
+/// own suspension is never worse than no resume at all.
+pub(super) fn generator_resume_yield<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<Option<OpRef>, DispatchError> {
+    let Some(resume) = ctx.fbw_mode.generator_resume else {
+        return Ok(None);
+    };
+    // The body's own markers for unported opcodes are still aborts.  Only the
+    // offset the admission resolved the `yield` to is the suspension.
+    if op_pc != resume.yield_marker_jit_pc {
+        return Ok(None);
+    }
+    // The suspension is published through the virtualizable shadow, and that
+    // shadow tracks exactly one frame.  When it is on some other frame — the
+    // caller's, in a walk where the generator is not the trace's virtualizable
+    // — the publish would land there instead, so leave the marker to abort.
+    if ctx.trace_ctx.diag_virtualizable_heap_ptr() != resume.frame {
+        return Ok(None);
+    }
+    // `valuestackdepth` is absolute (`stack_base_absolute + stack length`), so
+    // the value the opcode pops is the slot below the published depth.
+    let Some(top) =
+        crate::state::concrete_stack_depth(resume.frame).and_then(|depth| depth.checked_sub(1))
+    else {
+        return Ok(None);
+    };
+    let Some(store) = fbw_generator_stack_store_at(resume.frame, top) else {
+        return Ok(None);
+    };
+    // The marker leaves the frame in the state the INTERPRETER resumes on: the
+    // yielded value still on the stack, and `last_instr` one BEFORE the yield
+    // so that a bail re-runs it.  A walk that has taken the value here has
+    // already run it, so publish the suspension instead — pop the value and put
+    // the coordinate AT the yield, which is what the next `next()` reads back.
+    // Without this the generator would hand out the same item twice.
+    //
+    // The undos are already armed — every one of the marker's own stores went
+    // through `durable_resume_frame` first — but arm again rather than depend
+    // on that: the note is first-write-per-frame wins, so a redundant call
+    // keeps the earlier, pre-walk image.
+    fbw_arm_durable_frame_undo(resume.frame);
+    publish_suspension_field(ctx, "valuestackdepth", top as i64);
+    publish_suspension_field(ctx, "last_instr", resume.yield_py_pc as i64);
+    Ok(Some(store.value))
+}
+
+/// Write one static virtualizable field of the frame the shadow tracks.
+///
+/// The mirror carries both halves: the boxes a compiled run writes back at a
+/// force, and — through the `synchronize_virtualizable` it pairs with — the
+/// live frame this walk's own residuals and its interpreter resume read.
+fn publish_suspension_field<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    static_field_name: &str,
+    value: i64,
+) {
+    let value_op = ctx.trace_ctx.const_int(value);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx.trace_ctx,
+        static_field_name,
+        value_op,
+        majit_ir::Value::Int(value),
+    );
+}
+
 /// Why a `FOR_ITER` over a suspended generator was not resumed into the trace.
 ///
 /// Named rather than counted so the corpus census answers WHICH precondition

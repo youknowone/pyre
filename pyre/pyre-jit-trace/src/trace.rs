@@ -5598,6 +5598,8 @@ fn run_perfn_walk<Sym: WalkSym>(
         // The mirrored locals stand with the rest of the walk's end state: a
         // resumed interpreter reads its fastlocals straight out of that array.
         crate::jitcode_dispatch::fbw_locals_mirror_commit();
+        // …and the operand-stack depth those locals are indexed against.
+        crate::jitcode_dispatch::fbw_frame_vsd_commit();
         // A committed bridge recording keeps its advanced iterator cursor (the
         // compiled bridge / adopted end state owns the iteration count).
         crate::jitcode_dispatch::fbw_bridge_iter_journal_clear();
@@ -5613,6 +5615,12 @@ fn run_perfn_walk<Sym: WalkSym>(
         // force flushed the same frame the older pre-fold image is the one that
         // stands.
         crate::jitcode_dispatch::fbw_locals_mirror_rollback();
+        // …and the operand-stack depth, which a resumed generator's frame
+        // carries as durably as its locals: the walk syncs it at every block
+        // head, and a frame the walk did not create keeps whatever it is left
+        // at.  Armed only for such a frame (`fbw_arm_durable_frame_undo`), so
+        // this is a no-op for every walk that creates the frames it writes.
+        crate::jitcode_dispatch::fbw_frame_vsd_rollback();
         // A bridge/retrace recording that does not commit restores the
         // iterator cursor it eagerly advanced, so the interpreter resume
         // re-consumes the in-flight item exactly once (no drop).  A root walk

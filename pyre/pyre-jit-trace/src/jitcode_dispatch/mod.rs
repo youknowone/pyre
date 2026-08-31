@@ -1564,6 +1564,31 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// specialization census prove that every captured callee guard was
     /// actually stamped.
     pub instance_next_foriter_census_active: bool,
+    /// Set for the sub-walk that resumes a suspended generator body in place of
+    /// the `jit_next` residual a `FOR_ITER` over it would otherwise leave.
+    /// `None` for every other walk, which is what keeps the yield interception
+    /// and the durable-frame journal off every path but this one.
+    pub generator_resume: Option<GeneratorResumeSubwalk>,
+}
+
+/// The suspended generator a resume sub-walk is running on.
+///
+/// Two coordinates and one address, all fixed before the walk starts: the
+/// frame the body executes on, the marker the body's single `yield` lowered
+/// to, and the Python pc that marker stands at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GeneratorResumeSubwalk {
+    /// The suspended `PyFrame` — `gen.frame`, the frame the generator will be
+    /// resumed from again after this yield.  Durable, so every walk-time write
+    /// to it is journalled (`fbw_arm_durable_frame_undo`).
+    pub frame: usize,
+    /// JitCode offset of the `abort_permanent` the body's `yield` lowered to.
+    /// Exact rather than "any `abort_permanent`": a body can carry markers for
+    /// unported opcodes too, and those still abort.
+    pub yield_marker_jit_pc: usize,
+    /// Python pc of that `yield`.  The coordinate the frame is left suspended
+    /// at, so the next resume continues after it.
+    pub yield_py_pc: u32,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -1611,6 +1636,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             bridge_entry_merge_pc: None,
             instance_next_foriter_green_key: None,
             instance_next_foriter_census_active: false,
+            generator_resume: None,
         }
     }
 }
@@ -11499,6 +11525,16 @@ fn handle<Sym: WalkSym>(
             Err(DispatchError::AbortMarkerReached { pc: op.pc })
         }
         "abort_permanent/" => {
+            // A generator-resume sub-walk arriving at the marker its own
+            // `yield` lowered to is not aborting: that marker is the
+            // suspension, and the value it suspends with is the FOR_ITER item
+            // the resume was walked for.
+            if let Some(item) = generator_resume_yield(ctx, op.pc)? {
+                return Ok((
+                    DispatchOutcome::SubReturn { result: Some(item) },
+                    op.next_pc,
+                ));
+            }
             // pyre-only `BC_ABORT_PERMANENT` fail-path
             // (`bhimpl_abort_permanent`, `blackhole.rs`): emitted for
             // paths that must always terminate the frame (BigInt-overflow
