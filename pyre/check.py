@@ -347,7 +347,9 @@ FLOOR_GATE_MIN_BASELINE_S = 10 * EXEC_TIME_FLOOR_S
 # slower than pypy -- not a thing anyone wants to be true, and one more number
 # to re-fit every time the ceiling moves.  The floor is only an instrument for
 # reporting that a ceiling has gone stale, so it sits at parity: reaching it is
-# the event worth a red run.
+# the event worth a red run.  A fixture whose ceiling is already at or under
+# parity has nothing left for it to report, and `perf_gate_floor` gives it no
+# floor at all.
 PERF_GATE_FLOOR_RATIO = 1.0
 # A ceiling also sets a lower bound at one sixth of itself, capped at
 # parity.  A wider runner-to-runner spread is a measurement or fixture defect
@@ -1822,9 +1824,17 @@ def wasm_ratio_gate(path):
 def perf_gate_floor(ceiling):
     """The pypy ratio a bench with this ceiling must not read below.
 
-    Use one sixth of the ceiling, capped at parity so a benchmark is never
+    One sixth of the ceiling, capped at parity so a benchmark is never
     required to remain slower than pypy.
+
+    None -- no floor at all -- for a ceiling at or under parity.  Such a
+    ceiling already asserts that the fixture is at least as fast as pypy, which
+    is the event the floor exists to report; a floor derived beneath it asserts
+    the opposite thing, that the fixture must not get much FASTER than pypy,
+    and beating pypy is not a result any run should go red for.
     """
+    if ceiling <= PERF_GATE_FLOOR_RATIO:
+        return None
     return min(PERF_GATE_FLOOR_RATIO, ceiling / PERF_GATE_FLOOR_DIVISOR)
 
 
