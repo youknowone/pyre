@@ -5757,16 +5757,26 @@ pub fn pos_inner(a: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_unaryop(a, "__pos__")? {
             return Ok(result);
         }
-        if a.is_null() {
-            return Err(PyError::type_error(
-                "unsupported operand type for unary pos: 'NoneType'",
-            ));
-        }
-        Err(PyError::type_error(format!(
-            "unsupported operand type for unary pos: '{}'",
-            crate::baseobjspace::object_functionstr_type_name(a),
-        )))
+        Err(bad_operand_type("unary +", a))
     }
+}
+
+/// [3.14-spec] `UNARY_FUNC`'s refusal, `bad operand type for unary -: '<T>'`,
+/// spelled with the operator.  `_make_unaryop_impl` builds its wording from the
+/// symbol column of `ObjSpace.MethodTable`, which carries the *name* `neg` and
+/// `pos` for those two rows and the symbol only for `invert`, so PyPy answers
+/// `unsupported operand type for unary neg`.  Measured against 3.14.2;
+/// `abs_bad_operand` already words the fourth arm of the same macro this way.
+///
+/// A null receiver reaches here from the callers below, which reserve it for
+/// `None`.
+fn bad_operand_type(descr: &str, a: PyObjectRef) -> PyError {
+    let type_name = if a.is_null() {
+        "NoneType".to_string()
+    } else {
+        crate::baseobjspace::object_functionstr_type_name(a)
+    };
+    PyError::type_error(format!("bad operand type for {descr}: '{type_name}'"))
 }
 
 /// Unary negation.
@@ -5821,15 +5831,7 @@ pub fn neg_inner(a: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_unaryop(a, "__neg__")? {
             return Ok(result);
         }
-        if a.is_null() {
-            return Err(PyError::type_error(
-                "unsupported operand type for unary neg: 'NoneType'",
-            ));
-        }
-        Err(PyError::type_error(format!(
-            "unsupported operand type for unary neg: '{}'",
-            crate::baseobjspace::object_functionstr_type_name(a),
-        )))
+        Err(bad_operand_type("unary -", a))
     }
 }
 
@@ -5897,10 +5899,7 @@ pub fn invert_inner(a: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_unaryop(a, "__invert__")? {
             return Ok(result);
         }
-        Err(PyError::type_error(format!(
-            "unsupported operand type for unary ~: '{}'",
-            crate::baseobjspace::object_functionstr_type_name(a),
-        )))
+        Err(bad_operand_type("unary ~", a))
     }
 }
 
