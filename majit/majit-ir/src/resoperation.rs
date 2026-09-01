@@ -3745,11 +3745,16 @@ mod tests {
     fn ordinary_op_does_not_embed_guard_failarg_inline_storage() {
         // GuardResOp owns `_fail_args` upstream. A previous SmallVec<[Operand;
         // 3]> in the unified Rust Op made every ordinary operation reserve
-        // three Operand slots; keep the common allocation below that old
-        // 280-byte payload on 64-bit targets.
+        // three Operand slots: that field measures 72 bytes against the Vec
+        // header's 32, so Op was 280 and is 240. Bound it at what the change
+        // reached, not merely under the old size, or half a regression passes.
         #[cfg(target_pointer_width = "64")]
         {
-            assert!(std::mem::size_of::<Op>() < 280);
+            assert!(
+                std::mem::size_of::<Op>() <= 240,
+                "Op grew to {} bytes",
+                std::mem::size_of::<Op>()
+            );
         }
     }
 

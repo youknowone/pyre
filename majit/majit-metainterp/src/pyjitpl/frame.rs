@@ -223,6 +223,61 @@ impl MIFrame {
         frame
     }
 
+    /// `pyjitpl.py MIFrame.setup` on an object taken from
+    /// `MetaInterp.free_frames_list`.
+    ///
+    /// RPython reuses the `MIFrame` object and replaces its register lists.
+    /// Rust can preserve the lists' backing capacity while spelling the same
+    /// reset: every logical slot is cleared, the lists are resized for the new
+    /// JitCode, constants are recopied, and all per-call bookkeeping returns
+    /// to the values established by `setup`. This is allocator-equivalent to
+    /// RPython's nursery list replacement without changing frame identity or
+    /// retaining a live box across calls.
+    pub fn setup_reused(
+        &mut self,
+        jitcode: Arc<JitCode>,
+        pc: usize,
+        greenkey: Option<super::PortalGreenKey>,
+        ctx: Option<&mut crate::trace_ctx::TraceCtx>,
+    ) {
+        let regs_and_consts_i = jitcode.num_regs_and_consts_i();
+        let regs_and_consts_r = jitcode.num_regs_and_consts_r();
+        let regs_and_consts_f = jitcode.num_regs_and_consts_f();
+
+        self.jitcode = jitcode;
+        self.pc = pc;
+        self.code_cursor = 0;
+        self.last_opcode_position = pc;
+        self.int_regs.resize(regs_and_consts_i, None);
+        self.int_regs.fill(None);
+        self.int_values.resize(regs_and_consts_i, None);
+        self.int_values.fill(None);
+        self.ref_regs.resize(regs_and_consts_r, None);
+        self.ref_regs.fill(None);
+        self.ref_values.resize(regs_and_consts_r, None);
+        self.ref_values.fill(None);
+        self.float_regs.resize(regs_and_consts_f, None);
+        self.float_regs.fill(None);
+        self.float_values.resize(regs_and_consts_f, None);
+        self.float_values.fill(None);
+        self.inline_frame = false;
+        self.portal_scalar_state = None;
+        self.portal_entered = false;
+        self.portal_jd = 0;
+        self.return_i = None;
+        self.return_r = None;
+        self.return_f = None;
+        self.greenkey = greenkey;
+        self._result_argcode = b'v';
+        self.result_arg_index = None;
+        self.pushed_box = None;
+        self.parent_snapshot = -1;
+        self.unroll_iterations = 1;
+        if let Some(ctx) = ctx {
+            self.copy_constants(ctx);
+        }
+    }
+
     pub fn next_u8(&mut self) -> u8 {
         read_u8(&self.jitcode.code, &mut self.code_cursor)
     }
@@ -1190,6 +1245,12 @@ impl MIFrame {
 #[derive(Default)]
 pub struct MIFrameStack {
     pub frames: Vec<MIFrame>,
+    /// `pyjitpl.py MetaInterp.free_frames_list` for the generated
+    /// `JitCodeMachine` adapter.  The machine borrows this wrapper instead of
+    /// the whole `MetaInterp`, so the wrapper must carry the paired free list
+    /// alongside the live `framestack`; they still have one owner and one
+    /// lifetime, just as the two upstream `MetaInterp` attributes do.
+    free_frames: Vec<MIFrame>,
 }
 
 impl MIFrameStack {
@@ -1197,7 +1258,10 @@ impl MIFrameStack {
     /// `MetaInterp.initialize_state_from_start` (pyjitpl.py) and
     /// `rebuild_state_after_failure` (pyjitpl.py).
     pub fn empty() -> Self {
-        Self { frames: Vec::new() }
+        Self {
+            frames: Vec::new(),
+            free_frames: Vec::new(),
+        }
     }
 
     /// Build a stack pre-seeded with one root frame.  Pyre's
@@ -1205,7 +1269,10 @@ impl MIFrameStack {
     /// constructor mirrors `MIFrameStack::new(root)` from before the
     /// `Arc<JitCode>` migration.
     pub fn new(root: MIFrame) -> Self {
-        Self { frames: vec![root] }
+        Self {
+            frames: vec![root],
+            free_frames: Vec::new(),
+        }
     }
 
     pub fn current_mut(&mut self) -> &mut MIFrame {
@@ -1218,6 +1285,30 @@ impl MIFrameStack {
 
     pub fn pop(&mut self) -> Option<MIFrame> {
         self.frames.pop()
+    }
+
+    /// `pyjitpl.py MetaInterp.newframe`: take a cleaned MIFrame from
+    /// `free_frames_list` when possible, then run `MIFrame.setup` on it.
+    pub fn take_frame(
+        &mut self,
+        jitcode: Arc<JitCode>,
+        pc: usize,
+        greenkey: Option<super::PortalGreenKey>,
+        ctx: Option<&mut crate::trace_ctx::TraceCtx>,
+    ) -> MIFrame {
+        if let Some(mut frame) = self.free_frames.pop() {
+            frame.setup_reused(jitcode, pc, greenkey, ctx);
+            frame
+        } else {
+            MIFrame::setup(jitcode, pc, greenkey, ctx)
+        }
+    }
+
+    /// `pyjitpl.py MetaInterp.popframe`: clear live references before
+    /// returning the frame object to `free_frames_list`.
+    pub fn recycle_frame(&mut self, mut frame: MIFrame) {
+        frame.cleanup_registers();
+        self.free_frames.push(frame);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1275,6 +1366,42 @@ mod tests {
         assert_eq!(frame.ref_values[1], Some(201));
         assert_eq!(frame.float_regs[0], Some(OpRef::float_op(30)));
         assert_eq!(frame.float_values[0], Some(300));
+    }
+
+    #[test]
+    fn frame_stack_reuses_cleaned_register_storage() {
+        // pyjitpl.py `MetaInterp.newframe` / `popframe`: a popped MIFrame is
+        // cleaned, appended to `free_frames_list`, and selected for the next
+        // call.  The generated-machine adapter must preserve that lifecycle
+        // without leaking any per-call state into the reused frame.
+        let jitcode = make_jitcode_with_regs(2, 2, 1);
+        let mut stack = MIFrameStack::empty();
+        let mut frame = stack.take_frame(jitcode.clone(), 7, None, None);
+        let int_storage = frame.int_regs.as_ptr();
+        let ref_storage = frame.ref_regs.as_ptr();
+        let float_storage = frame.float_regs.as_ptr();
+        frame.int_regs[0] = Some(OpRef::int_op(11));
+        frame.ref_regs[0] = Some(OpRef::ref_op(12));
+        frame.float_regs[0] = Some(OpRef::float_op(13));
+        frame.inline_frame = true;
+        frame.return_i = Some(1);
+        frame.pushed_box = Some(OpRef::ref_op(14));
+
+        stack.recycle_frame(frame);
+        assert_eq!(stack.free_frames.len(), 1);
+
+        let frame = stack.take_frame(jitcode, 3, None, None);
+        assert_eq!(stack.free_frames.len(), 0);
+        assert_eq!(frame.int_regs.as_ptr(), int_storage);
+        assert_eq!(frame.ref_regs.as_ptr(), ref_storage);
+        assert_eq!(frame.float_regs.as_ptr(), float_storage);
+        assert!(frame.int_regs.iter().all(Option::is_none));
+        assert!(frame.ref_regs.iter().all(Option::is_none));
+        assert!(frame.float_regs.iter().all(Option::is_none));
+        assert!(!frame.inline_frame);
+        assert_eq!(frame.return_i, None);
+        assert_eq!(frame.pushed_box, None);
+        assert_eq!(frame.pc, 3);
     }
 
     /// `MIFrame::get_list_of_active_boxes` (non-in_a_call

@@ -2638,7 +2638,7 @@ where
     /// snapshot, if any, so a `sym`-holding caller can restore it (this
     /// method has no `sym` in scope).
     fn pop_exception_frame(&mut self, ctx: &mut TraceCtx) -> Option<Vec<(OpRef, i64)>> {
-        if let Some(frame) = self.frames.pop() {
+        if let Some(mut frame) = self.frames.pop() {
             if frame.inline_frame {
                 ctx.pop_inline_frame();
             }
@@ -2650,7 +2650,9 @@ where
                 let jd_box = ctx.const_int(frame.portal_jd as i64);
                 ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
             }
-            frame.portal_scalar_state
+            let portal_scalar_state = frame.portal_scalar_state.take();
+            self.frames.recycle_frame(frame);
+            portal_scalar_state
         } else {
             None
         }
@@ -3263,7 +3265,7 @@ where
         // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
         // `portal_jitcode`; enter their portal at `green_pc` as before.
         if let Some(portal) = runtime.portal_jitcode(jd_index) {
-            let mut portal_frame = MIFrame::setup(portal, green_pc, None, Some(ctx));
+            let mut portal_frame = self.frames.take_frame(portal, green_pc, None, Some(ctx));
             portal_frame.code_cursor = green_pc;
             ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
             // pyjitpl.py newframe -> enter_portal_frame(jd_no, unique_id)
@@ -3625,7 +3627,7 @@ where
             frame.finished()
         };
         if finished {
-            let finished_frame = self.frames.pop().expect("finished frame stack was empty");
+            let mut finished_frame = self.frames.pop().expect("finished frame stack was empty");
             if finished_frame.inline_frame {
                 ctx.pop_inline_frame();
             }
@@ -3640,7 +3642,7 @@ where
             }
             // [FR] Restore the caller's sym scalar/fixed-array state that this
             // inline recursive-portal frame overwrote.
-            if let Some(snapshot) = finished_frame.portal_scalar_state.clone() {
+            if let Some(snapshot) = finished_frame.portal_scalar_state.take() {
                 sym.restore_inline_scalar_state(snapshot);
             }
             if let Some(parent) = self.frames.frames.last_mut()
@@ -3675,6 +3677,7 @@ where
                     }
                 }
             }
+            self.frames.recycle_frame(finished_frame);
             return TraceAction::Continue;
         }
 
@@ -6336,13 +6339,14 @@ where
                         //     but DO NOT wire the return (do_recursive_call's job)
                         //     and DO NOT record LEAVE_PORTAL_FRAME yet
                         //     (leave_portal_frame=False).
-                        let popped = self.frames.pop().expect("recursive-cut: framestack < 2");
+                        let mut popped = self.frames.pop().expect("recursive-cut: framestack < 2");
                         if popped.inline_frame {
                             ctx.pop_inline_frame();
                         }
-                        if let Some(snapshot) = popped.portal_scalar_state.clone() {
+                        if let Some(snapshot) = popped.portal_scalar_state.take() {
                             sym.restore_inline_scalar_state(snapshot);
                         }
+                        self.frames.recycle_frame(popped);
                         // (3) do_recursive_call(assembler_call=True) on the caller
                         //     (now current): reuse the existing 8-step
                         //     CALL_ASSEMBLER recorder. `set_int_reg(result_dst)`
@@ -6972,7 +6976,7 @@ where
                     .unwrap_or_else(|| {
                         panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry")
                     });
-                let mut sub_frame = MIFrame::setup(sub_jitcode, 0, None, Some(ctx));
+                let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));
                 ctx.push_inline_frame((sub_idx, pc), u32::MAX);
                 sub_frame.inline_frame = true;
                 for (kind, caller_src, callee_dst) in arg_triples {
@@ -9387,7 +9391,7 @@ where
             // crashing the process.
             return TraceAction::Abort;
         };
-        let mut sub_frame = MIFrame::setup(sub_jitcode, 0, None, Some(ctx));
+        let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));
         ctx.push_inline_frame((sub_idx, pc), u32::MAX);
         sub_frame.inline_frame = true;
 

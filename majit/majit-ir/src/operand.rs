@@ -30,6 +30,32 @@ use crate::resoperation::{OpRc, OpRef};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Allocation-free identity source for the small-`ConstInt` arm below.
+///
+/// RPython's opencoder writes small integers directly into the byte stream and
+/// only mints the `ConstInt` object when an iterator decodes the operation. The
+/// legacy structured recorder has to expose an `Operand` immediately, but it
+/// need not ask the process allocator for the overwhelmingly common small-int
+/// object. The high word is an object-identity token; the low word is the
+/// sign-preserving `i32` payload. A clone keeps the token, while a fresh mint
+/// gets a new one, preserving `AbstractValue` identity and hashing.
+static NEXT_SMALL_INT_ID: AtomicU32 = AtomicU32::new(1);
+
+#[inline]
+fn fresh_small_int(value: i64) -> Option<u64> {
+    let value = i32::try_from(value).ok()?;
+    let id = NEXT_SMALL_INT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .unwrap_or_else(|_| panic!("small ConstInt identity space exhausted"));
+    Some((u64::from(id) << 32) | u64::from(value as u32))
+}
+
+#[inline]
+fn small_int_value(encoded: u64) -> i64 {
+    (encoded as u32 as i32) as i64
+}
 
 /// An operand stored in `Op.args` / `Op.fail_args`.
 ///
@@ -45,6 +71,11 @@ pub enum Operand {
     Op(OpRc),
     /// An input-arg producer (`resoperation.py` `AbstractInputArg`).
     InputArg(InputArgRc),
+    /// A freshly-minted `ConstInt` whose value fits in the opencoder's common
+    /// machine-int band. `encoded = identity:u32 | value:i32`; this has the
+    /// same one-word payload as an `Rc`, so it does not enlarge `Operand` or
+    /// the three inline operand slots in every [`Op`](crate::resoperation::Op).
+    SmallInt(u64),
     /// A constant (`history.py/268/314` `ConstInt`/`ConstFloat`/
     /// `ConstPtr`). The value lives in an `Rc<Cell<Value>>`: the `Cell` lets
     /// the GC root walker forward an inline `ConstPtr` `GcRef` in place
@@ -63,6 +94,16 @@ pub enum Operand {
 }
 
 impl Operand {
+    #[inline]
+    fn fresh_const_value(value: Value) -> Operand {
+        if let Value::Int(value) = value
+            && let Some(encoded) = fresh_small_int(value)
+        {
+            return Operand::SmallInt(encoded);
+        }
+        Operand::Const(Rc::new(Cell::new(value)))
+    }
+
     /// Wrap a bound op as `Operand::Op` (`Rc::clone`, cheap). The successor
     /// (`resoperation.py:250`) — no `box_cache` memoization, the `Rc`
     /// itself IS the stable identity.
@@ -80,13 +121,13 @@ impl Operand {
     /// `ConstInt(value)` object construction; identity starts here and is
     /// shared by every read of the slot).
     pub fn const_(value: Const) -> Operand {
-        Operand::Const(Rc::new(Cell::new(value.to_value())))
+        Self::fresh_const_value(value.to_value())
     }
 
     /// A constant operand straight from a [`Value`] — the successor to
     /// a fresh `Rc<Cell<Value>>` const identity (`history.py` `ConstInt`).
     pub fn const_from_value(value: Value) -> Operand {
-        Operand::Const(Rc::new(Cell::new(value)))
+        Self::fresh_const_value(value)
     }
 
     /// The absent-slot sentinel.
@@ -107,7 +148,7 @@ impl Operand {
     pub fn from_opref(r: OpRef) -> Operand {
         match r {
             OpRef::None => Operand::None,
-            OpRef::ConstInt(v) => Operand::Const(Rc::new(Cell::new(Value::Int(v)))),
+            OpRef::ConstInt(v) => Self::fresh_const_value(Value::Int(v)),
             OpRef::ConstFloat(v) => Operand::Const(Rc::new(Cell::new(Value::Float(v)))),
             OpRef::ConstPtr(v) => Operand::Const(Rc::new(Cell::new(Value::Ref(v)))),
             _ => panic!(
@@ -168,6 +209,7 @@ impl Operand {
             Operand::None => OpRef::NONE,
             Operand::Op(op) => op.pos.get(),
             Operand::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp),
+            Operand::SmallInt(encoded) => OpRef::const_int(small_int_value(*encoded)),
             // Re-encodes from the live `Cell` value, so a GC-moved `ConstPtr`
             // reads back at its post-move address (forwarding.rs parity).
             Operand::Const(cell) => match cell.get() {
@@ -185,7 +227,7 @@ impl Operand {
         match self {
             Operand::Op(op) => Some(op.pos.get().raw()),
             Operand::InputArg(ia) => Some(ia.index),
-            Operand::Const(_) | Operand::None => None,
+            Operand::SmallInt(_) | Operand::Const(_) | Operand::None => None,
         }
     }
 
@@ -194,6 +236,7 @@ impl Operand {
         match self {
             Operand::Op(op) => op.pos.get().ty().unwrap_or(Type::Void),
             Operand::InputArg(ia) => ia.tp,
+            Operand::SmallInt(_) => Type::Int,
             Operand::Const(cell) => cell.get().get_type(),
             Operand::None => Type::Void,
         }
@@ -203,6 +246,7 @@ impl Operand {
     /// `None` for non-`Const`.
     pub fn const_value(&self) -> Option<Value> {
         match self {
+            Operand::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
             Operand::Const(cell) => Some(cell.get()),
             _ => None,
         }
@@ -215,6 +259,7 @@ impl Operand {
     /// `history.py` concrete-value read.
     pub fn get_value(&self) -> Option<Value> {
         match self {
+            Operand::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
             Operand::Const(cell) => Some(cell.get()),
             Operand::Op(op) => op.get_value(),
             Operand::InputArg(ia) => ia.get_value(),
@@ -226,6 +271,7 @@ impl Operand {
     /// parity).
     pub fn const_int(&self) -> Option<i64> {
         match self {
+            Operand::SmallInt(encoded) => Some(small_int_value(*encoded)),
             Operand::Const(cell) => match cell.get() {
                 Value::Int(v) => Some(v),
                 _ => None,
@@ -236,7 +282,7 @@ impl Operand {
 
     /// `resoperation.py is_constant`.
     pub fn is_constant(&self) -> bool {
-        matches!(self, Operand::Const(_))
+        matches!(self, Operand::SmallInt(_) | Operand::Const(_))
     }
 
     pub fn is_inputarg(&self) -> bool {
@@ -269,7 +315,7 @@ impl Operand {
         match (self, other) {
             (Operand::Op(a), Operand::Op(b)) => Rc::ptr_eq(a, b),
             (Operand::InputArg(a), Operand::InputArg(b)) => Rc::ptr_eq(a, b),
-            (Operand::Const(a), Operand::Const(b)) => a.get() == b.get(),
+            (a, b) if a.is_constant() && b.is_constant() => a.const_value() == b.const_value(),
             (Operand::None, Operand::None) => true,
             _ => false,
         }
@@ -291,7 +337,7 @@ impl Operand {
             let forwarded = match &cur {
                 Operand::Op(op) => op.get_forwarded(),
                 Operand::InputArg(ia) => ia.get_forwarded(),
-                Operand::Const(_) | Operand::None => return cur,
+                Operand::SmallInt(_) | Operand::Const(_) | Operand::None => return cur,
             };
             match forwarded {
                 Forwarded::None | Forwarded::Info(_) => return cur,
@@ -337,7 +383,7 @@ impl Operand {
         match self {
             Operand::Op(op) => f(&**op),
             Operand::InputArg(ia) => f(&**ia),
-            Operand::Const(_) | Operand::None => default,
+            Operand::SmallInt(_) | Operand::Const(_) | Operand::None => default,
         }
     }
 
@@ -348,7 +394,7 @@ impl Operand {
         match self {
             Operand::Op(op) => f(&**op),
             Operand::InputArg(ia) => f(&**ia),
-            Operand::Const(_) | Operand::None => panic!(
+            Operand::SmallInt(_) | Operand::Const(_) | Operand::None => panic!(
                 "Operand::{what} on a non-producer operand — only a bound \
                  Op/InputArg carries a _forwarded slot (box identity precondition)"
             ),
@@ -486,7 +532,7 @@ impl Operand {
                     cell.set(v);
                 }
             }
-            Operand::None | Operand::Op(_) | Operand::InputArg(_) => {}
+            Operand::None | Operand::Op(_) | Operand::InputArg(_) | Operand::SmallInt(_) => {}
         }
     }
 }
@@ -506,6 +552,7 @@ impl PartialEq for Operand {
             (Operand::None, Operand::None) => true,
             (Operand::Op(a), Operand::Op(b)) => Rc::ptr_eq(a, b),
             (Operand::InputArg(a), Operand::InputArg(b)) => Rc::ptr_eq(a, b),
+            (Operand::SmallInt(a), Operand::SmallInt(b)) => a == b,
             (Operand::Const(a), Operand::Const(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
@@ -530,8 +577,12 @@ impl std::hash::Hash for Operand {
                 2u8.hash(state);
                 (Rc::as_ptr(ia) as *const () as usize).hash(state);
             }
-            Operand::Const(cell) => {
+            Operand::SmallInt(encoded) => {
                 3u8.hash(state);
+                encoded.hash(state);
+            }
+            Operand::Const(cell) => {
+                4u8.hash(state);
                 (Rc::as_ptr(cell) as usize).hash(state);
             }
         }
@@ -857,5 +908,32 @@ mod tests {
         // Const has no _forwarded slot -> readers return None (no panic).
         assert!(Operand::const_(Const::Int(0)).ptr_info().is_none());
         assert!(Operand::none().int_bound().is_none());
+    }
+
+    /// The structured-recorder adapter keeps RPython ConstInt object identity
+    /// without allocating the small values that opencoder.py writes inline.
+    #[test]
+    fn small_int_is_inline_but_keeps_fresh_object_identity() {
+        let first = Operand::const_(Const::Int(42));
+        let second = Operand::const_(Const::Int(42));
+        assert!(matches!(first, Operand::SmallInt(_)));
+        assert!(matches!(second, Operand::SmallInt(_)));
+        assert_ne!(
+            first, second,
+            "fresh ConstInt objects have distinct identity"
+        );
+        assert_eq!(first, first.clone(), "cloning preserves ConstInt identity");
+        assert!(first.same_box(&second), "ConstInt.same_box compares values");
+
+        let edge = Operand::const_(Const::Int(i32::MAX as i64));
+        let outside = Operand::const_(Const::Int(i32::MAX as i64 + 1));
+        assert!(matches!(edge, Operand::SmallInt(_)));
+        assert!(matches!(outside, Operand::Const(_)));
+
+        // SmallInt deliberately replaces an Rc-sized payload. Pin this on the
+        // two 64-bit production hosts so adding it cannot silently grow the
+        // three inline Operand slots embedded in every Op.
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(std::mem::size_of::<Operand>(), 16);
     }
 }
