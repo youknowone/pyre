@@ -13,7 +13,7 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, Function, InstBuilder, MemFlagsData, Signature, StackSlotData,
+    AbiParam, Block, BlockArg, Function, InstBuilder, MemFlagsData, Signature, StackSlotData,
     StackSlotKind,
 };
 use cranelift_codegen::settings::{self, Configurable};
@@ -7203,6 +7203,61 @@ fn emit_attached_loop_dispatch(
 ///   1. save result to jf_frame[0]
 ///   2. MOV [ebp + jf_descr], faildescrindex
 ///   3. _call_footer
+/// Move every block that only a guard exit can reach out of the trace body.
+///
+/// `write_pending_failure_recoveries` parity: RPython assembles the whole
+/// trace, collecting each guard's token in `pending_guard_tokens`, and only
+/// then emits the recovery stubs, so no failure-recovery instruction is ever
+/// laid out between two body instructions.
+///
+/// Cranelift's coldness is not transitive -- `Function::is_effectively_cold`
+/// reads the flag on the block itself and nothing else -- while a guard exit
+/// here is a chain of blocks: `emit_guard_exit` is entered on the one block
+/// this backend marks, and the write-barrier arm, the attached-bridge
+/// dispatch, the closing-jump dispatch and the deadframe return that follow it
+/// are all created fresh with no mark.  Those unmarked blocks were laid out
+/// inside the body's range: the three-guard integer loop in
+/// `pyre/bench/raise_catch_loop.py` carried ~75 instructions of exit code
+/// interleaved with its ~31 body instructions, and each iteration branched
+/// over them.
+///
+/// A block whose predecessors are all cold cannot be reached without first
+/// running cold code, so it is cold too.  Run that to a fixpoint.  Coldness is
+/// a layout and register-allocation hint only, so this changes placement and
+/// spill preference, never behaviour.
+fn propagate_cold_blocks(func: &mut Function) {
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let entry = func.layout.entry_block();
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    loop {
+        let mut changed = false;
+        for &block in &blocks {
+            if Some(block) == entry || func.layout.is_cold(block) {
+                continue;
+            }
+            // No predecessor at all means unreachable, not cold: leave it to
+            // the layout pass rather than claim a verdict about a block
+            // nothing branches to.
+            let mut reached = false;
+            let mut only_from_cold = true;
+            for pred in cfg.pred_iter(block) {
+                reached = true;
+                if !func.layout.is_cold(pred.block) {
+                    only_from_cold = false;
+                    break;
+                }
+            }
+            if reached && only_from_cold {
+                func.layout.set_cold(block);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 fn emit_guard_exit(
     builder: &mut FunctionBuilder,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -15462,6 +15517,7 @@ impl CraneliftBackend {
         }
         builder.finalize(frontend_config);
         self.func_ctx = func_ctx;
+        propagate_cold_blocks(&mut func);
 
         // Compile
         let mut ctx = Context::for_function(func);
