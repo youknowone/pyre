@@ -11140,19 +11140,22 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         }};
     }
     // Plain zero-argument `bh_call_fn(callable, PY_NULL)` shape only.
+    // These four are "not this fold", the same silent `Ok(None)` `super()`
+    // uses for a non-matching CALL.  Naming them LOCALS-PORTAL would
+    // attribute every residual CallFn in the corpus to this arm.
     if r_args.len() != 2 {
-        decline!("arity-not-zero-arg");
+        return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
     let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
         (arg_concretes[0], arg_concretes[1])
     else {
-        decline!("args-not-refs");
+        return Ok(None);
     };
     // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
     // as arg0 — not a plain `locals()` call.
     if concrete_callable.is_null() || !null_or_self.is_null() {
-        decline!("bound-receiver-or-null-callable");
+        return Ok(None);
     }
     // `vars()` with no argument delegates straight to `builtin_locals`
     // (`app_inspect.py`), so both names share the fold; `vars(obj)` and
@@ -11165,7 +11168,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     } else if pyre_interpreter::builtins::is_builtin_dir_function(concrete_callable) {
         FrameLocalsBuiltin::SortedNames
     } else {
-        decline!("not-a-locals-builtin");
+        return Ok(None);
     };
     // Inside an inline sub-walk or an inlined callee body, the frame
     // `gettopframe_nohidden()` resolves is the CALLEE's, which the expansion
