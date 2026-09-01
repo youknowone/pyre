@@ -2837,6 +2837,21 @@ impl TraceCtx {
         }
     }
 
+    /// Whether any virtualizable array is a Rust `Vec` embedded by value in
+    /// the interpreter's live state struct.
+    ///
+    /// Such an array is owned and rewritten by the outer executor on every
+    /// opcode, so the heap — not the trace's shadow — is authoritative for it
+    /// while the walk is in progress.
+    fn has_outer_owned_array(&self, info: &crate::virtualizable::VirtualizableInfo) -> bool {
+        info.array_fields.iter().any(|a| {
+            matches!(
+                a.storage,
+                crate::virtualizable::VableArrayStorage::RustVec { .. }
+            )
+        })
+    }
+
     /// pyjitpl.py `synchronize_virtualizable()`.
     ///
     /// Writes the concrete half of `virtualizable_boxes` (the
@@ -2847,10 +2862,10 @@ impl TraceCtx {
     /// identity untouched. No-op when the heap pointer, `virtualizable_info`,
     /// or `virtualizable_values` is unavailable.
     pub fn synchronize_virtualizable(&self) {
-        self.write_virtualizable_back();
+        self.write_virtualizable_back(true);
     }
 
-    /// The same write at the one moment the carve-out below does not apply:
+    /// The same write at a moment the carve-out does not apply:
     /// `pyjitpl.py rebuild_state_after_failure`'s closing
     /// `self.synchronize_virtualizable()`.
     ///
@@ -2862,7 +2877,18 @@ impl TraceCtx {
     /// `JitState::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE` is how it
     /// says so.
     pub fn synchronize_virtualizable_after_guard_failure(&self) {
-        self.write_virtualizable_back();
+        self.write_virtualizable_back(false);
+    }
+
+    /// The same full write ahead of a residual call that is handed the
+    /// virtualizable.
+    ///
+    /// The outer executor is suspended for the duration of that call and the
+    /// callee reads the live struct, so the shadow — which carries the values
+    /// the walk has produced since the executor last wrote — is what the
+    /// callee must see, arrays included.
+    fn synchronize_virtualizable_before_residual_call(&self) {
+        self.write_virtualizable_back(false);
     }
 
     /// Materialize a tokenless state-field virtualizable before a residual
@@ -2890,7 +2916,7 @@ impl TraceCtx {
         };
         let lengths = self.virtualizable_array_lengths.clone().unwrap_or_default();
 
-        self.synchronize_virtualizable();
+        self.synchronize_virtualizable_before_residual_call();
         // Walk the fields, not the boxes: `load_fields_from_virtualizable` and
         // `reload_tokenless_virtualizable_after_residual_call` both `continue`
         // past a `Type::Void` static field, so the flat vector is shorter than
@@ -3012,7 +3038,10 @@ impl TraceCtx {
     }
 
     /// `virtualizable.py write_boxes` over the whole shadow.
-    fn write_virtualizable_back(&self) {
+    ///
+    /// `skip_outer_owned_arrays` names the one storage shape whose write-back
+    /// is not this function's to make; see the carve-out below.
+    fn write_virtualizable_back(&self, skip_outer_owned_arrays: bool) {
         let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };
@@ -3045,6 +3074,17 @@ impl TraceCtx {
             }
             array_bits.push(items);
             cursor += len;
+        }
+        // When the virtualizable array is a Rust `Vec` embedded by value in
+        // the interpreter's live state struct (`RustVec` storage), an outer
+        // executor (the macro-generated mainloop) owns that struct and writes
+        // it on every opcode. The trace's shadow is seeded from that heap and
+        // tracked for IR purposes only; flushing the shadow back here would
+        // clobber the outer executor's writes. The heap is authoritative, so
+        // skip the write-back during tracing — the resume path performs its
+        // own field-aware flush on guard failure.
+        if skip_outer_owned_arrays && self.has_outer_owned_array(info) {
+            return;
         }
         // Safety: `heap_ptr` is cached at trace/bridge entry from
         // `MetaInterp::vable_ptr`, which the JitState pins for the trace
@@ -3089,6 +3129,13 @@ impl TraceCtx {
         ) else {
             return;
         };
+        // `RustVec`-stored arrays are owned and rewritten by the outer
+        // executor on every opcode, so the shadow is deliberately not kept
+        // equal to the heap for them — the same carve-out
+        // `synchronize_virtualizable` makes before writing back.
+        if self.has_outer_owned_array(info) {
+            return;
+        }
         let static_count = info.num_static_extra_boxes;
         let shadow_data_len = values.len().saturating_sub(1);
         if shadow_data_len < static_count {
