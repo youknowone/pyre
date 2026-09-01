@@ -1899,6 +1899,14 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     // value identifies compatibility callers that still need typed-key
     // threading.
     "confirm_enter_jit_missing_key",
+    // A bridge close resolved a head target token that carries a virtual
+    // state. `unroll.py jump_to_preamble` asserts the head has none before
+    // pointing the JUMP at it, because entering a specialized label needs the
+    // guards `_jump_to_existing_trace` generates from that state, and the
+    // unconditional take has no way to produce them. The close declines
+    // instead, so a nonzero value names the traces that lost a bridge to an
+    // invariant upstream states as unreachable.
+    "bridge_close_head_target_has_virtual_state",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

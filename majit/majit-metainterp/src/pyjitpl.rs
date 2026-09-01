@@ -8392,6 +8392,31 @@ impl<M: Clone> MetaInterp<M> {
                 crate::mc_diag_bump(29); // compile_trace: no front target token
                 return CompileOutcome::Cancelled;
             };
+            // `unroll.py jump_to_preamble` reaches this same unconditional
+            // take of the head, and it opens with
+            // `assert cell_token.target_tokens[0].virtual_state is None`.
+            // That assertion is what makes the take sound: a head carrying a
+            // virtual state is a specialized label, and entering one needs the
+            // guards `_jump_to_existing_trace` derives from that state — which
+            // the take, by construction, does not emit. The crate layering
+            // keeps `virtual_state` off the backend's descr list (see the note
+            // below), so read it from the `compiled_loops` projection the head
+            // is mirrored into. Upstream states this as unreachable; declining
+            // costs a bridge where crashing would cost the process.
+            if self
+                .compiled_loops
+                .get(&green_key)
+                .and_then(|compiled| compiled.front_target_tokens.first())
+                .is_some_and(|front| front.virtual_state.is_some())
+            {
+                if crate::closedbg_enabled() {
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
+                }
+                crate::mc_diag_bump(crate::mc_diag_slot(
+                    "bridge_close_head_target_has_virtual_state",
+                ));
+                return CompileOutcome::Cancelled;
+            }
             // The descr list on the token and the value list in
             // `compiled_loops` are two projections of one thing, written by
             // separate statements, and nothing else checks that they agree.

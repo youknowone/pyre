@@ -1121,6 +1121,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "guard_resume_decline_reserved_identity",
                 "inline_frame_trim_blanked_live_int",
                 "confirm_enter_jit_missing_key",
+                "bridge_close_head_target_has_virtual_state",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
