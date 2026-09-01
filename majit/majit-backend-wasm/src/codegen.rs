@@ -550,7 +550,10 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         i32_lt_u,
         i32_ne,
         i32_or,
+        i32_shl,
+        i32_shr_u,
         i32_sub,
+        i32_xor,
         i64_add,
         i64_and,
         i64_div_s,
@@ -1328,6 +1331,129 @@ fn resolve_same_as_forwarding(base: OpRef, forwardings: &[Option<OpRef>]) -> OpR
     current
 }
 
+/// `llsupport/gc.py WriteBarrierDescr` as the emitted barrier reads it, paired
+/// with the addresses of the two helpers its arms call.
+///
+/// A zero `cards_set` is the collector saying it has no cards, which is the
+/// gate `x86/assembler.py _write_barrier_fastpath` spells as
+/// `if array and descr.jit_wb_cards_set`; the dynasm backends read the same
+/// field off the same descriptor.
+#[derive(Clone, Copy)]
+pub struct WriteBarrierHelpers {
+    /// `wasm_jit_write_barrier`, the `remember_young_pointer` entry point.
+    pub fn_ptr: i64,
+    /// `wasm_jit_write_barrier_from_array`, the
+    /// `jit_remember_young_pointer_from_array` entry point.
+    pub array_fn_ptr: i64,
+    /// `jit_wb_if_flag_byteofs`: where the flag byte sits relative to the
+    /// object pointer. Negative, because the header precedes the object.
+    pub flag_byteofs: i32,
+    /// `jit_wb_if_flag_singlebyte`.
+    pub if_flag: u8,
+    /// `jit_wb_cards_set_singlebyte`.
+    pub cards_set: u8,
+    /// `jit_wb_card_page_shift`.
+    pub card_page_shift: u32,
+}
+
+impl WriteBarrierHelpers {
+    /// Take the geometry from a collector's descriptor. The addresses are the
+    /// backend's own exported helpers, so they are supplied separately.
+    pub fn new(fn_ptr: i64, array_fn_ptr: i64, descr: &majit_gc::WriteBarrierDescr) -> Self {
+        Self {
+            fn_ptr,
+            array_fn_ptr,
+            flag_byteofs: descr.jit_wb_if_flag_byteofs,
+            if_flag: descr.jit_wb_if_flag_singlebyte,
+            cards_set: descr.jit_wb_cards_set_singlebyte as u8,
+            card_page_shift: descr.jit_wb_card_page_shift,
+        }
+    }
+
+    /// The geometry the running collector advertises, for a caller that has no
+    /// descriptor in hand.
+    pub fn for_current_gc(fn_ptr: i64, array_fn_ptr: i64) -> Self {
+        Self::new(
+            fn_ptr,
+            array_fn_ptr,
+            &majit_gc::WriteBarrierDescr::for_current_gc(),
+        )
+    }
+
+    /// The `TEST8` mask: the TRACK_YOUNG_PTRS byte, widened to also catch
+    /// CARDS_SET when this store can mark a card, so one test covers both
+    /// arms (`_write_barrier_fastpath`: `mask = jit_wb_if_flag_singlebyte |
+    /// -0x80`).
+    fn flag_mask(&self, card_marking: bool) -> i32 {
+        let mask = if card_marking {
+            self.if_flag | self.cards_set
+        } else {
+            self.if_flag
+        };
+        i32::from(mask)
+    }
+}
+
+/// `rewrite.py RewriteState._known_lengths`: the constant length a `NEW_ARRAY`
+/// in this trace gave its result.
+///
+/// `emit_label` clears the map, because past a merge point the length is only
+/// known on the path that allocated. A collecting operation does not clear it —
+/// an array's length outlives a collection.
+#[derive(Default)]
+struct KnownArrayLengths(indexmap::IndexMap<OpRef, usize>);
+
+impl KnownArrayLengths {
+    /// `handle_new_array`: `if isinstance(v_length, ConstInt)`, keyed on the
+    /// allocation's own result.
+    fn observe(&mut self, op: &Op, constants: &indexmap::IndexMap<u32, i64>) {
+        match op.opcode {
+            OpCode::Label => self.0.clear(),
+            OpCode::NewArray | OpCode::NewArrayClear => {
+                if let Some(length) = const_operand_value(constants, op.arg(0).to_opref())
+                    && let Ok(length) = usize::try_from(length)
+                {
+                    self.0.insert(op.pos.get(), length);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `known_length(op, default)`.
+    fn get(&self, base: OpRef, default: usize) -> usize {
+        self.0.get(&base).copied().unwrap_or(default)
+    }
+}
+
+/// The element index a card-marking barrier needs, or `None` for a store that
+/// takes the plain barrier.
+///
+/// `rewrite.py gen_write_barrier_array` reaches for `COND_CALL_GC_WB_ARRAY`
+/// only when the collector has cards and the array is not statically known to
+/// be short: a short array is cheaper to remember whole than to card-mark index
+/// by index. SETFIELD_GC carries no index and never card-marks.
+fn write_barrier_card_index(
+    op: &Op,
+    wb: &WriteBarrierHelpers,
+    base_key: OpRef,
+    known_lengths: &KnownArrayLengths,
+) -> Option<OpRef> {
+    /// `gen_write_barrier_array`'s own `LARGE`.
+    const LARGE: usize = 130;
+    if wb.cards_set == 0 || wb.array_fn_ptr == 0 {
+        return None;
+    }
+    if known_lengths.get(base_key, LARGE) < LARGE {
+        return None;
+    }
+    matches!(
+        op.opcode,
+        OpCode::SetarrayitemGc | OpCode::SetinteriorfieldGc
+    )
+    .then(|| op.arg(1).to_opref())
+}
+
 /// Emit a store write barrier unless the base's forwarded value already has
 /// one on this path. The emitted barrier still receives the store's own base.
 #[allow(clippy::too_many_arguments)]
@@ -1337,85 +1463,212 @@ fn emit_write_barrier_if_needed(
     value_types: &ValueLocals,
     jit_call_idx: Option<u32>,
     residual_type_base: Option<u32>,
-    wb_fn_ptr: i64,
+    wb: &WriteBarrierHelpers,
+    op: &Op,
     base: Option<OpRef>,
     same_as_forwardings: &[Option<OpRef>],
     wb_applied: &mut indexmap::IndexSet<OpRef>,
+    known_lengths: &KnownArrayLengths,
 ) {
     let Some(base) = base else {
         return;
     };
+    // rewrite.py `handle_write_barrier_setfield` and
+    // `handle_write_barrier_setarrayitem` both open with the same
+    // `write_barrier_applied(val)` test, before either picks an arm.
     let wb_key = resolve_same_as_forwarding(base, same_as_forwardings);
     if wb_applied.contains(&wb_key) {
         return;
     }
+    let card_index = write_barrier_card_index(op, wb, wb_key, known_lengths);
     emit_write_barrier(
         sink,
         constants,
         value_types,
         jit_call_idx,
         residual_type_base,
-        wb_fn_ptr,
+        wb,
         base,
+        card_index,
     );
-    // rewrite.rs's `gen_write_barrier`: remember only after the
-    // barrier has been emitted.
-    wb_applied.insert(wb_key);
+    // rewrite.rs's `gen_write_barrier`: remember only after the barrier has
+    // been emitted. `gen_write_barrier_array` remembers nothing at all, since
+    // a card records one index and the next store may name another.
+    if card_index.is_none() {
+        wb_applied.insert(wb_key);
+    }
+}
+
+/// Push the barrier flag byte, the operand of `TEST8 [obj + jit_wb_if_flag_byteofs]`.
+fn emit_load_wb_flag_byte(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    wb: &WriteBarrierHelpers,
+    base_ref: OpRef,
+) {
+    emit_resolve(sink, constants, value_types, base_ref);
+    sink.i32_wrap_i64();
+    sink.i32_const(wb.flag_byteofs);
+    sink.i32_add();
+    sink.i32_load8_u(memarg(0, 0));
+}
+
+/// Push `index >> card_page_shift`, the card bit's index.
+fn emit_push_card_bitindex(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    wb: &WriteBarrierHelpers,
+    index: OpRef,
+) {
+    emit_resolve(sink, constants, value_types, index);
+    sink.i32_wrap_i64();
+    if wb.card_page_shift != 0 {
+        sink.i32_const(wb.card_page_shift as i32);
+        sink.i32_shr_u();
+    }
+}
+
+/// Push the address `incminimark.py get_card` computes:
+/// `obj - HEADER + ~(bitindex >> 3)`.
+///
+/// `WriteBarrierSlowPath` builds it in the same order — shift, `NOT`, subtract
+/// the header, add the base — so that only the last term needs the object.
+fn emit_push_card_addr(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    wb: &WriteBarrierHelpers,
+    base_ref: OpRef,
+    index: OpRef,
+) {
+    emit_push_card_bitindex(sink, constants, value_types, wb, index);
+    sink.i32_const(3);
+    sink.i32_shr_u();
+    sink.i32_const(-1);
+    sink.i32_xor();
+    sink.i32_const(majit_gc::header::GcHeader::SIZE as i32);
+    sink.i32_sub();
+    emit_resolve(sink, constants, value_types, base_ref);
+    sink.i32_wrap_i64();
+    sink.i32_add();
+}
+
+/// `*get_card(obj, bitindex >> 3) |= 1 << (bitindex & 7)`.
+///
+/// The address is built twice rather than parked in a local: every term is
+/// pure arithmetic, which the guest optimizer both folds and commons, while a
+/// local would have to be carved out of the `UintMulHigh` scratch pool.
+///
+/// `remember_young_pointer_from_array2` returns early when the bit is already
+/// set; the inlined form ORs unconditionally, exactly as
+/// `WriteBarrierSlowPath` does.
+fn emit_inline_card_mark(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    wb: &WriteBarrierHelpers,
+    base_ref: OpRef,
+    index: OpRef,
+) {
+    emit_push_card_addr(sink, constants, value_types, wb, base_ref, index);
+    emit_push_card_addr(sink, constants, value_types, wb, base_ref, index);
+    sink.i32_load8_u(memarg(0, 0));
+    sink.i32_const(1);
+    emit_push_card_bitindex(sink, constants, value_types, wb, index);
+    sink.i32_const(7);
+    sink.i32_and();
+    sink.i32_shl();
+    sink.i32_or();
+    sink.i32_store8(memarg(0, 0));
+}
+
+/// Call a one-arg `(i64)->i64` barrier helper and drop the dummy 0 result.
+fn emit_wb_helper_call(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    residual_type_base: u32,
+    fn_ptr: i64,
+    base_ref: OpRef,
+) {
+    emit_resolve(sink, constants, value_types, base_ref);
+    sink.i32_const(fn_ptr as i32);
+    sink.call_indirect(0, residual_type_base + 1);
+    sink.drop();
 }
 
 /// Emit a write-barrier check on `base_ref` before a ref-storing field/array
 /// store, standing in for the `COND_CALL_GC_WB` the native GC rewrite pass
-/// inserts. When the residual type family is declared (`residual_type_base`),
-/// the TRACK_YOUNG_PTRS flag is tested INLINE (assembler.py:2382
-/// `genop_discard_cond_call_gc_wb` — test the header flag byte, jump over the
-/// slow call when clear) and only a flagged old object takes the
-/// `wasm_jit_write_barrier` `call_indirect`; a young or already-remembered
-/// base skips the helper entirely. Otherwise the unconditional helper routes
-/// through the `jit_call` host trampoline (the helper re-checks the flag).
-/// Operand-stack-neutral: every push is consumed by a store, the call, or
-/// the result drop.
+/// inserts.
+///
+/// With the residual type family declared (`residual_type_base`), this is
+/// `_write_barrier_fastpath`: one test of the flag byte, and only a flagged
+/// object enters the body. A `card_index` store then follows
+/// `WriteBarrierSlowPath` — CARDS_SET already armed marks the card inline,
+/// otherwise `jit_remember_young_pointer_from_array` runs and the same test
+/// decides again on its return. Everything else calls `wasm_jit_write_barrier`.
+///
+/// Operand-stack-neutral: every push is consumed by a store, the call, or the
+/// result drop.
+#[allow(clippy::too_many_arguments)]
 fn emit_write_barrier(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     jit_call_idx: Option<u32>,
     residual_type_base: Option<u32>,
-    wb_fn_ptr: i64,
+    wb: &WriteBarrierHelpers,
     base_ref: OpRef,
+    card_index: Option<OpRef>,
 ) {
     if let Some(base) = residual_type_base {
-        // Header word is a u64 at `obj - GcHeader::SIZE` with the flags in
-        // its upper half (`FLAG_SHIFT == 32`), so on little-endian wasm32 the
-        // flags live in the i32 at `obj - 4`; TRACK_YOUNG_PTRS is flag bit 0.
-        const FLAGS_HALF_BACKOFS: i32 = (majit_gc::header::GcHeader::SIZE / 2) as i32;
-        const WB_FLAG: i32 = majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS.bits() as i32;
-        const _: () = assert!(majit_gc::header::FLAG_SHIFT == 32);
-        const _: () = assert!(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS.bits() <= u32::MAX as u64);
-        emit_resolve(sink, constants, value_types, base_ref);
-        sink.i32_wrap_i64();
-        sink.i32_const(FLAGS_HALF_BACKOFS);
-        sink.i32_sub();
-        sink.i32_load(MemArg {
-            offset: 0,
-            align: 2,
-            memory_index: 0,
-        });
-        sink.i32_const(WB_FLAG);
+        emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
+        sink.i32_const(wb.flag_mask(card_index.is_some()));
         sink.i32_and();
         sink.if_(BlockType::Empty);
-        emit_resolve(sink, constants, value_types, base_ref);
-        sink.i32_const(wb_fn_ptr as i32);
-        sink.call_indirect(0, base + 1);
-        sink.drop(); // returns 0; ignored
+        match card_index {
+            Some(index) => {
+                emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
+                sink.i32_const(i32::from(wb.cards_set));
+                sink.i32_and();
+                sink.if_(BlockType::Empty);
+                emit_inline_card_mark(sink, constants, value_types, wb, base_ref, index);
+                sink.else_();
+                emit_wb_helper_call(
+                    sink,
+                    constants,
+                    value_types,
+                    base,
+                    wb.array_fn_ptr,
+                    base_ref,
+                );
+                emit_load_wb_flag_byte(sink, constants, value_types, wb, base_ref);
+                sink.i32_const(i32::from(wb.cards_set));
+                sink.i32_and();
+                sink.if_(BlockType::Empty);
+                emit_inline_card_mark(sink, constants, value_types, wb, base_ref, index);
+                sink.end();
+                sink.end();
+            }
+            None => {
+                emit_wb_helper_call(sink, constants, value_types, base, wb.fn_ptr, base_ref);
+            }
+        }
         sink.end();
         return;
     }
+    // Host-trampoline fallback: the call area carries the base and nothing
+    // else, so this arm always takes the plain barrier, which is
+    // `gen_write_barrier_array`'s own fall-back case. The helper re-checks the
+    // flag itself.
     let Some(jit_call) = jit_call_idx else {
         return;
     };
     // func_ptr = wasm_jit_write_barrier
     emit_call_area_addr(sink);
-    sink.i64_const(wb_fn_ptr);
+    sink.i64_const(wb.fn_ptr);
     sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
     // num_args = 1 (the trampoline reflects arity from the wasm signature;
     // written for protocol symmetry with the alloc/call paths)
@@ -2552,7 +2805,7 @@ pub struct ModuleBuildInputs {
     pub classptr_to_typeid: HashMap<i64, u32>,
     pub guard_gc_type_info: GuardGcTypeInfo,
     pub alloc: AllocHelpers,
-    pub wb_fn_ptr: i64,
+    pub wb: WriteBarrierHelpers,
     pub nursery: Option<NurseryAllocParams>,
     pub invalidated_flag_addr: u32,
     pub gc_table_base: u32,
@@ -2712,7 +2965,7 @@ impl Clone for ModuleBuildInputs {
             classptr_to_typeid: self.classptr_to_typeid.clone(),
             guard_gc_type_info: self.guard_gc_type_info.clone(),
             alloc: self.alloc,
-            wb_fn_ptr: self.wb_fn_ptr,
+            wb: self.wb,
             nursery: self.nursery.clone(),
             invalidated_flag_addr: self.invalidated_flag_addr,
             gc_table_base: self.gc_table_base,
@@ -2866,7 +3119,7 @@ pub fn build_wasm_module(
         classptr_to_typeid,
         guard_gc_type_info,
         alloc,
-        wb_fn_ptr,
+        wb,
         nursery,
         invalidated_flag_addr,
         gc_table_base,
@@ -3471,7 +3724,7 @@ pub fn build_wasm_module(
         classptr_to_typeid,
         guard_gc_type_info,
         *alloc,
-        *wb_fn_ptr,
+        wb,
         nursery.as_ref(),
         &ref_values,
         &ref_homes,
@@ -3613,7 +3866,7 @@ fn build_function(
     classptr_to_typeid: &HashMap<i64, u32>,
     guard_gc_type_info: &GuardGcTypeInfo,
     alloc: AllocHelpers,
-    wb_fn_ptr: i64,
+    wb: &WriteBarrierHelpers,
     nursery: Option<&NurseryAllocParams>,
     ref_values: &RefValues,
     ref_homes: &RefHomes,
@@ -4120,6 +4373,7 @@ fn build_function(
     // at every potentially-collecting op and LABEL so this describes every
     // path reaching the next op, including entry through a LABEL loader.
     let mut wb_applied = indexmap::IndexSet::<OpRef>::new();
+    let mut known_lengths = KnownArrayLengths::default();
     let same_as_forwardings = same_as_forwardings(ops, num_vars);
 
     // A merged region whose closing JUMP names a LABEL published by another
@@ -4146,6 +4400,7 @@ fn build_function(
         if op.opcode == OpCode::Label || op.opcode.can_malloc() {
             wb_applied.clear();
         }
+        known_lengths.observe(op, constants);
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
             // End of the segment before label j (key-0 / earlier-label path).
             // Branch over the resume loader, then close C_j, emit the loader
@@ -5130,10 +5385,12 @@ fn build_function(
                     value_types,
                     jit_call_idx,
                     residual_type_base,
-                    wb_fn_ptr,
+                    wb,
+                    op,
                     emitted_write_barrier_base(op, ref_values),
                     &same_as_forwardings,
                     &mut wb_applied,
+                    &known_lengths,
                 );
                 emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // struct ptr
                 sink.i32_wrap_i64();
@@ -5214,10 +5471,12 @@ fn build_function(
                     value_types,
                     jit_call_idx,
                     residual_type_base,
-                    wb_fn_ptr,
+                    wb,
+                    op,
                     emitted_write_barrier_base(op, ref_values),
                     &same_as_forwardings,
                     &mut wb_applied,
+                    &known_lengths,
                 );
                 let base_size = emit_array_addr(&mut sink, constants, value_types, op);
                 if array_item_is_float_from_descr(op) {

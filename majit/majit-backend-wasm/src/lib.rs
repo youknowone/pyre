@@ -1712,6 +1712,36 @@ pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
     0
 }
 
+/// Array-store counterpart of [`wasm_jit_write_barrier`].
+///
+/// `incminimark.py jit_remember_young_pointer_from_array` / dynasm
+/// `dynasm_write_barrier_from_array`: the JIT has already seen
+/// TRACK_YOUNG_PTRS set and CARDS_SET clear. If the object has cards,
+/// arm CARDS_SET; otherwise fall back to the generic remembered-set
+/// path. The caller then marks the card inline when CARDS_SET is set.
+pub extern "C" fn wasm_jit_write_barrier_from_array(obj: i64) -> i64 {
+    with_wasm_active_gc_mut(|gc| gc.jit_remember_young_pointer_from_array(GcRef(obj as usize)));
+    0
+}
+
+/// The write-barrier geometry and helper addresses the emitted barrier reads.
+///
+/// `gc.py` sets `write_barrier_descr` from the collector, and the backends read
+/// it back rather than assuming a layout: `jit_wb_cards_set` is zero for a
+/// collector configured without cards, and `jit_wb_card_page_shift` is that
+/// collector's own shift. Falling back to the current header layout when no GC
+/// is live mirrors `dynasm_write_barrier_descr`.
+fn wasm_write_barrier_helpers() -> codegen::WriteBarrierHelpers {
+    // `fn as usize` is the `__indirect_function_table` index on wasm32; taking
+    // it here keeps the function in the table.
+    let fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
+    let array_fn_ptr = wasm_jit_write_barrier_from_array as *const () as usize as i64;
+    match with_wasm_active_gc(|gc| gc.get_write_barrier_descr()).flatten() {
+        Some(descr) => codegen::WriteBarrierHelpers::new(fn_ptr, array_fn_ptr, &descr),
+        None => codegen::WriteBarrierHelpers::for_current_gc(fn_ptr, array_fn_ptr),
+    }
+}
+
 /// Self-recursive CALL_ASSEMBLER (`PYRE_WASM_CA`) callee-frame allocation
 /// helper. Allocates the callee's execution frame as a young nursery
 /// GC-managed `JitFrame`, mirroring rewrite.py's nursery frame allocation:
@@ -3694,7 +3724,7 @@ impl majit_backend::Backend for WasmBackend {
         // `jit_call` trampoline. `fn as usize` is the `__indirect_function_table`
         // index on wasm32; taking it here keeps the function in the table.
         let alloc = alloc_helpers();
-        let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
+        let wb = wasm_write_barrier_helpers();
         // Exit indices come from the global fail-index space so a cross-trace
         // chain's `frame[0]` resolves regardless of which module wrote it
         // (`failguard::FAIL_DESCR_REGISTRY`).
@@ -3712,7 +3742,7 @@ impl majit_backend::Backend for WasmBackend {
             classptr_to_typeid: typeid_table,
             guard_gc_type_info,
             alloc,
-            wb_fn_ptr,
+            wb,
             nursery: nursery_alloc_params(ops),
             invalidated_flag_addr: Arc::as_ptr(&token.invalidated) as usize as u32,
             gc_table_base,
@@ -4596,7 +4626,7 @@ impl majit_backend::Backend for WasmBackend {
         let typeid_table = self.collect_classptr_typeid_table(ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info(ops);
         let alloc = alloc_helpers();
-        let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
+        let wb = wasm_write_barrier_helpers();
 
         // CALL_ASSEMBLER: the CA arm allocates a fresh callee using the target
         // token's frozen geometry. The earlier frame-fit decline guarantees a
@@ -4680,7 +4710,7 @@ impl majit_backend::Backend for WasmBackend {
             classptr_to_typeid: typeid_table,
             guard_gc_type_info,
             alloc,
-            wb_fn_ptr,
+            wb,
             nursery: nursery_alloc_params(ops),
             invalidated_flag_addr: Arc::as_ptr(&bridge_flag) as usize as u32,
             gc_table_base,
