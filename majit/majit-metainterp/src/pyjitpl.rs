@@ -9796,6 +9796,11 @@ impl<M: Clone> MetaInterp<M> {
         self.clear_retrace_state();
         if let Some(ctx) = self.tracing.take() {
             let green_key = ctx.green_key;
+            // A recorder panic settles the question the `MAX_TRACE_ABORT_COUNT`
+            // ceiling would otherwise take that many attempts to reach: the walk
+            // stopped on something about the jitcode it was reading, so every
+            // later attempt at this key reads it again. Ban the key here.
+            let permanent = permanent || ctx.recorder_panicked;
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] abort trace at key={} (permanent={})",
