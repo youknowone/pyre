@@ -1497,6 +1497,15 @@ mod host_abi {
         majit_backend_wasm::set_inline_trip_bytes_factor(entries_per_byte);
     }
 
+    /// Decline the eager merge arm once the owner module it would re-emit is
+    /// larger than the argument, in bytes. The host owns the environment, so a
+    /// run that wants a ceiling other than the built-in one carries it in here
+    /// before tracing begins.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_inline_eager_max_bytes(max_bytes: u32) {
+        majit_backend_wasm::set_inline_eager_max_bytes(max_bytes);
+    }
+
     /// Disable the default guard-to-bridge parameter entries. The host owns
     /// the environment, so this call carries its explicit opt-out into the
     /// guest before tracing begins.

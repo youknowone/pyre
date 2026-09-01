@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
 /// `pyre_jit_bridge_diag` guest export (the runner prints them at
@@ -121,6 +121,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 /// the trip threshold to keep a quasi-immutable dependency attached to the
 /// owner's flag, and pays an owner re-emission whether or not the region ever
 /// runs hot; a region that saves only its entry crossing does not earn it.
+///
+/// 65 = the same eager arm declined an owner already too large to re-emit. The
+/// arm cannot wait for the entry evidence the deferred arm waits for, so the
+/// only thing it can read is what the re-emission will cost.
 pub static BRIDGE_DIAG: [AtomicU64; BRIDGE_DIAG_LABELS.len()] =
     [const { AtomicU64::new(0) }; BRIDGE_DIAG_LABELS.len()];
 
@@ -202,6 +206,7 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "ca_decl_geometry",
     "ca_decl_terminal",
     "inline_decl_foreign_eager",
+    "inline_decl_eager_too_large",
 ];
 
 #[repr(u8)]
@@ -339,6 +344,9 @@ static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 /// `inline_trip_threshold_for`. Zero leaves `INLINE_TRIP_THRESHOLD` as the
 /// whole rule.
 static INLINE_TRIP_BYTES_FACTOR: AtomicU64 = AtomicU64::new(DEFAULT_INLINE_TRIP_BYTES_FACTOR);
+/// Owner size at which the eager merge arm stops merging. See
+/// `DEFAULT_INLINE_EAGER_MAX_BYTES`.
+static INLINE_EAGER_MAX_BYTES: AtomicU32 = AtomicU32::new(DEFAULT_INLINE_EAGER_MAX_BYTES);
 static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
 
 /// One compiled trace's guest-memory entry counters.  The generated module
@@ -494,6 +502,21 @@ fn inline_nonheader_enabled() -> bool {
 /// Zero leaves [`INLINE_TRIP_THRESHOLD`] as the whole rule.
 pub fn set_inline_trip_bytes_factor(entries_per_byte: u64) {
     INLINE_TRIP_BYTES_FACTOR.store(entries_per_byte, Ordering::Relaxed);
+}
+
+/// The wasm loop `token` was last compiled as, when it has one. Both merge
+/// arms price themselves off its `module_bytes`.
+fn compiled_wasm_loop(token: &JitCellToken) -> Option<&CompiledWasmLoop> {
+    token
+        .compiled
+        .get()
+        .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+}
+
+/// Set the owner size at which the eager merge arm declines, from the host
+/// before guest execution, in place of [`DEFAULT_INLINE_EAGER_MAX_BYTES`].
+pub fn set_inline_eager_max_bytes(max_bytes: u32) {
+    INLINE_EAGER_MAX_BYTES.store(max_bytes, Ordering::Relaxed);
 }
 
 /// Entries the bridge standing in for a merge must be entered before the merge
@@ -2025,6 +2048,22 @@ const INLINE_TRIP_THRESHOLD: u64 = 100_000;
 /// are postponed by an amount too small to charge them anything. Twice this is
 /// already inside the band where postponement dominates.
 const DEFAULT_INLINE_TRIP_BYTES_FACTOR: u64 = 40;
+
+/// Bytes of owner module above which the eager merge arm declines.
+///
+/// That arm merges before the compile returns, so a quasi-immutable fold's
+/// dependencies attach to the owner's flag rather than to a temporary bridge's
+/// — which is why it cannot wait for entry evidence the way
+/// [`inline_trip_threshold_for`] does. What it can read is the re-emission it
+/// is about to buy, and successive merges into one owner re-emit it whole each
+/// time: four merges into one owner re-emit it four times, at every size it
+/// passes through on the way.
+///
+/// The value is where the corpus stops paying for those re-emissions and has
+/// not yet started losing the merges that earn theirs. Below it the fixtures
+/// whose merge removes millions of crossings begin to lose it, and each one
+/// costs several times what the re-emissions saved.
+const DEFAULT_INLINE_EAGER_MAX_BYTES: u32 = 4096;
 
 /// A merge that passed every inline check and is waiting on
 /// [`INLINE_TRIP_THRESHOLD`] entries into the bridge compiled in its place.
@@ -4491,6 +4530,15 @@ impl majit_backend::Backend for WasmBackend {
                         // warmup on a workload too short to amortize one.
                         diag_bump(64);
                         decline("foreign_eager");
+                    } else if compiled_wasm_loop(&owner).is_some_and(|loop_| {
+                        loop_.module_bytes.get() > INLINE_EAGER_MAX_BYTES.load(Ordering::Relaxed)
+                    }) {
+                        // The re-emission this arm pays for is the whole owner,
+                        // and it takes it without the entry evidence the
+                        // deferred arm waits for. Past this size that trade is
+                        // one the region cannot be shown to earn.
+                        diag_bump(65);
+                        decline("eager_too_large");
                     } else {
                         // Deferral would register this region's dependencies
                         // against its temporary bridge flag. A header region
@@ -4603,11 +4651,8 @@ impl majit_backend::Backend for WasmBackend {
             // field rather than by value: a later re-emission reallocates the
             // array and the probe has to reach the live one. The owner's size
             // travels by value, because it prices this merge alone.
-            let (cells_base_ptr, owner_module_bytes) = owner
-                .compiled
-                .get()
-                .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-                .map_or((0, 0), |loop_| {
+            let (cells_base_ptr, owner_module_bytes) =
+                compiled_wasm_loop(&owner).map_or((0, 0), |loop_| {
                     (
                         &loop_.bridge_cells_base as *const std::cell::Cell<u32> as usize as u32,
                         loop_.module_bytes.get(),
