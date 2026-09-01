@@ -7482,9 +7482,9 @@ where
                     //    can_invalidate, can_collect,
                     //    call_release_gil_target) into the trace IR
                     //    instead of re-deriving the default for the opcode.
-                    //    The OS_LIBFFI_CALL pre-hook
-                    //    (`pyjitpl.py:2059-2061`) declines at the top of this
-                    //    branch, so the calldescr reaching here is the
+                    //    The OS_LIBFFI_CALL pre-hook in
+                    //    `pyjitpl.py do_residual_call` declines at the top of
+                    //    this branch, so the calldescr reaching here is the
                     //    original one.
                     let effect_info = calldescr.extra_info.clone();
                     if is_release_gil {
