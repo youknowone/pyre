@@ -5827,3 +5827,46 @@ fn interior_field_ops_compile() {
     assert_eq!(mul, 2, "item_size 16 is the IMUL fallback (set + get)");
     assert_eq!(shl, 1, "item_size 8 on the RAW store is get_scale 3");
 }
+
+/// `genop_discard_cond_call`: CondCallN is a real conditional call, not a no-op.
+#[test]
+fn cond_call_n_emits_predicate_and_trampoline() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::CondCallN,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::const_int(0x100),
+                OpRef::input_arg_int(1),
+            ],
+            OpRef::NONE,
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let mut eqz = 0;
+    let mut ifs = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::I64Eqz => eqz += 1,
+                    wasmparser::Operator::If { .. } => ifs += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(eqz >= 1, "CondCallN tests the predicate with i64.eqz");
+    assert!(ifs >= 1, "CondCallN wraps the call in an if");
+    assert!(
+        import_func_type(&bytes, "jit_call_compact").is_some(),
+        "CondCallN uses the residual trampoline"
+    );
+}

@@ -5686,14 +5686,69 @@ fn build_function(
             }
 
             // ── Conditional calls ──
-            OpCode::CondCallN | OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
+            OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 // No-op: the wasm backend does not consume the explicit
                 // COND_CALL_GC_WB / COND_CALL_GC_WB_ARRAY barrier ops. It emits
                 // the write barrier inline at each ref-store instead
-                // (`write_barrier_base` + `emit_write_barrier`, calling the
-                // `wasm_jit_write_barrier` host helper), so the standalone
-                // barrier op is redundant here. CondCallN is a conditional void
-                // call the wasm MVP does not need.
+                // (`write_barrier_base` + `emit_write_barrier`).
+            }
+            OpCode::CondCallN => {
+                // x86/assembler.py `genop_discard_cond_call`: TEST cond; JZ
+                // skip; CALL. The predicate is arg 0, the callee is arg 1, and
+                // the rest are the call's own arguments. The callee reaches the
+                // host through the same trampoline `CallN` uses; none of the
+                // residual `call_indirect` families admits this opcode, so
+                // `has_trampoline_calls` always imports `jit_call` for it.
+                //
+                // `do_conditional_call` asserts the callee forces no virtual or
+                // virtualizable, so unlike the CALL arm this needs no force
+                // bracket.
+                let jit_call =
+                    jit_call_idx.expect("COND_CALL op present but jit_call not imported");
+                let func = op.arg(1).to_opref();
+                let call_args = &op.getarglist()[2..];
+                // The predicate is a full word: `i32.wrap_i64` would read a
+                // value whose only set bits are above 32 as false, so the test
+                // has to be `i64.eqz` and the call has to sit in the else arm.
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                sink.i64_eqz();
+                sink.if_(BlockType::Empty);
+                sink.else_();
+                emit_call_area_addr(&mut sink);
+                emit_resolve(&mut sink, constants, value_types, func);
+                sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+                emit_call_area_addr(&mut sink);
+                sink.i64_const(call_args.len() as i64);
+                sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+                for (i, arg) in call_args.iter().enumerate() {
+                    emit_call_area_addr(&mut sink);
+                    emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
+                }
+                emit_jit_call(&mut sink, jit_call);
+                sink.end();
+                // COND_CALL sits inside the CALL opcode range, so a Ref living
+                // across it already owns a home; the collection that home
+                // exists for can happen on the taken arm. Reloading after the
+                // `if` covers both arms, and on the untaken one it re-reads
+                // slots the stores kept current.
+                if call_can_collect(op) {
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        None,
+                        frame,
+                    );
+                }
             }
 
             // x86/assembler.py genop_guard_guard_gc_type:
