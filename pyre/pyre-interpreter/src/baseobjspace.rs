@@ -10545,6 +10545,50 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
     Ok(bound)
 }
 
+/// The [`load_special_resolve`] shape that reduces, purely, to
+/// `w_method_new(w_descr, w_obj, w_type)`.
+///
+/// LOAD_SPECIAL looks the method up on the type alone, so — unlike
+/// [`bound_method_attr_fast_path`] — there is no instance dict to be shadowed
+/// by and no `__getattribute__` to be overridden: pinning the receiver's class
+/// and the type's version tag is the whole precondition.  The descriptor must
+/// be an exact `function`, the one kind whose `__get__` reduces to that
+/// constructor on both of `get`'s routes (the builtin-code arm, and the
+/// general `__get__` lookup that reaches `descr_function_get`); every other
+/// kind may run Python while binding.
+///
+/// Returns `(w_type, version_tag, w_descr)` when the reduction holds, `None`
+/// otherwise.
+///
+/// # Safety
+/// `w_obj` must be a valid object pointer (null tolerated).
+pub unsafe fn load_special_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    if w_obj.is_null() {
+        return None;
+    }
+    let w_type = crate::typedef::r#type(w_obj)?.as_ptr();
+    // The tracer pins the class by guarding the receiver's `w_class` slot, so
+    // only a receiver whose class IS that slot can be reproduced.  Exception
+    // instances carrying the generic stub resolve their class through the kind
+    // registry instead and are declined here.
+    if !std::ptr::eq(w_type, (*w_obj).w_class) {
+        return None;
+    }
+    // typeobject.py: an uncacheable type cannot pin the lookup.
+    let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
+    if version_tag == 0 {
+        return None;
+    }
+    let w_descr = lookup_in_type(w_type, name)?;
+    if !std::ptr::eq((*w_descr).ob_type, &crate::FUNCTION_TYPE as *const _) {
+        return None;
+    }
+    Some((w_type, version_tag, w_descr))
+}
+
 /// CPython 3.14 `PyType_GetFullyQualifiedName` — the `%T` formatting name.
 /// Heap types use `<module>.<qualname>`, except that `builtins` and
 /// `__main__` are omitted.  Static types retain their registered name.

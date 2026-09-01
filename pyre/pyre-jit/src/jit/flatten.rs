@@ -679,6 +679,9 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
         // `call.py` analyzed `EF_CAN_RAISE`. Matches the EI
         // `effect_info_for_call_flavor` hands the same flavor.
         CallFlavor::Plain => EffectInfoSlot::Unanalyzed,
+        // `call.py getcalldescr` — `EF_CAN_RAISE` (`elif
+        // self._canraise(op):` branch).
+        CallFlavor::CanRaise => EffectInfoSlot::CanRaise,
         // `call.py getcalldescr` — `EF_CANNOT_RAISE` (`else` branch).
         // RPython has a single `EF_CANNOT_RAISE` constant; the "no heap
         // touched" property of `PlainCannotRaiseNoHeap` is captured in
@@ -760,6 +763,13 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
         // not the `graphanalyze.py analyze_external_call`
         // `bottom_result()` reserved for external C functions.
         CallFlavor::Plain => majit_metainterp::default_effect_info(),
+        // `EF_CAN_RAISE` — `call.py`'s `elif self._canraise(op):` row.
+        // `check_can_raise()` holds (5 > `EF_CANNOT_RAISE`) so the
+        // walker keeps the trailing `GUARD_NO_EXCEPTION`, while
+        // `check_forces_virtual_or_virtualizable()` (`>= 6`) does not,
+        // so no `GUARD_NOT_FORCED` and no virtualizable force precede
+        // the call.
+        CallFlavor::CanRaise => majit_metainterp::can_raise_effect_info(),
         // `EF_CANNOT_RAISE` — `call.py else:` row of `getcalldescr`
         // (non-elidable + `_canraise(op) == False`). Same
         // analyzer-empty external-call shape as `Plain`, just with
@@ -899,6 +909,8 @@ pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
         ExtraEffect::ElidableCanRaise => CallFlavor::PureCanRaise,
         // `call.py getcalldescr`'s non-elidable cannot-raise branch.
         ExtraEffect::CannotRaise => CallFlavor::PlainCannotRaise,
+        // `call.py getcalldescr`'s non-elidable can-raise branch.
+        ExtraEffect::CanRaise => CallFlavor::CanRaise,
         _ => CallFlavor::Plain,
     }
 }
@@ -926,6 +938,24 @@ pub enum CallFlavor {
     /// no-graph `top_result()` outcome. Producers that know more pick
     /// one of the flavors below.
     Plain,
+    /// `EF_CAN_RAISE` (`effectinfo.py:22`). `call.py getcalldescr`'s
+    /// `elif self._canraise(op):` branch — the callee's graph WAS
+    /// analyzed, the write analyzer produced a concrete (here empty)
+    /// set, and the virtualizable analyzer declined, so nothing in the
+    /// callee can force a virtualizable.  `pyjitpl.py do_residual_call`
+    /// records a plain `CALL_*` with a trailing `GUARD_NO_EXCEPTION`
+    /// and no `GUARD_NOT_FORCED`.
+    ///
+    /// Maps to `can_raise_effect_info()` = `EffectInfo::const_new(
+    /// CanRaise, None)`: every six `_*_descrs_*` raw set + `*_descrs_*`
+    /// bitstring = `Some(Vec::new())`, `can_collect=true`.  Picking it
+    /// therefore asserts the callee writes no field or array the trace
+    /// has cached; a helper that mutates a namespace dict, a list's
+    /// items, or a function field must stay on [`CallFlavor::Plain`],
+    /// whose `EF_RANDOM_EFFECTS` row routes through `heap.py`'s
+    /// `clean_caches`.  Allocation is not such a write: a fresh object
+    /// is in no cache.
+    CanRaise,
     /// `EF_CANNOT_RAISE` (`effectinfo.py:19`). `call.py getcalldescr`
     /// picks this on the non-elidable `else` branch when
     /// `_canraise(op) == False` — `pyjitpl.py do_residual_call`
@@ -2646,7 +2676,6 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "simple_call"
             | "getattr"
             | "load_special"
-            | "load_special_self"
             | "load_fast_check"
             | "store_attr"
             | "binary_slice"
@@ -3455,11 +3484,6 @@ pub struct LoweringContext {
     /// ListR([obj]), Descr) → reg`; the helper resolves the fixed method name
     /// from the discriminant and runs `getattr` (`MayForce`).
     pub load_special_fn_idx: u16,
-    /// `load_special_self_fn` descrs-pool index.  The LOAD_SPECIAL
-    /// `null_or_self` half records `load_special_self(obj, attr, method_kind)`
-    /// and lowers to `residual_call_ir_r(ConstInt(fn_idx),
-    /// ListI([method_kind]), ListR([obj, attr]), Descr) → reg`.
-    pub load_special_self_fn_idx: u16,
     /// `store_attr_fn` descrs-pool index — see codewriter.rs
     /// `register_helper_fn_pointers` for the production source
     /// (`bind(assembler, cpu.store_attr_fn, CallFlavor::MayForce)`).
@@ -3716,8 +3740,9 @@ pub struct LoweringContext {
     /// ListI([name_idx]), Descr) → reg` via
     /// [`lower_load_fast_check_hlop_to_insn`] (the two-Ref-plus-one-Int
     /// LOAD_ATTR shape); `bh_load_fast_check_fn` returns the local when bound
-    /// or raises the unbound NameError (reads no heap, runs no user code →
-    /// `Plain`).
+    /// or raises the unbound `UnboundLocalError` (reads only the code object's
+    /// immutable `co_varnames`, writes nothing, runs no user code →
+    /// `CanRaise`).
     pub load_fast_check_fn_idx: u16,
     /// `unbound_local_error_fn` descrs-pool index. DELETE_FAST records the
     /// `unbound_local_error(code, name_idx)` HLOp only on its unbound arm,
@@ -5621,10 +5646,6 @@ where
     if let Some(insn) = lower_load_special_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
-    if let Some(insn) = lower_load_special_self_hlop_to_insn(op, ctx, get_register, lower_constant)
-    {
-        return Some(insn);
-    }
     if let Some(insn) = lower_setattr_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5862,7 +5883,16 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    // Tag the LOAD_SPECIAL helper calldescr so the full-body walker recognizes
+    // the call and folds the type-only lookup to a constant descriptor plus an
+    // inline bound-method construction, the shape PyPy's `BEFORE_WITH` gets by
+    // being ordinary RPython the tracer sees through.  The tag is the
+    // recognition vehicle (the walker crate cannot match the helper by
+    // fnaddr); a decline falls back to this same residual, so tagging is
+    // behaviour-preserving when the fold is disabled or the receiver shape is
+    // unsupported.
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadSpecial;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],
@@ -5889,8 +5919,9 @@ where
 /// ConstInt(load_fast_check_fn_idx), ListI([name_idx]), ListR([value,
 /// code]), Descr) → reg`.  The two-Ref-plus-one-Int shape of
 /// [`lower_getattr_hlop_to_insn`]; `bh_load_fast_check_fn(value, code,
-/// name_idx)` returns the local when bound or raises the unbound NameError
-/// (reads no heap, runs no user code → `Plain`).  Returns `None` for a
+/// name_idx)` returns the local when bound or raises the unbound
+/// `UnboundLocalError` (reads only the code object's immutable `co_varnames`,
+/// writes nothing, runs no user code → `CanRaise`).  Returns `None` for a
 /// non-`load_fast_check` opname or unexpected arity so the caller can fall
 /// through.
 pub fn lower_load_fast_check_hlop_to_insn<F, LC>(
@@ -5913,7 +5944,15 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    // The same `CanRaise` the helper is bound with: the stub's EffectInfo is
+    // what the recorded trace descr carries, and a descr that disagreed with
+    // the binding would dispatch through the other branch.
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::CanRaise);
+    // Tag the helper calldescr so the full-body walker recognizes the call and
+    // folds a bound local to `guard_nonnull` + the operand.  The tag is the
+    // recognition vehicle (the walker crate cannot match the helper by
+    // fnaddr); a decline falls back to this same residual.
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadFastCheck;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -7356,52 +7395,6 @@ where
     ))
 }
 
-/// Lower the LOAD_SPECIAL `null_or_self` half — pyre HLOp
-/// `load_special_self(obj, attr, method_kind)` → `result: Ref` — to
-/// `residual_call_ir_r(ConstInt(load_special_self_fn_idx),
-/// ListI([method_kind]), ListR([obj, attr]), Descr) → reg`.
-pub fn lower_load_special_self_hlop_to_insn<F, LC>(
-    op: &super::flow::SpaceOperation,
-    ctx: &LoweringContext,
-    get_register: &mut F,
-    lower_constant: &mut LC,
-) -> Option<Insn>
-where
-    F: FnMut(super::flow::Variable) -> Register,
-    LC: FnMut(&Constant) -> Operand,
-{
-    if op.opname != "load_special_self" || op.args.len() != 3 {
-        return None;
-    }
-    let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
-    let attr = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
-    let method_kind = const_int_for_value_arg(&op.args[2])?;
-    let dst_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
-        _ => return None,
-    };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
-    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
-        effect_info,
-        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
-        result_kind: Some(Kind::Ref),
-        void_word_abi: false,
-    }));
-    Some(Insn::op_with_result(
-        "residual_call_ir_r",
-        vec![
-            Operand::ConstInt(ctx.load_special_self_fn_idx as i64),
-            Operand::ListOfKind(ListOfKind::new(
-                Kind::Int,
-                vec![Operand::ConstInt(method_kind)],
-            )),
-            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![obj, attr])),
-            descr_operand,
-        ],
-        dst_reg,
-    ))
-}
-
 /// Lower a CALL-family pre-rtype HLOp `simple_call(callable, arg0,
 /// arg1, ..., argN-1)` → `result: Ref` to the equivalent post-rtype
 /// `residual_call_r_r(ConstInt(call_fn_N_idx), ListR([callable,
@@ -7719,6 +7712,7 @@ mod tests {
         // not the extraeffect discriminant, so the round-trip correctly
         // collapses to PlainCannotRaise.
         for flavor in [
+            CallFlavor::CanRaise,
             CallFlavor::PlainCannotRaise,
             CallFlavor::MayForce,
             CallFlavor::LoopInvariant,
@@ -13892,7 +13886,7 @@ mod tests {
                             );
                             assert_eq!(
                                 dispatch_kind_for_effect_info(&stub.effect_info),
-                                CallFlavor::Plain
+                                CallFlavor::CanRaise
                             );
                             assert!(!stub.effect_info.has_random_effects());
                         }

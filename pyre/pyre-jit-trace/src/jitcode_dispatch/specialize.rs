@@ -4630,8 +4630,151 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
         None
     };
 
-    // guard_class(obj, ob_type): the physical layout the `w_class` read below
-    // needs, and what pins the receiver's builtin kind.
+    walker_emit_constant_descr_bound_method(
+        ctx,
+        op_pc,
+        obj,
+        concrete_obj,
+        w_type,
+        w_descr,
+        shadow,
+        dst,
+        dst_bank,
+    )?;
+    Ok(Some(()))
+}
+
+/// Fold `bh_load_fast_check_fn(value, code, name_idx)` to the nullity guard it
+/// really is.  The helper returns `value` unchanged whenever the local is
+/// bound, so on a bound local the whole call is `guard_nonnull(value)` — the
+/// shape `pyjitpl.py _establish_nullity` proves a nullity with, and the shape
+/// LOAD_FAST_CHECK has no reason to be anything else.
+///
+/// Two things follow from removing the call rather than merely cheapening it.
+/// A `guard_nonnull` on a virtual is statically true, so the optimizer drops it
+/// and the local stops escaping into a residual — an object built inside the
+/// loop can then virtualize away entirely.  And the guard costs nothing on a
+/// value some earlier guard already proved non-null, where the residual cost a
+/// call per iteration regardless.
+///
+/// Declines on an unbound local (concrete `PY_NULL`), where the residual is the
+/// path that raises `UnboundLocalError` with the variable's name.  A guard
+/// failure resumes at this opcode, so the interpreter re-runs LOAD_FAST_CHECK
+/// and raises the same error the residual would have.
+pub(crate) fn try_walker_fold_load_fast_check<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    value: OpRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if walker_concrete_ref_object(ctx, value).is_none() {
+        return Ok(None);
+    }
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[value])?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+    Ok(Some(()))
+}
+
+/// LOAD_SPECIAL's `__enter__` / `__exit__` lookup, folded to the shape PyPy's
+/// `BEFORE_WITH` has for free: `space.lookup` is ordinary RPython there, so a
+/// promoted type makes the descriptor constant and the bound method it builds
+/// virtualizes into the `CALL` that immediately consumes it.  pyre's
+/// `load_special` is an opaque `CALL_MAY_FORCE` residual instead, which drags a
+/// `GUARD_NOT_FORCED` (forcing the virtualizable frame) and a
+/// `GUARD_NO_EXCEPTION` through every `with`, and materialises the context
+/// manager because it escapes into the call.
+///
+/// The lookup reads the type only, so the guards are just the receiver's class
+/// and the type's version tag — no instance-dict shadowing guard, which is what
+/// [`try_walker_specialize_load_bound_method_attr`] additionally needs.
+///
+/// Returns `None` (fall through to the residual, SAFE) for every shape
+/// [`pyre_interpreter::baseobjspace::load_special_fast_path`] declines,
+/// including the `async with` discriminants.
+///
+/// Inside an inlined callee sub-walk the fold carries the depth restriction
+/// [`try_walker_specialize_load_bound_method_attr`] documents.
+pub(crate) fn try_walker_specialize_load_special_method<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    method_kind: i64,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
+        return Ok(None);
+    }
+    // The codewriter emits the raw `SpecialMethod` oparg; `async with` reaches
+    // `emit_abort_permanent` there and never records this residual, so the two
+    // synchronous discriminants are the whole domain.
+    let name = match u8::try_from(method_kind)
+        .ok()
+        .and_then(|kind| pyre_interpreter::bytecode::SpecialMethod::try_from(kind).ok())
+    {
+        Some(pyre_interpreter::bytecode::SpecialMethod::Enter) => "__enter__",
+        Some(pyre_interpreter::bytecode::SpecialMethod::Exit) => "__exit__",
+        _ => return Ok(None),
+    };
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some((w_type, _version_tag, w_descr)) = (unsafe {
+        pyre_interpreter::baseobjspace::load_special_fast_path(concrete_obj, name)
+    }) else {
+        return Ok(None);
+    };
+
+    walker_emit_constant_descr_bound_method(
+        ctx,
+        op_pc,
+        obj,
+        concrete_obj,
+        w_type,
+        w_descr,
+        None,
+        dst,
+        dst_bank,
+    )?;
+    Ok(Some(()))
+}
+
+/// Emit the guards and the inline `Method` a constant-descriptor bind reduces
+/// to, given a `w_descr` some caller has already proven binds through
+/// `w_method_new(w_descr, obj, w_type)` alone.
+///
+/// Three guards make that reduction reproducible: `guard_class` on the physical
+/// layout the `w_class` read needs, `guard_value` on the Python-level class so
+/// a subclass reaching the same layout side-exits, and the type version tag
+/// (`typeobject.py promote(self.version_tag())`) so rebinding the name on the
+/// type retires the trace.  An optional instance-dict shadowing guard is the
+/// fourth when the caller looked the name up through `LOAD_ATTR`;
+/// `LOAD_SPECIAL` is type-only (`baseobjspace.py lookup`) and passes `None`.
+/// The `Method` is then built inline rather than called for, which is what
+/// lets the consuming `CALL` virtualize it away.
+///
+/// Shared by the two folds that reach this reduction from different
+/// preconditions: `LOAD_ATTR` of a plain function descriptor, and
+/// `LOAD_SPECIAL`'s type-only `__enter__` / `__exit__` lookup.
+#[allow(clippy::too_many_arguments)]
+fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+    w_descr: pyre_object::PyObjectRef,
+    shadow: Option<ShadowGuard>,
+    dst: usize,
+    dst_bank: char,
+) -> Result<(), DispatchError> {
     let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(phys_type);
@@ -4641,8 +4784,6 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
             .class_now_known(obj, phys_type);
     }
 
-    // Pin the Python-level class exactly: a subclass reaching the same
-    // physical layout can define its own `name` and must side-exit.
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     walker_emit_fold_guard_with_snapshot(
@@ -4655,16 +4796,14 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
         .heap_cache_mut()
         .replace_box(w_class_op, w_type_const);
 
-    // typeobject.py `promote(self.version_tag())`: reassigning the method on
-    // the type bumps the tag, so the constant `w_descr` side-exits.
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
 
     if let Some(shadow) = shadow {
         walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     }
 
-    // `w_method_new(w_descr, obj, w_type)` + the header stamp its allocation
-    // performs (`ob_type` comes from the NewWithVtable's size descr).
+    // The header stamp is the one `w_method_new`'s allocation performs
+    // (`ob_type` comes from the NewWithVtable's size descr).
     let func_const = ctx.trace_ctx.const_ref(w_descr as i64);
     let header_w_class = ctx
         .trace_ctx
@@ -4681,15 +4820,14 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
         .heap_cache_mut()
         .class_now_known(method_op, method_type_addr);
     // The concrete bound method the walker's own execution must observe; a
-    // fresh `Method` per evaluation is what `getattr` produces anyway, so the
-    // trace allocating its own is not an identity divergence.
+    // fresh `Method` per evaluation is what the interpreter's own bind produces
+    // anyway, so the trace allocating its own is not an identity divergence.
     let bound = pyre_object::w_method_new(w_descr, concrete_obj, w_type);
     ctx.trace_ctx.set_opref_concrete(
         method_op,
         majit_ir::Value::Ref(majit_ir::GcRef(bound as usize)),
     );
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_op)?;
-    Ok(Some(()))
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_op)
 }
 
 /// Fold `bh_load_method_self_fn(obj, attr, code, name_idx)` once both the

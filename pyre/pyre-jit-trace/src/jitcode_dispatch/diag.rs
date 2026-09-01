@@ -458,6 +458,8 @@ spec_folds! {
     LoadSuperAttrDescent => ("load_super_attr_descent",  "specialize",    "load_super_attr"),
     SuperAttrUnwrap      => ("super_attr_unwrap",        "residual_call", "load_super_attr"),
     LocalsTraceLimitCut  => ("builtin_locals_trace_limit_cut", "specialize", "builtin_locals"),
+    LoadSpecialMethod    => ("load_special_method",      "residual_call", "-"),
+    LoadFastCheck        => ("load_fast_check",          "residual_call", "-"),
 }
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();
