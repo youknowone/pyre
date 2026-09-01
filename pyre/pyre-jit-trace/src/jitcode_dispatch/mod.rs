@@ -9611,10 +9611,7 @@ fn walker_box_int<Sym: WalkSym>(
 /// SETFIELD_GC` pair for a `W_FloatObject` so the box stays virtualizable.
 /// There is no tagged float representation, so the boxed concrete is just the
 /// heap pointer and no counterpart to [`box_int_concrete`] is needed.
-fn walker_box_float<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    raw: OpRef,
-) -> OpRef {
+fn walker_box_float<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, raw: OpRef) -> OpRef {
     crate::state::wrapfloat(ctx.trace_ctx, raw)
 }
 

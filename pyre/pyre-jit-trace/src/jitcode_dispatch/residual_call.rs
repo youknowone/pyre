@@ -2572,23 +2572,34 @@ pub(crate) fn select_residual_call_opcode(
 /// * `allboxes[0]` is the funcbox (per `build_allboxes` layout); the
 ///   remaining slots are user args in `descr.arg_types()` ABI order.
 ///
-/// Best-effort: returns silently when any operand lacks a concrete
-/// `box_value` (the walker has no way to read the runtime value), or
-/// when the arity exceeds `MAX_HOST_CALL_ARITY` (16) — the trace still
-/// has the recorded `CallPure*` op for the optimizer to consume later,
+/// Having executed the helper, it continues into
+/// `pyjitpl.py record_result_of_call_pure` as `MIFrame.execute_varargs`
+/// does, and RETURNS the OpRef that carries the result afterwards: the
+/// constant itself when every argbox was a `Const` (the call is cut back
+/// out of the trace), and the re-recorded `CallPure*` otherwise, with
+/// `call_pure_results` populated for the optimizer.  Callers must use the
+/// returned OpRef rather than the one they recorded.
+///
+/// Best-effort: returns the caller's own OpRef unchanged when any operand
+/// lacks a concrete `box_value` (the walker has no way to read the runtime
+/// value), or when the arity exceeds `MAX_HOST_CALL_ARITY` (16) — the trace
+/// still has the recorded `CallPure*` op for the optimizer to consume later,
 /// just without the per-record fold.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_opcode: OpCode,
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
+    descr: majit_ir::DescrRef,
+    patch_pos: majit_metainterp::recorder::TracePosition,
     recorded: OpRef,
-) {
+) -> OpRef {
     if !matches!(
         call_opcode,
         OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN
     ) {
-        return;
+        return recorded;
     }
     // `MIFrame.execute_varargs(pure=True)` only fires for
     // `EF_ELIDABLE_CANNOT_RAISE`. `select_residual_call_opcode` returns
@@ -2600,10 +2611,10 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     // transcribe it.
     let ei = call_descr.get_extra_info();
     if ei.check_can_raise(false) {
-        return;
+        return recorded;
     }
     if allboxes.is_empty() {
-        return;
+        return recorded;
     }
     // pyjitpl.py `_build_allboxes`: slot 0 is funcbox, slots
     // 1.. are user args in `descr.arg_types()` ABI order.  Walker's
@@ -2617,43 +2628,52 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     // when the funcbox is non-constant; the recorded `CallPure*` op
     // stays in the trace for the optimizer to consume later.
     if !allboxes[0].is_constant() {
-        return;
+        return recorded;
     }
     let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
     let func_ptr = match funcptr_val {
         Some(majit_ir::Value::Int(addr)) => addr,
-        _ => return,
+        _ => return recorded,
     };
     // `jitcode.py::JitCode.__init__` uses NULL for "no address".  It is no
     // more executable than an unpatched symbolic path hash; leave the call
     // unfolded so the main residual-call gate can abort/decline it without
     // jumping through address zero.
     if func_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_ptr) {
-        return;
+        return recorded;
     }
     // Cap at MAX_HOST_CALL_ARITY (`call_int_function` / `call_void_function`
     // panic on excess arity).  `allboxes.len() - 1` is the arg count
     // (funcbox doesn't pass through).
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
-        return;
+        return recorded;
     }
     let mut args = Vec::with_capacity(allboxes.len() - 1);
+    // `pyjitpl.py:3572` keys `call_pure_results` on
+    // `[executor.constant_from_op(a) for a in normargboxes]`, so the `Value`
+    // form of every box — funcbox included — is collected here alongside the
+    // ABI word the executor takes.
+    let mut arg_values = Vec::with_capacity(allboxes.len());
+    arg_values.push(majit_ir::Value::Int(func_ptr));
     for &arg in &allboxes[1..] {
-        let v = match ctx.trace_ctx.box_value(arg) {
-            Some(majit_ir::Value::Int(n)) => n,
-            Some(majit_ir::Value::Ref(r)) => {
+        let Some(boxed) = ctx.trace_ctx.box_value(arg) else {
+            return recorded;
+        };
+        arg_values.push(boxed);
+        let v = match boxed {
+            majit_ir::Value::Int(n) => n,
+            majit_ir::Value::Ref(r) => {
                 // `usize::MAX` sentinel from `concrete_of_opref` means
                 // "no concrete known" — never reach this path because
                 // `box_value` returns `None` for un-stamped OpRefs, but
                 // belt-and-suspenders against future plumbing.
                 if r == majit_ir::GcRef::NO_CONCRETE {
-                    return;
+                    return recorded;
                 }
                 r.as_usize() as i64
             }
-            Some(majit_ir::Value::Float(f)) => f.to_bits() as i64,
-            Some(majit_ir::Value::Void) => 0,
-            None => return,
+            majit_ir::Value::Float(f) => f.to_bits() as i64,
+            majit_ir::Value::Void => 0,
         };
         args.push(v);
     }
@@ -2682,7 +2702,7 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     // call op and emits the necessary guards.
     for (i, &arg) in args.iter().enumerate() {
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
-            return;
+            return recorded;
         }
     }
     let result_i64 = majit_metainterp::executor::execute_pure_call(call_descr, func_ptr, &args);
@@ -2697,15 +2717,35 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
         // no return value); `CallPureN` is included in the matched set
         // only to mirror `MIFrame.execute_varargs(pure=True)`'s handling of all
         // pure shapes — skip the stamp for void.
-        majit_ir::Type::Void => return,
+        majit_ir::Type::Void => return recorded,
     };
+    // `pyjitpl.py:1945` follows the executed pure call with
+    // `record_result_of_call_pure`: an all-`Const` argument list cuts the call
+    // back out of the trace and hands the result back as a constant, and any
+    // other argument list populates `call_pure_results` so a later call with
+    // the same arguments reuses the value.  Executing the helper without that
+    // step leaves a `CallPure*` standing on constants, which is not what an
+    // elidable leaf over an immutable block is supposed to record.
+    let folded = ctx.trace_ctx.record_result_of_call_pure(
+        recorded,
+        allboxes,
+        &arg_values,
+        descr,
+        patch_pos,
+        call_opcode,
+        result_value,
+    );
     // Stamp only when the recorded result has a live slot in the active
     // recorder.  A deeper inlined / recursive frame's residual result may be
     // recorded in a context whose position is not allocated in the active
     // recorder; stamping it would violate the `*FrontendOp(pos, value)`
     // invariant.  Skipping leaves the result symbolic so the downstream branch
-    // aborts the trace into the trait fallback instead of crashing.
-    ctx.trace_ctx.try_set_opref_concrete(recorded, result_value);
+    // aborts the trace into the trait fallback instead of crashing.  A folded
+    // constant carries its value inline and has nothing to stamp.
+    if folded.inline_const_to_value().is_none() {
+        ctx.trace_ctx.try_set_opref_concrete(folded, result_value);
+    }
+    folded
 }
 
 /// Whether Ref argument `arg_index` of a may-force CALL to `helper` is a
@@ -7736,6 +7776,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // the still-referenced young element and the collector then reads a
         // freed (poison) header.  The list barrier remembers the enclosing
         // `W_ListObject`, whose trace reaches every slot, and keeps them alive.
+        // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
+        // `record_result_of_call_pure` can cut it back out.
+        let patch_pos = ctx.trace_ctx.get_trace_position();
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
@@ -7748,7 +7791,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // any argbox is symbolic, when the EI can raise, or for non-pure
         // call opcodes.  The shared executor below handles the can-raise pure
         // case and transfers its exception state like `MIFrame.execute_varargs`.
-        try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
+        let recorded = try_fold_pure_call_via_executor(
+            ctx,
+            call_opcode,
+            &allboxes,
+            call_descr,
+            descr.clone(),
+            patch_pos,
+            recorded,
+        );
 
         // pyjitpl.py `_opimpl_residual_call{1,2,3}` parity
         // for the remaining shapes.  PyPy
@@ -9183,13 +9234,24 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
         }
+        // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
+        // `record_result_of_call_pure` can cut it back out.
+        let patch_pos = ctx.trace_ctx.get_trace_position();
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
         // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
-        try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
+        let recorded = try_fold_pure_call_via_executor(
+            ctx,
+            call_opcode,
+            &allboxes,
+            call_descr,
+            descr.clone(),
+            patch_pos,
+            recorded,
+        );
 
         // Non-elidable concrete-execute parity — see
         // `dispatch_residual_call_iRd_kind` for the full citation.
@@ -9454,13 +9516,24 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
         }
+        // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
+        // `record_result_of_call_pure` can cut it back out.
+        let patch_pos = ctx.trace_ctx.get_trace_position();
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
 
         // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
-        try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
+        let recorded = try_fold_pure_call_via_executor(
+            ctx,
+            call_opcode,
+            &allboxes,
+            call_descr,
+            descr.clone(),
+            patch_pos,
+            recorded,
+        );
         // `boxes3`-shaped may-force residual (`CallMayForce{R,I,F,N}`):
         // execute concretely under the authoritative walk and stamp the
         // result, identically to the `iRd` / `iIRd` siblings.

@@ -13730,7 +13730,6 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         Type::Float,
         majit_ir::ExtraEffect::ElidableCannotRaise,
     );
-    let recorded = tc.record_op_with_descr(majit_ir::OpCode::CallPureF, &allboxes, descr.clone());
     let call_descr = descr.as_call_descr().expect("CallPureF descr");
 
     // Same shape as the Int sibling above, which DOES fold — so a failure here
@@ -13746,8 +13745,6 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         tc.const_int(40),
         tc.const_int(2),
     ];
-    let int_recorded =
-        tc.record_op_with_descr(majit_ir::OpCode::CallPureI, &int_boxes, int_descr.clone());
     let int_call_descr = int_descr.as_call_descr().expect("CallPureI descr");
 
     let mut regs_i: Vec<OpRef> = Vec::new();
@@ -13786,29 +13783,49 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    try_fold_pure_call_via_executor(
+    // Record and fold one call at a time, as the dispatchers do: the fold
+    // cuts back to the position taken before the record, so a second op
+    // recorded in between would be cut away with it.
+    let float_pos = wc.trace_ctx.get_trace_position();
+    let recorded =
+        wc.trace_ctx
+            .record_op_with_descr(majit_ir::OpCode::CallPureF, &allboxes, descr.clone());
+    let folded_f = try_fold_pure_call_via_executor(
         &mut wc,
         majit_ir::OpCode::CallPureF,
         &allboxes,
         call_descr,
+        descr.clone(),
+        float_pos,
         recorded,
     );
-    try_fold_pure_call_via_executor(
+    let int_pos = wc.trace_ctx.get_trace_position();
+    let int_recorded = wc.trace_ctx.record_op_with_descr(
+        majit_ir::OpCode::CallPureI,
+        &int_boxes,
+        int_descr.clone(),
+    );
+    let folded_i = try_fold_pure_call_via_executor(
         &mut wc,
         majit_ir::OpCode::CallPureI,
         &int_boxes,
         int_call_descr,
+        int_descr.clone(),
+        int_pos,
         int_recorded,
     );
     drop(wc);
 
+    // Every argbox is a `Const`, so `record_result_of_call_pure` takes the
+    // `pyjitpl.py:3566` arm: the call is cut back out and the result comes
+    // back as the constant itself.
     assert_eq!(
-        tc.box_value(int_recorded),
+        folded_i.inline_const_to_value(),
         Some(majit_ir::Value::Int(42)),
         "control: the Int sibling folds, so the fixture reaches the executor",
     );
     assert_eq!(
-        tc.box_value(recorded),
+        folded_f.inline_const_to_value(),
         Some(majit_ir::Value::Float(3.5)),
         "halve_f64_for_walker_test(7) == 3.5; reading the integer return \
          register would stamp the argument 7 instead",
