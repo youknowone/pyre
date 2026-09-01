@@ -125,6 +125,19 @@ struct Host {
     /// `PYRE_WASM_GUEST_PROFILE` sampling profiler; taken/restored around each
     /// epoch tick so `sample` can borrow the store it lives in.
     guest_profiler: Option<wasmtime::GuestProfiler>,
+    /// Trace modules by the table slot that names them, recorded only while
+    /// `PYRE_WASM_GUEST_PROFILE` is armed. `GuestProfiler` takes its module
+    /// list once at construction and has no way to be handed a module compiled
+    /// later, so every sample that lands in a trace resolves to nothing and is
+    /// dropped; this list is what `WasmBacktrace` frames are matched against
+    /// instead.
+    trace_modules: Vec<(wasmtime::Module, u32)>,
+    /// Epoch samples whose innermost frame was in a trace module, by that
+    /// module's table slot and the function index within it.
+    trace_samples: std::collections::BTreeMap<(u32, u32), u64>,
+    /// Epoch samples whose innermost frame was anywhere else — the interpreter
+    /// itself, and any sample taken with no wasm frame on the stack.
+    trace_samples_elsewhere: u64,
     /// Trace slots whose compile exported a `trace_wide`, and whose `slot + 1`
     /// is therefore a published call target. The reserved spare slot holds the
     /// narrow function when a compile had no wide entry, so the table alone
@@ -389,6 +402,24 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             if let Some(mut p) = ctx.data_mut().guest_profiler.take() {
                 p.sample(&ctx, std::time::Duration::ZERO);
                 ctx.data_mut().guest_profiler = Some(p);
+            }
+            // The same tick, attributed a second way. A backtrace resolves its
+            // frames through the store's module registry, which every trace
+            // module joins when it is instantiated, so it reaches the code the
+            // profiler's fixed module list cannot name.
+            let hit = {
+                let backtrace = wasmtime::WasmBacktrace::capture(&ctx);
+                let host = ctx.data();
+                backtrace.frames().first().and_then(|frame| {
+                    host.trace_modules
+                        .iter()
+                        .find(|(module, _)| wasmtime::Module::same(module, frame.module()))
+                        .map(|(_, slot)| (*slot, frame.func_index()))
+                })
+            };
+            match hit {
+                Some(key) => *ctx.data_mut().trace_samples.entry(key).or_insert(0) += 1,
+                None => ctx.data_mut().trace_samples_elsewhere += 1,
             }
             Ok(wasmtime::UpdateDeadline::Continue(1))
         });
@@ -711,6 +742,24 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 Err(err) => eprintln!("[guest-profile] failed to write {path}: {err:#}"),
             },
             Err(err) => eprintln!("[guest-profile] failed to create {path}: {err:#}"),
+        }
+        let host = store.data();
+        let in_traces: u64 = host.trace_samples.values().sum();
+        let total = in_traces + host.trace_samples_elsewhere;
+        if total != 0 {
+            eprintln!(
+                "[trace-profile] samples={total} in_traces={in_traces} ({:.1}%) elsewhere={}",
+                100.0 * in_traces as f64 / total as f64,
+                host.trace_samples_elsewhere
+            );
+            let mut rows: Vec<_> = host.trace_samples.iter().collect();
+            rows.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+            for ((slot, func), count) in rows.into_iter().take(20) {
+                eprintln!(
+                    "[trace-profile] slot={slot} func={func} samples={count} ({:.1}%)",
+                    100.0 * *count as f64 / total as f64
+                );
+            }
         }
     }
     if std::env::var_os("PYRE_WASM_JIT_STATS").is_some() {
@@ -2107,7 +2156,7 @@ fn jit_compile_trace(
     bytes_ptr: u32,
     bytes_len: u32,
     kind: &str,
-) -> Result<(Table, Func, Option<Func>)> {
+) -> Result<(Table, Func, Option<Func>, Module)> {
     caller.data_mut().jit_compile_count += 1;
     let memory = caller
         .data()
@@ -2216,12 +2265,13 @@ fn jit_compile_trace(
         .context("trace module is missing its `trace` export")?;
     let trace_wide = instance.get_func(&mut *caller, "trace_wide");
 
-    Ok((table, trace, trace_wide))
+    Ok((table, trace, trace_wide, module))
 }
 
 /// Compile and instantiate a trace, then append its export to the trace table.
 fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
-    let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len, "compile")?;
+    let (table, trace, trace_wide, module) =
+        jit_compile_trace(caller, bytes_ptr, bytes_len, "compile")?;
     // Register the trace into the shared indirect function table so it is
     // reachable by table index. `grow` returns the newly appended slot.
     //
@@ -2239,7 +2289,20 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
             .context("register wide trace entry into shared table")?;
         caller.data_mut().wide_slots.insert(slot);
     }
+    record_trace_module(caller, module, slot);
     Ok(slot)
+}
+
+/// Name a freshly installed trace module by its table slot, so an epoch sample
+/// taken inside it can say which trace it was in. Only the profiling mode keeps
+/// the list; every other run leaves it empty and pays nothing.
+fn record_trace_module(caller: &mut Caller<'_, Host>, module: Module, slot: u32) {
+    if caller.data().guest_profiler.is_none() {
+        return;
+    }
+    let host = caller.data_mut();
+    host.trace_modules.retain(|(_, s)| *s != slot);
+    host.trace_modules.push((module, slot));
 }
 
 /// Compile and instantiate a trace, then replace an existing trace-table slot.
@@ -2254,7 +2317,8 @@ fn jit_replace(
             "jit_replace_wasm: id {func_id} is not a trace slot"
         )));
     }
-    let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len, "replace")?;
+    let (table, trace, trace_wide, module) =
+        jit_compile_trace(caller, bytes_ptr, bytes_len, "replace")?;
     if !matches!(
         table.get(&mut *caller, func_id as u64),
         Some(Ref::Func(Some(_)))
@@ -2285,6 +2349,7 @@ fn jit_replace(
             .context("replace wide trace entry in shared table")?;
         caller.data_mut().wide_slots.insert(func_id);
     }
+    record_trace_module(caller, module, func_id);
     Ok(func_id)
 }
 
