@@ -1,17 +1,21 @@
 //! The single process-global eval-breaker word polled by JIT-compiled loop
 //! back-edges. One `AtomicUsize` whose bits fold the two former back-edge
 //! polls into one load + one nonzero branch:
-//!   bit0 EB_ASYNC — an async ticker request; OR'd in by the OS signal handler
+//!   bit0 EB_GC_INTERP — process-stable `PYRE_GC_INTERP` dispatch gate.  It
+//!                       shares the word to spare the interpreter a second
+//!                       per-opcode atomic load, but it is not itself a reason
+//!                       to leave machine code.  It occupies the lowest bit so
+//!                       that every breaker bit outranks it numerically and a
+//!                       compiled poll can separate the two with one unsigned
+//!                       compare against `JIT_BREAKER_FLOOR` — see that
+//!                       constant.
+//!   bit1 EB_ASYNC — an async ticker request; OR'd in by the OS signal handler
 //!                   and action dispatcher, then copied into
 //!                   `ActionFlag._ticker` at a safe interpreter checkpoint.
-//!   bit1 EB_STW   — mirrors `GC_SYNC.stw_requested`; OR'd in by the collector
+//!   bit2 EB_STW   — mirrors `GC_SYNC.stw_requested`; OR'd in by the collector
 //!                   while it drains mutators to safepoints.
-//!   bit2 EB_FINALIZING — mirrors interpreter finalization; once armed,
+//!   bit3 EB_FINALIZING — mirrors interpreter finalization; once armed,
 //!                        non-owner mutators park before their next opcode.
-//!   bit3 EB_GC_INTERP — process-stable `PYRE_GC_INTERP` dispatch gate.  This
-//!                       is masked out of compiled back-edge polls: it avoids
-//!                       a second per-opcode atomic load in the interpreter,
-//!                       but is not itself a reason to leave machine code.
 //!   bit4 EB_GC    — the old-gen allocator reached the next-major threshold;
 //!                   OR'd in by the collector, consumed by the interpreter
 //!                   dispatch-loop GC safepoint.
@@ -37,14 +41,15 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// bit0 — async action / signal pending (mirrors a negative ticker).
-pub const EB_ASYNC: usize = 1;
-/// bit1 — GC stop-the-world requested (mirrors `GC_SYNC.stw_requested`).
-pub const EB_STW: usize = 2;
-/// bit2 — interpreter finalization has begun (terminal, never cleared).
-pub const EB_FINALIZING: usize = 4;
-/// bit3 — interpreter-path allocation/collection integration is enabled.
-pub const EB_GC_INTERP: usize = 8;
+/// bit0 — interpreter-path allocation/collection integration is enabled.
+/// Lowest bit so that it is the only value below `JIT_BREAKER_FLOOR`.
+pub const EB_GC_INTERP: usize = 1;
+/// bit1 — async action / signal pending (mirrors a negative ticker).
+pub const EB_ASYNC: usize = 2;
+/// bit2 — GC stop-the-world requested (mirrors `GC_SYNC.stw_requested`).
+pub const EB_STW: usize = 4;
+/// bit3 — interpreter finalization has begun (terminal, never cleared).
+pub const EB_FINALIZING: usize = 8;
 /// bit4 — the old-gen allocator crossed the next-major threshold and a
 /// collection is owed at the next root-complete point.
 pub const EB_GC: usize = 16;
@@ -61,6 +66,27 @@ pub const EB_MEMORY_ERROR: usize = 32;
 /// by the dispatch loop, so a compiled loop that never returns to it would run
 /// on past a heap the collector has already declared exhausted.
 pub const JIT_BREAKER_MASK: usize = EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC | EB_MEMORY_ERROR;
+
+/// Every bit the word can carry, breaker or not.
+pub const ALL_EVAL_BREAKER_BITS: usize =
+    EB_GC_INTERP | EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC | EB_MEMORY_ERROR;
+
+/// The lowest breaker bit. Every bit in `JIT_BREAKER_MASK` is at or above it
+/// and every other bit is below it, so `word >= JIT_BREAKER_FLOOR` decides
+/// "some breaker is armed" for the whole word. That lets a compiled back-edge
+/// poll test the word with a single unsigned compare instead of masking and
+/// then testing the remainder, while the interpreter keeps reading its own
+/// bits out of the same load.
+pub const JIT_BREAKER_FLOOR: usize = EB_ASYNC;
+
+// The compare above is only equivalent to the mask while the two bit groups
+// stay separated by `JIT_BREAKER_FLOOR`. Adding a non-breaker bit above the
+// floor, or a breaker bit below it, would silently turn every back-edge poll
+// into the wrong answer, so state the partition as a compile-time fact.
+const _: () = {
+    assert!(JIT_BREAKER_MASK & (JIT_BREAKER_FLOOR - 1) == 0);
+    assert!(ALL_EVAL_BREAKER_BITS & !JIT_BREAKER_MASK & !(JIT_BREAKER_FLOOR - 1) == 0);
+};
 
 /// The shared eval-breaker word (see module docs).
 static EVAL_BREAKER_WORD: AtomicUsize = AtomicUsize::new(0);
@@ -315,8 +341,8 @@ pub extern "C" fn take_memory_error_jit_abi() -> i64 {
 
 /// Depth of the operation chain between the poll's load and its guard.
 ///
-/// The recorder emits `RawLoadI -> IntAnd -> IntIsTrue -> GuardFalse`, so two
-/// links separate the guard's condition from the load. The walk below allows
+/// The recorder emits `RawLoadI -> UintGe -> GuardFalse`, so one link
+/// separates the guard's condition from the load. The walk below allows
 /// a few more so that an optimizer pass inserting or splitting one link does
 /// not silently stop matching, and stops well before a long pure chain.
 const POLL_CHAIN_DEPTH: usize = 6;
@@ -324,7 +350,7 @@ const POLL_CHAIN_DEPTH: usize = 6;
 /// Whether `guard`'s condition is a back-edge poll of this word.
 ///
 /// The poll is recorded as
-/// `GuardFalse(IntIsTrue(IntAnd(RawLoadI(addr, 0), JIT_BREAKER_MASK)))`. The
+/// `GuardFalse(UintGe(RawLoadI(addr, 0), JIT_BREAKER_FLOOR))`. The
 /// match anchors on the `RawLoadI` of the published address rather than on the
 /// whole shape: that load is the one link the recorder cannot drop (it must
 /// stay non-pure and outside the always-pure range, or CSE forwards the
@@ -362,14 +388,7 @@ pub fn is_back_edge_poll_guard(guard: &crate::resoperation::Op) -> bool {
 /// Every flag must fit in the word the poll actually loads. Checked per target,
 /// so a flag too wide for a 32-bit `usize` fails the wasm32 build rather than
 /// silently reading as unarmed there.
-// `ineffective_bit_mask` reads the fold as a runtime `x | 16` tested against a
-// constant; both sides here are constants and the whole item is a static
-// assertion, so there is no operand to compare directly.
-#[allow(clippy::ineffective_bit_mask)]
-const _: () = assert!(
-    (EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC_INTERP | EB_GC | EB_MEMORY_ERROR)
-        < (1 << (EVAL_BREAKER_WORD_SIZE * 8 - 1))
-);
+const _: () = assert!(ALL_EVAL_BREAKER_BITS < (1 << (EVAL_BREAKER_WORD_SIZE * 8 - 1)));
 
 #[cfg(test)]
 mod tests {
@@ -536,15 +555,30 @@ mod tests {
         crate::operand::Operand::const_(Const::Int(value))
     }
 
+    /// The compiled poll compares the whole word against `JIT_BREAKER_FLOOR`
+    /// where it used to mask and then test the remainder. That is only the
+    /// same question while the non-breaker bits stay below the floor, so
+    /// assert the equivalence over every word the flags can build rather than
+    /// over the handful the other tests happen to produce.
+    #[test]
+    fn the_floor_compare_answers_the_mask_test_for_every_representable_word() {
+        for word in 0..=ALL_EVAL_BREAKER_BITS {
+            assert_eq!(
+                word >= JIT_BREAKER_FLOOR,
+                word & JIT_BREAKER_MASK != 0,
+                "word {word:#b} disagrees"
+            );
+        }
+    }
+
     /// Build the recorded back-edge poll over `load_addr`, which the caller
     /// varies to separate "this word" from "some other raw load".
     fn poll_guard(load_addr: usize) -> Op {
         let load = bind(Op::new(OpCode::RawLoadI, &[int(load_addr as i64), int(0)]));
-        let masked = bind(Op::new(
-            OpCode::IntAnd,
-            &[load, int(JIT_BREAKER_MASK as i64)],
+        let armed = bind(Op::new(
+            OpCode::UintGe,
+            &[load, int(JIT_BREAKER_FLOOR as i64)],
         ));
-        let armed = bind(Op::new(OpCode::IntIsTrue, &[masked]));
         Op::new(OpCode::GuardFalse, &[armed])
     }
 

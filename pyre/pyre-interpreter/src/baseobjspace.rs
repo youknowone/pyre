@@ -2437,7 +2437,9 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
     // lane even when its value is 0 (notably for `r[-1:-3:-1]`).
     let w_substop = pyre_object::range_bigint_to_obj(substop.translated_alias());
     let w_substop = pyre_object::gc_roots::pin_root(w_substop);
-    Ok(pyre_object::w_range_new(w_substart, w_substop, w_substep))
+    Ok(pyre_object::w_range_new(
+        w_substart, w_substop, w_substep, false,
+    ))
 }
 
 /// `space.type(w_item) is space.w_int or space.w_bool` used by
@@ -3093,6 +3095,7 @@ pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
             pyre_object::gc_roots::shadow_stack_get(current_slot),
             pyre_object::gc_roots::shadow_stack_get(stop_slot),
             pyre_object::gc_roots::shadow_stack_get(step_slot),
+            false,
         );
         let w_range = pyre_object::gc_roots::pin_root(w_range);
         let state = w_tuple_new(vec![w_range]);
@@ -3132,6 +3135,7 @@ pub(crate) fn long_range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
             pyre_object::gc_roots::shadow_stack_get(current_slot),
             pyre_object::gc_roots::shadow_stack_get(stop_slot),
             pyre_object::gc_roots::shadow_stack_get(step_slot),
+            false,
         );
         let w_range = pyre_object::gc_roots::pin_root(w_range);
         let state = w_tuple_new(vec![w_range]);

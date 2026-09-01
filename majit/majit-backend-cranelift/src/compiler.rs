@@ -110,6 +110,13 @@ fn majit_verify_enabled() -> bool {
     *ENABLED
 }
 
+/// Whether `MAJIT_DUMP` is set, cached at first access.
+fn majit_dump_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_DUMP").is_some());
+    *ENABLED
+}
+
 use crate::asm_memory::{CraneliftArenaHandle, CraneliftArenaMemoryProvider};
 use crate::guard::{BridgeData, JitFrameDeadFrame, drop_bridge_payload};
 use majit_backend::deadframe::ExitDescr;
@@ -10579,7 +10586,17 @@ impl CraneliftBackend {
         }
         // else: linear trace — already in entry_block with vars defined
 
+        let dump_offsets = majit_dump_enabled();
         for op_idx in 0..ops.len() {
+            // Carry the trace's op index through codegen as a source location.
+            // Cranelift closes a srcloc region when the next one opens, so
+            // every byte the op emits — including the block plumbing a LABEL
+            // lowers to below — lands in that op's span, and the emitted bytes
+            // are unaffected either way. Only the dump reads the mapping back,
+            // so the regions are recorded only when it is asked for.
+            if dump_offsets {
+                builder.set_srcloc(cranelift_codegen::ir::SourceLoc::new(op_idx as u32));
+            }
             if let Some((_, label_block)) = label_blocks
                 .iter()
                 .find(|(label_idx, _)| *label_idx == op_idx)
@@ -15485,6 +15502,23 @@ impl CraneliftBackend {
             eprintln!("[jit][code-size] trace_id={trace_id} body_bytes={body_code_bytes}");
             if let Some(text) = ctx.compiled_code().and_then(|code| code.vcode.as_deref()) {
                 eprintln!("[jit][disasm-body] trace_id={trace_id}\n{text}");
+            }
+        }
+        if dump_offsets {
+            // Same line shape the dynasm backend prints, so a per-op byte
+            // count can be read off either backend and compared. Offsets are
+            // relative to the start of the trace body. One op can own several
+            // regions: the scheduler is free to interleave two ops' machine
+            // code, and each contiguous run is its own region.
+            if let Some(code) = ctx.compiled_code() {
+                for region in code.buffer.get_srclocs_sorted() {
+                    let op_idx = region.loc.bits() as usize;
+                    let Some(op) = ops.get(op_idx) else { continue };
+                    eprintln!(
+                        "[clif] @{:#06x} op[{}] {:?}",
+                        region.start, op_idx, op.opcode
+                    );
+                }
             }
         }
         self.module.clear_context(&mut ctx);

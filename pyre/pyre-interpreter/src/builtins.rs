@@ -4924,7 +4924,9 @@ pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 let _ = pyre_object::gc_roots::pin_root(w_step);
             }
         }
-        Ok(pyre_object::w_range_new(w_start, w_stop, w_step))
+        // `descr_new` promotes the step exactly when no step argument was
+        // given, so `range(0, 10, 1)` keeps the general iterator.
+        Ok(pyre_object::w_range_new(w_start, w_stop, w_step, n != 3))
     }
 }
 

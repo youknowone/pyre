@@ -2027,11 +2027,13 @@ impl MIFrame {
     ) -> Vec<OpRef> {
         // Mirror pypy/module/pypyjit/test_pypy_c/model.py's `--TICK--` shape:
         // load a process-global raw word through a baked constant address,
-        // compare it, then guard the result. The folded eval-breaker word is a
-        // bitmask, so this uses a nonzero test rather than upstream's
-        // `int_lt(ticker, 0)`.  EB_GC_INTERP is a process-stable dispatch
-        // configuration bit sharing the word to avoid another interpreter
-        // load; mask it out because it is not a compiled-loop breaker.
+        // compare it, then guard the result — three operations, upstream's
+        // `int_lt(ticker, 0)` being the compare there. The folded eval-breaker
+        // word is a bitmask rather than a counter, so the compare is against
+        // `JIT_BREAKER_FLOOR`: the word's one non-breaker bit
+        // (`EB_GC_INTERP`, a process-stable dispatch gate that shares the word
+        // to spare the interpreter a second load) sits below every breaker
+        // bit, so an unsigned compare separates them without a mask.
         //
         // Load-bearing invariant: RawLoadI must remain outside the always-pure
         // range and this descriptor must remain non-pure. Otherwise CSE can
@@ -2051,9 +2053,8 @@ impl MIFrame {
                 &[base, offset],
                 eval_breaker_word_descr(),
             );
-            let mask = ctx.const_int(majit_ir::eval_breaker_word::JIT_BREAKER_MASK as i64);
-            let breaker_bits = ctx.record_op(OpCode::IntAnd, &[word, mask]);
-            let armed = ctx.record_op(OpCode::IntIsTrue, &[breaker_bits]);
+            let floor = ctx.const_int(majit_ir::eval_breaker_word::JIT_BREAKER_FLOOR as i64);
+            let armed = ctx.record_op(OpCode::UintGe, &[word, floor]);
             // The poll is synthesized while this MIFrame is anchored at the
             // target merge point, but semantically it belongs to the
             // JUMP_BACKWARD that reached that target.  Temporarily install the

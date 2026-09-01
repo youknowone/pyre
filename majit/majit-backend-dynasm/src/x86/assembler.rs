@@ -2779,6 +2779,18 @@ impl<'a> Assembler386<'a> {
                             faillocs.len()
                         );
                     }
+                    // A guard owns bytes like any other op, so it opens its
+                    // own span. Without this line the guard's code is read as
+                    // part of the preceding op's span and every span after the
+                    // trace's first guard names the wrong operation.
+                    if crate::majit_dump_enabled() {
+                        eprintln!(
+                            "[dynasm] @{:#06x} op[{}] {:?}",
+                            self.mc.offset().0,
+                            op_index,
+                            op.opcode
+                        );
+                    }
                     self.regalloc_perform_guard(
                         op,
                         *op_index,
@@ -2798,6 +2810,17 @@ impl<'a> Assembler386<'a> {
                             op_index,
                             op.opcode,
                             al.join(", ")
+                        );
+                    }
+                    // A result-less op still emits code — the stores that
+                    // advance a loop's mutable state are all discards — so it
+                    // opens its own span too.
+                    if crate::majit_dump_enabled() {
+                        eprintln!(
+                            "[dynasm] @{:#06x} op[{}] {:?}",
+                            self.mc.offset().0,
+                            op_index,
+                            op.opcode
                         );
                     }
                     self.regalloc_perform(op, *op_index, arglocs, None, fail_index, ops);

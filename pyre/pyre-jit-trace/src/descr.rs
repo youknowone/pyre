@@ -592,6 +592,12 @@ pub const W_BOOL_GC_TYPE_ID: u32 = 5;
 /// GC type id for W_IntRangeIterator. Inherits from `object`
 /// (`RANGE_ITER_TYPE` in functional.rs).
 pub const RANGE_ITER_GC_TYPE_ID: u32 = 6;
+/// GC type ids for the two `step == 1` iterator shapes.  They are separate
+/// layouts behind one `range_iterator` Python type, so each needs its own id
+/// for `GuardClass` to tell them apart and reach `stop` at a fixed offset.
+pub use pyre_object::functional::{
+    W_RANGE_ITER_ONE_ARG_GC_TYPE_ID, W_RANGE_ITER_STEP_ONE_GC_TYPE_ID,
+};
 // `W_LIST_GC_TYPE_ID` / `W_TUPLE_GC_TYPE_ID` live in `pyre-object`
 // alongside their structs (matching W_INT/W_FLOAT pattern); re-exported
 // here for existing call sites.
@@ -1594,6 +1600,79 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     )
 });
 
+/// `functional.py W_IntRangeStepOneIterator` — `_immutable_fields_ =
+/// ['stop']`, and `start` never moves either, so both carry the immutable
+/// column and a compiled loop keeps the bound in a register.
+static RANGE_ITER_STEP_ONE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::functional::W_IntRangeStepOneIterator>(),
+        W_RANGE_ITER_STEP_ONE_GC_TYPE_ID,
+        &pyre_object::functional::RANGE_ITER_STEP_ONE_TYPE as *const _ as usize,
+        &[
+            (
+                "current",
+                RANGE_ITER_STEP_ONE_CURRENT_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "stop",
+                RANGE_ITER_STEP_ONE_STOP_OFFSET,
+                8,
+                Type::Int,
+                true,
+                true,
+                false,
+            ),
+            (
+                "start",
+                RANGE_ITER_STEP_ONE_START_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+        ],
+        "W_IntRangeStepOneIterator",
+        "functional::W_IntRangeStepOneIterator",
+    )
+});
+
+/// `functional.py W_IntRangeOneArgIterator` — the `range(stop)` shape.
+static RANGE_ITER_ONE_ARG_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::functional::W_IntRangeOneArgIterator>(),
+        W_RANGE_ITER_ONE_ARG_GC_TYPE_ID,
+        &pyre_object::functional::RANGE_ITER_ONE_ARG_TYPE as *const _ as usize,
+        &[
+            (
+                "current",
+                RANGE_ITER_ONE_ARG_CURRENT_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "stop",
+                RANGE_ITER_ONE_ARG_STOP_OFFSET,
+                8,
+                Type::Int,
+                true,
+                true,
+                false,
+            ),
+        ],
+        "W_IntRangeOneArgIterator",
+        "functional::W_IntRangeOneArgIterator",
+    )
+});
+
 static SEQ_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::iterobject::W_SeqIterObject>(),
@@ -1777,6 +1856,15 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 Type::Ref,
                 false,
                 true,
+                false,
+            ),
+            (
+                "promote_step",
+                RANGE_PROMOTE_STEP_OFFSET,
+                1,
+                Type::Int,
+                false,
+                false,
                 false,
             ),
         ],
@@ -3217,8 +3305,10 @@ use pyre_object::floatobject::{
     FLOAT_FLOATVAL_OFFSET, FLOAT_W_DICT_OFFSET, FLOAT_W_SLOTS_OFFSET, W_FloatObject,
 };
 use pyre_object::functional::{
-    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET,
-    RANGE_LENGTH_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, RANGE_STOP_OFFSET, W_Range,
+    RANGE_ITER_CURRENT_OFFSET, RANGE_ITER_ONE_ARG_CURRENT_OFFSET, RANGE_ITER_ONE_ARG_STOP_OFFSET,
+    RANGE_ITER_REMAINING_OFFSET, RANGE_ITER_STEP_OFFSET, RANGE_ITER_STEP_ONE_CURRENT_OFFSET,
+    RANGE_ITER_STEP_ONE_START_OFFSET, RANGE_ITER_STEP_ONE_STOP_OFFSET, RANGE_LENGTH_OFFSET,
+    RANGE_PROMOTE_STEP_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, RANGE_STOP_OFFSET, W_Range,
 };
 use pyre_object::interp_exceptions::{
     EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_SUPPRESS_CONTEXT_OFFSET,
@@ -3349,6 +3439,31 @@ pub fn range_iter_step_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 2)
 }
 
+/// Field descriptor for `W_IntRangeStepOneIterator.current` (i64, signed).
+pub fn range_iter_step_one_current_descr() -> DescrRef {
+    field_descr_from_group(&RANGE_ITER_STEP_ONE_DESCR_GROUP, 0)
+}
+
+/// Field descriptor for `W_IntRangeStepOneIterator.stop` (i64, immutable).
+pub fn range_iter_step_one_stop_descr() -> DescrRef {
+    field_descr_from_group(&RANGE_ITER_STEP_ONE_DESCR_GROUP, 1)
+}
+
+/// Field descriptor for `W_IntRangeStepOneIterator.start` (i64, immutable).
+pub fn range_iter_step_one_start_descr() -> DescrRef {
+    field_descr_from_group(&RANGE_ITER_STEP_ONE_DESCR_GROUP, 2)
+}
+
+/// Field descriptor for `W_IntRangeOneArgIterator.current` (i64, signed).
+pub fn range_iter_one_arg_current_descr() -> DescrRef {
+    field_descr_from_group(&RANGE_ITER_ONE_ARG_DESCR_GROUP, 0)
+}
+
+/// Field descriptor for `W_IntRangeOneArgIterator.stop` (i64, immutable).
+pub fn range_iter_one_arg_stop_descr() -> DescrRef {
+    field_descr_from_group(&RANGE_ITER_ONE_ARG_DESCR_GROUP, 1)
+}
+
 /// Field descriptor for `W_SeqIterObject.seq`.
 pub fn seq_iter_seq_descr() -> DescrRef {
     field_descr_from_group(&SEQ_ITER_DESCR_GROUP, 0)
@@ -3420,6 +3535,11 @@ pub fn range_step_descr() -> DescrRef {
 /// Field descriptor for `W_Range.length` (wrapped PyObjectRef).
 pub fn range_length_descr() -> DescrRef {
     range_field_descr(RANGE_LENGTH_OFFSET)
+}
+
+/// Field descriptor for `W_Range.promote_step` (one byte).
+pub fn range_promote_step_descr() -> DescrRef {
+    range_field_descr(RANGE_PROMOTE_STEP_OFFSET)
 }
 
 /// `Method.w_function` — the underlying function (`Function` or
@@ -4807,6 +4927,18 @@ pub fn w_bool_size_descr() -> DescrRef {
 /// vtable = &RANGE_ITER_TYPE; type_id = 0.
 pub fn w_range_iter_size_descr() -> DescrRef {
     RANGE_ITER_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_IntRangeStepOneIterator` allocation via
+/// NewWithVtable.  vtable = &RANGE_ITER_STEP_ONE_TYPE.
+pub fn w_range_iter_step_one_size_descr() -> DescrRef {
+    RANGE_ITER_STEP_ONE_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_IntRangeOneArgIterator` allocation via
+/// NewWithVtable.  vtable = &RANGE_ITER_ONE_ARG_TYPE.
+pub fn w_range_iter_one_arg_size_descr() -> DescrRef {
+    RANGE_ITER_ONE_ARG_DESCR_GROUP.size_descr.clone()
 }
 
 /// Size descriptor for W_Range allocation via NewWithVtable.
@@ -7219,6 +7351,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("functional::W_IntRangeIterator", || {
         LazyLock::force(&RANGE_ITER_DESCR_GROUP);
+    }),
+    ("functional::W_IntRangeStepOneIterator", || {
+        LazyLock::force(&RANGE_ITER_STEP_ONE_DESCR_GROUP);
+    }),
+    ("functional::W_IntRangeOneArgIterator", || {
+        LazyLock::force(&RANGE_ITER_ONE_ARG_DESCR_GROUP);
     }),
     ("functional::W_Range", || {
         LazyLock::force(&RANGE_DESCR_GROUP);
