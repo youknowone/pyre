@@ -159,7 +159,7 @@ impl W_BufferedRandom {
     }
 
     fn raw_read(&mut self, start: usize, length: usize) -> Result<usize, crate::PyError> {
-        let temp = pyre_object::bytearrayobject::w_bytearray_new(length);
+        let temp = super::try_new_buffer(length)?;
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(self.self_obj());
         let _ = pyre_object::gc_roots::pin_root(temp);
@@ -424,7 +424,10 @@ impl W_BufferedRandom {
         if n <= current_size {
             return Ok(self.read_fast(n));
         }
-        let mut output = Vec::with_capacity(n);
+        // `_bufferedreader_read_generic` sizes its result with
+        // `PyBytes_FromStringAndSize(NULL, n)`: one fallible reservation of
+        // the requested length, whose failure is a `MemoryError`.
+        let mut output = crate::builtins::try_vec_with_capacity::<u8>(n)?;
         if current_size > 0 {
             let start = self.pos as usize;
             output.extend_from_slice(&self.buffer_bytes(start, start + current_size));
@@ -437,8 +440,11 @@ impl W_BufferedRandom {
 
         let mut remaining = n - output.len();
         while remaining >= self.buffer_size as usize {
+            // `MINUS_LAST_BLOCK`: every whole block still wanted bypasses the
+            // stream's buffer and is read in one go, leaving the last partial
+            // block to the buffer below.
             let block = self.buffer_size as usize * (remaining / self.buffer_size as usize);
-            let temp = pyre_object::bytearrayobject::w_bytearray_new(block);
+            let temp = super::try_new_buffer(block)?;
             let _roots = pyre_object::gc_roots::push_roots();
             let _ = pyre_object::gc_roots::pin_root(self.self_obj());
             let _ = pyre_object::gc_roots::pin_root(temp);
@@ -495,14 +501,19 @@ impl W_BufferedRandom {
     }
 
     fn read_size(&mut self, size: i64) -> Result<PyObjectRef, crate::PyError> {
+        // `_io__Buffered_read_impl` refuses the length before it looks at the
+        // stream, so a closed file still answers a bad length with the length's
+        // own message.
+        if size < -1 {
+            // [3.14-spec] zero is a valid length there; PyPy `read_w` still
+            // says "positive".
+            return Err(crate::PyError::value_error(
+                "read length must be non-negative or -1",
+            ));
+        }
         self.check_closed("read of closed file")?;
         if size == -1 {
             return self.with_lock(Self::read_all_unlocked);
-        }
-        if size < -1 {
-            return Err(crate::PyError::value_error(
-                "read length must be positive or -1",
-            ));
         }
         let size = size as usize;
         if let Some(result) = self.read_fast(size) {
@@ -532,7 +543,10 @@ impl W_BufferedRandom {
                 if size > this.buffer_size {
                     this.reader_reset_buf();
                     let requested = size as usize;
-                    let temp = pyre_object::bytearrayobject::w_bytearray_new(requested);
+                    // `_io__Buffered_read1_impl` allocates the whole request
+                    // with `PyBytes_FromStringAndSize(NULL, n)` and fills it
+                    // from a single raw read.
+                    let temp = super::try_new_buffer(requested)?;
                     let _roots = pyre_object::gc_roots::push_roots();
                     let _ = pyre_object::gc_roots::pin_root(this.self_obj());
                     let _ = pyre_object::gc_roots::pin_root(temp);
@@ -602,7 +616,7 @@ impl W_BufferedRandom {
             while written < requested {
                 let remaining = requested - written;
                 if remaining > this.buffer_size as usize {
-                    let temp = pyre_object::bytearrayobject::w_bytearray_new(remaining);
+                    let temp = super::try_new_buffer(remaining)?;
                     let _roots = pyre_object::gc_roots::push_roots();
                     let _ = pyre_object::gc_roots::pin_root(this.self_obj());
                     let _ = pyre_object::gc_roots::pin_root(temp);
@@ -706,7 +720,9 @@ impl W_BufferedRandom {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(w_raw);
         let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let buffer = pyre_object::bytearrayobject::w_bytearray_new(buffer_size as usize);
+        // `_buffered_init` reports a buffer it cannot allocate as
+        // `MemoryError`, and `buffer_size` came from Python.
+        let buffer = super::try_new_buffer(buffer_size as usize)?;
         self.w_raw = pyre_object::gc_roots::shadow_stack_get(raw_slot);
         self.buffer = buffer;
         self.buffer_size = buffer_size;

@@ -361,7 +361,9 @@ impl W_BufferedWriter {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(w_raw);
         let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let buffer = pyre_object::bytearrayobject::w_bytearray_new(buffer_size as usize);
+        // `_buffered_init` reports a buffer it cannot allocate as
+        // `MemoryError`, and `buffer_size` came from Python.
+        let buffer = super::try_new_buffer(buffer_size as usize)?;
         self.w_raw = pyre_object::gc_roots::shadow_stack_get(raw_slot);
         self.buffer = buffer;
         self.buffer_size = buffer_size;
