@@ -75,22 +75,27 @@ pub struct W_SSLSession {
 /// and the two that hold the body's length.
 const TLS_RECORD_HEADER_LEN: usize = 5;
 
-/// Where the shutdown exchange stands inside the record it is reading.
+/// Where the connection stands inside the TLS record it is reading.
 ///
-/// OpenSSL's record layer reads a header and then the body its length names,
-/// which is what keeps a socket-backed `SSL_shutdown` from lifting the
-/// plaintext that follows the peer's close_notify out of the kernel.  A
-/// transport that returns short -- a non-blocking socket, a timed one, an
+/// `ssl3_read_n` takes the 5-byte header and then exactly the body its length
+/// names, so OpenSSL never lifts more off the transport than the record it is
+/// parsing.  That is what leaves the plaintext following the peer's
+/// close_notify in the kernel for the socket `unwrap()` hands back, and it
+/// holds for every read rather than only the shutdown exchange: a `recv` that
+/// took the close_notify and the bytes behind it would drop those bytes into
+/// the TLS stream, where nothing can return them.
+///
+/// A transport that returns short -- a non-blocking socket, a timed one, an
 /// interrupted read -- unwinds back to the caller, which asks again, so this
 /// belongs to the connection and not to one call.
 #[derive(Default)]
-pub struct ShutdownRecord {
+pub struct RecordCursor {
     header: [u8; TLS_RECORD_HEADER_LEN],
     header_read: usize,
     body_left: usize,
 }
 
-impl ShutdownRecord {
+impl RecordCursor {
     /// The bytes still owed before the next record boundary.
     fn want(&self) -> usize {
         if self.body_left > 0 {
@@ -102,7 +107,7 @@ impl ShutdownRecord {
 
     /// Account for `data`, which must be no longer than [`want`].
     ///
-    /// [`want`]: ShutdownRecord::want
+    /// [`want`]: RecordCursor::want
     fn consume(&mut self, data: &[u8]) {
         if self.body_left > 0 {
             self.body_left -= data.len();
@@ -134,7 +139,7 @@ pub struct W_SSLSocket {
     pub server_hostname: PyObjectRef,
     pub server_side: bool,
     pub shutdown_started: bool,
-    pub shutdown_record: ShutdownRecord,
+    pub record: RecordCursor,
     pub requested_session: *mut pyre_native::ssl::NativeSession,
 }
 
@@ -548,7 +553,7 @@ fn allocate_ssl_socket(
         },
         server_side,
         shutdown_started: false,
-        shutdown_record: ShutdownRecord::default(),
+        record: RecordCursor::default(),
         requested_session,
     })
 }
@@ -1618,7 +1623,7 @@ mod ssl_socket_methods {
         if let Some((transport, fd)) = pump_transport(socket)? {
             let backend = socket.backend;
             loop {
-                match pump(backend, fd, &mut [], PumpGoal::Flush) {
+                match pump(backend, fd, &mut [], PumpGoal::Flush, &mut socket.record) {
                     PumpExit::Done(_) => return Ok(()),
                     PumpExit::Interrupted => {
                         crate::module::signal::interp_signal::checksignals_now()?
@@ -1696,17 +1701,6 @@ mod ssl_socket_methods {
         Rejected((i32, String)),
     }
 
-    /// [`pump_record_bounded`] for the goals that read whatever the transport
-    /// has, rather than one TLS record at a time.
-    fn pump(
-        backend: *mut pyre_native::ssl::TlsConnection,
-        fd: crate::module::_socket::rsocket_rffi::Socket,
-        buf: &mut [u8],
-        goal: PumpGoal,
-    ) -> PumpExit {
-        pump_record_bounded(backend, fd, buf, goal, &mut ShutdownRecord::default())
-    }
-
     /// The `PySSL_BEGIN_ALLOW_THREADS` bracket that `SSL_do_handshake`,
     /// `SSL_read` and `SSL_write` each put around their whole exchange: the
     /// peer's records are read, answered and parsed without the interpreter,
@@ -1719,15 +1713,15 @@ mod ssl_socket_methods {
     /// server context to choose, a signal to deliver, an error to raise - end
     /// the run and are answered by the caller.
     ///
-    /// `record` carries where a [`PumpGoal::Shutdown`] run stands inside the
-    /// record it is reading, so it has to outlive the call: a transport that
-    /// returns short unwinds to the caller, which re-enters here.
-    fn pump_record_bounded(
+    /// `record` is the connection's cursor into the record being read, so it
+    /// outlives the call: a transport that returns short unwinds to the
+    /// caller, which re-enters here and has to resume where it stopped.
+    fn pump(
         backend: *mut pyre_native::ssl::TlsConnection,
         fd: crate::module::_socket::rsocket_rffi::Socket,
         buf: &mut [u8],
         goal: PumpGoal,
-        record: &mut ShutdownRecord,
+        record: &mut RecordCursor,
     ) -> PumpExit {
         use crate::module::_socket::interp_socket::{socket_recv_raw, socket_send_raw};
         use crate::module::_socket::rsocket_rffi::error_is_interrupted;
@@ -1789,16 +1783,15 @@ mod ssl_socket_methods {
                     }
                 }
             }
-            let want = match goal {
-                PumpGoal::Shutdown => record.want().min(buf.len()),
-                _ => buf.len(),
-            };
+            // Every goal, not only `Shutdown`: a read that stops at the
+            // boundary is what keeps the cursor describing the transport, and
+            // it is also what leaves a later close_notify's trailing plaintext
+            // where `unwrap()` can still hand it over.
+            let want = record.want().min(buf.len());
             match socket_recv_raw(fd, &mut buf[..want], 0) {
                 Ok(0) => return PumpExit::Eof,
                 Ok(read) => {
-                    if matches!(goal, PumpGoal::Shutdown) {
-                        record.consume(&buf[..read]);
-                    }
+                    record.consume(&buf[..read]);
                     if let Err(error) =
                         unsafe { pyre_native::ssl::connection_receive_tls(backend, &buf[..read]) }
                     {
@@ -1889,20 +1882,10 @@ mod ssl_socket_methods {
         Ok(Some((transport, fd)))
     }
 
+    /// The callback-aware counterpart of [`pump`], which returns to the
+    /// interpreter after every record instead of holding it across the
+    /// exchange.  It stops at the same boundary, for the same reason.
     fn receive_transport(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
-        receive_transport_bounded(socket, false)
-    }
-
-    /// `track_record` stops the socket read at the boundary the connection's
-    /// `shutdown_record` is tracking, and accounts what it read against it.
-    /// The shutdown exchange needs that: what follows the peer's close_notify
-    /// is the plaintext `unwrap()` hands back with the socket, and a read that
-    /// crossed the boundary would feed those bytes to the TLS stream, where
-    /// nothing can return them.
-    fn receive_transport_bounded(
-        socket: &mut W_SSLSocket,
-        track_record: bool,
-    ) -> Result<(), crate::PyError> {
         ensure_connection(socket)?;
         if !unsafe { is_none(socket.incoming) } {
             let incoming = W_MemoryBIO::from_obj(socket.incoming)
@@ -1930,11 +1913,7 @@ mod ssl_socket_methods {
         let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
         crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, false)?;
         let mut buf = vec![0u8; 32 * 1024];
-        let want = if track_record {
-            socket.shutdown_record.want().min(buf.len())
-        } else {
-            buf.len()
-        };
+        let want = socket.record.want().min(buf.len());
         let read = match crate::module::_socket::interp_socket::socket_recv_bytes(
             transport,
             fd,
@@ -1956,9 +1935,7 @@ mod ssl_socket_methods {
                 "EOF occurred in violation of protocol".to_string(),
             ));
         }
-        if track_record {
-            socket.shutdown_record.consume(&buf[..read]);
-        }
+        socket.record.consume(&buf[..read]);
         receive_tls(socket, &buf[..read]).map(|_| ())
     }
 
@@ -2171,7 +2148,13 @@ mod ssl_socket_methods {
                         pump_buffer.resize(32 * 1024, 0u8);
                     }
                     let backend = self.backend;
-                    match pump(backend, fd, &mut pump_buffer, PumpGoal::Handshake) {
+                    match pump(
+                        backend,
+                        fd,
+                        &mut pump_buffer,
+                        PumpGoal::Handshake,
+                        &mut self.record,
+                    ) {
                         PumpExit::Done(_) => {
                             settle_received_tls(self)?;
                             return Ok(());
@@ -2292,7 +2275,13 @@ mod ssl_socket_methods {
                 let mut buf = vec![0u8; 32 * 1024];
                 let backend = self.backend;
                 loop {
-                    match pump(backend, fd, &mut buf, PumpGoal::Read(size)) {
+                    match pump(
+                        backend,
+                        fd,
+                        &mut buf,
+                        PumpGoal::Read(size),
+                        &mut self.record,
+                    ) {
                         PumpExit::Done(data) => {
                             settle_received_tls(self)?;
                             break data;
@@ -2555,12 +2544,12 @@ mod ssl_socket_methods {
             if let Some((transport, fd)) = pump_transport(self)? {
                 let mut buf = vec![0u8; 32 * 1024];
                 loop {
-                    match pump_record_bounded(
+                    match pump(
                         self.backend,
                         fd,
                         &mut buf,
                         PumpGoal::Shutdown,
-                        &mut self.shutdown_record,
+                        &mut self.record,
                     ) {
                         PumpExit::Done(_) => {
                             settle_received_tls(self)?;
@@ -2582,10 +2571,10 @@ mod ssl_socket_methods {
                 // A message callback requires returning to the interpreter
                 // after every record.  Keep PyPy's shutdown loop in that
                 // case too, but use the callback-aware transport helpers
-                // instead of the released pump -- reading to the same record
-                // boundary the pump stops at.
+                // instead of the released pump -- which reads to the same
+                // record boundary.
                 while !unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
-                    receive_transport_bounded(self, true)?;
+                    receive_transport(self)?;
                     flush_transport(self)?;
                 }
             }
