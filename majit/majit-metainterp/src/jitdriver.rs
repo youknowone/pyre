@@ -5388,34 +5388,18 @@ impl<S: JitState> JitDriver<S> {
         // position to re-enter at; every other JitState resumes through its
         // own frontend.
         let dispatch = self.dispatch_jitcode().cloned()?;
-        // The cut below is a MASK, not a boundary. It refuses a guard whose
-        // deferred writes span more than one virtual, and the wrong answers
-        // that motivated it are not this entry's to begin with: they are made
-        // at the CLOSE, by the shape of the loop the bridge closes onto.
+        // The cut below is a MASK, not a boundary: it refuses a guard whose
+        // deferred writes span more than one virtual. The wrong answers that
+        // motivated it were never this entry's to begin with — they are made
+        // at the CLOSE, by a loop whose single LABEL its own closing JUMP
+        // specialized, and `compile_loop` now declines to compile that shape
+        // rather than publishing a label nothing can enter soundly (see
+        // `MetaInterp::closing_jump_fixes_label_slots`).
         //
-        // A jitdriver that drops `unroll` from its pass list compiles every
-        // loop through the simple-loop path, and that path mints ONE target
-        // token — nothing in front of it, and no virtual state on it. The
-        // loop's own closing JUMP still carries the traced iteration's
-        // constants: `remove_consts_and_duplicates` records a `SAME_AS` for
-        // each one, and the rewrite pass folds it straight back. Some of those
-        // slots are ones the body never reads, so the label is specialized to
-        // their constants while declaring plain boxes, and an entry supplying
-        // a different value in one of them keeps it for a single iteration and
-        // loses it to the back edge. Upstream never has that shape to enter:
-        // `compile_loop` peels, keeps the unspecialized preamble as
-        // `target_tokens[0]`, and gives the peeled label a virtual state, so
-        // `unroll.py jump_to_existing_trace` either matches that state or
-        // falls back to the preamble. Without the peel there is no preamble to
-        // fall back to and no state to match.
-        //
-        // Guard-resume entries are implicated only because they are the
-        // bridges that close onto such a loop; rebuilding from resume data is
-        // not itself what corrupts, which is why declining every one of them
-        // removes the wrong answer at a cost no policy would pay.
-        //
-        // The cut stays because it halves this frontend's guard failures. It
-        // is NOT a soundness argument, and it is not what makes an entry safe.
+        // What is left here is policy. Rebuilding a bridge entry from resume
+        // data is sound on its own; this only narrows which guards are given
+        // one. Nothing below depends on the cut for correctness, and removing
+        // it cannot reintroduce the close-side defect.
         //
         // Sited here rather than in the ladder below because
         // `compile.py ResumeGuardDescr.handle_fail` runs ONE of resume.py's
