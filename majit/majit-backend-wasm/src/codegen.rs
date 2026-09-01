@@ -5543,7 +5543,7 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let base_size = emit_array_addr(&mut sink, constants, value_types, op);
-                    let (item_size, signed) = array_item_size_sign_from_descr(op);
+                    let (item_size, signed) = array_item_access_size_sign(op);
                     emit_sized_int_load(&mut sink, base_size, item_size, signed);
                     sink.local_set(value_types.local(vi));
                 }
@@ -5552,7 +5552,8 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let base_size = emit_array_addr(&mut sink, constants, value_types, op);
-                    sink.i64_load32_u(memarg(base_size, 2));
+                    let (item_size, signed) = array_item_access_size_sign(op);
+                    emit_sized_int_load(&mut sink, base_size, item_size, signed);
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -5587,7 +5588,7 @@ fn build_function(
                     // A Ref item is pointer-width (4 bytes on wasm32). Storing a
                     // fixed 8 bytes would clobber the next item, or run past the
                     // array end on the last item and corrupt the heap.
-                    let (item_size, _signed) = array_item_size_sign_from_descr(op);
+                    let (item_size, _signed) = array_item_access_size_sign(op);
                     emit_sized_int_store(&mut sink, base_size, item_size);
                 }
             }
@@ -5618,14 +5619,11 @@ fn build_function(
                     // register class — it is what the value local was declared
                     // from — so it picks the load the same way the three
                     // `Getarrayitem` arms do.
-                    match op.opcode {
-                        OpCode::GetinteriorfieldGcF => {
-                            sink.f64_load(mem64(base));
-                        }
-                        OpCode::GetinteriorfieldGcR => {
-                            sink.i64_load32_u(memarg(base, 2));
-                        }
-                        _ => emit_sized_int_load(&mut sink, base, field.field_size, field.signed),
+                    if op.opcode == OpCode::GetinteriorfieldGcF {
+                        sink.f64_load(mem64(base));
+                    } else {
+                        let (size, signed) = field.access_size_sign();
+                        emit_sized_int_load(&mut sink, base, size, signed);
                     }
                     sink.local_set(value_types.local(vi));
                 }
@@ -5661,7 +5659,7 @@ fn build_function(
                     sink.f64_store(mem64(base));
                 } else {
                     emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    emit_sized_int_store(&mut sink, base, field.access_size());
+                    emit_sized_int_store(&mut sink, base, field.access_size_sign().0);
                 }
             }
 
@@ -8278,10 +8276,32 @@ fn emit_array_addr(
     )
 }
 
-/// The width of a GC pointer in the wasm32 guest heap, which is what
-/// `GetarrayitemGcR` reads back. A descriptor's `field_size` reports the width
-/// on whichever target compiled it.
+/// The width of a GC pointer in the wasm32 guest heap.
+///
+/// A descriptor mints its width from the compiling target, so for a pyre descr
+/// this is already what `field_size` / `item_size` says. It stays as its own
+/// constant for the descr that does not: a pointer is four bytes here whatever
+/// the descr claims, and a reading arm and its writing arm must take the width
+/// from ONE place — the two spellings agreeing today is not the same as them
+/// being one rule.
 const GUEST_PTR_SIZE: usize = 4;
+
+/// The width an access to one array item moves, and how a read of it extends.
+/// The array twin of [`InteriorFieldLayout::access_size`]; every
+/// `GETARRAYITEM` / `SETARRAYITEM` arm reads it from here.
+///
+/// The address stride still comes from the descriptor's own `item_size`
+/// (`emit_array_addr`), which is what the allocation laid the array out with.
+fn array_item_access_size_sign(op: &Op) -> (usize, bool) {
+    op.with_array_descr(|ad| {
+        if ad.is_array_of_pointers() {
+            (GUEST_PTR_SIZE, false)
+        } else {
+            (ad.item_size(), ad.is_item_signed())
+        }
+    })
+    .unwrap_or_else(|| missing_layout_descr("array descr (item size/sign)", op))
+}
 
 /// `descr.py unpack_interiorfielddescr`: `ofs = basesize + field.offset`,
 /// plus the element stride and the field's own width / signedness / kind.
@@ -8298,14 +8318,15 @@ struct InteriorFieldLayout {
 }
 
 impl InteriorFieldLayout {
-    /// The width an access to this field moves. A pointer field is
-    /// guest-pointer-wide, the width `GetarrayitemGcR` reads back; the
-    /// descriptor's own `field_size` is the host's.
-    fn access_size(&self) -> usize {
+    /// The width an access to this field moves, and how a read of it extends.
+    /// A pointer is guest-pointer-wide and never extends as signed, whatever
+    /// the descriptor says; every reading and writing arm takes both from here
+    /// so the two cannot drift apart.
+    fn access_size_sign(&self) -> (usize, bool) {
         if self.is_ptr {
-            GUEST_PTR_SIZE
+            (GUEST_PTR_SIZE, false)
         } else {
-            self.field_size
+            (self.field_size, self.signed)
         }
     }
 }

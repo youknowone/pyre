@@ -2321,6 +2321,55 @@ fn test_true_void_int_ref_call_uses_void_result_type_without_drop() {
 }
 
 #[test]
+fn a_pointer_array_item_is_read_and_written_at_the_same_width() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    // A descriptor claiming the host's eight-byte pointer. The guest's is four,
+    // and whichever of the two the arms take, the read and the write have to
+    // take the same one: a four-byte read of an eight-byte write returns half a
+    // pointer, and an eight-byte write over four-byte items clobbers the next.
+    let descr: majit_ir::DescrRef = Arc::new(SimpleArrayDescr::new(0, 16, 8, 71, Type::Ref));
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Ref, 2),
+    ];
+    let get = make_op(
+        OpCode::GetarrayitemGcR,
+        &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+        OpRef::ref_op(3),
+    );
+    get.setdescr(Arc::clone(&descr));
+    let set = make_op(
+        OpCode::SetarrayitemGc,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_ref(2),
+        ],
+        OpRef::NONE,
+    );
+    set.setdescr(descr);
+    let ops = vec![get, set, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(3))])];
+    let (bytes, _guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    let (mut narrow_loads, mut narrow_stores, mut wide_stores) = (0usize, 0usize, 0usize);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Load32U { memarg } if memarg.offset == 16 => narrow_loads += 1,
+        wasmparser::Operator::I64Store32 { memarg } if memarg.offset == 16 => narrow_stores += 1,
+        wasmparser::Operator::I64Store { memarg } if memarg.offset == 16 => wide_stores += 1,
+        _ => {}
+    });
+    assert_eq!(
+        (narrow_loads, narrow_stores, wide_stores),
+        (1, 1, 0),
+        "the item read and the item write moved different widths"
+    );
+}
+
+#[test]
 fn an_allocation_is_followed_by_a_memory_error_check() {
     use majit_ir::descr::SimpleSizeDescr;
     use std::sync::Arc;
