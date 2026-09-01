@@ -92,6 +92,18 @@ pub(crate) struct VirtualizableConfig {
     /// before it consults this field at all, so a tracker is still installed
     /// there with this set to `None`.
     pub identity_input_index: Option<usize>,
+    /// [`VirtualizableInfo::has_vable_token`], which decides whether a
+    /// residual call may leave the tracked field/array maps stale.
+    ///
+    /// With a token, a callee that touches the virtualizable clears it and
+    /// `vable_after_residual_call` (`pyjitpl.py:3373-3375`) aborts the trace,
+    /// so no read after the call can observe a write the maps missed. A
+    /// `without_vable_token` machine has no such signal: the tracer writes the
+    /// fields out before the call and reads them back after
+    /// (`TraceCtx::materialize_tokenless_virtualizable_before_residual_call`
+    /// and its reload twin) and keeps tracing, so the maps must be dropped at
+    /// the call for those reads to survive.
+    pub has_vable_token: bool,
 }
 
 /// JitVirtualRef field slot indices.
@@ -436,6 +448,35 @@ impl VirtualizableTracker {
                 }
             });
         }
+    }
+
+    /// Drop every tracked static field and array element of the standard
+    /// virtualizable.
+    ///
+    /// The counterpart of `clean_caches` (`heap.py:519-531`) for the two maps
+    /// this tracker keeps outside `OptHeap`. It applies only to a
+    /// `without_vable_token` machine: see
+    /// [`VirtualizableConfig::has_vable_token`] for why a token-bearing one
+    /// cannot reach a stale read.
+    ///
+    /// `field_descrs` survives — it is the descr each slot was seeded with,
+    /// not a value, and the force path still needs it after the values go.
+    fn invalidate_all(&self, ctx: &mut OptContext) {
+        if self.config.has_vable_token {
+            return;
+        }
+        let Some(identity) = self
+            .identity_input_ref(ctx)
+            .and_then(|r| ctx.get_box_replacement_operand_opt(r))
+        else {
+            return;
+        };
+        ctx.with_ptr_info_mut(&identity, |info| {
+            if let PtrInfo::Virtualizable(vstate) = info {
+                vstate.fields.clear();
+                vstate.arrays.clear();
+            }
+        });
     }
 
     /// Read counterpart to [`mirror_setarrayitem`]: returns the tracked
@@ -2350,6 +2391,17 @@ impl Optimization for OptVirtualize {
                         return OptimizationResult::Remove;
                     }
                 }
+                // The callee is handed the virtualizable and may write it.
+                // On a token-bearing machine that write clears the token and
+                // the trace has already aborted, so the maps stay good; a
+                // `without_vable_token` machine keeps tracing, and the reload
+                // the tracer records after the call is the only reader of what
+                // the callee wrote. Folding that reload back to the value
+                // stored before the call is the wrong answer, so drop the maps
+                // here.
+                if let Some(ref vt) = self.vable {
+                    vt.invalidate_all(ctx);
+                }
                 OptimizationResult::PassOn
             }
 
@@ -3915,6 +3967,7 @@ mod tests {
                 array_field_descrs: vec![],
                 vable_input_offset: 0,
                 identity_input_index: Some(0),
+                has_vable_token: true,
             },
         )));
         let forced = opt.force_box(OpRef::input_arg_ref(0), &mut ctx);
@@ -3945,6 +3998,7 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
+            has_vable_token: true,
         });
         pass.setup();
 
@@ -4044,6 +4098,7 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
+            has_vable_token: true,
         });
         pass.setup();
 
@@ -4092,6 +4147,7 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
+            has_vable_token: true,
         });
         pass.setup();
 
@@ -4122,6 +4178,7 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
+            has_vable_token: true,
         });
         pass.setup();
 
@@ -4155,6 +4212,7 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
+            has_vable_token: true,
         });
         pass.setup();
         if let Some(ref mut vt) = pass.vable {
@@ -4230,6 +4288,7 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
+            has_vable_token: true,
         });
         pass.setup();
 
@@ -4275,6 +4334,7 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
+            has_vable_token: true,
         });
         pass.setup();
 
@@ -4325,6 +4385,7 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
+            has_vable_token: true,
         });
         pass.setup();
 
@@ -4432,6 +4493,7 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
+            has_vable_token: true,
         });
         pass.setup();
 
@@ -4545,6 +4607,7 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
+            has_vable_token: true,
         });
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let mut ops = vec![
