@@ -3111,6 +3111,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
         && (addr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(addr))
     {
+        // Every caller catches this variant to decline its whole fold, so
+        // without a report here the un-lowered helper that stopped the descent
+        // is unnameable.  `symbolic` resolves against `symbolic_fnaddr_paths`
+        // in the build's jit metadata.
+        if fbw_debug_abort_enabled() {
+            eprintln!("[subwalk-unsupported] pc={op_pc} symbolic={addr:#x}");
+        }
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
             pc: op_pc,
             symbolic: addr,
