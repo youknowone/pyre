@@ -197,10 +197,11 @@ fn root_forwarded_gcref(
             // (ConstInt), never a traced ref — no rooting needed.
             _ => {}
         }
-    } else if let majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(gcref)) = forwarded
+    } else if let majit_ir::forwarding::Forwarded::Const(cell) = forwarded
+        && let majit_ir::Value::Ref(gcref) = cell.get()
         && !gcref.is_null()
     {
-        let ss_idx = majit_gc::shadow_stack::push(*gcref);
+        let ss_idx = majit_gc::shadow_stack::push(gcref);
         rooted_refs.push((dummy_key, const_ref_field, ss_idx));
     }
 }
@@ -234,13 +235,16 @@ fn refresh_forwarded_const_ref(
     forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
     updated: majit_ir::GcRef,
 ) {
-    let is_const_ref = matches!(
-        &*forwarded.borrow(),
-        majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(_))
-    );
-    if is_const_ref {
-        *forwarded.borrow_mut() =
-            majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(updated));
+    let cell = match &*forwarded.borrow() {
+        majit_ir::forwarding::Forwarded::Const(cell)
+            if matches!(cell.get(), majit_ir::Value::Ref(_)) =>
+        {
+            Some(std::rc::Rc::clone(cell))
+        }
+        _ => None,
+    };
+    if let Some(cell) = cell {
+        cell.set(majit_ir::Value::Ref(updated));
     }
 }
 
@@ -421,6 +425,9 @@ pub struct UnrollOptimizer {
     /// because the unroll optimizer owns the inner phase optimizers while the
     /// registered GC walker enters through MetaInterp.
     pub compile_snapshot_root_slots: Option<usize>,
+    /// Address of `MetaInterp.compile_resume_memos`, forwarded to every
+    /// `Optimizer` this unroll builds so its memo is rooted while in flight.
+    pub compile_resume_memos_slot: Option<usize>,
     /// MetaInterp-owned slot that publishes the in-flight phase-2
     /// `Optimizer.short_preamble_producer` to the registered GC walker.
     pub compile_short_preamble_producer_slot: Option<usize>,
@@ -556,6 +563,7 @@ impl UnrollOptimizer {
             cpu: crate::cpu::default_cpu(),
             phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
+            compile_resume_memos_slot: None,
             compile_short_preamble_producer_slot: None,
             persistent_snapshot_root_slots: Vec::new(),
         }
@@ -629,9 +637,38 @@ impl UnrollOptimizer {
         }
         optimizer.published_short_preamble_producer_slot =
             self.compile_short_preamble_producer_slot;
+        self.register_resume_memo(optimizer);
         PublishedShortPreambleProducer {
             slot: self.compile_short_preamble_producer_slot,
             previous,
+        }
+    }
+
+    /// Hand `optimizer`'s resume memo to the metainterpreter's root area for
+    /// the rest of this compile.
+    ///
+    /// optimizer.py:732 gives every `Optimizer` its own `ResumeDataLoopMemo`,
+    /// and `store_final_boxes_in_guard` fills that memo's `rd_consts` with live
+    /// GCREFs as it numbers each guard. RPython reaches them through the
+    /// optimizer the compiling frame holds; here the walker reaches only what
+    /// the metainterpreter published, so each optimizer that numbers guards
+    /// registers its own memo — `unroll.py optimize_preamble`'s as well as
+    /// `optimize_peeled_loop`'s.
+    ///
+    /// The handle is `Weak`, so a dropped `Optimizer` needs no withdrawal:
+    /// `MetaInterp::walk_rd_consts_refs` keeps only the ones that upgrade.
+    fn register_resume_memo(&self, optimizer: &crate::optimizeopt::optimizer::Optimizer) {
+        let Some(addr) = self.compile_resume_memos_slot else {
+            return;
+        };
+        // SAFETY: pyjitpl installs this address from
+        // `MetaInterp.compile_resume_memos` for the duration of one compile,
+        // and `CompileSnapshotRootsGuard` empties the vector before the
+        // compile returns. Unroll phases run on the same thread as the
+        // registered root walker.
+        unsafe {
+            (*(addr as *mut Vec<crate::resume::LiveResumeMemo>))
+                .push(std::rc::Rc::downgrade(&optimizer.resumedata_memo));
         }
     }
 
@@ -825,6 +862,7 @@ impl UnrollOptimizer {
                 }
                 None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
             };
+            self.register_resume_memo(&opt_p1);
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.callinfocollection = self.callinfocollection.clone();
             opt_p1.cpu = self.cpu.clone();
@@ -2633,8 +2671,11 @@ impl ExportedState {
             let mut forwarded = forwarded.borrow_mut();
             match &mut *forwarded {
                 majit_ir::forwarding::Forwarded::Info(info) => visit_op_info(info, visitor),
-                majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(gcref)) => {
-                    visitor(gcref)
+                majit_ir::forwarding::Forwarded::Const(cell) => {
+                    if let majit_ir::Value::Ref(mut gcref) = cell.get() {
+                        visitor(&mut gcref);
+                        cell.set(majit_ir::Value::Ref(gcref));
+                    }
                 }
                 _ => {}
             }

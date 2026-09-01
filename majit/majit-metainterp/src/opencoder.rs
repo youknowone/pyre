@@ -203,9 +203,9 @@ pub trait BaseTrace {}
 // makes `_index`'s dual use safe.
 
 /// opencoder.py class TraceIterator(BaseTrace).
-pub struct TraceIterator<'a> {
+pub struct TraceIterator<'a, T = majit_ir::OpRc> {
     /// opencoder.py:252 self.trace
-    pub trace: &'a [majit_ir::OpRc],
+    pub trace: &'a [T],
     /// opencoder.py:255 self._cache: per-iterator map from raw trace
     /// position to the fresh box OBJECT materialized for this iteration.
     /// In RPython this is `[None] * trace._index` holding the fresh
@@ -244,9 +244,12 @@ pub struct TraceIterator<'a> {
     pub _fresh: u32,
 }
 
-impl BaseTrace for TraceIterator<'_> {}
+impl<T> BaseTrace for TraceIterator<'_, T> where T: std::borrow::Borrow<majit_ir::Op> {}
 
-impl<'a> TraceIterator<'a> {
+impl<'a, T> TraceIterator<'a, T>
+where
+    T: std::borrow::Borrow<majit_ir::Op>,
+{
     /// opencoder.py TraceIterator.__init__.
     ///
     /// `force_inputargs` corresponds to the same RPython parameter
@@ -257,13 +260,68 @@ impl<'a> TraceIterator<'a> {
     /// ranges. RPython does not need this because each iteration's
     /// `cls()` allocation produces distinct Python objects.
     pub fn new(
-        trace: &'a [majit_ir::OpRc],
+        trace: &'a [T],
         start: usize,
         end: usize,
         force_inputargs: Option<&[OpRef]>,
         inputarg_types: &[majit_ir::Type],
         start_fresh: u32,
     ) -> Self {
+        let dense_positions: Vec<OpRef> = inputarg_types
+            .iter()
+            .enumerate()
+            .map(|(position, &tp)| OpRef::input_arg_typed(position as u32, tp))
+            .collect();
+        Self::new_with_input_layout(
+            trace,
+            start,
+            end,
+            force_inputargs,
+            inputarg_types,
+            &dense_positions,
+            start_fresh,
+        )
+    }
+
+    /// `TraceIterator.__init__` with the recorded trace's actual input boxes.
+    ///
+    /// RPython seeds `_cache[trace.inputargs[i].get_position()]`, not
+    /// `_cache[i]`.  Most majit traces have dense input positions, so `new`
+    /// retains the compact type-only surface for those callers.  Guard-failure
+    /// histories can contain holes, however: `Trace(max_num_inputargs)` keeps
+    /// the original coordinate space while `History.set_inputargs` filters
+    /// dead boxes.  This entry point preserves those sparse positions.
+    pub fn new_with_inputargs(
+        trace: &'a [T],
+        start: usize,
+        end: usize,
+        force_inputargs: Option<&[OpRef]>,
+        inputargs: &[InputArg],
+        start_fresh: u32,
+    ) -> Self {
+        let inputarg_types: Vec<majit_ir::Type> = inputargs.iter().map(|arg| arg.tp).collect();
+        let inputarg_positions: Vec<OpRef> = inputargs.iter().map(InputArg::opref).collect();
+        Self::new_with_input_layout(
+            trace,
+            start,
+            end,
+            force_inputargs,
+            &inputarg_types,
+            &inputarg_positions,
+            start_fresh,
+        )
+    }
+
+    fn new_with_input_layout(
+        trace: &'a [T],
+        start: usize,
+        end: usize,
+        force_inputargs: Option<&[OpRef]>,
+        inputarg_types: &[majit_ir::Type],
+        inputarg_positions: &[OpRef],
+        start_fresh: u32,
+    ) -> Self {
+        debug_assert_eq!(inputarg_types.len(), inputarg_positions.len());
         // self._cache = [None] * trace._index
         // The iterator's cache must be large enough to hold any raw trace
         // position we may encounter. RPython sizes it from `trace._index`
@@ -272,6 +330,7 @@ impl<'a> TraceIterator<'a> {
         let num_inputargs = inputarg_types.len();
         let max_pos = trace[start..end]
             .iter()
+            .map(std::borrow::Borrow::borrow)
             .flat_map(|op| {
                 std::iter::once(op.pos.get())
                     .chain(op.getarglist_copy().into_iter().map(|a| a.to_opref()))
@@ -328,8 +387,12 @@ impl<'a> TraceIterator<'a> {
                     r
                 })
                 .collect();
-            for i in 0..num_inputargs {
-                _cache[i] = Some(Operand::from_bound_inputarg(&inputargs[i]));
+            for (i, position) in inputarg_positions.iter().enumerate() {
+                let p = position.raw() as usize;
+                if p >= _cache.len() {
+                    _cache.resize(p + 1, None);
+                }
+                _cache[p] = Some(Operand::from_bound_inputarg(&inputargs[i]));
             }
         }
         TraceIterator {
@@ -421,17 +484,25 @@ impl<'a> TraceIterator<'a> {
         if self.done() {
             return None;
         }
-        let src = &self.trace[self.pos];
+        let src: &majit_ir::Op = self.trace[self.pos].borrow();
         self.pos += 1;
-        let mut res: majit_ir::Op = (**src).clone();
+        let mut res: majit_ir::Op = src.clone();
         // opencoder.py:379-387: for i in range(argnum):
         //     res.setarg(i, self._untag(self._next()))
         for i in 0..res.num_args() {
-            res.setarg(i, self._untag(res.arg(i).to_opref()));
+            // The legacy adapter already carries the decoded Const object in
+            // the source op. RPython's byte iterator creates it once while
+            // decoding `_untag`; keep that object instead of flattening it to
+            // OpRef and allocating a second Const wrapper immediately.
+            if !res.arg(i).is_constant() {
+                res.setarg(i, self._untag(res.arg(i).to_opref()));
+            }
         }
         if let Some(fa) = res.fail_args_mut() {
             for arg in fa.iter_mut() {
-                *arg = self._untag(arg.to_opref());
+                if !arg.is_constant() {
+                    *arg = self._untag(arg.to_opref());
+                }
             }
         }
         // RPython opencoder.py:399-401:
@@ -3027,6 +3098,48 @@ mod tests {
         let finish = iter.next().unwrap();
         assert_eq!(finish.arg(0).to_opref(), iop(3));
         assert!(iter.done());
+    }
+
+    #[test]
+    fn trace_iterator_keeps_an_already_decoded_const_operand() {
+        let constant = majit_ir::operand::Operand::const_from_value(majit_ir::Value::Int(7));
+        let ops = vec![majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[constant.clone(), constant.clone()],
+        )];
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &[], 0);
+
+        let decoded = iter.next().expect("one encoded operation");
+
+        assert!(decoded.arg(0).same_box(&constant));
+        assert!(decoded.arg(1).same_box(&constant));
+    }
+
+    #[test]
+    fn trace_iterator_seeds_sparse_guard_history_positions() {
+        // `Trace(max_num_inputargs=3)` reserved position 1, but
+        // `History.set_inputargs([box0, box2])` filtered that dead box.
+        // `TraceIterator.__init__` must seed `_cache` by each surviving
+        // box's recorded position, not by its compact vector index.
+        let ops = vec![std::rc::Rc::new(op_at(
+            3,
+            majit_ir::OpCode::IntAdd,
+            &[iarg(0), iarg(2)],
+        ))];
+        let inputargs = vec![
+            majit_ir::InputArg::new_int(0),
+            majit_ir::InputArg::new_int(2),
+        ];
+
+        let mut iter = TraceIterator::new_with_inputargs(&ops, 0, ops.len(), None, &inputargs, 10);
+        assert_eq!(cache_opref(&iter, 0), Some(iarg(10)));
+        assert_eq!(cache_opref(&iter, 1), None);
+        assert_eq!(cache_opref(&iter, 2), Some(iarg(11)));
+
+        let add = iter.next().unwrap();
+        assert_eq!(add.arg(0).to_opref(), iarg(10));
+        assert_eq!(add.arg(1).to_opref(), iarg(11));
+        assert_eq!(add.pos.get(), iop(12));
     }
 
     #[test]

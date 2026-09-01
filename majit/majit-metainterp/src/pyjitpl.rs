@@ -755,13 +755,19 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
 pub(crate) struct CompileSnapshotRootsGuard {
     refs: *mut Vec<usize>,
     short_preamble_producer: *mut Option<usize>,
+    resume_memos: *mut Vec<crate::resume::LiveResumeMemo>,
 }
 
 impl CompileSnapshotRootsGuard {
-    pub(crate) fn new(refs: &mut Vec<usize>, short_preamble_producer: &mut Option<usize>) -> Self {
+    pub(crate) fn new(
+        refs: &mut Vec<usize>,
+        short_preamble_producer: &mut Option<usize>,
+        resume_memos: &mut Vec<crate::resume::LiveResumeMemo>,
+    ) -> Self {
         Self {
             refs: refs as *mut _,
             short_preamble_producer: short_preamble_producer as *mut _,
+            resume_memos: resume_memos as *mut _,
         }
     }
 }
@@ -777,6 +783,7 @@ impl Drop for CompileSnapshotRootsGuard {
         unsafe {
             (*self.refs).clear();
             *self.short_preamble_producer = None;
+            (*self.resume_memos).clear();
         }
     }
 }
@@ -875,32 +882,6 @@ struct PreparedBridgeTrace {
     snapshot_frame_pcs: SnapshotFramePcs,
     pending_bridge_rd: Option<PendingBridgeRd>,
     runtime_boxes: Vec<OpRef>,
-}
-
-/// Wrap a recorded `&[Op]` bridge trace into the `Vec<OpRc>` the
-/// `prepare_bridge_trace_for_optimizer` boundary consumes, preserving each
-/// result box's observed runtime value across the clone.
-///
-/// `Op::clone` resets the result box's value (`_resint`/`_resref`,
-/// resoperation.py:243-247 fresh-identity reset), which is correct for the
-/// trace ops the optimizer re-mints. But the bridge's `runtime_boxes` (the
-/// closing JUMP's live boxes) carry observed values that the IntBound runtime
-/// fallback reads un-forwarded (`runtime_box.getint()`, virtualstate.py);
-/// RPython keeps them because `runtime_boxes` are the separate original history
-/// boxes (pyjitpl.py:3213). Pyre resolves a runtime box's value through its
-/// producing op, so this carries the observed value onto the cloned snapshot op
-/// to expose the same un-forwarded value on the runtime-box channel.
-fn clone_bridge_ops_preserving_value(bridge_ops: &[majit_ir::Op]) -> Vec<majit_ir::OpRc> {
-    bridge_ops
-        .iter()
-        .map(|op| {
-            let cloned = op.clone();
-            if let Some(value) = op.get_value() {
-                cloned.set_value(value);
-            }
-            std::rc::Rc::new(cloned)
-        })
-        .collect()
 }
 
 #[cfg(feature = "jit-audits")]
@@ -1026,8 +1007,8 @@ fn translate_trace_iter_box_map(
 /// fresh OpRefs in `[bridge_inputarg_base..)`, and rewrites every
 /// reference (op args, fail_args, snapshot boxes, vable boxes,
 /// `pending_bridge_rd.liveboxes`) through the iterator's `_cache`.
-fn prepare_bridge_trace_for_optimizer(
-    bridge_ops: &[OpRc],
+fn prepare_bridge_trace_for_optimizer<T>(
+    bridge_ops: &[T],
     bridge_inputargs: &[InputArg],
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
@@ -1037,7 +1018,10 @@ fn prepare_bridge_trace_for_optimizer(
     pending_bridge_rd: Option<PendingBridgeRd>,
     runtime_boxes: Vec<OpRef>,
     bridge_inputarg_base: u32,
-) -> PreparedBridgeTrace {
+) -> PreparedBridgeTrace
+where
+    T: std::borrow::Borrow<majit_ir::Op>,
+{
     // Open this bridge's audit scope before anything reads it. Every caller of
     // `translate_trace_iter_opref` and `translate_trace_iter_box_map` is below
     // this line, so the keys they file all carry this call's generation and no
@@ -1048,13 +1032,12 @@ fn prepare_bridge_trace_for_optimizer(
     // RPython allocates fresh InputArg / ResOperation objects before
     // optimize_bridge() consumes the trace; majit's analogue is a fresh
     // TraceIterator walk with `start_fresh = bridge_inputarg_base`.
-    let bridge_inputarg_types: Vec<Type> = bridge_inputargs.iter().map(|ia| ia.tp).collect();
-    let mut iter = crate::opencoder::TraceIterator::new(
+    let mut iter = crate::opencoder::TraceIterator::new_with_inputargs(
         bridge_ops,
         0,
         bridge_ops.len(),
         None,
-        &bridge_inputarg_types,
+        bridge_inputargs,
         bridge_inputarg_base,
     );
     let mut ops = Vec::with_capacity(bridge_ops.len());
@@ -1073,7 +1056,11 @@ fn prepare_bridge_trace_for_optimizer(
     // (`get_virtual_runtime_field` / virtualstate.py:493-498). The source/
     // re-minted op lists are 1:1 (one `next()` per recorded op), so copy each
     // observed value across.
-    for (src, dst) in bridge_ops.iter().zip(ops.iter()) {
+    for (src, dst) in bridge_ops
+        .iter()
+        .map(std::borrow::Borrow::borrow)
+        .zip(ops.iter())
+    {
         if let Some(value) = src.get_value() {
             dst.set_value(value);
         }
@@ -1870,6 +1857,17 @@ pub struct MetaInterp<M: Clone> {
     /// producer. Installed only while that optimizer is alive so the
     /// registered root walker can forward its inline ConstPtr fields.
     pub(crate) compile_short_preamble_producer: Option<usize>,
+    /// Memos the in-flight optimizers own, for the window before their guards
+    /// reach a compiled trace.
+    ///
+    /// `resume.py finish` does `storage.rd_consts = self.memo.consts`, so each
+    /// guard is handed the memo's own list and one GC object roots the pool for
+    /// the whole optimizer. Pyre copies the pool into a per-guard
+    /// [`majit_ir::SharedConstPool`], which the loop below only reaches once the
+    /// guard is attached to a compiled trace; until then the memo's live
+    /// `consts` — and the raw-address keys of its `refs` cache — name nothing
+    /// the collector forwards. Emptied by [`CompileSnapshotRootsGuard`].
+    pub(crate) compile_resume_memos: Vec<crate::resume::LiveResumeMemo>,
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
@@ -2598,6 +2596,31 @@ impl<M: Clone> MetaInterp<M> {
                 builder.walk_const_ptr_refs_mut(&mut visitor);
             }
         }
+        // `resume.py finish` hands each guard `self.memo.consts` itself, so
+        // upstream roots the pool through the optimizer that owns it. Pyre
+        // copies the pool per guard, and a guard's copy is only reachable from
+        // `compiled_loops` once its trace is attached; the memo's own pool and
+        // its address-keyed `refs` cache need this separate root for the window
+        // an `Optimizer` holds them.
+        // The memos the in-flight optimizers still own. Reached through
+        // `self`, which the registered root area derives from its `data`
+        // pointer — a foreign collecting thread runs this walk during STW, so
+        // it must not read the caller's TLS.
+        self.compile_resume_memos.retain(|weak| {
+            let Some(memo) = weak.upgrade() else {
+                return false;
+            };
+            // SAFETY: pyre is single-threaded and this walker runs from the
+            // allocation path, so the only other code that could hold the
+            // `RefCell` is the optimizer frame this walk interrupted. Going
+            // through `as_ptr` rather than `borrow_mut` is what lets the
+            // collector forward a pool the interrupted frame is mid-way
+            // through appending to — the same escape hatch
+            // `SharedConstPool::as_mut_vec_for_gc` exists for.
+            let memo = unsafe { &mut *memo.as_ptr() };
+            memo.walk_const_ptr_refs_mut(&mut visitor);
+            true
+        });
     }
 
     /// framework.py `root_walker.walk_roots` hook for the stashed
@@ -3455,6 +3478,7 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
             compile_short_preamble_producer: None,
+            compile_resume_memos: Vec::new(),
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
             pending_preamble_tokens: indexmap::IndexMap::new(),
@@ -6499,6 +6523,7 @@ impl<M: Clone> MetaInterp<M> {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
+            &mut self.compile_resume_memos,
         );
         // Only this call's own give-up decides the reason the caller accounts.
         self.pending_abort_reason = None;
@@ -6947,6 +6972,9 @@ impl<M: Clone> MetaInterp<M> {
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
+        unroll_opt.compile_resume_memos_slot = Some(
+            (&mut self.compile_resume_memos as *mut Vec<crate::resume::LiveResumeMemo>) as usize,
+        );
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         // Zero, not the previous entry's count — see the fresh-token note above.
@@ -8159,6 +8187,7 @@ impl<M: Clone> MetaInterp<M> {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
+            &mut self.compile_resume_memos,
         );
         let ends_with_jump = finish_descr.is_none();
         let ctx = match self.tracing.as_mut() {
@@ -8269,8 +8298,8 @@ impl<M: Clone> MetaInterp<M> {
                 cloned
             })
             .collect();
-        // Mint the bridge's input args from types alone, WITHOUT carrying the
-        // values the recorder's own inputargs hold.
+        // Carry the history's live input boxes, WITHOUT carrying the values
+        // the recorder's own inputargs hold.
         //
         // The channel that put those values there is not resume-walked:
         // pyre's bridge setup (`state.rs seed_virtualizable_boxes` follow-up
@@ -8286,17 +8315,12 @@ impl<M: Clone> MetaInterp<M> {
         // `bridges_compiled` unchanged (21 vs 20) so compile volume is not
         // what moved.
         //
-        // `compile_bridge`'s `PendingBridgeRd` zip is likewise positional over
-        // every bridge inputarg rather than a resume-walked subset. See
-        // the live-filtered channel for the live-filtered channel this site needs before the
-        // values can be carried again.
-        let bridge_inputargs: Vec<majit_ir::InputArg> = ctx
-            .recorder
-            .inputarg_types()
-            .iter()
-            .enumerate()
-            .map(|(i, &tp)| majit_ir::InputArg::from_type(tp, i as u32))
-            .collect();
+        // `initialize_state_from_guard_failure` has already filtered resume
+        // holes from `History.inputargs`; retain those live boxes' original
+        // sparse positions here, exactly as `TraceIterator.__init__` reads
+        // `trace.inputargs[i].get_position()` upstream.  Concrete values are
+        // restored separately from `pending_frontend_boxes` below.
+        let bridge_inputargs = ctx.recorder.live_inputargs_cloned();
         // compile.py `ResumeFromInterpDescr.compile_and_attach`
         // passes `orig_inputargs` through to `send_loop_to_backend`, which
         // reads the concrete virtualizable before patching the expanded loop
@@ -8415,6 +8439,17 @@ impl<M: Clone> MetaInterp<M> {
                 let fail_descr = descr_arc
                     .as_fail_descr()
                     .expect("bridge source op.descr must implement FailDescr");
+                // The `@@@GUARD` line in `record_guard_failure_event` names the
+                // coordinate a failure arrived at; this names the coordinate a
+                // bridge attached to. Only both together answer the question
+                // that log exists for — whether a coordinate that keeps
+                // arriving was ever bridged at all, or is bridged and still
+                // returning. Ordered against `@@@GUARD` in one stream, a
+                // failure after this line for the same coordinate is a bridge
+                // that did not take.
+                if guardlog_enabled() {
+                    eprintln!("@@@BRIDGE tid={trace_id} fail={fail_index}");
+                }
                 let success = self.compile_bridge(
                     origin_key,
                     green_key,
@@ -8524,6 +8559,7 @@ impl<M: Clone> MetaInterp<M> {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
+            &mut self.compile_resume_memos,
         );
         // compile.py:355-359: resolve `loop_jitcell_token` before recording
         // the closing JUMP.  Keep this lookup before any state is consumed so
@@ -8779,6 +8815,9 @@ impl<M: Clone> MetaInterp<M> {
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
+        unroll_opt.compile_resume_memos_slot = Some(
+            (&mut self.compile_resume_memos as *mut Vec<crate::resume::LiveResumeMemo>) as usize,
+        );
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         // `AbstractResumeGuardDescr.compile_and_attach`, `compile.py`,
@@ -9707,6 +9746,7 @@ impl<M: Clone> MetaInterp<M> {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
+            &mut self.compile_resume_memos,
         );
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
@@ -10223,6 +10263,7 @@ impl<M: Clone> MetaInterp<M> {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
+            &mut self.compile_resume_memos,
         );
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
@@ -13121,12 +13162,8 @@ impl<M: Clone> MetaInterp<M> {
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
-        // Wrap `&[Op]` into `Vec<OpRc>` for the prepare_bridge_trace_for_optimizer
-        // boundary (history.py:528 identity at trace level), keeping the
-        // runtime-box channel's observed values intact across the clone.
-        let bridge_ops_rc = clone_bridge_ops_preserving_value(bridge_ops);
         let prepared = prepare_bridge_trace_for_optimizer(
-            &bridge_ops_rc,
+            bridge_ops,
             bridge_inputargs,
             snapshot_boxes,
             snapshot_frame_sizes,
@@ -13739,13 +13776,35 @@ impl<M: Clone> MetaInterp<M> {
                 // parent guard's saved types instead so the deserializer
                 // matches the types the serializer used at memo.finish()
                 // time.
-                let livebox_types: Vec<Type> = exit_layout
+                let positional_livebox_types: Vec<Type> = exit_layout
                     .descr
                     .as_ref()
                     .and_then(|descr| descr.as_fail_descr())
                     .map(|fd| fd.fail_arg_types().to_vec())
                     .filter(|types| !types.is_empty())
                     .unwrap_or_else(|| bridge_inputargs.iter().map(|ia| ia.tp).collect());
+                // pyjitpl.py `initialize_state_from_guard_failure` removes
+                // None entries before bridgeopt.py receives `liveboxes`.
+                // `fail_arg_types` retains the resume numbering's positional
+                // holes, so apply the same rd_locs filter here; otherwise the
+                // type at the first hole is paired with the next live box and
+                // the known-class bitfield is decoded out of phase.
+                let livebox_types: Vec<Type> = if fail_descr.rd_locs().len()
+                    == positional_livebox_types.len()
+                {
+                    positional_livebox_types
+                        .into_iter()
+                        .zip(fail_descr.rd_locs().iter())
+                        .filter_map(|(tp, &loc)| (loc != 0xFFFF).then_some(tp))
+                        .collect()
+                } else {
+                    positional_livebox_types
+                };
+                assert_eq!(
+                    livebox_types.len(),
+                    liveboxes.len(),
+                    "bridgeopt.py liveboxes and intrinsic Box.type layout must be compacted together"
+                );
                 // unroll.py:183-188: frontend_inputargs = trace.inputargs
                 // bridgeopt.py:126 asserts len(frontend_boxes) == len(liveboxes).
                 // Cluster 2 (c1): `compile_bridge` is invoked twice for the
@@ -13830,12 +13889,9 @@ impl<M: Clone> MetaInterp<M> {
         };
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
-        // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`),
-        // keeping the runtime-box channel's observed values intact across the
-        // clone.
-        let bridge_ops_rc = clone_bridge_ops_preserving_value(bridge_ops);
+        // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
         let prepared = prepare_bridge_trace_for_optimizer(
-            &bridge_ops_rc,
+            bridge_ops,
             bridge_inputargs,
             snapshot_boxes,
             snapshot_frame_sizes,
@@ -14368,12 +14424,6 @@ impl<M: Clone> MetaInterp<M> {
         crate::mc_diag_bump(6); // start_retrace_from_guard entered
         self.enter_profiler_tracing();
         self.try_to_free_some_loops();
-        // bridgeopt.py:124 frontend_boxes come directly from the guard
-        // failure values in fail_arg_types order.
-        self.pending_frontend_boxes = Some(fail_values.to_vec());
-        self.pending_frontend_box_types = descr_arc
-            .as_fail_descr()
-            .map(|fd| fd.fail_arg_types().to_vec());
         let _compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => {
@@ -14409,10 +14459,46 @@ impl<M: Clone> MetaInterp<M> {
         // ResumeGuardDescr Arc carries the post-`store_final_boxes_in_guard`
         // type vector (compile.py `_attrs_`).
         let bridge_input_types = fail_descr.fail_arg_types();
-        self.warm_state.start_retrace(bridge_input_types);
+        debug_assert_eq!(
+            fail_values.len(),
+            bridge_input_types.len(),
+            "deadframe values and fail_arg_types must share the guard's positional layout"
+        );
+        // pyjitpl.py `initialize_state_from_guard_failure` returns
+        // `[box for box in inputargs_and_holes if box]`: the resume numbering
+        // and deadframe keep None positions, but the bridge history exposes
+        // only live boxes. `fail_arg_types` cannot identify a hole because
+        // pyre retains the parallel type snapshot, so use the canonical
+        // `store_info_on_descr` encoding instead.
+        let live_input_mask: Vec<bool> = if fail_descr.rd_locs().len() == bridge_input_types.len() {
+            fail_descr
+                .rd_locs()
+                .iter()
+                .map(|&pos| pos != 0xFFFF)
+                .collect()
+        } else {
+            // Synthetic descriptors that have not reached codegen carry no
+            // encoded holes; every declared test input remains live.
+            vec![true; bridge_input_types.len()]
+        };
+        let live_input_types: Vec<Type> = bridge_input_types
+            .iter()
+            .zip(live_input_mask.iter())
+            .filter_map(|(&tp, &live)| live.then_some(tp))
+            .collect();
+        self.pending_frontend_boxes = Some(
+            fail_values
+                .iter()
+                .zip(live_input_mask.iter())
+                .filter_map(|(&value, &live)| live.then_some(value))
+                .collect(),
+        );
+        self.pending_frontend_box_types = Some(live_input_types.clone());
+        self.warm_state.start_retrace(&live_input_types);
         // RPython pyjitpl.py `create_history(max_num_inputargs)` — the
         // MetaInterp owns the history factory on the bridge path too.
-        let recorder = crate::recorder::Trace::with_input_types(bridge_input_types);
+        let recorder =
+            crate::recorder::Trace::with_input_layout(bridge_input_types, &live_input_mask);
         // No deadframe stamping here. `resume.py load_box_from_cpu`
         // runs once per LIVE box while `rebuild_from_resumedata` walks the
         // resume data, not once per `fail_arg_types` slot, and `compile_bridge`
@@ -23715,12 +23801,11 @@ mod tests {
             cpu: crate::cpu::default_cpu(),
         };
 
-        let bridge_ops_rc = clone_bridge_ops_preserving_value(&bridge_ops);
         // The closing JUMP's args are the bridge `runtime_boxes`; they must be
         // rewritten into the fresh-iterator namespace like the snapshot feeds.
         let bridge_runtime_boxes = vec![OpRef::ref_op(2), OpRef::int_op(3)];
         let prepared = prepare_bridge_trace_for_optimizer(
-            &bridge_ops_rc,
+            &bridge_ops,
             &bridge_inputargs,
             snapshot_boxes,
             Vec::new(),
@@ -23811,7 +23896,7 @@ mod tests {
         bridge_inputargs[0].set_value(Value::Int(42));
 
         let prepared = prepare_bridge_trace_for_optimizer(
-            &[],
+            &[] as &[majit_ir::Op],
             &bridge_inputargs,
             Vec::new(),
             Vec::new(),

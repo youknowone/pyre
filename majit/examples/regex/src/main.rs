@@ -26,10 +26,17 @@
 //! could not measure — the post's own 2010 figures — is printed under a heading
 //! that says so, and no ratio above it is computed from any of it.
 
+#[cfg(feature = "alloc-census")]
+pub mod alloc_census;
+pub mod gc;
 pub mod interp;
 pub mod jit_interp;
 pub mod regex;
 pub mod shortcircuit;
+
+#[cfg(feature = "alloc-census")]
+#[global_allocator]
+static ALLOC: alloc_census::Counting = alloc_census::Counting;
 
 use regex::{NodeRec, bench_regex, bench_regex_left, count, depth, lower, nonmatching, vectors};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,6 +52,31 @@ const REPEATS: usize = 5;
 /// per-character rate at all, which is the only reading under which the rows
 /// can be compared to each other or to anybody else.
 const LENGTHS: [usize; 3] = [1 << 12, 1 << 16, 1 << 20];
+
+/// Keep the published benchmark's three-length sweep by default, but let the
+/// allocation census select a short, deterministic diagnostic input.  The
+/// latter counts per character and does not gain information by spending
+/// minutes repeating the same allocation pattern at 1 MiB.
+fn lengths() -> Vec<usize> {
+    let Some(value) = std::env::var_os("PYRE_REGEX_LENGTHS") else {
+        return LENGTHS.to_vec();
+    };
+    let value = value.to_string_lossy();
+    let parsed: Vec<usize> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<usize>()
+                .unwrap_or_else(|_| panic!("PYRE_REGEX_LENGTHS contains a non-usize: {part:?}"))
+        })
+        .collect();
+    assert!(
+        !parsed.is_empty() && parsed.iter().all(|&length| length > 0),
+        "PYRE_REGEX_LENGTHS must contain one or more positive comma-separated lengths"
+    );
+    parsed
+}
 
 /// The `{N}` of the post's benchmark regex `(a|b)*a(a|b){20}a(a|b)*`.
 const N: usize = 20;
@@ -126,6 +158,15 @@ struct Row {
     /// Loops the JIT compiled across the timed runs. 0 for a row that never
     /// enters the JIT.
     compiles: usize,
+    /// What the timed runs allocated. Deterministic where `rates` is not, so
+    /// this is the half of the row that grades a per-deopt cost change on a
+    /// machine under load. See [`alloc_census`].
+    #[cfg(feature = "alloc-census")]
+    alloc: alloc_census::Census,
+    /// Exact-size allocation fingerprints for this row.  Kept empty unless
+    /// explicitly requested so the ordinary census remains one compact line.
+    #[cfg(feature = "alloc-census")]
+    alloc_sizes: Vec<String>,
 }
 
 impl Row {
@@ -171,13 +212,19 @@ fn bench(
     root: *mut NodeRec,
     s: &[u8],
     counter: Option<&AtomicUsize>,
-    run: impl Fn(*mut NodeRec, &[u8]) -> bool,
+    mut run: impl FnMut(*mut NodeRec, &[u8]) -> bool,
 ) -> Row {
     assert!(
         !run(root, s),
         "{name}: the benchmark input is supposed NOT to match"
     );
+    #[cfg(feature = "alloc-census")]
+    alloc_census::rearm_trace(name);
     let before = counter.map_or(0, |c| c.load(Ordering::Relaxed));
+    #[cfg(feature = "alloc-census")]
+    let alloc_before = alloc_census::read();
+    #[cfg(feature = "alloc-census")]
+    let sizes_before = alloc_census::read_sizes();
     let mut rates = Vec::with_capacity(REPEATS);
     for _ in 0..REPEATS {
         let t0 = Instant::now();
@@ -186,12 +233,27 @@ fn bench(
         assert!(!hit, "{name}: the benchmark input is supposed NOT to match");
         rates.push(rate(s.len(), secs));
     }
+    #[cfg(feature = "alloc-census")]
+    let alloc = alloc_before.since(alloc_census::read());
+    #[cfg(feature = "alloc-census")]
+    let alloc_sizes = if std::env::var_os("PYRE_CENSUS_HISTOGRAM").is_some() {
+        let sizes_after = alloc_census::read_sizes();
+        let oversize = sizes_before.oversize_since(&sizes_after);
+        let rows = sizes_before.since(&sizes_after);
+        alloc_census::report_rows(&rows, oversize, s.len(), REPEATS, 16)
+    } else {
+        Vec::new()
+    };
     let compiles = counter.map_or(0, |c| c.load(Ordering::Relaxed) - before);
     rates.sort_by(f64::total_cmp);
     Row {
         name,
         rates,
         compiles,
+        #[cfg(feature = "alloc-census")]
+        alloc,
+        #[cfg(feature = "alloc-census")]
+        alloc_sizes,
     }
 }
 
@@ -225,6 +287,11 @@ fn census(body: &[majit_ir::OpCode]) -> String {
 }
 
 fn main() {
+    #[cfg(feature = "alloc-census")]
+    alloc_census::configure_trace_from_env();
+    // Before anything runs compiled code. `target.py --opt=jit` is a translated
+    // binary and carries a collector; this is majit's side of that.
+    gc::install();
     let started = Instant::now();
     println!("{}", machine());
     println!();
@@ -264,6 +331,10 @@ fn main() {
         lower(&bench_regex(N)),
         lower(&bench_regex(N)),
     ];
+    // warmspot.py owns one JitDriver for a portal. Keep each portal instance
+    // across the whole sweep so compiled loops are reused between matches.
+    let mut masking_matcher = jit_interp::Matcher::new(roots[1], THRESHOLD);
+    let mut branching_matcher = shortcircuit::Matcher::new(roots[2], THRESHOLD);
 
     println!();
     println!("timed rows: {REPEATS} runs each, median (min - max).");
@@ -271,30 +342,29 @@ fn main() {
     println!("must read every character and no early exit can hide the per-character cost.");
 
     let mut sweep: Vec<(usize, [Row; 3])> = Vec::new();
-    for len in LENGTHS {
+    for len in lengths() {
         let s = nonmatching(len, N, SEED);
         assert!(
             !interp::matches(balanced, &s),
             "the benchmark input is supposed NOT to match"
         );
 
-        let rows = [
-            bench(NAMES[0], roots[0], &s, None, |r, s| interp::matches(r, s)),
-            bench(
-                NAMES[1],
-                roots[1],
-                &s,
-                Some(&jit_interp::COMPILES),
-                |r, s| jit_interp::matches(r, s, THRESHOLD),
-            ),
-            bench(
-                NAMES[2],
-                roots[2],
-                &s,
-                Some(&shortcircuit::COMPILES),
-                |r, s| shortcircuit::matches(r, s, THRESHOLD),
-            ),
-        ];
+        let interp_row = bench(NAMES[0], roots[0], &s, None, |r, s| interp::matches(r, s));
+        let masking_row = bench(
+            NAMES[1],
+            roots[1],
+            &s,
+            Some(&jit_interp::COMPILES),
+            |_r, s| masking_matcher.matches(s),
+        );
+        let branching_row = bench(
+            NAMES[2],
+            roots[2],
+            &s,
+            Some(&shortcircuit::COMPILES),
+            |_r, s| branching_matcher.matches(s),
+        );
+        let rows = [interp_row, masking_row, branching_row];
 
         println!();
         println!("  {} chars, no match as intended:", commas(len as f64));
@@ -315,6 +385,12 @@ fn main() {
                 commas(row.max()),
                 compiled,
             );
+            #[cfg(feature = "alloc-census")]
+            println!("    {:<32}  {}", "", row.alloc.per_char(len, REPEATS));
+            #[cfg(feature = "alloc-census")]
+            for size in &row.alloc_sizes {
+                println!("    {:<32}  {size}", "");
+            }
         }
         sweep.push((len, rows));
     }
@@ -365,12 +441,10 @@ fn main() {
         }
         println!("    A row fastest at the LONGEST input is amortizing a cost that is fixed per");
         println!(
-            "    `matches` call. `loops compiled per run` above is the candidate: each portal"
+            "    `matches` call. The JitDriver now follows warmspot.py ownership and survives"
         );
-        println!("    builds its `JitDriver` inside `mainloop`, so the compiled-loop cache dies");
-        println!("    with the call and the next call records and compiles the loop again. Read");
-        println!("    such a row at the shortest length as a matcher-plus-compiler rate, and at");
-        println!("    the longest as the compiled loop's own.");
+        println!("    the whole sweep, so `loops compiled per run` distinguishes a real new");
+        println!("    specialization from fixed per-call setup.");
         println!("    A row fastest at the SHORTEST input has two candidates and this sweep does");
         println!("    not separate them. The tree is 93 nodes at every length, but the input");
         println!("    buffer grows from 4 KiB to 1 MiB, so the longest length is not reading out");
@@ -398,7 +472,7 @@ fn main() {
     }
 
     // ── the summary, in the post's shape ───────────────────────────────────
-    let (len, rows) = sweep.last().expect("LENGTHS is not empty");
+    let (len, rows) = sweep.last().expect("lengths() is not empty");
     let slowest = rows
         .iter()
         .min_by(|a, b| a.median().total_cmp(&b.median()))

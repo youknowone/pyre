@@ -77,33 +77,33 @@ use majit_metainterp::JitDriver;
     int_fields = {
         NodeRec::kind => u8,
         NodeRec::ch => u8,
-        NodeRec::empty => u8,
-        NodeRec::marked => u8,
+        NodeRec::empty => bool,
+        NodeRec::marked => bool,
     },
 )]
-fn shift(n: usize, c: i64, mark: i64) -> i64 {
+fn shift(n: usize, c: i64, mark: bool) -> bool {
     let k = n.kind;
     let m = match k {
         KIND_CHAR => {
             let ch = n.ch as i64;
-            mark & ((ch == c) as i64)
+            mark & (ch == c)
         }
         KIND_ALTERNATIVE => shift(n.left, c, mark) | shift(n.right, c, mark),
-        KIND_REPETITION => shift(n.left, c, mark | n.marked as i64),
+        KIND_REPETITION => shift(n.left, c, mark | n.marked),
         KIND_SEQUENCE => {
             // The left mark from the PREVIOUS character is what enters the
             // right side, so read it before `shift` overwrites it.
             let l = n.left;
             let r = n.right;
-            let old_left = l.marked as i64;
+            let old_left = l.marked;
             let marked_left = shift(l, c, mark);
-            let marked_right = shift(r, c, old_left | (mark & l.empty as i64));
-            (marked_left & r.empty as i64) | marked_right
+            let marked_right = shift(r, c, old_left | (mark & l.empty));
+            (marked_left & r.empty) | marked_right
         }
         // Epsilon, and anything else: no mark ever comes out.
-        _ => 0i64,
+        _ => false,
     };
-    n.marked = m as u8;
+    n.marked = m;
     m
 }
 
@@ -136,9 +136,6 @@ struct Input {
 }
 
 struct MatchState {
-    /// The lowered regex. Red, then promoted: the promote is the one guard the
-    /// specialization costs.
-    root: usize,
     /// The input buffer.
     inp: usize,
     pos: i64,
@@ -173,9 +170,8 @@ pub static GUARD_FAILURE_PROBE: std::sync::atomic::AtomicBool =
 #[majit_macros::jit_interp(
     state = MatchState,
     env = Bytecode,
-    greens = [pc, program],
+    greens = [pc, program, root: ref],
     state_fields = {
-        root: ref(NodeRec),
         inp: ref(Input),
         pos: int,
         len: int,
@@ -189,64 +185,36 @@ pub static GUARD_FAILURE_PROBE: std::sync::atomic::AtomicBool =
     int_fields = {
         NodeRec::kind => u8,
         NodeRec::ch => u8,
-        NodeRec::empty => u8,
-        NodeRec::marked => u8,
+        NodeRec::empty => bool,
+        NodeRec::marked => bool,
     },
     calls = { shift => inline_int },
 )]
 #[allow(unused_assignments, unused_variables)]
 fn mainloop(
     program: &Bytecode,
-    threshold: u32,
+    mut driver: &mut JitDriver<MatchState>,
     root: usize,
     inp: usize,
     len: i64,
     first: i64,
 ) -> i64 {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut driver: JitDriver<MatchState> = JitDriver::new(threshold);
-    driver.set_on_compile_loop(|_gk, _before, ops_after, opcodes| {
-        COMPILES.fetch_add(1, Relaxed);
-        LAST_OPS_AFTER.store(ops_after, Relaxed);
-        *LAST_BODY.lock().unwrap() = opcodes.to_vec();
-    });
-    driver.set_on_compile_bridge(|_gk, _fail_index, _num_ops| {
-        BRIDGES.fetch_add(1, Relaxed);
-    });
-    driver.set_on_trace_abort(|_gk, _permanent| {
-        ABORTS.fetch_add(1, Relaxed);
-    });
-    if GUARD_FAILURE_PROBE.load(Relaxed) {
-        driver.set_on_guard_failure(|_gk, _trace_id, _fail_index| {
-            GUARD_FAILURES.fetch_add(1, Relaxed);
-        });
-    }
     let mut pc: usize = 0;
     let mut state = MatchState {
-        root,
         inp,
         pos: 1i64,
         len,
         result: first,
     };
-    {
-        use majit_metainterp::JitState as _;
-        state
-            .build_meta(0, program)
-            .install_canonical_liveness(&mut driver);
-    }
-
     while pc < program.len() {
         jit_merge_point!(driver, program, pc; state);
         let opcode = program[pc];
         pc += 1;
         match opcode {
             OP_SHIFT => {
-                let root = state.root;
-                majit_metainterp::jit::promote(root);
                 let idx = state.pos as usize;
                 let c = state.inp.data[idx] as i64;
-                state.result = shift(root, c, 0i64);
+                state.result = shift(root, c, false) as i64;
                 state.pos = state.pos + 1i64;
             }
             OP_LOOP => {
@@ -263,34 +231,81 @@ fn mainloop(
     state.result
 }
 
+/// A portal instance with warmspot.py ownership: its JitDriver and compiled
+/// loop cache survive across calls. The lowered regex is a ref green, matching
+/// `marked.py`'s module-level `JitDriver(greens=['re'])`.
+pub struct Matcher {
+    root: *mut NodeRec,
+    driver: JitDriver<MatchState>,
+}
+
+impl Matcher {
+    pub fn new(root: *mut NodeRec, threshold: u32) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut driver = JitDriver::new(threshold);
+        driver.set_on_compile_loop(|_gk, _before, ops_after, opcodes| {
+            COMPILES.fetch_add(1, Relaxed);
+            LAST_OPS_AFTER.store(ops_after, Relaxed);
+            *LAST_BODY.lock().unwrap() = opcodes.to_vec();
+        });
+        driver.set_on_compile_bridge(|_gk, _fail_index, _num_ops| {
+            BRIDGES.fetch_add(1, Relaxed);
+        });
+        driver.set_on_trace_abort(|_gk, _permanent| {
+            ABORTS.fetch_add(1, Relaxed);
+        });
+        if GUARD_FAILURE_PROBE.load(Relaxed) {
+            driver.set_on_guard_failure(|_gk, _trace_id, _fail_index| {
+                GUARD_FAILURES.fetch_add(1, Relaxed);
+            });
+        }
+        {
+            use majit_metainterp::JitState as _;
+            MatchState {
+                inp: 0,
+                pos: 0,
+                len: 0,
+                result: 0,
+            }
+            .build_meta(0, &PROGRAM)
+            .install_canonical_liveness(&mut driver);
+        }
+        Self { root, driver }
+    }
+
+    pub fn matches(&mut self, s: &[u8]) -> bool {
+        if s.is_empty() {
+            return unsafe { (*self.root).empty };
+        }
+        let first = crate::interp::shift(self.root, s[0] as i64, 1);
+        let result = if s.len() == 1 {
+            first
+        } else {
+            let mut input = Input {
+                data: s.as_ptr() as *mut u8,
+                len: s.len() as i64,
+            };
+            mainloop(
+                &PROGRAM,
+                &mut self.driver,
+                self.root as usize,
+                &mut input as *mut Input as usize,
+                input.len,
+                first,
+            )
+        };
+        crate::interp::reset(self.root);
+        result != 0
+    }
+}
+
 /// `interp::matches`, with the per-character loop handed to the JIT.
 ///
 /// The first character is shifted in outside the loop — it is the one that
 /// carries a mark in from the left — so the loop body is uniform and the trace
 /// has no first-iteration special case.
 pub fn matches(root: *mut NodeRec, s: &[u8], threshold: u32) -> bool {
-    if s.is_empty() {
-        return unsafe { (*root).empty } != 0;
-    }
-    let first = crate::interp::shift(root, s[0] as i64, 1);
-    let result = if s.len() == 1 {
-        first
-    } else {
-        let mut input = Input {
-            data: s.as_ptr() as *mut u8,
-            len: s.len() as i64,
-        };
-        mainloop(
-            &PROGRAM,
-            threshold,
-            root as usize,
-            &mut input as *mut Input as usize,
-            input.len,
-            first,
-        )
-    };
-    crate::interp::reset(root);
-    result != 0
+    Matcher::new(root, threshold).matches(s)
 }
 
 #[cfg(test)]
@@ -393,6 +408,26 @@ mod tests {
         let warm = matches_locked(root, &s, 3);
         assert!(cold, "the reinstated pair is supposed to match");
         assert_eq!(warm, cold);
+    }
+
+    #[test]
+    fn matcher_reuses_the_same_compiled_cell_across_calls() {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        COMPILES.store(0, Ordering::Relaxed);
+        let root = lower(&bench_regex(20));
+        let input = nonmatching(4096, 20, 42);
+        let mut matcher = Matcher::new(root, 3);
+
+        assert!(!matcher.matches(&input));
+        let after_first = COMPILES.load(Ordering::Relaxed);
+        assert!(after_first > 0, "the first call did not compile a loop");
+
+        assert!(!matcher.matches(&input));
+        assert_eq!(
+            COMPILES.load(Ordering::Relaxed),
+            after_first,
+            "a second call rebuilt the regex's JitDriver cell instead of reusing it",
+        );
     }
 
     /// Association changes the tree depth and nothing else, and the depth is

@@ -1704,6 +1704,10 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
             .enumerate()
             .map(|(i, d)| match d {
                 RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+                RuntimeBhDescr::ResolvedDescr { .. } => d
+                    .as_optimizer_descr()
+                    .expect("resolved field descriptor")
+                    .clone(),
                 RuntimeBhDescr::JitCode(_)
                 | RuntimeBhDescr::JitCodeBackEdge(_)
                 | RuntimeBhDescr::Call(_)

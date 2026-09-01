@@ -7,7 +7,7 @@ use syn::{Block, Expr, ExprMatch, ItemFn, Stmt};
 
 use super::JitInterpConfig;
 use super::classify::classify_arms;
-use super::jitcode_lower::{self, LowererConfig, is_jit_merge_point_macro};
+use super::jitcode_lower::{self, LowererConfig, ValueKind, is_jit_merge_point_macro};
 
 pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let fn_name = &func.sig.ident;
@@ -27,6 +27,21 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             .to_compile_error();
     };
 
+    let portal_greens = super::portal_green_params(config, func);
+    let portal_green_layout: Vec<(String, ValueKind)> = portal_greens
+        .iter()
+        .map(|(name, _, tag)| {
+            let kind = match tag {
+                super::green_type_tag::GreenTypeTag::Int => ValueKind::Int,
+                super::green_type_tag::GreenTypeTag::Ref
+                | super::green_type_tag::GreenTypeTag::Str
+                | super::green_type_tag::GreenTypeTag::Unicode => ValueKind::Ref,
+                super::green_type_tag::GreenTypeTag::Float => ValueKind::Float,
+            };
+            (name.to_string(), kind)
+        })
+        .collect();
+
     let lowerer_config = LowererConfig::new(
         &config.io_shims,
         &config.calls,
@@ -35,6 +50,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         config.state_fields.as_ref(),
         &config.greens,
         &config.green_type_tags,
+        &portal_green_layout,
         &config.reds,
         &config.state_type,
         &config.env_type,
@@ -64,7 +80,8 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     // driver-shared `Assembler` already holds every triple the dispatch
     // factory will emit — preserving the no-growth invariant asserted in
     // `__trace_*` below for the dispatch JitCode build path.
-    let dispatch_lowerer_config = lowerer_config.with_vable_input_ref_reg(1);
+    let (_, portal_ref_args, _) = lowerer_config.portal_input_kind_counts();
+    let dispatch_lowerer_config = lowerer_config.with_vable_input_ref_reg(portal_ref_args);
     let (
         dispatch_body,
         dispatch_prebuild,
@@ -134,6 +151,44 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     } else {
         quote! {}
     };
+    let portal_green_param_decls: Vec<_> = portal_greens
+        .iter()
+        .map(|(name, ty, _)| quote! { #name: #ty, })
+        .collect();
+    let portal_green_arg_pushes: Vec<_> = portal_greens
+        .iter()
+        .map(|(name, _, tag)| match tag {
+            super::green_type_tag::GreenTypeTag::Int => quote! {
+                let __green_bits = #name as i64;
+                let __green_box = __ctx.const_int(__green_bits);
+                __jitcode_args.push((
+                    majit_metainterp::JitArgKind::Int,
+                    __green_box,
+                    __green_bits,
+                ));
+            },
+            super::green_type_tag::GreenTypeTag::Ref
+            | super::green_type_tag::GreenTypeTag::Str
+            | super::green_type_tag::GreenTypeTag::Unicode => quote! {
+                let __green_bits = #name as i64;
+                let __green_box = __ctx.const_ref(__green_bits);
+                __jitcode_args.push((
+                    majit_metainterp::JitArgKind::Ref,
+                    __green_box,
+                    __green_bits,
+                ));
+            },
+            super::green_type_tag::GreenTypeTag::Float => quote! {
+                let __green_bits = (#name as f64).to_bits() as i64;
+                let __green_box = __ctx.const_float(__green_bits);
+                __jitcode_args.push((
+                    majit_metainterp::JitArgKind::Float,
+                    __green_box,
+                    __green_bits,
+                ));
+            },
+        })
+        .collect();
 
     let trace_fn_body = quote! {
         #[allow(non_snake_case, unused_variables, unused_mut)]
@@ -142,6 +197,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             __sym: &mut #sym_ty,
             program: &#env_type,
             pc: usize,
+            #(#portal_green_param_decls)*
             // Slice X-D production wire-up: caller passes a
             // `ClosureRuntimeWithResolver` carrying both `label_at` and
             // the warmstate-backed `jitcell_token_arc_for_number`
@@ -200,6 +256,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 __pc_box,
                 __pc_bits,
             ));
+            #(#portal_green_arg_pushes)*
             #push_virtualizable_argbox
             let __result = majit_metainterp::trace_jitcode_with_args_and_runtime(
                 __ctx,

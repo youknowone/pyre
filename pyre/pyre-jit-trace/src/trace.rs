@@ -1697,6 +1697,10 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
         .enumerate()
         .map(|(i, d)| match d {
             RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
+            RuntimeBhDescr::ResolvedDescr { .. } => d
+                .as_optimizer_descr()
+                .expect("resolved field descriptor")
+                .clone(),
             // `inline_call`'s `d` operand resolves the callee through
             // `JitCodeDescr::jitcode_index()` → `sub_jitcode_lookup`.  Key the
             // descr by its own pool slot `i` so the per-fn lookup below

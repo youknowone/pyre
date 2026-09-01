@@ -469,7 +469,7 @@ pub struct Optimizer {
     pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// optimizer.py:732 — resume.ResumeDataLoopMemo.
     /// Shared constant pool + box numbering cache across all guards in a loop.
-    pub resumedata_memo: crate::resume::ResumeDataLoopMemo,
+    pub resumedata_memo: std::rc::Rc<std::cell::RefCell<crate::resume::ResumeDataLoopMemo>>,
     /// resume.py parity: per-guard snapshots from tracing time.
     /// Maps rd_resume_position → flattened OpRef boxes from the snapshot.
     /// Propagated to OptContext for store_final_boxes_in_guard.
@@ -569,14 +569,24 @@ pub(crate) fn lower_typed_constants_to_const_pool(
     pool
 }
 
-fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> bit_set::BitSet {
-    let mut live_positions = bit_set::BitSet::new();
+/// The runtime OpRefs `ops` defines, as a set.
+///
+/// A set rather than a `BitSet` keyed by the raw. Pyre's OpRefs come from a
+/// monotonic counter and a bridge mints its own at `[parent_high_water..)`, so
+/// a bitmap indexed by the bare raw is sized by everything the trace family has
+/// compiled so far — one more of the positional side tables `optimizer.py` does
+/// not have, since it forwards on the box object (`op.set_forwarded(newop)`)
+/// and keeps no table at all. The membership tests below run once per constant
+/// and once per considered op, both bounded by the trace, so hashing is the
+/// cheaper half of the trade.
+fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> rustc_hash::FxHashSet<u32> {
+    let mut live_positions = rustc_hash::FxHashSet::default();
     for op in ops {
         let pos = op.pos.get();
         if pos.is_none() || pos.is_constant() {
             continue;
         }
-        live_positions.insert(pos.raw() as usize);
+        live_positions.insert(pos.raw());
     }
     live_positions
 }
@@ -586,7 +596,7 @@ pub(crate) fn sanitize_backend_constants_for_ops<'a>(
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ops);
-    constants.retain(|idx, _| !live_positions.contains(*idx as usize));
+    constants.retain(|idx, _| !live_positions.contains(idx));
 }
 
 /// Export newly-discovered constants from `OptContext` into the
@@ -620,9 +630,9 @@ pub(crate) fn merge_backend_constants_from_ctx(
         if pos.is_none() || pos.is_constant() {
             return;
         }
-        let idx = pos.raw() as usize;
+        let idx = pos.raw();
         let value = match op.forwarded.borrow().clone() {
-            majit_ir::forwarding::Forwarded::Const(c) => c.to_value(),
+            majit_ir::forwarding::Forwarded::Const(c) => c.get(),
             _ => return,
         };
         // A ref constant is never resolved from this backend pool: a referenced
@@ -639,10 +649,10 @@ pub(crate) fn merge_backend_constants_from_ctx(
         if matches!(value, majit_ir::Value::Ref(_)) {
             return;
         }
-        if live_positions.contains(idx) {
+        if live_positions.contains(&idx) {
             return;
         }
-        let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
+        let key = OptContext::op_ref_for_value(idx, &value).raw();
         constants.entry(key).or_insert_with(|| value);
     };
     for op in &ctx.new_operations {
@@ -1516,7 +1526,9 @@ impl Optimizer {
             string_content_resolver: None,
             string_constant_alloc: None,
             callinfocollection: None,
-            resumedata_memo: crate::resume::ResumeDataLoopMemo::new(),
+            resumedata_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::resume::ResumeDataLoopMemo::new(),
+            )),
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
@@ -1786,7 +1798,7 @@ impl Optimizer {
     /// piggybacks on the same deferred-fold pattern as the resumedata
     /// memo counters.
     pub fn update_counters(&mut self, profiler: &crate::jitprof::JitProfiler) {
-        self.resumedata_memo.update_counters(profiler);
+        self.resumedata_memo.borrow().update_counters(profiler);
         profiler.count(crate::pyjitpl::counters::OPT_OPS, self.opt_ops_emitted);
         profiler.count(
             crate::pyjitpl::counters::OPT_GUARDS,
@@ -1904,6 +1916,14 @@ impl Optimizer {
                     builder.add_preamble_op_from_pop(&preamble_op, resolved_for_pop);
                 }
             }
+        }
+        // `optimizer.py Optimizer.force_box` returns a Const unchanged after
+        // the potential-extra-op lookup: Const carries no PtrInfo and cannot
+        // be virtual.  The flattened OpRef already carries its whole value,
+        // so resolving it back to an `Operand::Const` for the two impossible
+        // tests below only allocates an Rc that is immediately discarded.
+        if resolved.is_constant() {
+            return resolved;
         }
         // optimizer.py:361-362: if op.type == 'i' and info.is_constant():
         //     return ConstInt(info.get_constant_int())
@@ -2515,6 +2535,11 @@ impl Optimizer {
         ctx.string_content_resolver = self.string_content_resolver.clone();
         ctx.string_constant_alloc = self.string_constant_alloc.clone();
         ctx.callinfocollection = self.callinfocollection.clone();
+        // optimizer.py `Optimizer.__init__` owns one ResumeDataLoopMemo and
+        // `store_final_boxes_in_guard` reuses it for every emitted guard.
+        // OptContext is only a Rust borrow-splitting adaptation, so share the
+        // same object rather than constructing a memo per guard.
+        ctx.resumedata_memo = std::rc::Rc::clone(&self.resumedata_memo);
         // virtualstate.py `GenerateGuardState.__init__: self.cpu =
         // optimizer.cpu`. Propagate the runtime typeptr-read hook so
         // virtualstate match (KnownClass arms) can fall back to
@@ -4983,11 +5008,21 @@ impl Optimizer {
         // ops and get_producing_op consumers can read info off op.arg(i) —
         // the same canonicalization the pass-entry resolver applies.
         for i in 0..op.num_args() {
-            let forced = self.force_box(op.arg(i).to_opref(), ctx);
+            let original_arg = op.arg(i).clone();
+            let forced = self.force_box(original_arg.to_opref(), ctx);
             self.flush_queued_producer(forced, ctx)?;
-            let resolved = match ctx.get_box_replacement_operand_opt(forced) {
-                Some(b) => b,
-                None => ctx.materialize_operand_at(forced),
+            let resolved = if original_arg.is_constant() && original_arg.to_opref() == forced {
+                // RPython `_emit_operation` calls `force_box` for Const too,
+                // but `get_box_replacement` returns the SAME Const object.
+                // Keep the Operand already stored on the op; round-tripping
+                // through pyre's flat OpRef adapter minted a new Rc-backed
+                // Const at every emitted use.
+                original_arg
+            } else {
+                match ctx.get_box_replacement_operand_opt(forced) {
+                    Some(b) => b,
+                    None => ctx.materialize_operand_at(forced),
+                }
             };
             // The forced value is a chain terminal, so its canonical box's
             // OpRef identity equals `forced`; OpRef-keyed consumers (the

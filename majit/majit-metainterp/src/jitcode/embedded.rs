@@ -162,7 +162,7 @@ impl EmbeddedJitCodeTable {
                     // Every other variant is an ordinary `d` descr and carries
                     // through unchanged: the runtime pool element and the
                     // build-time one are the same type.
-                    other => RuntimeBhDescr::Descr(Box::new(other)),
+                    other => RuntimeBhDescr::Descr(Box::new(other)).into_resolved(),
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),

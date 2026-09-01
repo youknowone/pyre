@@ -2022,6 +2022,7 @@ version = "0.0.2"
 dependencies = [
  "majit-ir",
  "majit-metainterp",
+ "majit-translate",
  "proc-macro2",
  "quote",
  "syn",
@@ -3148,6 +3149,8 @@ dependencies = [
 name = "regex"
 version = "0.0.2"
 dependencies = [
+ "majit-backend",
+ "majit-gc",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",

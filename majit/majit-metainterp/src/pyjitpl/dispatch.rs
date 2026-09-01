@@ -142,6 +142,20 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
 /// (`optimizeopt/virtualize.rs`) requires the parent to virtualize
 /// the store.  A parentless field (getfield round-trip / non-virtualized
 /// store) keeps the placeholder builder.
+/// The byte offset a field descriptor names, without minting the optimizer
+/// object beside it.
+///
+/// `field_descr_ref_from_bh` returns this same offset paired with a freshly
+/// built descr. A caller that already holds the pool's resolved descr
+/// (`MIFrame::runtime_optimizer_descr`) wants only this half, and enforces the
+/// same invariant; `site` names the opcode so the abort still says which one.
+pub fn field_offset_from_bh(descr: &crate::blackhole::BhDescr, site: &str) -> usize {
+    match descr {
+        crate::blackhole::BhDescr::Field { offset, .. } => *offset,
+        other => panic!("{site}: descriptor is not a Field: {other:?}"),
+    }
+}
+
 pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_ir::DescrRef) {
     match descr {
         crate::blackhole::BhDescr::Field {
@@ -4064,7 +4078,10 @@ where
                         crate::blackhole::BhDescr::Field { field_size, .. } => *field_size,
                         _ => 8,
                     };
-                    let (offset, fielddescr) = field_descr_ref_from_bh(bh);
+                    let offset = field_offset_from_bh(bh, "BC_SETFIELD_GC");
+                    let fielddescr = frame
+                        .runtime_optimizer_descr(descr_idx)
+                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
                     (offset, field_size, fielddescr)
                 };
                 let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
@@ -4350,7 +4367,10 @@ where
                         } => (*field_size, *is_field_signed),
                         _ => (8, false),
                     };
-                    let (offset, fielddescr) = field_descr_ref_from_bh(bh);
+                    let offset = field_offset_from_bh(bh, "BC_GETFIELD_GC");
+                    let fielddescr = frame
+                        .runtime_optimizer_descr(descr_idx)
+                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
                     (offset, field_size, is_field_signed, fielddescr)
                 };
                 let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
@@ -4435,7 +4455,13 @@ where
                     let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                         panic!("BC_GETFIELD_GC_F: descrs[{descr_idx}] is not a BhDescr entry")
                     });
-                    field_descr_ref_from_bh(bh)
+                    let offset = field_offset_from_bh(bh, "BC_GETFIELD_GC_F");
+                    (
+                        offset,
+                        frame
+                            .runtime_optimizer_descr(descr_idx)
+                            .unwrap_or_else(|| field_descr_ref_from_bh(bh).1),
+                    )
                 };
                 let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
                 let loaded = if struct_ptr != 0 {
@@ -9134,14 +9160,22 @@ where
                             "BC_NEWLIST_CLEAR: descrs[{length_descr_idx}] is not a BhDescr entry"
                         )
                     });
-                    field_descr_ref_from_bh(bh)
+                    let offset = field_offset_from_bh(bh, "BC_NEWLIST_CLEAR length");
+                    let descr = frame
+                        .runtime_optimizer_descr(length_descr_idx)
+                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
+                    (offset, descr)
                 };
                 let (items_offset, items_fielddescr) = {
                     let frame = self.frames.current_mut();
                     let bh = frame.runtime_bh_descr(items_descr_idx).unwrap_or_else(|| {
                         panic!("BC_NEWLIST_CLEAR: descrs[{items_descr_idx}] is not a BhDescr entry")
                     });
-                    field_descr_ref_from_bh(bh)
+                    let offset = field_offset_from_bh(bh, "BC_NEWLIST_CLEAR items");
+                    let descr = frame
+                        .runtime_optimizer_descr(items_descr_idx)
+                        .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
+                    (offset, descr)
                 };
                 // arraydescr: geometry for the live items-block allocation
                 // (`base_size + length*itemsize` bytes, cleared, length word

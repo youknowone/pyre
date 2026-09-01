@@ -400,6 +400,7 @@ pub(super) fn is_supported_int_cast(ty: &Type) -> bool {
                 || type_path.path.is_ident("u16")
                 || type_path.path.is_ident("i8")
                 || type_path.path.is_ident("u8")
+                || type_path.path.is_ident("bool")
         }
         _ => false,
     }

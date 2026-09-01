@@ -1215,7 +1215,7 @@ fn normal_frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     let max_fail_args = guards
         .iter()
-        .map(|g| g.fail_arg_refs.len())
+        .map(|g| live_fail_arg_extent(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
         .max()
         .unwrap_or(0);
     let value_area = max_fail_args.max(inputargs.len());
@@ -1233,7 +1233,7 @@ fn counter_slot(inputargs: &[InputArg], ops: &[Op]) -> Option<usize> {
     }
     let max_fail_args = guards
         .iter()
-        .map(|g| g.fail_arg_refs.len())
+        .map(|g| live_fail_arg_extent(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
         .max()
         .unwrap_or(0);
     Some(max_fail_args.max(inputargs.len()))
@@ -1725,6 +1725,58 @@ fn lookup_typeid_from_classptr(table: &HashMap<i64, u32>, classptr: usize) -> Op
 }
 
 /// Information about a guard exit collected during pre-scan.
+/// The live-position mask a guard's bridge inputargs were filtered by.
+///
+/// `pyjitpl.rs initialize_state_from_guard_failure` builds the bridge history
+/// from `rd_locs`: a position is live when its entry is not `0xFFFF`, and a
+/// descr whose `rd_locs` has not been sized to the fail-arg list (a synthetic
+/// one that never reached codegen) declares every position live. Any arity a
+/// backend compares against `bridge.inputargs.len()` has to come from that same
+/// table — `OpRef::is_none()` is this backend's own IR-level hole set and is a
+/// different mask, so counting with it refuses bridges whose arity was fine.
+pub fn live_fail_arg_mask(meta_descr: Option<&majit_ir::DescrRef>, n: usize) -> Vec<bool> {
+    match meta_descr.and_then(|d| d.as_fail_descr()) {
+        Some(fd) if fd.rd_locs().len() == n => {
+            fd.rd_locs().iter().map(|&pos| pos != 0xFFFF).collect()
+        }
+        _ => vec![true; n],
+    }
+}
+
+/// How many of a guard's fail-arg positions reach its bridge as inputargs.
+pub fn live_fail_arg_count(meta_descr: Option<&majit_ir::DescrRef>, n: usize) -> usize {
+    live_fail_arg_mask(meta_descr, n)
+        .iter()
+        .filter(|l| **l)
+        .count()
+}
+
+/// One past a guard's highest LIVE fail-arg position: the frame slots its exit
+/// has to write, and therefore the width the frozen layout has to hold.
+///
+/// A guard keeps its fail arguments in their *logical* resume positions here —
+/// `optimizeopt/mod.rs` hands this backend an identity-with-holes `rd_locs` and
+/// `emit_guard_fail_args_spill` writes position `i` into slot `i` — so the
+/// width is a property of the numbering, not of how many values are live.
+/// `optimizer.py:732` keeps one `ResumeDataLoopMemo` per `Optimizer`, so a
+/// guard numbered late in a trace carries positions every earlier guard filled;
+/// `resume.py:511 _invalidation_needed` only clears that cache once a guard
+/// passes `failargs_limit // 2` live boxes, which a trace can stay under while
+/// its logical width keeps growing.
+///
+/// Nothing reads a hole: its `rd_locs` entry is `0xFFFF`, so
+/// `initialize_state_from_guard_failure` never asks for the slot, and
+/// `emit_resolve` only spills a zero placeholder into it. Holes past the last
+/// live position therefore cost slots that no reader can observe, which on this
+/// backend is not free — a frame's offsets freeze when its token is compiled
+/// and `compile_bridge` declines a later bridge that does not fit them.
+pub fn live_fail_arg_extent(meta_descr: Option<&majit_ir::DescrRef>, n: usize) -> usize {
+    live_fail_arg_mask(meta_descr, n)
+        .iter()
+        .rposition(|&live| live)
+        .map_or(0, |i| i + 1)
+}
+
 pub struct GuardExit {
     pub fail_index: u32,
     pub fail_arg_refs: Vec<OpRef>,
@@ -2270,7 +2322,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
     if guards.iter().any(|g| g.counter_value_spill.is_some()) {
         let value_area = guards
             .iter()
-            .map(|g| g.fail_arg_refs.len())
+            .map(|g| live_fail_arg_extent(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
             .max()
             .unwrap_or(0)
             .max(inputargs.len());
@@ -2966,7 +3018,10 @@ pub fn build_wasm_module(
                     "wasm backend: inlined bridge source guard is outside the owner stream".into(),
                 )
             })?;
-        let source_args = source_guard.fail_arg_refs.len();
+        let source_args = live_fail_arg_count(
+            source_guard.meta_descr.as_ref(),
+            source_guard.fail_arg_refs.len(),
+        );
         if source_args != bridge.inputargs.len() {
             return Err(BackendError::Unsupported(format!(
                 "wasm backend: inlined bridge input arity {} differs from source guard arity {source_args}",
@@ -3007,7 +3062,7 @@ pub fn build_wasm_module(
     let bridge_param_arities: Vec<usize> = if *bridge_param_dispatch && bridge_dispatch {
         let mut arities: Vec<usize> = guards
             .iter()
-            .map(|guard| guard.fail_arg_refs.len())
+            .map(|guard| live_fail_arg_count(guard.meta_descr.as_ref(), guard.fail_arg_refs.len()))
             .collect();
         arities.sort_unstable();
         arities.dedup();
@@ -7852,6 +7907,22 @@ fn emit_guard_exit(
 /// Tail-call this guard's bridge directly when its cell is armed. The guard's
 /// failure list fixes both the values and the wasm function type, so this path
 /// needs neither an arity tag nor staging locals.
+/// A guard op's fail args restricted to the positions its bridge received.
+///
+/// Same rule as `live_fail_arg_mask`, read off the op's own descr.
+fn live_fail_args_of(op: &Op) -> Vec<OpRef> {
+    let all: Vec<OpRef> = op
+        .getfailargs()
+        .map(|args| args.iter().map(|arg| arg.to_opref()).collect::<Vec<_>>())
+        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect());
+    let descr = op.getdescr();
+    let mask = live_fail_arg_mask(descr.as_ref(), all.len());
+    all.into_iter()
+        .zip(mask)
+        .filter_map(|(arg, live)| live.then_some(arg))
+        .collect()
+}
+
 fn emit_guard_param_tail_call(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -7860,10 +7931,7 @@ fn emit_guard_param_tail_call(
     op: &Op,
     dispatch: BridgeDispatch<'_>,
 ) {
-    let fail_args: Vec<OpRef> = op
-        .getfailargs()
-        .map(|args| args.iter().map(|arg| arg.to_opref()).collect())
-        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect());
+    let fail_args: Vec<OpRef> = live_fail_args_of(op);
     let arity = fail_args.len();
     let type_idx = *dispatch
         .param_type_indices
@@ -7903,10 +7971,7 @@ fn emit_guard_inline_bridge_move(
     op: &Op,
     inputargs: &[InputArg],
 ) {
-    let fail_args: Vec<OpRef> = op
-        .getfailargs()
-        .map(|args| args.iter().map(|arg| arg.to_opref()).collect())
-        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect());
+    let fail_args: Vec<OpRef> = live_fail_args_of(op);
     assert_eq!(
         fail_args.len(),
         inputargs.len(),
@@ -8012,7 +8077,15 @@ fn emit_force_arm(
 ) {
     // `counter_value_spill` answers `None` for anything but a GUARD_VALUE, so
     // the counter slot has nothing to contribute to a force bracket.
-    for (i, &arg_ref) in exit_fail_args(guard_op).iter().enumerate() {
+    //
+    // Same range `emit_guard_fail_args_spill` writes and
+    // `normal_frame_value_slots` reserves: one past the last live position.
+    let mut force_args = exit_fail_args(guard_op);
+    force_args.truncate(live_fail_arg_extent(
+        guard_op.getdescr().as_ref(),
+        force_args.len(),
+    ));
+    for (i, &arg_ref) in force_args.iter().enumerate() {
         sink.local_get(0);
         if undefined == Some(arg_ref.raw()) {
             sink.i64_const(0);
@@ -8072,7 +8145,13 @@ fn emit_guard_fail_args_spill(
     counter_slot: Option<u64>,
     spill_helpers: &indexmap::IndexMap<usize, u32>,
 ) {
-    let fail_args = exit_fail_args(op);
+    // Only through the last live position: `normal_frame_value_slots` sizes the
+    // value area the same way, so writing past it would write past the frame.
+    let mut fail_args = exit_fail_args(op);
+    fail_args.truncate(live_fail_arg_extent(
+        op.getdescr().as_ref(),
+        fail_args.len(),
+    ));
 
     // The shared function writes the same slots in the same order; the call
     // site pushes the frame pointer once and each value once. The counter slot

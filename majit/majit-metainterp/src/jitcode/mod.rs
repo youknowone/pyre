@@ -238,6 +238,17 @@ pub enum RuntimeBhDescr {
     /// of these in `BlackholeInterpBuilder.descrs`; pyre's runtime
     /// `JitCodeBuilder` uses the per-JitCode pool described below.
     Descr(Box<CanonicalBhDescr>),
+    /// Ordinary blackhole descriptor paired with the optimizer descriptor
+    /// that the same `d` operand denotes while tracing.  RPython stores the
+    /// `FieldDescr` object itself in `Assembler.descrs`; its blackhole and
+    /// metainterp consumers therefore reuse one object.  Pyre's serialized
+    /// [`CanonicalBhDescr`] is the blackhole-facing half, so resolve the
+    /// optimizer-facing object once when the runtime pool is finalized and
+    /// keep it on that same pool entry.
+    ResolvedDescr {
+        canonical: Box<CanonicalBhDescr>,
+        optimizer: std::sync::OnceLock<majit_ir::DescrRef>,
+    },
     /// Target JitCode for a `j` argcode (`BC_INLINE_CALL`).  RPython:
     /// `blackhole.py:150-157` — `argtype == 'j' → descrs[idx]` asserted
     /// `isinstance(value, JitCode)`.
@@ -277,7 +288,44 @@ impl RuntimeBhDescr {
     pub fn as_bh_descr(&self) -> Option<&CanonicalBhDescr> {
         match self {
             Self::Descr(descr) => Some(descr.as_ref()),
+            Self::ResolvedDescr { canonical, .. } => Some(canonical.as_ref()),
             _ => None,
+        }
+    }
+
+    /// Optimizer-facing identity carried by this descriptor-pool entry.
+    pub fn as_optimizer_descr(&self) -> Option<&majit_ir::DescrRef> {
+        match self {
+            Self::ResolvedDescr {
+                canonical,
+                optimizer,
+            } => Some(
+                optimizer
+                    .get_or_init(|| crate::pyjitpl::dispatch::field_descr_ref_from_bh(canonical).1),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Finalize a field entry after its canonical parent layout has been
+    /// patched.  Mirrors `Assembler.descrs` in RPython: resolution happens
+    /// once per descriptor object, not once per executed field opcode.
+    ///
+    /// Takes the entry by value so the canonical box moves straight into the
+    /// resolved variant. Rewriting it through `&mut self` would need a stand-in
+    /// entry to hold the slot while the box moves out, and any stand-in is
+    /// both an allocation and a descriptor the pool never meant to contain.
+    pub(crate) fn into_resolved(self) -> Self {
+        match self {
+            Self::Descr(canonical)
+                if matches!(canonical.as_ref(), CanonicalBhDescr::Field { .. }) =>
+            {
+                Self::ResolvedDescr {
+                    canonical,
+                    optimizer: std::sync::OnceLock::new(),
+                }
+            }
+            other => other,
         }
     }
 

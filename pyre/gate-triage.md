@@ -85,13 +85,20 @@ Kept as-is; listed for completeness.
   `MAJIT_RTYPER_VERBOSE`, `MAJIT_JTRANSFORM_SHADOW`, `PYRE_DIAG124C`, `_51C`,
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `MAJIT_NBODY_DEBUG`,
-  `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`, `PYRE_DESCR_DEMAND`.
+  `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`, `PYRE_DESCR_DEMAND`,
+  `PYRE_CENSUS_HISTOGRAM`, `PYRE_REGEX_LENGTHS`.
   `PYRE_DESCR_DEMAND` records the distinct dense descriptor indices a run
   actually resolves, so the per-index pool loader can be measured against the
   pool size; the resolve path reads it through a `OnceLock` and pays nothing
   when it is unset. It is a measurement probe with no ON behaviour to graduate,
   so it has no epic — delete it with the demand counter itself once the pool's
   working set is settled.
+  `PYRE_CENSUS_HISTOGRAM` prints the regex allocation census by exact request
+  size. It is disabled by default and retires with the regex deopt-allocation
+  investigation that consumes the histogram.
+  `PYRE_REGEX_LENGTHS` selects the regex example input lengths used by that
+  investigation. It is disabled by default and retires with the same
+  measurement-only tooling.
 - **Default-OFF experiments (0)** — every gate this bucket once held has had
   its reader and its ON path deleted, the last of them when the `LIST_APPEND`
   admission it gated became unconditional. The live default-OFF arms left in
@@ -223,16 +230,22 @@ build.
 | PYRE_FBW_INLINE_POISON | admits a callee the replay scan declined and refuses at the scan's poisoned pcs during the walk (`diag.rs fbw_inline_poison_enabled`) | when a refusal that follows an executed effect has a resume leg that neither repeats it nor drops it |
 | PYRE_JD1 | arms the jd1 (`unpackiterable_driver`) compiled-loop experiment — `eval.rs jd1_experiment_enabled` is `PYRE_JD1 == "1"`, so nothing else turns it on.  `PYRE_NO_JD1`, `PYRE_JD1=0` and the master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) each force it back off | the jd1 experiment concludes |
 
-### §6b — VALUE knobs (14): config, not gates
+### §6b — VALUE knobs (17): config, not gates
 
 `PYRE_FBW_MULTIFRAME_DEPTH`,
 `PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
 `PYRE_PORTAL_METATRACE_ENTRY`, `PYRE_PORTAL_METATRACE_SKIP`,
+`PYRE_CENSUS_TRACE_SIZE`, `PYRE_CENSUS_TRACE_SKIP`,
 `MAJIT_DTRACE_CONST_FROM`, `MAJIT_DTRACE_CONST_TO`,
 `MAJIT_TRACE_CALL_DIAG`, `MAJIT_TRACE_OPS_DIAG`,
 `PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,
 `PYRE_WASM_GUEST_PROFILE`, `PYRE_WASM_MODULE`.
+
+`PYRE_CENSUS_TRACE_SIZE` enables the alloc-census example's bounded
+backtrace attribution for one exact allocation size, and is disabled when
+unset. `PYRE_CENSUS_TRACE_SKIP` is its optional nonnegative sample offset and
+defaults to zero. Both are measurement inputs, not runtime experiments.
 
 `PYRE_FBW_NO_SPECIALIZE` is the one entry here that changes behaviour rather
 than reporting it: its comma-separated selectors (or the reserved `all`) turn

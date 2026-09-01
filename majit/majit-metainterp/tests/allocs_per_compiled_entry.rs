@@ -585,7 +585,7 @@ fn main() {
 /// remaining rows are backend-neutral. The figure was per-backend while
 /// dynasm still built its entry frame off the GC.
 ///
-/// Four of the allocations are shared by both backends:
+/// All four allocations are shared by both backends:
 ///
 /// | n | site |
 /// |---|------|

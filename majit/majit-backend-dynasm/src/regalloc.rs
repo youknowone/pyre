@@ -1697,14 +1697,12 @@ pub struct RegAlloc<'a> {
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     pub(crate) operations: &'a [Op],
-    /// `inputarg_pos[arg.index] = idx in inputargs`, sentinel
-    /// [`OpTypeIndex::NO_POS`] for unset slots. Mirrors
+    /// `arg.index` raw -> idx in inputargs. Mirrors
     /// `OpTypeIndex::inputarg_pos`.
-    inputarg_pos: Vec<u32>,
-    /// `op_pos[op.pos.raw()] = idx in operations`, sentinel
-    /// [`OpTypeIndex::NO_POS`] for unset slots and Void/None ops.
+    inputarg_pos: majit_ir::PosIndex,
+    /// `op.pos.raw()` -> idx in operations, skipping Void/None ops.
     /// Mirrors `OpTypeIndex::op_pos`.
-    op_pos: Vec<u32>,
+    op_pos: majit_ir::PosIndex,
     /// x86/regalloc.py:1305 self.jump_target_descr — TargetToken descriptor
     /// of the closing JUMP. PyPy keys it by Python object identity; we use
     /// the underlying `Arc<dyn Descr>` allocation address.

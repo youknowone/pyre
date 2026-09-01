@@ -3234,13 +3234,8 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 // loop_reentry: use raw fail_args (same as run_compiled_code
                 // bridge dispatch). rebuild_state_after_failure transforms
                 // outputs for blackhole resume which may change Vec length.
-                let raw_outputs = outputs[..bridge.num_inputs].to_vec();
-                let bridge_frame = CraneliftBackend::execute_bridge(
-                    &bridge,
-                    &raw_outputs,
-                    fail_descr_fd.fail_arg_types(),
-                    attachments,
-                );
+                let bridge_frame =
+                    CraneliftBackend::execute_bridge(&bridge, &outputs, fail_descr_fd, attachments);
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                     .expect("bridge deadframe must have descriptor");
                 // llgraph/runner.py Jump exception on external JUMP:
@@ -3292,7 +3287,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             return CraneliftBackend::execute_bridge(
                 &bridge,
                 &mat_outputs,
-                fail_arg_types,
+                fail_descr_fd,
                 attachments,
             );
         }
@@ -3715,12 +3710,8 @@ fn call_assembler_guard_failure_inner(
     if let Some(bridge) = fail_descr_bridge_ref(fail_descr_ref) {
         let raw_num = fail_descr_ref.fail_arg_types().len();
         let parent_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, raw_num) };
-        let frame = CraneliftBackend::execute_bridge(
-            &bridge,
-            parent_outputs,
-            fail_descr_ref.fail_arg_types(),
-            attachments,
-        );
+        let frame =
+            CraneliftBackend::execute_bridge(&bridge, parent_outputs, fail_descr_ref, attachments);
         if let Some(result) = call_assembler_finish_or_blackhole_deadframe(frame) {
             return result;
         }
@@ -6071,6 +6062,11 @@ fn spill_guard_fail_args(
     ref_root_base_ofs: i32,
 ) {
     for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+        // resume.py failargs may contain None holes.  They retain their slot
+        // index in rd_locs, but no value exists to resolve or publish.
+        if arg_ref.is_none() {
+            continue;
+        }
         let raw = if !arg_ref.is_constant()
             && arg_ref.raw() == call_result
             && !constants.contains_key(&arg_ref.raw())
@@ -6848,6 +6844,7 @@ fn emit_attached_bridge_dispatch(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
     bridge_cache_addrs: (usize, usize),
+    bridge_source_slots: &[usize],
     ptr_type: cranelift_codegen::ir::Type,
 ) {
     // dynasm/x86 patches the failing guard's jump to the attached bridge.
@@ -6900,6 +6897,52 @@ fn emit_attached_bridge_dispatch(
 
     builder.switch_to_block(bridge_block);
     builder.seal_block(bridge_block);
+    // `compile_bridge` receives only the live fail arguments: resume holes
+    // stay in the source guard's logical list but are absent from the bridge
+    // inputargs (`compile.py ResumeGuardDescr.compile_and_attach`).  The
+    // parent recovery stub above stores values at those logical positions,
+    // while the bridge entry loader reads its compact inputargs from slots
+    // `0..N`.  Dynasm's regalloc makes the same transfer through the bridge's
+    // fail locations.  Cranelift shares the JITFRAME across this tail jump, so
+    // compact it here before entering the bridge.
+    //
+    // Load every source before writing any destination.  A late logical slot
+    // can be copied onto an earlier slot that is itself still a source.
+    //
+    // The sources come from `rd_locs` (`rebuild_faillocs_from_descr`), never
+    // from `fail_arg_refs`: the two carry different hole sets.  `rd_locs` is
+    // the mask `optimizeopt/mod.rs` derives from `inputargs_and_holes`, which
+    // is what `compile_bridge` filtered its inputargs by, while
+    // `fail_arg_refs` holes are this backend's own IR-level view.  Measured on
+    // `jit_recursive_closure_live_set.py`: one guard's `rd_locs` marked
+    // positions 21 and 22 dead where `fail_arg_refs` marked 20 and 21, so
+    // compacting by the latter moved the wrong words into the bridge's inputs.
+    let live_slots = bridge_source_slots;
+    if live_slots
+        .iter()
+        .enumerate()
+        .any(|(dense, source)| dense != *source)
+    {
+        let values: Vec<CValue> = live_slots
+            .iter()
+            .map(|source| {
+                builder.ins().load(
+                    cl_types::I64,
+                    MemFlagsData::trusted(),
+                    jf_ptr,
+                    JF_FRAME_ITEM0_OFS + (*source as i32) * 8,
+                )
+            })
+            .collect();
+        for (dense, value) in values.into_iter().enumerate() {
+            builder.ins().store(
+                MemFlagsData::trusted(),
+                value,
+                jf_ptr,
+                JF_FRAME_ITEM0_OFS + (dense as i32) * 8,
+            );
+        }
+    }
     // assembler.py:987 `patch_jump_for_descr`: the failing guard's JMP is
     // rewritten to jump straight into the bridge — a tail transfer, not a
     // call.  The cranelift analogue is `return_call_indirect` into the
@@ -7181,6 +7224,13 @@ fn emit_guard_exit(
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
         let offset = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
 
+        // resume.py failargs may contain None holes.  Keep the slot numbering
+        // positional, while leaving the dead slot unwritten like PyPy's
+        // recovery stub.
+        if arg_ref.is_none() {
+            continue;
+        }
+
         if let Some(accum) = accum_positions.get(&slot) {
             // _update_at_exit: reduce vector accumulator to scalar.
             // resume.py:28 + vector_ext.py:130: accum_info.location = vector SSA
@@ -7367,6 +7417,7 @@ fn emit_guard_exit(
             jf_ptr,
             info.bridge_cache_addrs
                 .expect("can_have_bridge=true GuardInfo must carry bridge_cache_addrs"),
+            &info.bridge_source_slots,
             ptr_type,
         );
     }
@@ -8335,6 +8386,13 @@ struct GuardInfo {
     /// guard's whole gcmap (`GuardToken.compute_gcmap`), and the slots a
     /// paired CALL_MAY_FORCE / CALL_RELEASE_GIL publishes into before its call.
     failarg_ref_slots: Vec<usize>,
+    /// `llsupport/assembler.py rebuild_faillocs_from_descr`: the physical
+    /// frame slot each of an attached bridge's inputargs is read from, in
+    /// bridge inputarg order.  Decoded from this guard's `rd_locs` — one
+    /// entry per logical resume position, `0xFFFF` for a hole — which
+    /// `optimizeopt/mod.rs` writes as identity-with-holes for this backend.
+    /// Empty when the descr carries no `rd_locs`, i.e. plain identity.
+    bridge_source_slots: Vec<usize>,
     /// Leaked `[length, data...]` gcmap pointer, or 0 for NULLGCMAP.
     /// allocate_gcmap (gcmap.py) parity.
     gcmap: i64,
@@ -9309,18 +9367,39 @@ impl CraneliftBackend {
     fn execute_bridge(
         bridge: &BridgeData,
         parent_outputs: &[i64],
-        parent_types: &[Type],
+        parent_descr: &dyn FailDescr,
         attachments: &'static CpuDescrAttachments,
     ) -> DeadFrame {
-        // The bridge's inputs are the parent guard's fail args.
-        let num_bridge_inputs = bridge.num_inputs.min(parent_types.len());
-        let bridge_inputs = &parent_outputs[..num_bridge_inputs];
+        // `compile.py ResumeGuardDescr.compile_and_attach` passes only live
+        // boxes to the bridge.  `rd_locs` still has one entry per logical
+        // resume position, including `0xFFFF` holes, and maps each live entry
+        // to the physical word in `parent_outputs`.  Decode that table just as
+        // `llmodel.py _decode_pos` does instead of slicing the first N logical
+        // positions (which shifts every value after the first hole).
+        let rd_locs = parent_descr.rd_locs();
+        let mut bridge_inputs = Vec::with_capacity(bridge.num_inputs);
+        if rd_locs.is_empty() {
+            bridge_inputs.extend(parent_outputs.iter().copied().take(bridge.num_inputs));
+        } else {
+            for &loc in rd_locs {
+                if loc == 0xFFFF {
+                    continue;
+                }
+                let Some(&value) = parent_outputs.get(loc as usize) else {
+                    break;
+                };
+                bridge_inputs.push(value);
+                if bridge_inputs.len() == bridge.num_inputs {
+                    break;
+                }
+            }
+        }
         let exec = run_compiled_code(
             bridge.code_ptr,
             &bridge.fail_descrs,
             bridge.num_ref_roots,
             bridge.max_output_slots,
-            &FrameInputs::Ints(bridge_inputs),
+            &FrameInputs::Ints(&bridge_inputs),
             attachments,
             0, // bridge entry (br_table preamble slot)
         );
@@ -9329,7 +9408,7 @@ impl CraneliftBackend {
 
         if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
             let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
-                CallAssemblerCallerContext::from_bridge_data(bridge, bridge_inputs),
+                CallAssemblerCallerContext::from_bridge_data(bridge, &bridge_inputs),
             );
             return wrap_call_assembler_deadframe_with_caller_prefix(frame);
         }
@@ -9352,12 +9431,7 @@ impl CraneliftBackend {
             // Extracted on the one arm that feeds it forward; the FINISH and
             // no-bridge exits above and below return the frame itself.
             let outputs = exec.extract_outputs(bridge.max_output_slots.max(1));
-            return Self::execute_bridge(
-                &next_bridge,
-                &outputs,
-                fail_descr_fd.fail_arg_types(),
-                attachments,
-            );
+            return Self::execute_bridge(&next_bridge, &outputs, fail_descr_fd, attachments);
         }
 
         // jf_guard_exc already written by emit_guard_exit.
@@ -11506,6 +11580,9 @@ impl CraneliftBackend {
                     // implement_guard_recovery / _update_at_exit parity:
                     // Write fail_arg values to jf_frame[0..n] in fail_args order.
                     for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+                        if arg_ref.is_none() {
+                            continue;
+                        }
                         let raw = resolve_failarg_opref(
                             &mut builder,
                             &constants,
@@ -16284,7 +16361,11 @@ fn collect_guards(
                                 length,
                             }
                         }
-                        majit_ir::RdVirtualInfo::Empty => continue,
+                        // `ResumeDataVirtualAdder._number_virtuals` can leave
+                        // a None hole when loop-memo numbering is reused by a
+                        // later guard. Keep it in the vector: skipping it
+                        // would shift every subsequent TAGVIRTUAL index.
+                        majit_ir::RdVirtualInfo::Empty => ExitVirtualLayout::Hole,
                     };
                     recovery_layout.virtual_layouts.push(layout);
                 }
@@ -16597,6 +16678,22 @@ fn collect_guards(
                 | majit_ir::OpCode::GuardNoException
                 | majit_ir::OpCode::GuardNotForced
         );
+        // `llsupport/assembler.py rebuild_faillocs_from_descr`: walk `rd_locs`,
+        // skip the `0xFFFF` holes, and the k-th survivor is where the bridge's
+        // k-th inputarg lives.  `CraneliftBackend::execute_bridge` decodes the
+        // same table for the re-entry path; the shared-frame tail jump reads it
+        // from here so both dispatches agree on one mapping.
+        let bridge_source_slots: Vec<usize> = descr_arc
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map(|fd| {
+                fd.rd_locs()
+                    .iter()
+                    .filter(|&&loc| loc != 0xFFFF)
+                    .map(|&loc| loc as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
         guard_infos.push(GuardInfo {
             source_op_index: op_idx,
             fail_index,
@@ -16610,6 +16707,7 @@ fn collect_guards(
             // where `before_call` has just refreshed every named slot. dynasm
             // ports the same split (`guard_gcmap_from_faillocs`). Anything a
             // guard exit does not itself write must stay out of this map.
+            bridge_source_slots,
             gcmap: allocate_gcmap(&failarg_ref_slots),
             failarg_ref_slots,
             fail_descr_ptr,
@@ -23474,6 +23572,38 @@ mod tests {
         assert_eq!(descr.fail_index(), 0);
         assert_eq!(backend.get_float_value(&frame, 0), 9.25);
         assert_eq!(backend.get_ref_value(&frame, 1), GcRef(0xBEEF));
+    }
+
+    #[test]
+    fn test_guard_fail_args_leave_none_holes_unwritten() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let guard_op = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard_op.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::NONE),
+            rb(OpRef::input_arg_int(1)),
+        ]);
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            guard_op,
+            mk_op(OpCode::Finish, &[], OpRef::NONE.raw()),
+        ];
+
+        let token = JitCellToken::new(1002);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(42)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(backend.get_int_value(&frame, 2), 42);
     }
 
     #[test]

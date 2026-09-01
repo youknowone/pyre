@@ -23,15 +23,15 @@ fn chr(n: *mut NodeRec) -> i64 {
 }
 #[inline(always)]
 fn empty(n: *mut NodeRec) -> i64 {
-    unsafe { (*n).empty as i64 }
+    unsafe { i64::from((*n).empty) }
 }
 #[inline(always)]
 fn marked(n: *mut NodeRec) -> i64 {
-    unsafe { (*n).marked as i64 }
+    unsafe { i64::from((*n).marked) }
 }
 #[inline(always)]
 fn set_marked(n: *mut NodeRec, m: i64) {
-    unsafe { (*n).marked = m as u8 }
+    unsafe { (*n).marked = m != 0 }
 }
 #[inline(always)]
 fn left(n: *mut NodeRec) -> *mut NodeRec {

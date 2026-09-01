@@ -1124,8 +1124,13 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                                         length,
                                     }
                                 }
+                                // `ResumeDataVirtualAdder._number_virtuals`
+                                // leaves None entries when a shared memo's
+                                // cached virtual number is absent from this
+                                // guard. Preserve the index; the slot is not
+                                // referenced by this guard's numbering.
                                 majit_ir::RdVirtualInfo::Empty => {
-                                    panic!("[jit] rd_virtuals[{vidx}] is Empty");
+                                    majit_backend::ExitVirtualLayout::Hole
                                 }
                             }
                         })

@@ -172,7 +172,10 @@ impl Op {
     /// return avoids the `Ref<[T]>` ergonomics tax for callers that chain
     /// through `.into_iter().flatten()` or `.iter()` patterns.
     pub fn getfailargs(&self) -> Option<smallvec::SmallVec<[crate::operand::Operand; 3]>> {
-        self.fail_args.borrow().as_ref().map(|fa| fa.clone())
+        self.fail_args
+            .borrow()
+            .as_ref()
+            .map(|fa| fa.iter().cloned().collect())
     }
 
     /// `resoperation.py GuardResOp.getfailargs_copy` parity.
@@ -205,7 +208,7 @@ impl Op {
         // `Operand::Const`. An unbound position-only fail-arg is a contract
         // violation (every writer binds its producer) — `Operand::from_opref`
         // panics for it at the call site.
-        *self.fail_args.borrow_mut() = Some(fail_args);
+        *self.fail_args.borrow_mut() = Some(fail_args.into_iter().collect());
     }
 
     /// In-place mutable view of the fail_args slot.  Lets callers iterate
@@ -214,9 +217,7 @@ impl Op {
     /// slot is empty.  Uses `RefCell::get_mut` so it requires `&mut Op`;
     /// shared-`Op` callers should clone via `getfailargs_copy`, mutate
     /// the copy, and call `setfailargs`.
-    pub fn fail_args_mut(
-        &mut self,
-    ) -> Option<&mut smallvec::SmallVec<[crate::operand::Operand; 3]>> {
+    pub fn fail_args_mut(&mut self) -> Option<&mut Vec<crate::operand::Operand>> {
         self.fail_args.get_mut().as_mut()
     }
 

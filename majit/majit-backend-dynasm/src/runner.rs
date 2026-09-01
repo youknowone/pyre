@@ -2829,12 +2829,23 @@ impl Backend for DynasmBackend {
             fail_descr.trace_id(),
             fail_descr.fail_index_per_trace(),
         );
-        let arglocs = Asm::rebuild_faillocs_from_descr(
-            guard_descr
-                .as_fail_descr()
-                .expect("guard_descr is FailDescr"),
-            inputargs,
-        );
+        // `assembler.py assemble_bridge` reads the locations off the
+        // `faildescr` it was handed — the descr the guard actually failed on —
+        // and `compile.py ResumeGuardDescr.compile_and_attach` is what hands it
+        // over. `guard_descr` below is a `(trace_id, fail_index)` lookup that
+        // exists for `patch_jump_for_descr`'s `adr_jump_offset`, and it can
+        // answer with a different object than the one that failed.
+        //
+        // These two must be the same descr: `jitdriver.rs`
+        // `start_bridge_tracing` takes the bridge's inputarg count from
+        // `fail_descr.fail_arg_types().len()`, while `_update_bindings` zips
+        // that inputarg vector against this location vector. Reading the
+        // locations off the other object let the two lengths disagree —
+        // measured on `pyre/bench/fannkuch.py`, 17 inputargs against 15
+        // locations — and every inputarg past the shorter list then bound
+        // nothing at all (`RegisterManager.loc: box InputArgInt(1844) not
+        // found`).
+        let arglocs = Asm::rebuild_faillocs_from_descr(fail_descr, inputargs);
         let compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
@@ -4193,6 +4204,22 @@ mod tests {
             dynasm_alloc_oldgen_varsize_typed_and_set_len(1, 0, 2, 0, usize::MAX),
             0
         );
+    }
+
+    #[test]
+    fn bridge_fail_locations_drop_resume_holes_like_rpython() {
+        let descr =
+            majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Ref, Type::Int]);
+        let fail_descr = descr.as_fail_descr().expect("resume guard fail descr");
+        fail_descr.set_rd_locs(vec![0, 0xFFFF, 1]);
+        // pyjitpl.py initialize_state_from_guard_failure filters the hole
+        // before the history is built, so only the two live boxes reach the
+        // backend bridge.
+        let inputargs = [InputArg::new_int(0), InputArg::new_int(1)];
+
+        let locs = Asm::rebuild_faillocs_from_descr(fail_descr, &inputargs);
+
+        assert_eq!(locs.len(), inputargs.len());
     }
 
     fn install_test_libc_jitframe_tracer() {

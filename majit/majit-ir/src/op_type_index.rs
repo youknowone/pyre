@@ -19,17 +19,15 @@ use crate::value::{InputArg, Type};
 pub struct OpTypeIndex<'a, T: AsRef<Op> = Op> {
     inputargs: &'a [InputArg],
     ops: &'a [T],
-    /// `inputarg_pos[raw] = slice index in inputargs`, sentinel
-    /// [`NO_POS`] for unset slots. `arg.index` raw uniqueness is
-    /// enforced at build time, mirroring RPython's backend uniqueness
-    /// assertion (x86/assembler.py:516-518 + aarch64/assembler.py:54-56
-    /// `assert len(set(inputargs)) == len(inputargs)`).
-    inputarg_pos: Cow<'a, [u32]>,
-    /// `op_pos[raw] = slice index in ops`, sentinel [`NO_POS`] for
-    /// unset slots and Void/None ops. `op.pos.raw()` raw uniqueness is
-    /// enforced at build time per RPython Box identity (Box `is`
-    /// semantics in `rpython/jit/metainterp/resoperation.py:38`).
-    op_pos: Cow<'a, [u32]>,
+    /// `arg.index` raw -> slice index in inputargs. `arg.index` raw
+    /// uniqueness is enforced at build time, mirroring RPython's backend
+    /// uniqueness assertion (x86/assembler.py:516-518 +
+    /// aarch64/assembler.py:54-56 `assert len(set(inputargs)) == len(inputargs)`).
+    inputarg_pos: Cow<'a, PosIndex>,
+    /// `op.pos.get().raw()` -> slice index in ops, skipping Void/None ops.
+    /// Raw uniqueness is enforced at build time per RPython Box identity
+    /// (Box `is` semantics in `rpython/jit/metainterp/resoperation.py:38`).
+    op_pos: Cow<'a, PosIndex>,
 }
 
 /// Sentinel for "no entry at this raw u32 slot" in `inputarg_pos` /
@@ -38,6 +36,72 @@ pub struct OpTypeIndex<'a, T: AsRef<Op> = Op> {
 /// gated out before reaching these arrays, so raw values land well
 /// below `u32::MAX`.
 pub const NO_POS: u32 = u32::MAX;
+
+/// A `raw -> slice index` table for one trace's boxes, based at the lowest
+/// raw the trace actually uses.
+///
+/// The base is the whole point. Pyre's `OpRef` raws come from a monotonic
+/// counter and a bridge allocates its own at `[parent_high_water..)`, so a
+/// table indexed by the bare raw is sized by everything the trace family has
+/// compiled so far rather than by the trace in hand: measured on
+/// `majit/examples/regex`'s branching portal, the 500th build held 187 entries
+/// spanning 282 raws in 17,332 slots, and both the allocation and its `memset`
+/// grew without bound as more bridges were built. Basing the table removes
+/// that term — the length is the trace's own raw span and nothing else.
+///
+/// RPython keeps no positional side table at all: `box.type` lives on the box
+/// (`history.py:182`, `resoperation.py:29`) and the backends key their own
+/// tables by box identity (`llsupport/regalloc.py` `longevity`,
+/// `aarch64/assembler.py` `loc`). This is the identity-keyed lookup those
+/// dicts provide, without a hash.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PosIndex {
+    /// The raw that `slots[0]` answers for. Meaningless when `slots` is empty.
+    base: u32,
+    /// `slots[raw - base] = slice index`, sentinel [`NO_POS`] for unset.
+    slots: Vec<u32>,
+}
+
+impl PosIndex {
+    /// Empty table: every lookup answers `None`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allocate a table covering `[base, max]` with every slot unset.
+    fn spanning(base: u32, max: u32) -> Self {
+        let len = (max - base) as usize + 1;
+        Self {
+            base,
+            slots: vec![NO_POS; len],
+        }
+    }
+
+    /// The slot for `raw`, or `None` when `raw` is outside the span.
+    #[inline]
+    fn slot(&self, raw: u32) -> Option<usize> {
+        let off = raw.checked_sub(self.base)? as usize;
+        (off < self.slots.len()).then_some(off)
+    }
+
+    /// `raw -> slice index`, or `None` for an out-of-span raw or an unset slot.
+    #[inline]
+    pub fn get(&self, raw: u32) -> Option<usize> {
+        let entry = self.slots[self.slot(raw)?];
+        (entry != NO_POS).then_some(entry as usize)
+    }
+
+    /// Bind `raw` to `idx`, returning the previous binding if there was one.
+    /// `raw` must be inside the span the table was built for.
+    fn bind(&mut self, raw: u32, idx: u32) -> Option<u32> {
+        let off = self
+            .slot(raw)
+            .expect("PosIndex::bind: raw outside the span the table was built for");
+        let prev = self.slots[off];
+        self.slots[off] = idx;
+        (prev != NO_POS).then_some(prev)
+    }
+}
 
 impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     pub fn new(inputargs: &'a [InputArg], ops: &'a [T]) -> Self {
@@ -56,8 +120,8 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     pub fn from_parts(
         inputargs: &'a [InputArg],
         ops: &'a [T],
-        inputarg_pos: &'a [u32],
-        op_pos: &'a [u32],
+        inputarg_pos: &'a PosIndex,
+        op_pos: &'a PosIndex,
     ) -> Self {
         Self {
             inputargs,
@@ -77,21 +141,19 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     /// one in any variant-blind reader. Hard-panic on raw collision so
     /// the violation surfaces here rather than as a wrong-type guard
     /// fail much further along.
-    pub fn build_inputarg_pos(inputargs: &[InputArg]) -> Vec<u32> {
-        if inputargs.is_empty() {
-            return Vec::new();
-        }
-        let max_raw = inputargs.iter().map(|a| a.index).max().unwrap_or(0);
-        let mut pos: Vec<u32> = vec![NO_POS; max_raw as usize + 1];
+    pub fn build_inputarg_pos(inputargs: &[InputArg]) -> PosIndex {
+        let Some(base) = inputargs.iter().map(|a| a.index).min() else {
+            return PosIndex::new();
+        };
+        let max = inputargs.iter().map(|a| a.index).max().unwrap_or(base);
+        let mut pos = PosIndex::spanning(base, max);
         for (idx, arg) in inputargs.iter().enumerate() {
-            let r = arg.index as usize;
-            if pos[r] != NO_POS {
+            if let Some(prev) = pos.bind(arg.index, idx as u32) {
                 panic!(
                     "OpTypeIndex: raw inputarg index {} bound to inputargs[{}] {:?} and inputargs[{}] {:?} — backend uniqueness violated",
-                    arg.index, pos[r], inputargs[pos[r] as usize].tp, idx, arg.tp,
+                    arg.index, prev, inputargs[prev as usize].tp, idx, arg.tp,
                 );
             }
-            pos[r] = idx as u32;
         }
         pos
     }
@@ -107,34 +169,32 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     /// tag, because pyre's backend boundary keys by raw u32 and would
     /// silently keep only the later op. Hard-panic on raw collision so
     /// the violation surfaces here.
-    pub fn build_op_pos(ops: &[T]) -> Vec<u32> {
-        let max_raw = ops
-            .iter()
-            .map(|op| op.as_ref())
-            .filter(|op| !op.pos.get().is_none() && op.type_ != Type::Void)
-            .map(|op| op.pos.get().raw())
-            .max();
-        let Some(max_raw) = max_raw else {
-            return Vec::new();
+    pub fn build_op_pos(ops: &[T]) -> PosIndex {
+        let boxes = || {
+            ops.iter()
+                .map(|op| op.as_ref())
+                .filter(|op| !op.pos.get().is_none() && op.type_ != Type::Void)
+                .map(|op| op.pos.get().raw())
         };
-        let mut pos: Vec<u32> = vec![NO_POS; max_raw as usize + 1];
+        let (Some(base), Some(max)) = (boxes().min(), boxes().max()) else {
+            return PosIndex::new();
+        };
+        let mut pos = PosIndex::spanning(base, max);
         for (idx, op) in ops.iter().enumerate() {
             let op = op.as_ref();
             if op.pos.get().is_none() || op.type_ == Type::Void {
                 continue;
             }
-            let r = op.pos.get().raw() as usize;
-            if pos[r] != NO_POS {
+            if let Some(prev) = pos.bind(op.pos.get().raw(), idx as u32) {
                 panic!(
                     "OpTypeIndex: raw {} bound to ops[{}] {:?} and ops[{}] {:?} — Box identity broken",
                     op.pos.get().raw(),
-                    pos[r],
-                    ops[pos[r] as usize].as_ref().opcode,
+                    prev,
+                    ops[prev as usize].as_ref().opcode,
                     idx,
                     op.opcode,
                 );
             }
-            pos[r] = idx as u32;
         }
         pos
     }
@@ -190,7 +250,7 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
         ) {
             return None;
         }
-        let idx = op_pos_lookup(&self.op_pos, opref.raw() as usize)?;
+        let idx = self.op_pos.get(opref.raw())?;
         Some(self.ops[idx].as_ref())
     }
 
@@ -199,7 +259,7 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     /// an OpRef's pre-redefinition type when an op later overwrote the
     /// same OpRef with a different type.
     pub fn inputarg_type(&self, opref: OpRef) -> Option<Type> {
-        let idx = op_pos_lookup(&self.inputarg_pos, opref.raw() as usize)?;
+        let idx = self.inputarg_pos.get(opref.raw())?;
         Some(self.inputargs[idx].tp)
     }
 
@@ -209,19 +269,7 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     /// The `inputarg_pos` position array uses `OpRef::raw()` (less the
     /// inputarg base) internally, so the round-trip carries no information.
     pub fn inputarg_type_raw(&self, raw: u32) -> Option<Type> {
-        let idx = op_pos_lookup(&self.inputarg_pos, raw as usize)?;
+        let idx = self.inputarg_pos.get(raw)?;
         Some(self.inputargs[idx].tp)
     }
-}
-
-/// Look up `raw` in a position array (`inputarg_pos` / `op_pos`).
-/// Returns `Some(idx)` for a populated slot, `None` for an out-of-range
-/// raw or a sentinel slot.
-#[inline]
-fn op_pos_lookup(pos: &[u32], raw: usize) -> Option<usize> {
-    let entry = *pos.get(raw)?;
-    if entry == NO_POS {
-        return None;
-    }
-    Some(entry as usize)
 }

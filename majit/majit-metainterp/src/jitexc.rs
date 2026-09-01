@@ -40,7 +40,7 @@ pub enum JitException {
     BailToInterpreter,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContinueRunningNormallyArgs {
     pub green_int: Vec<i64>,
     pub green_ref: Vec<i64>,

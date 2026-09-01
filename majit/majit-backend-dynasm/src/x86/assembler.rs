@@ -835,14 +835,14 @@ pub struct Assembler386<'a> {
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     operations: &'a [Op],
-    /// `inputarg_pos[arg.index] = idx in inputargs`, sentinel
+    /// `arg.index` raw -> idx in inputargs, sentinel
     /// [`OpTypeIndex::NO_POS`] for unset slots. Mirrors
     /// `OpTypeIndex::inputarg_pos`.
-    inputarg_pos: Vec<u32>,
+    inputarg_pos: majit_ir::PosIndex,
     /// `op_pos[op.pos.raw()] = idx in operations`, sentinel
     /// [`OpTypeIndex::NO_POS`] for unset slots and Void/None ops.
     /// Mirrors `OpTypeIndex::op_pos`.
-    op_pos: Vec<u32>,
+    op_pos: majit_ir::PosIndex,
     /// Constants: OpRef index (>= 10000) → typed `Const` value. The box
     /// variant carries its own type (`Const::get_type`), so no separate
     /// constant-type map is needed.

@@ -8,6 +8,7 @@ mod lower_stmt;
 mod lower_vable;
 mod lower_value;
 mod lowerer;
+mod regalloc;
 
 pub use api::GeneratedJitCodeBody;
 #[allow(unused_imports)]
@@ -186,6 +187,11 @@ pub struct LowererConfig {
     /// `warmspot.py:663 _green_args_spec` STR/UNICODE distinction
     /// instead of collapsing to `GreenType::Ref`.
     pub green_type_tags: Vec<Option<crate::jit_interp::green_type_tag::GreenTypeTag>>,
+    /// Function-parameter greens beyond the conventional `pc` / `program`
+    /// pair, in declaration order.  These are real portal arguments, just as
+    /// every variable in `JitDriver.greens` is an argument of RPython's
+    /// `JIT_ENTER_FUNCTYPE`; body-local greens are deliberately absent.
+    pub(super) portal_green_params: Vec<(String, ValueKind)>,
     /// Slice (audit Issue #6) — explicit red declarations.  Source:
     /// `JitInterpConfig.reds` (mod.rs).  Empty = use the default
     /// `[program, pc(+ optional vable)]` candidate list.
@@ -278,13 +284,29 @@ pub struct LowererConfig {
 }
 
 impl LowererConfig {
+    /// Per-bank portal argument counts before a possible virtualizable.
+    /// `program` owns r0 and `pc` owns i0; function-parameter greens follow
+    /// densely in their respective banks, matching `MIFrame.setup_call`.
+    pub(super) fn portal_input_kind_counts(&self) -> (u16, u16, u16) {
+        let mut ints = 1u16;
+        let mut refs = 1u16;
+        let mut floats = 0u16;
+        for (_, kind) in &self.portal_green_params {
+            match kind {
+                ValueKind::Int => ints += 1,
+                ValueKind::Ref => refs += 1,
+                ValueKind::Float => floats += 1,
+            }
+        }
+        (ints, refs, floats)
+    }
+
     /// First ref-bank register available for ref-scalar identity slots.
-    /// `MIFrame::setup_call` packs the dispatch JitCode's ref args densely
-    /// from r0 (`program` at r0, the virtualizable identity at r1 when
-    /// present), and the blackhole re-executes ops reading those argument
-    /// registers, so identity slots start past them.
+    /// `MIFrame::setup_call` packs the dispatch JitCode's ref args densely;
+    /// the virtualizable, when present, follows the explicit portal greens.
     pub(super) fn ref_identity_base(&self) -> u16 {
-        1 + u16::from(self.vable_var.is_some())
+        let (_, refs, _) = self.portal_input_kind_counts();
+        refs + u16::from(self.vable_var.is_some())
     }
 
     /// First int-bank register available for scalar/array identity
@@ -295,7 +317,7 @@ impl LowererConfig {
     /// so the blackhole's re-executed jit_merge_point reads a state
     /// scalar where it expects the green pc.
     pub(super) fn int_identity_base(&self) -> u16 {
-        1
+        self.portal_input_kind_counts().0
     }
 
     /// First float-bank register available for float-scalar identity slots.
@@ -303,16 +325,7 @@ impl LowererConfig {
     /// zero; keep it computed from the schema helper instead of baking call
     /// sites to `0`.
     pub(super) fn float_identity_base(&self) -> u16 {
-        self.greens
-            .iter()
-            .zip(self.green_type_tags.iter())
-            .filter(|(_, tag)| {
-                matches!(
-                    tag,
-                    Some(crate::jit_interp::green_type_tag::GreenTypeTag::Float)
-                )
-            })
-            .count() as u16
+        self.portal_input_kind_counts().2
     }
 
     /// One past the last float-bank identity slot.
@@ -1012,6 +1025,7 @@ impl LowererConfig {
             state_float_scalars: HashMap::new(),
             greens: Vec::new(),
             green_type_tags: Vec::new(),
+            portal_green_params: Vec::new(),
             reds: Vec::new(),
             state_type_name: String::new(),
             env_type_name: String::new(),
@@ -1048,7 +1062,7 @@ impl LowererConfig {
         clippy::too_many_arguments,
         reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
     )]
-    pub fn new(
+    pub(super) fn new(
         io_shims: &[(Path, Ident)],
         calls: &[crate::jit_interp::CallEntry],
         auto_calls: bool,
@@ -1056,6 +1070,7 @@ impl LowererConfig {
         state_fields_cfg: Option<&crate::jit_interp::StateFieldsConfig>,
         greens: &[Expr],
         green_type_tags: &[Option<crate::jit_interp::green_type_tag::GreenTypeTag>],
+        portal_green_params: &[(String, ValueKind)],
         reds: &[Expr],
         state_type: &Ident,
         env_type: &Ident,
@@ -1293,6 +1308,7 @@ impl LowererConfig {
             state_float_scalars,
             greens: greens.to_vec(),
             green_type_tags: green_type_tags.to_vec(),
+            portal_green_params: portal_green_params.to_vec(),
             reds: reds.to_vec(),
             state_type_name: state_type.to_string(),
             env_type_name: env_type.to_string(),
@@ -2054,12 +2070,6 @@ impl LoweredSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn parse_pat(code: &str) -> Pat {
-        let match_code = format!("match x {{ {code} => () }}");
-        let expr: syn::ExprMatch = syn::parse_str(&match_code).expect("failed to parse match");
-        expr.arms.into_iter().next().unwrap().pat
-    }
 
     #[test]
     fn liveness_records_alive_at_marker_after_use() {

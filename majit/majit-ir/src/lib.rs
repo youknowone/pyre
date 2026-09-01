@@ -45,7 +45,7 @@ pub use effectinfo::{
     UnsupportedFieldExc, consider_array, consider_struct, frozenset_or_none,
 };
 pub use indexmap_ext::{ConstMap, IndexMapExt};
-pub use op_type_index::OpTypeIndex;
+pub use op_type_index::{OpTypeIndex, PosIndex};
 pub use resoperation::{
     AbstractValue, ArrayDescrInfo, BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT,
     Op, OpCode, OpRc, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,

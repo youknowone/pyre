@@ -1929,12 +1929,75 @@ fn generate_green_key_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 ///
 /// This keeps the mainloop hot path thin — only an `is_tracing()` flag check
 /// appears inline, while the closure capture and tracing logic live here.
+/// Green variables that are portal function parameters rather than the
+/// conventional `pc` / `program` pair.  RPython obtains their lltypes from
+/// the portal graph signature.  The Rust macro needs an explicit tag for the
+/// same reason: it must choose an Int/Ref/Float register bank before rustc
+/// type-checks the generated body.
+pub(super) fn portal_green_params(
+    config: &JitInterpConfig,
+    func: &ItemFn,
+) -> Vec<(Ident, syn::Type, green_type_tag::GreenTypeTag)> {
+    use std::collections::HashMap;
+
+    let param_types: HashMap<String, syn::Type> = func
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            let syn::FnArg::Typed(arg) = arg else {
+                return None;
+            };
+            let syn::Pat::Ident(pat) = &*arg.pat else {
+                return None;
+            };
+            Some((pat.ident.to_string(), (*arg.ty).clone()))
+        })
+        .collect();
+
+    config
+        .greens
+        .iter()
+        .zip(config.green_type_tags.iter())
+        .filter_map(|(expr, tag)| {
+            let Expr::Path(path) = expr else {
+                return None;
+            };
+            let ident = path.path.get_ident()?.clone();
+            let name = ident.to_string();
+            if name == "pc" || name == "program" {
+                return None;
+            }
+            let ty = param_types.get(&name)?.clone();
+            let tag = tag.unwrap_or_else(|| {
+                panic!(
+                    "#[jit_interp] portal-parameter green `{name}` needs an explicit \
+                     `: int`, `: ref`, or `: float` tag so the generated JitCode can \
+                     assign its register bank (RPython derives this from the portal \
+                     graph's lltype)"
+                )
+            });
+            Some((ident, ty, tag))
+        })
+        .collect()
+}
+
 fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let fn_name = &func.sig.ident;
     let merge_fn_name = quote::format_ident!("__merge_{}", fn_name);
     let trace_fn_name = quote::format_ident!("__trace_{}", fn_name);
     let state_type = &config.state_type;
     let env_type = &config.env_type;
+    let portal_greens = portal_green_params(config, func);
+    let portal_green_names: Vec<_> = portal_greens.iter().map(|(name, _, _)| name).collect();
+    let portal_green_param_decls: Vec<_> = portal_greens
+        .iter()
+        .map(|(name, ty, _)| quote! { #name: #ty, })
+        .collect();
+    let portal_green_call_args: Vec<_> = portal_green_names
+        .iter()
+        .map(|name| quote! { #name, })
+        .collect();
     quote! {
         #[cold]
         #[inline(never)]
@@ -1943,6 +2006,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __driver: &mut majit_metainterp::JitDriver<#state_type>,
             __env: &#env_type,
             __pc: usize,
+            #(#portal_green_param_decls)*
         ) -> ::core::option::Option<(usize, ::std::vec::Vec<majit_metainterp::Value>)> {
             // Clone the dispatch JitCode Arc before the mutable
             // `merge_point` borrow so the closure can forward it to
@@ -2024,6 +2088,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                                 __sym,
                                 __env,
                                 __pc,
+                                #(#portal_green_call_args)*
                                 &__runtime,
                                 __dispatch_jitcode.as_ref(),
                             )
@@ -2552,9 +2617,14 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
 
     // Rewrite the function body, replacing marker macros
     let finish_return = finish_return_for(&sig.output);
+    let portal_green_args: Vec<Expr> = portal_green_params(config, func)
+        .into_iter()
+        .map(|(name, _, _)| syn::parse_quote!(#name))
+        .collect();
     let body = rewrite_body(
         &block,
         &merge_fn_name,
+        &portal_green_args,
         &config.greens,
         config.greens_declared,
         &config.green_type_tags,
@@ -2653,6 +2723,7 @@ impl FinishReturn {
 fn rewrite_body(
     block: &syn::Block,
     merge_fn_name: &Ident,
+    portal_green_args: &[Expr],
     default_greens: &[Expr],
     greens_declared: bool,
     default_green_type_tags: &[Option<green_type_tag::GreenTypeTag>],
@@ -2790,8 +2861,11 @@ fn rewrite_body(
                 }
             },
             Some(GreenTypeTag::Ref) => quote! {
-                ((#spec_expr) as *const _ as *const () as usize as i64,
-                 majit_ir::GreenType::Ref)
+                {
+                    let (__green_bits, _) =
+                        <_ as majit_ir::GreenAsI64>::__green_repr(#spec_expr);
+                    (__green_bits, majit_ir::GreenType::Ref)
+                }
             },
             // ABI: the i64 is the address of a `'static` slot holding
             // a `&'static str`.  `majit_ir::value::default_str_eq` /
@@ -2963,6 +3037,7 @@ fn rewrite_body(
 
     struct MarkerRewriter {
         merge_fn_name: Ident,
+        portal_green_args: Vec<Expr>,
         /// Whether this body's `jit_merge_point!` carries the `; state`
         /// single-executor close. `take_single_pass_finish` is set only by that
         /// machinery, so it is also what decides whether the back edge below
@@ -3001,6 +3076,7 @@ fn rewrite_body(
                     let driver = args.driver.unwrap_or_else(|| syn::parse_quote!(driver));
                     let env = args.env.unwrap_or_else(|| syn::parse_quote!(program));
                     let pc = args.pc.unwrap_or_else(|| syn::parse_quote!(pc));
+                    let portal_green_args = &self.portal_green_args;
                     // jit_merge_point!() in #[jit_interp] dispatch portals
                     // expands to a single merge_wrapper invocation.  The wrapper
                     // (generate_merge_wrapper) clones the dispatch JitCode Arc and calls
@@ -3025,7 +3101,12 @@ fn rewrite_body(
                         // `None` whenever the walk did not populate reds.
                         quote! {
                             if #driver.is_tracing() {
-                                let mut __mp_out = #merge_fn(&mut #driver, #env, #pc);
+                                let mut __mp_out = #merge_fn(
+                                    &mut #driver,
+                                    #env,
+                                    #pc,
+                                    #(#portal_green_args),*
+                                );
                                 // pyjitpl.py:2949
                                 // run_blackhole_interp_to_cancel_tracing: an
                                 // abort can stop mid-source-opcode, where the
@@ -3138,7 +3219,12 @@ fn rewrite_body(
                     } else {
                         quote! {
                             if #driver.is_tracing() {
-                                #merge_fn(&mut #driver, #env, #pc);
+                                #merge_fn(
+                                    &mut #driver,
+                                    #env,
+                                    #pc,
+                                    #(#portal_green_args),*
+                                );
                             }
                         }
                     };
@@ -3441,6 +3527,7 @@ fn rewrite_body(
 
     let mut rewriter = MarkerRewriter {
         merge_fn_name: merge_fn_name.clone(),
+        portal_green_args: portal_green_args.to_vec(),
         single_pass_close: scan.found,
         default_greens: default_greens.to_vec(),
         greens_declared,
