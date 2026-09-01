@@ -7913,6 +7913,21 @@ where
                     // writes the call result into the frame *before*
                     // vable_after_residual_call fires GUARD_NOT_FORCED
                     // (see legacy BC_CALL_MAY_FORCE_INT arm for rationale).
+                    // `pyjitpl.py execute_and_record_varargs` runs the call
+                    // through `executor.execute_varargs` and hands the result
+                    // to `history.record_nospec`, so the recorded op carries
+                    // the executed value on its own frontend slot -- every
+                    // later `getvalue()` of that box answers it.  Writing the
+                    // value into the destination register alone leaves
+                    // `concrete_of_opref` answering `None` for the box, and
+                    // the two readers then disagree: `_nonstandard_virtualizable`
+                    // asks the box, so a residual that returns the standard
+                    // virtualizable (the portal's `reload_top_root`) loses its
+                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
+                    // vable access on that register takes the nonstandard leg.
+                    // The full-body walker already stamps its own residual
+                    // results this way (`jitcode_dispatch/residual_call.rs`).
+                    ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
                     self.set_int_reg(dst, Some(traced), Some(concrete));
                     if is_forces
                         && matches!(
@@ -8188,6 +8203,24 @@ where
                         }
                         _ => traced,
                     };
+                    // `pyjitpl.py execute_and_record_varargs` runs the call
+                    // through `executor.execute_varargs` and hands the result
+                    // to `history.record_nospec`, so the recorded op carries
+                    // the executed value on its own frontend slot -- every
+                    // later `getvalue()` of that box answers it.  Writing the
+                    // value into the destination register alone leaves
+                    // `concrete_of_opref` answering `None` for the box, and
+                    // the two readers then disagree: `_nonstandard_virtualizable`
+                    // asks the box, so a residual that returns the standard
+                    // virtualizable (the portal's `reload_top_root`) loses its
+                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
+                    // vable access on that register takes the nonstandard leg.
+                    // The full-body walker already stamps its own residual
+                    // results this way (`jitcode_dispatch/residual_call.rs`).
+                    ctx.set_opref_concrete(
+                        traced,
+                        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                    );
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
                     if is_forces
                         && matches!(
@@ -8446,6 +8479,21 @@ where
                         }
                         _ => traced,
                     };
+                    // `pyjitpl.py execute_and_record_varargs` runs the call
+                    // through `executor.execute_varargs` and hands the result
+                    // to `history.record_nospec`, so the recorded op carries
+                    // the executed value on its own frontend slot -- every
+                    // later `getvalue()` of that box answers it.  Writing the
+                    // value into the destination register alone leaves
+                    // `concrete_of_opref` answering `None` for the box, and
+                    // the two readers then disagree: `_nonstandard_virtualizable`
+                    // asks the box, so a residual that returns the standard
+                    // virtualizable (the portal's `reload_top_root`) loses its
+                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
+                    // vable access on that register takes the nonstandard leg.
+                    // The full-body walker already stamps its own residual
+                    // results this way (`jitcode_dispatch/residual_call.rs`).
+                    ctx.set_opref_concrete(traced, majit_ir::Value::Float(concrete));
                     self.set_float_reg(dst, Some(traced), Some(concrete.to_bits() as i64));
                     if is_forces
                         && matches!(
