@@ -12,7 +12,7 @@
 #     so the handler was skipped.
 # A trace that raises from iteration 1 records the handler and never needs
 # the resume path; only warm-up-then-raise reaches it.
-N = 24000
+N = 48000
 
 
 def work(n):

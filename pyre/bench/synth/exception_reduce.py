@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=65
 # The ceiling is twice the slowest ratio observed (32.5x on the linux runner),
 # rounded up.
-N = 50000
+N = 100000
 
 
 def main():

@@ -71,7 +71,7 @@ const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 /// `TraceCtx::box_value` — composing the const pool, standard-
 /// virtualizable shadow, and the frontend object's `value` field in one
 /// call.  No separate side table.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CacheEntry {
     cache_anything: vecset::VecMap<OpRef, OpRef>,
     cache_seen_allocation: vecset::VecMap<OpRef, OpRef>,
@@ -325,6 +325,7 @@ impl FieldUpdater {
 ///
 /// Tracks field values, known classes, and allocation status during
 /// a single trace recording session.
+#[derive(Clone)]
 pub struct HeapCache {
     /// heapcache.py:172 `self.heap_cache = {}` — maps descrs to
     /// `CacheEntry`.  Field reads/writes for a given descr land in the

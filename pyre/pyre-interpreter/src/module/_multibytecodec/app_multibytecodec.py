@@ -8,7 +8,7 @@
 _OMITTED = object()
 
 
-def _codec_errors_arg(name, errors):
+def _codec_errors_arg(name, errors, _str_getitem=str.__getitem__, _whole=slice(None)):
     # The `errors: str(accept={str, NoneType})` the two `MultibyteCodec`
     # methods declare: `None` is the "strict" spelling.
     if errors is None:
@@ -18,10 +18,13 @@ def _codec_errors_arg(name, errors):
             f"{name}() argument 'errors' must be str or None, "
             f"not {type(errors).__name__}"
         )
-    return errors
+    # `text_or_none` is a gateway conversion in PyPy, so rebinding names in
+    # the app module cannot change it.  Capture the two builtin operands in
+    # defaults instead of resolving `str` or `slice` through mutable globals.
+    return _str_getitem(errors, _whole)
 
 
-def _errors_arg(name, position, errors):
+def _errors_arg(name, position, errors, _str_getitem=str.__getitem__, _whole=slice(None)):
     # The plain `s` the four initializers declare: only a str, and an omitted
     # one means "strict".
     if errors is _OMITTED:
@@ -30,7 +33,7 @@ def _errors_arg(name, position, errors):
         # `seterror` names `None` itself rather than its type.
         got = "None" if errors is None else type(errors).__name__
         raise TypeError(f"{name}() argument {position} must be str, not {got}")
-    return errors
+    return _str_getitem(errors, _whole)
 
 
 def _codec_of(obj):
@@ -41,6 +44,17 @@ def _codec_of(obj):
     if not isinstance(codec, MultibyteCodec):
         raise TypeError("codec is unexpected type")
     return codec
+
+
+def _bufferstr_bytes(object, _memoryview=memoryview):
+    # PyPy's `bufferstr_w` acquires one C-contiguous read-only byte view.  A
+    # multi-byte-element exporter is accepted and its consumed position is
+    # still measured in bytes, but a strided view must not be flattened into a
+    # different byte sequence by `memoryview.tobytes()`.
+    view = _memoryview(object)
+    if not view.c_contiguous:
+        raise BufferError("memoryview: underlying buffer is not C-contiguous")
+    return view.tobytes()
 
 
 class MultibyteCodec:
@@ -58,10 +72,14 @@ def _get_errors(self):
     return self._errors
 
 
-def _set_errors(self, value):
+def _set_errors(self, value, _str_getitem=str.__getitem__, _whole=slice(None)):
     if not isinstance(value, str):
         raise TypeError("errors must be a string")
-    self._errors = value
+    # PyPy `fset_errors` stores `space.text_w(w_errors)` and `fget_errors`
+    # mints a fresh text object, so a str subclass never becomes the stored
+    # observable value.  Call the base implementation directly to bypass a
+    # subclass's `__getitem__` override while normalizing it to exact `str`.
+    self._errors = _str_getitem(value, _whole)
 
 
 def _del_errors(self):
@@ -95,11 +113,15 @@ class MultibyteIncrementalDecoder:
         self.state = bytearray(_initial_state(self.codec.name, True))
 
     def decode(self, object, final=False):
-        data = self.pending + object
+        # PyPy `decode_w(object='bufferstr')` hands the RPython codec a byte
+        # string.  `consumed` is consequently a byte offset even when the
+        # caller supplied a multi-byte-element buffer such as array('H').
+        # Materialize before both dispatch and the pending suffix slice.
+        data = self.pending + _bufferstr_bytes(object)
         output, consumed = _decode_stateful(
             self.codec.name, data, self.errors, (final, self.state)
         )
-        self.pending = data[consumed:]
+        self.pending = memoryview(data)[consumed:].tobytes()
         return output
 
     def reset(self):
@@ -136,7 +158,7 @@ class MultibyteIncrementalDecoder:
             raise UnicodeDecodeError(
                 self.codec.name, buffer, 0, len(buffer), "pending buffer too large"
             )
-        codec_state = flag.to_bytes(8, "little")
+        codec_state = int.to_bytes(flag, 8, "little")
         self.pending = buffer
         self.state = bytearray(codec_state)
 
@@ -189,7 +211,7 @@ class MultibyteIncrementalEncoder:
             raise TypeError(
                 f"setstate() argument must be int, not {type(state).__name__}"
             )
-        buffer = state.to_bytes(17, "little")
+        buffer = int.to_bytes(state, 17, "little")
         pending_len = buffer[0]
         if pending_len > 8:
             raise UnicodeError("pending buffer too large")

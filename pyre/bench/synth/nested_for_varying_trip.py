@@ -4,7 +4,7 @@
 # compiled exhaustion guard resumes in the interpreter. The exact
 # aggregate makes corruption of either iterator or the accumulator
 # visible in the output.
-N = 5000
+N = 10000
 
 
 def main():

@@ -39,6 +39,21 @@ fresh.value = 42
 assert fresh.value == 42
 assert vars(fresh)["value"] == 42
 
+
+class InitializingFlag:
+    def __bool__(self):
+        raise RuntimeError("initializing truth test")
+
+
+fresh.__spec__ = types.SimpleNamespace(_initializing=InitializingFlag())
+fresh.__annotate__ = lambda _format: {"value": int}
+try:
+    fresh.__annotations__
+except RuntimeError as exc:
+    assert str(exc) == "initializing truth test"
+else:
+    raise AssertionError("module annotations suppressed _initializing failure")
+
 # A module cannot be pickled at any protocol.
 for proto in range(0, pickle.HIGHEST_PROTOCOL + 1):
     try:

@@ -997,7 +997,20 @@ impl OptVirtualize {
                 && let Some(class_val) = vinfo.known_class.filter(|&c| c != 0)
             {
                 let b = ctx.materialize_operand_at(op.pos.get());
-                ctx.make_constant_box(&b, majit_ir::Value::Int(class_val));
+                // PyPy's `handle_getfield_typeptr` removes this load before
+                // optimization and carries the vtable as a `ConstInt`.  Pyre's
+                // object model can still expose the header as GETFIELD_GC_R;
+                // preserve that operation's Ref result type rather than
+                // forwarding a ConstInt into a Ref box.  The integer spelling
+                // remains for the orthodox GETFIELD_GC_I form.
+                let class_const = match op.result_type() {
+                    majit_ir::Type::Ref => {
+                        majit_ir::Value::Ref(majit_ir::GcRef(class_val as usize))
+                    }
+                    majit_ir::Type::Int => majit_ir::Value::Int(class_val),
+                    other => unreachable!("typeptr getfield must return Int or Ref, got {other:?}"),
+                };
+                ctx.make_constant_box(&b, class_const);
                 return OptimizationResult::Remove;
             }
             // Pyre object-model: `w_class` (PyObject offset 8) is a header
@@ -2617,12 +2630,14 @@ fn field_slot_disagreement(
     };
     if !slot_holds_field(slot.as_ref(), field) {
         return Some(format!(
-            "field {:?} at offset {} claims slot {field_idx} of descr index {}, but that \
-             slot holds {:?} at offset {}",
+            "field {:?} (key {:?}) at offset {} claims slot {field_idx} of descr index {}, but \
+             that slot holds {:?} (key {:?}) at offset {}",
             field.field_name(),
+            field.field_key(),
             field.offset(),
             descr.index(),
             slot.field_name(),
+            slot.field_key(),
             slot.offset(),
         ));
     }
@@ -4740,6 +4755,50 @@ mod tests {
             result.iter().any(|op| op.opcode == OpCode::GetfieldGcR),
             "a zero-vtable ob_type read must remain instead of folding to null: {:?}",
             result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ob_type_read_from_virtual_keeps_constptr_type_through_pure_fold() {
+        // `handle_getfield_typeptr` makes the upstream spelling Int-valued,
+        // but pyre's object header is read by GETFIELD_GC_R.  Folding its
+        // known class to ConstInt cross-types the following PTR_EQ and makes
+        // executor.py's ref/ref helper unreachable.
+        let sd: DescrRef = majit_ir::make_size_descr_with_vtable(1, 8, 0, 0xCAFE);
+        let typeptr_descr: DescrRef = Arc::new(majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "PyObject.ob_type".to_string(),
+            "ob_type".to_string(),
+        ));
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd),
+            Op::with_descr(
+                OpCode::GetfieldGcR,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Ref,
+                    0,
+                )],
+                typeptr_descr,
+            ),
+            Op::new(
+                OpCode::PtrEq,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 1),
+                    Operand::const_from_value(Value::Ref(majit_ir::GcRef(0xCAFE))),
+                ],
+            ),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_default_pipeline(&ops);
+        assert!(
+            result.iter().all(|op| op.opcode != OpCode::PtrEq),
+            "ConstPtr(vtable) == ConstPtr(vtable) must fold: {result:?}"
         );
     }
 

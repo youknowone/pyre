@@ -306,6 +306,15 @@ pub enum CallTarget {
         /// [`sum_variant_ctor`]: crate::codewriter::jtransform
         #[serde(default)]
         is_struct: bool,
+        /// The variant's declaration index (Charon `AggregateKind::Adt`
+        /// `variant_idx`), recorded where the frontend resolved a
+        /// `TypeDeclKind::Enum` variant.  A payload-less variant folded
+        /// to a prebuilt singleton carries its discriminant from here to
+        /// runtime materialization
+        /// (`JitCodeBody::unit_variant_consts`).  `None` for struct
+        /// ctors, positional aggregates, and hand-built targets.
+        #[serde(default)]
+        variant_tag: Option<i64>,
     },
     /// RPython: `indirect_call` opname. Receiver's static type is a
     /// `dyn Trait` (Rust fat pointer); at JIT time the actual callee
@@ -370,6 +379,7 @@ impl CallTarget {
             name: name.into(),
             owner_path: Vec::new(),
             is_struct: false,
+            variant_tag: None,
         }
     }
 
@@ -385,6 +395,26 @@ impl CallTarget {
             name: name.into(),
             owner_path,
             is_struct: false,
+            variant_tag: None,
+        }
+    }
+
+    /// [`synthetic_transparent_ctor_with_owner`] for a resolved enum
+    /// variant, carrying the variant's declaration index so a
+    /// payload-less variant folded to a prebuilt singleton keeps its
+    /// discriminant value.
+    ///
+    /// [`synthetic_transparent_ctor_with_owner`]: Self::synthetic_transparent_ctor_with_owner
+    pub fn synthetic_transparent_enum_variant_ctor(
+        owner_path: Vec<String>,
+        name: impl Into<String>,
+        variant_tag: i64,
+    ) -> Self {
+        Self::SyntheticTransparentCtor {
+            name: name.into(),
+            owner_path,
+            is_struct: false,
+            variant_tag: Some(variant_tag),
         }
     }
 
@@ -404,6 +434,7 @@ impl CallTarget {
             name: name.into(),
             owner_path,
             is_struct: true,
+            variant_tag: None,
         }
     }
 
@@ -1058,6 +1089,12 @@ pub enum OpKind {
         funcptr: crate::flowspace::model::Variable,
         args: Vec<crate::flowspace::model::Variable>,
         graphs: Option<Vec<crate::parse::CallPath>>,
+        /// Pre-rtyping identity of a Rust dyn-trait vtable slot.  The MIR
+        /// frontend preserves the actual `Field[Adt(vtable), slot]` as
+        /// `funcptr`; `rpbc::lower_indirect_calls` consumes this key to fill
+        /// the same `c_graphs` family as `FunctionReprBase.call`, then clears
+        /// it.  Ordinary stored function pointers have no such key.
+        family_key: Option<(String, String)>,
         result_ty: ValueType,
     },
     /// Virtualizable field read → reads from boxes, no heap op.
@@ -8289,6 +8326,64 @@ mod tests {
             vec![("item".to_string(), ValueType::Int)],
         )]);
         assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 0);
+    }
+
+    /// `registered_struct_layout` resolves a spelling that is not a key by
+    /// asking the StructId registry — the arm every synthetic fixture in this
+    /// file skips by publishing the exact ctor spelling. It may only answer
+    /// when every key sharing the id carries the same rows, so a registry that
+    /// maps two spellings with different layouts onto one id declines instead
+    /// of returning whichever the iteration reached first.
+    #[test]
+    fn registered_struct_layout_resolves_and_declines_across_owner_spellings() {
+        use crate::test_support::register_struct_ids_serialized;
+
+        let full = "model_registered_layout_test::Owner";
+        let relative = "registered_layout_test::Owner";
+        let alias = "model_registered_layout_test::OwnerAlias";
+        let other = "model_registered_layout_test::Other";
+        let owner_id = majit_ir::descr::StructId::from_canonical(full);
+        let other_id = majit_ir::descr::StructId::from_canonical(other);
+        // One registration for the whole test: the guard is not reentrant, and
+        // the differing-rows case varies the `attrs` argument, not the table.
+        let _registry = register_struct_ids_serialized(std::collections::HashMap::from([
+            (full.to_string(), Some(owner_id)),
+            (relative.to_string(), Some(owner_id)),
+            (alias.to_string(), Some(owner_id)),
+            (other.to_string(), Some(other_id)),
+        ]));
+
+        let rows = || {
+            vec![
+                ("ob_header".to_string(), ValueType::Ref(None)),
+                ("intval".to_string(), ValueType::Int),
+            ]
+        };
+
+        // Only the crate-relative spelling is a key; the full one reaches the
+        // same rows through the id.
+        let attrs = std::collections::HashMap::from([(relative.to_string(), rows())]);
+        assert_eq!(registered_struct_layout(full, &attrs), Some(&rows()));
+        assert_eq!(registered_struct_layout(relative, &attrs), Some(&rows()));
+
+        // An owner the registry knows, but whose id no key shares.
+        assert_eq!(registered_struct_layout(other, &attrs), None);
+
+        // An owner no registry entry names at all.
+        assert_eq!(
+            registered_struct_layout("unregistered::Owner", &attrs),
+            None
+        );
+
+        // Two keys, one id, disagreeing rows: the answer is not a coin flip.
+        let ambiguous = std::collections::HashMap::from([
+            (relative.to_string(), rows()),
+            (
+                alias.to_string(),
+                vec![("ob_header".to_string(), ValueType::Ref(None))],
+            ),
+        ]);
+        assert_eq!(registered_struct_layout(full, &ambiguous), None);
     }
 
     /// The four numeric boxing structs' complete field layouts. Synthetic

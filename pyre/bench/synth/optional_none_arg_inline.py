@@ -19,7 +19,7 @@
 # `clamp` is called once more off the hot path so the printed total depends on
 # the arm the trace guards away as well as the one it keeps: an identity test
 # answered the wrong way changes the sum rather than the timing.
-N = 200000
+N = 400000
 
 
 def clamp(v, lo=None):

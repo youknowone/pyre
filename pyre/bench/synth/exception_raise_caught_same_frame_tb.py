@@ -17,7 +17,7 @@
 # `reraise` covers the bare-`raise` spelling, which must preserve the node the
 # original raise attached rather than adding one of its own, and the callee
 # case pins the two-frame chain the same run has to keep producing.
-N = 4000
+N = 8000
 
 
 def chain(traceback):

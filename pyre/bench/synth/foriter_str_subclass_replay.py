@@ -3,7 +3,7 @@
 # visible state.  The trailing opaque `id` call makes the first inline walk
 # abort; treating the subclass as exact replays that override once (N + 1).
 
-N = 5000
+N = 10000
 hits = [0]
 
 

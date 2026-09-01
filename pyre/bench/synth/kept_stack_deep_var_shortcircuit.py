@@ -14,7 +14,7 @@
 # mutation.  The `log` length must equal 3x the iteration count exactly (g, h,
 # and one conditional g/h append per iteration): a doubled delivery
 # over-counts, a dropped iteration under-counts.
-N = 40000
+N = 80000
 log = []
 
 

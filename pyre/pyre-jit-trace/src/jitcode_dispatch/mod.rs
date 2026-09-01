@@ -588,10 +588,6 @@ pub struct WalkSession {
     pub recording_jitcode_index: i32,
     /// Last opcode executed by the root recording frame.
     pub recording_opcode_position: usize,
-    /// Nested `run_sub_jitcode_walk` activations currently on the host stack.
-    /// Bounded by [`fbw_max_subwalk_depth`]; see that function for why the
-    /// walker needs a bound RPython's heap-allocated framestack does not.
-    pub subwalk_depth: usize,
     /// How many `BINARY_OP` / `COMPARE_OP` dunder inlines admitted on the
     /// entry's rewind are currently descending.
     ///
@@ -629,7 +625,6 @@ impl Default for WalkSession {
             recording_frame_ptr: 0,
             recording_jitcode_index: -1,
             recording_opcode_position: 0,
-            subwalk_depth: 0,
             binop_rewind_depth: 0,
             binop_rewind_refused: false,
         }
@@ -1143,34 +1138,20 @@ fn finish_current_frame_execution<Sym: WalkSym>(
         return;
     }
     if !ctx.is_top_level && (concrete_frame.is_null() || unsafe { !(*concrete_frame).escaped() }) {
-        // RPython records this store on a virtual MIFrame and
+        // RPython records `PyFrame.finish_value` on a virtual MIFrame and
         // optimizeopt.virtualize removes the whole frame when it never
-        // escapes.  The walker has already selected the concrete path and can
-        // make the same distinction before recording: an unescaped inline
-        // frame has no observer after return.  Escaped inline frames and the
-        // portal red frame keep the real store below.
+        // escapes.  The recording-time carrier likewise has no observer.
         return;
     }
 
-    let flags_descr = crate::descr::pyframe_flags_descr();
-    let live_flags = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, frame, flags_descr.clone());
-    let finished_bit = ctx
-        .trace_ctx
-        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED));
-    let new_flags = ctx
-        .trace_ctx
-        .record_op(OpCode::IntOr, &[live_flags, finished_bit]);
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[frame, new_flags],
-        flags_descr.clone(),
-    );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(frame, flags_descr.index(), new_flags);
-
-    if !concrete_frame.is_null() {
-        unsafe { (*concrete_frame).set_frame_finished_execution(true) };
-    }
+    // `PyFrame.finish_value`'s translated graph has already emitted the
+    // read/or/store on this callee's red frame before the return opcode.  Now
+    // that the inline sub-walk threads that frame, recording another store
+    // here duplicates the interpreter graph and can read the graph's
+    // post-store heapcache value against a still-pre-store concrete carrier.
+    // `execute_and_record` would have applied the graph store while tracing;
+    // mirror only that recording-time side effect here.
+    unsafe { (*concrete_frame).set_frame_finished_execution(true) };
 }
 
 fn recording_raise_keeps_existing_traceback<Sym: WalkSym>(
@@ -1564,6 +1545,31 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// specialization census prove that every captured callee guard was
     /// actually stamped.
     pub instance_next_foriter_census_active: bool,
+    /// Set for the sub-walk that resumes a suspended generator body in place of
+    /// the `jit_next` residual a `FOR_ITER` over it would otherwise leave.
+    /// `None` for every other walk, which is what keeps the yield interception
+    /// and the durable-frame journal off every path but this one.
+    pub generator_resume: Option<GeneratorResumeSubwalk>,
+}
+
+/// The suspended generator a resume sub-walk is running on.
+///
+/// Two coordinates and one address, all fixed before the walk starts: the
+/// frame the body executes on, the marker the body's single `yield` lowered
+/// to, and the Python pc that marker stands at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GeneratorResumeSubwalk {
+    /// The suspended `PyFrame` — `gen.frame`, the frame the generator will be
+    /// resumed from again after this yield.  Durable, so every walk-time write
+    /// to it is journalled (`fbw_arm_durable_frame_undo`).
+    pub frame: usize,
+    /// JitCode offset of the `abort_permanent` the body's `yield` lowered to.
+    /// Exact rather than "any `abort_permanent`": a body can carry markers for
+    /// unported opcodes too, and those still abort.
+    pub yield_marker_jit_pc: usize,
+    /// Python pc of that `yield`.  The coordinate the frame is left suspended
+    /// at, so the next resume continues after it.
+    pub yield_py_pc: u32,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -1611,6 +1617,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             bridge_entry_merge_pc: None,
             instance_next_foriter_green_key: None,
             instance_next_foriter_census_active: false,
+            generator_resume: None,
         }
     }
 }
@@ -2393,11 +2400,11 @@ pub enum DispatchError {
         provided: usize,
         callee_num_regs_f: usize,
     },
-    /// A canonical-helper descent would have pushed a `walk()` activation past
-    /// [`fbw_max_subwalk_depth`]. Refused before the callee's register banks
-    /// are allocated and before any of its body runs, so the enclosing frame
-    /// resumes at its own CALL with nothing to undo.
-    SubWalkDepthExceeded { pc: usize, depth: usize },
+    /// Internal yield from one heap-owned sub-walk frame to the explicit
+    /// sub-walk driver.  It is consumed before ordinary abort handling and can
+    /// never escape [`run_sub_jitcode_walk`].  RPython's `_interpret` gets the
+    /// same transition by changing `framestack[-1]` in its single driver loop.
+    SubWalkSuspended { pc: usize },
     /// `inline_call_r_r/dR>r`'s callee surfaced
     /// `SubReturn { result: None }`. RPython parity: the `_r_r` variant
     /// is wired (in `assembler.py:gen_inline_call`) to a callee whose
@@ -2853,7 +2860,7 @@ impl DispatchError {
             Self::InlineCallArityMismatch { .. } => "InlineCallArityMismatch",
             Self::InlineCallIntArityMismatch { .. } => "InlineCallIntArityMismatch",
             Self::InlineCallFloatArityMismatch { .. } => "InlineCallFloatArityMismatch",
-            Self::SubWalkDepthExceeded { .. } => "SubWalkDepthExceeded",
+            Self::SubWalkSuspended { .. } => "SubWalkSuspended",
             Self::UnexpectedVoidSubReturn { .. } => "UnexpectedVoidSubReturn",
             Self::UnexpectedNonVoidSubReturn { .. } => "UnexpectedNonVoidSubReturn",
             Self::ReraiseWithoutLastExcValue { .. } => "ReraiseWithoutLastExcValue",
@@ -2942,7 +2949,7 @@ impl DispatchError {
             | Self::InlineCallArityMismatch { pc, .. }
             | Self::InlineCallIntArityMismatch { pc, .. }
             | Self::InlineCallFloatArityMismatch { pc, .. }
-            | Self::SubWalkDepthExceeded { pc, .. }
+            | Self::SubWalkSuspended { pc, .. }
             | Self::UnexpectedVoidSubReturn { pc, .. }
             | Self::UnexpectedNonVoidSubReturn { pc, .. }
             | Self::ReraiseWithoutLastExcValue { pc, .. }
@@ -3022,7 +3029,6 @@ impl DispatchError {
                 | Self::InlineCallArityMismatch { .. }
                 | Self::InlineCallIntArityMismatch { .. }
                 | Self::InlineCallFloatArityMismatch { .. }
-                | Self::SubWalkDepthExceeded { .. }
                 | Self::LoopBearingCalleeInlineUnsupported {
                     blackhole_required: true,
                     ..
@@ -3497,8 +3503,18 @@ pub fn walk<Sym: WalkSym>(
             let callee = fbw_state::fbw_innermost_inline_callee_key(ctx);
             return Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee));
         }
+        inline_call::note_subwalk_driver_step::<Sym>(
+            ctx.trace_ctx.get_trace_position(),
+            ctx.trace_ctx.heap_cache(),
+        );
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => stepped,
+            // Not an abort: a nested inline_call asked the heap-owned
+            // sub-walk driver to push its callee.  Preserve this frame at the
+            // CALL coordinate and let the driver resume it after the callee
+            // produces SubReturn/SubRaise, matching PyPy's one `_interpret`
+            // loop over `metainterp.framestack`.
+            Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
             Err(error) => {
                 // `pyjitpl.py run_blackhole_interp_to_cancel_tracing`
                 // parity.  Upstream has ONE abort path: every abort inside
@@ -9755,13 +9771,21 @@ fn walker_numeric_builtin_class(obj: pyre_object::PyObjectRef) -> pyre_object::P
 }
 
 /// Walker-native mirror of the trait `trace_guard_exact_w_class`
-/// (`trace_opcode.rs`): emit `getfield_gc_r(w_class)` → `ptr_eq(expected)`
-/// → `guard_true` so the spec_ii fast path only stays live for an element
-/// whose Python-level `w_class` is the canonical type object — a later
+/// (`trace_opcode.rs`): emit `getfield_gc_r(w_class)` →
+/// `guard_value(expected)` so the spec_ii fast path only stays live for an
+/// element whose Python-level `w_class` is the canonical type object — a later
 /// subclass sharing the payload `ob_type` side-exits rather than being
 /// silently rewrapped as a plain int.  Skipped for an unescaped element (a
 /// fresh `wrapint` box is provably plain, and reading its `w_class` would
 /// force the box OptVirtualize removes).
+///
+/// Spelled `guard_value` rather than `ptr_eq` + `guard_true` because only
+/// `guard_value` teaches the optimizer the equality: `rewrite.py
+/// postprocess_GUARD_VALUE` runs `make_constant(arg0, arg1)`, so the read
+/// becomes a constant and exports LEVEL_CONSTANT at the loop jump instead of
+/// being carried as a label argument.  `optimize_GUARD_TRUE` learns nothing
+/// about the box inside a `ptr_eq`, which leaves a loop-invariant class word
+/// to be re-read and re-compared once per iteration.
 fn walker_guard_exact_w_class<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9790,8 +9814,12 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     let actual =
         crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
     let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
-    let eq = ctx.trace_ctx.record_op(OpCode::PtrEq, &[actual, expected]);
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[eq])
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[actual, expected])?;
+    // `implement_guard_value`'s second half (`pyjitpl.py:1915-1928`): the guard
+    // has proved the read equals the constant, so the heapcache serves the
+    // constant to every later reader of the same box.
+    ctx.trace_ctx.heap_cache_mut().replace_box(actual, expected);
+    Ok(())
 }
 
 /// Global descr-pool sub-jitcode lookup (resolves a global jitcode index
@@ -11499,6 +11527,16 @@ fn handle<Sym: WalkSym>(
             Err(DispatchError::AbortMarkerReached { pc: op.pc })
         }
         "abort_permanent/" => {
+            // A generator-resume sub-walk arriving at the marker its own
+            // `yield` lowered to is not aborting: that marker is the
+            // suspension, and the value it suspends with is the FOR_ITER item
+            // the resume was walked for.
+            if let Some(item) = generator_resume_yield(ctx, op.pc)? {
+                return Ok((
+                    DispatchOutcome::SubReturn { result: Some(item) },
+                    op.next_pc,
+                ));
+            }
             // pyre-only `BC_ABORT_PERMANENT` fail-path
             // (`bhimpl_abort_permanent`, `blackhole.rs`): emitted for
             // paths that must always terminate the frame (BigInt-overflow

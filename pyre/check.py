@@ -5331,24 +5331,30 @@ def main():
         # parity, and macos dynasm reads 0.9x.  Run 33300212586 measured dynasm
         # 0.9-1.7x and cranelift 1.4-2.1x across the three hosts, so both are
         # re-recorded at twice the slowest.  The cpython gates are untouched.
-        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       3.4,     2,       4.2)
+        # Runs 33359421283 and 33359651351 (floor divisor 6) then read ubuntu
+        # cranelift at 0.56x-0.62x, through the 0.7x floor the 4.2 ceiling
+        # derives; pypy's own fib execution moved 0.31s-0.85s between the two
+        # ubuntu jobs of one run.  The cranelift ceiling moves between the
+        # bounds instead of twice the slowest: floor 0.42x under the 0.56x
+        # reading, 1.7x over the 1.47x macos reading.
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       3.4,     2,       2.5)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
-        # spectral_norm's hosts spread 0.5x-4.3x against pypy: pypy runs it in
-        # 0.13s on the linux and macos runners and 0.39s on the windows one, so
-        # pyre reads faster than pypy there. This is the bench that sets the
-        # floor divisor's lower bound among the non-synthetic ones.
+        # Run 33363045302 measured spectral_norm at 0.4-1.4x on the healthy
+        # pypy baselines; windows' clamped baseline displayed an indicative
+        # 2.0x.  A 2.3 ceiling covers that reading with 15% headroom while its
+        # 0.383x derived floor remains below ubuntu dynasm's exact 0.436x.
         #
         # Neither carries a cpython gate, and an absent gate is what stops
         # cpython being spawned for the row at all. On the ubuntu runner
         # cpython takes 11.38s against the slowest backend's 0.45s here and
         # 4.42s against 0.85s on nbody, so the gates they used to carry (1x,
-        # and 0.5x/1x) sat 25x and 3x inside their margin while the 5x pypy
-        # gate beside them reads 1.6x-2.6x: pypy trips on the smaller
+        # and 0.5x/1x) sat 25x and 3x inside their margin while the pypy gate
+        # beside them reads 0.4x-1.4x: pypy trips on the smaller
         # regression of the two in both rows. Those two spawns were three
         # quarters of every cpython second this file spends outside the
         # synthetic suite.
-        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       None,    5,       None,    5)
+        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       None,    2.3,     None,    2.3)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       None,    5,       None,    5,    wasm_float_tol=True)
         # fannkuch is almost nothing but cross-loop JUMP, which the two
         # backends pay differently: cranelift's closing_jump carries a LABEL's

@@ -21,7 +21,7 @@
 # live below the value being computed.
 import sys
 
-N = 30000
+N = 60000
 
 
 def run():

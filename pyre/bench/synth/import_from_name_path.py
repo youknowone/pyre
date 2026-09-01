@@ -11,7 +11,7 @@
 # path is install-dependent, so only its basename is checked.  `keyword` is a
 # pure-Python stdlib module importable on every backend (including wasm, which
 # has no `os`/`posix`).  Output verified against CPython/PyPy.
-N = 4000
+N = 8000
 
 
 def main():

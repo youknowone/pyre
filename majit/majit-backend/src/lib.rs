@@ -1186,6 +1186,20 @@ pub struct JitCellToken {
     /// When set to `true`, any `GUARD_NOT_INVALIDATED` in the compiled
     /// code will fail, causing execution to bail out to the interpreter.
     pub invalidated: Arc<AtomicBool>,
+    /// Set once a backend has established that it cannot emit a
+    /// CALL_ASSEMBLER entering this token, so the tracer records the ordinary
+    /// recursive call instead of an operation the backend must refuse.
+    ///
+    /// The wasm backend is the one that sets it: when a callee guard's bridge
+    /// is structurally undeployable, that callee cannot reach compiled steady
+    /// state through a CALL_ASSEMBLER, and every trace carrying the edge is
+    /// declined whole. Declining the EDGE at trace time costs the inline; not
+    /// declining it costs the whole trace, and then the guard that would have
+    /// bridged blackholes for the rest of the run.
+    ///
+    /// A recompile mints a fresh token, so the refusal never outlives the
+    /// compiled loop that earned it.
+    call_assembler_refused: AtomicBool,
     /// Invalidation flags minted for bridges attached to this token. Each
     /// bridge's `GUARD_NOT_INVALIDATED` reads its own generation's flag, so a
     /// bridge compiled after an invalidation starts valid and only a later
@@ -1397,6 +1411,7 @@ impl JitCellToken {
                 bridge_flags: bridge_invalidation_flags.clone(),
             }),
             invalidated,
+            call_assembler_refused: AtomicBool::new(false),
             bridge_invalidation_flags,
             version_info: None,
             keepalive_tokens: parking_lot::Mutex::new(Vec::new()),
@@ -1514,6 +1529,17 @@ impl JitCellToken {
     /// Check whether this loop has been invalidated.
     pub fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
+    }
+
+    /// Record that a CALL_ASSEMBLER entering this token cannot be compiled.
+    /// See [`Self::call_assembler_refused`].
+    pub fn refuse_call_assembler(&self) {
+        self.call_assembler_refused.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Self::refuse_call_assembler`] has been called for this token.
+    pub fn call_assembler_refused(&self) -> bool {
+        self.call_assembler_refused.load(Ordering::Acquire)
     }
 
     /// model.py: has_compiled_code()

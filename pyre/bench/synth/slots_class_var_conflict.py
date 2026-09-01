@@ -2,7 +2,7 @@
 # A `__slots__` entry naming a class variable raises ValueError at class
 # creation, while a duplicate `__slots__` entry is silently ignored.
 # Output verified against CPython/PyPy.
-N = 5000
+N = 10000
 
 
 def make_conflict():

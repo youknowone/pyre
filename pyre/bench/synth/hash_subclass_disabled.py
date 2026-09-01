@@ -2,7 +2,7 @@
 # A tuple/frozenset subclass that sets __hash__ = None is unhashable: hash()
 # and set insertion both raise TypeError instead of the structural fast path
 # hashing by contents. Output verified against CPython/PyPy.
-N = 20000
+N = 40000
 
 
 class T(tuple):

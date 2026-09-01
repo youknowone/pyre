@@ -12,7 +12,7 @@
 # at stock thresholds.
 #
 # `grab` is what makes the cell a real closure cell rather than a plain local.
-N = 20000
+N = 40000
 
 log = []
 

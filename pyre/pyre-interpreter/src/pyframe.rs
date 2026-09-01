@@ -3070,7 +3070,14 @@ impl PyFrame {
     /// pyframe.py getdebug → self.debugdata
     #[inline]
     fn getdebug_data(&self) -> Option<&FrameDebugData> {
-        (!self.debugdata.is_null()).then(|| unsafe { &*self.debugdata })
+        // Spelled without a closure: a closure aggregate lowers to a
+        // synthetic ctor call the walker cannot bind, and upstream's
+        // `getdebug` is a plain None-checked field read.
+        if self.debugdata.is_null() {
+            None
+        } else {
+            Some(unsafe { &*self.debugdata })
+        }
     }
 
     /// pyframe.py getorcreatedebug
@@ -3181,16 +3188,22 @@ impl PyFrame {
     /// pyframe.py get_w_f_trace
     #[inline]
     pub fn get_w_f_trace(&self) -> PyObjectRef {
-        self.getdebug_data()
-            .and_then(|data| (!data.w_f_trace.is_null()).then_some(data.w_f_trace))
-            .unwrap_or(pyre_object::PY_NULL)
+        // Closure-free for the walker; upstream reads `debugdata.w_f_trace`
+        // behind two None checks.
+        match self.getdebug_data() {
+            Some(data) if !data.w_f_trace.is_null() => data.w_f_trace,
+            _ => pyre_object::PY_NULL,
+        }
     }
 
     /// pyframe.py get_is_being_profiled
     #[inline]
     pub fn get_is_being_profiled(&self) -> bool {
-        self.getdebug_data()
-            .is_some_and(|data| data.is_being_profiled)
+        // Closure-free for the walker (see `getdebug_data`).
+        match self.getdebug_data() {
+            Some(data) => data.is_being_profiled,
+            None => false,
+        }
     }
 
     /// `getorcreatedebug().w_locals` — the STORE_NAME / DELETE_NAME target
@@ -3646,15 +3659,12 @@ impl PyFrame {
         w_globals: PyObjectRef,
     ) -> Result<FrameBox, crate::PyError> {
         // Root the globals across the code/object allocations and the frame
-        // construction; `createframe_obj` stores `w_globals` into the frame
-        // (and `w_code_set_w_globals` into the code), both of which root it
-        // once they return.
+        // construction; `createframe_obj` publishes `w_globals` to the code
+        // on its first use, or stores a later distinct dictionary on the
+        // frame's debug data, and both locations root it once they return.
         let _root = pyre_object::gc_roots::push_roots();
         let w_globals = pyre_object::gc_roots::pin_root(w_globals);
         let w_code = crate::box_code_object(code);
-        unsafe {
-            crate::w_code_set_w_globals(w_code, w_globals);
-        }
         let ctx_ptr = Rc::into_raw(execution_context);
         crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
     }
@@ -3672,13 +3682,13 @@ impl PyFrame {
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = _roots.publish(&[w_code, w_globals]);
         _roots.normalize(root_base, 2);
-        let w_code = _roots.get(root_base);
-        let w_globals = _roots.get(root_base + 1);
-        unsafe {
-            crate::w_code_set_w_globals(w_code, w_globals);
-        }
         let ctx_ptr = Rc::into_raw(execution_context);
-        crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
+        crate::createframe_obj(
+            _roots.get(root_base) as *const (),
+            _roots.get(root_base + 1),
+            ctx_ptr,
+            None,
+        )
     }
 
     /// RPython MetaInterp traces against its own MIFrame stack instead of

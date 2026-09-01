@@ -1,8 +1,11 @@
 //! PyPy `_multibytecodec`, with its cjkcodecs engines ported to Rust.
-
-mod cjkcodecs;
+//!
+//! The Python/GC adapter stays here; the pure state machines and mapping
+//! tables live in `rustpython_common::encodings::cjk`, outside Charon/LLBC
+//! extraction and reusable by either interpreter.
 
 use pyre_object::*;
+use rustpython_common::encodings::cjk as cjkcodecs;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
 fn codec_supported(name: &str) -> bool {
@@ -381,10 +384,10 @@ fn codec_input_bytes(w_input: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
 fn raw_encode(args: &[PyObjectRef]) -> crate::PyResult {
     let roots = pyre_object::gc_roots::push_roots();
     let base = publish_codec_args(&roots, args, "_encode")?;
-    let name = crate::baseobjspace::text_w(roots.get(base))?;
-    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?.to_owned();
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?.to_owned();
     let final_input = crate::baseobjspace::is_true(roots.get(base + 3))?;
-    let (output, consumed) = encode_impl(name, roots.get(base + 1), errors, final_input)?;
+    let (output, consumed) = encode_impl(&name, roots.get(base + 1), &errors, final_input)?;
     Ok(w_tuple_new(vec![
         pyre_object::bytesobject::w_bytes_from_bytes(&output),
         w_int_new(consumed as i64),
@@ -423,13 +426,13 @@ fn codec_call_control(
 fn raw_encode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
     let roots = pyre_object::gc_roots::push_roots();
     let base = publish_codec_args(&roots, args, "_encode_stateful")?;
-    let name = crate::baseobjspace::text_w(roots.get(base))?;
-    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?.to_owned();
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?.to_owned();
     let (final_input, state, w_state) = codec_call_control(roots.get(base + 3))?;
     let (output, consumed, _) = encode_impl_with_state(
-        name,
+        &name,
         roots.get(base + 1),
-        errors,
+        &errors,
         final_input,
         Some(&state),
         Some(w_state),
@@ -443,11 +446,11 @@ fn raw_encode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
 fn raw_decode(args: &[PyObjectRef]) -> crate::PyResult {
     let roots = pyre_object::gc_roots::push_roots();
     let base = publish_codec_args(&roots, args, "_decode")?;
-    let name = crate::baseobjspace::text_w(roots.get(base))?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?.to_owned();
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?.to_owned();
     let input = codec_input_bytes(roots.get(base + 1))?;
-    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
     let final_input = crate::baseobjspace::is_true(roots.get(base + 3))?;
-    let (output, consumed) = decode_impl(name, &input, errors, final_input)?;
+    let (output, consumed) = decode_impl(&name, &input, &errors, final_input)?;
     Ok(w_tuple_new(vec![
         pyre_object::unicodeobject::w_str_from_wtf8_managed(output),
         w_int_new(consumed as i64),
@@ -457,14 +460,14 @@ fn raw_decode(args: &[PyObjectRef]) -> crate::PyResult {
 fn raw_decode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
     let roots = pyre_object::gc_roots::push_roots();
     let base = publish_codec_args(&roots, args, "_decode_stateful")?;
-    let name = crate::baseobjspace::text_w(roots.get(base))?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?.to_owned();
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?.to_owned();
     let input = codec_input_bytes(roots.get(base + 1))?;
-    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
     let (final_input, state, w_state) = codec_call_control(roots.get(base + 3))?;
     let (output, consumed, _) = decode_impl_with_state(
-        name,
+        &name,
         &input,
-        errors,
+        &errors,
         final_input,
         Some(&state),
         Some(w_state),

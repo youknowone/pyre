@@ -32,7 +32,7 @@ pub mod lib_obj;
 pub mod libraryobj;
 pub mod misc;
 pub mod newtype;
-pub mod parse_c_type;
+pub use pyre_native::cffi as parse_c_type;
 pub mod realize_c_type;
 pub mod wchar_helper;
 pub mod wrapper;

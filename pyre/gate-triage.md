@@ -232,7 +232,7 @@ build.
 
 ### §6b — VALUE knobs (17): config, not gates
 
-`PYRE_FBW_MAX_SUBWALK_DEPTH`, `PYRE_FBW_MULTIFRAME_DEPTH`,
+`PYRE_FBW_MULTIFRAME_DEPTH`,
 `PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
 `PYRE_PORTAL_METATRACE_ENTRY`, `PYRE_PORTAL_METATRACE_SKIP`,
@@ -262,14 +262,6 @@ consulted/fired tallies. `PYRE_WASM_SPEC_CENSUS` is that same readout on the
 wasm backend, where the guest reads no environment and the runner has to arm
 it through the `pyre_fbw_spec_census_enable` export instead.
 
-`PYRE_FBW_MAX_SUBWALK_DEPTH` lowers the host-stack budget for canonical-helper
-descent (`fbw_max_subwalk_depth`, default 64). The default is a backstop
-against exhausting the process stack, not a tuning knob — the walker recurses
-one `walk()` activation per descent level where RPython's `MetaInterp` keeps
-its frames on the heap. Lowering it is how the `SubWalkDepthExceeded` decline
-is exercised without building a pathological helper chain; it retires when the
-descent stops recursing on the host stack.
-
 `PYRE_PORTAL_METATRACE_ENTRY` selects where the one-shot jd0 portal probe
 starts: `merge` (the default) seeds the merge-point registers and `start`
 enters at pc 0 with the portal's declared arguments.  The numeric
@@ -277,7 +269,7 @@ enters at pc 0 with the portal's declared arguments.  The numeric
 probe passes before firing; it defaults to zero.  Neither has an effect unless
 the probe in §6c is enabled.
 
-### §6c — Default-OFF diagnostics, censuses and probes (75): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (76): keep, cost nothing
 
 Deleting one of these environment reads does not change behavior when the
 variable is unset. They remain listed so diagnostics are not mistaken for dead
@@ -297,7 +289,7 @@ configuration.
 `PYRE_FIELD_IDENTITY_CENSUS`,
 `PYRE_FORITER_INFLIGHT_CENSUS`, `PYRE_FOR_ITER_GATE_DIAG`,
 `PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GC_SIZE_AUDIT`,
-`PYRE_GEN_ENTRY_DIAG`,
+`PYRE_GEN_CENSUS`, `PYRE_GEN_ENTRY_DIAG`,
 `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
 `PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LOOP_CENSUS`,
 `PYRE_M73_BACKXLAT_TWIN_AUDIT`, `PYRE_M73_EMPTYTWIN_CENSUS`,
@@ -308,7 +300,7 @@ configuration.
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT`, `PYRE_PCMAP_RESIDUAL_CENSUS`,
 `MAJIT_PORTAL_RCA`, `PYRE_PORTAL_METATRACE`, `PYRE_PROBE_BH_STARTUP`,
 `PYRE_PROBE_SNAPSHOT`,
-`MAJIT_PROBE_SUBSCR`, `MAJIT_PROFILE_PIPELINE`, `PYRE_QMUT_MAPDICT_FORCE`,
+`MAJIT_PROBE_SUBSCR`, `MAJIT_PROFILE_PIPELINE`,
 `PYRE_RERAISE_DIAG`, `MAJIT_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
 `PYRE_UNJOURNALED_SITE`,
 `PYRE_VSTACK_EXACT_AUDIT`, `PYRE_VSTACK_KEEP_REORDER`, `PYRE_VSTACK_NO_EXACT`,
@@ -316,6 +308,13 @@ configuration.
 `PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_CALL_HIST`,
 `PYRE_WASM_NO_CACHE`, `PYRE_WASM_SPEC_CENSUS`, `PYRE_WASM_STARTUP_TRACE`,
 `PYRE_WASM_TRACE_ENTRY_CENSUS`.
+
+`PYRE_WASM_JIT_STATS` prints its readout for any value. The one value it
+reads is `nofuel`, which asks for the readout without wasmtime's fuel metering.
+Metering charges every guest instruction, which makes the host cranelift
+compile that `compile_ms` and `compile_bytes` measure slower than it is in a
+production run; `nofuel` is how those two fields are read. `wasm_ops` is the
+fuel subtraction and reports -1 under it.
 
 `PYRE_FBW_DESCENT_SCAN_OFF` turns off the descent's un-lowered-helper scan
 (`descent_unlowered_helper_scan_enabled`), so the walker descends into a
@@ -398,7 +397,6 @@ under measurement.
 | gate | default polarity | what it gates / retirement condition |
 |---|---|---|
 | `PYRE_PROBE14` | OFF | reports discarded reference-constant relocations; retire when relocation preservation is covered by ordinary tests |
-| `PYRE_GC_TYPE_COUNT` | OFF | prints `[gc-type-count] frozen=N max=M` when `freeze_types` runs, so the number to size `TypeRegistry::MAX_TYPES` against can be read instead of guessed -- the `register` assert names the cap it blew but not the total it needed; retire when the registry grows on demand rather than pre-allocating a fixed capacity for a stable base address |
 | `PYRE_GC_SIZE_AUDIT` | OFF | panics when a block is stamped with a type id whose declared payload is larger than the block's own extent, at the allocation that stamps it rather than in whichever later collection reads the neighbouring block as a field (varsize types are exempt); retire when every allocator derives the size from the type id it stamps, so the two cannot disagree |
 | `PYRE_GC_GATE_BASE` | VALUE | names the upstream commit `scripts/check-gc-root-brackets.py` measured its numbers over, so a backlog raised by code the baseline never saw is reported rather than charged to the branch; the workflow supplies it because a CI checkout is shallow, holds no `main` ref and has its merge commit's parent list truncated away, leaving nothing in the repository able to answer; retire when the gate's job checks out enough history for `git merge-base` to name the base itself |
 | `PYRE_EXIT_FRAME_DIAG` | OFF | prints one line per `exit_frame_with_exception` delivery to a frame's own exception table, naming the site and the verdict `exit_frame_handler_needs_unwritten_stack` reached there, passes included so a refusal is a share of something; retire when the handler search moves inside the trace and the two delivery sites become one |

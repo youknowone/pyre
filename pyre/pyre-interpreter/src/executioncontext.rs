@@ -1051,7 +1051,7 @@ impl ExecutionContext {
         // action_dispatcher do NOT run.  Use `?` so a tracer error
         // short-circuits before touching actionflag.
         frame = self.bytecode_only_trace(frame)?;
-        if self.actionflag.decrement_ticker(decr_by as isize) < 0 {
+        if space_decrement_ticker(self, decr_by as isize) < 0 {
             // executioncontext.py — `actionflag.action_dispatcher`.
             // Routed through a residual (dont_look_inside) boundary so the
             // tracer never sees the action machinery's trait-object
@@ -2368,6 +2368,30 @@ impl ActionFlagOps for SpaceActionFlag {
     fn decrement_ticker(&mut self, by: isize) -> isize {
         self.inner_mut().decrement_ticker(by)
     }
+}
+
+/// `dont_look_inside`: the ticker lives behind `SpaceActionFlag`'s interior
+/// pointer, which the codewriter refuses to lower (`rewrite_op_getsubstruct`
+/// bakes an abort before such a call). The residual takes the execution
+/// context itself, so no interior address appears in the caller's graph.
+/// Upstream traces carry the ticker as raw field operations instead; lowering
+/// this gate to those ops is a later port.
+#[majit_macros::dont_look_inside]
+pub fn space_decrement_ticker(ec: &mut ExecutionContext, by: isize) -> isize {
+    let mut actionflag = ec.actionflag;
+    actionflag.decrement_ticker(by)
+}
+
+/// One-word residual-call ABI for [`space_decrement_ticker`].
+///
+/// The residual lowering types a value-returning call as `(i64, i64) -> i64`;
+/// the Rust signature's reference and `isize` are narrower than a word on
+/// wasm32, where `call_indirect` type-checks its callee.
+pub extern "C" fn space_decrement_ticker_jit_abi(ec: i64, by: i64) -> i64 {
+    // SAFETY: the residual's first slot is the execution context the walked
+    // graph read it from; it outlives the call.
+    let ec = unsafe { &mut *(ec as *mut ExecutionContext) };
+    space_decrement_ticker(ec, by as isize) as i64
 }
 
 pub struct AsyncAction {

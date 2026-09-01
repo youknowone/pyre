@@ -8550,7 +8550,17 @@ impl GcAllocator for MiniMarkGC {
         let Some(total_size) = GcHeader::SIZE.checked_add(size) else {
             return GcRef(0);
         };
-        self.alloc_in_oldgen_clear(type_id, total_size)
+        // `GcLLDescr_framework._bh_malloc` reaches translated
+        // `do_malloc_fixedsize_clear`, whose rawmalloc failure is returned to
+        // the exception transformer as NULL and becomes `MemoryError`.
+        // Blackhole host calls need the same fallible edge; the infallible
+        // `oldgen.alloc()` path aborts the process before `_get_method` can
+        // deliver that exception.
+        let Some(obj) = self.try_alloc_in_oldgen(type_id, total_size) else {
+            return GcRef(0);
+        };
+        Self::raw_memclear(obj, total_size);
+        obj
     }
 
     fn collection_counts(&self) -> (usize, usize) {
@@ -8590,6 +8600,16 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn nursery_bounds(&self) -> Option<(usize, usize)> {
+        // `debug_rotate` installs the ring's front arena on every minor
+        // collection that finds no pinned survivor, so the range is then not
+        // fixed for the life of this allocator and no published pair can
+        // describe it.  `None` keeps every query on `is_nursery_object`,
+        // which reads the arena now installed.  Both terms are the pair
+        // `reset_nursery_with_pinned` tests before it rotates, and neither
+        // has a writer after construction.
+        if self.config.gc_nursery_debug && self.nursery.debug_rotating_nurseries() != 0 {
+            return None;
+        }
         let start = self.nursery.start_ptr() as usize;
         Some((start, start + self.nursery.size()))
     }
@@ -9130,6 +9150,33 @@ mod tests {
             large_object_threshold: nursery_size / 2,
             ..GcConfig::default()
         })
+    }
+
+    /// The ring's front arena is installed on every minor collection, so a
+    /// rotating allocator has no range that stays fixed for its lifetime and
+    /// nothing for `publish_singleton_nursery` to capture.
+    #[test]
+    fn a_rotating_nursery_publishes_no_fixed_bounds() {
+        if !crate::nursery::HAS_PROTECT {
+            return;
+        }
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            debug: 1,
+            gc_nursery_debug: true,
+            ..GcConfig::default()
+        });
+
+        let before = GcAllocator::nursery_bounds(&gc);
+        gc.do_collect_nursery();
+        let after = GcAllocator::nursery_bounds(&gc);
+
+        assert_eq!(
+            before, after,
+            "the arena moved, so a pair published before the collection would name a retired one"
+        );
+        assert_eq!(after, None, "a rotating arena has no publishable range");
     }
 
     /// incminimark.py `_minor_collection`: on the `gc_nursery_debug` arm with

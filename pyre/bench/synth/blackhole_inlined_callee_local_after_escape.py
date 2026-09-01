@@ -35,7 +35,7 @@
 # output, and the forcing read makes it a poor perf subject.
 import sys
 
-N = 20000
+N = 40000
 
 
 def catches_here(i):

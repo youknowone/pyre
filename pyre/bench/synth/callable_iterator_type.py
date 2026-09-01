@@ -4,7 +4,7 @@
 # returns self. The concrete type name differs across implementations, so only
 # the structural type-identity invariants are compared. Output verified against
 # CPython/PyPy.
-N = 40000
+N = 80000
 
 
 def f():

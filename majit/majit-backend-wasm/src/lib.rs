@@ -93,8 +93,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 /// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
 /// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
 /// the owner is already invalidated, so a merged region would inherit its set
-/// flag instead of starting valid; 51 = the region's closing JUMP names a LABEL
-/// published by another module, which no in-module `br` can reach; 52 = the
+/// flag instead of starting valid; 51 = a region retained for a deferred merge
+/// whose closing JUMP names a LABEL published by another module, so it keeps
+/// the cross-module tail call and merges only its entry side; 52 = the
 /// region's source guard is in the peeled preamble, outside the `loop` its
 /// block is opened in; 53 = eligible but no trip callback is published to
 /// defer to; 54 = eligible, merge deferred until the bridge standing in for it
@@ -102,6 +103,24 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 /// merge was attempted; 56 = eligible but not deferrable, because the region
 /// carries a `GUARD_NOT_INVALIDATED` whose dependencies would outlive the flag
 /// it reads.
+///
+/// 57-63 split slot 1, which says only that some CALL_ASSEMBLER target did not
+/// resolve and leaves the trace unsupported. Each answers one of the questions
+/// `general_int_call_assembler_target` asks before it admits a target: 57 = the
+/// operation is a CALL_ASSEMBLER whose result is neither Int nor Ref; 58 = it
+/// carries no call descr, or no target token; 59 = an argument or result type
+/// is outside Int/Ref; 60 = the target token is not in the registry at all;
+/// 61 = a registered target's deferred module failed to materialize a func
+/// handle; 62 = the registered geometry disagrees with the operation (input
+/// types, zero callee frame bytes, absent gcmap, absent compiled loop); 63 =
+/// the target compiled once and has since declined terminally. A decline that
+/// falls in 60-63 names a target that exists, which is the half of slot 1 a
+/// retrace could plausibly resolve; 57-59 name the operation itself.
+///
+/// 64 = a cross-module region declined the EAGER merge arm. That arm forgoes
+/// the trip threshold to keep a quasi-immutable dependency attached to the
+/// owner's flag, and pays an owner re-emission whether or not the region ever
+/// runs hot; a region that saves only its entry crossing does not earn it.
 pub static BRIDGE_DIAG: [AtomicU64; BRIDGE_DIAG_LABELS.len()] =
     [const { AtomicU64::new(0) }; BRIDGE_DIAG_LABELS.len()];
 
@@ -169,12 +188,20 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "inline_decl_label_resume_layout",
     "inline_decl_call_assembler",
     "inline_decl_owner_invalidated",
-    "inline_decl_foreign_label",
+    "inline_foreign_jump",
     "inline_ok_outside_loop",
     "inline_decl_no_trip_helper",
     "inline_deferred",
     "inline_trip_fired",
     "inline_decl_defer_invalidation_guard",
+    "ca_decl_opcode",
+    "ca_decl_descr",
+    "ca_decl_types",
+    "ca_decl_unregistered",
+    "ca_decl_materialize",
+    "ca_decl_geometry",
+    "ca_decl_terminal",
+    "inline_decl_foreign_eager",
 ];
 
 #[repr(u8)]
@@ -1465,11 +1492,17 @@ fn wasm_bh_alloc(type_id: u32, payload_size: usize) -> i64 {
         majit_gc::gc_write_barrier(GcRef(gc_ptr));
         return gc_ptr as i64;
     }
+    if type_id != 0 {
+        // `GcLLDescr_framework._bh_malloc` returns NULL on failure so the
+        // blackhole wrapper can raise `MemoryError`.  A raw fallback for a
+        // typed descr drops the GC header and its tracing layout.
+        return 0;
+    }
     wasm_bh_alloc_raw(payload_size)
 }
 
-/// Non-GC descrs (`type_id == 0`, raw buffers) and a runtime with no allocator
-/// installed keep the plain zeroed malloc the dynasm runner falls back to.
+/// Non-GC descrs (`type_id == 0`, raw buffers) keep the plain zeroed malloc the
+/// dynasm runner uses for the same descr shape.
 fn wasm_bh_alloc_raw(size: usize) -> i64 {
     let Ok(layout) = std::alloc::Layout::from_size_align(size.max(1), 8) else {
         return 0;
@@ -2956,12 +2989,15 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
             op.opcode,
             majit_ir::OpCode::CallAssemblerI | majit_ir::OpCode::CallAssemblerR
         ) {
+            diag_bump(57);
             return None;
         }
         let Some(descr_ref) = op.getdescr() else {
+            diag_bump(58);
             return None;
         };
         let Some(descr) = descr_ref.as_call_descr() else {
+            diag_bump(58);
             return None;
         };
         let arg_types = descr.arg_types();
@@ -2973,23 +3009,33 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
                 majit_ir::Type::Int | majit_ir::Type::Ref
             )
         {
+            diag_bump(59);
             return None;
         }
         let Some(target_token) = descr.call_target_token() else {
+            diag_bump(58);
             return None;
         };
         let Some(mut registered) = call_assembler_target(target_token) else {
+            diag_bump(60);
             return None;
         };
         // A straight-line function trace may have deferred host module
         // compilation. CALL_ASSEMBLER is its first real consumer, so
         // materialize it before publishing the stable dispatch entry.
         if registered.func_handle == 0 && registered.compiled_ptr != 0 {
-            let loop_ = unsafe { (registered.compiled_ptr as *const CompiledWasmLoop).as_ref() }?;
+            let Some(loop_) =
+                (unsafe { (registered.compiled_ptr as *const CompiledWasmLoop).as_ref() })
+            else {
+                diag_bump(61);
+                return None;
+            };
             let Ok(handle) = loop_.materialize_func_handle() else {
+                diag_bump(61);
                 return None;
             };
             if handle == 0 {
+                diag_bump(61);
                 return None;
             }
             registered.func_handle = handle;
@@ -3004,15 +3050,19 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
             publish_call_assembler_target(target_token, registered.clone());
         }
         if registered.input_types.as_slice() != arg_types {
+            diag_bump(62);
             return None;
         }
         if registered.callee_frame_bytes == 0 {
+            diag_bump(62);
             return None;
         }
         if registered.callee_gcmap_ptr == 0 {
+            diag_bump(62);
             return None;
         }
         if registered.compiled_ptr == 0 {
+            diag_bump(62);
             return None;
         }
         // A successfully compiled loop is retained by its token while it is
@@ -3024,6 +3074,7 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
                 .is_some_and(|loop_| !loop_.ca_terminal_declined.get())
         };
         if !live {
+            diag_bump(63);
             return None;
         }
         // The same target may occur in several operations; each operation was
@@ -3150,8 +3201,8 @@ fn transfer_call_assembler_target_activity(
 }
 
 /// Mark a CA target whose callee guard was structurally declined.  The host
-/// deopt helper calls this only after `MetaInterp` recorded the exact guard in
-/// `declined_bridge_guards`; invalidating the callers forces a retrace whose
+/// deopt helper calls this only after the exact guard descriptor was marked
+/// terminally declined; invalidating the callers forces a retrace whose
 /// admission check above restores the plain call path.
 pub fn mark_call_assembler_terminal_decline(compiled_ptr: usize) {
     unsafe {
@@ -3351,13 +3402,21 @@ impl majit_backend::Backend for WasmBackend {
 
     /// llmodel.py bh_new_array(length, arraydescr).
     fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        let length = usize::try_from(length).expect("bh_new_array length must be non-negative");
+        let Ok(length) = usize::try_from(length) else {
+            return 0;
+        };
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
         let len_offset = arraydescr
             .array_len_offset()
             .expect("bh_new_array requires ArrayDescr.lendescr");
         let type_id = arraydescr.resolve_gc_tid();
-        let ptr = wasm_bh_alloc(type_id, base_size + itemsize * length);
+        let Some(payload_size) = itemsize
+            .checked_mul(length)
+            .and_then(|items| base_size.checked_add(items))
+        else {
+            return 0;
+        };
+        let ptr = wasm_bh_alloc(type_id, payload_size);
         if ptr != 0 {
             unsafe {
                 *((ptr as *mut u8).add(len_offset) as *mut usize) = length;
@@ -3377,14 +3436,14 @@ impl majit_backend::Backend for WasmBackend {
 
     /// `LLtypeMixin.bh_newstr` → `gc_ll_descr.gc_malloc_str`.
     fn bh_newstr(&self, length: i64) -> i64 {
-        let length = usize::try_from(length).expect("bh_newstr length must be non-negative");
+        let Ok(length) = usize::try_from(length) else {
+            return 0;
+        };
         let base_size = 2 * std::mem::size_of::<usize>() + 1;
-        let ptr = wasm_bh_alloc(
-            majit_gc::lowlevel_str_type_id(),
-            base_size
-                .checked_add(length)
-                .expect("bh_newstr allocation size overflow"),
-        );
+        let Some(payload_size) = base_size.checked_add(length) else {
+            return 0;
+        };
+        let ptr = wasm_bh_alloc(majit_gc::lowlevel_str_type_id(), payload_size);
         if ptr != 0 {
             unsafe {
                 *((ptr as *mut u8).add(std::mem::size_of::<usize>()) as *mut usize) = length;
@@ -3395,15 +3454,17 @@ impl majit_backend::Backend for WasmBackend {
 
     /// `LLtypeMixin.bh_newunicode` → `gc_ll_descr.gc_malloc_unicode`.
     fn bh_newunicode(&self, length: i64) -> i64 {
-        let length = usize::try_from(length).expect("bh_newunicode length must be non-negative");
+        let Ok(length) = usize::try_from(length) else {
+            return 0;
+        };
         let base_size = 2 * std::mem::size_of::<usize>();
-        let ptr = wasm_bh_alloc(
-            majit_gc::lowlevel_unicode_type_id(),
-            length
-                .checked_mul(std::mem::size_of::<u32>())
-                .and_then(|items| base_size.checked_add(items))
-                .expect("bh_newunicode allocation size overflow"),
-        );
+        let Some(payload_size) = length
+            .checked_mul(std::mem::size_of::<u32>())
+            .and_then(|items| base_size.checked_add(items))
+        else {
+            return 0;
+        };
+        let ptr = wasm_bh_alloc(majit_gc::lowlevel_unicode_type_id(), payload_size);
         if ptr != 0 {
             unsafe {
                 *((ptr as *mut u8).add(std::mem::size_of::<usize>()) as *mut usize) = length;
@@ -4043,7 +4104,7 @@ impl majit_backend::Backend for WasmBackend {
         // the arities match, and the label's args are the complete live set of
         // the trace remainder (`label_resume_safe`); otherwise decline — the
         // guard then falls back to blackhole resume and
-        // `declined_bridge_guards` stops the metainterp re-tracing it.
+        // the guard descriptor's terminal bit stops the metainterp re-tracing it.
         // Non-peeled loops (entry == LABEL) re-enter correctly and keep
         // chaining.
         let bridge_is_loop_closing = has_cross_loop_terminal_jump(ops);
@@ -4086,7 +4147,7 @@ impl majit_backend::Backend for WasmBackend {
         // livelock at constant stack depth and heap state). Such a bridge is a
         // guard side-trace that omits the loop body's advancing arithmetic; it
         // has no correct in-module resume, so decline it — the guard falls back
-        // to blackhole resume and `declined_bridge_guards` stops the metainterp
+        // to blackhole resume and the guard descriptor's terminal bit stops the metainterp
         // re-tracing it. A genuinely advancing loop-closing bridge (an `i += 1`
         // counter feeding a JUMP arg) passes and keeps chaining.
         //
@@ -4206,6 +4267,16 @@ impl majit_backend::Backend for WasmBackend {
             }
         }
 
+        // A closing JUMP that names a LABEL of ANOTHER module cannot become a
+        // `br`, so a region carrying one keeps the cross-module tail call its
+        // out-of-line bridge made and only the ENTRY side is merged: the source
+        // guard branches to the region's block with its values in locals
+        // instead of storing them for a bridge call to read back.
+        let region_external =
+            (external_jump_slot != source_func_handle).then_some(codegen::ExternalJump {
+                slot: external_jump_slot,
+                key: external_jump_key,
+            });
         // Set by the inline block below to the owner of a merge candidate whose
         // merge waits on `INLINE_TRIP_THRESHOLD` entries into this bridge.
         let mut defer_inline: Option<(Arc<JitCellToken>, u32)> = None;
@@ -4263,15 +4334,6 @@ impl majit_backend::Backend for WasmBackend {
             } else if !bridge_is_loop_closing {
                 diag_bump(34);
                 decline("not_loop_closing");
-            } else if external_jump_slot != source_func_handle {
-                // The emitter turns a region's closing JUMP into a `br`, and a
-                // `br` cannot leave the module, so the JUMP must name a LABEL of
-                // the loop the region merges into. A JUMP naming another
-                // module's published label resolves to no LABEL in the merged
-                // stream, and the in-module arm would then branch to the
-                // owner's loop instead of the loop the bridge meant.
-                diag_bump(51);
-                decline("foreign_label");
             } else if let Some(candidate) = original_token
                 .compiled
                 .get()
@@ -4296,7 +4358,8 @@ impl majit_backend::Backend for WasmBackend {
                 } else if !codegen::merged_stream_has_loop_label(&candidate) {
                     diag_bump(39);
                     decline("no_loop_label");
-                } else if !resumes_at_loop_header
+                } else if region_external.is_none()
+                    && !resumes_at_loop_header
                     && !source_in_preamble
                     && !inline_nonheader_enabled()
                 {
@@ -4336,7 +4399,8 @@ impl majit_backend::Backend for WasmBackend {
                         ));
                     };
                     self.collect_constants_from_ops(ops);
-                    if outside_loop && codegen::has_invalidation_guard(ops) {
+                    let has_invalidation_guard = codegen::has_invalidation_guard(ops);
+                    if has_invalidation_guard && outside_loop {
                         // A quasi-immutable fold's dependencies are registered
                         // once, against whatever flag the token names when this
                         // compile returns — the bridge's own, because deferring
@@ -4346,25 +4410,46 @@ impl majit_backend::Backend for WasmBackend {
                         // while its dependencies still hold the bridge's: a
                         // field mutated before the trip would be forgotten, and
                         // one mutated after would leave the fold in place. The
-                        // eager arm below has no such window — it merges before
-                        // this compile returns, so the flag it records is the
-                        // one the dependencies then attach to.
+                        // eager invalidation arm below has no such window — it
+                        // merges before this compile returns, so the flag it
+                        // records is the one the dependencies then attach to.
                         diag_bump(56);
                         decline("defer_invalidation_guard");
-                    } else if outside_loop {
+                    } else if !has_invalidation_guard {
                         // Eligible, but not yet worth its owner re-emission:
                         // arm the bridge's entry counter and merge when it
-                        // trips. Everything else about this compile is the
-                        // ordinary out-of-line path below.
+                        // trips. This applies equally to a header-resuming
+                        // region: INLINE_TRIP_THRESHOLD is calibrated from
+                        // bridge entries, and eager header merging otherwise
+                        // bypasses that cost decision entirely. Everything else
+                        // about this compile is the ordinary out-of-line path
+                        // below.
                         defer_inline = Some((owner, merged_fail_index));
                         diag_bump(54);
                         decline("deferred");
+                    } else if region_external.is_some() {
+                        // The eager arm below forgoes the trip threshold to
+                        // keep a quasi-immutable dependency attached to the
+                        // owner's flag, and pays an owner re-emission for it
+                        // whether or not the region is ever hot. A cross-module
+                        // region saves only its entry crossing — the closing
+                        // tail call it keeps is the same one the out-of-line
+                        // bridge made — so that trade goes the other way:
+                        // taking it unmeasured cost `synth/gc_iterator_source_
+                        // drop` 10% of its wall clock and `guard_failures`
+                        // 1816 -> 5280, four eager merges' worth of restarted
+                        // warmup on a workload too short to amortize one.
+                        diag_bump(64);
+                        decline("foreign_eager");
                     } else {
-                        // A region resuming at the loop header sits on the
-                        // body's fall-through and was measured and shipped
-                        // merged on the spot, so it stays that way.
+                        // Deferral would register this region's dependencies
+                        // against its temporary bridge flag. A header region
+                        // can instead merge before this compile returns, so
+                        // its dependencies attach to the owner's flag from the
+                        // outset. The outside-loop case was declined above.
                         let region = codegen::InlinedBridge {
                             source_fail_index: merged_fail_index,
+                            external_jump: region_external.clone(),
                             outside_loop,
                             trace_id: self.trace_counter,
                             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
@@ -4449,8 +4534,12 @@ impl majit_backend::Backend for WasmBackend {
         // (`chained_bridge_slots`, keyed by that id) are replayed into the
         // merged region's cells when the owner is finally rebuilt.
         let inline_trip = defer_inline.map(|(owner, merged_fail_index)| {
+            if region_external.is_some() {
+                diag_bump(51);
+            }
             let region = codegen::InlinedBridge {
                 source_fail_index: merged_fail_index,
+                external_jump: region_external.clone(),
                 // Decided against the candidate as it stands when the merge
                 // actually runs, which may have taken more regions by then.
                 outside_loop: false,
@@ -5298,7 +5387,22 @@ mod tests {
     use majit_gc::trace::TypeInfo;
     use majit_ir::forwarding::bound_operand_from_opref as rb;
 
-    static WASM_COMPILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn typed_blackhole_allocation_never_falls_back_to_raw_memory() {
+        // No active wasm GC is installed on this test thread.  A typed descr
+        // therefore has no legal allocator and must report NULL to
+        // blackhole.py `_get_method`; the previous raw fallback returned a
+        // headerless block that the collector could neither identify nor
+        // trace.
+        assert_eq!(wasm_bh_alloc(1, 32), 0);
+    }
+
+    #[test]
+    fn blackhole_varsize_rejects_negative_lengths_without_panicking() {
+        let backend = WasmBackend::new();
+        assert_eq!(backend.bh_newstr(-1), 0);
+        assert_eq!(backend.bh_newunicode(-1), 0);
+    }
 
     #[test]
     fn cross_loop_terminal_jump_uses_target_descr_identity() {
@@ -5317,7 +5421,7 @@ mod tests {
 
     #[test]
     fn straightline_trace_defers_host_module_until_execution() {
-        let _compile_guard = WASM_COMPILE_TEST_LOCK.lock().unwrap();
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let mut backend = WasmBackend::new();
         let token = JitCellToken::new(1);
         let finish = Op::new(majit_ir::OpCode::Finish, &[]);
@@ -5346,7 +5450,7 @@ mod tests {
 
     #[test]
     fn identical_call_assembler_publication_reuses_the_runtime_snapshot() {
-        let _compile_guard = WASM_COMPILE_TEST_LOCK.lock().unwrap();
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let token_number = 9_900_000;
         ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
         ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
@@ -5363,7 +5467,7 @@ mod tests {
 
     #[test]
     fn redirect_call_assembler_grows_tmp_callback_frame_info() {
-        let _compile_guard = WASM_COMPILE_TEST_LOCK.lock().unwrap();
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         fn compile_with_depth(backend: &mut WasmBackend, token: &JitCellToken, value_count: u32) {
             let inputargs = vec![InputArg::new_int(0)];
             let mut previous = majit_ir::OpRef::input_arg_int(0);

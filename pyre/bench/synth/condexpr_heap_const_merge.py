@@ -18,7 +18,7 @@
 # shapes are kept for the small-vs-heap contrast, and `ce_big` is correct even
 # when the branch never diverges (the merge structure alone triggered the
 # drop).  Pure arithmetic -> deterministic checksum.
-N = 64000
+N = 128000
 
 
 def ce_small():

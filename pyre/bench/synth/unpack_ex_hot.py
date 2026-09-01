@@ -10,7 +10,7 @@
 # that follows re-enters through a bridge whose guard can then fail once
 # more, which moves guard_failures for reasons outside this fixture. Crossing
 # resumes around 0.45x of the old count; the gated counters are unchanged.
-N = 500000
+N = 1000000
 
 
 def main():

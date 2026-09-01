@@ -42,6 +42,10 @@ enc_b64 = binascii.b2a_base64
 assert_equal(enc_b64(b"213"), b"MjEz\n")
 assert_equal(enc_b64(b"213", newline=False), b"MjEz")
 
+# A leading newline leaves the quoted-printable CRLF probe at input index 0.
+# It must not inspect the byte before the beginning of the input.
+assert_equal(binascii.b2a_qp(b"\n"), b"\n")
+
 dec_b64 = binascii.a2b_base64
 
 assert_equal(dec_b64(b"UnVzdFB5dGhvbg==\n"), b"RustPython")

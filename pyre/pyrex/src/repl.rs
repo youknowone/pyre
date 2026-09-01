@@ -117,7 +117,7 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
 
             // pylifecycle.c init_importlib before site — see run_source.
             if let Err(e) =
-                crate::init_importlib_bootstrap(canonical, Rc::as_ptr(&execution_context))
+                importing::init_importlib_bootstrap(canonical, Rc::as_ptr(&execution_context))
             {
                 eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
             }
@@ -356,7 +356,9 @@ fn run_startup_file(
             return;
         }
     };
-    let source = match pyre_interpreter::decode_source_bytes(&bytes, &display, false) {
+    // `pymain_run_file_obj` is a tokenizer file boundary just like the normal
+    // script path: an embedded NUL keeps its filename, line and source text.
+    let source = match pyre_interpreter::decode_file_source_bytes(&bytes, &display, false) {
         Ok(source) => source,
         Err(error) => {
             report_or_exit_before_prompt(error, canonical, runtime.ctx_ptr);

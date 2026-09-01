@@ -8,7 +8,7 @@
 #   outer catches KeyError, e.__context__ must be the ValueError instance
 # Per-iteration contribution is 1 when the chain is correct; a mismatch jumps
 # by 1000, so any regression is loud. Deterministic.
-N = 30000
+N = 60000
 
 
 def run(n):

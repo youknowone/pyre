@@ -19,6 +19,17 @@
 # load-bearing together, not independently: at `trace_limit=200` the same body
 # jumps the band in one crossing and never segments.
 #
+# Which means the number tracks what one traced iteration COSTS in this tree,
+# and has to be re-fit whenever that moves.  Swept against the recorded shape
+# (`loops_compiled=2 bridges_compiled=4 loops_aborted=9 guard_failures=1008`),
+# the window is 270..288 and 280 is its centre; 264 misses the band low and
+# never segments (`loops_aborted=64 guard_failures=11922`), 294 crosses it high
+# and settles on a worse three-loop shape.  It read 300 while the FOR_ITER
+# receiver pin was spelled `ptr_eq` + `guard_true`; `guard_value` lets the
+# optimizer constant-fold the class word out of the body, the iteration got
+# shorter, and the whole window moved down with it.  Re-fit it by sweeping,
+# not by nudging.
+#
 # CPython (the oracle) has no `pypyjit`; PyPy and pyre do. Guarding the import
 # keeps the output identical across all three while the params only bind where a
 # JIT exists. `set_param` rather than an environment variable because the wasm
@@ -26,7 +37,7 @@
 try:
     import pypyjit
 
-    pypyjit.set_param("trace_limit=300")
+    pypyjit.set_param("trace_limit=280")
     pypyjit.set_param("threshold=20")
 except ImportError:
     pass

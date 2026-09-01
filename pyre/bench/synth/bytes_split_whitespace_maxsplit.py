@@ -10,7 +10,7 @@ try:
 except ImportError:
     pass
 
-N = 500
+N = 1000
 
 
 def main():

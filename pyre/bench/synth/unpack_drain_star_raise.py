@@ -29,7 +29,7 @@
 #      interpreter. The store is off the hot path (`i % ARGS_EVERY`) so the
 #      enclosing loop compiles without it and the drain is traced from a guard
 #      exit, which is where the leak shows.
-N = 4000
+N = 8000
 ROUNDS = 12
 # One less than the jd1 trace threshold, so the raise happens on the crossing
 # that starts the trace rather than after the loop is already compiled.

@@ -3096,7 +3096,12 @@ pub fn gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
 }
 
 /// Return the active collector's existing TYPE_INFO layout for `addr`.
-/// `None` means it is not a registered variable-size GC object.
+///
+/// `None` means either that `addr` is not a registered variable-size GC
+/// object, or that no backend has installed the query — the same answer
+/// [`gc_owns_object`] gives for an address no GC owns.  A caller that needs
+/// a layout regardless supplies its own, the way `jit_ll_arraymove` falls
+/// back to the array token of the block it allocates.
 pub fn gc_varsize_layout(addr: usize) -> Option<GcVarSizeLayout> {
     if addr == 0 {
         return None;
@@ -3124,8 +3129,11 @@ pub fn gc_mark_finalizer_run(addr: usize) {
 /// tagged-pointer setting `is_valid_gc_object` consults.
 ///
 /// `is_nursery_object_start` is `addr != 0 && !tagged && nursery.contains(addr)`
-/// — three loads and two compares against fields that never move for the life
-/// of the GC instance (`reset` rewinds `free`, never `start`/`size`).  Reaching
+/// — three loads and two compares against fields that do not move for the life
+/// of the GC instance (`reset` rewinds `free`, never `size`; the one writer of
+/// `start` is `debug_rotate`, and an allocator that rotates answers
+/// `nursery_bounds` with `None` rather than publish a range a minor collection
+/// will move).  Reaching
 /// them through the hook chain instead costs a thread-local lookup, a `RefCell`
 /// borrow and a trait-object dispatch on every root pin and every root reload,
 /// which is where the query is actually hot.  Publishing them lets the common

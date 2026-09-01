@@ -4,7 +4,7 @@
 # finishes in a fraction of a second, so a pypy ratio compares two
 # interpreters' startup and reads whatever the host's process spawn cost
 # happens to be that run. The jitstats baselines gate it.
-N = 50000
+N = 100000
 
 
 def main():

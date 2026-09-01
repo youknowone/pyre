@@ -4,7 +4,7 @@
 # fixture exists because the whole generator frame used to be unreachable —
 # resumption bypassed the eval override, so nothing in a generator body was
 # ever offered to the tracer, yield in the loop or not.
-N = 400
+N = 800
 ROUNDS = 600
 
 
@@ -33,5 +33,5 @@ def run(rounds, m):
 
 
 total = run(ROUNDS, N)
-assert total == 287280600, total
+assert total == 1150560600, total
 print(total)

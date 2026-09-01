@@ -6,8 +6,9 @@ meta-tracer cannot fold the arbitrary-precision operation out of the loop.
 
 With no CASE, every case runs at a reduced round count and prints its name and
 checksum. That mode is a cross-engine oracle rather than a measurement: it is
-what `wasm_check.py` gets, since that harness runs every `pyre/bench/*.py` with
-no argv and requires the outputs to match across host engines.
+what `wasm_check.py` gets, since that harness runs every `pyre/bench` and
+`pyre/oracle` script with no argv and requires the outputs to match across
+host engines.
 """
 
 import math

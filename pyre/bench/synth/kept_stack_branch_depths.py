@@ -15,7 +15,7 @@
 #
 # Pure arithmetic -> deterministic checksum across runtimes; a parity
 # regression target for the kept-stack branch-guard depth boundary.
-N = 200000
+N = 400000
 
 
 def main():

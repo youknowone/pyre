@@ -12,7 +12,7 @@
 # follows re-enters through a bridge whose guard can then fail once more,
 # which moves guard_failures for reasons outside this fixture. Crossing
 # resumes around 0.3x of the old count; the gated counters are unchanged.
-N = 75000
+N = 150000
 
 
 class Idx:

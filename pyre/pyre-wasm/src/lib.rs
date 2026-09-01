@@ -1061,6 +1061,24 @@ fn run_python_impl(source: &str) -> String {
         pyre_interpreter::call::getexecutioncontext(),
     );
 
+    // pylifecycle.c init_importlib, the step `run_script_path` runs before
+    // `site`: install the importlib bootstrap so `builtins.__import__` routes
+    // imports through `sys.meta_path` / `sys.path_hooks` from the first user
+    // statement. Without it `sys.modules` holds no `importlib._bootstrap` and
+    // every import on this launcher is served natively, so `sys.meta_path`
+    // stays empty and no module carries a real `__spec__`.
+    //
+    // A failure (no reachable stdlib) is non-fatal, as it is natively: the
+    // native importer keeps serving imports, the minimal-importer role.
+    if let Err(e) = pyre_interpreter::importing::init_importlib_bootstrap(
+        canonical,
+        pyre_interpreter::call::getexecutioncontext(),
+    ) {
+        pyre_interpreter::host_seam::emit_stderr(
+            format!("pyre: importlib bootstrap failed: {}\n", e.message_text()).as_bytes(),
+        );
+    }
+
     // catch_unwind to capture panics from JIT as error messages
     let eval_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pyre_jit::eval::eval_with_jit(&mut frame, None)

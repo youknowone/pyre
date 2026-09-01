@@ -693,6 +693,21 @@ assert b"-\xff".decode(sys.getfilesystemencoding(), "surrogateescape") == "-\udc
 # mod
 assert b"rust%bpython%b" % (b" ", b"!") == b"rust python!"
 assert b"x=%i y=%f" % (1, 2.5) == b"x=1 y=2.500000"
+assert b"%5b|" % b"x" == b"    x|"
+
+
+class BytesOperand:
+    def __bytes__(self):
+        return b"converted"
+
+
+assert b"%b" % BytesOperand() == b"converted"
+# `%b` accepts only a bytes-like object or one with `__bytes__`, and it is
+# not a conversion the str formatter knows at all.
+with assert_raises(TypeError):
+    b"%b" % 1
+with assert_raises(ValueError):
+    "%b" % 1
 
 
 # __bytes__

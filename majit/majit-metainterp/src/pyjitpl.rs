@@ -1879,17 +1879,6 @@ pub struct MetaInterp<M: Clone> {
     /// so explicitly. Set by [`register_retrace_merge_point`], consumed once
     /// by the driver.
     pub(crate) keep_tracing_after_close: bool,
-    /// Source guards `(trace_id, fail_index)` whose bridge the backend
-    /// declined as structurally `Unsupported` (e.g. the wasm chaining
-    /// backend cannot run a bridge needing more Ref-home slots than the
-    /// source loop reserved, or attached to a non-direct loop guard).
-    /// Such a decline is deterministic — re-tracing the same guard re-builds
-    /// the same unsupported bridge forever (a compile storm). RPython never
-    /// declines structurally (it always patches machine code), so its
-    /// counter-reset-and-retry (`compile.py:701-717`) is safe there; here a
-    /// declined guard is recorded so `must_compile_with_values` stops firing
-    /// for it and the guard falls back to the always-correct blackhole resume.
-    pub(crate) declined_bridge_guards: std::collections::HashSet<(u64, u32)>,
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop. Indexed by `green_key`; entries
     /// are added on InvalidLoop and removed when the next retrace succeeds,
@@ -3492,7 +3481,6 @@ impl<M: Clone> MetaInterp<M> {
             compile_resume_memos: Vec::new(),
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
-            declined_bridge_guards: std::collections::HashSet::new(),
             pending_preamble_tokens: indexmap::IndexMap::new(),
             pending_frontend_boxes: None,
             pending_frontend_box_types: None,
@@ -9584,8 +9572,7 @@ impl<M: Clone> MetaInterp<M> {
                 if matches!(e, majit_backend::BackendError::Unsupported(_))
                     && self.backend.bridge_decline_is_terminal()
                 {
-                    self.declined_bridge_guards
-                        .insert((source_trace_id, fail_index));
+                    fail_descr.set_bridge_declined_terminally();
                 }
                 self.stats.loops_aborted += 1;
                 let msg = format!("Retrace bridge compilation failed: {e}");
@@ -12635,11 +12622,8 @@ impl<M: Clone> MetaInterp<M> {
         // unsupported bridge forever. Transient backend and walker aborts do
         // not populate this set. Fall back to the blackhole resume the dormant
         // path always used for this guard.
-        if self
-            .declined_bridge_guards
-            .contains(&(trace_id, fail_index))
-        {
-            crate::mc_diag_bump(1); // declined_bridge_guards short-circuit
+        if descr_fd.bridge_declined_terminally() {
+            crate::mc_diag_bump(1); // guard-descr terminal-decline short-circuit
             return (false, owning_key);
         }
         // compile.py `_trace_and_compile_from_bridge` walks
@@ -12739,8 +12723,8 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Whether this exact guard's bridge was terminally declined by the
     /// backend.  The wasm CALL_ASSEMBLER host-deopt path queries the same
-    /// `(trace_id, fail_index)` record that normal guard failures populate,
-    /// so it cannot re-trace a structural decline in a side table.
+    /// descriptor bit that normal guard failures populate, so it cannot
+    /// re-trace a structural decline through a detached identity table.
     pub fn bridge_declined_terminally(
         &self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -12748,8 +12732,7 @@ impl<M: Clone> MetaInterp<M> {
         let descr = descr_arc
             .as_fail_descr()
             .expect("bridge_declined_terminally: descr_arc must be a FailDescr");
-        self.declined_bridge_guards
-            .contains(&(descr.trace_id(), descr.fail_index_per_trace()))
+        descr.bridge_declined_terminally()
     }
 
     /// Record that this exact source guard's bridge hit a deterministic
@@ -12764,8 +12747,7 @@ impl<M: Clone> MetaInterp<M> {
         let descr = descr_arc
             .as_fail_descr()
             .expect("record_declined_bridge_guard: descr_arc must be a FailDescr");
-        self.declined_bridge_guards
-            .insert((descr.trace_id(), descr.fail_index_per_trace()));
+        descr.set_bridge_declined_terminally();
     }
 
     /// `memmgr.py` `MemoryManager.keep_loop_alive`, which
@@ -14394,8 +14376,7 @@ impl<M: Clone> MetaInterp<M> {
                 if matches!(e, majit_backend::BackendError::Unsupported(_))
                     && self.backend.bridge_decline_is_terminal()
                 {
-                    self.declined_bridge_guards
-                        .insert((fail_descr.trace_id(), fail_descr.fail_index_per_trace()));
+                    fail_descr.set_bridge_declined_terminally();
                 }
                 let msg = format!("Bridge compilation failed: {e}");
                 crate::debug::log_one("jit-summary", &msg);
@@ -17271,6 +17252,13 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         };
+        // A backend that cannot compile a CALL_ASSEMBLER entering this token
+        // declines every trace carrying the edge. Fall back to the residual
+        // emission the caller keeps running for a `(None, None)` answer, the
+        // same shape the tmp-callback refusal above takes.
+        if target_token.call_assembler_refused() {
+            return (None, None);
+        }
         let vable_index = target_token.virtualizable_arg_index();
         // pyjitpl.py:3601 opnum = OpHelpers.call_assembler_for_descr(calldescr)
         let opnum = match descr_view.result_type() {

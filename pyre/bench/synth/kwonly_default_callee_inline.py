@@ -14,7 +14,7 @@
 # default, and the aggregate is exact, so a seeding that fills the slot with
 # the wrong value or the wrong local changes the printed sum rather than the
 # timing.
-N = 200000
+N = 400000
 
 
 def g(x, *, step=1):

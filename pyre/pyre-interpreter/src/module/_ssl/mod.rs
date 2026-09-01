@@ -4,7 +4,6 @@
 //! `ssl.py`.  This module supplies its low-level primitives while the actual
 //! TLS engine lives in `pyre-native`, outside the translated interpreter.
 
-use base64::Engine;
 use pyre_object::*;
 
 const PROTOCOL_TLS: i32 = 2;
@@ -72,6 +71,53 @@ pub struct W_SSLSession {
     pub backend: *mut pyre_native::ssl::NativeSession,
 }
 
+/// A TLS record's header: the content type, the two protocol version bytes,
+/// and the two that hold the body's length.
+const TLS_RECORD_HEADER_LEN: usize = 5;
+
+/// Where the shutdown exchange stands inside the record it is reading.
+///
+/// OpenSSL's record layer reads a header and then the body its length names,
+/// which is what keeps a socket-backed `SSL_shutdown` from lifting the
+/// plaintext that follows the peer's close_notify out of the kernel.  A
+/// transport that returns short -- a non-blocking socket, a timed one, an
+/// interrupted read -- unwinds back to the caller, which asks again, so this
+/// belongs to the connection and not to one call.
+#[derive(Default)]
+pub struct ShutdownRecord {
+    header: [u8; TLS_RECORD_HEADER_LEN],
+    header_read: usize,
+    body_left: usize,
+}
+
+impl ShutdownRecord {
+    /// The bytes still owed before the next record boundary.
+    fn want(&self) -> usize {
+        if self.body_left > 0 {
+            self.body_left
+        } else {
+            TLS_RECORD_HEADER_LEN - self.header_read
+        }
+    }
+
+    /// Account for `data`, which must be no longer than [`want`].
+    ///
+    /// [`want`]: ShutdownRecord::want
+    fn consume(&mut self, data: &[u8]) {
+        if self.body_left > 0 {
+            self.body_left -= data.len();
+            return;
+        }
+        self.header[self.header_read..self.header_read + data.len()].copy_from_slice(data);
+        self.header_read += data.len();
+        if self.header_read == TLS_RECORD_HEADER_LEN {
+            // The record's length is the header's last two bytes, big-endian.
+            self.body_left = u16::from_be_bytes([self.header[3], self.header[4]]) as usize;
+            self.header_read = 0;
+        }
+    }
+}
+
 /// One TLS state machine plus its Python-owned transport endpoints.  Rustls
 /// remains opaque in `pyre-native`; these references preserve the same
 /// per-object ownership shape as PyPy's `W_SSLObject`.
@@ -88,6 +134,7 @@ pub struct W_SSLSocket {
     pub server_hostname: PyObjectRef,
     pub server_side: bool,
     pub shutdown_started: bool,
+    pub shutdown_record: ShutdownRecord,
     pub requested_session: *mut pyre_native::ssl::NativeSession,
 }
 
@@ -501,6 +548,7 @@ fn allocate_ssl_socket(
         },
         server_side,
         shutdown_started: false,
+        shutdown_record: ShutdownRecord::default(),
         requested_session,
     })
 }
@@ -1648,6 +1696,17 @@ mod ssl_socket_methods {
         Rejected((i32, String)),
     }
 
+    /// [`pump_record_bounded`] for the goals that read whatever the transport
+    /// has, rather than one TLS record at a time.
+    fn pump(
+        backend: *mut pyre_native::ssl::TlsConnection,
+        fd: crate::module::_socket::rsocket_rffi::Socket,
+        buf: &mut [u8],
+        goal: PumpGoal,
+    ) -> PumpExit {
+        pump_record_bounded(backend, fd, buf, goal, &mut ShutdownRecord::default())
+    }
+
     /// The `PySSL_BEGIN_ALLOW_THREADS` bracket that `SSL_do_handshake`,
     /// `SSL_read` and `SSL_write` each put around their whole exchange: the
     /// peer's records are read, answered and parsed without the interpreter,
@@ -1659,15 +1718,16 @@ mod ssl_socket_methods {
     /// Nothing here may touch a Python object.  The states that need one - a
     /// server context to choose, a signal to deliver, an error to raise - end
     /// the run and are answered by the caller.
-    /// A TLS record's header: the content type, the two protocol version
-    /// bytes, and the two that hold the body's length.
-    const TLS_RECORD_HEADER_LEN: usize = 5;
-
-    fn pump(
+    ///
+    /// `record` carries where a [`PumpGoal::Shutdown`] run stands inside the
+    /// record it is reading, so it has to outlive the call: a transport that
+    /// returns short unwinds to the caller, which re-enters here.
+    fn pump_record_bounded(
         backend: *mut pyre_native::ssl::TlsConnection,
         fd: crate::module::_socket::rsocket_rffi::Socket,
         buf: &mut [u8],
         goal: PumpGoal,
+        record: &mut ShutdownRecord,
     ) -> PumpExit {
         use crate::module::_socket::interp_socket::{socket_recv_raw, socket_send_raw};
         use crate::module::_socket::rsocket_rffi::error_is_interrupted;
@@ -1681,10 +1741,8 @@ mod ssl_socket_methods {
         // body its length names, which is why a socket-backed `SSL_shutdown`
         // leaves the caller's bytes alone; track the same two-step here.  A
         // short read is fed on as it arrives -- the receiver buffers a partial
-        // record -- and only the byte count is carried across.
-        let mut header = [0u8; TLS_RECORD_HEADER_LEN];
-        let mut header_read = 0usize;
-        let mut body_left = 0usize;
+        // record -- and only the byte count is carried across.  `record` is the
+        // connection's, because a transport retry re-enters this function.
         loop {
             loop {
                 let data = match unsafe { pyre_native::ssl::connection_peek_tls(backend) } {
@@ -1732,26 +1790,14 @@ mod ssl_socket_methods {
                 }
             }
             let want = match goal {
-                PumpGoal::Shutdown if body_left > 0 => body_left.min(buf.len()),
-                PumpGoal::Shutdown => TLS_RECORD_HEADER_LEN - header_read,
+                PumpGoal::Shutdown => record.want().min(buf.len()),
                 _ => buf.len(),
             };
             match socket_recv_raw(fd, &mut buf[..want], 0) {
                 Ok(0) => return PumpExit::Eof,
                 Ok(read) => {
                     if matches!(goal, PumpGoal::Shutdown) {
-                        if body_left > 0 {
-                            body_left -= read;
-                        } else {
-                            header[header_read..header_read + read].copy_from_slice(&buf[..read]);
-                            header_read += read;
-                            if header_read == TLS_RECORD_HEADER_LEN {
-                                // The record's length is the header's last two
-                                // bytes, big-endian.
-                                body_left = u16::from_be_bytes([header[3], header[4]]) as usize;
-                                header_read = 0;
-                            }
-                        }
+                        record.consume(&buf[..read]);
                     }
                     if let Err(error) =
                         unsafe { pyre_native::ssl::connection_receive_tls(backend, &buf[..read]) }
@@ -1844,6 +1890,19 @@ mod ssl_socket_methods {
     }
 
     fn receive_transport(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
+        receive_transport_bounded(socket, false)
+    }
+
+    /// `track_record` stops the socket read at the boundary the connection's
+    /// `shutdown_record` is tracking, and accounts what it read against it.
+    /// The shutdown exchange needs that: what follows the peer's close_notify
+    /// is the plaintext `unwrap()` hands back with the socket, and a read that
+    /// crossed the boundary would feed those bytes to the TLS stream, where
+    /// nothing can return them.
+    fn receive_transport_bounded(
+        socket: &mut W_SSLSocket,
+        track_record: bool,
+    ) -> Result<(), crate::PyError> {
         ensure_connection(socket)?;
         if !unsafe { is_none(socket.incoming) } {
             let incoming = W_MemoryBIO::from_obj(socket.incoming)
@@ -1871,8 +1930,16 @@ mod ssl_socket_methods {
         let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
         crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, false)?;
         let mut buf = vec![0u8; 32 * 1024];
+        let want = if track_record {
+            socket.shutdown_record.want().min(buf.len())
+        } else {
+            buf.len()
+        };
         let read = match crate::module::_socket::interp_socket::socket_recv_bytes(
-            transport, fd, &mut buf, 0,
+            transport,
+            fd,
+            &mut buf[..want],
+            0,
         ) {
             Ok(read) => read,
             Err(error) if is_blocking_error(&error) => {
@@ -1888,6 +1955,9 @@ mod ssl_socket_methods {
                 pyre_native::ssl::TLS_ERROR_EOF,
                 "EOF occurred in violation of protocol".to_string(),
             ));
+        }
+        if track_record {
+            socket.shutdown_record.consume(&buf[..read]);
         }
         receive_tls(socket, &buf[..read]).map(|_| ())
     }
@@ -2485,7 +2555,13 @@ mod ssl_socket_methods {
             if let Some((transport, fd)) = pump_transport(self)? {
                 let mut buf = vec![0u8; 32 * 1024];
                 loop {
-                    match pump(self.backend, fd, &mut buf, PumpGoal::Shutdown) {
+                    match pump_record_bounded(
+                        self.backend,
+                        fd,
+                        &mut buf,
+                        PumpGoal::Shutdown,
+                        &mut self.shutdown_record,
+                    ) {
                         PumpExit::Done(_) => {
                             settle_received_tls(self)?;
                             break;
@@ -2506,9 +2582,10 @@ mod ssl_socket_methods {
                 // A message callback requires returning to the interpreter
                 // after every record.  Keep PyPy's shutdown loop in that
                 // case too, but use the callback-aware transport helpers
-                // instead of the released pump.
+                // instead of the released pump -- reading to the same record
+                // boundary the pump stops at.
                 while !unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
-                    receive_transport(self)?;
+                    receive_transport_bounded(self, true)?;
                     flush_transport(self)?;
                 }
             }
@@ -2591,11 +2668,13 @@ mod certificate_methods {
                 return Ok(self.der);
             }
             if encoding == 1 || encoding == 0x101 {
-                let encoded = base64::engine::general_purpose::STANDARD
-                    .encode(unsafe { pyre_object::bytesobject::w_bytes_data(self.der) });
+                let encoded = rustpython_common::binascii::b2a_base64(
+                    unsafe { pyre_object::bytesobject::w_bytes_data(self.der) },
+                    false,
+                );
                 let mut pem = String::with_capacity(encoded.len() + 64);
                 pem.push_str("-----BEGIN CERTIFICATE-----\n");
-                for line in encoded.as_bytes().chunks(64) {
+                for line in encoded.chunks(64) {
                     pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
                     pem.push('\n');
                 }

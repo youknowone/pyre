@@ -15,7 +15,7 @@
 # already writes the PC; the function-entry resume must match it.
 #
 # Deterministic: `s` counts the calls that returned the kept `b`.
-N = 4000
+N = 8000
 
 
 def f(a, b, n):

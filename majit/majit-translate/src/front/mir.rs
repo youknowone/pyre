@@ -617,18 +617,13 @@ fn is_primitive_payload_type(s: &str) -> bool {
     )
 }
 
-/// Whether a rendered payload type is an inline multi-word aggregate — a
-/// tuple `(A, B)`, array `[T; N]`, or slice `[T]` — rather than a single
-/// GC-word reference or a scalar.  The suffixed-owner textual field descr
-/// has no `StructId` for such a payload, so `type_flag_from_str` would fall
-/// back to a one-GC-word `Ref` (correct for a reference, WRONG for an
-/// inline aggregate that spans several words), so it must fail closed.  A
-/// tuple/array whose inner type is itself unresolved already renders with a
-/// `??` marker and is caught upstream; this only screens the resolved
-/// inline-aggregate spellings.
-fn is_inline_aggregate_type(s: &str) -> bool {
-    let s = s.trim();
-    (s.starts_with('(') && s != "()") || s.starts_with('[')
+/// Whether a rendered payload remains an inline Rust array/slice for which
+/// the translated field representation has not been established here.  A
+/// tuple is deliberately excluded: RPython gives every non-empty tuple a
+/// `Ptr(GcStruct(...))` representation, and pyre lowers tuple construction to
+/// that same GC-managed object shape.
+fn is_inline_array_or_slice_type(s: &str) -> bool {
+    s.trim().starts_with('[')
 }
 
 /// Register per-instantiation SUFFIXED variant payload rows for the
@@ -647,16 +642,20 @@ fn is_inline_aggregate_type(s: &str) -> bool {
 /// Substituting the instantiation's concrete type args into each variant
 /// field's type-var position recovers the concrete row, keyed under the
 /// same suffixed spellings (`{enum}{suffix}::{variant}`) that
-/// `getuniqueclassdef_for_enum_variant` projects through.  A variant
-/// registers when every payload field substitutes to either a heap
-/// (one-GC-word) type or — for a single-field variant — a primitive scalar
-/// (`Result<i64>`, `Option<bool>`): the textual descr path resolves the
-/// scalar's bank/width from the row type string, and a sole field sits at
-/// byte offset 0 so its layout is unambiguous.  An unresolved `??`
-/// placeholder, an inline multi-word aggregate (tuple/array/slice), or a
-/// primitive field in a multi-field variant (mixed scalar widths could
-/// reorder under `repr(Rust)`) leaves the variant unregistered (fail-closed
-/// Skip).  The qualified spelling always publishes; the bare-leaf / crate-
+/// `getuniqueclassdef_for_enum_variant` projects through.  A tuple payload is
+/// a GC reference in the translated program, even though Rust stores it
+/// inline: RPython's `TupleRepr` uses
+/// `Ptr(GcStruct('tupleN', ...))` (`rpython/rtyper/rtuple.py:119-126`), and
+/// pyre's synthetic aggregate constructor follows that representation.
+/// Consequently its textual field descr must use the ordinary one-word
+/// `Ref` fallback, not reject the row based on the source Rust width.  A
+/// variant registers when every payload field resolves and a primitive
+/// scalar in a multi-field source variant cannot make the descriptor offset
+/// ambiguous.  An unresolved `??` placeholder, an array/slice aggregate whose
+/// translated field representation is not established here, or a primitive
+/// field in a multi-field variant (mixed scalar widths could reorder under
+/// `repr(Rust)`) leaves the variant unregistered (fail-closed Skip).  The
+/// qualified spelling always publishes; the bare-leaf / crate-
 /// stripped spellings publish only while the leaf survived
 /// `harden_duplicate_leaf_metadata`, so a duplicate enum leaf fails closed
 /// instead of projecting whichever colliding decl was inserted first.  The
@@ -707,13 +706,14 @@ fn register_ref_enum_instantiation_rows(
                 let concrete = substitute_field_type(&f.ty, &inst.args, llbc);
                 let trimmed = concrete.trim();
                 // Register a field only when it is layout-safe for the
-                // suffixed owner's textual descr: a single-GC-word heap
-                // reference, or (sole field, offset 0) a real unboxed scalar.
-                // Fail closed on an unresolved `??` placeholder, an inline
-                // multi-word aggregate (tuple/array/slice), the unit / empty
-                // render, or a scalar outside a single-field variant.
+                // translated suffixed owner's textual descr: a GC-managed
+                // value (including RPython tuples, represented by one
+                // pointer), or (sole field, offset 0) a real unboxed scalar.
+                // Fail closed on an unresolved `??` placeholder, an
+                // array/slice aggregate, the unit / empty render, or a scalar
+                // outside a single-field variant.
                 let layout_safe = !concrete.contains("??")
-                    && !is_inline_aggregate_type(trimmed)
+                    && !is_inline_array_or_slice_type(trimmed)
                     && trimmed != "()"
                     && !trimmed.is_empty()
                     && (!is_primitive_payload_type(&concrete) || single_field);
@@ -1116,15 +1116,16 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // (keyed exactly as `merge_hints_from_llbcs`), so the narrow
         // codewriter surface stays restricted to opaque stubs; every
         // other fn keeps the declared-void default.
-        // A trait default body is registered as the `<default methods of
-        // Trait>` family sentinel and picked as the Indirect-dispatch
-        // witness (`getcalldescr`'s indirect arm reads its `return_type` as
-        // `FUNC.RESULT`).  Left `None` it maps to `Void` and mismatches the
-        // caller's `Ref`/`Int` `result_ty`; stamp the same token an opaque
-        // callee gets so the witness reports its real return kind.
+        // Every trait method can be a member of an indirect-call PBC row:
+        // default bodies and concrete overrides alike.  RPython's
+        // `FunctionReprBase.call` gets the row's result from
+        // `FuncType.RESULT`, so each member must carry that type before the
+        // graph analyzers run.  Left `None`, pyre maps it to `Void` and the
+        // first concrete witness can mismatch a real `Ref`/`Int` result.
+        // Stamp the same signature token an opaque callee gets.
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
-            || (trait_root.is_some() && self_ty_root.is_none());
+            || trait_root.is_some();
         let return_type = if gcref_result {
             Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
         } else if stamp_return_token {
@@ -2757,9 +2758,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::front::option_map_or::rewire_map_or_call_sites(&mut lo.graph, &lo.map_or_sites)
         };
         // The `Option::is_none`/`is_some` rewrite (`front::option_is_none`)
-        // replaces the residual predicate call in place with a
-        // `__discriminant` comparison; no block split, so it needs no
-        // reachability sweep.  Same fail-safe contract as the diamonds above.
+        // replaces the residual predicate call in place with either an
+        // aggregate `__discriminant` comparison or, for the nullable
+        // RPython ref representation, a pointer-null comparison. No block
+        // split, so it needs no reachability sweep. Same fail-safe contract
+        // as the diamonds above.
         if !lo.is_none_sites.is_empty() {
             crate::front::option_is_none::rewire_is_none_call_sites(
                 &mut lo.graph,
@@ -5015,8 +5018,7 @@ impl<'a> Lowering<'a> {
                             // rtyped.  RPython keeps the declared
                             // SomeInstance class on every assignment (and a
                             // nullable pointer merely sets `can_be_None`).
-                            value =
-                                self.narrow_typed_instance_field_value(bb_id, value, Some(dest_ty));
+                            value = self.narrow_typed_ref_field_value(bb_id, value, Some(dest_ty));
                             (
                                 FieldDescriptor::new(field_name, Some(owner_root))
                                     .with_owner_id(owner_id)
@@ -5064,15 +5066,18 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// Preserve the declared class of an instance-typed field value.
+    /// Preserve the declared RPython reference repr of a typed field value.
     ///
     /// RPython represents an instance attribute as `SomeInstance(classdef)`;
     /// when nullable, the same annotation simply carries `can_be_None=True`.
     /// Rust spells those slots as `&NamedAdt` or `*mut/*const NamedAdt`, whose
-    /// producer initially has pointer annotation.  The Rust field type-check
-    /// is the proof needed to narrow that producer before `setattr`; this is
-    /// an identity cast for non-null values and a typed null for null values.
-    fn narrow_typed_instance_field_value(
+    /// producer initially has pointer annotation.  A pointer to an RPython
+    /// array is the same boundary: `rutf8.UTF8_INDEX_STORAGE` is a `GcArray`,
+    /// while Rust carries the exact owner as `*mut Vec<Utf8LocElem>`.  The
+    /// Rust field type-check is the proof needed to narrow that producer
+    /// before `setattr`; this is an identity cast for non-null values and a
+    /// typed null for null values.
+    fn narrow_typed_ref_field_value(
         &mut self,
         bb_id: BlockId,
         value: LinkArg,
@@ -5085,6 +5090,7 @@ impl<'a> Lowering<'a> {
                 return adt_node_class_root(strip_ty_indirections(pointee, self.llbc)?, self.llbc);
             }
             raw_ptr_pointee_class_root(node, self.llbc)
+                .or_else(|| raw_ptr_pointee_container_root(node, self.llbc))
         }) else {
             return value;
         };
@@ -5681,7 +5687,7 @@ impl<'a> Lowering<'a> {
                 if self.tyref_is_niche_option_ptr(dest_ty) {
                     match operands.into_iter().next() {
                         None => {
-                            let nullc = self.push_niche_null_ptr(mir_bb);
+                            let nullc = self.push_niche_null_ptr(mir_bb, dest_ty);
                             return Ok((None, nullc));
                         }
                         Some(op) => {
@@ -5720,41 +5726,52 @@ impl<'a> Lowering<'a> {
                 // use `variant_idx = null`, enum variants index into the
                 // `TypeDeclKind::Enum` variant list.
                 let resolved = self.resolve_aggregate_adt(&kind);
-                let (owner_path, ctor_name, field_rows, aggregate_owner_id, adt_is_struct) =
-                    match resolved {
-                        Some((owner_path, ctor_name, field_rows, owner_id, is_struct)) => {
-                            (owner_path, ctor_name, field_rows, Some(owner_id), is_struct)
-                        }
-                        None => {
-                            // Synthetic placeholders for non-Adt aggregates
-                            // (`Tuple`, `Array`, `Closure`) — they have no
-                            // user-defined class to resolve into.  A non-empty
-                            // tuple or array carries its per-shape `<…>` suffix
-                            // so its `__pos_N` attrs do not collide with other
-                            // shapes on one global class; the suffix matches
-                            // `positional_aggregate_owner` (Site-A reads) and
-                            // `tyref_positional_aggregate_suffix` (Site-B reads).
-                            // The per-shape `<…>` suffix is rendered from the
-                            // destination place type, not the `AggregateKind` head:
-                            // Charon's `AggregateKind::Adt(Tuple, …)` carries no
-                            // element `types`, so keying off it would spell a bare
-                            // `Tuple` on the write while the `.N` projection reads
-                            // (which do see `place.ty`'s element types) spell the
-                            // suffixed owner — a write/read owner split.  `dest_ty`
-                            // is that same `place.ty`, so both sides agree.
-                            let leaf = format!(
-                                "{}{}",
-                                aggregate_ctor_name(&kind),
-                                tyref_positional_aggregate_suffix(dest_ty, self.llbc)
-                            );
-                            let positional = (0..arg_vars.len())
-                                .map(|i| (format!("__pos_{i}"), String::new(), None))
-                                .collect();
-                            // Not an Adt at all, so there is no struct decl to
-                            // stand behind an allocation rewrite.
-                            (Vec::new(), leaf, positional, None, false)
-                        }
-                    };
+                let (
+                    owner_path,
+                    ctor_name,
+                    field_rows,
+                    aggregate_owner_id,
+                    adt_is_struct,
+                    enum_variant_tag,
+                ) = match resolved {
+                    Some((owner_path, ctor_name, field_rows, owner_id, is_struct, tag)) => (
+                        owner_path,
+                        ctor_name,
+                        field_rows,
+                        Some(owner_id),
+                        is_struct,
+                        tag,
+                    ),
+                    None => {
+                        // Synthetic placeholders for non-Adt aggregates
+                        // (`Tuple`, `Array`, `Closure`) — they have no
+                        // user-defined class to resolve into.  A non-empty
+                        // tuple or array carries its per-shape `<…>` suffix
+                        // so its `__pos_N` attrs do not collide with other
+                        // shapes on one global class; the suffix matches
+                        // `positional_aggregate_owner` (Site-A reads) and
+                        // `tyref_positional_aggregate_suffix` (Site-B reads).
+                        // The per-shape `<…>` suffix is rendered from the
+                        // destination place type, not the `AggregateKind` head:
+                        // Charon's `AggregateKind::Adt(Tuple, …)` carries no
+                        // element `types`, so keying off it would spell a bare
+                        // `Tuple` on the write while the `.N` projection reads
+                        // (which do see `place.ty`'s element types) spell the
+                        // suffixed owner — a write/read owner split.  `dest_ty`
+                        // is that same `place.ty`, so both sides agree.
+                        let leaf = format!(
+                            "{}{}",
+                            aggregate_ctor_name(&kind),
+                            tyref_positional_aggregate_suffix(dest_ty, self.llbc)
+                        );
+                        let positional = (0..arg_vars.len())
+                            .map(|i| (format!("__pos_{i}"), String::new(), None))
+                            .collect();
+                        // Not an Adt at all, so there is no struct decl to
+                        // stand behind an allocation rewrite.
+                        (Vec::new(), leaf, positional, None, false, None)
+                    }
+                };
                 let result_ty_owner = if owner_path.is_empty() {
                     ctor_name.clone()
                 } else {
@@ -5781,6 +5798,15 @@ impl<'a> Lowering<'a> {
                     CallTarget::synthetic_transparent_struct_ctor(
                         owner_path.clone(),
                         ctor_name.clone(),
+                    )
+                } else if let Some(tag) = enum_variant_tag {
+                    // A resolved enum variant records its declaration
+                    // index so a payload-less variant folded to a
+                    // prebuilt singleton keeps its discriminant.
+                    CallTarget::synthetic_transparent_enum_variant_ctor(
+                        owner_path.clone(),
+                        ctor_name.clone(),
+                        tag,
                     )
                 } else {
                     CallTarget::synthetic_transparent_ctor_with_owner(
@@ -5866,11 +5892,7 @@ impl<'a> Lowering<'a> {
                         continue;
                     }
                     let value = self
-                        .narrow_typed_instance_field_value(
-                            bb_id,
-                            LinkArg::Value(value),
-                            declared_ty,
-                        )
+                        .narrow_typed_ref_field_value(bb_id, LinkArg::Value(value), declared_ty)
                         .as_variable()
                         .expect("aggregate field operand stays materialized")
                         .clone();
@@ -6016,18 +6038,42 @@ impl<'a> Lowering<'a> {
                 // (RPython has no `Option`; a maybe-null `Ptr` tests
                 // `ptr_nonzero`).
                 if self.tyref_is_niche_option_ptr(&place.ty) {
+                    let option_ty = clone_tyref(&place.ty);
                     let base = self.resolve_place(mir_bb, place)?;
-                    let nullc = self.push_niche_null_ptr(mir_bb);
-                    // The `ne` result is a `SomeBool`; a `SwitchInt` terminator
-                    // on it must close with `ExitCase::Bool`.  Record the
-                    // result-var id so `lower_switch` routes it through the
-                    // `If` bool path instead of the `Int`-exitcase path.
+                    let nullc = self.push_niche_null_ptr(mir_bb, &option_ty);
+                    // Preserve PyPy's identity test: first compute
+                    // `base is None`, then negate that bool for the Rust
+                    // discriminant (`Some` = 1). `ne` would dispatch to value
+                    // inequality on StringRepr/ListRepr, which is not a null
+                    // test (and FixedSizeListRepr deliberately has no such
+                    // operation). The final bool must close a `SwitchInt`
+                    // with `ExitCase::Bool`, so record its result id.
+                    let is_none = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let false_var = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let bb_id = self.block_id[mir_bb];
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(is_none.clone()),
+                        kind: OpKind::BinOp {
+                            op: "is_".to_string(),
+                            lhs: base,
+                            rhs: nullc,
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(false_var.clone()),
+                        kind: OpKind::ConstBool(false),
+                    });
                     self.niche_disc_vars.insert(res.id());
                     return Ok((
                         Some(OpKind::BinOp {
-                            op: "ne".to_string(),
-                            lhs: base,
-                            rhs: nullc,
+                            op: "eq".to_string(),
+                            lhs: is_none,
+                            rhs: false_var,
                             result_ty: ValueType::Int,
                         }),
                         res,
@@ -7137,6 +7183,7 @@ impl<'a> Lowering<'a> {
         Vec<(String, String, Option<TyRef>)>,
         majit_ir::descr::StructId,
         bool,
+        Option<i64>,
     )> {
         let adt = kind.as_object()?.get("Adt")?.as_array()?;
         // `AggregateKind::Adt` head: either a bare `type_id` u64 or a
@@ -7182,6 +7229,7 @@ impl<'a> Lowering<'a> {
                     field_rows,
                     concrete_adt_struct_id(template, head_adt, self.llbc),
                     true,
+                    None,
                 ))
             }
             (TypeDeclKind::Enum(variants), Some(idx)) => {
@@ -7225,6 +7273,7 @@ impl<'a> Lowering<'a> {
                     field_rows,
                     concrete_adt_struct_id(template, head_adt, self.llbc),
                     false,
+                    Some(idx as i64),
                 ))
             }
             _ => None,
@@ -8563,6 +8612,18 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && (self.is_to_string_identity(&reg, first_arg_ty.as_ref())
                         || self.is_string_clone_identity(&reg, first_arg_ty.as_ref()))
+                    // A `Wtf8::to_wtf8_buf` that defines a proven mutable
+                    // accumulator is not the ordinary immutable-string copy
+                    // this identity arm models.  Its later `push*` calls and
+                    // single materialisation spell RPython's
+                    // `StringBuilder`; let the builder-ctor arm below emit
+                    // `newstringbuilder` plus the seed append.  Otherwise the
+                    // identity shortcut binds the accumulator to the source
+                    // `SomeString`, and the terminal `build` asks that string
+                    // for a builder-only method.
+                    && !(self.builder_mode
+                        && str_builder_ctor_leaf(self.llbc, &reg).is_some()
+                        && is_builder_mode_accumulator(self.body, self.llbc, dest_local))
                 {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -9379,8 +9440,9 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Ref(None),
                         },
                     });
-                    // `Wtf8Buf::from_string(initial)` is the Rust ownership
-                    // spelling of an RPython builder followed by its first
+                    // `Wtf8Buf::from_string(initial)` and
+                    // `Wtf8::to_wtf8_buf(&initial)` are the Rust ownership
+                    // spellings of an RPython builder followed by its first
                     // append.  Keep the initial value as an append operand;
                     // passing it to `new` would misread it as the optional
                     // integer capacity argument.
@@ -9393,7 +9455,7 @@ impl<'a> Lowering<'a> {
                     // `ll_new(len(s))` (`:57-63`) is the PREBUILT-constant
                     // path — a builder already built at translation time —
                     // and is not this callsite.
-                    if builder_ctor_leaf == Some("from_string") {
+                    if matches!(builder_ctor_leaf, Some("from_string" | "to_wtf8_buf")) {
                         let void = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Void);
@@ -10202,6 +10264,30 @@ impl<'a> Lowering<'a> {
                 let (segments, method_hint) = if args.len() == 1 && is_slice_to_vec(&segments) {
                     (vec!["list".to_string()], None)
                 } else if args.len() == 2
+                    && is_vec_extend_segments(&segments)
+                    && second_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_vec_value(ty, self.llbc))
+                {
+                    // PyPy expresses these source sites as list
+                    // concatenation / `list.extend`, and
+                    // `AbstractListRepr.rtype_method_extend` lowers them to
+                    // `ll_extend`.  Rust's `Vec::extend(Vec<T>)` consumes its
+                    // source, but the source is dead after the call and both
+                    // values are translated lists, so route this exact
+                    // by-value Vec input through the already-orthodox
+                    // `extend_from_slice` → list.extend bridge.  An iterator
+                    // value (`Vec::IntoIter`, Map, Range, or a custom iterator)
+                    // is not a list and deliberately keeps the residual wall.
+                    (
+                        vec![
+                            "vec".to_string(),
+                            "Vec".to_string(),
+                            "extend_from_slice".to_string(),
+                        ],
+                        None,
+                    )
+                } else if args.len() == 2
                     && crate::front::str_find::is_rpython_str_slice_prefix(&segments)
                 {
                     // PyPy's `name[:dotindex]` reaches ordinary
@@ -10618,7 +10704,7 @@ impl<'a> Lowering<'a> {
                         abstract_trait_call_target(&reg, self.llbc)
                     {
                         CallTarget::indirect(trait_root, method_name)
-                    } else if let Some(path) = transparent_inherent_method_path(&reg, self.llbc) {
+                    } else if let Some(path) = scalar_inherent_method_path(&reg, self.llbc) {
                         CallTarget::FunctionPath { segments: path }
                     } else if args.len() == 1
                         && let Some(marker) = promote_marker
@@ -10657,10 +10743,11 @@ impl<'a> Lowering<'a> {
                 // the method fn-ptr straight out of the receiver's vtable
                 // (`(*recv).vtable.method_<name>`), so the operand's
                 // terminal projection is `Field[Adt(vtable_id), slot]`.
-                // Route those through the faithful `CallTarget::Indirect`
-                // vtable pipeline (`rpbc::lower_indirect_calls` →
-                // `VtableMethodPtr` + `IndirectCall`, carrying the full
-                // impl family) instead of the synthetic `__dyn_call`.  The
+                // Preserve that projection as the funcptr operand of an
+                // `IndirectCall`; `rpbc::lower_indirect_calls` supplies the
+                // full impl family, matching `ClassRepr.getclsfield` followed
+                // by `FunctionReprBase.call`, instead of routing through the
+                // synthetic `__dyn_call`.  The
                 // call args already carry the receiver in `args[0]` (the
                 // operand projection's base local), which is exactly the
                 // receiver slot `IndirectCall` expects, so the arg list
@@ -10680,9 +10767,18 @@ impl<'a> Lowering<'a> {
                 let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
                 let indirect = self.dyn_indirect_target(&dyn_operand);
                 if let Some((trait_root, method_name)) = indirect {
-                    OpKind::Call {
-                        target: CallTarget::indirect(trait_root, method_name),
+                    // RPython `ClassRepr.getclsfield` emits the concrete
+                    // vtable field read, then `FunctionReprBase.call` feeds
+                    // that pointer to `indirect_call`.  `resolve_operand`
+                    // already lowers this exact MIR Field projection, so keep
+                    // it instead of replacing it with a blackhole-only
+                    // name-based lookup that has no upstream counterpart.
+                    let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
+                    OpKind::IndirectCall {
+                        funcptr,
                         args,
+                        graphs: None,
+                        family_key: Some((trait_root, method_name)),
                         result_ty,
                     }
                 } else if let Some(family) = fn_ptr_family {
@@ -10695,6 +10791,7 @@ impl<'a> Lowering<'a> {
                         funcptr,
                         args,
                         graphs,
+                        family_key: None,
                         result_ty,
                     }
                 } else {
@@ -14289,34 +14386,22 @@ impl<'a> Lowering<'a> {
     /// the concrete field annotation that RPython's `InstanceRepr._setup_repr`
     /// consumes (`rpython/rtyper/rclass.py:501-509`).
     fn option_payload_instance_class_root(&self, option_ty: &TyRef) -> Option<String> {
-        let mut payload = tyref_node(option_ty, self.llbc)?
-            .as_object()?
-            .get("Adt")?
-            .get("generics")?
-            .get("types")?
-            .get(0)?;
-        loop {
-            let obj = payload.as_object()?;
-            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-                payload = self.llbc.dedup_body(id)?;
-                continue;
-            }
-            if let Some(parts) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
-                && parts.len() == 2
-            {
-                payload = &parts[1];
-                continue;
-            }
-            if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
-                return Some(root);
-            }
-            let pointee = obj.get("Ref")?.as_array()?.get(1)?;
-            let pointee = strip_ty_wrappers(pointee, self.llbc)?;
-            return raw_ptr_pointee_class_root(pointee, self.llbc)
-                .or_else(|| adt_node_class_root(pointee, self.llbc));
+        let payload = strip_ty_indirections(
+            tyref_node(option_ty, self.llbc)?
+                .as_object()?
+                .get("Adt")?
+                .get("generics")?
+                .get("types")?
+                .get(0)?,
+            self.llbc,
+        )?;
+        if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
+            return Some(root);
         }
+        let pointee = payload.as_object()?.get("Ref")?.as_array()?.get(1)?;
+        let pointee = strip_ty_wrappers(pointee, self.llbc)?;
+        raw_ptr_pointee_class_root(pointee, self.llbc)
+            .or_else(|| adt_node_class_root(pointee, self.llbc))
     }
 
     /// The per-instantiation `Option` enum root for a residual-call
@@ -14395,6 +14480,35 @@ impl<'a> Lowering<'a> {
             return None;
         }
         self.option_payload_instance_class_root(dest_ty)
+    }
+
+    /// Target projection for the null half of a nullable Option whose payload
+    /// the source translator has changed from a Rust container to an RPython
+    /// value repr. `null_mut()` begins as a classdef-less pointer; string and
+    /// list comparisons require the same `StringRepr` / `ListRepr` as their
+    /// receiver, exactly as `convert_const(None)` is applied on the selected
+    /// repr upstream. Ordinary pointer payloads already share InstanceRepr and
+    /// need no projection.
+    fn option_niche_null_cast(&self, option_ty: &TyRef) -> Option<(String, ValueType)> {
+        if !self.tyref_is_niche_option_ptr(option_ty) {
+            return None;
+        }
+        let payload = tyref_node(option_ty, self.llbc)?
+            .as_object()?
+            .get("Adt")?
+            .get("generics")?
+            .get("types")?
+            .get(0)?;
+        let stripped = strip_ty_wrappers(payload, self.llbc)?;
+        let rendered = charon_type_value_to_ast_string(stripped, self.llbc, 0);
+        let payload_ty = tyref_enum_payload_value_type(&TyRef::Other(payload.clone()), self.llbc);
+        if matches!(payload_ty, ValueType::Str) {
+            return Some((rendered, ValueType::Str));
+        }
+        if rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") {
+            return Some((rendered.clone(), ValueType::Ref(Some(rendered))));
+        }
+        None
     }
 
     /// Resolve the destination `Option` of a `bool::then` / `bool::then_some`
@@ -14728,6 +14842,8 @@ impl<'a> Lowering<'a> {
             result_var: result_var.clone(),
             option_owner,
             is_some,
+            niche: self.tyref_is_niche_option_ptr(&pointee),
+            niche_null_cast: self.option_niche_null_cast(&pointee),
         })
     }
 
@@ -15213,10 +15329,14 @@ impl<'a> Lowering<'a> {
             .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc))
     }
 
-    /// `true` when `ty` is represented as a one-word nullable `Option`:
+    /// `true` when `ty` is represented as a one-word nullable `Option` in
+    /// the translated RPython model:
     /// `Option<NonNull<T>>`, `Option<Box<T>>`, `Option<fn(..)>`, `Option<&mut T>`,
     /// `Option<&T>` with a thin (Sized) ADT pointee, or a raw pointer to a
-    /// thin nominal ADT.
+    /// thin nominal ADT. It also includes the exact Rust container spellings
+    /// that translate to one RPython GC pointer: `Option<Vec<T>>` becomes a
+    /// nullable `SomeList`, and `Option<&str>` becomes a nullable
+    /// `SomeString`.
     /// The JIT models each in ONE pointer word (`None` = null, `Some(p)` =
     /// the non-null payload pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
@@ -15251,18 +15371,23 @@ impl<'a> Lowering<'a> {
     /// references `&T` are included when the pointee is a thin (Sized)
     /// nominal ADT — equally a one-word null niche — via
     /// [`type_node_shared_ref_pointee`] gated on the pointee's resolved layout
-    /// size being concrete. Fat shared references are excluded: `&str` / `&[T]`
-    /// / `&dyn` carry no ADT def-id, and an unsized nominal newtype (a DST such
-    /// as `Wtf8 { bytes: [u8] }`) DOES carry a def-id but has no concrete layout
-    /// size — both are two-word references with no one-word niche payload.
+    /// size being concrete. Fat shared references are otherwise excluded:
+    /// `&[T]` / `&dyn` carry no ADT def-id, and an unsized nominal newtype (a
+    /// DST such as `Wtf8 { bytes: [u8] }`) DOES carry a def-id but has no
+    /// concrete layout size — both are two-word references with no one-word
+    /// niche payload. Bare `&str` is the deliberate exception because the
+    /// front has already replaced that Rust `(data, len)` spelling with
+    /// RPython's single `SomeString` value. PyPy `BuiltinCode.docstring` is
+    /// exactly `SomeString(can_be_None=True)` (`gateway.py:getdocstring`), not
+    /// a tag + payload aggregate.
     ///
     /// `front::iter_next` interaction (shared arm only). `Iterator::next()`
     /// returns `Option<&T>`, and `front::iter_next` rewrites its
     /// `__discriminant` match diamond into the native `[__iter_next]` op by
     /// matching a literal `FieldRead __discriminant` + `Value` exitswitch
     /// (`iter_next.rs` `rewire_one_next_site`). The `Discriminant` fold below
-    /// (`Rvalue::Discriminant`, this file) turns that into a pointer-null
-    /// `ne` bool switch when the recognizer accepts the receiver — for a
+    /// (`Rvalue::Discriminant`, this file) turns that into an identity-null
+    /// bool switch when the recognizer accepts the receiver — for a
     /// shared thin-ADT ref that would fire BEFORE iter_next runs and leave it
     /// no diamond to match, so the residual `next()` call would survive as an
     /// unregistered callee (a census Skip, not a miscompile). Currently
@@ -15328,6 +15453,21 @@ impl<'a> Lowering<'a> {
             let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc) else {
                 return false;
             };
+            // Rust's `&str` is a fat pointer, but this source translator has
+            // already projected the bare builtin `str` to RPython's single GC
+            // string pointer (`SomeString`). Preserve that projection through
+            // `Option`: None is the null string pointer and Some is the string
+            // itself. Do not admit nominal unsized wrappers here;
+            // `Option<&Wtf8>` remains the aggregate pinned below.
+            if stripped
+                .get("Adt")
+                .and_then(|a| a.get("id"))
+                .and_then(|id| id.get("Builtin"))
+                .and_then(serde_json::Value::as_str)
+                == Some("Str")
+            {
+                return true;
+            }
             // `&*mut T` is a thin shared reference even though its pointee is
             // itself a raw pointer rather than a nominal ADT.  This is the
             // shape of `<[*mut PyObject]>::get`: `Option<&PyObjectRef>` is one
@@ -15376,15 +15516,25 @@ impl<'a> Lowering<'a> {
         let Some(def_id) = adt_node_def_id(payload) else {
             return false;
         };
-        self.llbc
+        let payload_path = self
+            .llbc
             .type_by_id(def_id)
-            .map(|td| td.item_meta.name_path())
-            .as_deref()
-            == Some("core::ptr::non_null::NonNull")
+            .map(|td| td.item_meta.name_path());
+        // PyPy TextIOWrapper.pending_bytes is `None` or an ordinary RPython
+        // list (`interp_textio.py:_writeflush`). Rust's `Vec<T>` is a
+        // three-word source spelling, but the front translates it to the same
+        // one-pointer `SomeList`; retaining Rust's enum tag after that
+        // projection manufactures an attribute no RPython object has.
+        matches!(
+            payload_path.as_deref(),
+            Some("core::ptr::non_null::NonNull") | Some("alloc::vec::Vec")
+        )
     }
 
-    /// Emit a null pointer for a one-word niche `Option` (`None`) as a
-    /// `core::ptr::null_mut()` call, returning its result `Variable`.
+    /// Emit a null pointer for a nullable `Option` (`None`) as a
+    /// `core::ptr::null_mut()` call, returning its result `Variable`. A Rust
+    /// container projected to an RPython string/list is then narrowed to that
+    /// projected repr before it is returned or compared.
     ///
     /// `null_mut()` is preferred over a bare `ConstRefNull`: the annotator's
     /// `ptr_null_constant` types it as a classdef-less nullable `SomeInstance`
@@ -15397,9 +15547,26 @@ impl<'a> Lowering<'a> {
     /// merge.  Used by both the `Discriminant` null-test fold and the niche
     /// `Aggregate` `None` construction fold so every niche-Option null shares
     /// one repr-adaptive source.
-    fn push_niche_null_ptr(&mut self, mir_bb: usize) -> Variable {
+    fn push_niche_null_ptr(&mut self, mir_bb: usize, option_ty: &TyRef) -> Variable {
         let bb_id = self.block_id[mir_bb];
-        self.graph.push_null_mut_ptr(bb_id)
+        let null = self.graph.push_null_mut_ptr(bb_id);
+        let Some((root, result_ty)) = self.option_niche_null_cast(option_ty) else {
+            return null;
+        };
+        let narrowed = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::CAST_INSTANCE.to_string(), root],
+                },
+                args: vec![null],
+                result_ty,
+            },
+        });
+        narrowed
     }
 
     /// Lower `i64::checked_neg()` (`core::num::<Impl>::checked_neg` —
@@ -18435,12 +18602,15 @@ fn gc_root_pin_path(name: &str) -> bool {
 /// W_Root instance, re-creating on the read side exactly the StringRepr-meets-
 /// InstanceRepr union the write-side stamp exists to remove.  `get` is the
 /// only such leaf in `gc_roots`, so the match stays unambiguous.
+///
+/// `reload_top_root` answers the same kind of slot for the top entry, so it
+/// carries the stamp for the same reason.
 fn gc_root_gcref_result_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.iter().any(|s| *s == "gc_roots")
         && matches!(
             segments.last(),
-            Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get")
+            Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get") | Some(&"reload_top_root")
         )
 }
 
@@ -20385,6 +20555,16 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             }
         }
     }
+    // RPython `history.getkind` classifies `Ptr(FuncType)` through the raw
+    // pointer arm, hence as `int`.  Charon's equivalent is a top-level
+    // `FnPtr`: it is the machine address that `FunctionReprBase.call` feeds
+    // to `indirect_call`, not a GC reference.  Keeping it in the Ref bank
+    // makes `jtransform.handle_regular_indirect_call` spell the otherwise
+    // impossible `int_guard_value/r` and gives every following residual call
+    // a Ref funcptr operand (`residual_call_*/r...`).
+    if type_node_is_fn_ptr(value, llbc) {
+        return ValueType::Int;
+    }
     // A densely numbered fieldless enum gives `Option<E>` a scalar niche
     // representation.  The whole Option therefore lives in the Int bank;
     // it is not an aggregate reference.
@@ -21495,6 +21675,26 @@ fn adt_node_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> 
 fn raw_ptr_pointee_class_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let raw = node.as_object()?.get("RawPtr")?.as_array()?;
     adt_node_class_root(strip_ty_wrappers(raw.first()?, llbc)?, llbc)
+}
+
+/// The projected list root of a raw pointer onto a Rust container.
+///
+/// RPython keeps pointers to `GcArray` values typed, including null pointers
+/// (`lltype.nullptr(ARRAY)`).  Rust's corresponding owner can be a
+/// `*mut Vec<T>` field, which otherwise enters the annotator as a
+/// classdef-less pointer and cannot union with the `SomeList` produced when
+/// the array is allocated.  Return the same rendered container spelling
+/// `Bookkeeper::project_struct_field_type` consumes at the cast boundary.
+fn raw_ptr_pointee_container_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
+    let pointee = node
+        .as_object()?
+        .get("RawPtr")?
+        .as_array()?
+        .first()
+        .and_then(|node| strip_ty_wrappers(node, llbc))?;
+    let rendered = charon_type_value_to_ast_string(pointee, llbc, 0);
+    (rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") || rendered.starts_with('['))
+        .then_some(rendered)
 }
 
 /// Whether `ty` is a raw pointer onto a byte-sized integer literal —
@@ -23567,13 +23767,21 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
     trait_method_owner(declaration)
 }
 
-/// Return the static graph path for an inherent method on a transparent type.
+/// Return the static graph path for an inherent method on a scalar type.
 ///
 /// Its receiver is a scalar in the low-level model, so routing through
 /// `CallTarget::Method` would perform an attribute lookup on an integer. The
 /// Rust call is statically resolved already; use the registered impl graph
 /// directly and keep the scalar receiver as its first argument.
-fn transparent_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<String>> {
+///
+/// This covers both `#[repr(transparent)]` wrappers and payload-free enums.
+/// The latter are represented by their integer discriminant in the translated
+/// graph.  PyPy's corresponding buffer requests are integer `BUF_*` flags
+/// (`pypy/interpreter/baseobjspace.py:1650-1683`); Rust packages the same
+/// decisions as inherent helpers on a scalar tag.  Those helpers remain
+/// ordinary statically selected functions, not Python method lookups on the
+/// integer.
+fn scalar_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<String>> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
@@ -23582,7 +23790,12 @@ fn transparent_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Ve
     let receiver = declaration.signature.inputs.first()?;
     let node = strip_ty_wrappers(tyref_node(receiver, llbc)?, llbc)?;
     let owner_id = adt_node_def_id(node)?;
-    if !llbc.type_by_id(owner_id)?.is_repr_transparent() {
+    let owner_decl = llbc.type_by_id(owner_id)?;
+    let is_payload_free_enum = matches!(
+        &owner_decl.kind,
+        TypeDeclKind::Enum(variants) if variants.iter().all(|variant| variant.fields.is_empty())
+    );
+    if !owner_decl.is_repr_transparent() && !is_payload_free_enum {
         return None;
     }
     let mut path = crate::model::split_qualified_path(&owner);
@@ -25061,6 +25274,19 @@ fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
 fn is_slice_to_vec(segments: &[String]) -> bool {
     matches!(segments, [a, b, c, d]
         if a == "alloc" && b == "slice" && c == "<Impl>" && d == "to_vec")
+}
+
+fn is_vec_extend_segments(segments: &[String]) -> bool {
+    segments == ["vec", "Vec", "extend"]
+}
+
+/// Whether a call operand is a concrete `Vec<T>` value (possibly borrowed).
+/// A `Vec::IntoIter<T>` is deliberately excluded: it is an iterator repr, may
+/// already be partially consumed, and therefore cannot be treated as the
+/// complete source list merely because it originated from one.  An arbitrary
+/// `IntoIterator<Item=T>` has no list-representation proof either.
+fn tyref_is_vec_value(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc).as_deref() == Some("alloc::vec::Vec")
 }
 
 /// The `fmt::Arguments::new(pieces, args)` constructor that `format_args!`
@@ -27253,7 +27479,7 @@ mod tests {
         cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
         decode_literal, fn_ptr_family_for, json_ty_is_thin_pointer_element,
         json_ty_scalar_element_spelling, push_ptr_to_unsigned_cast, shaped_array_parts,
-        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
+        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr, tyref_to_value_type,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -27380,6 +27606,35 @@ mod tests {
                  fnptr_indirect={fnptr_indirect}"
             );
         }
+    }
+
+    #[test]
+    fn function_pointer_uses_the_raw_pointer_int_bank() {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [], "fun_decls": [], "global_decls": [],
+                "trait_decls": [], "trait_impls": [],
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let ty = TyRef::Other(serde_json::json!({
+            "FnPtr": {
+                "skip_binder": {
+                    "inputs": [],
+                    "output": { "Literal": { "Int": "I64" } },
+                    "is_unsafe": false
+                }
+            }
+        }));
+
+        assert_eq!(
+            tyref_to_value_type(&ty, &llbc),
+            ValueType::Int,
+            "RPython history.getkind(Ptr(FuncType)) uses the int bank"
+        );
     }
 
     #[test]
@@ -29905,6 +30160,105 @@ mod tests {
             0,
             "no residual Map::collect reload wall"
         );
+    }
+
+    /// Representative interpreter loops iterate `&[*mut PyObject]`, whose
+    /// `Option<&*mut PyObject>` is folded to the identity-null niche shape:
+    /// `(opt is null) == false`.  This is still RPython's `ptr_nonzero`
+    /// predicate and must feed the same `next` + StopIteration rewrite as the
+    /// aggregate Option shape above.  The four roots here fan out to most of
+    /// the census's `slice::Iter::next` failures.  Ignored by default because
+    /// it loads the real interpreter LLBC.
+    #[test]
+    #[ignore]
+    fn iter_next_fold_real_identity_null_niche() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for function in [
+            "pyre_interpreter::call::call_builtin_code_positional",
+            "pyre_interpreter::runtime_ops::build_map_from_refs",
+            "pyre_interpreter::display::py_repr_wtf8",
+            "pyre_interpreter::baseobjspace::mutated",
+        ] {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|e| panic!("lower {function}: {e}"));
+            let count_call_leaf = |leaf: &[&str]| {
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.operations.iter())
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                                if super::fmt_path_ends_with(segments, leaf)
+                        )
+                    })
+                    .count()
+            };
+            assert_eq!(
+                count_call_leaf(&["slice", "iter", "Iter", "next"]),
+                0,
+                "{function}: identity-null niche loop must not retain residual Iter::next"
+            );
+            assert!(
+                count_call_leaf(&["__iter_next"]) >= 1,
+                "{function}: identity-null niche loop must emit a native next op"
+            );
+        }
+    }
+
+    /// A concrete `Vec<T>` source is the translated-list case of PyPy's
+    /// `list.extend`; an arbitrary `IntoIterator` is not.  Pin both sides to
+    /// production LLBC so the frontend never broadens the bridge to Map or a
+    /// custom iterator.
+    #[test]
+    #[ignore]
+    fn vec_extend_retargets_only_concrete_vec_sources() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let count = |function: &str, leaf: &str| {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|e| panic!("lower {function}: {e}"));
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            if segments == &["vec", "Vec", leaf]
+                    )
+                })
+                .count()
+        };
+
+        for function in [
+            "pyre_interpreter::argument::combine_starargs_wrapped",
+            "pyre_interpreter::argument::combine_starstarargs_wrapped",
+            "pyre_interpreter::objspace::descroperation::list_repeat",
+        ] {
+            assert_eq!(count(function, "extend"), 0, "{function}");
+            assert!(count(function, "extend_from_slice") >= 1, "{function}");
+        }
+        let map_only = "pyre_interpreter::baseobjspace::generator_unpack_into";
+        assert_eq!(
+            count(map_only, "extend_from_slice"),
+            0,
+            "{map_only}: an iterator source must not take the list-to-list bridge"
+        );
+        assert!(count(map_only, "extend") >= 1, "{map_only}");
+
+        // This function has both a concrete Vec source and a Map source.  The
+        // former may bridge, but the latter must remain visible as `extend`.
+        let mixed = "pyre_interpreter::_structseq::new_instance_with_extra";
+        assert!(count(mixed, "extend_from_slice") >= 1, "{mixed}");
+        assert!(count(mixed, "extend") >= 1, "{mixed}");
     }
 
     /// Anchor the `&self` `Option::is_some` fold to the real lowered IR of
@@ -33245,7 +33599,7 @@ mod tests {
     /// `gettypeobject` (`gettypefor(..).map_or(PY_NULL, |p| p.as_ptr())`)
     /// must fold its `gettypefor` match through the niche
     /// `Option<NonNull<PyObject>>` path now that `gettypefor` returns a
-    /// one-word niche Option: the discriminant is a `ptr_ne` null-test
+    /// one-word niche Option: the map_or rewrite uses a `ptr_ne` null-test
     /// (`base != null_mut()`), NOT an aggregate `__discriminant` FieldRead,
     /// and the null is a `null_mut()` call (repr-adaptive) rather than a
     /// fixed-GCREF `ConstRefNull`.  Guards against a regression where the
@@ -33286,7 +33640,7 @@ mod tests {
             null_muts >= 1,
             "gettypeobject: expected a null_mut() feeding the niche ptr null-test"
         );
-        // The niche discriminant is a `ne` pointer null-test, and no
+        // The map_or niche discriminant contains a `ne` pointer null-test, and no
         // `__discriminant` FieldRead survives on the niche `gettypefor` result.
         let has_ne = graph
             .blocks
@@ -33330,16 +33684,29 @@ mod tests {
         let graph = super::lower_function(&llbc, "object_functionstr_type_name")
             .expect("lower object_functionstr_type_name");
 
-        // The niche match's discriminant is a `ne` pointer null-test.  It is
-        // routed through the `If` path (`set_branch`), which wraps the `ne` in
-        // an idempotent `bool` UnaryOp and switches on that wrapped var — so
-        // locate the block whose exitswitch is a `bool` UnaryOp over a `ne`.
-        let ne_result_ids: std::collections::HashSet<u64> = graph
+        // The niche match's Some-discriminant is `not (base is None)`. It is
+        // routed through the `If` path (`set_branch`), which may wrap the final
+        // bool in an idempotent `bool` UnaryOp. Locate switches on that final
+        // `eq(is_none, false)` value (or its wrapper).
+        let is_result_ids: std::collections::HashSet<u64> = graph
             .blocks
             .iter()
             .flat_map(|b| b.operations.iter())
             .filter_map(|op| match &op.kind {
-                OpKind::BinOp { op: name, .. } if name == "ne" => {
+                OpKind::BinOp { op: name, .. } if name == "is_" => {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect();
+        let some_result_ids: std::collections::HashSet<u64> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op: name, lhs, .. }
+                    if name == "eq" && is_result_ids.contains(&lhs.id()) =>
+                {
                     op.result.as_ref().map(|v| v.id())
                 }
                 _ => None,
@@ -33354,10 +33721,12 @@ mod tests {
             let switches_on_nulltest = b.operations.iter().any(|op| {
                 op.result.as_ref() == Some(sw)
                     && match &op.kind {
-                        OpKind::BinOp { op: name, .. } => name == "ne",
+                        OpKind::BinOp { op: name, lhs, .. } => {
+                            name == "eq" && is_result_ids.contains(&lhs.id())
+                        }
                         OpKind::UnaryOp {
                             op: name, operand, ..
-                        } => name == "bool" && ne_result_ids.contains(&operand.id()),
+                        } => name == "bool" && some_result_ids.contains(&operand.id()),
                         _ => false,
                     }
             });
@@ -33378,7 +33747,7 @@ mod tests {
         }
         assert!(
             checked >= 1,
-            "object_functionstr_type_name: expected a niche `ne` null-test switch block"
+            "object_functionstr_type_name: expected a niche identity-null-test switch block"
         );
     }
 
@@ -33471,6 +33840,62 @@ mod tests {
         assert_eq!(
             pos0_reads, 0,
             "the &mut niche arm must keep folding __pos_0"
+        );
+    }
+
+    /// PyPy `BuiltinCode.docstring` is a nullable RPython string and
+    /// `getdocstring` delegates to `space.newtext_or_none`: there is no enum
+    /// object carrying a `__discriminant` attribute. Rust spells the field as
+    /// `Option<&'static str>`, but the front's `SomeString` projection must
+    /// survive through that Option as one nullable GC pointer.
+    #[test]
+    #[ignore]
+    fn builtin_docstring_option_str_is_nullable_somestring() {
+        use crate::model::OpKind;
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "builtin_code_get_docstring")
+            .expect("lower builtin_code_get_docstring");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(&op.kind, OpKind::FieldRead { field, .. }
+                    if field.name == "__discriminant"))
+                .count(),
+            0,
+            "Option<&str> must test the nullable SomeString, not read an enum tag"
+        );
+        assert!(
+            ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_")),
+            "Option<&str> match must contain an identity null-test"
+        );
+    }
+
+    /// PyPy `W_TextIOWrapper.pending_bytes` is `None` or one ordinary list.
+    /// The Rust `Option<Vec<Vec<u8>>>` spelling therefore translates to a
+    /// nullable `SomeList`, not an enum shell around the list.
+    #[test]
+    #[ignore]
+    fn textio_pending_bytes_option_vec_is_nullable_somelist() {
+        use crate::model::OpKind;
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "write_flush").expect("lower TextIOWrapper.write_flush");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(&op.kind, OpKind::FieldRead { field, .. }
+                    if field.name == "__discriminant"))
+                .count(),
+            0,
+            "Option<Vec<_>> must test the nullable SomeList, not read an enum tag"
+        );
+        assert!(
+            !ops().any(|op| matches!(&op.kind,
+                OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                    if name == "is_some" || name == "is_none")),
+            "the Option predicate must not survive as a residual Rust method"
         );
     }
 
@@ -33755,6 +34180,97 @@ mod tests {
         );
     }
 
+    /// The Rust trait-object spelling of PyPy's
+    /// `W_DictMultiObject.getitem` / `getitem_str` strategy dispatch must
+    /// retain both halves RPython's PBC call carries: the concrete vtable
+    /// field read and the closed `DictStrategy` implementation family.
+    /// This uses the real extracted owner because a hand-written fixture can
+    /// accidentally make the trait leaf and vtable field shape agree.
+    #[test]
+    #[ignore]
+    fn dict_strategy_vtable_call_keeps_its_family_identity() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+        for (function, method) in [
+            ("w_dict_lookup", "getitem"),
+            ("w_dict_getitem_str_hashed", "getitem_str_hashed"),
+        ] {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|error| panic!("lower {function}: {error}"));
+            let calls: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter_map(|op| match &op.kind {
+                    OpKind::IndirectCall {
+                        funcptr,
+                        family_key: Some(family_key),
+                        ..
+                    } => Some((funcptr.clone(), family_key.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                calls.len(),
+                1,
+                "{function} must carry one DictStrategy vtable call: {calls:?}"
+            );
+            assert_eq!(
+                calls[0].1,
+                ("DictStrategy".to_string(), method.to_string()),
+                "{function}'s MIR vtable slot must name the same PBC family as the trait impls"
+            );
+            let funcptr = &calls[0].0;
+            let producers: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter(|op| op.result.as_ref() == Some(funcptr))
+                .collect();
+            assert_eq!(
+                producers.len(),
+                1,
+                "{function}'s indirect funcptr must have one concrete producer"
+            );
+            assert!(
+                matches!(
+                    &producers[0].kind,
+                    OpKind::FieldRead { field, ty: ValueType::Int, .. }
+                        if field.name == format!("method_{method}")
+                ),
+                "{function}'s vtable method pointer must be a raw-pointer/int FieldRead: {:?}",
+                producers[0].kind
+            );
+        }
+
+        let program = super::build_semantic_program_from_llbc(&llbc)
+            .expect("build semantic pyre-object program");
+        for method in ["getitem", "getitem_str_hashed"] {
+            let members: Vec<_> = program
+                .functions
+                .iter()
+                .filter(|function| {
+                    function.name == method
+                        && function.trait_root.as_deref() == Some("DictStrategy")
+                })
+                .map(|function| (function.self_ty_root.clone(), function.return_type.clone()))
+                .collect();
+            assert!(
+                members.iter().any(|(owner, _)| owner.is_some()),
+                "DictStrategy.{method} must retain concrete impl owners: {members:?}"
+            );
+            assert!(
+                members
+                    .iter()
+                    .all(|(_, result)| result.as_deref() == Some("ref")),
+                "every DictStrategy.{method} PBC member must carry FuncType.RESULT: {members:?}"
+            );
+        }
+    }
+
     /// The Sized gate: a shared reference to a fat pointee (`&[T]`, spelled
     /// `{"Ref":[_, {"Slice": elem}, "Shared"]}`) has no ADT def-id, so
     /// `type_node_shared_ref_pointee` + `adt_node_def_id` must NOT accept it;
@@ -33848,7 +34364,7 @@ mod tests {
 
     /// End-to-end: `str_slice_args -> Result<Option<&Wtf8>, PyError>` (matched by
     /// `startswith`/`endswith`). Because `Wtf8` is an unsized DST, its
-    /// `Option<&Wtf8>` must NOT niche-fold — no pointer-null `ne` discriminant
+    /// `Option<&Wtf8>` must NOT niche-fold — no pointer identity-null discriminant
     /// against a `null_mut()` may appear, or the fat pointer's length word is
     /// lost. The residual/aggregate Option handling must survive. Loads the real
     /// LLBC, ignored.
@@ -33859,7 +34375,7 @@ mod tests {
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "str_slice_args").expect("lower str_slice_args");
-        // The niche discriminant fold emits `ne(base, null_mut())`; a declined
+        // The niche discriminant fold emits an identity test with `null_mut()`; a declined
         // Option keeps a `null_mut` builtin ONLY when genuinely niche. Assert no
         // `null_mut` call is synthesised for this graph's Option<&Wtf8> — the fat
         // ref must not be treated as a one-word niche.
@@ -34514,6 +35030,57 @@ mod tests {
         }
     }
 
+    /// PyPy initializes `W_UnicodeObject._index_storage` with
+    /// `lltype.nullptr(UTF8_INDEX_STORAGE)`, where the storage is a typed
+    /// `GcArray`.  Rust spells the same slot `*mut Vec<Utf8LocElem>`; its null
+    /// constructor value must therefore be narrowed to the projected list
+    /// repr before the field write, not left as a classdef-less pointer that
+    /// later conflicts with `create_utf8_index_storage`'s list value.
+    #[test]
+    #[ignore]
+    fn unicode_index_storage_null_keeps_gcarray_repr() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "w_str_from_wtf8").expect("lower w_str_from_wtf8");
+        let value = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, value, .. } if field.name == "index_storage" => {
+                    match value {
+                        LinkArg::Value(value) => Some(value.clone()),
+                        LinkArg::Const(_) => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("W_UnicodeObject.index_storage write");
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    op.result.as_ref() == Some(&value)
+                        && matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments.first().map(String::as_str)
+                                == Some("__cast_instance_intrinsic")
+                                && segments.get(1).is_some_and(|root| root.starts_with("Vec<"))
+                        )
+                }),
+            "index_storage null must narrow to the Vec/GcArray list repr"
+        );
+    }
+
     /// `Wtf8::as_str` is fallible for a lone surrogate.  PyPy keeps the
     /// unicode value plus the runtime validity branch; the lifted graph must
     /// therefore contain the scalar validity residual and a tagged Result,
@@ -34572,6 +35139,81 @@ mod tests {
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "py_repr_wtf8").expect("lower py_repr_wtf8");
+        // Prove every append/build receiver is rooted at a builder ctor.
+        // Start from every phi as a candidate and remove any phi fed by a
+        // non-candidate; this greatest fixed point admits loop-carried
+        // builders while rejecting the old `to_wtf8_buf` identity value
+        // (a plain SomeString producer) and every phi reachable from it.
+        let builder_roots: std::collections::HashSet<u64> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &[crate::runtime_names::shims::STRINGBUILDER_NEW])
+                .then(|| op.result.as_ref().expect("builder new result").id())
+            })
+            .collect();
+        let mut builder_values = builder_roots.clone();
+        builder_values.extend(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.inputargs)
+                .map(|input| input.id()),
+        );
+        loop {
+            let mut changed = false;
+            for block in &graph.blocks {
+                for (pos, input) in block.inputargs.iter().enumerate() {
+                    let incoming: Vec<_> = graph
+                        .blocks
+                        .iter()
+                        .flat_map(|source| &source.exits)
+                        .filter(|link| link.target == block.id)
+                        .filter_map(|link| link.args.get(pos))
+                        .collect();
+                    if (incoming.is_empty()
+                        || incoming.iter().any(|arg| {
+                            arg.as_variable()
+                                .is_none_or(|value| !builder_values.contains(&value.id()))
+                        }))
+                        && !builder_roots.contains(&input.id())
+                    {
+                        changed |= builder_values.remove(&input.id());
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let unproven_builder_receivers: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                block.operations.iter().filter_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        ..
+                    } if matches!(segments.as_slice(), [marker]
+                        if marker == crate::runtime_names::shims::STRINGBUILDER_APPEND
+                            || marker == crate::runtime_names::shims::STRINGBUILDER_BUILD) =>
+                    {
+                        args.first()
+                            .filter(|recv| !builder_values.contains(&recv.id()))
+                            .map(|recv| (block.id, segments.clone(), recv.clone()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(
+            unproven_builder_receivers.is_empty(),
+            "builder operations must receive a value rooted at newstringbuilder: \
+             {unproven_builder_receivers:#?}"
+        );
         let residual: Vec<_> = graph
             .blocks
             .iter()
@@ -35114,6 +35756,157 @@ mod tests {
                     )
             }),
             "dstrategy assignment must retain the declared DictStrategyRef class"
+        );
+    }
+
+    /// `BufferRequest` is a payload-free enum and therefore travels through
+    /// the translated graph as its integer discriminant.  Its inherent
+    /// methods remain statically selected Rust functions; lowering them as
+    /// Python bound-method lookups would ask `SomeInteger` for
+    /// `require_contiguous` / `flags` and block annotation.
+    #[test]
+    #[ignore]
+    fn buffer_request_scalar_methods_keep_direct_graph_paths() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::baseobjspace::buffer_bytes")
+            .expect("lower buffer_bytes");
+
+        for method in ["require_contiguous", "flags"] {
+            assert!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments.last().map(String::as_str) == Some(method)
+                                && segments.iter().any(|part| part == "BufferRequest")
+                        )
+                    }),
+                "BufferRequest::{method} must be a direct static call"
+            );
+            assert!(
+                !graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::Method { name, .. },
+                                ..
+                            } if name == method
+                        )
+                    }),
+                "BufferRequest::{method} must not become an integer getattr"
+            );
+        }
+    }
+
+    /// `mini_buffer_params` constructs `Option<(*mut u8, usize)>`.  The Rust
+    /// payload is inline, but the translator gives the internal aggregate one
+    /// GC-managed `Tuple<...>` class identity; the per-instantiation `Some`
+    /// row must therefore be seeded with that same identity before any shared
+    /// `InstanceRepr` can cache the variant layout.
+    #[test]
+    #[ignore]
+    fn mini_buffer_params_preregisters_tuple_payload_row() {
+        use crate::annotator::model::SomeValue;
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                std::slice::from_ref(&llbc),
+                crate::HostStaticAddrs::default(),
+                &["module::_cffi_backend::cbuffer"],
+                &["mini_buffer_params", "call_once"],
+            )
+            .expect("build mini_buffer_params semantic program");
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name == "mini_buffer_params"),
+            "mini_buffer_params semantic function"
+        );
+        let tuple_owner = program
+            .functions
+            .iter()
+            .flat_map(|function| &function.graph.blocks)
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name == "Tuple<*mut u8,usize>" => Some(name.clone()),
+                _ => None,
+            })
+            .expect("concrete tuple aggregate class");
+
+        let (variant_owner, rows) = program
+            .struct_fields
+            .fields
+            .iter()
+            .find(|(owner, _)| owner.ends_with("Option<(*mut u8,usize)>::Some"))
+            .expect("concrete Option<tuple>::Some registry row");
+        assert_eq!(
+            rows,
+            &vec![("__pos_0".to_string(), "(*mut u8,usize)".to_string())],
+            "the concrete tuple payload must not fall back to the ??T template"
+        );
+        let variant_owner = variant_owner.clone();
+
+        let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+        bk.set_struct_fields(std::rc::Rc::new(program.struct_fields));
+        bk.set_enum_variant_by_discriminant(std::rc::Rc::new(program.enum_variant_by_discriminant));
+        for root in bk.struct_root_names() {
+            bk.getuniqueclassdef_for_struct_root(&root)
+                .expect("project struct root");
+        }
+        bk.pre_register_enum_variant_classes();
+
+        let enum_root = variant_owner
+            .strip_suffix("::Some")
+            .expect("Some-qualified owner");
+        let variant = bk
+            .getuniqueclassdef_for_enum_variant(enum_root, "Some")
+            .expect("resolve pre-registered Some classdef");
+        let variant = variant.borrow();
+        let Some(SomeValue::Instance(payload)) =
+            variant.attrs.get("__pos_0").map(|attr| &attr.s_value)
+        else {
+            panic!(
+                "Some.__pos_0 must carry the concrete tuple class, got {:?}",
+                variant.attrs.get("__pos_0").map(|attr| &attr.s_value)
+            )
+        };
+        assert_eq!(
+            payload
+                .classdef
+                .as_ref()
+                .expect("tuple payload classdef")
+                .borrow()
+                .name,
+            tuple_owner,
+            "the pre-registered payload and constructor must share one class"
+        );
+        assert!(
+            !variant.attrs["__pos_0"].readonly,
+            "the constructor payload must be an instance field before repr setup"
         );
     }
 

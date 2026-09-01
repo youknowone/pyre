@@ -2,7 +2,7 @@
 # A guard-failure bridge re-enters an inlined helper containing exact-integer
 # residual arithmetic.  The independent recurrence makes the clamp guard take
 # a different pattern while the bignum hash keeps the helper residual live.
-N = 1200
+N = 2400
 BIGP = 18446744073709551629
 BASE = 1000003
 P = 9223372036854775783

@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=76
 # gh#495 guard: inlined callee consumes user iterator whose next mutates state.
 # FOR loop over user iterator INSIDE branch-bearing inlined callee; __next__ mutates shared counter
-N = 30000
+N = 60000
 class It:
     def __init__(self): self.pos = 0; self.lim = 3
     def __iter__(self):

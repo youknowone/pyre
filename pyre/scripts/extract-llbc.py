@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from llbc_extract import CrateSpec, run_cli  # noqa: E402
+from llbc_extract import CrateSpec, llbc_dest_path, run_cli  # noqa: E402
 
 
 # Each successful extraction persists the repo-relative Local entries from the
@@ -32,6 +32,16 @@ from llbc_extract import CrateSpec, run_cli  # noqa: E402
 # cross-process determinism set compared byte-equal across the flag).
 # `--no-typecheck` was tried beside it and made the pass slower.
 CHARON_ARGS = ["--hide-marker-traits"]
+
+# `pyre-native` is the stable native/backend boundary.  Charon follows local
+# workspace dependencies by default, so merely moving an implementation into
+# that crate does *not* keep it out of an extracting crate's ULLBC.  Keep the
+# crate root opaque explicitly: callers retain declarations for residual calls
+# and opaque pointer/value types, while compression/crypto/TLS bodies are never
+# translated into the interpreter or JIT artefacts.  Reusable pure engines live
+# in rustpython-common instead; the output audit below guards their foreign
+# boundary as well.
+PYRE_RUNTIME_CHARON_ARGS = [*CHARON_ARGS, "--opaque", "pyre_native"]
 
 SPECS: dict[str, CrateSpec] = {
     # `corpus` lives outside the crate graph the metadata walk sees, so its
@@ -73,21 +83,21 @@ SPECS: dict[str, CrateSpec] = {
         name="pyre-module",
         crate_dir=ROOT / "pyre" / "pyre-module",
         output_name="pyre-module.ullbc",
-        charon_args=CHARON_ARGS,
+        charon_args=PYRE_RUNTIME_CHARON_ARGS,
         cargo_args=["--features", "pyre-interpreter/{features}"],
     ),
     "pyre-interpreter": CrateSpec(
         name="pyre-interpreter",
         crate_dir=ROOT / "pyre" / "pyre-interpreter",
         output_name="pyre-interpreter.ullbc",
-        charon_args=CHARON_ARGS,
+        charon_args=PYRE_RUNTIME_CHARON_ARGS,
         cargo_args=["--features", "{features}"],
     ),
     "pyre-jit": CrateSpec(
         name="pyre-jit",
         crate_dir=ROOT / "pyre" / "pyre-jit",
         output_name="pyre-jit.ullbc",
-        charon_args=CHARON_ARGS,
+        charon_args=PYRE_RUNTIME_CHARON_ARGS,
         # `--no-default-features` drops `prepass` and nothing else (`dynasm` is
         # the other default and is named): `pyre-jit-trace`'s build script
         # then writes its placeholders without build-depending on a host copy
@@ -155,6 +165,77 @@ def main() -> None:
         layout_targets=LAYOUT_TARGETS,
         layout_target_rustflags=LAYOUT_TARGET_RUSTFLAGS,
     )
+
+    # A crate move without this output check regressed once already: Charon
+    # follows workspace dependencies, so `pyre-native` appeared to be outside
+    # the interpreter while 83 of its items still had Transparent bodies in
+    # `pyre-interpreter.ullbc`.  Scan one item record at a time (the JSON is a
+    # single ~GB line, so line iteration or json.load is not viable) and refuse
+    # any runtime artefact that translated a native item body.
+    modes_without_an_artefact = {"--fingerprint", "--list-inputs", "--self-test"}
+    if not modes_without_an_artefact.intersection(sys.argv[1:]):
+        requested = [arg for arg in sys.argv[1:] if not arg.startswith("-")]
+        crates = requested or DEFAULT_CRATES
+        dest_dir = llbc_dest_path(ROOT / "build" / "llbc", ROOT)
+        for crate in crates:
+            if crate not in {"pyre-module", "pyre-interpreter", "pyre-jit"}:
+                continue
+            artefact = dest_dir / SPECS[crate].output_name
+            _assert_runtime_library_items_opaque(artefact)
+
+
+def _assert_runtime_library_items_opaque(path: Path) -> None:
+    """Refuse translated native or rustpython-common engine bodies."""
+    delimiter = b'{"def_id":'
+    native_prefix = b',"item_meta":{"name":[{"Ident":["pyre_native",0]'
+    common_prefix = b',"item_meta":{"name":[{"Ident":["rustpython_common",0]'
+    # `inet` reaches an artefact only on a target with no host socket layer,
+    # since `_socket` imports it exactly there; on the hosts this script
+    # extracts from, that entry matches nothing and guards the extraction
+    # targets rather than the current ones.
+    common_engine_prefixes = (
+        common_prefix + b'},{"Ident":["binascii",0]',
+        common_prefix + b'},{"Ident":["inet",0]',
+        common_prefix + b'},{"Ident":["json",0]',
+        common_prefix + b'},{"Ident":["encodings",0]},{"Ident":["cjk",0]',
+    )
+    opacity_key = b'"opacity":"'
+    buffer = bytearray()
+
+    def check_record(record: bytes | bytearray) -> None:
+        comma = record.find(b",")
+        if comma < 0:
+            return
+        item = record[comma:]
+        # A workspace-local body is only ever legitimate as `Opaque`; a crate
+        # Charon never enters is `Foreign` instead, and either answer keeps the
+        # engine out of the artefact.
+        if item.startswith(native_prefix):
+            boundary, allowed = "pyre_native", {"Opaque"}
+        elif any(item.startswith(prefix) for prefix in common_engine_prefixes):
+            boundary, allowed = "rustpython_common engine", {"Opaque", "Foreign"}
+        else:
+            return
+        start = record.find(opacity_key)
+        if start < 0:
+            raise SystemExit(f"extract-llbc.py: {path} {boundary} item has no opacity")
+        start += len(opacity_key)
+        end = record.find(b'"', start)
+        opacity = bytes(record[start:end]).decode("ascii", errors="replace")
+        if opacity not in allowed:
+            raise SystemExit(
+                f"extract-llbc.py: {path} contains a {opacity} {boundary} item; "
+                "library bodies must stay outside runtime ULLBC"
+            )
+
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            buffer.extend(chunk)
+            records = buffer.split(delimiter)
+            for record in records[:-1]:
+                check_record(record)
+            buffer = bytearray(records[-1])
+    check_record(buffer)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=40
-N = 60000
+N = 120000
 M = 4000
 
 # `cls.__name__` read from inside a method the enclosing `for` loop inlines.

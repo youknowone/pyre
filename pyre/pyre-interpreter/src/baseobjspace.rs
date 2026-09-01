@@ -19010,6 +19010,87 @@ unsafe fn leak_generator_iteration(mut e: PyError, message: &str) -> PyError {
     PyError::from_exc_object(rt)
 }
 
+/// generator.py `should_not_inline`.
+///
+/// A generator body with two or more `yield`s is not inlined into the
+/// caller's trace; upstream takes `generatorentry_driver`'s own merge point
+/// for it instead (`send_ex`).  Counting the yields is the whole test — the
+/// comment there records it as an approximate fix for the near-infinite
+/// slow-down a several-yield generator produced.
+pub fn should_not_inline(code: &crate::CodeObject) -> bool {
+    let mut count_yields = 0usize;
+    for index in 0..code.instructions.len() {
+        if matches!(
+            code.instructions[index].op,
+            crate::bytecode::Instruction::YieldValue { .. }
+        ) {
+            count_yields += 1;
+            if count_yields >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// What a suspended generator offers the tracer at a `FOR_ITER`.
+///
+/// The fields are the ones `_invoke_execute_frame` and `execute_frame` read
+/// before the resumed frame runs a single opcode, so a walker holding this
+/// has already answered every question those two ask.
+pub struct GeneratorResume {
+    /// `GeneratorIterator`'s type — the class the walker guards on.
+    pub w_type: PyObjectRef,
+    /// `self.pycode`, the third green of the driver this resume enters.
+    pub w_pycode: PyObjectRef,
+    /// `self.frame`, the suspended frame the resume runs.
+    pub frame: *mut crate::pyframe::PyFrame,
+    /// `frame.last_instr` — the `YIELD_VALUE` the frame is parked on.
+    /// `execute_frame` documents execution as starting just after it.
+    pub last_instr: isize,
+}
+
+/// The `next_fast_path` of a suspended generator: the shape a `FOR_ITER`
+/// needs to resume one into the trace instead of calling `jit_next`.
+///
+/// `next_fast_path` itself cannot serve — it opens on `is_instance`, and a
+/// generator is not a user-class instance, so its `__next__` lookup never
+/// runs.  The tests here are `_send_ex`'s and `_invoke_execute_frame`'s own:
+/// a started, unexhausted, non-running generator with a live frame parked on
+/// a `YIELD_VALUE`.  A just-started generator (`last_instr == -1`) is
+/// excluded because its resume runs the prologue rather than a suspension.
+///
+/// # Safety
+/// `w_obj` must be a live object pointer.
+pub unsafe fn generator_resume_fast_path(w_obj: PyObjectRef) -> Option<GeneratorResume> {
+    unsafe {
+        if !pyre_object::generator::is_generator(w_obj) {
+            return None;
+        }
+        if pyre_object::generator::w_generator_is_exhausted(w_obj)
+            || pyre_object::generator::w_generator_is_running(w_obj)
+            || !pyre_object::generator::w_generator_is_started(w_obj)
+        {
+            return None;
+        }
+        let frame =
+            pyre_object::generator::w_generator_get_frame(w_obj) as *mut crate::pyframe::PyFrame;
+        if frame.is_null() {
+            return None;
+        }
+        let last_instr = (*frame).last_instr;
+        if last_instr < 0 {
+            return None;
+        }
+        Some(GeneratorResume {
+            w_type: (*w_obj).ob_type as PyObjectRef,
+            w_pycode: pyre_object::generator::w_generator_get_pycode(w_obj),
+            frame,
+            last_instr,
+        })
+    }
+}
+
 /// PyPy: GeneratorIterator.next() — equivalent to __next__
 fn generator_next(gen_obj: PyObjectRef) -> PyResult {
     generator_send_ex(gen_obj, w_none(), None, None, false)
@@ -19825,6 +19906,33 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
         }
         let frame = &*(frame_ptr as *const crate::pyframe::PyFrame);
         let last_instr = frame.last_instr;
+        // PyPy `AsyncGenerator._finalize_`: once `init_hooks` captured the
+        // interpreter-owned finalizer, it owns finalization regardless of the
+        // suspended instruction's exception-table coverage.  The generic
+        // generator cleanup optimization below applies only when no async-gen
+        // finalizer was installed.
+        if is_async_generator(gen_obj) && !w_generator_is_exhausted(gen_obj) {
+            let finalizer = w_async_generator_get_finalizer(gen_obj);
+            if !finalizer.is_null() {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let base = pyre_object::gc_roots::pin_roots(&[gen_obj, finalizer]);
+                return match crate::call::call_function_impl_result(
+                    pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    &[pyre_object::gc_roots::shadow_stack_get(base)],
+                ) {
+                    Ok(_) => Ok(w_none()),
+                    Err(mut err) => {
+                        let gen_obj = pyre_object::gc_roots::shadow_stack_get(base);
+                        err.write_unraisable(
+                            w_none(),
+                            Wtf8::new("async generator finalizer"),
+                            gen_obj,
+                        );
+                        Ok(w_none())
+                    }
+                };
+            }
+        }
         // generator.py Coroutine._finalize_: warn before running the
         // GeneratorOrCoroutine finalizer. The flag is set before importing or
         // calling Python code so a failing warning hook cannot warn twice.
@@ -19844,22 +19952,6 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
         let code = frame.code();
         let pc_bytes = (last_instr as u32) * 2; // last_instr is a word index; table is byte offsets
         if crate::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes).is_some() {
-            if is_async_generator(gen_obj) {
-                let finalizer = w_async_generator_get_finalizer(gen_obj);
-                if !finalizer.is_null() {
-                    return match crate::call::call_function_impl_result(finalizer, &[gen_obj]) {
-                        Ok(_) => Ok(w_none()),
-                        Err(mut err) => {
-                            err.write_unraisable(
-                                w_none(),
-                                Wtf8::new("async generator finalizer"),
-                                gen_obj,
-                            );
-                            Ok(w_none())
-                        }
-                    };
-                }
-            }
             return generator_close_impl(gen_obj, false);
         }
     }

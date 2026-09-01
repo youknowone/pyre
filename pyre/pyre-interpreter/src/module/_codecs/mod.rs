@@ -58,14 +58,12 @@ struct CodecState {
 
 impl CodecState {
     fn new() -> Self {
-        let mut state = Self {
+        Self {
             codec_search_path: w_list_new(Vec::new()),
             codec_search_cache: w_dict_new(),
             codec_error_registry: w_dict_new(),
             codec_need_encodings: true,
-        };
-        register_builtin_error_handlers(&mut state);
-        state
+        }
     }
 }
 
@@ -475,30 +473,38 @@ fn surrogateescape_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
 }
 
-fn register_builtin_error_handlers(state: &mut CodecState) {
-    let handlers: [(
-        &str,
-        fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
-    ); 8] = [
-        ("strict", strict_errors),
-        ("ignore", ignore_errors),
-        ("replace", replace_errors),
-        ("xmlcharrefreplace", xmlcharrefreplace_errors),
-        ("backslashreplace", backslashreplace_errors),
-        ("surrogateescape", surrogateescape_errors),
-        ("surrogatepass", surrogatepass_errors),
-        ("namereplace", namereplace_errors),
-    ];
-    for (name, handler) in handlers {
-        let w_handler = crate::make_builtin_function_with_arity(name, handler, 1);
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str(
-                state.codec_error_registry,
-                name,
-                w_handler,
-            );
+// PyPy `pypy/module/_codecs/interp_codecs.py:560-568` marks this module-startup
+// registry population `@not_rpython`: `moduledef.py:87-100` calls it while the
+// MixedModule is installed, not from the translated `CodecState` constructor.
+// `importing::install_builtin_modules` is pyre's matching host-only install
+// phase and calls this function after registering `_codecs`.
+#[majit_macros::not_rpython]
+pub(crate) fn register_builtin_error_handlers() {
+    with_codec_state(|state| {
+        let handlers: [(
+            &str,
+            fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+        ); 8] = [
+            ("strict", strict_errors),
+            ("ignore", ignore_errors),
+            ("replace", replace_errors),
+            ("xmlcharrefreplace", xmlcharrefreplace_errors),
+            ("backslashreplace", backslashreplace_errors),
+            ("surrogateescape", surrogateescape_errors),
+            ("surrogatepass", surrogatepass_errors),
+            ("namereplace", namereplace_errors),
+        ];
+        for (name, handler) in handlers {
+            let w_handler = crate::make_builtin_function_with_arity(name, handler, 1);
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(
+                    state.codec_error_registry,
+                    name,
+                    w_handler,
+                );
+            }
         }
-    }
+    });
 }
 
 /// `interp_codecs.py lookup_error`.  The direct codec loops implement

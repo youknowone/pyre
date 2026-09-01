@@ -5,7 +5,7 @@
 # so the guard failure resumes in the blackhole and the exception must hop
 # floordiv -> inner finally -> reraise -> outer except entirely under blackhole
 # control. Benches that raise from iteration 1 do not exercise this path.
-N = 40000
+N = 80000
 
 
 def nested(n):

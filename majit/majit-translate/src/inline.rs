@@ -594,11 +594,13 @@ pub(crate) fn remap_op_kind(
             funcptr,
             args,
             graphs,
+            family_key,
             result_ty,
         } => OpKind::IndirectCall {
             funcptr: remap_var(funcptr),
             args: args.iter().map(&remap_var).collect(),
             graphs: graphs.clone(),
+            family_key: family_key.clone(),
             result_ty: result_ty.clone(),
         },
         OpKind::RecordQuasiImmutField {

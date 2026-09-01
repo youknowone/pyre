@@ -30,9 +30,14 @@
 //! returned reference remains protected until the caller roots it before its
 //! next collection-capable call.
 
-use parking_lot::{Condvar, Mutex};
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+// `os_thread.reinit_threads` calls `rthread.thread_after_fork` while the
+// vanished parent mutators are still represented by native waiters.  Keep the
+// STW pair on OS-backed primitives: a parking_lot condvar also inherits its
+// process-global userspace waiter queue, and waking that queue in the child
+// deadlocks before the rest of the after-fork hooks can rebuild thread state.
+use std::sync::{Condvar, Mutex};
 
 use crate::collector::MiniMarkGC;
 // The singleton is concrete, but its `GcAllocator` methods still need the
@@ -103,7 +108,7 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
     if GC_INITIALIZED.load(Ordering::Acquire) {
         return;
     }
-    let _guard = GC_SYNC.install_mutex.lock();
+    let _guard = GC_SYNC.install_mutex.lock().unwrap();
     // Double-check after acquiring mutex.
     if GC_INITIALIZED.load(Ordering::Acquire) {
         return;
@@ -127,7 +132,7 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
 /// oldgen residue or stale registered roots cannot corrupt this test's
 /// collections.
 pub fn replace_singleton_leaking_old(gc: Box<MiniMarkGC>) {
-    let _guard = GC_SYNC.install_mutex.lock();
+    let _guard = GC_SYNC.install_mutex.lock().unwrap();
     // SAFETY: install_mutex held; the gc_stress harness runs tests serially, so
     // no concurrent gc_op is in flight during the swap.
     unsafe {
@@ -255,10 +260,11 @@ pub fn register_thread() {
         FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
     }
 
-    let mut state = GC_SYNC.quiesce.lock();
-    GC_SYNC.resumed.wait_while(&mut state, |_| {
-        GC_SYNC.stw_requested.load(Ordering::Acquire)
-    });
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
+    state = GC_SYNC
+        .resumed
+        .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
+        .unwrap();
     state.running += 1;
     GC_THREAD.with(|t| t.running.set(true));
     GC_THREAD.with(|t| t.registered.set(true));
@@ -304,7 +310,7 @@ pub fn unregister_thread() {
     if crate::rgil::am_i_holding_the_gil() {
         crate::rgil::release();
     }
-    let mut state = GC_SYNC.quiesce.lock();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     // A thread that came in through `register_thread_parked` sits outside the
     // census between callbacks, so there is nothing to subtract for it.
     if GC_THREAD.with(|t| t.running.replace(false)) {
@@ -364,10 +370,11 @@ impl Drop for BlockingGuard {
         if !self.left_census {
             return;
         }
-        let mut state = GC_SYNC.quiesce.lock();
-        GC_SYNC.resumed.wait_while(&mut state, |_| {
-            GC_SYNC.stw_requested.load(Ordering::Acquire)
-        });
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
+        state = GC_SYNC
+            .resumed
+            .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
+            .unwrap();
         state.running += 1;
         assert!(
             !GC_THREAD.with(|t| t.running.replace(true)),
@@ -393,7 +400,7 @@ pub fn before_external_block() -> BlockingGuard {
     // leave, and nothing to rejoin when it ends.
     let left_census = GC_THREAD.with(|t| t.registered.get() && t.running.get());
     if left_census {
-        let mut state = GC_SYNC.quiesce.lock();
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
         GC_THREAD.with(|t| t.running.set(false));
         state.running = state
             .running
@@ -411,7 +418,7 @@ pub fn before_external_block() -> BlockingGuard {
 impl Drop for CallbackGuard {
     fn drop(&mut self) {
         if self.rejoined {
-            let mut state = GC_SYNC.quiesce.lock();
+            let mut state = GC_SYNC.quiesce.lock().unwrap();
             assert!(
                 GC_THREAD.with(|t| t.running.replace(false)),
                 "GC mutator left an external callback twice"
@@ -438,10 +445,11 @@ pub fn enter_external_callback() -> CallbackGuard {
     let running = GC_THREAD.with(|t| t.running.get());
     let mut rejoined = false;
     if registered && !running {
-        let mut state = GC_SYNC.quiesce.lock();
-        GC_SYNC.resumed.wait_while(&mut state, |_| {
-            GC_SYNC.stw_requested.load(Ordering::Acquire)
-        });
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
+        state = GC_SYNC
+            .resumed
+            .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
+            .unwrap();
         state.running += 1;
         GC_THREAD.with(|t| t.running.set(true));
         rejoined = true;
@@ -463,7 +471,7 @@ pub(crate) fn leave_running_for_gil() -> GilCensus {
     if !GC_THREAD.with(|t| t.registered.get() && t.running.get()) {
         return GilCensus { rejoin: false };
     }
-    let mut state = GC_SYNC.quiesce.lock();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     GC_THREAD.with(|t| t.running.set(false));
     state.running = state
         .running
@@ -480,7 +488,7 @@ pub(crate) fn rejoin_running_after_gil(census: GilCensus) {
     if !census.rejoin {
         return;
     }
-    let mut state = GC_SYNC.quiesce.lock();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     debug_assert!(
         !GC_SYNC.stw_requested.load(Ordering::Acquire),
         "the GIL was acquired while a collector was draining mutators"
@@ -529,7 +537,7 @@ pub fn after_fork_child() {
     // that did not survive the fork has no dispatch loop left to raise it in
     // the child.
     majit_ir::eval_breaker_word::memory_error_after_fork_child();
-    let mut state = GC_SYNC.quiesce.lock();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     state.running = usize::from(registered && running);
     GC_SYNC.stw_generation.fetch_add(1, Ordering::SeqCst);
     GC_SYNC.resumed.notify_all();
@@ -642,16 +650,17 @@ pub fn quiesce_mutators() -> StwGuard {
         };
     }
 
-    let mut state = GC_SYNC.quiesce.lock();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     GC_SYNC.stw_requested.store(true, Ordering::Release);
     majit_ir::eval_breaker_word::set_stw();
 
     let collector_is_running =
         GC_THREAD.with(|t| t.registered.get()) && GC_THREAD.with(|t| t.running.get());
     let drain_target = usize::from(collector_is_running);
-    GC_SYNC
+    state = GC_SYNC
         .quiesced
-        .wait_while(&mut state, |state| state.running != drain_target);
+        .wait_while(state, |state| state.running != drain_target)
+        .unwrap();
     drop(state);
     STW_OWNER.store(ident, Ordering::Release);
     STW_DEPTH.store(1, Ordering::Relaxed);
@@ -682,7 +691,7 @@ impl Drop for StwGuard {
         assert_eq!(remaining, 0, "outer STW guard dropped before nested guard");
         STW_OWNER.store(0, Ordering::Release);
 
-        let _state = GC_SYNC.quiesce.lock();
+        let _state = GC_SYNC.quiesce.lock().unwrap();
         GC_SYNC.stw_requested.store(false, Ordering::Release);
         majit_ir::eval_breaker_word::clear_stw();
         GC_SYNC.stw_generation.fetch_add(1, Ordering::Release);
@@ -763,7 +772,7 @@ fn park_until_stw_done() {
         return;
     }
 
-    let mut state = GC_SYNC.quiesce.lock();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     if !GC_SYNC.stw_requested.load(Ordering::Acquire) {
         return;
     }
@@ -777,9 +786,10 @@ fn park_until_stw_done() {
         .expect("RUNNING underflow entering dispatch safepoint");
     GC_SYNC.quiesced.notify_all();
 
-    GC_SYNC.resumed.wait_while(&mut state, |_| {
-        GC_SYNC.stw_requested.load(Ordering::Acquire)
-    });
+    state = GC_SYNC
+        .resumed
+        .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
+        .unwrap();
     state.running += 1;
     assert!(
         !GC_THREAD.with(|t| t.running.replace(true)),

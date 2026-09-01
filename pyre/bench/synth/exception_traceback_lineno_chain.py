@@ -8,7 +8,7 @@
 # raise coordinate before finishing. The pre-compile iterations report the call
 # line, so the shape has to be surveyed over the whole run rather than sampled
 # once: a single miscompiled frame turns one (name, lineno) tuple into two.
-N = 4000
+N = 8000
 
 
 def chain(traceback):

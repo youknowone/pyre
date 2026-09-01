@@ -5,7 +5,7 @@ Usage:
     python pyre/wasm_check.py [--reps N] [--timeout T] [BENCH_GLOB ...]
 
 Examples:
-    python pyre/wasm_check.py                  # all pyre/bench/*.py
+    python pyre/wasm_check.py                  # all pyre/bench + pyre/oracle scripts
     python pyre/wasm_check.py int_loop fib     # scripts matching these substrings
     python pyre/wasm_check.py --reps 3         # best-of-3 per (bench, engine)
 
@@ -27,6 +27,11 @@ import sys
 from pathlib import Path
 
 BENCH_DIR = "pyre/bench"
+# Scripts that exist to be run for their output rather than their speed.
+# They are collected here for the same reason the benchmarks are: this
+# harness compares stdout across host engines, and what it needs is
+# deterministic workloads, not fast ones.
+ORACLE_DIR = "pyre/oracle"
 EXE = ".exe" if sys.platform == "win32" else ""
 # Per-bench timeout (seconds). Override with --timeout.
 DEFAULT_TIMEOUT = 15
@@ -90,15 +95,20 @@ def find_runner() -> str:
 
 
 def collect_benches(filters: list[str]) -> list[Path]:
-    """Glob top-level pyre/bench/*.py, optionally filtering by substring.
+    """Glob top-level pyre/bench/*.py and pyre/oracle/*.py.
 
     Only top-level scripts are collected (not pyre/bench/synth/ or subdirs).
     Synthetic benchmarks under synth/ are pyre-interpreter-specific and are
     not expected to run correctly under the wasm path.
+
+    Both directories are collected because this harness wants deterministic
+    output, which the benchmarks and the oracle scripts both provide; only
+    `pyre/bench` is scored for speed. No name is filtered out here: a script
+    that does not belong in either directory is a thing to move, not to skip
+    silently.
     """
     all_scripts = sorted(Path(BENCH_DIR).glob("*.py"))
-    # Exclude tmp_ files
-    all_scripts = [s for s in all_scripts if not s.name.startswith("tmp_")]
+    all_scripts += sorted(Path(ORACLE_DIR).glob("*.py"))
     if not filters:
         return all_scripts
     matched = []

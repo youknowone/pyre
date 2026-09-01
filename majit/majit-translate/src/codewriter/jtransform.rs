@@ -1626,6 +1626,7 @@ impl<'a> Transformer<'a> {
                 funcptr,
                 args,
                 graphs,
+                family_key: _,
                 result_ty,
             } if self.config.classify_calls => self.lower_indirect_call_op(
                 op,
@@ -6842,6 +6843,7 @@ impl<'a> Transformer<'a> {
             name,
             owner_path: _,
             is_struct: _,
+            variant_tag: _,
         } = target
         else {
             return false;
@@ -7580,6 +7582,7 @@ fn remap_op(
             funcptr,
             args,
             graphs,
+            family_key,
             result_ty,
         } => {
             let remap_var = |var: &crate::flowspace::model::Variable| remap_value(var, aliases);
@@ -7587,6 +7590,7 @@ fn remap_op(
                 funcptr: remap_var(funcptr),
                 args: args.iter().map(remap_var).collect(),
                 graphs: graphs.clone(),
+                family_key: family_key.clone(),
                 result_ty: result_ty.clone(),
             }
         }
@@ -12542,6 +12546,65 @@ mod tests {
         match rewritten {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// Both root-stack operations keep their call.  `pin_root` publishes a
+    /// slot that bound `shadow_stack_get` residuals read back positionally,
+    /// and `reload_top_root` re-reads the slot after a collection may have
+    /// moved the object; a trace that keeps the pre-move word instead has no
+    /// other forwarding for it.
+    #[test]
+    fn gc_root_pin_and_reload_keep_their_calls() {
+        for leaf in ["pin_root", "reload_top_root"] {
+            let config = GraphTransformConfig::default();
+            let mut transformer = Transformer::new(&config);
+            let mut graph = FunctionGraph::new(format!("gc_roots_{leaf}"));
+            let entry = graph.startblock;
+            let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let target =
+                CallTarget::function_path([crate::runtime_names::crates::OBJECT, "gc_roots", leaf]);
+            let result_ty = ValueType::Ref(None);
+            let op = SpaceOperation {
+                result: Some(result_var),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: vec![arg.clone()],
+                    result_ty: result_ty.clone(),
+                },
+            };
+
+            let rewritten = transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                &format!("gc_roots_{leaf}"),
+                &mut graph,
+            );
+            assert!(
+                matches!(rewritten, RewriteResult::Keep),
+                "{leaf} must keep its call unrewritten"
+            );
+
+            graph.blocks[entry.0].operations.push(op);
+            let exceptblock = graph.exceptblock;
+            transformer.optimize_block(
+                &mut graph,
+                entry.0,
+                &format!("gc_roots_{leaf}"),
+                exceptblock,
+            );
+            let surviving = &graph.blocks[entry.0].operations;
+            assert_eq!(surviving.len(), 1, "{leaf} must survive as one operation");
+            assert!(
+                matches!(
+                    &surviving[0].kind,
+                    OpKind::Call { target: survived, .. } if *survived == target
+                ),
+                "{leaf} must survive as the same call, not a replacement"
+            );
         }
     }
 

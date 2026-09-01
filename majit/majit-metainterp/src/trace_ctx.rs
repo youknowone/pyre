@@ -424,8 +424,8 @@ pub struct TraceCtx {
     /// re-optimizes the whole trace-so-far: an inner loop crossed N times costs
     /// N optimizer passes over a trace that keeps growing. A structural decline
     /// is deterministic — the same key rebuilds the same unsupported bridge —
-    /// which is the reasoning `MetaInterp::declined_bridge_guards` records for
-    /// guards. Per-trace, so a fresh walk retries once.
+    /// which is the reasoning the guard descr's terminal-decline bit records
+    /// for guards. Per-trace, so a fresh walk retries once.
     pub declined_cross_loop_closes: Vec<u64>,
     /// For a bridge trace (`is_bridge_trace`), the loop-header bytecode pc of
     /// the parent loop the bridge will JUMP into. The bridge closes when it

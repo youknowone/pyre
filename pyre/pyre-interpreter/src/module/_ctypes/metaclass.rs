@@ -1373,12 +1373,18 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 cdata::cdata_write(obj, offset, &bytes);
                 return Ok(pyre_object::w_none());
             }
+            // `value` is an arbitrary object under `"O"`, and the encode both
+            // allocates and can run Python: pin it and read the slot back.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            let value = pyre_object::gc_roots::pin_root(value);
             let mut bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;
             if field_needs_swap(obj, proto, size) {
                 bytes.reverse();
             }
             cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
             cdata::cdata_write(obj, offset, &bytes);
+            let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
             if cdata::is_cdata_instance(value) {
                 cdata::keep_ref(obj, &index.to_string(), value);
             }
@@ -2009,9 +2015,15 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(meta.proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
+            // `value` is an arbitrary object under `"O"`, and the encode both
+            // allocates and can run Python: pin it and read the slot back.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            let value = pyre_object::gc_roots::pin_root(value);
             let bytes = cdata::encode_instance_or_value(&tc, value, obj, &idx.to_string())?;
             cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
             cdata::cdata_write(obj, offset, &bytes);
+            let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
             if cdata::is_cdata_instance(value) {
                 cdata::keep_ref(obj, &idx.to_string(), value);
             }
@@ -2503,9 +2515,15 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
         ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
+            // `value` is an arbitrary object under `"O"`, and the encode both
+            // allocates and can run Python: pin it and read the slot back.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            let value = pyre_object::gc_roots::pin_root(value);
             let bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;
             cdata::release_bstr_slot(&tc, addr);
             unsafe { host_ctypes::copy_bytes_to_address(addr, &bytes, element_size) };
+            let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
             if cdata::is_cdata_instance(value) {
                 cdata::keep_ref(obj, &index.to_string(), value);
             }

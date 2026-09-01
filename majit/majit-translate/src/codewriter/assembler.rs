@@ -526,6 +526,7 @@ impl Assembler {
             constants_r: Vec::new(),
             constants_f: Vec::new(),
             str_consts: Vec::new(),
+            unit_variant_consts: Vec::new(),
             num_regs_i,
             num_regs_r,
             num_regs_f,
@@ -642,6 +643,7 @@ impl Assembler {
                 .collect(),
             constants_f: state.constants_f,
             str_consts: state.str_consts,
+            unit_variant_consts: state.unit_variant_consts,
             c_num_regs_i: num_regs_i as u16,
             c_num_regs_r: num_regs_r as u16,
             c_num_regs_f: num_regs_f as u16,
@@ -3222,6 +3224,19 @@ impl Assembler {
         {
             return self.emit_str_const_r(bytes, hash, state);
         }
+        // A unit-variant prebuilt singleton is likewise process-local
+        // (`rpbc.py SingleFrozenPBCRepr`'s prebuilt instance): the
+        // `HostObject` lives only in the translator, so pool a
+        // non-canonical sentinel plus a descriptor for the runtime load
+        // pass to overwrite with the immortal discriminant cell.
+        if let ConstValue::HostObject(obj) = value
+            && let Some((qualname, tag)) =
+                crate::translator::rtyper::unit_variant_fold::unit_variant_const_by_identity(
+                    obj.identity_id(),
+                )
+        {
+            return self.emit_unit_variant_const_r(qualname, tag, state);
+        }
         let bits = match value {
             ConstValue::HostObject(obj) => obj.identity_id() as i64,
             ConstValue::LLAddress(
@@ -3260,6 +3275,42 @@ impl Assembler {
             bytes,
             precomputed_hash,
         });
+        reg
+    }
+
+    /// Record a unit-variant singleton constant for runtime
+    /// materialization and pool its sentinel —
+    /// [`Self::emit_str_const_r`]'s shape for prebuilt variant
+    /// instances.  Identical variants (by qualname) share one
+    /// descriptor and one sentinel.
+    fn emit_unit_variant_const_r(
+        &mut self,
+        qualname: String,
+        tag: i64,
+        state: &mut AssemblyState,
+    ) -> u8 {
+        if let Some(ordinal) = state
+            .unit_variant_consts
+            .iter()
+            .position(|d| d.qualname == qualname)
+        {
+            return self.emit_const_r_bits(unit_variant_const_sentinel(ordinal), state);
+        }
+        let ordinal = state.unit_variant_consts.len();
+        let constants_r_index = state.constants_r.len();
+        let reg = self.emit_const_r_bits(unit_variant_const_sentinel(ordinal), state);
+        debug_assert_eq!(
+            state.constants_r.len(),
+            constants_r_index + 1,
+            "a fresh unit-variant sentinel must push a new constants_r slot"
+        );
+        state
+            .unit_variant_consts
+            .push(super::jitcode::UnitVariantConstDescriptor {
+                constants_r_index,
+                qualname,
+                tag,
+            });
         reg
     }
 
@@ -3335,6 +3386,22 @@ fn str_const_sentinel(ordinal: usize) -> i64 {
     STR_CONST_SENTINEL_BASE | ordinal as i64
 }
 
+/// Non-canonical tag marking a deferred unit-variant singleton slot in
+/// `constants_r`, disjoint from [`STR_CONST_SENTINEL_BASE`] in the same
+/// non-canonical high-word space; the low 48 bits carry the
+/// [`super::jitcode::UnitVariantConstDescriptor`] ordinal.
+pub const UNIT_VARIANT_CONST_SENTINEL_BASE: i64 = 0x7E58_0000_0000_0000u64 as i64;
+
+/// `UNIT_VARIANT_CONST_SENTINEL_BASE | ordinal` — see
+/// [`UNIT_VARIANT_CONST_SENTINEL_BASE`].
+fn unit_variant_const_sentinel(ordinal: usize) -> i64 {
+    debug_assert!(
+        (ordinal as u64) < (1u64 << 48),
+        "too many unit-variant constants in one jitcode"
+    );
+    UNIT_VARIANT_CONST_SENTINEL_BASE | ordinal as i64
+}
+
 /// Per-assembly state (RPython: Assembler.setup() fields).
 struct AssemblyState {
     code: Vec<u8>,
@@ -3345,6 +3412,10 @@ struct AssemblyState {
     /// [`JitCodeBody::str_consts`].  Parallel to `constants_r`: each entry
     /// owns the `constants_r` slot named by its `constants_r_index`.
     str_consts: Vec<StrConstDescriptor>,
+    /// Unit-variant singleton constants recorded while assembling,
+    /// committed to [`JitCodeBody::unit_variant_consts`]; same ownership
+    /// contract as `str_consts`.
+    unit_variant_consts: Vec<super::jitcode::UnitVariantConstDescriptor>,
     num_regs_i: usize,
     num_regs_r: usize,
     num_regs_f: usize,
@@ -4757,18 +4828,20 @@ fn op_kind_to_opname_with_kinds(kind: &crate::model::OpKind, operand_kinds: &str
             _ => format!("int_{op}"),
         };
     }
-    // RPython parity (`jtransform.py:1243-1255`): equality / inequality
-    // on Ref operands lowers to `ptr_eq` / `ptr_ne`, not the integer
-    // form.  Float arithmetic carries the full `float_*` opname through
-    // `op_kind_to_opname`'s BinOp arm already; here we only need to
-    // route the `eq` / `ne` labels emitted by the MIR front-end when
-    // they meet two Ref operands.  Mixed `ri` / `ir` Ref-Int shapes
+    // RPython parity (`rtyper/rmodel.py`, pairtype(Repr, Repr).rtype_is_,
+    // and `jtransform.py`'s pointer comparisons): equality, inequality,
+    // and identity on Ref operands lower to `ptr_eq` / `ptr_ne`, not the
+    // integer form. Float arithmetic carries the full `float_*` opname
+    // through `op_kind_to_opname`'s BinOp arm already; here we route the
+    // high-level labels emitted by the MIR front-end when they meet two Ref
+    // operands. Mixed `ri` / `ir` Ref-Int shapes
     // remain a kind-flow gap (see `default_bh_builder_unwired_set_*`
     // snapshot) — surfaced via the canonical fallthrough below.
     if let OpKind::BinOp { op, .. } = kind {
         match (op.as_str(), operand_kinds) {
             ("eq", "rr") => return "ptr_eq".into(),
             ("ne", "rr") => return "ptr_ne".into(),
+            ("is_", "rr") => return "ptr_eq".into(),
             _ => {}
         }
     }
@@ -5671,6 +5744,20 @@ mod tests {
     use crate::regalloc;
 
     #[test]
+    fn surviving_ref_identity_uses_rpython_ptr_eq_opname() {
+        let lhs = crate::flowspace::model::Variable::new();
+        let rhs = crate::flowspace::model::Variable::new();
+        let identity = crate::model::OpKind::BinOp {
+            op: "is_".into(),
+            lhs,
+            rhs,
+            result_ty: crate::model::ValueType::Int,
+        };
+
+        assert_eq!(op_kind_to_opname_with_kinds(&identity, "rr"), "ptr_eq");
+    }
+
+    #[test]
     fn vable_arraydescrof_pins_the_flat_word_base_for_pointer_items() {
         // `FixedObjectArray`: length word at 0, word-wide pointer items flat
         // at the word. On the host both words are `size_of::<usize>()`.
@@ -5740,44 +5827,7 @@ mod tests {
         );
     }
 
-    /// Publish `table` into the process-global name → `StructId` map and hold
-    /// every other registering test out until the returned guard drops.
-    ///
-    /// `register_struct_ids` REPLACES the whole table (`majit-ir/src/descr.rs`,
-    /// `*guard = table`), which is right for production — the front end
-    /// populates it once per program, and merging would leak one program's
-    /// names into the next — and hostile to `cargo test`'s default
-    /// parallelism, where a second registering test wipes the first one's only
-    /// entry while that test is still running. The victim does not fail where
-    /// it registered: its `fielddescrof` silently takes a different arm and
-    /// returns a wrong `offset`.
-    ///
-    /// Measured, not inferred: the two tests below, run as a pair with default
-    /// threads, failed 9 of 12 runs; in the full 3141-test binary the same race
-    /// surfaced once in 6, because the scheduler rarely puts them adjacent.
-    /// Both pass in isolation and under `--test-threads=1`, so neither the
-    /// isolated run nor the serial run can see this.
-    ///
-    /// Scope is one test BINARY, which is the whole racing population: other
-    /// crates' tests run in their own processes and cannot reach this table.
-    ///
-    /// The lock is poison-tolerant. A test that panics mid-body would
-    /// otherwise convert one real failure into a cascade of unrelated ones.
-    ///
-    /// Bind the result to a NAMED local (`let _registry = …`). A bare
-    /// `let _ = …` drops the guard at once and restores exactly the race this
-    /// exists to remove — while still compiling, and still passing in
-    /// isolation.
-    #[must_use = "the returned guard holds the registry lock for the rest of \
-                  the test; dropping it immediately re-opens the race"]
-    fn register_struct_ids_serialized(
-        table: HashMap<String, Option<majit_ir::descr::StructId>>,
-    ) -> parking_lot::MutexGuard<'static, ()> {
-        static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        let guard = LOCK.lock();
-        majit_ir::descr::register_struct_ids(table);
-        guard
-    }
+    use crate::test_support::register_struct_ids_serialized;
 
     #[test]
     fn fielddescrof_resolves_the_slot_when_the_offset_comes_from_the_layout_registry() {
@@ -6184,6 +6234,7 @@ mod tests {
             constants_r: Vec::new(),
             constants_f: Vec::new(),
             str_consts: Vec::new(),
+            unit_variant_consts: Vec::new(),
             num_regs_i: 4,
             num_regs_r: 0,
             num_regs_f: 0,
@@ -6729,6 +6780,40 @@ mod tests {
 
         assert_eq!(body.constants_r, vec![module.identity_id() as i64]);
         assert!(asm.insns.contains_key("ref_return/r"));
+    }
+
+    #[test]
+    fn assemble_ref_return_with_unit_variant_constant() {
+        // A `RefReturn` of an interned unit-variant singleton drives
+        // `ConstValue::HostObject` through `emit_const_r` into the
+        // deferred sentinel path and commits the recorded descriptor into
+        // `JitCodeBody.unit_variant_consts` — the build-side half of the
+        // loop the runtime `materialize_unit_variant_consts` pass closes.
+        let instance =
+            crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+                "TestUnitVariantEnum.Only",
+                Some(7),
+            )
+            .expect("unit variant instance");
+        let mut flat = SSARepr {
+            name: "return_unit_variant".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(instance)),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let regallocs = empty_regallocs();
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+        assert_eq!(body.unit_variant_consts.len(), 1);
+        let d = &body.unit_variant_consts[0];
+        assert_eq!(d.tag, 7);
+        assert_eq!(d.qualname, "TestUnitVariantEnum.Only");
+        assert_eq!(
+            body.constants_r[d.constants_r_index].get(),
+            UNIT_VARIANT_CONST_SENTINEL_BASE,
+        );
     }
 
     #[test]

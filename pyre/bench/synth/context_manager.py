@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=29
-N = 75000
+N = 150000
 
 
 class Accumulator:

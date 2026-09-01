@@ -17,38 +17,6 @@
 
 use super::*;
 
-/// Host-stack budget for canonical-helper descent
-/// ([`run_sub_jitcode_walk`]), counted in nested `walk()` activations.
-///
-/// RPython has no counterpart because it needs none: `MetaInterp` keeps every
-/// inlined frame in `framestack` and drives them from one loop, so its descent
-/// costs heap. Pyre's walker recurses on the host stack — each level is a
-/// `walk()` activation owning a `WalkContext` and five freshly allocated
-/// register banks — and a helper body that descends into a helper body has
-/// nothing bounding the chain but the process stack. Overflowing it kills the
-/// process with no abort, no trace and no jitstats line, which is the one
-/// failure mode the walk is otherwise built to avoid.
-///
-/// The bound is therefore a backstop, not a tuning knob. The deepest chain the
-/// whole `bench/synth` corpus reaches is FOUR levels — swept 2026-08-24, 452
-/// fixtures, zero declines at a cap of 4 — so the default sits 16x above it.
-/// Reaching it declines at the caller's own opcode boundary the same way an
-/// arity mismatch does. `PYRE_FBW_MAX_SUBWALK_DEPTH` lowers it, which is how
-/// the decline path is exercised without constructing a pathological helper
-/// chain: at a cap of 1/2/3 `bound_method_builtin_fold.py` declines 1842 times
-/// at depth 2/3/4 and its output stays byte-identical, which is both the
-/// arming proof and the proof that a decline costs correctness nothing.
-pub(crate) fn fbw_max_subwalk_depth() -> usize {
-    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *DEPTH.get_or_init(|| {
-        std::env::var("PYRE_FBW_MAX_SUBWALK_DEPTH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(64)
-            .clamp(1, 64)
-    })
-}
-
 /// Maximum inline depth the multiframe guard-snapshot path
 /// (`walker_capture_multi_frame_inline_snapshot`) unrolls a straight-line
 /// value-returning callee CHAIN before folding to the `CALL_ASSEMBLER` tail.
@@ -270,6 +238,41 @@ thread_local! {
     /// armed for one frame the older (pre-fold) image is the one that stands.
     static FBW_LOCALS_MIRROR_UNDO: std::cell::RefCell<Vec<FbwLocalsMirrorUndo>> =
         const { std::cell::RefCell::new(Vec::new()) };
+
+    /// `(frame, valuestackdepth_before)` for the walk-time stores that sync a
+    /// live frame's operand-stack depth.
+    ///
+    /// The sibling of [`FBW_EXIT_LAST_INSTR_UNDO`], and armed for the same
+    /// reason: `store_live_frame_static_int` writes field 2 straight into the
+    /// concrete frame, so a walk that does not commit leaves the depth the walk
+    /// modelled rather than the depth the frame entered with.  It stayed
+    /// unjournalled while every frame that field was written on was one the
+    /// walk had CREATED — a fresh callee frame a decline simply discards.  A
+    /// resumed generator's frame is not fresh: it is the durable frame the
+    /// generator will next be resumed from, so its depth has to come back with
+    /// `last_instr` and the locals image.
+    ///
+    /// First write per frame wins, as with both siblings.
+    static FBW_FRAME_VSD_UNDO: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// `(frame, slot, value, concrete)` for the most recent operand-stack Ref
+    /// store a generator-resume sub-walk made into its own suspended frame.
+    ///
+    /// The yield interception needs the value the body is suspending WITH, and
+    /// `emit_abort_permanent!` has already put it there: the marker is preceded
+    /// by one `setarrayitem_vable_r` per live operand-stack slot, ascending, so
+    /// the last of them writes the top of stack — which for `YIELD_VALUE` is
+    /// exactly the value the opcode pops.  Latched at the store rather than
+    /// re-read off the frame at the marker because the interception wants the
+    /// OpRef as well as the object, and only the store site holds both.
+    ///
+    /// One entry, last write wins, carrying the frame it was made on and the
+    /// slot it landed in.  A nested resume that overwrote it names a different
+    /// frame, and the interception then declines rather than taking another
+    /// generator's value.
+    static FBW_GENERATOR_YIELD_TOS: std::cell::Cell<Option<GeneratorStackStore>> =
+        const { std::cell::Cell::new(None) };
 
     /// Armed by the bridge tracer (`call_jit::trace_and_compile_from_bridge`)
     /// before a single-frame, direct-return-capable guard-failure walk.  When
@@ -519,6 +522,8 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(false));
     FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow_mut().clear());
     FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow_mut().clear());
+    FBW_FRAME_VSD_UNDO.with(|c| c.borrow_mut().clear());
+    FBW_GENERATOR_YIELD_TOS.with(|c| c.set(None));
 }
 
 /// The address a journalled frame lives at NOW.
@@ -651,6 +656,101 @@ pub(crate) fn fbw_locals_mirror_rollback() {
 /// straight out of that array).
 pub(crate) fn fbw_locals_mirror_commit() {
     FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow_mut().clear());
+}
+
+/// Record the `valuestackdepth` a walk-time sync is about to displace, so
+/// [`fbw_frame_vsd_rollback`] can put it back when the walk does not commit.
+/// First write per frame wins: that is the depth the frame carried when the
+/// walk began.
+pub(crate) fn fbw_note_frame_vsd_undo(frame: usize) {
+    if frame == 0 {
+        return;
+    }
+    let frame = live_frame_addr(frame);
+    FBW_FRAME_VSD_UNDO.with(|c| {
+        let mut undo = c.borrow_mut();
+        if undo.iter().any(|(f, _)| *f == frame) {
+            return;
+        }
+        let Some(before) = crate::state::concrete_stack_depth(frame) else {
+            return;
+        };
+        undo.push((frame, before));
+    });
+}
+
+/// Put `valuestackdepth` back for a walk that did not commit, so the replay
+/// resumes on the operand stack the frame carried before the walk.  Runs beside
+/// [`fbw_exit_last_instr_rollback`]; the commit side just drops the undo.
+pub(crate) fn fbw_frame_vsd_rollback() {
+    let undo = FBW_FRAME_VSD_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    // Newest first, matching both siblings.
+    for (frame, before) in undo.into_iter().rev() {
+        crate::state::set_concrete_stack_depth(live_frame_addr(frame), before);
+    }
+}
+
+/// Drop the undo: the walk's end state is kept, so the synced depth is the one
+/// the frame should carry.
+pub(crate) fn fbw_frame_vsd_commit() {
+    FBW_FRAME_VSD_UNDO.with(|c| c.borrow_mut().clear());
+}
+
+/// One operand-stack Ref store made into a resumed generator's own frame.
+#[derive(Clone, Copy)]
+pub(crate) struct GeneratorStackStore {
+    /// The suspended frame the store landed on.
+    pub(crate) frame: usize,
+    /// Absolute `locals_cells_stack_w` slot it wrote.
+    pub(crate) slot: usize,
+    /// The stored value.
+    pub(crate) value: OpRef,
+}
+
+/// Record an operand-stack Ref store a generator-resume sub-walk made into its
+/// own suspended frame.  See [`FBW_GENERATOR_YIELD_TOS`].
+pub(crate) fn fbw_note_generator_stack_store(store: GeneratorStackStore) {
+    FBW_GENERATOR_YIELD_TOS.with(|c| c.set(Some(store)));
+}
+
+/// The latched store, if the last one was made on `frame` and landed on `slot`.
+pub(crate) fn fbw_generator_stack_store_at(
+    frame: usize,
+    slot: usize,
+) -> Option<GeneratorStackStore> {
+    FBW_GENERATOR_YIELD_TOS
+        .with(|c| c.get())
+        .filter(|store| store.frame == frame && store.slot == slot)
+}
+
+/// Arm all three frame undos, called by each walk-time store into a frame the
+/// walk did not create, before that store lands.
+///
+/// The three are otherwise armed separately, each by the site that makes its
+/// own kind of write, because every frame those sites reach was built by the
+/// walk writing it: a decline discards the frame, so only the one field the
+/// caller reads back needs an undo.  A resumed generator's frame is the object
+/// the generator will next be resumed from, so a declined walk owes it back
+/// whole — locals, operand stack, depth and coordinate alike.
+///
+/// Arming at the store rather than at walk entry keeps the same snapshot: each
+/// note is first-write-per-frame wins, so whichever store gets there first
+/// records the state the frame carried before the walk touched it.
+///
+/// The locals note takes the whole `locals_cells_stack_w` array rather than the
+/// `nlocals` prefix its other caller passes.  That caller excludes the operand
+/// stack deliberately, so a rollback cannot revert a stack slot another
+/// walk-time write owns; here there is no other writer — the frame is suspended
+/// and this walk is the only thing running on it — and the operand stack is
+/// exactly where a resumed generator's yield state lives.
+pub(crate) fn fbw_arm_durable_frame_undo(frame: usize) {
+    if frame == 0 {
+        return;
+    }
+    fbw_note_last_instr_undo(frame);
+    fbw_note_frame_vsd_undo(frame);
+    let whole_array = crate::state::concrete_frame_array_len(frame).unwrap_or(0);
+    fbw_note_locals_mirror_undo(frame, whole_array);
 }
 
 /// GC: a pre-fold image can be the ONLY reference to a value the mirror
@@ -3909,7 +4009,16 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     .get(descr_index)
                     .and_then(|descr| descr.as_field_descr())
                     .is_some_and(|field| field.is_immutable());
-                if !fresh_ref_regs[target_reg as usize] || !immutable_field {
+                // PyPy's `MetaInterp._interpret` owns one MIFrame per inlined
+                // call.  Replaying the caller CALL abandons and rebuilds that
+                // callee frame, so lifecycle/bookkeeping stores on the
+                // callee's own virtualizable are no more externally visible
+                // than initialization stores on a `new_with_vtable` result.
+                // A deferred call can publish the frame, at which point that
+                // ownership proof no longer holds.
+                let callee_owned_frame = vable_reg == Some(target_reg) && !deferred_call;
+                if !callee_owned_frame && (!fresh_ref_regs[target_reg as usize] || !immutable_field)
+                {
                     replay_poison!(poison, "SetfieldGcTargetNotFreshOrMutable", d.pc, d.opname);
                 }
             } else {

@@ -710,20 +710,29 @@ fn dynasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
 /// `base + GcHeader::SIZE`, which would shift every field offset the descr
 /// carries.
 ///
-/// Non-GC descrs (`type_id == 0`, raw buffers) and a runtime with no allocator
-/// hook installed (unit tests) keep the plain zeroed malloc.
+/// Non-GC descrs (`type_id == 0`, raw buffers) keep the plain zeroed malloc.
+/// A typed descr never does: absence/failure of its collector is NULL, the
+/// translated `do_malloc_fixedsize_clear` failure edge.
 fn bh_alloc_struct(sizedescr: &majit_translate::jitcode::BhDescr) -> *mut libc::c_void {
     let size = sizedescr.as_size();
+    let type_id = sizedescr.resolve_gc_tid();
     let gc_ptr = if sizedescr.is_headerless() {
         majit_gc::alloc_nursery_headerless_no_collect(size).0
     } else {
-        match sizedescr.resolve_gc_tid() {
+        match type_id {
             0 => 0,
             type_id => dynasm_alloc_oldgen_typed(type_id, size).0,
         }
     };
     if gc_ptr != 0 {
         return gc_ptr as *mut libc::c_void;
+    }
+    // `GcLLDescr_framework._bh_malloc` allocates a GC struct through
+    // `do_malloc_fixedsize_clear`; NULL is its OOM result and is converted to
+    // `MemoryError` by blackhole.py `_get_method`.  Falling through to a raw
+    // block for a typed descr loses the GC header and tracing layout.
+    if type_id != 0 && !sizedescr.is_headerless() {
+        return std::ptr::null_mut();
     }
     let ptr = unsafe { libc::malloc(size) };
     if !ptr.is_null() {
@@ -3521,7 +3530,9 @@ impl Backend for DynasmBackend {
 
     /// llmodel.py bh_new_array / bh_new_array_clear.
     fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        let length = usize::try_from(length).expect("bh_new_array length must be non-negative");
+        let Ok(length) = usize::try_from(length) else {
+            return 0;
+        };
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
         let len_offset = arraydescr
             .array_len_offset()
@@ -3560,13 +3571,17 @@ impl Backend for DynasmBackend {
 
     /// `LLtypeMixin.bh_newstr` → `gc_ll_descr.gc_malloc_str`.
     fn bh_newstr(&self, length: i64) -> i64 {
-        let length = u64::try_from(length).expect("bh_newstr length must be non-negative");
+        let Ok(length) = u64::try_from(length) else {
+            return 0;
+        };
         dynasm_malloc_str(majit_gc::lowlevel_str_type_id() as u64, length) as i64
     }
 
     /// `LLtypeMixin.bh_newunicode` → `gc_ll_descr.gc_malloc_unicode`.
     fn bh_newunicode(&self, length: i64) -> i64 {
-        let length = u64::try_from(length).expect("bh_newunicode length must be non-negative");
+        let Ok(length) = u64::try_from(length) else {
+            return 0;
+        };
         dynasm_malloc_unicode(majit_gc::lowlevel_unicode_type_id() as u64, length) as i64
     }
 

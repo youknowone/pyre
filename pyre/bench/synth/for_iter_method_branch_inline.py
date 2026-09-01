@@ -3,7 +3,7 @@
 # field.  The callee body carries a `truth` residual before trace-time folding;
 # the replay-safety scan must defer it so the walker can erase it instead of
 # compiling a separate function-entry trace for the method.
-N = 120000
+N = 240000
 
 
 class Cursor:

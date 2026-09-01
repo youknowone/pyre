@@ -14,7 +14,7 @@
 #
 # Shapes: explicit `raise` two frames down, a builtin ZeroDivisionError two
 # frames down, and an explicit `raise` three frames down.
-N = 4000
+N = 8000
 
 
 def frame_names(traceback):

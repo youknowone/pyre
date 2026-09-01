@@ -50,14 +50,13 @@ members = [
     "pyre/pyre-wasm",
     "pyre/pyre-wasm-test",
     "pyre/pyre-wasm-runner",
-    "pyre/pyre-bench",
 ]
 
 [workspace.dependencies]
 # pyre internal crates
 pyre-object = { version = "0.0.2", path = "pyre/pyre-object" }
 pyre-macros = { version = "0.0.2", path = "pyre/pyre-macros" }
-pyre-native = { version = "0.0.2", path = "pyre/pyre-native" }
+pyre-native = { version = "0.0.2", path = "pyre/pyre-native", default-features = false }
 pyre-interpreter = { version = "0.0.2", path = "pyre/pyre-interpreter" }
 pyre-sandbox = { version = "0.0.2", path = "pyre/pyre-sandbox" }
 pyre-module = { version = "0.0.2", path = "pyre/pyre-module" }
@@ -79,16 +78,17 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # Moved up again for the console read-boundary fix from #8621, and now also
 # names `MarshalError::DataTooShort` / `EofObject` and `CFormatType::Bytes`,
 # which arrived with it.
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
+#
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "6a3a8b0f1123d29f48a7755f058488f417f0419c", features = ["binascii", "cjk-codecs", "inet", "json"] }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "6a3a8b0f1123d29f48a7755f058488f417f0419c" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "6a3a8b0f1123d29f48a7755f058488f417f0419c" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "6a3a8b0f1123d29f48a7755f058488f417f0419c" }
 ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
-rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "4bd95458385eb9eae031679f681564e167125c8f" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "6a3a8b0f1123d29f48a7755f058488f417f0419c" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "6a3a8b0f1123d29f48a7755f058488f417f0419c" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "6a3a8b0f1123d29f48a7755f058488f417f0419c" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "6a3a8b0f1123d29f48a7755f058488f417f0419c" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
@@ -191,9 +191,6 @@ bzip2 = "0.6.1"
 # liblzma, with the same entry points `Modules/_lzmamodule.c` calls, so
 # `_lzma` needs no C toolchain and builds for wasm32 like the others.
 xz-core = "0.1.0-rc.0"
-# binascii transforms (pure-Rust logic).
-base64 = "0.22"
-crc32fast = "1.4"
 
 # TLS backend (pyre-native only).  The interpreter sees opaque, non-inlined
 # entry points so rustls and its crypto provider stay outside Charon/LLBC.
@@ -212,8 +209,11 @@ der = { version = "0.8", features = ["alloc", "pem"] }
 pkcs8 = { version = "0.11", features = ["encryption", "pkcs5", "pem"] }
 rustls-native-certs = "0.8"
 
-# math
-pymath = { version = "0.2.0", features = ["malachite-bigint"] }
+# math.  The bigint arm stays off: `math.factorial` and its siblings are
+# implemented here on `RBigInt`, so enabling it would only pull a second
+# `malachite-bigint` major into the graph beside the one the compiler
+# constants use.
+pymath = "0.2.0"
 
 # cli
 lexopt = "0.3"
