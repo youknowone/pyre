@@ -8697,6 +8697,26 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // same `space.getattr` but carries its name as a constant
                 // operand, so the lookup has to reach it already resolved.
                 let attr_name = walker_load_name_from_code(w_code_ptr, namei as usize);
+                // `descroperation.py getattr` selects a custom
+                // `__getattribute__` before it runs the ordinary descriptor
+                // protocol.  PyPy traces into that Python frame; do the same
+                // before every default-attribute fold below (all of which
+                // correctly decline the override but would otherwise leave
+                // it in the opaque residual).
+                if let Some(inlined) = try_walker_inline_getattribute_hook(
+                    ctx,
+                    op,
+                    code,
+                    &r_args,
+                    call_descr,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                }
                 if let Some(attr_name) = attr_name.as_deref()
                     && spec_gate(SpecFold::LoadAttr, || {
                         try_walker_specialize_load_attr(

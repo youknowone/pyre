@@ -8524,6 +8524,7 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
 /// semantics).
 /// The leading argument `get_and_call_function` binds ahead of the attribute
 /// name, one variant per descriptor spelling of a `__getattr__` hook.
+#[derive(Clone, Copy)]
 enum HookLeading {
     /// Plain `Function`: `funccall(w_obj, w_name)` leads with the receiver.
     Receiver,
@@ -8536,6 +8537,7 @@ enum HookLeading {
 /// The wrapper slot a descriptor spelling of the hook unwrapped, so the fold
 /// can pin the value it read.  `function.py:673`/`:720`
 /// `_immutable_fields_ = ['w_function?']`.
+#[derive(Clone, Copy)]
 enum WrapperField {
     ClassMethod,
     StaticMethod,
@@ -8548,6 +8550,154 @@ impl WrapperField {
             Self::StaticMethod => crate::descr::staticmethod_w_function_quasi_descr(),
         }
     }
+}
+
+/// Resolve the three descriptor spellings `get_and_call_function` gives an
+/// attribute hook.  Shared by `__getattribute__` and `__getattr__`, which are
+/// dispatched identically in `descroperation.py:_handle_getattribute` once
+/// their respective lookup has selected a descriptor.
+unsafe fn resolve_attribute_hook(
+    w_hook: pyre_object::PyObjectRef,
+) -> Option<(pyre_object::PyObjectRef, HookLeading, Option<WrapperField>)> {
+    let resolved = unsafe {
+        if pyre_object::function::is_exact_classmethod(w_hook) {
+            (
+                pyre_object::function::w_classmethod_get_func(w_hook),
+                HookLeading::Class,
+                Some(WrapperField::ClassMethod),
+            )
+        } else if pyre_object::function::is_exact_staticmethod(w_hook) {
+            (
+                pyre_object::function::w_staticmethod_get_func(w_hook),
+                HookLeading::None,
+                Some(WrapperField::StaticMethod),
+            )
+        } else {
+            (w_hook, HookLeading::Receiver, None)
+        }
+    };
+    (!resolved.0.is_null()).then_some(resolved)
+}
+
+/// Inline a custom Python `__getattribute__` selected by LOAD_ATTR / the
+/// attribute half of LOAD_METHOD.
+///
+/// PyPy's `descroperation.py getattr` traces the receiver-type lookup and then
+/// enters `get_and_call_function(w_descr, w_obj, w_name)`.  The optimized
+/// trace therefore carries the same map promotion and type-version dependency
+/// as mapdict LOAD_ATTR, followed by a distinct inlined MIFrame for the hook.
+/// Pyre's fused `load_attr_fn` otherwise hides both stages in one
+/// `CALL_MAY_FORCE`, so a hot override executes in the blackhole interpreter
+/// on every iteration.
+///
+/// This is the hit-side predecessor of [`try_walker_inline_getattr_hook`].  It
+/// admits the same exact Function/classmethod/staticmethod spellings, pins the
+/// same wrapper fields, and uses the same per-frame resolved-call path.  A loop
+/// in the hook, a type whose `__getattr__` would have to catch AttributeError,
+/// or any shape the oracle cannot guard remains residual.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, map, w_getattribute)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::getattribute_hook_fast_path(concrete_obj)
+    }) else {
+        return Ok(None);
+    };
+    let Some((w_func, leading, wrapper_field)) =
+        (unsafe { resolve_attribute_hook(w_getattribute) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_func) }) else {
+        return Ok(None);
+    };
+    if nparams != usize::from(!matches!(leading, HookLeading::None)) + 1 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header {
+        return Ok(None);
+    }
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    if let Some(field) = wrapper_field {
+        walker_pin_descriptor_slot(ctx, op.pc, w_getattribute, field.quasi_descr())?;
+    }
+
+    let name_obj =
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name.as_str()))
+            as pyre_object::PyObjectRef;
+    let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
+    let leading_arg = match leading {
+        HookLeading::Receiver => Some((obj, concrete_obj)),
+        HookLeading::Class => Some((ctx.trace_ctx.const_ref(w_type as i64), w_type)),
+        HookLeading::None => None,
+    };
+    let mut arg_concretes = vec![ConcreteValue::Ref(w_func), ConcreteValue::Null];
+    let mut callee_args = Vec::with_capacity(2);
+    let mut callee_arg_concretes = Vec::with_capacity(2);
+    if let Some((arg, concrete)) = leading_arg {
+        arg_concretes.push(ConcreteValue::Ref(concrete));
+        callee_args.push(arg);
+        callee_arg_concretes.push(ConcreteValue::Ref(concrete));
+    }
+    arg_concretes.push(ConcreteValue::Ref(name_obj));
+    callee_args.push(name_const);
+    callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
+    let hook_const = ctx.trace_ctx.const_ref(w_func as i64);
+    let inlined = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        hook_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        w_func,
+        hook_const,
+        w_func,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        true,
+        false,
+        None,
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8591,26 +8741,10 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     // through that override, so unwrapping `w_function` in its place calls the
     // wrong callable.  `wrapper_field` names the slot that unwrapping read, for
     // the guard below; the plain arm reads no field.
-    let (w_func, leading, wrapper_field) = unsafe {
-        if pyre_object::function::is_exact_classmethod(w_getattr) {
-            (
-                pyre_object::function::w_classmethod_get_func(w_getattr),
-                HookLeading::Class,
-                Some(WrapperField::ClassMethod),
-            )
-        } else if pyre_object::function::is_exact_staticmethod(w_getattr) {
-            (
-                pyre_object::function::w_staticmethod_get_func(w_getattr),
-                HookLeading::None,
-                Some(WrapperField::StaticMethod),
-            )
-        } else {
-            (w_getattr, HookLeading::Receiver, None)
-        }
-    };
-    if w_func.is_null() {
+    let Some((w_func, leading, wrapper_field)) = (unsafe { resolve_attribute_hook(w_getattr) })
+    else {
         return Ok(None);
-    }
+    };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_func) }) else {
         return Ok(None);
     };

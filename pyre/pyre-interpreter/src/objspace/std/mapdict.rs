@@ -1994,6 +1994,48 @@ pub unsafe fn getattr_hook_fast_path(
     Some((w_type, version_tag, map, w_getattr))
 }
 
+/// Return the guarded lookup ingredients for the receiver type's custom
+/// `__getattribute__` slot.
+///
+/// `descroperation.py getattr` resolves this descriptor before it examines the
+/// requested name.  PyPy traces through that lookup and
+/// `get_and_call_function(w_descr, w_obj, w_name)`: the promoted receiver map
+/// pins the mapdict carrier shape, while the type's `_version_tag?` pins which
+/// descriptor the MRO lookup returned.  The full-body walker uses these same
+/// ingredients to enter a plain Python hook instead of leaving the whole
+/// access behind an opaque `load_attr_fn` residual.
+///
+/// A default `object.__getattribute__`, a devolved map, an uncacheable type, or
+/// a type with `__getattr__` declines.  The last gate preserves
+/// `_handle_getattribute`'s AttributeError fallback until the inline entry can
+/// carry both Python frames as one operation.  The requested name is
+/// deliberately absent from this oracle: a custom hook owns every name and
+/// receives the name as its second argument.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn getattribute_hook_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() || unsafe { map_is_devolved(map) } {
+        return None;
+    }
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    let w_getattribute = unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }?;
+    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some() {
+        return None;
+    }
+    Some((w_type, version_tag, map, w_getattribute))
+}
+
 /// The `__getattr__`-less twin of [`getattr_hook_fast_path`]: `name` resolves
 /// nowhere *and* the type has no hook to run afterwards, so the access ends in
 /// the `AttributeError` `object_getattr_miss` raises.
