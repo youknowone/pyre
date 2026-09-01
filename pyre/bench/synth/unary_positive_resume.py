@@ -1,5 +1,4 @@
 # pyre-check: max-pypy-ratio=5
-# pyre-check: spec-folds=unary_positive_descent
 # The trip count puts pypy's execution above the startup-subtraction floor, so
 # this ratio is a measurement. It collapses from the clamped reading rather
 # than rising: at the old trip count the numerator was mostly pyre's fixed

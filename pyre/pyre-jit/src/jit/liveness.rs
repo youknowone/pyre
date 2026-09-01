@@ -251,7 +251,8 @@ fn _compute_liveness_must_continue(
                             follow_label(&mut alive, label2alive, label);
                         }
                     }
-                    DescrOperand::Bh(_)
+                    DescrOperand::JitCode(_)
+                    | DescrOperand::Bh(_)
                     | DescrOperand::CallDescrStub(_)
                     | DescrOperand::VableArrayField(_)
                     | DescrOperand::VableArray(_)

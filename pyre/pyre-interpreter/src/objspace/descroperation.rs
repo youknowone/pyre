@@ -6254,8 +6254,8 @@ impl CompareOp {
 /// Unary positive (`+a`).
 ///
 /// `inline(never)` is load-bearing: rustc otherwise folds this body into its
-/// one-call wrapper and the codewriter never mints the graph a trace descends
-/// (`specialize.rs try_walker_orthodox_unary`).
+/// one-call wrapper and the codewriter never mints the graph named by
+/// `flatten.rs build_orthodox_inline_call_r_r`.
 #[inline(never)]
 pub fn pos(a: PyObjectRef) -> PyResult {
     unsafe {
@@ -6349,8 +6349,8 @@ fn bad_operand_type(descr: &str, a: PyObjectRef) -> PyError {
 /// Unary negation.
 ///
 /// `inline(never)` is load-bearing: rustc otherwise folds this body into its
-/// one-call wrapper and the codewriter never mints the graph a trace descends
-/// (`specialize.rs try_walker_orthodox_unary`).
+/// one-call wrapper and the codewriter never mints the graph named by
+/// `flatten.rs build_orthodox_inline_call_r_r`.
 #[inline(never)]
 pub fn neg(a: PyObjectRef) -> PyResult {
     unsafe {
@@ -6433,8 +6433,8 @@ pub(crate) fn bool_invert_deprecation_text() -> PyObjectRef {
 /// Unary bitwise inversion.
 ///
 /// `inline(never)` is load-bearing: rustc otherwise folds this body into its
-/// one-call wrapper and the codewriter never mints the graph a trace descends
-/// (`specialize.rs try_walker_orthodox_unary`).
+/// one-call wrapper and the codewriter never mints the graph named by
+/// `flatten.rs build_orthodox_inline_call_r_r`.
 #[inline(never)]
 pub fn invert(a: PyObjectRef) -> PyResult {
     unsafe {
