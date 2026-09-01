@@ -3609,6 +3609,40 @@ mod tests {
     }
 
     #[test]
+    fn guard_isnull_uses_the_inputargs_own_forwarding_chain() {
+        let mut ctx = OptContext::with_inputarg_types(4, &[majit_ir::Type::Ref]);
+        let input = std::rc::Rc::new(majit_ir::InputArg::from_type(majit_ir::Type::Ref, 0));
+        let arg = Operand::from_bound_inputarg(&input);
+        arg.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0)));
+        let mut guard = Op::new(OpCode::GuardIsnull, std::slice::from_ref(&arg));
+        guard.pos.set(OpRef::void_op(0));
+        let guard_rc = std::rc::Rc::new(guard.clone());
+        let mut pass = OptRewrite::new();
+
+        let result = pass.propagate_forward(&guard, &guard_rc, &mut ctx);
+        assert_remove(&result);
+    }
+
+    #[test]
+    fn guard_value_uses_the_inputargs_own_forwarding_chain() {
+        let mut ctx = OptContext::with_inputarg_types(4, &[majit_ir::Type::Ref]);
+        let input = std::rc::Rc::new(majit_ir::InputArg::from_type(majit_ir::Type::Ref, 0));
+        let arg = Operand::from_bound_inputarg(&input);
+        let value = majit_ir::GcRef(42);
+        arg.set_forwarded_const(majit_ir::Const::Ref(value));
+        let mut guard = Op::new(
+            OpCode::GuardValue,
+            &[arg, Operand::const_from_value(majit_ir::Value::Ref(value))],
+        );
+        guard.pos.set(OpRef::void_op(0));
+        let guard_rc = std::rc::Rc::new(guard.clone());
+        let mut pass = OptRewrite::new();
+
+        let result = pass.propagate_forward(&guard, &guard_rc, &mut ctx);
+        assert_remove(&result);
+    }
+
+    #[test]
     fn test_guard_value_match() {
         let (result, _) = run_one(
             vec![same_i(), same_i(), bin_i(OpCode::GuardValue, 0, 1)],

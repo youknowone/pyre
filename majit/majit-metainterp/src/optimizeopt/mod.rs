@@ -5050,6 +5050,35 @@ impl OptContext {
     /// The heal keys on the bound `Op` host directly off the `Operand`; the
     /// native walk (`arg.get_box_replacement`) is byte-identical to the legacy
     /// resolve-then-rewrap, asserted below.
+    /// The loop-carried operand for a trace input arg that a peeled body
+    /// names by its recorder slot.
+    ///
+    /// Phase 2 optimizes the recorded operations a second time, so a body
+    /// operation still carries `InputArg(i)` as the recorder emitted it,
+    /// while `import_state` installs that iteration's value on the phase 2
+    /// host at `inputarg_base + i`. Reading slot `i` alone finds the
+    /// unforwarded recorder host and loses the import, so a slot the
+    /// preamble proved constant would reach the body as an unknown.
+    /// `unroll.py:497` `source.set_forwarded(target)` writes onto the very
+    /// box the body operations hold; the flat `OpRef` namespace splits that
+    /// one box in two, and this rejoins them.
+    ///
+    /// `None` when there is nothing to rejoin: phase 1 (`inputarg_base` 0),
+    /// a position outside the input args, or a host that resolves back to
+    /// `arg` itself — the identity import a pass-through slot records.
+    fn imported_inputarg_operand(&self, arg: &Operand) -> Option<Operand> {
+        if self.inputarg_base == 0 || !arg.is_inputarg() {
+            return None;
+        }
+        let slot = arg.to_opref().raw();
+        if slot >= self.num_inputs {
+            return None;
+        }
+        let host = OpRef::input_arg_typed(self.inputarg_base + slot, arg.type_());
+        let imported = self.get_box_replacement_operand_opt(host)?;
+        (!imported.same_box(arg)).then_some(imported)
+    }
+
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
         self.heal_arg_to_canonical(arg);
 
@@ -5062,11 +5091,17 @@ impl OptContext {
             return arg.clone();
         }
 
-        if arg.bound_op().is_some() {
+        // info.py `getptrinfo` starts with `get_box_replacement(op)`.
+        // Both result ops and input args carry that native `_forwarded`
+        // chain; consult it before the positional store fallback.
+        if arg.is_resop() || arg.is_inputarg() {
             let resolved = arg.get_box_replacement(false);
             // Self-resolved box-native: the canonical forwarding for this
             // position lives in the `OpRef` store (see `get_box_replacement_operand`).
             if resolved.same_box(arg) {
+                if let Some(imported) = self.imported_inputarg_operand(arg) {
+                    return imported;
+                }
                 self.get_box_replacement_operand(arg.to_opref())
             } else {
                 resolved
@@ -5089,13 +5124,22 @@ impl OptContext {
             return Some(arg.clone());
         }
 
-        if arg.bound_op().is_some() {
+        // info.py `getptrinfo` starts with `get_box_replacement(op)`.
+        // Both result ops and input args carry that native `_forwarded`
+        // chain; consult it before the positional store fallback.
+        if arg.is_resop() || arg.is_inputarg() {
             let resolved = arg.get_box_replacement(false);
             if resolved.same_box(arg) {
-                Some(
-                    self.get_box_replacement_operand_opt(arg.to_opref())
-                        .unwrap_or(resolved),
-                )
+                if let Some(imported) = self.imported_inputarg_operand(arg) {
+                    return Some(imported);
+                }
+                // An unregistered InputArg keeps the old `None` contract so
+                // the dispatch-entry caller can materialize one canonical
+                // host for every occurrence of that position. Result ops
+                // already carry their canonical producer and are total here.
+                let fallback = (!arg.is_inputarg()).then_some(resolved);
+                self.get_box_replacement_operand_opt(arg.to_opref())
+                    .or(fallback)
             } else {
                 Some(resolved)
             }
@@ -10148,6 +10192,68 @@ mod boxref_forwarding_tests {
                 "producing op.type_ must match the variant tag / opref_type"
             );
         }
+    }
+
+    /// A peeled body names its input args by the recorder slot, while
+    /// `import_state` (unroll.py:497 `source.set_forwarded(target)`) writes
+    /// that iteration's value onto the host at `inputarg_base + slot`.
+    /// RPython writes onto the one box the body operations hold; the flat
+    /// `OpRef` namespace splits it in two, so reading the recorder slot on
+    /// its own loses the import and a slot the preamble proved constant
+    /// reaches the body as an unknown.
+    #[test]
+    fn a_peeled_body_reads_the_slot_the_import_forwarded() {
+        use majit_ir::operand::Operand;
+        const BASE: u32 = 71;
+        const SLOT: u32 = 5;
+        const NUM_INPUTS: usize = 11;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(
+            8,
+            NUM_INPUTS,
+            BASE,
+            BASE + NUM_INPUTS as u32,
+        );
+        let recorder = majit_ir::InputArg::from_type_rc(Type::Ref, SLOT);
+        let host = majit_ir::InputArg::from_type_rc(Type::Ref, BASE + SLOT);
+        let host_arg = Operand::from_bound_inputarg(&host);
+        host_arg.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0)));
+        ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
+        ctx.register_carried_host(&host_arg);
+
+        let body_arg = Operand::from_bound_inputarg(&recorder);
+        let resolved = ctx
+            .resolve_operand_operand_opt(&body_arg)
+            .expect("the imported host resolves");
+        assert!(
+            ctx.getptrinfo(&resolved).is_some_and(|info| info.is_null()),
+            "the body must read the null the preamble proved, not its own slot"
+        );
+    }
+
+    /// The counterpart of `a_peeled_body_reads_the_slot_the_import_forwarded`:
+    /// a preamble numbers its input args from zero, so slot `i` is the whole
+    /// address and there is no second host to consult.
+    #[test]
+    fn a_preamble_reads_its_own_input_arg_slot() {
+        use majit_ir::operand::Operand;
+        const SLOT: u32 = 5;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(8, 11, 0, 11);
+        let recorder = majit_ir::InputArg::from_type_rc(Type::Ref, SLOT);
+        // The position a shifted read would land on if the base were not 0.
+        let decoy = majit_ir::InputArg::from_type_rc(Type::Ref, SLOT + 11);
+        let decoy_arg = Operand::from_bound_inputarg(&decoy);
+        decoy_arg.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0)));
+        ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
+        ctx.register_carried_host(&decoy_arg);
+
+        let body_arg = Operand::from_bound_inputarg(&recorder);
+        let resolved = ctx
+            .resolve_operand_operand_opt(&body_arg)
+            .expect("the recorder slot resolves to itself");
+        assert!(
+            resolved.same_box(&body_arg),
+            "a preamble must not read another slot's import"
+        );
     }
 }
 
