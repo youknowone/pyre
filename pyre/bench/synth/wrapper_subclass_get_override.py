@@ -17,7 +17,7 @@ try:
 except ImportError:
     pass
 
-N = 1000
+N = 2000
 
 
 class GetOverridingClassMethod(classmethod):

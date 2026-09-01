@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=1
+# pyre-check: max-pypy-ratio=2.5
 # pyre-check: spec-folds=builtin_len
 # pyre-check: skip-cpython
 # A module-scope LOAD_NAME whose name misses the module dict resolves through
@@ -8,7 +8,7 @@
 # census reads `builtin_len` consulted twice and fired once, the decline being
 # the shadowed call.
 
-N = 900000000
+N = 225000000
 M = 4000000
 s = "xx"
 

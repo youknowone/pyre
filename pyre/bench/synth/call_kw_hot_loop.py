@@ -10,7 +10,7 @@
 # The keyword overrides a default (`step=1`) and the result depends on both
 # the positional and the keyword arg so the call cannot be constant-folded
 # away; the exact aggregate makes a single dropped iteration observable.
-N = 200000
+N = 400000
 
 
 def g(x, step=1):

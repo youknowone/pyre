@@ -5,7 +5,7 @@
 # so the hot body JIT-compiles rather than declining to the trait leg.
 # A conditional exercises a branch between the two STORE_GLOBAL sites.
 # Output is verified against CPython/PyPy.
-N = 200000
+N = 400000
 
 counter = 0
 total = 0

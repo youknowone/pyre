@@ -7,7 +7,7 @@
 # enough that PyPy clears check.py's timing floor and the ratio ceiling is
 # enforced rather than displayed as an informational lower bound.
 
-N = 20000000
+N = 40000000
 
 
 def show(label, fn):

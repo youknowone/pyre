@@ -8,7 +8,7 @@
 # through a tuple/list build or an array element access panicked with an
 # unwired opcode. A traced loop that never deopts through these ops would
 # not cover them.
-N = 40000
+N = 80000
 
 
 def work(n):

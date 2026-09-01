@@ -3,7 +3,7 @@
 # nested method-form call.  The nested `LOAD_METHOD` path emits a
 # `load_method_self` residual after the attribute lookup; deferring it lets the
 # record-time fold remove it before the replay backstop.
-N = 120000
+N = 240000
 
 
 class Cursor:

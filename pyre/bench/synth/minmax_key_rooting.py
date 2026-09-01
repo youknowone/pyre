@@ -9,7 +9,7 @@
 # propagation out of the compare and out of the callback itself, and the
 # `default=` path that returns before any of the rooting starts. Output
 # verified against CPython/PyPy.
-N = 20000
+N = 40000
 
 
 def tie_keeps_first(n):

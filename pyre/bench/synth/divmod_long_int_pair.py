@@ -20,7 +20,7 @@ except ImportError:
     pass
 
 BIG = (1 << 200) + 12345
-N = 5000
+N = 10000
 
 
 def unpacked(n):

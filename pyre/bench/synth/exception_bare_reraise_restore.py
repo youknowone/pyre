@@ -8,7 +8,7 @@
 #   even i -> bare re-raise -> outer except (reraised++)
 #   odd  i -> handled locally               (caught++)
 # With N=30000: caught=15000, reraised=15000. Deterministic.
-N = 30000
+N = 60000
 
 
 def run(n):

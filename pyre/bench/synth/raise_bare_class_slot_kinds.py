@@ -13,7 +13,7 @@
 # N is large because the residual shape this replaces degrades super-linearly:
 # 30k iterations hide it inside compile time, while 3M separate the two shapes
 # by two orders of magnitude.
-N = 3000000
+N = 6000000
 
 
 def stop_iteration():

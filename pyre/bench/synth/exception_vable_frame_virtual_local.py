@@ -21,7 +21,7 @@
 #
 # Expected output: 2000 ('i', 'marker') and 2000 ('i', 'marker', 'odd_only')
 
-N = 4000
+N = 8000
 
 
 def branchy(i):

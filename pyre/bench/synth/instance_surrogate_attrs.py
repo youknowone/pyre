@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=50
-N = 100000
+N = 200000
 
 METH = '\udc81'   # lone surrogate naming a method on the class
 PROP = '\udc82'   # lone surrogate naming a property (data descriptor)

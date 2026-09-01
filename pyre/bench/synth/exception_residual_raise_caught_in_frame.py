@@ -15,7 +15,7 @@
 #
 # The raise sites are builtin containers, so each one is a residual call rather
 # than an inlined callee.
-N = 4000
+N = 8000
 
 
 def names(traceback):

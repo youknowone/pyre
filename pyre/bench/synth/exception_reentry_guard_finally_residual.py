@@ -18,7 +18,7 @@
 # unsupported and the abort has to be adopted rather than retraced.
 import sys
 
-N = 4000
+N = 8000
 _cur = [None]
 
 

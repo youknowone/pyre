@@ -7,7 +7,7 @@
 # being an exact range says nothing about what its length slot holds, and the
 # hot small ranges below would otherwise let a bignum-length range take their
 # recorded exit and hand the bignum straight to `len()`.
-N = 20000
+N = 40000
 
 SMALL = range(10)
 HUGE = range(-4611686018427387904, 4611686018427387904)

@@ -33,7 +33,7 @@ try:
 except ImportError:
     pass
 
-N = 200
+N = 400
 REPEAT = 3
 
 

@@ -40,7 +40,7 @@ M = 1000000007
 # Sized so pypy's own execution clears `FLOOR_GATE_MIN_BASELINE_S`: below it
 # the floor gate declines the baseline as too small to judge and the ratio
 # reports startup rather than these loops.
-N = 1600000
+N = 3200000
 
 
 class Leaf:

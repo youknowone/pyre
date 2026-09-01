@@ -3,7 +3,7 @@
 # type and its MRO, mirroring _handle_getattribute looking the hook up on
 # type(cls). A present attribute resolves normally without the hook.
 
-N = 50000
+N = 100000
 
 
 class Meta(type):

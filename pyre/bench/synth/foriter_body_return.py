@@ -12,7 +12,7 @@
 # Both exits are driven. `i % (N + 8)` overshoots the largest element for one
 # probe in five, so the scan returns from inside the loop for the rest and
 # falls through to the exhaustion `return` for those.
-N = 32
+N = 64
 ITERS = 20000
 
 

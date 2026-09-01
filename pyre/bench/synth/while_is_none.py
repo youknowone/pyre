@@ -10,7 +10,7 @@
 #
 # N/ITERS are sized to leave every backend well inside the synthetic timeout
 # while still driving the compiled walk loop thousands of times.
-N = 300
+N = 600
 ITERS = 500
 
 

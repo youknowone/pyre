@@ -18,7 +18,7 @@
 #
 # Expected output: 4000 ('i', 'marker')
 
-N = 4000
+N = 8000
 
 
 def mid(i):

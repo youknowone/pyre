@@ -45,7 +45,7 @@
 # weaker, since the coordinate it reads comes out of a compiled activation.
 import sys
 
-N = 30000
+N = 60000
 
 
 def inner():

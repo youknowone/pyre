@@ -3,7 +3,7 @@
 # runs interpreted; the answer is recorded here for the day it is admitted.
 # `exception_with_exit_self_null_slot` is the same shape written as a `while`
 # loop, where no gate stands between it and the JIT.
-N = 20000
+N = 40000
 
 
 class Context:

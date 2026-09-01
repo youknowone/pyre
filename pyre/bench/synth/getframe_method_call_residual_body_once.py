@@ -33,7 +33,7 @@
 # Expected output: (20000, 20000, 20000)
 import sys
 
-N = 20000
+N = 40000
 
 
 class Force:

@@ -9,7 +9,7 @@
 # result, and invoke it on every call.  If the call is incorrectly marked replay-safe, the first replay
 # invokes the getter twice (N + 1 hits).
 
-N = 5000
+N = 10000
 hits = [0]
 
 

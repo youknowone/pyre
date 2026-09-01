@@ -14,7 +14,7 @@
 # the cell every iteration, so the peeled body must re-read it live or the
 # inlined callee sees the previous iteration's `i` and picks the wrong branch.
 # Output is verified against CPython/PyPy.
-N = 30000
+N = 60000
 
 
 def process(x, i):

@@ -21,7 +21,7 @@ try:
 except ImportError:
     pass
 
-N = 10000
+N = 20000
 
 
 def main():
