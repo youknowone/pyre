@@ -13071,7 +13071,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
     ) -> Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>> {
         let storage = self.get_resume_storage(green_key, trace_id, fail_index)?;
-        Some(storage.rd_virtuals.clone())
+        Some(storage.rd_virtuals().to_vec())
     }
 
     /// resume.py _prepare parity: get rd_pendingfields for a guard.
@@ -13082,7 +13082,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
     ) -> Option<Vec<majit_ir::GuardPendingFieldEntry>> {
         let storage = self.get_resume_storage(green_key, trace_id, fail_index)?;
-        Some(storage.rd_pendingfields.clone())
+        Some(storage.rd_pendingfields().to_vec())
     }
 
     /// compile.py ResumeFromInterpDescr.compile_and_attach parity.
@@ -14692,7 +14692,7 @@ impl<M: Clone> MetaInterp<M> {
         // forced virtuals fell back to NullAllocator entries and pending
         // heap writes were dropped on async forcing.
         let storage = exit_layout.storage.as_deref();
-        let rd_numb = storage.map(|s| s.rd_numb.as_slice()).unwrap_or(&[]);
+        let rd_numb = storage.map(|s| s.rd_numb.as_ref()).unwrap_or(&[]);
         let empty_consts: [Const; 0] = [];
         let rd_consts: &[Const] = storage.map(|s| s.rd_consts()).unwrap_or(&empty_consts);
         // resume.py _prepare(storage) parity: materialize rd_virtuals
@@ -14706,8 +14706,8 @@ impl<M: Clone> MetaInterp<M> {
             fail_values.len() as i32
         };
         let rd_virtuals = storage.map(|s| {
-            let num_virtuals = s.rd_virtuals.len();
-            s.rd_virtuals
+            let num_virtuals = s.rd_virtuals().len();
+            s.rd_virtuals()
                 .iter()
                 .map(|rd| {
                     crate::resume::rd_virtual_to_virtual_info(
@@ -14735,7 +14735,7 @@ impl<M: Clone> MetaInterp<M> {
                 fail_values,
                 Some(deadframe_types),
                 rd_virtuals.as_deref(),
-                storage.map(|s| s.rd_pendingfields.as_slice()),
+                storage.map(|s| s.rd_pendingfields()),
                 Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
                 vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
                 None, // ginfo — pyre has no greenfield mechanism
@@ -24415,7 +24415,7 @@ mod tests {
         let storage = meta
             .get_resume_storage(green_key, trace_id, fail_index)
             .expect("storage should be present");
-        assert_eq!(storage.rd_numb, vec![7, 8, 9]);
+        assert_eq!(storage.rd_numb.as_ref(), &[7, 8, 9]);
         assert_eq!(storage.rd_consts_snapshot(), vec![majit_ir::Const::Int(11)]);
         assert_eq!(
             meta.get_recovery_slot_types(green_key, trace_id, fail_index),
@@ -25099,9 +25099,9 @@ mod tests {
             .storage
             .as_ref()
             .expect("retrace storage should be present");
-        assert_eq!(storage.rd_numb, expected_rd_numb);
+        assert_eq!(storage.rd_numb.as_ref(), expected_rd_numb.as_slice());
         assert!(storage.rd_consts().is_empty());
-        assert!(storage.rd_virtuals.is_empty());
+        assert!(storage.rd_virtuals().is_empty());
         assert_eq!(meta.pending_frontend_boxes_ref(), Some([42].as_slice()));
         assert_eq!(
             meta.pending_frontend_box_types.as_deref(),

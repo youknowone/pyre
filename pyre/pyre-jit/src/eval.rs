@@ -13676,7 +13676,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     // from the guard-owned shared Arc instead of a per-guard Vec copy.
     let (typed, mut pending_virtuals_cache) = {
         let storage = exit_layout.storage.as_deref();
-        let rd_numb = storage.map(|s| s.rd_numb.as_slice()).unwrap_or(&[]);
+        let rd_numb = storage.map(|s| s.rd_numb.as_ref()).unwrap_or(&[]);
         let empty_consts: Vec<majit_ir::Const> = Vec::new();
         let rd_consts: &[majit_ir::Const] = storage.map(|s| s.rd_consts()).unwrap_or(&empty_consts);
         if rd_numb.is_empty() {
@@ -13738,7 +13738,7 @@ pub(crate) fn decode_and_restore_guard_failure(
         // in the vable `last_instr` field.
         build_resumed_frames(
             raw_values,
-            storage.rd_numb.as_slice(),
+            storage.rd_numb.as_ref(),
             storage.rd_consts(),
             exit_layout,
             ResumeVableMode::GuardFailureSync,

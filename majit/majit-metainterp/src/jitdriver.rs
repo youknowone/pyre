@@ -803,9 +803,9 @@ fn convert_rd_virtuals_for_storage(
 ) -> Vec<crate::resume::VirtualInfo> {
     let rd_consts = storage.rd_consts();
     let count = raw_value_count as i32;
-    let num_virtuals = storage.rd_virtuals.len();
+    let num_virtuals = storage.rd_virtuals().len();
     storage
-        .rd_virtuals
+        .rd_virtuals()
         .iter()
         .map(|rd| crate::resume::rd_virtual_to_virtual_info(rd, rd_consts, count, num_virtuals))
         .collect()
@@ -5250,7 +5250,7 @@ impl<S: JitState> JitDriver<S> {
             )
             .and_then(|layout| layout.storage)
             .is_some_and(|storage| {
-                !storage.rd_pendingfields.is_empty() && storage.rd_virtuals.len() > 1
+                !storage.rd_pendingfields().is_empty() && storage.rd_virtuals().len() > 1
             })
     }
 
@@ -6420,7 +6420,7 @@ impl<S: JitState> JitDriver<S> {
             // Arc so blackhole resume observes the guard-owned pool
             // the GC walker updates (no per-call Vec clone).
             if let Some(storage) = exit_layout.storage.as_deref() {
-                let rd_numb = storage.rd_numb.as_slice();
+                let rd_numb = storage.rd_numb.as_ref();
                 let rd_consts_slice: &[Const] = storage.rd_consts();
 
                 // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
@@ -6512,7 +6512,7 @@ impl<S: JitState> JitDriver<S> {
                     &raw_values,
                     Some(&exit_layout.exit_types),
                     rd_virtuals_slice,
-                    Some(&storage.rd_pendingfields), // rd_guard_pendingfields
+                    Some(storage.rd_pendingfields()), // rd_guard_pendingfields
                     Some(
                         &self.meta_interp().staticdata.virtualref_info
                             as &dyn crate::resume::VRefInfo,
@@ -9120,7 +9120,7 @@ impl<S: JitState> JitDriver<S> {
             if execute_replay
                 && replay_allocator.is_none()
                 && retrace.storage.as_deref().is_some_and(|storage| {
-                    !storage.rd_pendingfields.is_empty() || !storage.rd_virtuals.is_empty()
+                    !storage.rd_pendingfields().is_empty() || !storage.rd_virtuals().is_empty()
                 })
             {
                 ctx.mark_bridge_replay_incomplete();
@@ -9129,7 +9129,7 @@ impl<S: JitState> JitDriver<S> {
                 sym,
                 ctx,
                 bfm,
-                retrace.storage.as_deref().map(|s| s.rd_virtuals.as_slice()),
+                retrace.storage.as_deref().map(|s| s.rd_virtuals()),
                 &raw_values,
                 &retrace.fail_types,
                 replay_allocator,

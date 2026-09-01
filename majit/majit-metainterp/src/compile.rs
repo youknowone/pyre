@@ -801,17 +801,11 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             // ResumeGuardCopiedDescr).
             let storage_for_guard = op.resolved_rd_numb().map(|numb| {
                 crate::resume::ResumeStorage::with_shared_consts(
-                    numb.to_vec(),
+                    numb,
                     op.resolved_rd_consts()
                         .unwrap_or_else(|| majit_ir::SharedConstPool::new(Vec::new())),
-                    op.resolved_rd_virtuals()
-                        .as_deref()
-                        .map(<[std::rc::Rc<majit_ir::RdVirtualInfo>]>::to_vec)
-                        .unwrap_or_default(),
-                    op.resolved_rd_pendingfields()
-                        .as_deref()
-                        .map(<[majit_ir::GuardPendingFieldEntry]>::to_vec)
-                        .unwrap_or_default(),
+                    op.resolved_rd_virtuals(),
+                    op.resolved_rd_pendingfields(),
                 )
             });
             result.insert(fail_index, layout);

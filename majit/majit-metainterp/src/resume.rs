@@ -582,6 +582,52 @@ const ENCODED_UNAVAILABLE: i64 = -3;
 const INLINE_TAGGED_MIN: i64 = -(1_i64 << 61);
 const INLINE_TAGGED_MAX: i64 = (1_i64 << 61) - 1;
 
+/// RPython's nullable `rd_virtuals` / `rd_pendingfields` arrays with a slice
+/// surface.  The overwhelmingly common null case occupies only the enum and
+/// performs no allocation; a populated array shares the guard descr's exact
+/// backing storage.  `Deref<[T]>` deliberately preserves the field operations
+/// used by generated JIT code (`len`, `iter`, indexing).
+pub enum SharedResumeSlice<T> {
+    Empty,
+    Shared(Arc<[T]>),
+}
+
+impl<T> SharedResumeSlice<T> {
+    pub fn as_slice(&self) -> &[T] {
+        match self {
+            Self::Empty => &[],
+            Self::Shared(values) => values,
+        }
+    }
+}
+
+impl<T> From<Vec<T>> for SharedResumeSlice<T> {
+    fn from(values: Vec<T>) -> Self {
+        if values.is_empty() {
+            Self::Empty
+        } else {
+            Self::Shared(Arc::from(values))
+        }
+    }
+}
+
+impl<T> From<Option<Arc<[T]>>> for SharedResumeSlice<T> {
+    fn from(values: Option<Arc<[T]>>) -> Self {
+        match values {
+            Some(values) if !values.is_empty() => Self::Shared(values),
+            _ => Self::Empty,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for SharedResumeSlice<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
 /// compile.py `ResumeGuardDescr` storage.
 ///
 /// Canonical, guard-owned resume payload (`storage.rd_numb/rd_consts/
@@ -599,7 +645,7 @@ const INLINE_TAGGED_MAX: i64 = (1_i64 << 61) - 1;
 pub struct ResumeStorage {
     /// resume.py:466 `storage.rd_numb` — packed byte stream (NUMBERING
     /// lltype equivalent). Immutable once installed.
-    pub rd_numb: Vec<u8>,
+    pub rd_numb: Arc<[u8]>,
     /// resume.py:467 `storage.rd_consts` — shared constant pool.
     ///
     /// Interior mutability: the minor-collection root walker visits
@@ -610,10 +656,10 @@ pub struct ResumeStorage {
     pub rd_consts: Arc<majit_ir::SharedConstPool>,
     /// compile.py:858 `storage.rd_virtuals` — live `RdVirtualInfo`
     /// entries describing virtual objects to materialize on resume.
-    pub rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
+    pub rd_virtuals: SharedResumeSlice<std::rc::Rc<majit_ir::RdVirtualInfo>>,
     /// resume.py:468 `storage.rd_pendingfields` — pending field writes
     /// replayed during blackhole resume.
-    pub rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
+    pub rd_pendingfields: SharedResumeSlice<majit_ir::GuardPendingFieldEntry>,
 }
 
 impl ResumeStorage {
@@ -631,12 +677,12 @@ impl ResumeStorage {
     /// `_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescrRef`),
     /// matching the `_attrs_`-only-on-`AbstractResumeGuardDescr` contract.
     pub fn from_fail_descr(descr: &dyn majit_ir::FailDescr) -> Option<Self> {
-        let rd_numb = descr.rd_numb()?.to_vec();
+        let rd_numb = descr.rd_numb_arc()?;
         Some(Self {
             rd_numb,
             rd_consts: descr.rd_consts_arc()?,
-            rd_virtuals: descr.rd_virtuals().unwrap_or(&[]).to_vec(),
-            rd_pendingfields: descr.rd_pendingfields().unwrap_or(&[]).to_vec(),
+            rd_virtuals: descr.rd_virtuals_arc().into(),
+            rd_pendingfields: descr.rd_pendingfields_arc().into(),
         })
     }
 }
@@ -653,8 +699,8 @@ impl std::fmt::Debug for ResumeStorage {
         f.debug_struct("ResumeStorage")
             .field("rd_numb_len", &self.rd_numb.len())
             .field("rd_consts_len", &consts_len)
-            .field("rd_virtuals_len", &self.rd_virtuals.len())
-            .field("rd_pendingfields_len", &self.rd_pendingfields.len())
+            .field("rd_virtuals_len", &self.rd_virtuals().len())
+            .field("rd_pendingfields_len", &self.rd_pendingfields().len())
             .finish()
     }
 }
@@ -667,10 +713,10 @@ impl ResumeStorage {
         rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) -> Arc<Self> {
         Arc::new(ResumeStorage {
-            rd_numb,
+            rd_numb: Arc::from(rd_numb),
             rd_consts: majit_ir::SharedConstPool::new(rd_consts),
-            rd_virtuals,
-            rd_pendingfields,
+            rd_virtuals: rd_virtuals.into(),
+            rd_pendingfields: rd_pendingfields.into(),
         })
     }
 
@@ -692,17 +738,30 @@ impl ResumeStorage {
         self.rd_consts.as_slice()
     }
 
+    /// `resume.py ResumeDataReader._prepare_virtuals`: `None` is the
+    /// allocation-free common case; readers see the same empty slice they
+    /// previously obtained from an empty `Vec`.
+    pub fn rd_virtuals(&self) -> &[std::rc::Rc<majit_ir::RdVirtualInfo>] {
+        self.rd_virtuals.as_slice()
+    }
+
+    /// `resume.py ResumeDataReader._prepare_pendingfields`: upstream uses a
+    /// null pointer when there are no deferred writes.
+    pub fn rd_pendingfields(&self) -> &[majit_ir::GuardPendingFieldEntry] {
+        self.rd_pendingfields.as_slice()
+    }
+
     pub fn with_shared_consts(
-        rd_numb: Vec<u8>,
+        rd_numb: Arc<[u8]>,
         rd_consts: Arc<majit_ir::SharedConstPool>,
-        rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
-        rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
+        rd_virtuals: Option<Arc<[std::rc::Rc<majit_ir::RdVirtualInfo>]>>,
+        rd_pendingfields: Option<Arc<[majit_ir::GuardPendingFieldEntry]>>,
     ) -> Arc<Self> {
         Arc::new(ResumeStorage {
             rd_numb,
             rd_consts,
-            rd_virtuals,
-            rd_pendingfields,
+            rd_virtuals: rd_virtuals.into(),
+            rd_pendingfields: rd_pendingfields.into(),
         })
     }
 }

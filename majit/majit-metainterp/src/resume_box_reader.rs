@@ -1276,13 +1276,13 @@ pub fn replay_pending_fields(
     if __diag {
         eprintln!(
             "[replay] storage=Some pendingfields={} rd_virtuals={} num_failargs={}",
-            storage.rd_pendingfields.len(),
-            storage.rd_virtuals.len(),
+            storage.rd_pendingfields().len(),
+            storage.rd_virtuals().len(),
             resume_data.num_failargs,
         );
     }
-    let num_virtuals = storage.rd_virtuals.len();
-    for pending in &storage.rd_pendingfields {
+    let num_virtuals = storage.rd_virtuals().len();
+    for pending in storage.rd_pendingfields() {
         let Some(descr) = pending.descr.as_ref() else {
             if __diag {
                 eprintln!(

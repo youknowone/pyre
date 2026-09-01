@@ -9025,7 +9025,7 @@ fn prepare_bridge_pending_fields(
         return pending_ref_array_writes;
     };
     let target_descr = crate::descr::ec_sys_exc_value_descr();
-    for pending in &storage.rd_pendingfields {
+    for pending in storage.rd_pendingfields() {
         let Some(descr) = pending.descr.as_ref() else {
             continue;
         };
@@ -11629,7 +11629,7 @@ impl JitState for PyreJitState {
         // MetaInterp::initialize_virtualizable(), not carried as reds.
         _meta.trace_extra_reds = 1;
         let storage = storage?;
-        let rd_numb = storage.rd_numb.as_slice();
+        let rd_numb = storage.rd_numb.as_ref();
         // resume.py `self.consts = storage.rd_consts` — borrow
         // the shared pool; `ResumeDataResult` carries the Arc handle
         // so downstream virtual materialization reads the same pool
