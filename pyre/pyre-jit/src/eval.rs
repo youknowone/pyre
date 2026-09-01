@@ -6957,47 +6957,43 @@ pub fn releaseall(_space: pyre_object::PyObjectRef) {
 
 fn init_callbacks() {
     use pyre_jit_trace::callbacks::{self, CallJitCallbacks};
-    thread_local! {
-        static INIT: Cell<bool> = const { Cell::new(false) };
-    }
-    INIT.with(|c| {
-        if !c.get() {
-            c.set(true);
-            let cb = Box::leak(Box::new(CallJitCallbacks {
-                callee_frame_helper: crate::call_jit::callee_frame_helper,
-                recursive_force_cache_safe: crate::call_jit::recursive_force_cache_safe,
-                jit_drop_callee_frame: crate::call_jit::jit_drop_callee_frame as *const (),
-                jit_frame_set_slot_ref: crate::call_jit::jit_frame_set_slot_ref as *const (),
-                jit_frame_set_slot_int: crate::call_jit::jit_frame_set_slot_int as *const (),
-                jit_frame_set_slot_float: crate::call_jit::jit_frame_set_slot_float as *const (),
-                jit_force_callee_frame: crate::call_jit::jit_force_callee_frame as *const (),
-                jit_force_recursive_call_1: crate::call_jit::jit_force_recursive_call_1
-                    as *const (),
-                jit_force_recursive_call_argraw_boxed_1:
-                    crate::call_jit::jit_force_recursive_call_argraw_boxed_1 as *const (),
-                jit_force_self_recursive_call_argraw_boxed_1:
-                    crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1 as *const (),
-                jit_create_callee_frame_1: crate::call_jit::jit_create_callee_frame_1 as *const (),
-                jit_create_callee_frame_1_raw_int:
-                    crate::call_jit::jit_create_callee_frame_1_raw_int as *const (),
-                jit_create_self_recursive_callee_frame_1:
-                    crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
-                jit_create_self_recursive_callee_frame_1_raw_int:
-                    crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
-                driver_pair: || driver_pair() as *mut JitDriverPair as *mut u8,
-                ensure_majit_jitcode: |code, w_code| {
-                    if !code.is_null() {
-                        return crate::jit::codewriter::ensure_trace_jitcode_for_w_code(
-                            code, w_code,
-                        )
+    // The table this publishes is process-global, so its once-guard is too.
+    // A per-thread guard leaks a second, field-identical but distinct table on
+    // every further thread that reaches here, and `callbacks::init` rejects a
+    // second table by pointer.
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let cb = Box::leak(Box::new(CallJitCallbacks {
+            callee_frame_helper: crate::call_jit::callee_frame_helper,
+            recursive_force_cache_safe: crate::call_jit::recursive_force_cache_safe,
+            jit_drop_callee_frame: crate::call_jit::jit_drop_callee_frame as *const (),
+            jit_frame_set_slot_ref: crate::call_jit::jit_frame_set_slot_ref as *const (),
+            jit_frame_set_slot_int: crate::call_jit::jit_frame_set_slot_int as *const (),
+            jit_frame_set_slot_float: crate::call_jit::jit_frame_set_slot_float as *const (),
+            jit_force_callee_frame: crate::call_jit::jit_force_callee_frame as *const (),
+            jit_force_recursive_call_1: crate::call_jit::jit_force_recursive_call_1 as *const (),
+            jit_force_recursive_call_argraw_boxed_1:
+                crate::call_jit::jit_force_recursive_call_argraw_boxed_1 as *const (),
+            jit_force_self_recursive_call_argraw_boxed_1:
+                crate::call_jit::jit_force_self_recursive_call_argraw_boxed_1 as *const (),
+            jit_create_callee_frame_1: crate::call_jit::jit_create_callee_frame_1 as *const (),
+            jit_create_callee_frame_1_raw_int: crate::call_jit::jit_create_callee_frame_1_raw_int
+                as *const (),
+            jit_create_self_recursive_callee_frame_1:
+                crate::call_jit::jit_create_self_recursive_callee_frame_1 as *const (),
+            jit_create_self_recursive_callee_frame_1_raw_int:
+                crate::call_jit::jit_create_self_recursive_callee_frame_1_raw_int as *const (),
+            driver_pair: || driver_pair() as *mut JitDriverPair as *mut u8,
+            ensure_majit_jitcode: |code, w_code| {
+                if !code.is_null() {
+                    return crate::jit::codewriter::ensure_trace_jitcode_for_w_code(code, w_code)
                         .is_some();
-                    }
-                    false
-                },
-                drain_backend_jit_exc: crate::call_jit::drain_backend_jit_exc,
-            }));
-            callbacks::init(cb);
-        }
+                }
+                false
+            },
+            drain_backend_jit_exc: crate::call_jit::drain_backend_jit_exc,
+        }));
+        callbacks::init(cb);
     });
 }
 
