@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 import _warnings
 import os
 import sys
@@ -112,6 +113,31 @@ class Loader:
         return "first line\nsecond line\n"
 
 
+class Spec:
+    def __init__(self, loader):
+        self.loader = loader
+
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    _warnings.warn_explicit(
+        "loader source",
+        UserWarning,
+        "loader.py",
+        2,
+        module_globals={
+            "__spec__": Spec(Loader()),
+            "__name__": "warnings_source_test",
+        },
+    )
+    assert len(caught) == 1
+    # A loader-provided source line feeds the direct stderr fallback only;
+    # WarningMessage.line remains None.
+    assert caught[0].line is None
+
+# module_globals is read through __spec__.loader; naming the loader only as
+# __loader__, or disagreeing with __spec__.loader, is deprecated and warns
+# before the source lookup runs.
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always")
     _warnings.warn_explicit(
@@ -121,10 +147,26 @@ with warnings.catch_warnings(record=True) as caught:
         2,
         module_globals={"__loader__": Loader(), "__name__": "warnings_source_test"},
     )
-    assert len(caught) == 1
-    # PyPy uses a loader-provided source line only for the direct stderr
-    # fallback; WarningMessage.line remains None.
-    assert caught[0].line is None
+    assert [entry.category for entry in caught] == [DeprecationWarning, UserWarning]
+    assert str(caught[0].message) == "Module globals is missing a __spec__.loader"
+    assert caught[-1].line is None
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    _warnings.warn_explicit(
+        "loader source",
+        UserWarning,
+        "loader.py",
+        2,
+        module_globals={
+            "__spec__": Spec(Loader()),
+            "__loader__": Loader(),
+            "__name__": "warnings_source_test",
+        },
+    )
+    assert [entry.category for entry in caught] == [DeprecationWarning, UserWarning]
+    assert str(caught[0].message) == "Module globals; __loader__ != __spec__.loader"
+    assert caught[-1].line is None
 
 
 class BadLoader:
@@ -143,7 +185,7 @@ with warnings.catch_warnings(record=True) as caught:
         UserWarning,
         "loader.py",
         1,
-        module_globals={"__loader__": BadLoader(), "__name__": "bad_source"},
+        module_globals={"__spec__": Spec(BadLoader()), "__name__": "bad_source"},
     )
     assert len(caught) == 1
 
