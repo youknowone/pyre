@@ -1356,6 +1356,25 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_unary_positive_value",
         crate::opcode_ops::jit_unary_positive_value,
     );
+    // Codewriter `inline_call_r_r` targets the object-space graph names, not
+    // the opcode residual wrappers.  Bind each graph to its dedicated
+    // one-word C-ABI entry point so both recording-time descent and
+    // guard-failure blackholing execute the same interpreter operation.
+    cp1(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::neg",
+        crate::opcode_ops::jit_descroperation_neg,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::invert",
+        crate::opcode_ops::jit_descroperation_invert,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::pos",
+        crate::opcode_ops::jit_descroperation_pos,
+    );
     cpa2(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_getitem",
@@ -5044,6 +5063,27 @@ mod tests {
         try_pop_to(depth);
         assert_eq!(push(marker), depth, "try_pop_to left the depth unrestored");
         try_pop_to(depth);
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_codewriter_unary_graphs_with_word_abi_bridges() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for (path, expected) in [
+            (
+                "pyre_interpreter::objspace::descroperation::neg",
+                crate::opcode_ops::jit_descroperation_neg as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::objspace::descroperation::invert",
+                crate::opcode_ops::jit_descroperation_invert as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::objspace::descroperation::pos",
+                crate::opcode_ops::jit_descroperation_pos as *const () as usize as i64,
+            ),
+        ] {
+            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+        }
     }
 
     /// Two registered functions must never share an address.

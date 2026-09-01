@@ -1684,11 +1684,115 @@ fn dispatch_op(
         opname if opname.starts_with("residual_call_") => {
             dispatch_residual_call(state, opname, args, result);
         }
+        // `jtransform.py handle_regular_call` shape: leading JitCode descr,
+        // then the non-empty kind lists selected by `rewrite_call`, and an
+        // optional typed result.  Unlike the older pyre-only nested-call
+        // adapter, this emits the canonical dR/dIR/dIRF byte layout.
+        opname if opname.starts_with("inline_call_") => {
+            dispatch_inline_call(state, opname, args, result);
+        }
         other => panic!(
             "assemble(): unimplemented opname {:?} — add a builder mapping in jit/assembler.rs",
             other
         ),
     }
+}
+
+fn dispatch_inline_call(
+    state: &mut AssemblyState,
+    opname: &str,
+    args: &[Operand],
+    result: Option<&Register>,
+) {
+    let tail = &opname["inline_call_".len()..];
+    let (kinds, reskind) = tail
+        .rsplit_once('_')
+        .unwrap_or_else(|| panic!("malformed inline_call opname: {opname:?}"));
+    assert!(matches!(kinds, "r" | "ir" | "irf"));
+    assert!(matches!(reskind, "i" | "r" | "f" | "v"));
+
+    let target = match args.first() {
+        Some(Operand::Descr(descr)) => match &**descr {
+            DescrOperand::JitCode(jitcode) => Arc::clone(jitcode),
+            other => panic!("inline_call expects a JitCode descr, got {other:?}"),
+        },
+        other => panic!("inline_call expects a leading Descr operand, got {other:?}"),
+    };
+    let target_idx = state.builder.add_sub_jitcode_arc(target);
+
+    let mut cursor = 1usize;
+    let mut args_i = None;
+    let mut args_r = None;
+    let mut args_f = None;
+    if kinds.contains('i') {
+        args_i = Some(
+            expect_list_regs_or_pool(state, &args[cursor], Kind::Int)
+                .into_iter()
+                .map(u16::from)
+                .collect::<Vec<_>>(),
+        );
+        cursor += 1;
+    }
+    if kinds.contains('r') {
+        args_r = Some(
+            expect_list_regs_or_pool(state, &args[cursor], Kind::Ref)
+                .into_iter()
+                .map(u16::from)
+                .collect::<Vec<_>>(),
+        );
+        cursor += 1;
+    }
+    if kinds.contains('f') {
+        args_f = Some(
+            expect_list_regs_or_pool(state, &args[cursor], Kind::Float)
+                .into_iter()
+                .map(u16::from)
+                .collect::<Vec<_>>(),
+        );
+        cursor += 1;
+    }
+    assert_eq!(cursor, args.len(), "inline_call has trailing operands");
+
+    let result = match reskind {
+        "v" => {
+            assert!(result.is_none(), "void inline_call cannot have a result");
+            None
+        }
+        "i" => Some((
+            majit_metainterp::jitcode::JitArgKind::Int,
+            expect_result_reg(result, Kind::Int, "inline_call_i needs result"),
+        )),
+        "r" => Some((
+            majit_metainterp::jitcode::JitArgKind::Ref,
+            expect_result_reg(result, Kind::Ref, "inline_call_r needs result"),
+        )),
+        "f" => Some((
+            majit_metainterp::jitcode::JitArgKind::Float,
+            expect_result_reg(result, Kind::Float, "inline_call_f needs result"),
+        )),
+        _ => unreachable!(),
+    };
+    let key: &'static str = match (kinds, reskind) {
+        ("r", "i") => "inline_call_r_i/dR>i",
+        ("r", "r") => "inline_call_r_r/dR>r",
+        ("r", "v") => "inline_call_r_v/dR",
+        ("ir", "i") => "inline_call_ir_i/dIR>i",
+        ("ir", "r") => "inline_call_ir_r/dIR>r",
+        ("ir", "v") => "inline_call_ir_v/dIR",
+        ("irf", "i") => "inline_call_irf_i/dIRF>i",
+        ("irf", "r") => "inline_call_irf_r/dIRF>r",
+        ("irf", "f") => "inline_call_irf_f/dIRF>f",
+        ("irf", "v") => "inline_call_irf_v/dIRF",
+        _ => panic!("unsupported canonical inline_call shape: {opname}"),
+    };
+    state.builder.canonical_inline_call(
+        key,
+        target_idx,
+        args_i.as_deref(),
+        args_r.as_deref(),
+        args_f.as_deref(),
+        result,
+    );
 }
 
 /// Consumer for the `residual_call_{kinds}_{reskind}` shape
@@ -3243,6 +3347,50 @@ mod tests {
             .unwrap()
             .as_calldescr();
         assert!(descr.extra_info.is_call_release_gil());
+    }
+
+    #[test]
+    fn assemble_inline_call_r_r_emits_the_canonical_descr_varlist_shape() {
+        let target = Arc::new(JitCodeBuilder::default().finish());
+        let mut ssarepr = SSARepr::new("inline_call_r_r");
+        ssarepr.insns.push(Insn::op_with_result(
+            "inline_call_r_r",
+            vec![
+                Operand::descr(DescrOperand::JitCode(Arc::clone(&target))),
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Ref,
+                    vec![Operand::Register(Register::new(Kind::Ref, 0))],
+                )),
+            ],
+            Register::new(Kind::Ref, 1),
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                ref_: 2,
+                ..NumRegs::default()
+            }),
+        );
+
+        assert_eq!(
+            jitcode.code,
+            vec![majit_translate::insns::BC_INLINE_CALL_R_R, 0, 0, 1, 0, 1,]
+        );
+        match &jitcode.exec.descrs[0] {
+            majit_metainterp::jitcode::RuntimeBhDescr::JitCode(stored) => {
+                assert!(Arc::ptr_eq(stored, &target));
+            }
+            other => panic!("inline_call descr slot is not a JitCode: {other:?}"),
+        }
+        assert_eq!(
+            jitcode
+                .resulttypes
+                .as_ref()
+                .and_then(|resulttypes| resulttypes.get(&jitcode.code.len())),
+            Some(&'r')
+        );
     }
 
     #[test]

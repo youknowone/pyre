@@ -591,6 +591,11 @@ pub struct JitCode {
     /// `JitCodeBuilder` populates this during runtime per-CodeObject
     /// emission.
     pub exec: JitCodeExecState,
+    /// Which descriptor namespace bytecode `d`/`j` operands address.
+    /// `from_canonical` wraps a source-translator JitCode whose operands use
+    /// the process-wide codewriter table; `JitCodeBuilder` creates a runtime
+    /// Python-code body whose operands use `exec.descrs`.
+    uses_global_descr_pool: bool,
     /// Reachable symbolic residual targets, computed after the runtime wrapper
     /// has received its final function-address bindings and descriptor pool.
     ///
@@ -634,6 +639,7 @@ impl JitCode {
         Self {
             core: majit_translate::jitcode::JitCode::new(name),
             exec: JitCodeExecState::default(),
+            uses_global_descr_pool: false,
             reachable_symbolic_residuals: std::sync::OnceLock::new(),
         }
     }
@@ -663,8 +669,13 @@ impl JitCode {
                 jit_merge_point_offset,
                 ..JitCodeExecState::default()
             },
+            uses_global_descr_pool: true,
             reachable_symbolic_residuals: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn uses_global_descr_pool(&self) -> bool {
+        self.uses_global_descr_pool
     }
 
     /// Borrow the canonical core (e.g. for serialization that
@@ -684,7 +695,9 @@ impl JitCode {
 
 impl Default for JitCode {
     fn default() -> Self {
-        Self::from_canonical(majit_translate::jitcode::JitCode::default())
+        let mut jitcode = Self::from_canonical(majit_translate::jitcode::JitCode::default());
+        jitcode.uses_global_descr_pool = false;
+        jitcode
     }
 }
 
@@ -693,6 +706,7 @@ impl Clone for JitCode {
         Self {
             core: self.core.clone(),
             exec: self.exec.clone(),
+            uses_global_descr_pool: self.uses_global_descr_pool,
             reachable_symbolic_residuals: self.reachable_symbolic_residuals.clone(),
         }
     }

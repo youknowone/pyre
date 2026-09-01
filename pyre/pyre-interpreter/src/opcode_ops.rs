@@ -1097,6 +1097,30 @@ pub extern "C" fn jit_unary_positive_value(value: i64) -> i64 {
     }
 }
 
+// `CallControl.get_jitcode` gives each inlined graph its own callable
+// `JitCode.fnaddr`.  The source graphs below are Rust `PyResult` functions,
+// whose native ABI is not the one-word Ref ABI used by codewriter
+// `inline_call_r_r`.  Publish distinct C-ABI entry points for those graph
+// paths, just as translation supplies callable addresses for RPython graphs.
+// Keep these as separate functions from the opcode residual bridges: the
+// fnaddr registry deliberately rejects unrelated path names sharing one
+// address, because address-keyed runtime rebinding would otherwise be
+// ambiguous.
+#[inline(never)]
+pub extern "C" fn jit_descroperation_neg(value: i64) -> i64 {
+    jit_unary_negative_value(value)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_invert(value: i64) -> i64 {
+    jit_unary_invert_value(value)
+}
+
+#[inline(never)]
+pub extern "C" fn jit_descroperation_pos(value: i64) -> i64 {
+    jit_unary_positive_value(value)
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     match getitem(obj as PyObjectRef, index as PyObjectRef) {

@@ -408,6 +408,16 @@ impl<'a> RawDescrPool<'a> {
             Self::PerFn(descrs) => descrs.len(),
         }
     }
+
+    fn runtime_jitcode_at(
+        self,
+        idx: usize,
+    ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+        match self {
+            Self::Global => None,
+            Self::PerFn(descrs) => descrs.get(idx).and_then(|descr| descr.as_jitcode_owned()),
+        }
+    }
 }
 
 /// A callee local slot's recording-time concrete, tagged with the frame

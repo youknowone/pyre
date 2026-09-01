@@ -6970,55 +6970,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // UNARY_POSITIVE.  Descend `pos` whole rather than re-emit its identity
-    // arm by hand; the body's own `guard_class` and promoted `w_class` select
-    // the arm.  The `unary_positive_int` fold that stood behind this descent
-    // measured `consulted=0` on every fixture once the descent was in.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
-        && let Some(outcome) = spec_gate(SpecFold::UnaryPositiveDescent, || {
-            try_walker_orthodox_unary_positive(ctx, op.pc, r_args[0], dst, dst_bank)
-        })?
-    {
-        return Ok((outcome, op.next_pc));
-    }
-
-    // UNARY_NEGATIVE.  Descend `neg` whole rather than re-emit its integer arm
-    // by hand.  The translated body owns the ordinary int arm and the exact
-    // `long` operand. Bool, subclass and non-int operands still fall through
-    // to the generic residual so their override semantics are preserved.  The
-    // `unary_negative_int` fold that stood behind this descent measured
-    // `consulted=0` on every fixture once `-INT_MIN` was descended too.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
-        && let Some(outcome) = spec_gate(SpecFold::UnaryNegativeDescent, || {
-            try_walker_orthodox_unary_negative(ctx, op.pc, r_args[0], dst, dst_bank)
-        })?
-    {
-        return Ok((outcome, op.next_pc));
-    }
-
-    // UNARY_INVERT.  Descend `invert` whole rather than re-emit its integer arm
-    // by hand.  This
-    // replaced `unary_invert_int`, whose site it took whole: with the descent
-    // in, that fold measured `consulted=0` on every fixture that exercises `~`.
-    // Falls through to the generic residual when the body is absent from this
-    // build or reaches a helper the build did not lower.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryInvert
-        && let Some(outcome) = spec_gate(SpecFold::UnaryInvertDescent, || {
-            try_walker_orthodox_unary_invert(ctx, op.pc, r_args[0], dst, dst_bank)
-        })?
-    {
-        return Ok((outcome, op.next_pc));
-    }
-
     // #62: specialize STORE_SUBSCR `list[int] = value` (int / float storage,
     // in-bounds, type-matching) to the walker-native `setarrayitem_raw` form,
     // eliding the `CALL_MAY_FORCE` that would force the virtualizable every

@@ -1,13 +1,11 @@
 # pyre-check: max-pypy-ratio=6
-# pyre-check: spec-folds=unary_negative_descent,unary_invert_descent
-# The ceiling sits between the two measured states: with the orthodox unary
-# descents this runs 2.5x pypy, and with invert descent suppressed about 15.8x.
+# Negative and invert are emitted as canonical codewriter `inline_call`s and
+# carry no residual-call fold gate.
 # Unary operations must observe the current loop-carried integer. Exercise
 # both ordinary values and the large-integer boundary, plus neighboring
 # operations that serve as controls. Deterministic.
-# A hot `~i` loop is descended here too: without `unary_invert_descent` each
-# iteration leaves a `CallMayForce` residual instead of the interpreter body's
-# `IntInvert`, which measures 6.9x on its own (0.095s -> 0.653s).
+# A hot `~i` loop proves that generation now reaches the interpreter body's
+# `IntInvert` directly instead of leaving a `CallMayForce` residual.
 
 
 def loop_carried_neg(n):

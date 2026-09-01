@@ -759,9 +759,10 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// refuses the wrapper for the shape of its error path.
 ///
 /// [`summarize_descent_blockers`] therefore walks the body's control-flow graph
-/// carrying one fact — whether an effect has been executed on some path to this
-/// point — and reports the two kinds of blocker separately.  Of the two, only
-/// `blocker_after_effect` is a decline.
+/// carrying whether an effect has executed plus the Int/array-length facts it
+/// can prove.  A known condition follows one successor exactly; a red
+/// condition conservatively joins both.  It reports the two kinds of blocker
+/// separately, and only `blocker_after_effect` is a decline.
 ///
 /// The other decline is the scan admitting it did not read the whole body.
 /// Everything the walk concludes rests on having seen every path, so a body it
@@ -785,11 +786,18 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// body rather than once per call site.  Only this entry point memoizes: the
 /// summary a cycle produces belongs to the occurrence that opened it, not to
 /// the body, so [`summarize_descent_blockers`] caches nothing.
-fn descent_decline(jitcode_index: usize) -> Option<DescentDecline> {
+fn descent_decline(
+    jitcode_index: usize,
+    entry_array_lengths: &[(usize, usize)],
+) -> Option<DescentDecline> {
     if !descent_unlowered_helper_scan_enabled() {
         return None;
     }
-    let summary = descent_blocker_summary(jitcode_index);
+    let summary = if entry_array_lengths.is_empty() {
+        descent_blocker_summary(jitcode_index)
+    } else {
+        summarize_descent_blockers_with_entry(jitcode_index, &mut Vec::new(), entry_array_lengths)
+    };
     if summary.body_not_walked {
         return Some(DescentDecline::BodyNotWalked);
     }
@@ -959,6 +967,7 @@ fn collect_descent_effect_aware_blockers(
         },
         &mut residual_call_is_effect_free,
         &mut switch_descr_targets,
+        &[],
     );
     for (blocker, effect) in here {
         record_reachable_blocker(out, blocker, entry_effect || effect);
@@ -1092,9 +1101,9 @@ fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSummary {
 
 /// One reachable point of [`summarize_descent_blockers`]'s dataflow.
 ///
-/// Both fields only ever lose information when two paths meet — `effect` goes
-/// false to true and a disagreeing `known_i` slot goes to `None` — so the
-/// worklist converges.
+/// The carried facts only lose information when two paths meet — `effect` goes
+/// false to true, disagreeing known-value slots go to `None`, and freshness
+/// goes true to false — so the worklist converges.
 #[derive(Clone)]
 struct DescentPoint {
     /// Whether some path from the body entry to here executed an effect.
@@ -1103,6 +1112,11 @@ struct DescentPoint {
     /// `allocate_callee_register_banks` uses: the slots at and above
     /// `num_regs_i` are pre-filled from `constants_i`.
     known_i: Vec<Option<i64>>,
+    /// Known lengths of Ref-bank slots that hold GC arrays.  Generated
+    /// `__majit_wrap_*` gateways receive their concrete argument-array length
+    /// from the call site; copies preserve it and any other Ref producer drops
+    /// it back to unknown.
+    known_array_len_r: Vec<Option<usize>>,
     /// Which Ref-bank slots hold an object this body itself allocated (a
     /// `new*` result) on every path to here.  A write into such an object is
     /// not an effect: a rewind discards the allocation with it.
@@ -1235,11 +1249,107 @@ fn switch_descr_targets(descr_index: usize) -> Option<Vec<usize>> {
     )
 }
 
+/// Evaluate the Int result of the small, side-effect-free opcode family the
+/// blocker scan needs to decide a following conditional edge.
+///
+/// This is the static counterpart of the corresponding `opimpl_*` methods in
+/// `pyjitpl.py`: it does not invent a value for a red operand.  It only folds
+/// when every input is already known, either from `constants_i` (`c`) or from
+/// a previously folded Int register (`i`).  Unknown and overflow-sensitive
+/// operations stay unknown, so the caller keeps both successors.
+fn known_int_result(
+    code: &[u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+    known_i: &[Option<i64>],
+    constants_i: &[i64],
+    known_array_len_r: &[Option<usize>],
+) -> Option<i64> {
+    let int = |offset: usize| {
+        code.get(op.pc + 1 + offset)
+            .and_then(|&slot| known_i.get(slot as usize))
+            .copied()
+            .flatten()
+    };
+    let constant = |offset: usize| {
+        code.get(op.pc + 1 + offset)
+            .and_then(|&slot| constants_i.get(slot as usize))
+            .copied()
+    };
+    let bool_word = |value: bool| i64::from(value);
+
+    match op.key {
+        "arraylen_gc/rd>i" => code
+            .get(op.pc + 1)
+            .and_then(|&slot| known_array_len_r.get(slot as usize))
+            .copied()
+            .flatten()
+            .and_then(|value| i64::try_from(value).ok()),
+        "int_copy/i>i" => int(0),
+        "int_copy/c>i" => constant(0),
+        "int_add/ii>i" => Some(int(0)?.wrapping_add(int(1)?)),
+        "int_sub/ii>i" => Some(int(0)?.wrapping_sub(int(1)?)),
+        "int_mul/ii>i" => Some(int(0)?.wrapping_mul(int(1)?)),
+        "int_and/ii>i" => Some(int(0)? & int(1)?),
+        "int_or/ii>i" => Some(int(0)? | int(1)?),
+        "int_xor/ii>i" => Some(int(0)? ^ int(1)?),
+        "int_neg/i>i" => Some(int(0)?.wrapping_neg()),
+        "int_invert/i>i" => Some(!int(0)?),
+        "int_is_true/i>i" => Some(bool_word(int(0)? != 0)),
+        "int_lt/ii>i" => Some(bool_word(int(0)? < int(1)?)),
+        "int_le/ii>i" => Some(bool_word(int(0)? <= int(1)?)),
+        "int_eq/ii>i" => Some(bool_word(int(0)? == int(1)?)),
+        "int_ne/ii>i" => Some(bool_word(int(0)? != int(1)?)),
+        "int_gt/ii>i" => Some(bool_word(int(0)? > int(1)?)),
+        "int_ge/ii>i" => Some(bool_word(int(0)? >= int(1)?)),
+        _ => None,
+    }
+}
+
+/// Whether a known Int condition makes this `goto_if_not*` take its label.
+/// `None` is the deliberately conservative answer for a red condition or for
+/// the pointer/float forms, whose value domains this scan does not carry.
+fn known_goto_if_taken(
+    code: &[u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+    known_i: &[Option<i64>],
+) -> Option<bool> {
+    let int = |offset: usize| {
+        code.get(op.pc + 1 + offset)
+            .and_then(|&slot| known_i.get(slot as usize))
+            .copied()
+            .flatten()
+    };
+    let predicate = match op.key {
+        "goto_if_not/iL" | "goto_if_not_int_is_true/iL" => int(0)? != 0,
+        "goto_if_not_int_is_zero/iL" => int(0)? == 0,
+        "goto_if_not_int_lt/iiL" => int(0)? < int(1)?,
+        "goto_if_not_int_le/iiL" => int(0)? <= int(1)?,
+        "goto_if_not_int_eq/iiL" => int(0)? == int(1)?,
+        "goto_if_not_int_ne/iiL" => int(0)? != int(1)?,
+        "goto_if_not_int_gt/iiL" => int(0)? > int(1)?,
+        "goto_if_not_int_ge/iiL" => int(0)? >= int(1)?,
+        _ => return None,
+    };
+    Some(!predicate)
+}
+
 /// Recursive worker of [`descent_blocker_summary`].  `seen` is the stack of
 /// jitcode indices currently being scanned.
 fn summarize_descent_blockers(
     jitcode_index: usize,
     seen: &mut Vec<usize>,
+) -> DescentBlockerSummary {
+    summarize_descent_blockers_with_entry(jitcode_index, seen, &[])
+}
+
+/// [`summarize_descent_blockers`] with concrete facts known at the entry of
+/// the top body.  Callee facts are not guessed: without mapping an
+/// `inline_call_*` varlist into the callee banks, recursive bodies use their
+/// ordinary conservative summaries.
+fn summarize_descent_blockers_with_entry(
+    jitcode_index: usize,
+    seen: &mut Vec<usize>,
+    entry_array_lengths: &[(usize, usize)],
 ) -> DescentBlockerSummary {
     if seen.contains(&jitcode_index) {
         return DescentBlockerSummary {
@@ -1280,6 +1390,7 @@ fn summarize_descent_blockers(
         &mut |_blocker, _effect| true,
         &mut residual_call_is_effect_free,
         &mut switch_descr_targets,
+        entry_array_lengths,
     );
     seen.pop();
     summary
@@ -1305,6 +1416,7 @@ pub(crate) fn summarize_body_blockers(
         &mut |_blocker, _effect| true,
         &mut |_descr_index| false,
         &mut |_descr_index| None,
+        &[],
     )
 }
 
@@ -1330,6 +1442,10 @@ pub(crate) fn summarize_body_blockers(
 /// `switch_targets` answers a `switch/id` op's descr index with the arm
 /// targets its table holds ([`switch_descr_targets`]); `None` widens the
 /// successors to every instruction start.
+///
+/// `entry_array_lengths` seeds concrete GC-array lengths known at this call
+/// site.  Production uses it for the generated builtin wrapper's sole `r0`
+/// argument; tests and memoized whole-body summaries pass an empty slice.
 pub(crate) fn summarize_body_blockers_with(
     code: &[u8],
     num_regs_i: usize,
@@ -1338,6 +1454,7 @@ pub(crate) fn summarize_body_blockers_with(
     on_blocker: &mut dyn FnMut(i64, bool) -> bool,
     call_effect_free: &mut dyn FnMut(usize) -> bool,
     switch_targets: &mut dyn FnMut(usize) -> Option<Vec<usize>>,
+    entry_array_lengths: &[(usize, usize)],
 ) -> DescentBlockerSummary {
     let mut summary = DescentBlockerSummary::default();
 
@@ -1378,6 +1495,12 @@ pub(crate) fn summarize_body_blockers_with(
     // `residual_call` in a handler reads its funcbox from, and a funcbox that
     // reads unknown is a blocker the scan does not report.
     let handler_known = entry_known.clone();
+    let mut entry_array_len_r = vec![None; FRESH_SLOTS];
+    for &(slot, len) in entry_array_lengths {
+        if let Some(value) = entry_array_len_r.get_mut(slot) {
+            *value = Some(len);
+        }
+    }
     let mut points: std::collections::HashMap<usize, DescentPoint> =
         std::collections::HashMap::new();
     points.insert(
@@ -1385,6 +1508,7 @@ pub(crate) fn summarize_body_blockers_with(
         DescentPoint {
             effect: false,
             known_i: entry_known,
+            known_array_len_r: entry_array_len_r,
             fresh_r: vec![false; FRESH_SLOTS],
         },
     );
@@ -1409,6 +1533,16 @@ pub(crate) fn summarize_body_blockers_with(
                             widened = true;
                         }
                         for (slot, incoming) in existing.known_i.iter_mut().zip(&state.known_i) {
+                            if *slot != *incoming && slot.is_some() {
+                                *slot = None;
+                                widened = true;
+                            }
+                        }
+                        for (slot, incoming) in existing
+                            .known_array_len_r
+                            .iter_mut()
+                            .zip(&state.known_array_len_r)
+                        {
                             if *slot != *incoming && slot.is_some() {
                                 *slot = None;
                                 widened = true;
@@ -1442,6 +1576,7 @@ pub(crate) fn summarize_body_blockers_with(
         };
         let mut effect = point.effect;
         let mut known_i = point.known_i;
+        let mut known_array_len_r = point.known_array_len_r;
         let mut fresh_r = point.fresh_r;
 
         if d.opname.starts_with("residual_call") {
@@ -1513,19 +1648,15 @@ pub(crate) fn summarize_body_blockers_with(
         }
 
         // An op writes at most one register, named by the argcode suffix after
-        // `>` and encoded as the instruction's last byte.  Only `int_copy/i>i`
-        // carries a known value forward; every other Int-bank write makes its
-        // destination unknown again.
+        // `>` and encoded as the instruction's last byte.  Carry every Int
+        // result whose inputs are already known; a red input or an unmodelled
+        // operation clears the destination back to unknown.
         if d.argcodes
             .split_once('>')
             .is_some_and(|(_, dst)| dst == "i")
             && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
         {
-            let carried = (d.key == "int_copy/i>i")
-                .then(|| code.get(d.pc + 1))
-                .flatten()
-                .and_then(|&src| known_i.get(src as usize).copied())
-                .flatten();
+            let carried = known_int_result(code, &d, &known_i, constants_i, &known_array_len_r);
             if let Some(slot) = known_i.get_mut(dst as usize) {
                 *slot = carried;
             }
@@ -1541,10 +1672,27 @@ pub(crate) fn summarize_body_blockers_with(
         {
             *slot = d.opname.starts_with("new");
         }
+        // The wrapper-argument array can move between Ref colors before its
+        // length check.  Only a plain ref copy preserves that entry fact.
+        if d.argcodes
+            .split_once('>')
+            .is_some_and(|(_, dst)| dst == "r")
+            && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
+        {
+            let carried = (d.key == "ref_copy/r>r")
+                .then(|| code.get(d.pc + 1))
+                .flatten()
+                .and_then(|&src| known_array_len_r.get(src as usize).copied())
+                .flatten();
+            if let Some(slot) = known_array_len_r.get_mut(dst as usize) {
+                *slot = carried;
+            }
+        }
 
         let state = DescentPoint {
             effect,
             known_i: known_i.clone(),
+            known_array_len_r: known_array_len_r.clone(),
             fresh_r: fresh_r.clone(),
         };
         let label = label_operand_offset(d.argcodes).map(|off| read_label(code, &d, off));
@@ -1575,6 +1723,7 @@ pub(crate) fn summarize_body_blockers_with(
                         DescentPoint {
                             effect: true,
                             known_i: handler_known.clone(),
+                            known_array_len_r: vec![None; FRESH_SLOTS],
                             fresh_r: vec![false; FRESH_SLOTS],
                         }
                     );
@@ -1585,12 +1734,20 @@ pub(crate) fn summarize_body_blockers_with(
                     push!(points, work, target, state);
                 }
             }
-            name if name.starts_with("goto_if") => {
-                if let Some(target) = label {
-                    push!(points, work, target, state.clone());
+            name if name.starts_with("goto_if") => match known_goto_if_taken(code, &d, &known_i) {
+                Some(true) => {
+                    if let Some(target) = label {
+                        push!(points, work, target, state);
+                    }
                 }
-                push!(points, work, d.next_pc, state);
-            }
+                Some(false) => push!(points, work, d.next_pc, state),
+                None => {
+                    if let Some(target) = label {
+                        push!(points, work, target, state.clone());
+                    }
+                    push!(points, work, d.next_pc, state);
+                }
+            },
             "catch_exception" => {
                 // The exception this handler catches can be raised by any op in
                 // the region it protects, so the handler is entered with the
@@ -1605,6 +1762,7 @@ pub(crate) fn summarize_body_blockers_with(
                         DescentPoint {
                             effect: true,
                             known_i: handler_known.clone(),
+                            known_array_len_r: vec![None; FRESH_SLOTS],
                             fresh_r: vec![false; FRESH_SLOTS],
                         }
                     );
@@ -4270,7 +4428,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     } else {
         false
     };
-    if !builtin_len_shortcut && let Some(decline) = descent_decline(jitcode.index()) {
+    let wrapper_item_count = usize::from(receiver.is_some()) + (r_args.len() - 2);
+    if !builtin_len_shortcut
+        && let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_item_count)])
+    {
         if matches!(decline, DescentDecline::Helper(_)) {
             log_descent_unlowered_helper_blockers(jitcode.index());
         }
@@ -4417,7 +4578,6 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // holds no `getarrayitem_gc_r` to name the item descriptor and the seeding
     // loop below has nothing to seed.  Require the descriptor only when an
     // element is actually published.
-    let wrapper_item_count = usize::from(receiver.is_some()) + (r_args.len() - 2);
     let wrapper_args_descr_index = match wrapper_args_item_descr_index(body.code) {
         Some(index) => Some(index),
         None if wrapper_item_count == 0 => None,
@@ -11864,6 +12024,47 @@ pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_inline_call_subwalk<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    descr_index: usize,
+    sub_body: &SubJitCodeBody,
+    int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+    ref_arg_concretes: &[ConcreteValue],
+    float_args: &[OpRef],
+) -> Result<DispatchOutcome, DispatchError> {
+    let uses_global_descr_pool = ctx
+        .raw_descrs
+        .runtime_jitcode_at(descr_index)
+        .is_some_and(|jitcode| jitcode.uses_global_descr_pool());
+    if !uses_global_descr_pool {
+        return run_sub_jitcode_walk(
+            ctx,
+            pc,
+            sub_body,
+            int_args,
+            int_arg_concretes,
+            ref_args,
+            ref_arg_concretes,
+            float_args,
+        );
+    }
+
+    super::specialize::run_codewriter_helper_inline_call(
+        ctx,
+        pc,
+        sub_body,
+        int_args,
+        int_arg_concretes,
+        ref_args,
+        ref_arg_concretes,
+        float_args,
+    )
+}
+
 thread_local! {
     /// Active explicit sub-walk driver for this OS thread.  The pointer is
     /// scoped by `SubWalkDriverGuard` and is only dereferenced synchronously by
@@ -12456,8 +12657,17 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
-    let callee_result =
-        run_sub_jitcode_walk(ctx, op.pc, &sub_body, &[], &[], &args, &arg_concretes, &[]);
+    let callee_result = run_inline_call_subwalk(
+        ctx,
+        op.pc,
+        descr_index,
+        &sub_body,
+        &[],
+        &[],
+        &args,
+        &arg_concretes,
+        &[],
+    );
     let callee_outcome = callee_result?;
 
     match callee_outcome {
@@ -12661,9 +12871,10 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    let callee_outcome = run_sub_jitcode_walk(
+    let callee_outcome = run_inline_call_subwalk(
         ctx,
         op.pc,
+        descr_index,
         &sub_body,
         &int_args,
         &int_arg_concretes,
@@ -12863,9 +13074,10 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    let callee_result = run_sub_jitcode_walk(
+    let callee_result = run_inline_call_subwalk(
         ctx,
         op.pc,
+        descr_index,
         &sub_body,
         &int_args,
         &int_arg_concretes,

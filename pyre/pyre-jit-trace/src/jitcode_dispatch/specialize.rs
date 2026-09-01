@@ -8926,6 +8926,7 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
         &[ConcreteValue::Int(raw_key)],
         &[seq_op],
         &[ConcreteValue::Ref(seq_obj)],
+        &[],
     );
     let (walk_outcome, _walk_start) = match walk {
         Ok(pair) => pair,
@@ -8968,24 +8969,6 @@ struct HelperDescent {
     decline_tag: &'static str,
 }
 
-const UNARY_POSITIVE_DESCENT: HelperDescent = HelperDescent {
-    path: "pyre_interpreter::objspace::descroperation::pos",
-    commit_label: "unary_positive_commit",
-    call_site_label: "pos_call_site",
-    decline_tag: "UNARY-POSITIVE-SUBWALK",
-};
-const UNARY_NEGATIVE_DESCENT: HelperDescent = HelperDescent {
-    path: "pyre_interpreter::objspace::descroperation::neg",
-    commit_label: "unary_negative_commit",
-    call_site_label: "neg_call_site",
-    decline_tag: "UNARY-NEGATIVE-SUBWALK",
-};
-const UNARY_INVERT_DESCENT: HelperDescent = HelperDescent {
-    path: "pyre_interpreter::objspace::descroperation::invert",
-    commit_label: "unary_invert_commit",
-    call_site_label: "invert_call_site",
-    decline_tag: "UNARY-INVERT-SUBWALK",
-};
 /// The `BINARY_OP` helper itself: the operator tag is a trace-time constant,
 /// so its `match` folds and only the selected operator's body is traced.
 const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
@@ -9092,6 +9075,7 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
         &int_concretes,
         &ref_oprefs,
         &ref_concretes,
+        &[],
     );
     let (walk_outcome, _walk_start) = match walk {
         // The body reached a helper this build did not lower.  The arms an
@@ -9133,78 +9117,6 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
     Ok(Some(DispatchOutcome::Continue))
-}
-
-/// [`try_walker_orthodox_descent`] for a unary operator: the one operand
-/// must be a concrete exact builtin instance.
-fn try_walker_orthodox_unary<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    dst: usize,
-    dst_bank: char,
-    descent: &HelperDescent,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    let Some(operand_obj) = walker_concrete_ref_object(ctx, operand) else {
-        return Ok(None);
-    };
-    // SAFETY: `operand_obj` is a live concrete `PyObjectRef` from the walker
-    // shadow.
-    if !unsafe { pyre_object::is_exact_builtin_instance(operand_obj) } {
-        return Ok(None);
-    }
-    try_walker_orthodox_descent(
-        ctx,
-        op_pc,
-        &[],
-        &[(operand, operand_obj)],
-        dst,
-        dst_bank,
-        descent,
-    )
-}
-
-/// `+x`: descend `pos`.  See [`try_walker_orthodox_unary`].
-pub(crate) fn try_walker_orthodox_unary_positive<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    try_walker_orthodox_unary(ctx, op_pc, operand, dst, dst_bank, &UNARY_POSITIVE_DESCENT)
-}
-
-/// `-x`: descend `neg`.  See [`try_walker_orthodox_unary`].
-///
-/// `-INT_MIN` is the one operand `descr_neg` promotes, and the body's
-/// overflow arm (`rbigint.fromint(x).neg()`) is walked like any other: the
-/// promotion's two `rbigint` calls are recorded as hoisted `CallPure*`
-/// short boxes, the promoted long crosses the LABEL as a loop argument and
-/// `compare_op_long`'s `jit_bigint_cmp` is re-emitted in the loop body.  The
-/// retired `unary_negative_int` fold pinned that operand with `guard_value`
-/// instead (3x faster on a loop that negates `INT_MIN` every iteration);
-/// with the descent taking the site whole it measured `consulted=0` on every
-/// fixture, and the upstream trace has this same shape.
-pub(crate) fn try_walker_orthodox_unary_negative<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    try_walker_orthodox_unary(ctx, op_pc, operand, dst, dst_bank, &UNARY_NEGATIVE_DESCENT)
-}
-
-/// `~x`: descend `invert`.  See [`try_walker_orthodox_unary`].
-pub(crate) fn try_walker_orthodox_unary_invert<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    try_walker_orthodox_unary(ctx, op_pc, operand, dst, dst_bank, &UNARY_INVERT_DESCENT)
 }
 
 /// `a OP b`: descend `binary_value_from_tag` with the operator tag as a
@@ -15633,6 +15545,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     int_arg_concretes: &[ConcreteValue],
     ref_args: &[OpRef],
     ref_arg_concretes: &[ConcreteValue],
+    float_args: &[OpRef],
 ) -> Result<(DispatchOutcome, majit_metainterp::recorder::TracePosition), DispatchError> {
     let nested_helper = nested_entry.is_some();
     let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
@@ -15759,7 +15672,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
         int_arg_concretes,
         ref_args,
         ref_arg_concretes,
-        &[],
+        float_args,
     );
     drop(helper_frame);
     ctx.fbw_mode = saved_fbw_mode;
@@ -15772,6 +15685,48 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.sub_jitcode_lookup = saved_lookup;
 
     Ok((walk_result?, walk_start))
+}
+
+/// Execute a canonical helper reached through a real codewriter
+/// `inline_call_*` opcode with the same caller-boundary and descriptor-pool
+/// setup as specialization-driven orthodox descent.
+///
+/// Once `flatten` emits the inline-call directly, the opcode handler owns only
+/// the callee body and argument lists; this wrapper recovers the full-body
+/// symbol and delegates to the already-proven boundary machinery instead of
+/// growing a second, subtly different helper-frame model.
+pub(crate) fn run_codewriter_helper_inline_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    sub_body: &SubJitCodeBody,
+    int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+    ref_arg_concretes: &[ConcreteValue],
+    float_args: &[OpRef],
+) -> Result<DispatchOutcome, DispatchError> {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+    }
+    let sym = unsafe { &*sym_ptr };
+    let nested_entry = orthodox_helper_nested_entry(ctx, op_pc)
+        .map_err(|_| DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
+    run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        sub_body,
+        nested_entry,
+        "codewriter_helper_inline_commit",
+        "codewriter_helper_inline_call_site",
+        int_args,
+        int_arg_concretes,
+        ref_args,
+        ref_arg_concretes,
+        float_args,
+    )
+    .map(|(outcome, _)| outcome)
 }
 
 /// Commit core of the #171 orthodox list-append fold, shared by the
@@ -15947,6 +15902,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         &[],
         &[self_ref, value_op],
         &[ConcreteValue::Ref(inner_self), ConcreteValue::Ref(value)],
+        &[],
     )?;
 
     match walk_outcome {
@@ -16254,6 +16210,7 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
         &[],
         &[self_ref],
         &[ConcreteValue::Ref(inner_self)],
+        &[],
     )?;
 
     let result = match walk_outcome {

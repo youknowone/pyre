@@ -160,6 +160,41 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
     get_jitcode_ref_by_index(index).cloned()
 }
 
+/// Runtime wrappers for canonical source-translator JitCodes embedded as
+/// `AbstractDescr` operands in per-Python-function bytecode.  RPython owns
+/// these in the process-wide `CallControl.jitcodes[graph]` map, so this cache
+/// is process-wide too rather than another copy in each thread.  The slots are
+/// index-aligned with the canonical JitCode table.
+static RUNTIME_JITCODE_CELLS: std::sync::OnceLock<
+    Box<[std::sync::OnceLock<Arc<majit_metainterp::jitcode::JitCode>>]>,
+> = std::sync::OnceLock::new();
+
+fn runtime_jitcode_cells() -> &'static [std::sync::OnceLock<Arc<majit_metainterp::jitcode::JitCode>>]
+{
+    RUNTIME_JITCODE_CELLS.get_or_init(|| {
+        (0..jitcode_count())
+            .map(|_| std::sync::OnceLock::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    })
+}
+
+pub fn get_runtime_jitcode_by_index(
+    index: usize,
+) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    let cell = runtime_jitcode_cells().get(index)?;
+    Some(
+        cell.get_or_init(|| {
+            let canonical = get_jitcode_by_index(index)
+                .expect("runtime JitCode cell index must resolve canonically");
+            Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
+                (*canonical).clone(),
+            ))
+        })
+        .clone(),
+    )
+}
+
 /// The source translator's exact `Assembler.indirectcalltargets` set as
 /// references into `all_jitcodes`.
 ///
@@ -438,6 +473,22 @@ pub(crate) fn pathed_jitcode_cached(canonical_path: &'static str) -> Option<Arc<
             .or_insert_with(|| compute_pathed_jitcode_index(canonical_path))
     })?;
     get_jitcode_by_index(idx)
+}
+
+/// Runtime-wrapper sibling of [`pathed_jitcode_cached`], for a codewriter
+/// `inline_call_*` operand.  RPython's JitCode is both the body and its
+/// `AbstractDescr`; pyre keeps the serializable canonical body separate from
+/// the runtime descr pool, so this is the single identity-preserving join.
+pub fn pathed_runtime_jitcode_cached(
+    canonical_path: &'static str,
+) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    let idx = PATHED_JITCODE_INDEX.with(|cache| {
+        *cache
+            .borrow_mut()
+            .entry(canonical_path)
+            .or_insert_with(|| compute_pathed_jitcode_index(canonical_path))
+    })?;
+    get_runtime_jitcode_by_index(idx)
 }
 
 /// Resolve an ordinary portal-closure JitCode by its unique graph leaf name.
@@ -3053,6 +3104,17 @@ mod tests {
     fn deserializes_jitcodes_without_error() {
         let jitcodes = all_jitcodes();
         assert!(!jitcodes.is_empty(), "expected at least one jitcode");
+    }
+
+    #[test]
+    fn canonical_runtime_wrapper_identity_is_shared_across_threads() {
+        let first = get_runtime_jitcode_by_index(0).expect("first canonical runtime JitCode");
+        let second = std::thread::spawn(|| {
+            get_runtime_jitcode_by_index(0).expect("first canonical runtime JitCode on child")
+        })
+        .join()
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

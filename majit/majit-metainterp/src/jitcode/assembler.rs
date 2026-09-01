@@ -3564,6 +3564,64 @@ impl JitCodeBuilder {
         self.inline_call_r_v(sub_jitcode_idx, &[], None);
     }
 
+    /// Emit RPython's canonical `inline_call_{r,ir,irf}_{i,r,f,v}`
+    /// bytecode shape.
+    ///
+    /// This is deliberately separate from [`Self::inline_call_r_r`] and its
+    /// siblings.  Those methods predate the codewriter port and emit pyre's
+    /// opaque `inline_call_nested_ext/P` payload, including explicit callee
+    /// destination registers.  `jtransform.py handle_regular_call` instead
+    /// emits a JitCode descr followed by kind-separated varlists; the callee's
+    /// `MIFrame.setup_call` places each list at the start of its matching
+    /// register bank.  `pyre-jit`'s SSA assembler uses this method for that
+    /// orthodox stream.
+    pub fn canonical_inline_call(
+        &mut self,
+        key: &'static str,
+        sub_jitcode_idx: u16,
+        args_i: Option<&[u16]>,
+        args_r: Option<&[u16]>,
+        args_f: Option<&[u16]>,
+        result: Option<(JitArgKind, u16)>,
+    ) {
+        self.write_insn(key);
+        self.push_u16(sub_jitcode_idx);
+        if let Some(args) = args_i {
+            self.push_canonical_inline_varlist(args, JitArgKind::Int);
+        }
+        if let Some(args) = args_r {
+            self.push_canonical_inline_varlist(args, JitArgKind::Ref);
+        }
+        if let Some(args) = args_f {
+            self.push_canonical_inline_varlist(args, JitArgKind::Float);
+        }
+        if let Some((kind, dst)) = result {
+            match kind {
+                JitArgKind::Int => self.touch_reg(dst),
+                JitArgKind::Ref => self.touch_ref_reg(dst),
+                JitArgKind::Float => self.touch_float_reg(dst),
+            }
+            self.push_reg_u8(dst, "canonical inline_call return");
+        }
+    }
+
+    fn push_canonical_inline_varlist(&mut self, args: &[u16], kind: JitArgKind) {
+        if args.len() > u8::MAX as usize {
+            self.encoding_overflow = true;
+            self.push_u8(0);
+            return;
+        }
+        self.push_u8(args.len() as u8);
+        for &src in args {
+            match kind {
+                JitArgKind::Int => self.touch_reg(src),
+                JitArgKind::Ref => self.touch_ref_reg(src),
+                JitArgKind::Float => self.touch_float_reg(src),
+            }
+            self.push_reg_u8(src, "canonical inline_call argument");
+        }
+    }
+
     pub fn inline_call_r_i(
         &mut self,
         sub_jitcode_idx: u16,
