@@ -4674,6 +4674,26 @@ mod tests {
                     .strip_suffix(short)
                     .is_some_and(|prefix| prefix.ends_with("::"))
         }
+        /// One path is the other with a single interior segment removed —
+        /// the shape an inner module's own path has against the re-export
+        /// from the module that publishes it.  A one-segment deletion cannot
+        /// relate two paths of equal length, so a substitution like
+        /// `module::a::f` against `module::b::f` stays two functions.
+        fn drops_one_segment(a: &str, b: &str) -> bool {
+            // A path with a segment removed is strictly shorter in bytes, so
+            // byte length orders the pair the same way segment count does.
+            let (short, long) = if a.len() > b.len() { (b, a) } else { (a, b) };
+            let short: Vec<&str> = short.split("::").collect();
+            let long: Vec<&str> = long.split("::").collect();
+            if long.len() != short.len() + 1 {
+                return false;
+            }
+            (0..long.len()).any(|i| {
+                let mut without = long.clone();
+                without.remove(i);
+                without == short
+            })
+        }
         fn split_head(path: &str) -> Option<(&str, &str)> {
             path.split_once("::")
         }
@@ -4690,7 +4710,7 @@ mod tests {
         // rule: `module::a::type_object` and `module::b::type_object` would
         // read as aliases while address-keyed patching between them stays
         // ambiguous. Those are related by no suffix here and are reported.
-        if extends(a, b) {
+        if extends(a, b) || drops_one_segment(a, b) {
             return true;
         }
         match (split_head(a), split_head(b)) {
@@ -4716,6 +4736,13 @@ mod tests {
         assert!(are_alias_spellings(
             "module::_io::stringio::type_object",
             "pyre_interpreter::module::_io::stringio::type_object",
+        ));
+        // An inner module's own path beside the re-export the enclosing
+        // module publishes: `jit_libffi` defines its cfg-selected bodies in
+        // `imp` and re-exports them, and the LLBC carries both spellings.
+        assert!(are_alias_spellings(
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_size",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_size",
         ));
         // Two crates cannot re-export one another's item, so identical module
         // paths under different crates are two functions, not two spellings.
