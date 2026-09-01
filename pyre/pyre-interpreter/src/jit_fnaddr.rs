@@ -3316,6 +3316,24 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::get_sys_exception",
         get_sys_exc,
     );
+    // `ExecutionContext._get_topmost_exception` is the loop-bearing cold arm
+    // of `ExecutionContext.sys_exc_info` (`pypy/interpreter/executioncontext.py`).
+    // PyPy's JitPolicy leaves that graph out of an inline trace because it
+    // contains a loop, but `getfunctionptr(graph)` still gives the residual
+    // call a real address. Publish the same method target here: without it the
+    // codewriter leaves a symbolic hash in `get_sys_exception`'s JitCode, and
+    // the builtin descent gate must reject even the ordinary handled-exception
+    // arm which never calls this helper.
+    let get_topmost_exception: fn(
+        &crate::executioncontext::ExecutionContext,
+    ) -> pyre_object::PyObjectRef =
+        crate::executioncontext::ExecutionContext::_get_topmost_exception;
+    pa1(
+        &mut entries,
+        "pyre_interpreter::executioncontext::ExecutionContext::_get_topmost_exception",
+        "pyre_interpreter::ExecutionContext::_get_topmost_exception",
+        get_topmost_exception,
+    );
     let set_current_exc: fn(pyre_object::PyObjectRef) = crate::eval::set_current_exception;
     pa1(
         &mut entries,
@@ -5059,6 +5077,20 @@ mod tests {
             get_sys_exc
         );
         assert_eq!(bindings["pyre_interpreter::get_sys_exception"], get_sys_exc);
+
+        let get_topmost_exception: fn(
+            &crate::executioncontext::ExecutionContext,
+        ) -> pyre_object::PyObjectRef =
+            crate::executioncontext::ExecutionContext::_get_topmost_exception;
+        let get_topmost_exception = get_topmost_exception as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::executioncontext::ExecutionContext::_get_topmost_exception"],
+            get_topmost_exception,
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::ExecutionContext::_get_topmost_exception"],
+            get_topmost_exception,
+        );
 
         let set_exc: fn(pyre_object::PyObjectRef) = crate::eval::set_current_exception;
         let set_exc = set_exc as *const () as usize as i64;

@@ -6416,6 +6416,54 @@ fn walker_foldable_runtime_helper<Sym: WalkSym>(
 ///     callee body slice.  Over-capture is correctness-preserving:
 ///     `store_final_boxes_in_guard` filters dead boxes from the
 ///     snapshot via the optimizer's liveness pass.
+fn try_walker_lower_getexecutioncontext<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if dst_bank != 'r' || !r_args.is_empty() {
+        return Ok(None);
+    }
+    let Some(majit_ir::Value::Int(funcaddr)) = ctx.trace_ctx.box_value(funcptr) else {
+        return Ok(None);
+    };
+    let take_last_exec_ctx =
+        pyre_interpreter::call::take_last_exec_ctx as *const () as usize as i64;
+    if funcaddr != take_last_exec_ctx {
+        return Ok(None);
+    }
+
+    // `ObjSpace.getexecutioncontext` returns `threadlocals.get_ec()` in the
+    // translated arm (`pypy/interpreter/baseobjspace.py`). Inside the portal
+    // that object is already the second red (`interp_jit.py
+    // PyPyJitDriver.reds = ['frame', 'ec']`), so the meta-trace carries the
+    // red itself; it does not retain a TLS call before every EC field access.
+    //
+    // Charon cannot extract Rust's `thread_local!` body, which leaves
+    // `take_last_exec_ctx` as a residual leaf inside otherwise translated
+    // helpers such as `get_sys_exception`. Connect that leaf to the same live
+    // red here. Do not fold to the recording pointer: a compiled loop may run
+    // on another OS thread, and the red is what gives that entry its own EC.
+    let Some(ec) = walker_ensure_execution_context(ctx) else {
+        return Ok(None);
+    };
+    let concrete_ec = pyre_interpreter::call::getexecutioncontext();
+    if concrete_ec.is_null() {
+        return Ok(None);
+    }
+    write_ref_reg(
+        ctx,
+        op_pc,
+        dst,
+        ec,
+        ConcreteValue::Ref(concrete_ec as usize as pyre_object::PyObjectRef),
+    )?;
+    Ok(Some(()))
+}
+
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -6504,6 +6552,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             dst,
             dst_bank,
         )?
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // `space.getexecutioncontext()` in an inlined translated helper is the
+    // portal's already-live EC red. Rust's opaque TLS accessor otherwise
+    // survives as a residual call and separates the handler's EC store from
+    // the helper's read, preventing both heap forwarding and exception
+    // virtualization.
+    if try_walker_lower_getexecutioncontext(ctx, op.pc, funcptr, &r_args, dst_bank, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
@@ -7270,6 +7328,22 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::SysGetframe, || {
             try_walker_specialize_sys_getframe(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // `function.py funccall_valuestack`'s exact `sys.exc_info` direct path.
+    // The generated CALL has already become a CallFn residual at this seam,
+    // so reproduce the source fast path here with this inline level's own red
+    // frame and the shared EC red. Unsafe look-ahead shapes and generator
+    // chain state decline to the regular builtin wrapper.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::SysExcInfo, || {
+            try_walker_specialize_sys_exc_info(ctx, code, op, &r_args, dst)
         })?
         .is_some()
     {

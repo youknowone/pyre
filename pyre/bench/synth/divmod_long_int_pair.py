@@ -94,7 +94,34 @@ def hot_long_int_floordiv_mod(n):
     return s
 
 
+def side_exit_contracts(n):
+    """Correctness arms declined by the three exact builtin folds."""
+    int_min = -(1 << 63)
+    for i in range(n):
+        divisor = 7 if i & 1 else -7
+        q, r = divmod(i, divisor)
+        assert q * divisor + r == i
+        q, r = divmod(BIG + i, divisor)
+        assert q * divisor + r == BIG + i
+        assert (BIG + i) // divisor == q and (BIG + i) % divisor == r
+    assert divmod(int_min, -1) == (1 << 63, 0)
+    assert divmod(BIG, True) == (BIG, 0)
+    try:
+        divmod(BIG, False)
+    except ZeroDivisionError:
+        pass
+    else:
+        raise AssertionError("divmod by False did not raise")
+
+    class Override(int):
+        def __divmod__(self, other):
+            return "override", other
+
+    assert divmod(Override(9), 4) == ("override", 4)
+
+
 # Both loops remain far beyond the tracing threshold; the fold census, rather
 # than low-resolution wall-clock subtraction, proves that each arm fired.
 print(hot_divmod_int(100000))
 print(hot_long_int_floordiv_mod(100000))
+side_exit_contracts(N)

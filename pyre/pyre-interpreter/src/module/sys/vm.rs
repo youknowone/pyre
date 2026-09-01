@@ -1437,48 +1437,220 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
-/// pypy/module/sys/vm.py `exc_info_direct` — return the active exception
-/// as a `(type, value, traceback)` tuple.
+/// Decode the next logical opcode after `pc`, skipping the inline-cache words
+/// CPython 3.14 places after adaptive instructions.  PyPy's bytecode has no
+/// cache words; this is the representation adapter around its direct `co_code`
+/// indexing in `exc_info_direct`.
+fn exc_info_next_instruction(
+    code: &crate::CodeObject,
+    pc: usize,
+) -> Option<(usize, crate::bytecode::Instruction, crate::bytecode::OpArg)> {
+    let pc = crate::pyopcode::skip_caches(&code.instructions, pc);
+    let Ok((opcode_pc, instruction, op_arg)) =
+        crate::pyopcode::decode_instruction_forward(code, pc)
+    else {
+        return None;
+    };
+    Some((opcode_pc, instruction.deoptimize(), op_arg))
+}
+
+/// Return the wrapped constant loaded by `instruction`, preserving the
+/// enclosing PyCode's `co_consts_w` identity just like
+/// `PyFrame.getconstant_w` in `pypy/interpreter/pyopcode.py`.
+fn exc_info_load_const(
+    frame: &crate::pyframe::PyFrame,
+    instruction: crate::bytecode::Instruction,
+    op_arg: crate::bytecode::OpArg,
+) -> PyObjectRef {
+    match instruction {
+        crate::bytecode::Instruction::LoadConst { consti } => unsafe {
+            crate::pycode::w_code_const(
+                frame.pycode as PyObjectRef,
+                usize::from(consti.get(op_arg)),
+            )
+        },
+        // CPython 3.14's compiler uses this compact spelling for the small
+        // non-negative indices PyPy spells as LOAD_CONST.  It denotes the
+        // same immutable integer input to the look-ahead test.
+        crate::bytecode::Instruction::LoadSmallInt { i } => {
+            pyre_object::w_int_new(i.get(op_arg) as i64)
+        }
+        _ => pyre_object::PY_NULL,
+    }
+}
+
+fn exc_info_is_binary_subscr(
+    instruction: crate::bytecode::Instruction,
+    op_arg: crate::bytecode::OpArg,
+) -> bool {
+    let crate::bytecode::Instruction::BinaryOp { op } = instruction else {
+        return false;
+    };
+    crate::pyopcode::binary_op_arg(op, op_arg) == crate::bytecode::BinaryOperator::Subscr
+}
+
+/// `pypy/module/sys/vm.py exc_info_direct` bytecode look-ahead.
 ///
-/// Used by both the regular `sys.exc_info` builtin and the JIT direct path
-/// in `function.funccall_valuestack` (function.py). Splitting it
-/// out lets the JIT bypass invoke the same logic without going through the
-/// builtin call dispatch.
-pub fn exc_info_direct() -> PyObjectRef {
+/// The traceback can stay unescaped when the caller immediately selects a
+/// tuple component/slice that cannot reach slot 2.  This is the JIT-relevant
+/// part of PyPy's implementation: returning None in slot 2 prevents the live
+/// traceback/frame chain from forcing the virtual frame.
+fn exc_info_result_needs_traceback_at(
+    frame: &crate::pyframe::PyFrame,
+    call_pc: usize,
+) -> bool {
+    use crate::bytecode::{BuildSliceArgCount, Instruction};
+
+    if frame.hide() {
+        return true;
+    }
+    let code = frame.getcode();
+    let Some((call_instruction, _)) =
+        crate::pyopcode::decode_instruction_at(code, call_pc)
+    else {
+        return true;
+    };
+    if !matches!(call_instruction.deoptimize(), Instruction::Call { .. }) {
+        return true;
+    }
+
+    let Some((first_pc, first_instruction, first_arg)) =
+        exc_info_next_instruction(code, call_pc + 1)
+    else {
+        return true;
+    };
+    let w_first = exc_info_load_const(frame, first_instruction, first_arg);
+    if w_first.is_null() {
+        return true;
+    }
+
+    let Some((second_pc, second_instruction, second_arg)) =
+        exc_info_next_instruction(code, first_pc + 1)
+    else {
+        return true;
+    };
+    if exc_info_is_binary_subscr(second_instruction, second_arg) {
+        // CPython 3.14 folds a two-argument BUILD_SLICE into one immutable
+        // slice constant.  Apply PyPy's same start/stop proof to that compact
+        // representation before handling the ordinary integer index.
+        if unsafe { pyre_object::sliceobject::is_slice(w_first) } {
+            let start = unsafe { pyre_object::sliceobject::w_slice_get_start(w_first) };
+            let stop = unsafe { pyre_object::sliceobject::w_slice_get_stop(w_first) };
+            let step = unsafe { pyre_object::sliceobject::w_slice_get_step(w_first) };
+            let safe_start = unsafe { pyre_object::is_none(start) }
+                || unsafe { crate::baseobjspace::isinstance_int_w(start) };
+            let safe_stop = if unsafe { crate::baseobjspace::isinstance_int_w(stop) } {
+                match crate::baseobjspace::int_w(stop) {
+                    Ok(value) => value <= 2,
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+            return !(safe_start && safe_stop && unsafe { pyre_object::is_none(step) });
+        }
+        if unsafe { crate::baseobjspace::isinstance_int_w(w_first) }
+            && let Ok(index) = crate::baseobjspace::int_w(w_first)
+        {
+            return !((-3..=1).contains(&index) && index != -1);
+        }
+        return true;
+    }
+
+    let w_second = exc_info_load_const(frame, second_instruction, second_arg);
+    if w_second.is_null()
+        || !(unsafe { pyre_object::is_none(w_first) }
+            || unsafe { crate::baseobjspace::isinstance_int_w(w_first) })
+    {
+        return true;
+    }
+    let Ok(stop) = crate::baseobjspace::int_w(w_second) else {
+        return true;
+    };
+    if stop > 2 {
+        return true;
+    }
+
+    let Some((slice_pc, slice_instruction, slice_arg)) =
+        exc_info_next_instruction(code, second_pc + 1)
+    else {
+        return true;
+    };
+    let Instruction::BuildSlice { argc } = slice_instruction else {
+        return true;
+    };
+    if crate::pyopcode::build_slice_arg(argc, slice_arg) != BuildSliceArgCount::Two {
+        return true;
+    }
+    let Some((_, subscr_instruction, subscr_arg)) =
+        exc_info_next_instruction(code, slice_pc + 1)
+    else {
+        return true;
+    };
+    !exc_info_is_binary_subscr(subscr_instruction, subscr_arg)
+}
+
+/// Tracer-facing half of PyPy's `exc_info_direct` look-ahead.
+///
+/// The generated full-body walker owns the executing Python coordinate rather
+/// than publishing it to `PyFrame.last_instr` before every source operation.
+/// Let that walker ask the identical bytecode question with its live per-frame
+/// coordinate; this is the `CallFn`-boundary equivalent of
+/// `function.py funccall_valuestack` passing its live frame upstream.
+pub fn exc_info_result_needs_traceback_for_call(
+    frame: &crate::pyframe::PyFrame,
+    call_pc: usize,
+) -> bool {
+    exc_info_result_needs_traceback_at(frame, call_pc)
+}
+
+fn exc_info_result_needs_traceback(frame: &crate::pyframe::PyFrame) -> bool {
+    if frame.last_instr < 0 {
+        return true;
+    }
+    exc_info_result_needs_traceback_at(frame, frame.last_instr as usize)
+}
+
+/// Return the active exception as `(type, value, traceback-or-None)`.
+fn exc_info_tuple(include_traceback: bool) -> PyObjectRef {
     let exc = crate::eval::get_sys_exception();
     unsafe {
-        if exc.is_null() || pyre_object::is_none(exc) || !pyre_object::is_exception(exc) {
-            w_tuple_new(vec![w_none(), w_none(), w_none()])
+        if exc.is_null() {
+            crate::runtime_ops::jit_build_tuple_3(
+                w_none() as i64,
+                w_none() as i64,
+                w_none() as i64,
+            ) as PyObjectRef
         } else {
-            // `pypy/module/sys/vm.py exc_info_direct` returns
-            // `(type, value, traceback)` where `type` is
-            // `space.exception_getclass(value)` — the specific
-            // subclass W_TypeObject (e.g. `ZeroDivisionError`), not
-            // the generic `Exception` stub set in
-            // `w_exception_new`.  Pyre routes the per-`ExcKind`
-            // lookup through `typedef::r#type` (`typedef.rs`)
-            // which `exception_getclass` delegates to, so go through
-            // that instead of dereferencing the raw `w_class` slot
-            // (which still points at the constructor-time
-            // `EXCEPTION_TYPE` stub).
             let exc_type = crate::baseobjspace::exception_getclass(exc);
             let exc_type = if exc_type.is_null() {
                 w_none()
             } else {
                 exc_type
             };
-            // The third tuple slot mirrors
-            // `vm.py exc_info_with_tb`'s
-            // `operror.get_w_traceback(space)`, i.e. the slot read plus
-            // the escape mark it wraps.  Pyre stores the chain on the
-            // typed `w_traceback` slot of `W_BaseException`; surface it
-            // directly here.
-            let tb = pyre_object::interp_exceptions::w_exception_get_traceback(exc);
-            crate::pytraceback::mark_traceback_escaped(tb);
-            let w_tb = if tb.is_null() { w_none() } else { tb };
-            w_tuple_new(vec![exc_type, exc, w_tb])
+            let w_tb = if include_traceback {
+                let tb = pyre_object::interp_exceptions::w_exception_get_traceback(exc);
+                crate::pytraceback::mark_traceback_escaped(tb);
+                if tb.is_null() { w_none() } else { tb }
+            } else {
+                w_none()
+            };
+            crate::runtime_ops::jit_build_tuple_3(exc_type as i64, exc as i64, w_tb as i64)
+                as PyObjectRef
         }
     }
+}
+
+/// pypy/module/sys/vm.py `exc_info_direct` — return the active exception
+/// as a `(type, value, traceback)` tuple, omitting the traceback when the live
+/// caller bytecode proves it cannot observe tuple slot 2.
+///
+/// Used by the JIT direct path in `function.funccall_valuestack`
+/// (function.py). Splitting it out lets the JIT bypass invoke the same logic
+/// without going through the regular builtin call dispatch.
+pub fn exc_info_direct(frame: &mut crate::pyframe::PyFrame) -> PyObjectRef {
+    let include_traceback = exc_info_result_needs_traceback(frame);
+    exc_info_tuple(include_traceback)
 }
 
 /// The `BuiltinCode.func` behind `sys.exc_info`.
@@ -1497,7 +1669,29 @@ pub fn exc_info_direct() -> PyObjectRef {
 pub fn __majit_wrap_exc_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     debug_assert!(args.is_empty(), "exc_info takes no arguments");
     let _ = args;
-    Ok(exc_info_direct())
+    Ok(exc_info_tuple(true))
+}
+
+/// True iff `callable` is the canonical `sys.exc_info` builtin.
+///
+/// `sys` is mutable, so the generated JIT must pin the function's builtin-code
+/// identity before reproducing `function.py funccall_valuestack`'s direct
+/// path. This is the `sys.exc_info` sibling of
+/// [`is_builtin_getframe_function`].
+pub fn is_builtin_exc_info_function(callable: PyObjectRef) -> bool {
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_fn_eq(
+            crate::gateway::builtin_code_get(code),
+            __majit_wrap_exc_info as crate::gateway::BuiltinCodeFn,
+        )
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1514,12 +1708,14 @@ static __majit_wrap_exc_info_target: crate::gateway::BuiltinWrapperDescriptor =
 /// `exc_info_direct`'s tuple.
 pub fn sys_exception_direct() -> PyObjectRef {
     let exc = crate::eval::get_sys_exception();
-    unsafe {
-        if exc.is_null() || !pyre_object::is_exception(exc) {
-            w_none()
-        } else {
-            exc
-        }
+    // `vm.py exception`: `sys_exc_info()` returns an internal exception
+    // carrier or None, and `get_w_value()` returns its value without another
+    // isinstance check. Pyre stores that value directly in `sys_exc_value`;
+    // the slot's writers preserve the same exception-or-null invariant.
+    if exc.is_null() {
+        w_none()
+    } else {
+        exc
     }
 }
 
@@ -4348,4 +4544,50 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     crate::baseobjspace::setdictvalue_native(stream, "writable", writable_fn);
     crate::baseobjspace::setdictvalue_native(stream, "readable", readable_fn);
     stream
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytecode::Instruction;
+
+    fn traceback_needed_after(source: &str) -> bool {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile::compile_exec(source).expect("compile failed");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        let call_pc = frame
+            .getcode()
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(pc, unit)| {
+                matches!(unit.op.deoptimize(), Instruction::Call { .. }).then_some(pc)
+            })
+            .expect("source must contain CALL");
+        frame.last_instr = call_pc as isize;
+        exc_info_result_needs_traceback(&frame)
+    }
+
+    #[test]
+    fn exc_info_direct_omits_traceback_only_for_pypy_safe_subscripts() {
+        for source in [
+            "import sys\nresult = sys.exc_info()[0]",
+            "import sys\nresult = sys.exc_info()[1]",
+            "import sys\nresult = sys.exc_info()[-2]",
+            "import sys\nresult = sys.exc_info()[-3]",
+            "import sys\nresult = sys.exc_info()[:2]",
+            "import sys\nresult = sys.exc_info()[1:2]",
+        ] {
+            assert!(!traceback_needed_after(source), "{source}");
+        }
+        for source in [
+            "import sys\nresult = sys.exc_info()",
+            "import sys\nresult = sys.exc_info()[-1]",
+            "import sys\nresult = sys.exc_info()[2]",
+            "import sys\nresult = sys.exc_info()[:]",
+            "import sys\nresult = sys.exc_info()[1:3]",
+        ] {
+            assert!(traceback_needed_after(source), "{source}");
+        }
+    }
 }

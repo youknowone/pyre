@@ -7145,6 +7145,54 @@ mod tests {
         }
     }
 
+    /// The hand-lowered handler ops and translated execution-context helpers
+    /// address the same three words through the same descriptor objects.
+    /// `pypy/jit/backend/llsupport/descr.py GcCache.get_field_descr` has no
+    /// second identity for a field merely because a different graph read it.
+    #[test]
+    fn make_descr_from_bh_bridges_execution_context_fields_to_declared_group() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::BhDescr;
+
+        for (name, offset, canonical) in [
+            (
+                "sys_exc_value",
+                pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
+                ec_sys_exc_value_descr(),
+            ),
+            (
+                "topframeref",
+                pyre_interpreter::EC_TOPFRAMEREF_OFFSET,
+                ec_topframeref_descr(),
+            ),
+            (
+                "w_tracefunc",
+                pyre_interpreter::EC_W_TRACEFUNC_OFFSET,
+                ec_w_tracefunc_descr(),
+            ),
+        ] {
+            for owner in ["ExecutionContext", "executioncontext::ExecutionContext"] {
+                let descr = make_descr_from_bh(&BhDescr::Field {
+                    offset,
+                    field_size: std::mem::size_of::<pyre_object::PyObjectRef>(),
+                    field_type: Type::Ref,
+                    field_flag: ArrayFlag::Pointer,
+                    is_field_signed: false,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: None,
+                    parent: None,
+                    name: name.into(),
+                    owner: owner.into(),
+                });
+                assert!(
+                    std::sync::Arc::ptr_eq(&descr, &canonical),
+                    "{owner}.{name} must use the declared EC field Arc",
+                );
+            }
+        }
+    }
+
     #[test]
     fn make_descr_from_bh_struct_array_preserves_type_and_interior_fields() {
         use majit_ir::descr::ArrayFlag;
@@ -8065,6 +8113,35 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     && canonical.field_type() == *field_type
                 {
                     return w_class_descr();
+                }
+            }
+            // `ExecutionContext` is the second red portal input and is not a
+            // GC object. PUSH_EXC_INFO / POP_EXCEPT and portal guards use the
+            // declared `EC_DESCR_GROUP`, while a translated helper body names
+            // the same Rust fields through Charon's qualified owner. PyPy's
+            // `GcCache.get_field_descr` returns one descriptor object for one
+            // `(STRUCT, fieldname)`; keeping a second Arc here makes the heap
+            // optimizer miss the intervening `sys_exc_value` read and erase a
+            // live handler store. Bridge every EC field the walker itself
+            // emits before the generic parent-group lookup, as the shared
+            // `PyObject.w_class` bridge above already does.
+            if matches!(
+                owner.as_str(),
+                "ExecutionContext" | "executioncontext::ExecutionContext"
+            ) {
+                let canonical = match name.as_str() {
+                    "sys_exc_value" => Some(ec_sys_exc_value_descr()),
+                    "topframeref" => Some(ec_topframeref_descr()),
+                    "w_tracefunc" => Some(ec_w_tracefunc_descr()),
+                    _ => None,
+                };
+                if let Some(canonical) = canonical
+                    && let Some(field) = canonical.as_field_descr()
+                    && field.offset() == *offset
+                    && field.field_size() == *field_size
+                    && field.field_type() == *field_type
+                {
+                    return canonical;
                 }
             }
             if owner.as_str() == "W_ListObject" {
