@@ -5692,3 +5692,138 @@ fn a_statically_short_array_takes_the_plain_barrier() {
         "the card arm never calls the field helper"
     );
 }
+
+fn count_i32_scale_ops(bytes: &[u8]) -> (u32, u32) {
+    let mut mul = 0;
+    let mut shl = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::I32Mul => mul += 1,
+                    wasmparser::Operator::I32Shl => shl += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    (mul, shl)
+}
+
+fn array_get_bytes(item_size: usize, index: OpRef) -> Vec<u8> {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let descr = Arc::new(SimpleArrayDescr::new(1, 16, item_size, 55, Type::Int));
+    let get = make_op(
+        OpCode::GetarrayitemGcI,
+        &[OpRef::input_arg_ref(0), index],
+        OpRef::int_op(2),
+    );
+    get.setdescr(descr);
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![get, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    bytes
+}
+
+/// `llsupport/regalloc.py valid_addressing_size` / `get_scale`: item_size 1
+/// emits no scale, 2/4/8 emit `i32.shl`, any other stride keeps `i32.mul`.
+#[test]
+fn array_addr_uses_get_scale_instead_of_multiply() {
+    let (mul1, shl1) = count_i32_scale_ops(&array_get_bytes(1, OpRef::input_arg_int(1)));
+    assert_eq!(
+        mul1, 0,
+        "item_size == 1 skips the scale, like x86 getarrayitem"
+    );
+    assert_eq!(shl1, 0, "item_size == 1 is get_scale 0, not a shift");
+
+    let (mul4, shl4) = count_i32_scale_ops(&array_get_bytes(4, OpRef::input_arg_int(1)));
+    assert_eq!(mul4, 0, "item_size == 4 is a valid addressing size");
+    assert_eq!(shl4, 1, "item_size == 4 is get_scale 2, an i32.shl");
+
+    let (mul8, shl8) = count_i32_scale_ops(&array_get_bytes(8, OpRef::input_arg_int(1)));
+    assert_eq!(mul8, 0, "item_size == 8 is a valid addressing size");
+    assert_eq!(shl8, 1, "item_size == 8 is get_scale 3, an i32.shl");
+
+    let (mul3, shl3) = count_i32_scale_ops(&array_get_bytes(3, OpRef::input_arg_int(1)));
+    assert_eq!(
+        mul3, 1,
+        "item_size == 3 is the IMUL fallback of _imul_const_scaled"
+    );
+    assert_eq!(shl3, 0);
+
+    let (mul_c, shl_c) = count_i32_scale_ops(&array_get_bytes(8, OpRef::const_int(5)));
+    assert_eq!(
+        (mul_c, shl_c),
+        (0, 0),
+        "a ConstInt index folds into the MemArg offset, rewrite.py GC_LOAD arm"
+    );
+}
+
+/// `descr.py unpack_interiorfielddescr` / `rewrite.py transform_to_gc_load`:
+/// GET/SETINTERIORFIELD must compile, not decline the trace.
+#[test]
+fn interior_field_ops_compile() {
+    use majit_ir::descr::{
+        ArrayDescr, FieldDescr, SimpleArrayDescr, SimpleFieldDescr, SimpleInteriorFieldDescr,
+    };
+    use std::sync::Arc;
+
+    let interior = |item_size: usize| {
+        let array: Arc<dyn ArrayDescr> =
+            Arc::new(SimpleArrayDescr::new(1, 8, item_size, 55, Type::Int));
+        let field: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new(0, 4, 4, Type::Int, false));
+        Arc::new(SimpleInteriorFieldDescr::new(0, array, field))
+    };
+
+    let get = make_op(
+        OpCode::GetinteriorfieldGcI,
+        &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+        OpRef::int_op(3),
+    );
+    get.setdescr(interior(16));
+    let set = make_op(
+        OpCode::SetinteriorfieldGc,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_int(2),
+        ],
+        OpRef::NONE,
+    );
+    set.setdescr(interior(16));
+    let raw = make_op(
+        OpCode::SetinteriorfieldRaw,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_int(2),
+        ],
+        OpRef::NONE,
+    );
+    raw.setdescr(interior(8));
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Int, 2),
+    ];
+    let ops = vec![
+        set,
+        raw,
+        get,
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    let (mul, shl) = count_i32_scale_ops(&bytes);
+    assert_eq!(mul, 2, "item_size 16 is the IMUL fallback (set + get)");
+    assert_eq!(shl, 1, "item_size 8 on the RAW store is get_scale 3");
+}

@@ -5493,23 +5493,76 @@ fn build_function(
             }
 
             // ── Interior field access ──
-            // getinteriorfield/setinteriorfield address an interior field of an
-            // array element at `base + base_size + index*item_size + offset`. The
-            // prior lowering resolved only arg(0) (the array ptr) and applied
-            // field_offset_from_descr (which returns 0 for an InteriorFieldDescr),
-            // dropping arg(1) (the index) entirely, so it read/wrote element 0's
-            // field regardless of index — a silent wrong-memory access (wasm
-            // offset 0 is valid linear memory, so it does not trap). Decline and
-            // let the metainterp fall back to the interpreter, which addresses the
-            // interior field correctly.
+            // rewrite.py transform_to_gc_load / unpack_interiorfielddescr:
+            // addr = base + index * itemsize + (basesize + field.offset).
+            // Wasm skips the GC rewrite, so the GET/SETINTERIORFIELD ops
+            // themselves carry that address, matching cranelift's
+            // emit_scaled_index_addr rather than being rewritten to
+            // GC_LOAD_INDEXED first.
             OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
-            | OpCode::GetinteriorfieldGcF
-            | OpCode::SetinteriorfieldGc => {
-                return Err(BackendError::Unsupported(format!(
-                    "wasm codegen: interior-field op {:?} (index-aware addressing unimplemented)",
-                    op.opcode
-                )));
+            | OpCode::GetinteriorfieldGcF => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    let field = unpack_interior_field(op);
+                    let base = emit_scaled_index_addr(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
+                        field.item_size,
+                        field.offset,
+                    );
+                    // The opcode, not the descriptor, names the result's
+                    // register class — it is what the value local was declared
+                    // from — so it picks the load the same way the three
+                    // `Getarrayitem` arms do.
+                    match op.opcode {
+                        OpCode::GetinteriorfieldGcF => {
+                            sink.f64_load(mem64(base));
+                        }
+                        OpCode::GetinteriorfieldGcR => {
+                            sink.i64_load32_u(memarg(base, 2));
+                        }
+                        _ => emit_sized_int_load(&mut sink, base, field.field_size, field.signed),
+                    }
+                    sink.local_set(value_types.local(vi));
+                }
+            }
+            OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
+                if op.opcode == OpCode::SetinteriorfieldGc {
+                    emit_write_barrier_if_needed(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        jit_call_idx,
+                        residual_type_base,
+                        wb,
+                        op,
+                        emitted_write_barrier_base(op, ref_values),
+                        &same_as_forwardings,
+                        &mut wb_applied,
+                        &known_lengths,
+                    );
+                }
+                let field = unpack_interior_field(op);
+                let base = emit_scaled_index_addr(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    field.item_size,
+                    field.offset,
+                );
+                if field.is_float {
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
+                    sink.f64_store(mem64(base));
+                } else {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
+                    emit_sized_int_store(&mut sink, base, field.access_size());
+                }
             }
 
             // ── String/Unicode ops (direct memory access) ──
@@ -7865,12 +7918,81 @@ fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
     .unwrap_or_else(|| missing_layout_descr("array descr (len layout)", op))
 }
 
+/// `llsupport/regalloc.py valid_addressing_size`: the scales x86 SIB (and a
+/// wasm `i32.shl`) can form without a multiply.
+fn valid_addressing_size(size: u64) -> bool {
+    matches!(size, 1 | 2 | 4 | 8)
+}
+
+/// `llsupport/regalloc.py get_scale`: 1,2,4,8 → shift 0,1,2,3.
+fn get_scale(size: u64) -> u32 {
+    debug_assert!(valid_addressing_size(size));
+    if size < 4 {
+        (size as u32) - 1
+    } else {
+        (size as u32 >> 2) + 1
+    }
+}
+
+/// Scale the i32 index already on the stack by `item_size`.
+///
+/// `x86/assembler.py` getarrayitem skips the scale when `itemsize == 1`.
+/// `valid_addressing_size` / `get_scale` turn 2/4/8 into `i32.shl`; every
+/// other stride keeps `i32.mul`, matching the IMUL fallback of
+/// `_imul_const_scaled`.
+fn emit_scale_index(sink: &mut PeepSink<'_, '_>, item_size: u64) {
+    if item_size == 1 {
+        return;
+    }
+    if valid_addressing_size(item_size) {
+        sink.i32_const(get_scale(item_size) as i32);
+        sink.i32_shl();
+    } else {
+        sink.i32_const(item_size as i32);
+        sink.i32_mul();
+    }
+}
+
+/// Leave `base + index * item_size` on the wasm stack as an i32 address, and
+/// return the remaining displacement (`extra_offset`).
+///
+/// A ConstInt index is folded into that displacement — `rewrite.py
+/// emit_gc_load_or_indexed` picks the non-indexed `GC_LOAD` arm for the
+/// same case. The header / interior-field offset stays in the access's own
+/// MemArg, the same place the `getfield` arms put `field_offset_from_descr`.
+fn emit_scaled_index_addr(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    base: OpRef,
+    index: OpRef,
+    item_size: u64,
+    extra_offset: u64,
+) -> u64 {
+    emit_resolve(sink, constants, value_types, base);
+    sink.i32_wrap_i64();
+    // Only a constant that really lands inside the addressable range folds: a
+    // MemArg displacement is unsigned and traps past the end of memory, so a
+    // negative or overflowing index has to keep the run-time `i32` arithmetic,
+    // which wraps instead.
+    if let Some(idx) = const_operand_value(constants, index)
+        && let Some(offset) = u64::try_from(idx)
+            .ok()
+            .and_then(|idx| idx.checked_mul(item_size))
+            .and_then(|scaled| scaled.checked_add(extra_offset))
+            .filter(|offset| u32::try_from(*offset).is_ok())
+    {
+        return offset;
+    }
+    emit_resolve(sink, constants, value_types, index);
+    sink.i32_wrap_i64();
+    emit_scale_index(sink, item_size);
+    sink.i32_add();
+    extra_offset
+}
+
 /// Leave `base + index * item_size` on the wasm stack as an i32 address, and
 /// return the `base_size` displacement the access still owes.
-///
-/// The header is a fixed part of the descr, so it rides in the access's own
-/// MemArg offset instead of being added at run time — the same place the
-/// `getfield` arms put `field_offset_from_descr`.
 fn emit_array_addr(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -7880,14 +8002,66 @@ fn emit_array_addr(
     let (base_size, item_size) = op
         .with_array_descr(|ad| (ad.base_size() as u64, ad.item_size() as u64))
         .unwrap_or_else(|| missing_layout_descr("array descr (base/item size)", op));
-    emit_resolve(sink, constants, value_types, op.arg(0).to_opref()); // array ptr
-    sink.i32_wrap_i64();
-    emit_resolve(sink, constants, value_types, op.arg(1).to_opref()); // index
-    sink.i32_wrap_i64();
-    sink.i32_const(item_size as i32);
-    sink.i32_mul();
-    sink.i32_add();
-    base_size
+    emit_scaled_index_addr(
+        sink,
+        constants,
+        value_types,
+        op.arg(0).to_opref(),
+        op.arg(1).to_opref(),
+        item_size,
+        base_size,
+    )
+}
+
+/// The width of a GC pointer in the wasm32 guest heap, which is what
+/// `GetarrayitemGcR` reads back. A descriptor's `field_size` reports the width
+/// on whichever target compiled it.
+const GUEST_PTR_SIZE: usize = 4;
+
+/// `descr.py unpack_interiorfielddescr`: `ofs = basesize + field.offset`,
+/// plus the element stride and the field's own width / signedness / kind.
+struct InteriorFieldLayout {
+    /// `basesize + field.offset`, the displacement past the scaled index.
+    offset: u64,
+    /// The array's element stride.
+    item_size: u64,
+    /// The field's own width, and how a read of it extends.
+    field_size: usize,
+    signed: bool,
+    is_float: bool,
+    is_ptr: bool,
+}
+
+impl InteriorFieldLayout {
+    /// The width an access to this field moves. A pointer field is
+    /// guest-pointer-wide, the width `GetarrayitemGcR` reads back; the
+    /// descriptor's own `field_size` is the host's.
+    fn access_size(&self) -> usize {
+        if self.is_ptr {
+            GUEST_PTR_SIZE
+        } else {
+            self.field_size
+        }
+    }
+}
+
+fn unpack_interior_field(op: &Op) -> InteriorFieldLayout {
+    let descr = op
+        .getdescr()
+        .unwrap_or_else(|| missing_layout_descr("interior-field descr", op));
+    let ifd = descr
+        .as_interior_field_descr()
+        .unwrap_or_else(|| missing_layout_descr("interior-field descr", op));
+    let ad = ifd.array_descr();
+    let fd = ifd.field_descr();
+    InteriorFieldLayout {
+        offset: (ad.base_size() + fd.offset()) as u64,
+        item_size: ad.item_size() as u64,
+        field_size: fd.field_size(),
+        signed: fd.is_field_signed(),
+        is_float: fd.is_float_field(),
+        is_ptr: fd.is_pointer_field(),
+    }
 }
 
 // ── Guard emission helpers ──
