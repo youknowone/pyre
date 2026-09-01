@@ -7654,6 +7654,46 @@ impl<M: Clone> MetaInterp<M> {
         // resume.py parity: rd_numb is now produced inline during optimization
         // (ctx.emit → store_final_boxes_in_guard) rather than post-assembly.
 
+        // A loop compiled without the peel has ONE label and no virtual
+        // state, so nothing distinguishes a general entry from a specialized
+        // one — and the loop's own closing JUMP specializes it wherever it
+        // fills a slot the LABEL declares as a box with a constant. The body
+        // may never read that slot, so a value any entry supplies survives one
+        // iteration and the back edge writes the constant over it. The peel is
+        // what keeps that from mattering: it leaves the unspecialized preamble
+        // at `target_tokens[0]` and puts the loop's invariants in the peeled
+        // label's virtual state, which `unroll.py jump_to_existing_trace` must
+        // match or fall back to the preamble for.
+        //
+        // Refusing the compile is a DEVIATION. `pyjitpl.py` computes
+        // `can_use_unroll = cpu.supports_guard_gc_type and 'unroll' in
+        // enable_opts` and forwards a false value through `compile_loop` to
+        // `compile_simple_loop`, which publishes exactly this shape with
+        // `patch_jumpop_at_end=True`; `optimize_bridge` then takes
+        // `target_tokens[0]` through `jump_to_preamble`, whose only assertion
+        // is that the head carries no virtual state. Nothing on that route
+        // examines the closing JUMP, so the specialized label is entered with
+        // no guard proving the constant. With no peel there is no preamble to
+        // fall back to and no state to match, so declining the loop is the
+        // only answer left that is not the wrong one.
+        //
+        // The abort ceiling turns a key that keeps producing this shape into a
+        // `JC_DONT_TRACE_HERE`, so the frontend converges on interpreting it.
+        if retried_without_unroll && Self::closing_jump_fixes_label_slots(&compiled_ops) {
+            crate::mc_diag_bump(crate::mc_diag_slot(
+                "peel_less_loop_label_is_const_specialized",
+            ));
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] unroll-free loop label is specialized by its own \
+                     closing jump at key={green_key}"
+                );
+            }
+            self.warm_state.abort_tracing(green_key, false);
+            self.exported_state = None;
+            return CompileOutcome::Aborted;
+        }
+
         // Use the pre-allocated token object if available (for self-recursion
         // support), otherwise allocate a fresh one.
         let mut token = if let Some((pk, token)) = self.pending_token.take() {
@@ -10592,6 +10632,35 @@ impl<M: Clone> MetaInterp<M> {
 
         let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
+        // This path mints one TargetToken with no virtual state and no
+        // preamble in front of it, so its LABEL is the only entry the key
+        // has — and the trace's own closing JUMP specializes that LABEL
+        // wherever it fills a slot the LABEL declares as a box with a
+        // constant. See `closing_jump_fixes_label_slots` for why that is a
+        // wrong answer rather than a lost optimization, and `compile_loop`'s
+        // sibling refusal for the same shape reached the other way.
+        //
+        // The segmented caller is upstream's `patch_jumpop_at_end=False`
+        // case: `pyjitpl.py _create_segmented_trace_and_blackhole` records an
+        // unreachable FINISH and asks for no back edge, so the LABEL it
+        // publishes exists only for a later segment to close onto. A trace
+        // that arrives here carrying a back edge is outside that contract,
+        // and the closing JUMP below would descr it onto this very token.
+        if Self::closing_jump_fixes_label_slots(&optimized_ops) {
+            crate::mc_diag_bump(crate::mc_diag_slot(
+                "segmented_loop_label_is_const_specialized",
+            ));
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] compile_simple_loop: label is specialized by its own \
+                     closing jump at key={green_key}"
+                );
+            }
+            self.warm_state.abort_tracing(green_key, false);
+            self.compile_snapshot_refs.clear();
+            return None;
+        }
+
         // Allocate token and compile.
         let token_num = self.warm_state.alloc_token_number();
         // `compile.py jitcell_token = make_jitcell_token(jitdriver_sd)`.
@@ -11100,6 +11169,40 @@ impl<M: Clone> MetaInterp<M> {
             packed.push(value);
         }
         Some(packed)
+    }
+
+    /// Whether the loop's own closing JUMP fills a slot the LABEL declares as
+    /// a box with a constant, which makes the LABEL a specialized entry.
+    ///
+    /// `remove_consts_and_duplicates` (pyjitpl.py) records a `SAME_AS` for
+    /// every constant it meets in the merge point's live boxes, and the
+    /// rewrite pass folds that straight back, so a slot whose value the
+    /// metainterp knows as a constant reaches the optimized JUMP as one.
+    /// Against a LABEL that declares a box there, the pair says "any value may
+    /// enter, and this constant is what leaves" — sound for the trace that
+    /// recorded it, and an overwrite for anything else that enters.
+    ///
+    /// An op list whose LABEL has not been synthesized yet answers from the
+    /// JUMP alone: that LABEL will declare the trace's inputargs, which are
+    /// boxes without exception, so every constant in the JUMP lands on one.
+    ///
+    /// Conservative on purpose: a constant an operation in the loop genuinely
+    /// derives is refused too. Both compiles that consult this publish a
+    /// single label with no preamble behind it, and there refusing the compile
+    /// costs a loop where admitting it costs the answer.
+    fn closing_jump_fixes_label_slots(ops: &[majit_ir::OpRc]) -> bool {
+        let Some(jump) = ops.last().filter(|op| op.opcode == OpCode::Jump) else {
+            return false;
+        };
+        let jump_args = jump.getarglist();
+        let Some(label) = ops.iter().find(|op| op.opcode == OpCode::Label) else {
+            return jump_args.iter().any(|arg| arg.is_constant());
+        };
+        let label_args = label.getarglist();
+        jump_args
+            .iter()
+            .zip(label_args.iter())
+            .any(|(jump_arg, label_arg)| jump_arg.is_constant() && !label_arg.is_constant())
     }
 
     fn front_entry_index_for(tokens: &[crate::history::TargetToken]) -> Option<usize> {
@@ -27380,5 +27483,95 @@ mod loop_side_table_tests {
             Some(7),
             "copying old_entry.loop_header_pc across keeps the close target"
         );
+    }
+}
+
+/// The predicate that tells a specialized label from a general one on a loop
+/// compiled without the peel.
+///
+/// `compile_simple_loop` mints one TargetToken and gives it no
+/// `virtual_state`, so the only evidence a close has that the label is
+/// specialized is the loop's own closing JUMP: a constant there against a box
+/// in the LABEL says "any value may enter, and this constant is what leaves".
+/// The body may never read that slot, so a value the close supplies survives
+/// exactly one iteration and the back edge writes the constant over it.
+#[cfg(test)]
+mod closing_jump_fixes_label_slots_tests {
+    use super::*;
+    use majit_ir::operand::Operand;
+    use majit_ir::{Op, OpRef, Type};
+
+    fn op(opcode: OpCode, args: &[OpRef]) -> majit_ir::OpRc {
+        let args: Vec<Operand> = args.iter().map(|a| Operand::bound_from_opref(*a)).collect();
+        std::rc::Rc::new(Op::new(opcode, &args))
+    }
+
+    /// An `OpRef` naming a producer, i.e. what a LABEL declares each of its
+    /// slots as.
+    fn boxed(pos: u32) -> OpRef {
+        OpRef::op_typed(pos, Type::Int)
+    }
+
+    #[test]
+    fn a_constant_against_a_declared_box_is_the_specializing_shape() {
+        let ops = vec![
+            op(OpCode::Label, &[boxed(1), boxed(2)]),
+            op(OpCode::Jump, &[boxed(1), OpRef::ConstInt(605)]),
+        ];
+        assert!(
+            MetaInterp::<()>::closing_jump_fixes_label_slots(&ops),
+            "slot 1 enters as a box and leaves as 605, so anything that enters \
+             carrying another value loses it on the back edge",
+        );
+    }
+
+    /// The control: a loop whose closing JUMP hands every slot back as the box
+    /// it was declared as is a general entry, and refusing closes onto it
+    /// would cost bridges for nothing.
+    #[test]
+    fn a_jump_that_returns_every_slot_unchanged_is_a_general_entry() {
+        let ops = vec![
+            op(OpCode::Label, &[boxed(1), boxed(2)]),
+            op(OpCode::Jump, &[boxed(1), boxed(2)]),
+        ];
+        assert!(!MetaInterp::<()>::closing_jump_fixes_label_slots(&ops));
+    }
+
+    /// A slot the LABEL itself declares as a constant is already specialized
+    /// in a way every entry has to match, and the JUMP handing the same
+    /// constant back adds nothing.
+    #[test]
+    fn a_constant_the_label_itself_declares_is_not_this_defect() {
+        let ops = vec![
+            op(OpCode::Label, &[boxed(1), OpRef::ConstInt(605)]),
+            op(OpCode::Jump, &[boxed(1), OpRef::ConstInt(605)]),
+        ];
+        assert!(!MetaInterp::<()>::closing_jump_fixes_label_slots(&ops));
+    }
+
+    /// Without a back edge there is no loop to speak about.
+    #[test]
+    fn an_op_list_without_a_closing_jump_answers_no() {
+        assert!(!MetaInterp::<()>::closing_jump_fixes_label_slots(&[]));
+        assert!(!MetaInterp::<()>::closing_jump_fixes_label_slots(&[op(
+            OpCode::Label,
+            &[boxed(1)]
+        )]));
+    }
+
+    /// The compile-time site runs before the LABEL is synthesized, and that
+    /// LABEL will declare the trace's inputargs — boxes without exception. A
+    /// constant in the JUMP therefore lands on one, and answering from the
+    /// JUMP alone is what lets the check sit ahead of the token.
+    #[test]
+    fn a_jump_with_no_label_yet_answers_from_the_jump_alone() {
+        assert!(MetaInterp::<()>::closing_jump_fixes_label_slots(&[op(
+            OpCode::Jump,
+            &[boxed(1), OpRef::ConstInt(605)]
+        )]));
+        assert!(!MetaInterp::<()>::closing_jump_fixes_label_slots(&[op(
+            OpCode::Jump,
+            &[boxed(1), boxed(2)]
+        )]));
     }
 }
