@@ -33,7 +33,7 @@ use majit_ir::{
 // (`info.py:203-206`). What the tags still buy is disjoint index ranges,
 // so two descr kinds cannot collide on one `HeapCache` key — a flat
 // counter would have to preserve that much and nothing else.
-/// `symbolic.py:12 WORD` — the target pointer width. Every `Type::Ref`
+/// `symbolic.py WORD` — the target pointer width. Every `Type::Ref`
 /// field is one pointer, so its descr width derives from the target
 /// instead of spelling a 64-bit literal.
 const WORD: usize = core::mem::size_of::<usize>();

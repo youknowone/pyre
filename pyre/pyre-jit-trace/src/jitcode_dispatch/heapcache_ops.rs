@@ -690,7 +690,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
 /// `[last_instr, pycode, valuestackdepth, debugdata]`.
 pub(crate) const VABLE_CODE_FIELD_IDX: usize = 1;
 
-/// `pyjitpl.py:1518-1524 opimpl_guard_class` for the `guard_class/r>X` op
+/// `pyjitpl.py opimpl_guard_class` for the `guard_class/r>X` op
 /// `jtransform.rs rewrite_op_getfield` emits in place of a read of the
 /// header's class word.  The receiver's class is pinned with a `GuardClass`
 /// unless the heapcache already knows it, and the op's result is that class

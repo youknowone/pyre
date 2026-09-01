@@ -6456,7 +6456,7 @@ fn build_orthodox_inline_call_r_r(
 }
 
 /// Lower the UNARY_NEGATIVE flowspace op `neg(value)` → `result: Ref`
-/// (operation.py:466) to the canonical
+/// (operation.py `neg`) to the canonical
 /// `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by RPython's
 /// `jtransform.py handle_regular_call`.  A build without the translated
 /// `descroperation::neg` body retains the MayForce residual fallback.
