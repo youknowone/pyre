@@ -218,16 +218,14 @@ pub struct JitCodeBody {
     #[serde(default)]
     pub unit_variant_consts: Vec<UnitVariantConstDescriptor>,
     /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
-    /// RPython packs into a single chr (`assert num_regs_i < 256`); pyre
-    /// uses `u16` to keep CPython 3.13 codes that legitimately exceed 255
-    /// registers per kind reachable.  The codewriter still asserts
-    /// `< 256` for now (assembler.rs); widening the field is a parity
-    /// preparation for that limit being lifted.
-    pub c_num_regs_i: u16,
+    /// The one-byte carrier is part of the JitCode format; both
+    /// `JitCode.setup` and `Assembler.check_result` reject values that do not
+    /// fit it before the body is published.
+    pub c_num_regs_i: u8,
     /// RPython `jitcode.py` `self.c_num_regs_r = chr(num_regs_r)`.
-    pub c_num_regs_r: u16,
+    pub c_num_regs_r: u8,
     /// RPython `jitcode.py` `self.c_num_regs_f = chr(num_regs_f)`.
-    pub c_num_regs_f: u16,
+    pub c_num_regs_f: u8,
     /// RPython `jitcode.py` `self._startpoints = startpoints` —
     /// debug-only set of bytecode offsets where instructions start.
     /// `setup(..., startpoints=None)` (jitcode.py) is the upstream

@@ -865,7 +865,7 @@ fn lower_extended_arg_inner_while(
         quote::quote! { let _ = __builder.live_placeholder(); },
     );
     lowerer.emit_op(
-        OpMeta::conditional_guard_int_eq(
+        OpMeta::conditional_guard_compare(
             Register::int(opcode_reg),
             Register::int(extended_arg_const_reg),
             after_loop.clone(),
@@ -1085,7 +1085,7 @@ fn try_lower_have_argument_guard(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
         quote! { let _ = __builder.live_placeholder(); },
     );
     lowerer.emit_op(
-        OpMeta::conditional_guard_int_eq(
+        OpMeta::conditional_guard_compare(
             Register::int(local_reg),
             Register::int(const_reg),
             ok_label.clone(),
@@ -2727,7 +2727,7 @@ pub(super) fn lower_dispatch_chain(
                 // Fused goto_if_not_int_eq: branch to the next alternative (or the
                 // arm skip label) if opcode != const.
                 lowerer.emit_op(
-                    OpMeta::conditional_guard_int_eq(
+                    OpMeta::conditional_guard_compare(
                         Register::int(opcode_reg),
                         Register::int(const_reg),
                         miss_label.clone(),

@@ -12,20 +12,6 @@ fn literal_nonnegative_i64(expr: &Expr) -> Option<i64> {
 }
 
 impl<'c> Lowerer<'c> {
-    /// True when any op recorded since index `since` is a float
-    /// comparison — an `OpKind::BinopF` whose result register is int
-    /// banked.  Float arithmetic writes a float result; only the value-
-    /// form `float_lt/le/eq/ne/gt/ge` (`ff>i`) writes an int.  A float
-    /// comparison feeding a conditional guard grows a bridge that hangs the
-    /// compiled trace, so the branch lowerers roll back and use interpreter
-    /// fallback when the condition lowered through one.
-    fn ops_since_contain_float_compare(&self, since: usize) -> bool {
-        self.op_metadata[since..].iter().any(|op| {
-            matches!(op.kind, OpKind::BinopF)
-                && op.writes.iter().any(|w| matches!(w.kind, BindingKind::Int))
-        })
-    }
-
     /// Lower an `if` / `while` condition, peeling a leading `!` into the
     /// branch instead of computing it.
     ///
@@ -40,7 +26,7 @@ impl<'c> Lowerer<'c> {
     /// and does not exist. A condition is `bool` by the language's own typing
     /// rule, which is the guarantee `optimize_goto_if_not` spells out as
     /// `v.concretetype != lltype.Bool: return False`.
-    pub(super) fn lower_condition(&mut self, cond: &Expr) -> Option<(Binding, bool)> {
+    pub(super) fn lower_condition(&mut self, cond: &Expr) -> Option<LoweredCondition> {
         let mut negated = false;
         let mut expr = cond;
         loop {
@@ -57,31 +43,61 @@ impl<'c> Lowerer<'c> {
                 _ => break,
             }
         }
+
+        // RPython `jtransform.py` `optimize_goto_if_not`: when the boolean
+        // comparison result is used only as this block's exitswitch, remove
+        // the value-producing op and carry its operands in the exitswitch.
+        // Flatten then emits `goto_if_not_<opname>/{ii,ff}L`.
+        //
+        // Do not fuse through `!`: `!(a < b)` is not `a >= b` for NaNs.
+        if !negated {
+            let fused = self.transactional(|s| {
+                let Expr::Binary(binary) = expr else {
+                    return None;
+                };
+                let suffix = match &binary.op {
+                    BinOp::Lt(_) => "lt",
+                    BinOp::Le(_) => "le",
+                    BinOp::Eq(_) => "eq",
+                    BinOp::Ne(_) => "ne",
+                    BinOp::Gt(_) => "gt",
+                    BinOp::Ge(_) => "ge",
+                    _ => return None,
+                };
+                let lhs = s.lower_value_expr(&binary.left)?;
+                let rhs = s.lower_value_expr(&binary.right)?;
+                if lhs.kind != rhs.kind
+                    || !matches!(lhs.kind, BindingKind::Int | BindingKind::Float)
+                {
+                    return None;
+                }
+                let prefix = match lhs.kind {
+                    BindingKind::Int => "goto_if_not_int_",
+                    BindingKind::Float => "goto_if_not_float_",
+                    BindingKind::Ref => unreachable!(),
+                };
+                Some(LoweredCondition::Compare {
+                    lhs,
+                    rhs,
+                    branch: format_ident!("{prefix}{suffix}"),
+                })
+            });
+            if fused.is_some() {
+                return fused;
+            }
+        }
+
         let binding = self.lower_value_expr(expr)?;
         // The int bank is what `goto_if_not_int_is_zero` reads. An unnegated
         // condition keeps whatever the caller already accepted.
         if negated && !matches!(binding.kind, BindingKind::Int) {
             return None;
         }
-        Some((binding, negated))
+        Some(LoweredCondition::Value { binding, negated })
     }
 
     pub(super) fn lower_if_stmt(&mut self, expr_if: &ExprIf) -> Option<()> {
-        let snap_stmts = self.statements.len();
-        let snap_meta = self.op_metadata.len();
-        let snap_reg = self.next_reg;
-        let snap_bindings = self.bindings.clone();
-        let (cond, cond_negated) = self.lower_condition(&expr_if.cond)?;
-        if self.ops_since_contain_float_compare(snap_meta) {
-            // Guard over a float comparison hangs the compiled trace; roll
-            // back the condition ops and bail so the arm runs interpreted.
-            self.statements.truncate(snap_stmts);
-            self.op_metadata.truncate(snap_meta);
-            self.next_reg = snap_reg;
-            self.bindings = snap_bindings;
-            return None;
-        }
-        let cond_reg = cond.reg;
+        let cond = self.lower_condition(&expr_if.cond)?;
         let then_seq = self.lower_branch_expr(&Expr::Block(syn::ExprBlock {
             attrs: Vec::new(),
             label: None,
@@ -112,7 +128,7 @@ impl<'c> Lowerer<'c> {
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
         );
-        self.emit_conditional_guard_negatable(cond_reg, &else_label, cond_negated);
+        self.emit_lowered_condition_guard(&cond, &else_label);
         self.append_lowered_sequence(then_seq);
         self.emit_jump(&end_label);
         self.emit_label_def(&else_label);
@@ -280,8 +296,6 @@ impl<'c> Lowerer<'c> {
     }
 
     fn lower_while_loop_inner(&mut self, expr_while: &syn::ExprWhile) -> Option<()> {
-        let snap_meta = self.op_metadata.len();
-
         // `loop_start` has to be marked *before* the condition lowers:
         // `mark_label` records the builder's current bytecode position, the
         // back edge re-enters there, and the condition must be re-tested on
@@ -298,18 +312,12 @@ impl<'c> Lowerer<'c> {
         self.emit_label_def(&loop_start);
 
         // Evaluate the condition
-        let (cond, cond_negated) = self.lower_condition(&expr_while.cond)?;
-        if self.ops_since_contain_float_compare(snap_meta) {
-            // Guard over a float comparison hangs the compiled trace; bail so
-            // the arm runs interpreted instead.
-            return None;
-        }
-        let cond_reg = cond.reg;
+        let cond = self.lower_condition(&expr_while.cond)?;
         self.emit_op(
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
         );
-        self.emit_conditional_guard_negatable(cond_reg, &loop_end, cond_negated);
+        self.emit_lowered_condition_guard(&cond, &loop_end);
 
         // Lower the body, with break targets pointing to loop_end
         let body_seq = self.lower_loop_body(&expr_while.body, &loop_end, &loop_start)?;
@@ -570,16 +578,9 @@ impl<'c> Lowerer<'c> {
             return None; // no break/continue, fall back to normal lowering
         }
 
-        let snap_meta = self.op_metadata.len();
-        let (cond, cond_negated) = self.lower_condition(&expr_if.cond)?;
-        if self.ops_since_contain_float_compare(snap_meta) {
-            // Guard over a float comparison hangs the compiled trace; bail so
-            // the arm runs interpreted instead.
-            return None;
-        }
+        let cond = self.lower_condition(&expr_if.cond)?;
         let else_label = self.alloc_label();
         let end_label = self.alloc_label();
-        let cond_reg = cond.reg;
 
         self.emit_aux(quote! { let #else_label = __builder.new_label(); });
         self.emit_aux(quote! { let #end_label = __builder.new_label(); });
@@ -587,7 +588,7 @@ impl<'c> Lowerer<'c> {
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
         );
-        self.emit_conditional_guard_negatable(cond_reg, &else_label, cond_negated);
+        self.emit_lowered_condition_guard(&cond, &else_label);
 
         // Lower then-branch with loop control
         let then_seq = self.lower_loop_body(&expr_if.then_branch, break_label, continue_label)?;

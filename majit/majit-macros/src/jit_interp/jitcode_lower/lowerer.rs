@@ -404,6 +404,30 @@ impl<'c> Lowerer<'c> {
         );
     }
 
+    /// Emit the exitswitch shape chosen by `jtransform.py`'s
+    /// `optimize_goto_if_not`.
+    pub(super) fn emit_lowered_condition_guard(
+        &mut self,
+        condition: &LoweredCondition,
+        target: &Ident,
+    ) {
+        match condition {
+            LoweredCondition::Value { binding, negated } => {
+                self.emit_conditional_guard_negatable(binding.reg, target, *negated);
+            }
+            LoweredCondition::Compare { lhs, rhs, branch } => {
+                let lhs_reg = Register::new(lhs.kind, lhs.reg);
+                let rhs_reg = Register::new(rhs.kind, rhs.reg);
+                let lhs_index = lhs.reg;
+                let rhs_index = rhs.reg;
+                self.emit_op(
+                    OpMeta::conditional_guard_compare(lhs_reg, rhs_reg, target.clone()),
+                    quote! { __builder.#branch(#lhs_index, #rhs_index, #target); },
+                );
+            }
+        }
+    }
+
     /// Emit a builder-side aux statement (no BC_* op, no def/use).
     pub(super) fn emit_aux(&mut self, tokens: TokenStream) {
         self.emit_op(OpMeta::aux(), tokens);

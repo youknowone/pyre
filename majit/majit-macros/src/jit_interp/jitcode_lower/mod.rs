@@ -1642,6 +1642,34 @@ pub(super) struct Binding {
     pub(super) struct_type: Option<syn::Path>,
 }
 
+/// A condition after `jtransform.py`'s `optimize_goto_if_not` decision.
+///
+/// A comparison whose boolean result is consumed only by the branch is kept
+/// as its two operands and becomes `goto_if_not_<comparison>` directly.
+/// Other conditions retain their materialized int result. In particular a
+/// leading `!` stays in the latter form: inverting a float comparison would
+/// change its NaN semantics.
+pub(super) enum LoweredCondition {
+    Value {
+        binding: Binding,
+        negated: bool,
+    },
+    Compare {
+        lhs: Binding,
+        rhs: Binding,
+        branch: Ident,
+    },
+}
+
+impl LoweredCondition {
+    pub(super) fn depends_on_stack(&self) -> bool {
+        match self {
+            Self::Value { binding, .. } => binding.depends_on_stack,
+            Self::Compare { lhs, rhs, .. } => lhs.depends_on_stack || rhs.depends_on_stack,
+        }
+    }
+}
+
 /// Mirror of RPython `rpython/jit/codewriter/flatten.py:Register(kind, index)`.
 /// Each emitted register carries its bank with it; the liveness walker
 /// (`liveness.py:33-79`) keeps a single `set()` of `Register` objects per
@@ -1958,10 +1986,10 @@ impl OpMeta {
         }
     }
 
-    /// Two-register conditional guard for `goto_if_not_int_eq(a, b, target)`.
-    /// jtransform.py `optimize_goto_if_not` fuses `int_eq + goto_if_not`
-    /// into `goto_if_not_int_eq/iiL`. Both `a_reg` and `b_reg` are read uses.
-    pub(super) fn conditional_guard_int_eq(
+    /// Two-register conditional guard produced by `optimize_goto_if_not`.
+    /// Both comparison operands are read uses; their register banks carry the
+    /// `/iiL` versus `/ffL` distinction used by `assembler.py`.
+    pub(super) fn conditional_guard_compare(
         a_reg: Register,
         b_reg: Register,
         target: Ident,
@@ -2539,6 +2567,21 @@ mod tests {
         syn::parse_str(code).expect("failed to parse call")
     }
 
+    fn method_call_config(
+        owner: &str,
+        method: &str,
+        kind: crate::jit_interp::CallPolicyKind,
+    ) -> LowererConfig {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.state_type_name = "Machine".to_string();
+        config.env_type_name = "Program".to_string();
+        config.calls.push((
+            vec![owner.to_string(), method.to_string()],
+            CallPolicySpec::Explicit(kind),
+        ));
+        config
+    }
+
     fn inline_call_tokens_combined(bindings: &[Binding], result_reg: u16) -> String {
         let (call_match, post_live) = inline_call_tokens(bindings, result_reg);
         format!("{} {}", call_match, post_live)
@@ -2562,6 +2605,108 @@ mod tests {
         lowerer.append_lowered_sequence(seq);
         assert_eq!(lowerer.statements.len(), lowerer.op_metadata.len());
         assert!(matches!(lowerer.op_metadata[1].kind, OpKind::LoadConstI));
+    }
+
+    #[test]
+    fn method_call_uses_the_shared_residual_ref_lowering() {
+        let mut config = method_call_config(
+            "Program",
+            "lookup",
+            crate::jit_interp::CallPolicyKind::ResidualRef,
+        );
+        config.call_returns.insert(
+            vec!["Program".to_string(), "lookup".to_string()],
+            syn::parse_quote!(Node),
+        );
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("program".to_string(), binding(0, BindingKind::Ref));
+        lowerer
+            .bindings
+            .insert("pc".to_string(), binding(0, BindingKind::Int));
+        let call: Expr = syn::parse_quote! { program.lookup(pc) };
+
+        let result = lowerer
+            .lower_value_expr(&call)
+            .expect("a method has the same residual-ref policy surface as a free call");
+
+        assert!(matches!(result.kind, BindingKind::Ref));
+        assert_eq!(result.struct_type, Some(syn::parse_quote!(Node)));
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(body.contains("Program :: lookup"), "{body}");
+        assert!(
+            body.contains("residual_call_ref_canonical_via_target"),
+            "{body}"
+        );
+        assert!(body.contains("live_placeholder"), "{body}");
+    }
+
+    #[test]
+    fn method_call_uses_the_shared_wrapped_float_lowering() {
+        let config = method_call_config(
+            "Machine",
+            "ratio",
+            crate::jit_interp::CallPolicyKind::ElidableFloatCannotRaiseWrapped,
+        );
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("state".to_string(), binding(0, BindingKind::Ref));
+        lowerer
+            .bindings
+            .insert("value".to_string(), binding(0, BindingKind::Int));
+        let call: Expr = syn::parse_quote! { state.ratio(value) };
+
+        let result = lowerer
+            .lower_value_expr(&call)
+            .expect("method syntax must not narrow the wrapped float policy surface");
+
+        assert!(matches!(result.kind, BindingKind::Float));
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(
+            body.contains("Machine :: __majit_call_policy_ratio"),
+            "{body}"
+        );
+        assert!(
+            body.contains("call_pure_float_canonical_via_target_cannot_raise"),
+            "{body}"
+        );
+        assert!(!body.contains("live_placeholder"), "{body}");
+    }
+
+    #[test]
+    fn method_statement_uses_the_shared_void_lowering() {
+        let config = method_call_config(
+            "Machine",
+            "mutate",
+            crate::jit_interp::CallPolicyKind::ResidualVoid,
+        );
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer
+            .bindings
+            .insert("state".to_string(), binding(0, BindingKind::Ref));
+        lowerer
+            .bindings
+            .insert("value".to_string(), binding(0, BindingKind::Int));
+        let call: Expr = syn::parse_quote! { state.mutate(value) };
+
+        lowerer
+            .lower_config_call_stmt(&call)
+            .expect("method statements share the free-call void policy surface");
+
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(body.contains("Machine :: mutate"), "{body}");
+        assert!(
+            body.contains("residual_call_void_canonical_via_target"),
+            "{body}"
+        );
+        assert!(body.contains("live_placeholder"), "{body}");
+        assert_eq!(lowerer.op_metadata[0].reads.len(), 2);
+        assert!(matches!(lowerer.op_metadata[1].kind, OpKind::LiveMarker));
     }
 
     #[test]
