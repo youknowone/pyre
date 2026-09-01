@@ -20992,12 +20992,13 @@ mod tests {
         ));
 
         // So the predicate must admit it, naming the very same descriptor.
-        let (fp_type, fp_version_tag, fp_descr) =
+        let (fp_type, fp_version_tag, fp_descr, owes_shadow_guard) =
             unsafe { bound_method_attr_fast_path(w_list, "append") }
                 .expect("the fold precondition must admit what get() binds");
         assert!(std::ptr::eq(fp_type, w_type));
         assert!(std::ptr::eq(fp_descr, w_descr));
         assert_ne!(fp_version_tag, 0);
+        assert!(!owes_shadow_guard, "a list has no mapdict shadow guard");
     }
 
     /// typeobject.py:293-301 — under the interpreter (`we_are_jitted()`
