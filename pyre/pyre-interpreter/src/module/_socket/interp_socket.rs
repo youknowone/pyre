@@ -4710,7 +4710,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             } else {
                 0
             };
-            let mut buf = vec![0u8; n];
+            let mut buf = crate::builtins::try_vec_zeroed(n)?;
             socket_wait_readable(obj, fd)?;
             let got = socket_recv_bytes(obj, fd, &mut buf, flags)?;
             buf.truncate(got);
@@ -4826,7 +4826,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             } else {
                 0
             };
-            let mut buf = vec![0u8; n];
+            let mut buf = crate::builtins::try_vec_zeroed(n)?;
             let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
             socket_wait_readable(obj, fd)?;
@@ -5073,8 +5073,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             };
             let fd = socket_fd(args[0])?;
 
-            let mut data = vec![0u8; bufsize];
-            let mut control = vec![0u8; ancbufsize];
+            let mut data = crate::builtins::try_vec_zeroed(bufsize)?;
+            let mut control = crate::builtins::try_vec_zeroed(ancbufsize)?;
             let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
             socket_wait_readable(args[0], fd)?;
             let (got, msg_flags, msg_namelen, controllen) = loop {
@@ -5247,7 +5247,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                 })
                 .collect();
-            let mut control = vec![0u8; ancbufsize];
+            let mut control = crate::builtins::try_vec_zeroed(ancbufsize)?;
             let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
             socket_wait_readable(args[0], fd)?;
             let (got, msg_flags, msg_namelen, controllen) = loop {
