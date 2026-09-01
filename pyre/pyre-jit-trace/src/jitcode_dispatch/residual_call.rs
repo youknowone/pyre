@@ -7817,7 +7817,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
         // pyjitpl.py `execute_and_record_varargs`; may-force
         // calls use `history.record_nospec` and therefore count nothing.
-        if matches!(
+        let profiled_call = matches!(
             call_opcode,
             OpCode::CallI
                 | OpCode::CallR
@@ -7831,13 +7831,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 | OpCode::CallLoopinvariantR
                 | OpCode::CallLoopinvariantF
                 | OpCode::CallLoopinvariantN
-        ) {
+        );
+        if profiled_call {
             ctx.trace_ctx
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::OPS);
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
         }
         // Always record `list_write_barrier` on the Object strategy's in-place
         // append arm.  Dropping it in favour of the backend's
@@ -7854,6 +7852,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+        // `_record_helper_varargs` counts RECORDED_OPS as it records; a
+        // may-force call takes `history.record_nospec` and counts nothing.
+        if profiled_call {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
 
         // `MIFrame.execute_varargs(pure=True)` parity: for
         // `CallPure*` whose every argbox carries a known `box_value`,
@@ -9416,7 +9421,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
-        if matches!(
+        let profiled_call = matches!(
             call_opcode,
             OpCode::CallI
                 | OpCode::CallR
@@ -9430,13 +9435,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 | OpCode::CallLoopinvariantR
                 | OpCode::CallLoopinvariantF
                 | OpCode::CallLoopinvariantN
-        ) {
+        );
+        if profiled_call {
             ctx.trace_ctx
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::OPS);
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
         }
         // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
         // `record_result_of_call_pure` can cut it back out.
@@ -9444,6 +9447,13 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+        // `_record_helper_varargs` counts RECORDED_OPS as it records; a
+        // may-force call takes `history.record_nospec` and counts nothing.
+        if profiled_call {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
 
         // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
@@ -9698,7 +9708,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
             write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
-        if matches!(
+        let profiled_call = matches!(
             call_opcode,
             OpCode::CallI
                 | OpCode::CallR
@@ -9712,13 +9722,11 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
                 | OpCode::CallLoopinvariantR
                 | OpCode::CallLoopinvariantF
                 | OpCode::CallLoopinvariantN
-        ) {
+        );
+        if profiled_call {
             ctx.trace_ctx
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::OPS);
-            ctx.trace_ctx
-                .profiler()
-                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
         }
         // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
         // `record_result_of_call_pure` can cut it back out.
@@ -9726,6 +9734,13 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let recorded = ctx
             .trace_ctx
             .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+        // `_record_helper_varargs` counts RECORDED_OPS as it records; a
+        // may-force call takes `history.record_nospec` and counts nothing.
+        if profiled_call {
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
+        }
 
         // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
