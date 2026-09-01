@@ -8673,6 +8673,12 @@ pub(crate) fn try_walker_specialize_subscr_tuple_slice2<Sym: WalkSym>(
         return Ok(None);
     }
     let exact_int_bound = |obj: pyre_object::PyObjectRef| -> Option<i64> {
+        // A slice bound is a stored field, so it reaches here untyped: an
+        // immediate carries no header and its odd address survives the null
+        // test below. Decline before any `ob_type` read.
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+            return None;
+        }
         if obj.is_null()
             || unsafe {
                 !std::ptr::eq((*obj).ob_type, &pyre_object::INT_TYPE)
@@ -8744,6 +8750,20 @@ pub(crate) fn try_walker_specialize_subscr_tuple_slice2<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
+    // The emitted loads name `start` and `start + 1`, which `clamp` derived
+    // locally; the answer they have to agree with is the one `descr_getslice`
+    // just produced. Comparing the two makes the executed result the authority
+    // on which elements may be named, so a bound normalization that ever drifts
+    // declines the fold instead of compiling a read of the wrong index.
+    let (Some(result0), Some(result1)) = (
+        unsafe { pyre_object::w_tuple_getitem(result_concrete, 0) },
+        unsafe { pyre_object::w_tuple_getitem(result_concrete, 1) },
+    ) else {
+        return Ok(None);
+    };
+    if !std::ptr::eq(result0, item0_concrete) || !std::ptr::eq(result1, item1_concrete) {
+        return Ok(None);
+    }
 
     // --- commit: exact tuple guards, fixed length, immutable item reads ---
     let tuple_type_addr = &pyre_object::TUPLE_TYPE as *const _ as i64;
