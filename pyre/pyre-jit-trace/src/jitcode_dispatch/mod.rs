@@ -4729,6 +4729,21 @@ pub(crate) fn read_float_reg_concrete<Sym: WalkSym>(
         })
 }
 
+/// Float-valued store counterpart of [`raw_store_int`] —
+/// `bhimpl_raw_store_f`.
+///
+/// # Safety
+/// `addr` must name writable memory of at least `itemsize` bytes.
+unsafe fn raw_store_float(addr: *mut u8, itemsize: usize, value: f64) {
+    unsafe {
+        match itemsize {
+            4 => addr.cast::<f32>().write_unaligned(value as f32),
+            8 => addr.cast::<f64>().write_unaligned(value),
+            _ => panic!("raw_store_f descr itemsize {itemsize} is not a minted width"),
+        }
+    }
+}
+
 /// Int-bank twin of [`write_ref_reg`] (Int-bank concrete shadow).  Writes an Int
 /// register and its concrete shadow in lock-step.  Mirrors the
 /// Ref-bank contract: every walker handler that writes
@@ -12149,6 +12164,50 @@ fn handle<Sym: WalkSym>(
                 }
             }
             // pyjitpl.py `_opimpl_raw_store`.
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawStore, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawStore, majit_metainterp::counters::RECORDED_OPS);
+            ctx.trace_ctx
+                .record_op_with_descr(OpCode::RawStore, &[base, offset, value], descr);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // Float twin of `raw_store_i`, under the same execute-as-you-walk
+        // contract: the walk performs the store, so a non-concrete operand
+        // declines rather than continue past a lost write.  The value's
+        // concrete f64 comes from the Float bank's OpRef carrier.
+        // Operand layout `iifd`: 1B base + 1B offset + 1B value + 2B descr.
+        "raw_store_f/iifd" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let offset = read_int_reg(code, op, 1, ctx)?;
+            let value = read_float_reg(code, op, 2, ctx)?;
+            let descr = read_descr(code, op, 3, ctx)?;
+            match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                read_int_reg_concrete(code, op, 1, ctx),
+                read_float_reg_concrete(code, op, 2, ctx),
+                descr.as_array_descr(),
+            ) {
+                (
+                    ConcreteValue::Int(b),
+                    ConcreteValue::Int(o),
+                    ConcreteValue::Float(v),
+                    Some(ad),
+                ) => {
+                    let addr = b.wrapping_add(o) as usize as *mut u8;
+                    // SAFETY: same contract as the raw_store_i arm — the walk
+                    // executed the residuals that produced `addr`.
+                    unsafe { raw_store_float(addr, ad.item_size(), v) };
+                }
+                _ => {
+                    return Err(DispatchError::UnsupportedOpname {
+                        pc: op.pc,
+                        key: "raw_store_f/iifd non-concrete operand",
+                    });
+                }
+            }
             ctx.trace_ctx
                 .profiler()
                 .count_ops(OpCode::RawStore, majit_metainterp::counters::OPS);

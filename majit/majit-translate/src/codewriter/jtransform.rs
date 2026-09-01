@@ -4629,8 +4629,7 @@ impl<'a> Transformer<'a> {
     /// a zero byte offset (`jtransform.py:1156-1171 rewrite_op_raw_store` /
     /// `rewrite_op_raw_load`, descr `arraydescrof(rffi.CArray(T))`).  The
     /// single-float width stays a residual call — `jit_libffi.py types`
-    /// special-cases the `'S'` kind the same way — and a float store stays
-    /// residual too: the insn table carries no `raw_store_f` bytecode.
+    /// special-cases the `'S'` kind the same way.
     fn _handle_raw_access_call(
         &mut self,
         oopspec_name: &str,
@@ -4675,13 +4674,10 @@ impl<'a> Transformer<'a> {
             "ptr" => (ValueType::Int, crate::layout::target_word_size(), false),
             _ => return None,
         };
-        if is_store && item_ty == ValueType::Float {
-            return None;
-        }
         // The leaf receives an already-offset pointer; the raw op's byte
         // offset is the constant zero.
-        let zero = graph
-            .alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        let zero =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
         let zero_op = SpaceOperation {
             result: Some(zero.clone()),
             kind: OpKind::ConstInt(0),

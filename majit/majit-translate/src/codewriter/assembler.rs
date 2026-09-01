@@ -2131,16 +2131,21 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 let (reg, value_kind) = self.lookup_reg_with_kind_var(value, regallocs);
-                assert_eq!(
-                    value_kind, 'i',
-                    "raw_store value must be int-kind (the insn table carries \
-                     no raw_store_f), got {value_kind:?} — graph {:?}",
+                assert!(
+                    matches!(value_kind, 'i' | 'f'),
+                    "raw_store value must be int- or float-kind, got {value_kind:?} — \
+                     graph {:?}",
                     self.current_graph_name,
                 );
                 state.code.push(reg);
                 argcodes.push(value_kind);
+                let descr_ty = if value_kind == 'f' {
+                    crate::model::ValueType::Float
+                } else {
+                    crate::model::ValueType::Int
+                };
                 let descr_idx = self.emit_ready_descr(raw_carray_descrof(
-                    &crate::model::ValueType::Int,
+                    &descr_ty,
                     *itemsize,
                     *is_item_signed,
                 ));
@@ -4986,9 +4991,10 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             crate::model::ValueType::Float => "raw_load_f".into(),
             _ => "raw_load_i".into(),
         },
-        // The insn table carries no `raw_store_f`; the lowering arm only
-        // mints int-valued stores.
-        OpKind::RawStore { .. } => "raw_store_i".into(),
+        OpKind::RawStore { item_ty, .. } => match item_ty {
+            crate::model::ValueType::Float => "raw_store_f".into(),
+            _ => "raw_store_i".into(),
+        },
         // RPython: ConstInt is NOT a standalone op; see encode_op comment.
         // Pyre materialises constants as an int_copy from pool-region reg.
         OpKind::ConstInt(_) | OpKind::ConstUInt(_) => "int_copy".into(),
