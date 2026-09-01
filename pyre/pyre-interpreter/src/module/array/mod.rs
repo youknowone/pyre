@@ -1799,9 +1799,15 @@ fn array_repeat_bytes(obj: PyObjectRef, count: i64) -> PyResult {
         .len()
         .checked_mul(n)
         .ok_or_else(|| PyError::memory_error(""))?;
-    let mut out = Vec::with_capacity(total);
-    for _ in 0..n {
-        out.extend_from_slice(src);
+    // The count came from Python, so the buffer is reserved fallibly: an
+    // infallible reservation ends the process where `_mul_helper` raises.
+    let mut out = crate::builtins::try_vec_with_capacity::<u8>(total)?;
+    // `array_repeat` copies only for `oldbytes > 0`; without that, repeating an
+    // empty array runs the count as a loop trip and never comes back.
+    if !src.is_empty() {
+        for _ in 0..n {
+            out.extend_from_slice(src);
+        }
     }
     Ok(arr::w_array_from_bytes(tc, isz, out))
 }
@@ -1854,9 +1860,12 @@ fn array_imul_method(args: &[PyObjectRef]) -> PyResult {
         .checked_mul(count - 1)
         .ok_or_else(|| PyError::memory_error(""))?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
-    vec.reserve(extra);
-    for _ in 1..count {
-        vec.extend_from_slice(&src);
+    vec.try_reserve_exact(extra)
+        .map_err(|_| crate::builtins::reservation_failed())?;
+    if !src.is_empty() {
+        for _ in 1..count {
+            vec.extend_from_slice(&src);
+        }
     }
     Ok(obj)
 }
