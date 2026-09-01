@@ -16010,8 +16010,8 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
 /// short-circuit away and the walk records the boxing body's own null and
 /// exception guards after the length is already shrunk, and a failure there
 /// pops twice. The Object arm returns the element itself, so no boxing call
-/// follows its stores and the hazard cannot arise; Float stays out for want of
-/// a `walker_box_float` to elide its `w_float_new`.
+/// follows its stores and the hazard cannot arise.  A Float element reaches
+/// neither arm: `PoppedValue` carries the Integer and Object shapes only.
 /// The pre-fold `GuardClass` / `GuardValue` and the strategy
 /// switch's guard are ahead of the store by construction; the body's own ops
 /// are checked instead of assumed —

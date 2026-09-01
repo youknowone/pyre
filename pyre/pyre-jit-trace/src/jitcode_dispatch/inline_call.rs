@@ -11342,6 +11342,38 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
 
+    // The `w_int_new` boundary of `dispatch_inline_call_dir_kind`, for the
+    // float box.  `w_float_new`'s translated body builds the whole
+    // `W_FloatObject` and writes it into the collector block in one copy;
+    // that is neither the `malloc_typed` shape `fuse_boxing_alloc` rewrites
+    // into a `NewWithVtable` nor a field-wise store sequence, so the header
+    // constructor and the copy both stay symbolic funcptr calls the sub-walk
+    // cannot record.  Take the helper call as the allocation intrinsic here,
+    // where the rtyper has already replaced `malloc(W_FloatObject)`.
+    let is_w_float_new = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+        .is_some_and(|jc| jc.name == "w_float_new" && jc.code.as_ptr() == sub_body.code.as_ptr());
+    if is_w_float_new
+        && dst_bank == 'r'
+        && int_args.is_empty()
+        && ref_args.is_empty()
+        && float_args.len() == 1
+        && let ConcreteValue::Float(value) = concrete_from_recorded_opref(ctx, float_args[0])
+    {
+        let boxed = walker_box_float(ctx, float_args[0]);
+        ctx.trace_ctx.set_opref_concrete(
+            boxed,
+            majit_ir::Value::Ref(majit_ir::GcRef(
+                pyre_object::floatobject::w_float_new(value) as usize,
+            )),
+        );
+        let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
+        let ConcreteValue::Ref(boxed_shadow) = concrete_from_recorded_opref(ctx, boxed) else {
+            unreachable!("the stamped concrete of a float box is a Ref")
+        };
+        write_ref_reg(ctx, op.pc, dst, boxed, ConcreteValue::Ref(boxed_shadow))?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     let callee_result = run_sub_jitcode_walk(
         ctx,
         op.pc,

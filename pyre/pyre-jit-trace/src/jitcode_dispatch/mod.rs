@@ -9607,6 +9607,17 @@ fn walker_box_int<Sym: WalkSym>(
     Ok(crate::state::wrapint(ctx.trace_ctx, raw))
 }
 
+/// Float twin of [`walker_box_int`]: records the `NEW_WITH_VTABLE +
+/// SETFIELD_GC` pair for a `W_FloatObject` so the box stays virtualizable.
+/// There is no tagged float representation, so the boxed concrete is just the
+/// heap pointer and no counterpart to [`box_int_concrete`] is needed.
+fn walker_box_float<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    raw: OpRef,
+) -> OpRef {
+    crate::state::wrapfloat(ctx.trace_ctx, raw)
+}
+
 /// Concrete counterpart to [`walker_box_int`]. The op is now a heap
 /// `NewWithVtable`, so the stamped concrete must ALSO be a heap ptr. When the
 /// residual result is tagged (flag-true), materialize a real heap
