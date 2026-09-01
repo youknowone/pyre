@@ -514,7 +514,7 @@ fn build_module_with_ca(
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: gc_info.clone(),
         alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
@@ -764,7 +764,7 @@ fn build_module_with_write_barrier_target(
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
         alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: write_barrier_target,
+        wb: codegen::WriteBarrierHelpers::for_current_gc(write_barrier_target, 0),
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
@@ -1284,7 +1284,7 @@ fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
         alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
@@ -1548,7 +1548,7 @@ fn inline_region_inputs(
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
         alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
@@ -1720,7 +1720,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             classptr_to_typeid: HashMap::new(),
             guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
             alloc: codegen::AllocHelpers::default(),
-            wb_fn_ptr: 0,
+            wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
             nursery: None,
             invalidated_flag_addr: 0,
             gc_table_base: 0,
@@ -1934,7 +1934,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             classptr_to_typeid: HashMap::new(),
             guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
             alloc: codegen::AllocHelpers::default(),
-            wb_fn_ptr: 0,
+            wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
             nursery: None,
             invalidated_flag_addr: 0,
             gc_table_base: 0,
@@ -2244,7 +2244,7 @@ fn zero_arity_parameter_entry_is_structurally_type_zero() {
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
         alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
@@ -2696,7 +2696,7 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
         alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
         nursery: None,
         invalidated_flag_addr: 0x1000,
         gc_table_base: 0,
@@ -3078,7 +3078,7 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
         alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base,
@@ -3417,7 +3417,7 @@ fn build_external_jump_module(
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
         alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
@@ -3908,7 +3908,7 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
                 new_oldgen_fn_ptr: NEW_OLDGEN_FN,
                 new_array_oldgen_fn_ptr: NEW_ARRAY_OLDGEN_FN,
             },
-            wb_fn_ptr: 0,
+            wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
             nursery: None, // the inline bump is off, so only the helper choice shows
             invalidated_flag_addr: 0,
             gc_table_base: 0,
@@ -4946,7 +4946,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
         alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
@@ -5143,7 +5143,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
         alloc: codegen::AllocHelpers::default(),
-        wb_fn_ptr: 0,
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
         nursery: None,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
@@ -5425,5 +5425,448 @@ fn a_counterless_trace_reserves_the_slot_a_bridge_may_need() {
         codegen::frame_value_slots(&inputargs, &counterless),
         codegen::frame_value_slots(&inputargs, &with_counter),
         "a source loop that spills nothing must still fit a bridge that does"
+    );
+}
+
+fn count_i32_store8(bytes: &[u8]) -> u32 {
+    let mut n = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                if matches!(
+                    operators.read().unwrap(),
+                    wasmparser::Operator::I32Store8 { .. }
+                ) {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+const WB_FIELD: i64 = 0x4a11;
+const WB_ARRAY: i64 = 0x4a22;
+
+/// The geometry `MiniMarkGC::get_write_barrier_descr` reports for a collector
+/// configured without cards.
+fn wb_helpers_without_cards() -> codegen::WriteBarrierHelpers {
+    let mut descr = majit_gc::WriteBarrierDescr::for_current_gc();
+    descr.jit_wb_cards_set = 0;
+    descr.jit_wb_cards_set_byteofs = 0;
+    descr.jit_wb_cards_set_singlebyte = 0;
+    descr.jit_wb_card_page_shift = 0;
+    codegen::WriteBarrierHelpers::new(WB_FIELD, WB_ARRAY, &descr)
+}
+
+fn build_module_with_barrier_helpers(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    wb: codegen::WriteBarrierHelpers,
+) -> Vec<u8> {
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.to_vec(),
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::compact(6, 3, 0),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("write barrier module compiles");
+    validate_wasm(&bytes);
+    bytes
+}
+
+fn ref_array_store(
+    descr: &std::sync::Arc<majit_ir::descr::SimpleArrayDescr>,
+    idx: OpRef,
+    val: OpRef,
+) -> Op {
+    let op = make_op(
+        OpCode::SetarrayitemGc,
+        &[OpRef::input_arg_ref(0), idx, val],
+        OpRef::NONE,
+    );
+    op.setdescr(descr.clone());
+    op
+}
+
+fn two_ref_array_stores() -> (Vec<InputArg>, Vec<Op>) {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+    let descr = Arc::new(SimpleArrayDescr::new(1, 16, 8, 55, Type::Ref));
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Ref, 2),
+        InputArg::from_type(Type::Ref, 3),
+    ];
+    let ops = vec![
+        ref_array_store(&descr, OpRef::input_arg_int(1), OpRef::input_arg_ref(2)),
+        ref_array_store(&descr, OpRef::const_int(5), OpRef::input_arg_ref(3)),
+        Op::new(OpCode::Finish, &[]),
+    ];
+    (inputargs, ops)
+}
+
+/// `_write_barrier_fastpath(..., array=True)` / `WriteBarrierSlowPath`: a
+/// SETARRAYITEM_GC of a Ref marks a card byte, and `gen_write_barrier_array`
+/// remembers nothing, so the second store to the same base barriers again.
+#[test]
+fn array_write_barrier_marks_a_card_when_the_collector_has_them() {
+    let (inputargs, ops) = two_ref_array_stores();
+    let bytes = build_module_with_barrier_helpers(
+        &inputargs,
+        &ops,
+        codegen::WriteBarrierHelpers::for_current_gc(WB_FIELD, WB_ARRAY),
+    );
+    assert!(
+        count_i32_store8(&bytes) >= 2,
+        "each array store marks its own card byte"
+    );
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_ARRAY as i32),
+        2,
+        "the CARDS_SET-clear arm calls jit_remember_young_pointer_from_array"
+    );
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_FIELD as i32),
+        0,
+        "array stores must not use the field write_barrier helper"
+    );
+}
+
+/// `gen_write_barrier_array` falls through to `gen_write_barrier` when
+/// `jit_wb_cards_set` is 0, and that arm *is* remembered.
+#[test]
+fn array_write_barrier_without_cards_is_the_plain_remembered_barrier() {
+    let (inputargs, ops) = two_ref_array_stores();
+    let bytes = build_module_with_barrier_helpers(&inputargs, &ops, wb_helpers_without_cards());
+    assert_eq!(
+        count_i32_store8(&bytes),
+        0,
+        "a collector with no cards has no card byte to mark"
+    );
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_ARRAY as i32),
+        0,
+        "jit_wb_cards_set == 0 never reaches the array helper"
+    );
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_FIELD as i32),
+        1,
+        "the fall-back arm is a plain write_barrier, so the second store elides"
+    );
+}
+
+/// `handle_write_barrier_setarrayitem` opens with the same
+/// `write_barrier_applied(val)` test `handle_write_barrier_setfield` does: a
+/// base already remembered by a field barrier takes no array barrier at all.
+#[test]
+fn a_remembered_base_suppresses_a_later_array_barrier() {
+    use majit_ir::descr::{SimpleArrayDescr, SimpleFieldDescr};
+    use std::sync::Arc;
+
+    let array = Arc::new(SimpleArrayDescr::new(1, 16, 8, 55, Type::Ref));
+    let field = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(2))],
+    );
+    field.setdescr(Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false)));
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Ref, 2),
+        InputArg::from_type(Type::Ref, 3),
+    ];
+    let ops = vec![
+        field,
+        ref_array_store(&array, OpRef::input_arg_int(1), OpRef::input_arg_ref(3)),
+        Op::new(OpCode::Finish, &[]),
+    ];
+    let bytes = build_module_with_barrier_helpers(
+        &inputargs,
+        &ops,
+        codegen::WriteBarrierHelpers::for_current_gc(WB_FIELD, WB_ARRAY),
+    );
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_FIELD as i32),
+        1,
+        "the field store barriers once"
+    );
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_ARRAY as i32),
+        0,
+        "the array store finds the base already in write_barrier_applied"
+    );
+    assert_eq!(
+        count_i32_store8(&bytes),
+        0,
+        "a suppressed barrier marks no card either"
+    );
+}
+
+/// `gen_write_barrier_array`'s `known_length(v_base, LARGE)`: a NEW_ARRAY this
+/// trace gave a statically short length takes the plain remembered barrier, so
+/// the second store to it elides; one at the threshold keeps the card arm.
+#[test]
+fn a_statically_short_array_takes_the_plain_barrier() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let descr = Arc::new(SimpleArrayDescr::new(1, 16, 8, 55, Type::Ref));
+    let build = |length: i64| {
+        let new = make_op(
+            OpCode::NewArray,
+            &[OpRef::const_int(length)],
+            OpRef::ref_op(4),
+        );
+        new.setdescr(descr.clone());
+        let store = |val: OpRef| {
+            let op = make_op(
+                OpCode::SetarrayitemGc,
+                &[OpRef::ref_op(4), OpRef::input_arg_int(1), val],
+                OpRef::NONE,
+            );
+            op.setdescr(descr.clone());
+            op
+        };
+        let inputargs = vec![
+            InputArg::from_type(Type::Ref, 0),
+            InputArg::from_type(Type::Int, 1),
+            InputArg::from_type(Type::Ref, 2),
+            InputArg::from_type(Type::Ref, 3),
+        ];
+        let ops = vec![
+            new,
+            store(OpRef::input_arg_ref(2)),
+            store(OpRef::input_arg_ref(3)),
+            Op::new(OpCode::Finish, &[]),
+        ];
+        build_module_with_barrier_helpers(
+            &inputargs,
+            &ops,
+            codegen::WriteBarrierHelpers::for_current_gc(WB_FIELD, WB_ARRAY),
+        )
+    };
+
+    let short = build(129);
+    assert_eq!(
+        direct_write_barrier_call_count(&short, WB_ARRAY as i32),
+        0,
+        "a length under LARGE never reaches the array helper"
+    );
+    assert_eq!(
+        direct_write_barrier_call_count(&short, WB_FIELD as i32),
+        1,
+        "the plain arm is remembered, so the second store elides"
+    );
+
+    let long = build(130);
+    assert_eq!(
+        direct_write_barrier_call_count(&long, WB_ARRAY as i32),
+        2,
+        "at LARGE the card arm takes over, and it remembers nothing"
+    );
+    assert_eq!(
+        direct_write_barrier_call_count(&long, WB_FIELD as i32),
+        0,
+        "the card arm never calls the field helper"
+    );
+}
+
+fn count_i32_scale_ops(bytes: &[u8]) -> (u32, u32) {
+    let mut mul = 0;
+    let mut shl = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::I32Mul => mul += 1,
+                    wasmparser::Operator::I32Shl => shl += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    (mul, shl)
+}
+
+fn array_get_bytes(item_size: usize, index: OpRef) -> Vec<u8> {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let descr = Arc::new(SimpleArrayDescr::new(1, 16, item_size, 55, Type::Int));
+    let get = make_op(
+        OpCode::GetarrayitemGcI,
+        &[OpRef::input_arg_ref(0), index],
+        OpRef::int_op(2),
+    );
+    get.setdescr(descr);
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![get, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    bytes
+}
+
+/// `llsupport/regalloc.py valid_addressing_size` / `get_scale`: item_size 1
+/// emits no scale, 2/4/8 emit `i32.shl`, any other stride keeps `i32.mul`.
+#[test]
+fn array_addr_uses_get_scale_instead_of_multiply() {
+    let (mul1, shl1) = count_i32_scale_ops(&array_get_bytes(1, OpRef::input_arg_int(1)));
+    assert_eq!(
+        mul1, 0,
+        "item_size == 1 skips the scale, like x86 getarrayitem"
+    );
+    assert_eq!(shl1, 0, "item_size == 1 is get_scale 0, not a shift");
+
+    let (mul4, shl4) = count_i32_scale_ops(&array_get_bytes(4, OpRef::input_arg_int(1)));
+    assert_eq!(mul4, 0, "item_size == 4 is a valid addressing size");
+    assert_eq!(shl4, 1, "item_size == 4 is get_scale 2, an i32.shl");
+
+    let (mul8, shl8) = count_i32_scale_ops(&array_get_bytes(8, OpRef::input_arg_int(1)));
+    assert_eq!(mul8, 0, "item_size == 8 is a valid addressing size");
+    assert_eq!(shl8, 1, "item_size == 8 is get_scale 3, an i32.shl");
+
+    let (mul3, shl3) = count_i32_scale_ops(&array_get_bytes(3, OpRef::input_arg_int(1)));
+    assert_eq!(
+        mul3, 1,
+        "item_size == 3 is the IMUL fallback of _imul_const_scaled"
+    );
+    assert_eq!(shl3, 0);
+
+    let (mul_c, shl_c) = count_i32_scale_ops(&array_get_bytes(8, OpRef::const_int(5)));
+    assert_eq!(
+        (mul_c, shl_c),
+        (0, 0),
+        "a ConstInt index folds into the MemArg offset, rewrite.py GC_LOAD arm"
+    );
+}
+
+/// `descr.py unpack_interiorfielddescr` / `rewrite.py transform_to_gc_load`:
+/// GET/SETINTERIORFIELD must compile, not decline the trace.
+#[test]
+fn interior_field_ops_compile() {
+    use majit_ir::descr::{
+        ArrayDescr, FieldDescr, SimpleArrayDescr, SimpleFieldDescr, SimpleInteriorFieldDescr,
+    };
+    use std::sync::Arc;
+
+    let interior = |item_size: usize| {
+        let array: Arc<dyn ArrayDescr> =
+            Arc::new(SimpleArrayDescr::new(1, 8, item_size, 55, Type::Int));
+        let field: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new(0, 4, 4, Type::Int, false));
+        Arc::new(SimpleInteriorFieldDescr::new(0, array, field))
+    };
+
+    let get = make_op(
+        OpCode::GetinteriorfieldGcI,
+        &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+        OpRef::int_op(3),
+    );
+    get.setdescr(interior(16));
+    let set = make_op(
+        OpCode::SetinteriorfieldGc,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_int(2),
+        ],
+        OpRef::NONE,
+    );
+    set.setdescr(interior(16));
+    let raw = make_op(
+        OpCode::SetinteriorfieldRaw,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_int(2),
+        ],
+        OpRef::NONE,
+    );
+    raw.setdescr(interior(8));
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Int, 2),
+    ];
+    let ops = vec![
+        set,
+        raw,
+        get,
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    let (mul, shl) = count_i32_scale_ops(&bytes);
+    assert_eq!(mul, 2, "item_size 16 is the IMUL fallback (set + get)");
+    assert_eq!(shl, 1, "item_size 8 on the RAW store is get_scale 3");
+}
+
+/// `genop_discard_cond_call`: CondCallN is a real conditional call, not a no-op.
+#[test]
+fn cond_call_n_emits_predicate_and_trampoline() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::CondCallN,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::const_int(0x100),
+                OpRef::input_arg_int(1),
+            ],
+            OpRef::NONE,
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let mut eqz = 0;
+    let mut ifs = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::I64Eqz => eqz += 1,
+                    wasmparser::Operator::If { .. } => ifs += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(eqz >= 1, "CondCallN tests the predicate with i64.eqz");
+    assert!(ifs >= 1, "CondCallN wraps the call in an if");
+    assert!(
+        import_func_type(&bytes, "jit_call_compact").is_some(),
+        "CondCallN uses the residual trampoline"
     );
 }

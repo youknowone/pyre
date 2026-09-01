@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
 /// `pyre_jit_bridge_diag` guest export (the runner prints them at
@@ -121,6 +121,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 /// the trip threshold to keep a quasi-immutable dependency attached to the
 /// owner's flag, and pays an owner re-emission whether or not the region ever
 /// runs hot; a region that saves only its entry crossing does not earn it.
+///
+/// 65 = the same eager arm declined an owner already too large to re-emit. The
+/// arm cannot wait for the entry evidence the deferred arm waits for, so the
+/// only thing it can read is what the re-emission will cost.
 pub static BRIDGE_DIAG: [AtomicU64; BRIDGE_DIAG_LABELS.len()] =
     [const { AtomicU64::new(0) }; BRIDGE_DIAG_LABELS.len()];
 
@@ -202,6 +206,7 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "ca_decl_geometry",
     "ca_decl_terminal",
     "inline_decl_foreign_eager",
+    "inline_decl_eager_too_large",
 ];
 
 #[repr(u8)]
@@ -335,6 +340,13 @@ static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Off for the loop-body half of the class. See `inline_nonheader_enable`.
 static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Entries a merge must earn per byte of the module it re-emits. See
+/// `inline_trip_threshold_for`. Zero leaves `INLINE_TRIP_THRESHOLD` as the
+/// whole rule.
+static INLINE_TRIP_BYTES_FACTOR: AtomicU64 = AtomicU64::new(DEFAULT_INLINE_TRIP_BYTES_FACTOR);
+/// Owner size at which the eager merge arm stops merging. See
+/// `DEFAULT_INLINE_EAGER_MAX_BYTES`.
+static INLINE_EAGER_MAX_BYTES: AtomicU32 = AtomicU32::new(DEFAULT_INLINE_EAGER_MAX_BYTES);
 static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
 
 /// One compiled trace's guest-memory entry counters.  The generated module
@@ -483,6 +495,51 @@ pub fn inline_nonheader_enable() {
 
 fn inline_nonheader_enabled() -> bool {
     INLINE_NONHEADER_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Set the per-byte entry price a deferred merge must earn, from the host
+/// before guest execution, in place of [`DEFAULT_INLINE_TRIP_BYTES_FACTOR`].
+/// Zero leaves [`INLINE_TRIP_THRESHOLD`] as the whole rule.
+pub fn set_inline_trip_bytes_factor(entries_per_byte: u64) {
+    INLINE_TRIP_BYTES_FACTOR.store(entries_per_byte, Ordering::Relaxed);
+}
+
+/// The wasm loop `token` was last compiled as, when it has one. Both merge
+/// arms price themselves off its `module_bytes`.
+fn compiled_wasm_loop(token: &JitCellToken) -> Option<&CompiledWasmLoop> {
+    token
+        .compiled
+        .get()
+        .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+}
+
+/// Set the owner size at which the eager merge arm declines, from the host
+/// before guest execution, in place of [`DEFAULT_INLINE_EAGER_MAX_BYTES`].
+pub fn set_inline_eager_max_bytes(max_bytes: u32) {
+    INLINE_EAGER_MAX_BYTES.store(max_bytes, Ordering::Relaxed);
+}
+
+/// Entries the bridge standing in for a merge must be entered before the merge
+/// is taken, for an owner whose last emission was `owner_module_bytes` long.
+///
+/// A merge re-emits the whole owner, so its cost scales with the owner's size
+/// rather than the region's: cranelift charges about 0.65 ms per KB of module,
+/// while a cross-module crossing the merge removes is about 2.5 ns. Those two
+/// rates are what [`INLINE_TRIP_BYTES_FACTOR`] converts between; a bridge's
+/// entry count is a floor on the crossings removed, so the price is a floor
+/// too.
+///
+/// [`INLINE_TRIP_THRESHOLD`] stays as the lower bound, because a fixture whose
+/// entire crossing budget is under a millisecond cannot pay back any rebuild.
+///
+/// Above the price at which a merge is refused outright sits a band where the
+/// price only postpones a merge that is taken anyway, and every crossing in
+/// that window is paid for nothing. The default sits below that band.
+fn inline_trip_threshold_for(owner_module_bytes: u32) -> u64 {
+    let priced = INLINE_TRIP_BYTES_FACTOR
+        .load(Ordering::Relaxed)
+        .saturating_mul(owner_module_bytes as u64);
+    priced.max(INLINE_TRIP_THRESHOLD)
 }
 
 /// Disable guard-to-bridge value parameters from the host before guest
@@ -1655,6 +1712,36 @@ pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
     0
 }
 
+/// Array-store counterpart of [`wasm_jit_write_barrier`].
+///
+/// `incminimark.py jit_remember_young_pointer_from_array` / dynasm
+/// `dynasm_write_barrier_from_array`: the JIT has already seen
+/// TRACK_YOUNG_PTRS set and CARDS_SET clear. If the object has cards,
+/// arm CARDS_SET; otherwise fall back to the generic remembered-set
+/// path. The caller then marks the card inline when CARDS_SET is set.
+pub extern "C" fn wasm_jit_write_barrier_from_array(obj: i64) -> i64 {
+    with_wasm_active_gc_mut(|gc| gc.jit_remember_young_pointer_from_array(GcRef(obj as usize)));
+    0
+}
+
+/// The write-barrier geometry and helper addresses the emitted barrier reads.
+///
+/// `gc.py` sets `write_barrier_descr` from the collector, and the backends read
+/// it back rather than assuming a layout: `jit_wb_cards_set` is zero for a
+/// collector configured without cards, and `jit_wb_card_page_shift` is that
+/// collector's own shift. Falling back to the current header layout when no GC
+/// is live mirrors `dynasm_write_barrier_descr`.
+fn wasm_write_barrier_helpers() -> codegen::WriteBarrierHelpers {
+    // `fn as usize` is the `__indirect_function_table` index on wasm32; taking
+    // it here keeps the function in the table.
+    let fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
+    let array_fn_ptr = wasm_jit_write_barrier_from_array as *const () as usize as i64;
+    match with_wasm_active_gc(|gc| gc.get_write_barrier_descr()).flatten() {
+        Some(descr) => codegen::WriteBarrierHelpers::new(fn_ptr, array_fn_ptr, &descr),
+        None => codegen::WriteBarrierHelpers::for_current_gc(fn_ptr, array_fn_ptr),
+    }
+}
+
 /// Self-recursive CALL_ASSEMBLER (`PYRE_WASM_CA`) callee-frame allocation
 /// helper. Allocates the callee's execution frame as a young nursery
 /// GC-managed `JitFrame`, mirroring rewrite.py's nursery frame allocation:
@@ -1979,6 +2066,35 @@ static INLINE_TRIP_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
 /// worth 0.75x on 72.0M crossings removed.
 const INLINE_TRIP_THRESHOLD: u64 = 100_000;
 
+/// The per-byte half of the same price, in entries per byte of the module the
+/// merge re-emits — see [`inline_trip_threshold_for`], which takes the larger
+/// of the two.
+///
+/// A merge charges cranelift for the whole owner while the crossings it removes
+/// answer only to the bridge, so a fixture whose owner is large enough loses on
+/// a merge the entry count alone would have taken. At this value `fannkuch`
+/// keeps 8 of its 10 merges and `nbody` 3 of its 4, dropping 30KB and 18KB of
+/// emitted module, while the merges of the four fixtures that never lose one
+/// are postponed by an amount too small to charge them anything. Twice this is
+/// already inside the band where postponement dominates.
+const DEFAULT_INLINE_TRIP_BYTES_FACTOR: u64 = 40;
+
+/// Bytes of owner module above which the eager merge arm declines.
+///
+/// That arm merges before the compile returns, so a quasi-immutable fold's
+/// dependencies attach to the owner's flag rather than to a temporary bridge's
+/// — which is why it cannot wait for entry evidence the way
+/// [`inline_trip_threshold_for`] does. What it can read is the re-emission it
+/// is about to buy, and successive merges into one owner re-emit it whole each
+/// time: four merges into one owner re-emit it four times, at every size it
+/// passes through on the way.
+///
+/// The value is where the corpus stops paying for those re-emissions and has
+/// not yet started losing the merges that earn theirs. Below it the fixtures
+/// whose merge removes millions of crossings begin to lose it, and each one
+/// costs several times what the re-emissions saved.
+const DEFAULT_INLINE_EAGER_MAX_BYTES: u32 = 4096;
+
 /// A merge that passed every inline check and is waiting on
 /// [`INLINE_TRIP_THRESHOLD`] entries into the bridge compiled in its place.
 struct PendingInline {
@@ -2079,6 +2195,7 @@ fn register_pending_inline(
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
     cells_base_ptr: u32,
+    owner_module_bytes: u32,
 ) -> codegen::InlineTripProbe {
     let counter_addr = Box::leak(Box::new(0u64)) as *const u64 as usize as u32;
     let dispatch_cell_index = region.source_fail_index;
@@ -2094,7 +2211,7 @@ fn register_pending_inline(
     });
     codegen::InlineTripProbe {
         counter_addr,
-        threshold: INLINE_TRIP_THRESHOLD,
+        threshold: inline_trip_threshold_for(owner_module_bytes),
         trip_fn_ptr: inline_trip_helper_slot() as i64,
         pending_id,
         cells_base_ptr,
@@ -2763,6 +2880,7 @@ impl WasmBackend {
             compiled._bridge_owned_cells.borrow_mut().push(owner);
         }
         compiled.bridge_cells_base.set(new_cells_base);
+        compiled.module_bytes.set(code_size as u32);
         compiled.num_guard_cells.set(guard_exits.len());
         {
             let mut metas = compiled.chained_trace_meta.borrow_mut();
@@ -3606,7 +3724,7 @@ impl majit_backend::Backend for WasmBackend {
         // `jit_call` trampoline. `fn as usize` is the `__indirect_function_table`
         // index on wasm32; taking it here keeps the function in the table.
         let alloc = alloc_helpers();
-        let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
+        let wb = wasm_write_barrier_helpers();
         // Exit indices come from the global fail-index space so a cross-trace
         // chain's `frame[0]` resolves regardless of which module wrote it
         // (`failguard::FAIL_DESCR_REGISTRY`).
@@ -3624,7 +3742,7 @@ impl majit_backend::Backend for WasmBackend {
             classptr_to_typeid: typeid_table,
             guard_gc_type_info,
             alloc,
-            wb_fn_ptr,
+            wb,
             nursery: nursery_alloc_params(ops),
             invalidated_flag_addr: Arc::as_ptr(&token.invalidated) as usize as u32,
             gc_table_base,
@@ -3781,6 +3899,7 @@ impl majit_backend::Backend for WasmBackend {
             num_ref_homes,
             frame,
             bridge_cells_base: std::cell::Cell::new(bridge_cells_base),
+            module_bytes: std::cell::Cell::new(code_size as u32),
             num_guard_cells: std::cell::Cell::new(guard_exits.len()),
             has_preamble,
             label_descrs,
@@ -4441,6 +4560,15 @@ impl majit_backend::Backend for WasmBackend {
                         // warmup on a workload too short to amortize one.
                         diag_bump(64);
                         decline("foreign_eager");
+                    } else if compiled_wasm_loop(&owner).is_some_and(|loop_| {
+                        loop_.module_bytes.get() > INLINE_EAGER_MAX_BYTES.load(Ordering::Relaxed)
+                    }) {
+                        // The re-emission this arm pays for is the whole owner,
+                        // and it takes it without the entry evidence the
+                        // deferred arm waits for. Past this size that trade is
+                        // one the region cannot be shown to earn.
+                        diag_bump(65);
+                        decline("eager_too_large");
                     } else {
                         // Deferral would register this region's dependencies
                         // against its temporary bridge flag. A header region
@@ -4498,7 +4626,7 @@ impl majit_backend::Backend for WasmBackend {
         let typeid_table = self.collect_classptr_typeid_table(ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info(ops);
         let alloc = alloc_helpers();
-        let wb_fn_ptr = wasm_jit_write_barrier as *const () as usize as i64;
+        let wb = wasm_write_barrier_helpers();
 
         // CALL_ASSEMBLER: the CA arm allocates a fresh callee using the target
         // token's frozen geometry. The earlier frame-fit decline guarantees a
@@ -4549,17 +4677,18 @@ impl majit_backend::Backend for WasmBackend {
                 gc_table_base,
                 constants: self.constants.clone(),
             };
-            // The cell the owner's guard consults, by address of the field
-            // rather than by value: a later re-emission reallocates the array
-            // and the probe has to reach the live one.
-            let cells_base_ptr = owner
-                .compiled
-                .get()
-                .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-                .map_or(0, |loop_| {
-                    &loop_.bridge_cells_base as *const std::cell::Cell<u32> as usize as u32
+            // The cell the owner's guard consults travels by address of the
+            // field rather than by value: a later re-emission reallocates the
+            // array and the probe has to reach the live one. The owner's size
+            // travels by value, because it prices this merge alone.
+            let (cells_base_ptr, owner_module_bytes) =
+                compiled_wasm_loop(&owner).map_or((0, 0), |loop_| {
+                    (
+                        &loop_.bridge_cells_base as *const std::cell::Cell<u32> as usize as u32,
+                        loop_.module_bytes.get(),
+                    )
                 });
-            register_pending_inline(owner, region, cells_base_ptr)
+            register_pending_inline(owner, region, cells_base_ptr, owner_module_bytes)
         });
         let pending_guard = PendingInlineGuard(inline_trip.map(|probe| probe.pending_id));
 
@@ -4581,7 +4710,7 @@ impl majit_backend::Backend for WasmBackend {
             classptr_to_typeid: typeid_table,
             guard_gc_type_info,
             alloc,
-            wb_fn_ptr,
+            wb,
             nursery: nursery_alloc_params(ops),
             invalidated_flag_addr: Arc::as_ptr(&bridge_flag) as usize as u32,
             gc_table_base,
