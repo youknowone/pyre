@@ -1119,19 +1119,39 @@ fn finish_current_frame_execution<Sym: WalkSym>(
         let jitcode_index = ctx
             .inline_callee_consts
             .map_or(-1, |consts| consts.jitcode_index);
-        let Some(jitcode) = crate::state::pyjitcode_for_jitcode_index(jitcode_index) else {
-            return;
-        };
-        let frame_reg = jitcode.metadata.portal_frame_reg as usize;
-        let frame = ctx
-            .registers_r
-            .get(frame_reg)
-            .copied()
-            .unwrap_or(OpRef::NONE);
-        let concrete = match ctx.concrete_registers_r.get(frame_reg).copied() {
-            Some(ConcreteValue::Ref(frame_ptr)) => frame_ptr as *mut pyre_interpreter::PyFrame,
-            _ => std::ptr::null_mut(),
-        };
+        let mut frame = OpRef::NONE;
+        let mut concrete = std::ptr::null_mut();
+        if let Some(jitcode) = crate::state::pyjitcode_for_jitcode_index(jitcode_index) {
+            let frame_reg = jitcode.metadata.portal_frame_reg as usize;
+            frame = ctx
+                .registers_r
+                .get(frame_reg)
+                .copied()
+                .unwrap_or(OpRef::NONE);
+            concrete = match ctx.concrete_registers_r.get(frame_reg).copied() {
+                Some(ConcreteValue::Ref(frame_ptr)) => frame_ptr as *mut pyre_interpreter::PyFrame,
+                _ => std::ptr::null_mut(),
+            };
+        }
+        // `sys._getframe` marks the inlined callee's own red frame escaped
+        // (`CalleeLocalsShadow`).  After the walk rewrites that frame as
+        // `NewWithVtable`, `portal_frame_reg` can name a different box or
+        // an unescaped concrete, and finishing that other box leaves the
+        // returned object with only `FLAG_ESCAPED`.  `frame.clear()` then
+        // refuses a frame that has already returned.
+        if let Some(shadow) = ctx.callee_shadow.as_ref() {
+            let shadow_concrete = if shadow.concrete_frame == 0 {
+                std::ptr::null_mut()
+            } else {
+                shadow.concrete_frame as *mut pyre_interpreter::PyFrame
+            };
+            if !shadow_concrete.is_null() && unsafe { (*shadow_concrete).escaped() } {
+                if shadow.frame_box != OpRef::NONE {
+                    frame = shadow.frame_box;
+                }
+                concrete = shadow_concrete;
+            }
+        }
         (frame, concrete)
     };
     if frame.is_none() {
