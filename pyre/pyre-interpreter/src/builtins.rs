@@ -20813,11 +20813,12 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let encoding_slot = opener_slot - 4;
     let buffering_slot = opener_slot - 5;
 
-    // A buffering value outside the machine-int range is an OverflowError, not a
-    // silent fallback to default buffering, so index through `space_index_w`
-    // rather than the negative-preserving sentinel converter.
-    let mut buffering =
-        crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(buffering_slot))?;
+    // `_io_open`'s `buffering` is an Argument Clinic `int`, so a value the C type
+    // cannot hold is an OverflowError rather than a silent fallback to default
+    // buffering.  The later `_blksize` clamp keeps the wider Rust type.
+    let mut buffering = i64::from(crate::baseobjspace::index_c_int_w(
+        pyre_object::gc_roots::shadow_stack_get(buffering_slot),
+    )?);
 
     for (name, slot) in [
         ("encoding", encoding_slot),
