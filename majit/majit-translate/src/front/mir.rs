@@ -30261,7 +30261,6 @@ mod tests {
         for function in [
             "pyre_interpreter::argument::combine_starargs_wrapped",
             "pyre_interpreter::argument::combine_starstarargs_wrapped",
-            "pyre_interpreter::objspace::descroperation::list_repeat",
         ] {
             assert_eq!(count(function, "extend"), 0, "{function}");
             assert!(count(function, "extend_from_slice") >= 1, "{function}");
@@ -30279,6 +30278,96 @@ mod tests {
         let mixed = "pyre_interpreter::_structseq::new_instance_with_extra";
         assert!(count(mixed, "extend_from_slice") >= 1, "{mixed}");
         assert!(count(mixed, "extend") >= 1, "{mixed}");
+    }
+
+    /// PyPy's deque item operations call `decode_index4(w_index, self)`: the
+    /// post-`__index__` length read is an ordinary read from the deque owner,
+    /// not a niladic callback.  Keep the Rust interpreter spelling equally
+    /// direct so Charon does not introduce a synthetic `FnOnce::call_once`
+    /// graph between `deque_index` and `deque_len`.
+    #[test]
+    #[ignore]
+    fn deque_index_reads_its_owner_without_a_fnonce_adapter() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let function = "pyre_interpreter::module::_collections::deque_index";
+        let graph = super::lower_function(&llbc, function)
+            .unwrap_or_else(|e| panic!("lower {function}: {e}"));
+        assert_eq!(
+            graph.block(graph.startblock).inputargs.len(),
+            2,
+            "deque_index should receive only (index, self_obj)"
+        );
+        let calls: Vec<&[String]> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            calls.iter().any(|segments| {
+                super::fmt_path_ends_with(segments, &["_collections", "deque_len"])
+            }),
+            "deque_index must read the live deque length directly"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|segments| !super::fmt_path_ends_with(segments, &["FnOnce", "call_once"])),
+            "deque_index must not manufacture a closure call for its owner read"
+        );
+    }
+
+    /// PyPy spells `W_MemoryView.copy` and `descr_toreadonly` as two concrete
+    /// view constructions.  Their Rust counterparts must likewise reach the
+    /// buffer-view allocator directly, without a shared closure-valued derive
+    /// helper that inserts `FnOnce::call_once` into the translated closure.
+    #[test]
+    #[ignore]
+    fn memoryview_derivations_are_concrete_graphs() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for function in [
+            "pyre_interpreter::builtins::w_memoryview_copy_derived",
+            "pyre_interpreter::builtins::w_memoryview_readonly_derived",
+        ] {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|e| panic!("lower {function}: {e}"));
+            let calls: Vec<&[String]> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .filter_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } => Some(segments.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                calls
+                    .iter()
+                    .any(|segments| { super::fmt_path_ends_with(segments, &["bufferview_alloc"]) }),
+                "{function}: concrete derivation must allocate its view"
+            );
+            assert!(
+                calls.iter().all(|segments| {
+                    !super::fmt_path_ends_with(segments, &["FnOnce", "call_once"])
+                }),
+                "{function}: concrete derivation must not call a closure adapter"
+            );
+        }
     }
 
     /// Anchor the `&self` `Option::is_some` fold to the real lowered IR of

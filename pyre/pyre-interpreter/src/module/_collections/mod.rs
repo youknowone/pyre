@@ -742,15 +742,16 @@ fn pop_left(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
 /// `TypeError`, route any `__index__`-able object through
 /// `getindex_w`, apply the negative-index wrap and the in-range
 /// check, and return the resolved element position.
-fn deque_index(index: PyObjectRef, len_of: impl FnOnce() -> i64) -> Result<usize, crate::PyError> {
+fn deque_index(index: PyObjectRef, self_obj: PyObjectRef) -> Result<usize, crate::PyError> {
     if unsafe { pyre_object::is_slice(index) } {
         return Err(crate::PyError::type_error("deque[:] is not supported"));
     }
     let mut idx = crate::builtins::getindex_w(index)?;
-    // `decode_index4(w_index, self)` bounds the converted index against the
-    // deque as it stands *after* `__index__` ran, so a re-entrant clear or
-    // shrink is reported as IndexError instead of addressing stale storage.
-    let len = len_of();
+    // PyPy `decode_index4(w_index, self)` bounds the converted index against
+    // the deque as it stands *after* `__index__` ran.  Read the owner directly
+    // at that point, rather than manufacturing a closure for the length read,
+    // so the translated graph keeps PyPy's ordinary owner/value shape.
+    let len = deque_len(self_obj);
     if idx < 0 {
         idx += len;
     }
@@ -1268,7 +1269,7 @@ impl W_Deque {
     }
     fn __getitem__(&self, index: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = self as *const W_Deque as PyObjectRef;
-        let idx = deque_index(index, || deque_len(self_obj))? as i64;
+        let idx = deque_index(index, self_obj)? as i64;
         // `locate` walks the chain and the caller then reads through the block
         // it returns, so the pair has to exclude a concurrent `store`. The
         // index conversion runs Python and stays outside.
@@ -1283,7 +1284,7 @@ impl W_Deque {
         value: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        let idx = deque_index(index, || deque_len(self_obj))? as i64;
+        let idx = deque_index(index, self_obj)? as i64;
         // interp_deque.py W_Deque.setitem replaces the block entry in place
         // and deliberately does not call `modified()`: deque iterators remain
         // valid and observe subsequently assigned elements (including after
@@ -1296,7 +1297,7 @@ impl W_Deque {
     }
     fn __delitem__(&mut self, index: PyObjectRef) -> Result<(), crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        let idx = deque_index(index, || deque_len(self_obj))?;
+        let idx = deque_index(index, self_obj)?;
         // See `rotate`: the snapshot/store pair is the read-modify-write that
         // the stripe has to cover as one.
         let _deque_guard = unsafe { w_deque_lock(self_obj) };
