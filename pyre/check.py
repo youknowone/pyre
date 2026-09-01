@@ -5337,7 +5337,14 @@ def main():
         # ubuntu jobs of one run.  The cranelift ceiling moves between the
         # bounds instead of twice the slowest: floor 0.42x under the 0.56x
         # reading, 1.7x over the 1.47x macos reading.
-        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       3.4,     2,       2.5)
+        # Run 33478699331 then read ubuntu dynasm at 0.50x, under the 0.567x
+        # floor the 3.4 ceiling derives, in a job where pypy's own fib
+        # execution read 0.93s against 0.33s on the same host in run
+        # 33459084124.  Runs 33448258893, 33459084124 and a local darwin box
+        # put dynasm between 0.50x and 1.4x, so it moves between the bounds
+        # the way cranelift already does: floor 0.34x under the 0.50x
+        # reading, 2.05x over the 1.4x windows reading.
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       2.05,    2,       2.5)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
         # Run 33363045302 measured spectral_norm at 0.4-1.4x on the healthy
