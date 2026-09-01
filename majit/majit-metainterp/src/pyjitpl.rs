@@ -6987,7 +6987,7 @@ impl<M: Clone> MetaInterp<M> {
         // optimizer's `&[Op]` surface gets owned data. The deep-clone
         // mirrors PyPy's `cls()` fresh ResOperation per iteration —
         // optimizer mutations don't leak into TreeLoop.ops identity.
-        let trace_ops: Vec<Op> = preamble_data
+        let mut trace_ops: Vec<Op> = preamble_data
             .base
             .operations()
             .iter()
@@ -7037,11 +7037,6 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // Save trace_ops + constants snapshot for potential unroll-free retry
-        // (pyjitpl.py:3016-3021).
-        let trace_ops_snapshot = trace_ops.clone();
-        let constants_snapshot = constants.clone();
-
         // PyPy: pyjitpl.py:3016-3017 gates unrolling on `unroll` in
         // warmstate.enable_opts. MAJIT_NO_UNROLL remains a diagnostic override.
         let no_unroll_reason = crate::unroll_skip_reason(
@@ -7049,6 +7044,19 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.get_enable_opts(),
         );
         let no_unroll = no_unroll_reason.is_some();
+
+        // Save trace_ops + constants snapshot for potential unroll-free retry
+        // (pyjitpl.py:3016-3021).
+        //
+        // `compile.py:271-273` reaches `compile_simple_loop` by branching before
+        // `PreambleCompileData` exists, and hands it the same trace object. Pyre
+        // reaches that compile through the retry below instead, so the copy is
+        // what stands in for the branch: it exists because a peeling attempt
+        // that ran first may have left the recorded operations forwarded. When
+        // the attempt is skipped they are still as the recorder left them, and
+        // the retry takes them rather than a copy.
+        let trace_ops_snapshot: Option<Vec<Op>> = (!no_unroll).then(|| trace_ops.clone());
+        let constants_snapshot = constants.clone();
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
@@ -7285,6 +7293,9 @@ impl<M: Clone> MetaInterp<M> {
                         // read-only after `setup_descrs`; `bridgeopt.py:155`
                         // indexes it blind.
                         simple_opt.all_descrs = unroll_opt.all_descrs.clone();
+                        // compile.py:272 `compile_simple_loop` — this retry is
+                        // that call, so it optimizes as `SimpleCompileData` does.
+                        simple_opt.simple_compile = true;
                         // history.py/261/307: `Const.type` /
                         // `InputArg.type` are intrinsic on the box;
                         // no raw-u32 type side-table propagation is
@@ -7310,9 +7321,12 @@ impl<M: Clone> MetaInterp<M> {
                         // `Rc<Op>`), so producer lookup resolves identity.
                         simple_opt.explicit_input_ops_seed =
                             Some(preamble_data.base.operations().to_vec());
+                        // Consumed here and nowhere else, so the operations move
+                        // into their `Rc`s instead of being copied into them.
                         let trace_ops_snapshot_rc: Vec<majit_ir::OpRc> = trace_ops_snapshot
-                            .iter()
-                            .map(|op| std::rc::Rc::new(op.clone()))
+                            .unwrap_or_else(|| std::mem::take(&mut trace_ops))
+                            .into_iter()
+                            .map(std::rc::Rc::new)
                             .collect();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
