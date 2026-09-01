@@ -6439,12 +6439,61 @@ where
     ))
 }
 
+/// The body of a fixed callee path whose host addresses this build has fully
+/// bound — what an `inline_call_*` may name — or `None` for the residual-call
+/// case.
+///
+/// Three conditions answer `None`.  The path may resolve to no JitCode at all,
+/// in a build whose translation pipeline never assembled that graph.  The
+/// resolved body may carry no `startpoints`, the record of which byte offsets
+/// begin an instruction; without it the scan below cannot tell an opcode byte
+/// from an operand byte of equal value, and so inspects nothing.  Or the body
+/// may still hold a `symbolic_fnaddr_for_path` placeholder — transitively,
+/// through the `inline_call_*` callees it names — standing for a call this
+/// build never bound to a host address.
+///
+/// That last condition is pyre's own admission rule and has no upstream
+/// counterpart: after translation every graph has a real `getfunctionptr`
+/// address, so an unbound placeholder cannot exist there.  Upstream's nearest
+/// gate is about something else and is not transitive — `call.py
+/// CallControl.is_candidate` is `graph in self.candidate_graphs`, and
+/// `policy.py JitPolicy.look_inside_graph`, which seeds that set, reads one
+/// graph's own operations, its own back-edges and its own
+/// `_jit_look_inside_` / `_elidable_function_` flags.
+///
+/// What is upstream is that the decision belongs here, before emission:
+/// `jtransform.py handle_regular_call` emits `inline_call_*` only for a graph
+/// `graphs_from` returned, and `pyjitpl.py _opimpl_inline_call1`/`2`/`3`
+/// accordingly have no decline path
+/// — nor does pyre's walker route for the op (`specialize.rs
+/// run_codewriter_helper_inline_call`).  A walk that meets an unbound symbolic
+/// target aborts the whole trace, not just the callee, whereas the residual
+/// fallback the caller keeps executes it.
+///
+/// The transitive scan is `JitCode::reachable_symbolic_residuals`, memoized on
+/// the JitCode, so a body walk costs O(body) once per callee rather than once
+/// per lowered site.  It follows each `inline_call_*` through the shared
+/// build-time descr pool, which a body assembled at build time does not carry
+/// per-jitcode; the pool is installed first because a scan that resolves no
+/// callee also reports no target, which would read here as a clean body.
+fn fully_bound_callee_body(
+    canonical_path: &'static str,
+) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+    let jitcode = pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(canonical_path)?;
+    jitcode.startpoints.as_ref()?;
+    if !jitcode.reachable_symbolic_residuals().targets.is_empty() {
+        return None;
+    }
+    Some(jitcode)
+}
+
 fn build_orthodox_inline_call_r_r(
     canonical_path: &'static str,
     value: Operand,
     dst_reg: Register,
 ) -> Option<Insn> {
-    let jitcode = pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(canonical_path)?;
+    let jitcode = fully_bound_callee_body(canonical_path)?;
     Some(Insn::op_with_result(
         "inline_call_r_r",
         vec![
@@ -6458,8 +6507,9 @@ fn build_orthodox_inline_call_r_r(
 /// Lower the UNARY_NEGATIVE flowspace op `neg(value)` → `result: Ref`
 /// (operation.py `neg`) to the canonical
 /// `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by RPython's
-/// `jtransform.py handle_regular_call`.  A build without the translated
-/// `descroperation::neg` body retains the MayForce residual fallback.
+/// `jtransform.py handle_regular_call`.  A build whose `descroperation::neg`
+/// body `fully_bound_callee_body` declines retains the MayForce residual
+/// fallback.
 ///
 /// Returns `None` for non-`neg` opnames so the caller can fall through to
 /// other lowering arms.
@@ -6502,8 +6552,9 @@ where
 /// the canonical `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by
 /// RPython's `jtransform.py handle_regular_call`.  This lets the ordinary
 /// inline-call dispatcher trace `descroperation::invert` rather than asking a
-/// residual-call specialization to rediscover it.  A build without that
-/// translated body retains the `bh_unary_invert_fn` MayForce fallback.
+/// residual-call specialization to rediscover it.  A build whose body
+/// `fully_bound_callee_body` declines retains the `bh_unary_invert_fn`
+/// MayForce fallback.
 ///
 /// Returns `None` for non-`invert` opnames so the caller can fall
 /// through to other lowering arms.
@@ -6544,9 +6595,9 @@ where
 /// Lower the UNARY_POSITIVE object-space op `pos(value)` → `result: Ref`
 /// (pyopcode.py `unaryoperation("pos")`) to
 /// the canonical `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by
-/// RPython's `jtransform.py handle_regular_call`.  A build without the
-/// translated `descroperation::pos` body retains the MayForce residual
-/// fallback.
+/// RPython's `jtransform.py handle_regular_call`.  A build whose
+/// `descroperation::pos` body `fully_bound_callee_body` declines retains the
+/// MayForce residual fallback.
 ///
 /// Returns `None` for non-`pos` opnames so the caller can fall through
 /// to other lowering arms.
@@ -13388,21 +13439,19 @@ mod tests {
         }
     }
 
-    /// Shared body for the single-Ref unary HLOp lowerings.  An orthodox
-    /// source body lowers to canonical `inline_call_r_r`; a compile-only build
-    /// without generated bodies, and operations without an inline target,
-    /// retain the residual fallback.
-    fn assert_unary_lowering_emits_inline_or_residual(
+    /// Lower the shared single-Ref unary HLOp fixture — `value` in Ref
+    /// register 101, result in Ref register 102 — and return the emitted
+    /// `Insn::Op` parts.  Every unary lowering below is handed the same
+    /// fixture, so the two expectations differ only in `opname` and `args[0]`.
+    fn lower_unary_hlop_fixture(
         op_name: &str,
-        canonical_path: Option<&'static str>,
-        expected_fn_idx: i64,
         lower: impl FnOnce(
             &super::super::flow::SpaceOperation,
             &LoweringContext,
             &mut dyn FnMut(Variable) -> Register,
             &mut dyn FnMut(&Constant) -> Operand,
         ) -> Option<Insn>,
-    ) {
+    ) -> (String, Vec<Operand>, Option<Register>) {
         let value_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, _, _) = load_attr_lowering_fixture();
@@ -13431,53 +13480,110 @@ mod tests {
                 opname,
                 args,
                 result,
-            } => {
-                let target_present = canonical_path.is_some_and(|path| {
-                    pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(path).is_some()
-                });
-                if target_present {
-                    assert_eq!(opname, "inline_call_r_r");
-                    assert!(
-                        matches!(args[0], Operand::Descr(ref descr) if matches!(&**descr, DescrOperand::JitCode(_))),
-                        "{op_name} inline target, got {:?}",
-                        args[0]
-                    );
-                } else {
-                    assert_eq!(opname, "residual_call_r_r");
-                    assert!(
-                        matches!(args[0], Operand::ConstInt(idx) if idx == expected_fn_idx),
-                        "{op_name}_fn pool index {expected_fn_idx}, got {:?}",
-                        args[0]
-                    );
-                }
-                match &args[1] {
-                    Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
-                        assert!(
-                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
-                            "ListR = [value], got {:?}",
-                            list.content
-                        );
-                    }
-                    other => panic!("expected ListR, got {other:?}"),
-                }
-                assert_eq!(
-                    result,
-                    Some(Register {
-                        kind: Kind::Ref,
-                        index: 102
-                    }),
+            } => (opname, args, result),
+            other => panic!("expected Insn::Op, got {other:?}"),
+        }
+    }
+
+    /// Assert the operand tail every single-Ref unary lowering shares,
+    /// whichever call shape it chose: `ListR([value])` and the Ref result
+    /// register the fixture asked for.
+    fn assert_unary_hlop_call_tail(op_name: &str, args: &[Operand], result: Option<Register>) {
+        match &args[1] {
+            Operand::ListOfKind(list) => {
+                assert_eq!(list.kind, Kind::Ref);
+                assert!(
+                    matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
+                    "{op_name} ListR = [value], got {:?}",
+                    list.content
                 );
             }
-            _ => panic!("expected Insn::Op, got {insn:?}"),
+            other => panic!("expected ListR, got {other:?}"),
         }
+        assert_eq!(
+            result,
+            Some(Register {
+                kind: Kind::Ref,
+                index: 102
+            }),
+        );
+    }
+
+    /// A single-Ref unary HLOp with no inline target emits the residual call
+    /// on its `_fn` pool index.  Pinned outright: no callee path is consulted.
+    fn assert_unary_lowering_emits_residual(
+        op_name: &str,
+        expected_fn_idx: i64,
+        lower: impl FnOnce(
+            &super::super::flow::SpaceOperation,
+            &LoweringContext,
+            &mut dyn FnMut(Variable) -> Register,
+            &mut dyn FnMut(&Constant) -> Operand,
+        ) -> Option<Insn>,
+    ) {
+        let (opname, args, result) = lower_unary_hlop_fixture(op_name, lower);
+        assert_eq!(opname, "residual_call_r_r");
+        assert!(
+            matches!(args[0], Operand::ConstInt(idx) if idx == expected_fn_idx),
+            "{op_name}_fn pool index {expected_fn_idx}, got {:?}",
+            args[0]
+        );
+        assert_unary_hlop_call_tail(op_name, &args, result);
+    }
+
+    /// A single-Ref unary HLOp whose callee body this build carries fully
+    /// bound emits the canonical `inline_call_r_r` naming that body; one whose
+    /// body is absent or still unbound keeps the residual fallback.
+    ///
+    /// Which of the two the build offers is a property of the build, so the
+    /// expectation is read from the callee registry and the body scan rather
+    /// than from `fully_bound_callee_body`: asking the gate itself would agree
+    /// with any answer it gave.  Read this way, a gate that declines a body
+    /// that resolves and names no unbound symbolic residual fails here.
+    fn assert_unary_lowering_inlines_bound_body(
+        op_name: &str,
+        canonical_path: &'static str,
+        expected_fn_idx: i64,
+        lower: impl FnOnce(
+            &super::super::flow::SpaceOperation,
+            &LoweringContext,
+            &mut dyn FnMut(Variable) -> Register,
+            &mut dyn FnMut(&Constant) -> Operand,
+        ) -> Option<Insn>,
+    ) {
+        let (opname, args, result) = lower_unary_hlop_fixture(op_name, lower);
+        // The scan follows `inline_call_*` through the shared build-time descr
+        // pool, so this read needs the same installed pool the gate does.
+        pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+        let body_is_bound =
+            pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(canonical_path)
+                .is_some_and(|jitcode| {
+                    jitcode.startpoints.is_some()
+                        && jitcode.reachable_symbolic_residuals().targets.is_empty()
+                });
+        if body_is_bound {
+            assert_eq!(opname, "inline_call_r_r");
+            assert!(
+                matches!(args[0], Operand::Descr(ref descr) if matches!(&**descr, DescrOperand::JitCode(_))),
+                "{op_name} inline target, got {:?}",
+                args[0]
+            );
+        } else {
+            assert_eq!(opname, "residual_call_r_r");
+            assert!(
+                matches!(args[0], Operand::ConstInt(idx) if idx == expected_fn_idx),
+                "{op_name}_fn pool index {expected_fn_idx}, got {:?}",
+                args[0]
+            );
+        }
+        assert_unary_hlop_call_tail(op_name, &args, result);
     }
 
     #[test]
     fn lower_unary_negative_hlop_emits_inline_call_or_residual_fallback() {
-        assert_unary_lowering_emits_inline_or_residual(
+        assert_unary_lowering_inlines_bound_body(
             "neg",
-            Some("pyre_interpreter::objspace::descroperation::neg"),
+            "pyre_interpreter::objspace::descroperation::neg",
             112,
             |op, ctx, gr, lc| {
                 super::lower_unary_negative_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
@@ -13487,9 +13593,9 @@ mod tests {
 
     #[test]
     fn lower_unary_invert_hlop_emits_inline_call_or_residual_fallback() {
-        assert_unary_lowering_emits_inline_or_residual(
+        assert_unary_lowering_inlines_bound_body(
             "invert",
-            Some("pyre_interpreter::objspace::descroperation::invert"),
+            "pyre_interpreter::objspace::descroperation::invert",
             109,
             |op, ctx, gr, lc| {
                 super::lower_unary_invert_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
@@ -13499,9 +13605,9 @@ mod tests {
 
     #[test]
     fn lower_unary_positive_hlop_emits_inline_call_or_residual_fallback() {
-        assert_unary_lowering_emits_inline_or_residual(
+        assert_unary_lowering_inlines_bound_body(
             "pos",
-            Some("pyre_interpreter::objspace::descroperation::pos"),
+            "pyre_interpreter::objspace::descroperation::pos",
             118,
             |op, ctx, gr, lc| {
                 super::lower_unary_positive_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
@@ -13512,20 +13618,15 @@ mod tests {
     #[test]
     fn lower_list_to_tuple_hlop_emits_list_to_tuple_fn_residual() {
         // MayForce — allocates a fresh tuple / non-list raises TypeError.
-        assert_unary_lowering_emits_inline_or_residual(
-            "list_to_tuple",
-            None,
-            125,
-            |op, ctx, gr, lc| {
-                super::lower_list_to_tuple_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
-            },
-        );
+        assert_unary_lowering_emits_residual("list_to_tuple", 125, |op, ctx, gr, lc| {
+            super::lower_list_to_tuple_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+        });
     }
 
     #[test]
     fn lower_unary_not_hlop_emits_unary_not_fn_residual() {
         // MayForce — a user `__bool__` / `__len__` may run Python.
-        assert_unary_lowering_emits_inline_or_residual("not_", None, 110, |op, ctx, gr, lc| {
+        assert_unary_lowering_emits_residual("not_", 110, |op, ctx, gr, lc| {
             super::lower_unary_not_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
         });
     }
