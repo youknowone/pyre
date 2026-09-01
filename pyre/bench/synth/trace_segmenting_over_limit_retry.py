@@ -19,8 +19,8 @@
 # load-bearing together, not independently: at `trace_limit=200` the same body
 # jumps the band in one crossing and never segments.  The band follows the RAW
 # op count of one traced iteration, so a change in what the walker records for
-# the body moves it: at 166 raw ops per iteration the cut fires for limits in
-# 235..265 and nowhere above 270, and 250 sits in the middle of that.
+# the body moves it.  The swept band is recorded once, at the `set_param`
+# call below, and 250 sits inside it.
 #
 # Which means the number tracks what one traced iteration COSTS in this tree,
 # and has to be re-fit whenever that moves — by sweeping, not by nudging.
