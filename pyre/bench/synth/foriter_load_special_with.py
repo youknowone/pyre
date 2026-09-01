@@ -31,4 +31,4 @@ def main():
 
 
 main()
-# Expected: 180060000 20000
+# Expected: 3*N + sum(i for i in range(N) if i % 10), then N

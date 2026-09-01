@@ -4726,9 +4726,9 @@ pub(crate) fn try_walker_specialize_load_special_method<Sym: WalkSym>(
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
         return Ok(None);
     };
-    let Some((w_type, _version_tag, w_descr)) = (unsafe {
-        pyre_interpreter::baseobjspace::load_special_fast_path(concrete_obj, name)
-    }) else {
+    let Some((w_type, _version_tag, w_descr)) =
+        (unsafe { pyre_interpreter::baseobjspace::load_special_fast_path(concrete_obj, name) })
+    else {
         return Ok(None);
     };
 
