@@ -4737,8 +4737,11 @@ pub(crate) fn read_float_reg_concrete<Sym: WalkSym>(
 unsafe fn raw_store_float(addr: *mut u8, itemsize: usize, value: f64) {
     unsafe {
         match itemsize {
-            4 => addr.cast::<f32>().write_unaligned(value as f32),
             8 => addr.cast::<f64>().write_unaligned(value),
+            // A single-precision element is not a Float-bank value:
+            // `jit_libffi.py types` keeps the `'S'` kind residual for that
+            // reason, and `_handle_raw_access_call` mints no float width but
+            // `f64`.
             _ => panic!("raw_store_f descr itemsize {itemsize} is not a minted width"),
         }
     }
