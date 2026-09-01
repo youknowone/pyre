@@ -2983,18 +2983,33 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         reader: &mut crate::resume::ResumeDataDirectReader,
     ) {
         let vable_ptr = virtualizable as *mut u8;
-        if vable_ptr.is_null() {
-            return;
-        }
         // virtualizable.py:131-133: ALL static fields.  Route through
         // `write_field` so the resume bits are specialized back to the field
         // type (`f64::from_bits` for `Float`); a raw `i64` write would store a
         // float's bit pattern as an integer and corrupt the field.
+        //
+        // The reader is a cursor over one shared stream, so the item COUNT this
+        // function consumes is what keeps every later section (vrefs, then the
+        // frames) aligned — and `get_total_size` right below already promises
+        // that count to `consume_vable_info`'s `== vable_size - 1` assert.  It
+        // counts `static_fields.len()` whether or not there is a virtualizable
+        // to read the array lengths off, so the static items must be consumed
+        // unconditionally too; skipping the loop on a null identity leaves them
+        // in the stream to be re-read as somebody else's values.  A null gets
+        // no write — upstream has no such case at all, `cast_gcref_to_vtype`
+        // hands `setattr` a null and it crashes — but the read still happens.
         for (field_index, field) in self.static_fields.iter().enumerate() {
             let value = reader.next_value_of_type(field.field_type);
-            unsafe {
-                self.write_field(vable_ptr, field_index, value);
+            if !vable_ptr.is_null() {
+                unsafe {
+                    self.write_field(vable_ptr, field_index, value);
+                }
             }
+        }
+        if vable_ptr.is_null() {
+            // Matches `get_total_size`, which adds no array length without a
+            // virtualizable to measure: there are no array items encoded.
+            return;
         }
         // virtualizable.py:134-137: array items
         for array in &self.array_fields {
