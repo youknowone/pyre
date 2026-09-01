@@ -11869,6 +11869,16 @@ pub fn reservation_failed() -> crate::PyError {
     crate::PyError::memory_error("")
 }
 
+/// `_PY_READ_MAX` — the largest count one raw read is asked for.
+///
+/// `read(2)`'s count is an `int` on Windows, and a count above `INT_MAX` fails
+/// with `EINVAL` on macOS, so both clamp there; elsewhere the whole
+/// `Py_ssize_t` range goes through untouched.
+#[cfg(any(windows, target_os = "macos"))]
+pub const PY_READ_MAX: i64 = i32::MAX as i64;
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const PY_READ_MAX: i64 = isize::MAX as i64;
+
 /// An empty `Vec` with room for `count` elements, reserved fallibly.
 ///
 /// A builtin that sizes its storage from a Python-supplied count —
@@ -11880,6 +11890,18 @@ pub fn try_vec_with_capacity<T>(count: usize) -> Result<Vec<T>, crate::PyError> 
     let mut out = Vec::new();
     out.try_reserve_exact(count)
         .map_err(|_| reservation_failed())?;
+    Ok(out)
+}
+
+/// A zero-filled `Vec<u8>` of `count` bytes, for a `count` that came from
+/// Python.
+///
+/// `vec![0u8; count]` reaches Rust's infallible allocator, which ends the
+/// process where `PyBytes_FromStringAndSize(NULL, count)` answers
+/// `MemoryError`.
+pub fn try_vec_zeroed(count: usize) -> Result<Vec<u8>, crate::PyError> {
+    let mut out = try_vec_with_capacity::<u8>(count)?;
+    out.resize(count, 0);
     Ok(out)
 }
 
@@ -19915,9 +19937,7 @@ fn fd_read(fd: i32, n: usize) -> Result<Option<Vec<u8>>, crate::PyError> {
     // reaches here as a request the allocator cannot meet.  `os.read` sizes
     // its buffer through `rffi.scoped_alloc_buffer`, which raises
     // `MemoryError`; an infallible `vec![0; n]` would abort the process.
-    let mut out = Vec::new();
-    out.try_reserve_exact(n)
-        .map_err(|_| crate::PyError::memory_error("out of memory"))?;
+    let mut out = try_vec_with_capacity::<u8>(n)?;
     out.resize(n, 0);
     loop {
         let got = match fd_read_into(fd, &mut out) {
@@ -20053,7 +20073,10 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             Some(value) if unsafe { pyre_object::is_none(value) } => None,
             Some(value) => {
                 let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(value)?)?;
-                (value >= 0).then_some(value as usize)
+                // `_io_FileIO_read_impl` clamps the request to `_PY_READ_MAX`
+                // before it allocates, so a size past it reads that much
+                // rather than failing to reserve the whole of it.
+                (value >= 0).then_some(value.min(PY_READ_MAX) as usize)
             }
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]

@@ -769,7 +769,12 @@ mod real {
 
         fn read(fd: i32, size: i64) -> SeamResult<Vec<u8>> {
             let n = size.max(0) as usize;
-            let mut buf = vec![0u8; n];
+            // The count carries a Python-supplied `read(size)` through, so an
+            // infallible `vec![0u8; n]` would abort the process on a request
+            // the allocator cannot meet rather than raise `MemoryError`.
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(n).map_err(|_| SeamError::Memory)?;
+            buf.resize(n, 0);
             // SAFETY: read(2) into a buffer we own and sized to `n`.
             let (got, err) = blocking(|| {
                 let got = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, n) };
@@ -788,7 +793,12 @@ mod real {
         fn urandom(size: i64) -> SeamResult<Vec<u8>> {
             use std::io::Read;
             let n = size.max(0) as usize;
-            let mut buf = vec![0u8; n];
+            // The size carries a Python-supplied `urandom(n)` through, so an
+            // infallible `vec![0u8; n]` would end the process on a request the
+            // allocator cannot meet rather than raise `MemoryError`.
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(n).map_err(|_| SeamError::Memory)?;
+            buf.resize(n, 0);
             blocking(|| {
                 std::fs::File::open("/dev/urandom")
                     .and_then(|mut f| f.read_exact(&mut buf))

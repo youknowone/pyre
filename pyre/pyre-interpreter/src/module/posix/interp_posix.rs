@@ -3078,10 +3078,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         "read: negative size",
                     ));
                 }
-                let n = n_signed as usize;
+                // `os_read_impl` then clamps the request to `_PY_READ_MAX`
+                // before it allocates, and `_Py_read` clamps it again.
+                // Unclamped, the whole request reaches the allocator, and a
+                // Windows `n > INT_MAX` reaches the C runtime as EINVAL
+                // instead of data.
+                let n = n_signed.min(crate::builtins::PY_READ_MAX) as usize;
                 #[cfg(not(feature = "sandbox"))]
                 let buf = {
-                    let mut buf = vec![0u8; n];
+                    // `PyBytes_FromStringAndSize(NULL, length)` reserves the
+                    // whole request up front and reports a failure it cannot
+                    // satisfy as MemoryError; an infallible `vec![0u8; n]`
+                    // aborts the process there instead.  The block stays
+                    // uninitialised until the read reports how much of it was
+                    // filled, so nothing writes the tail either.
+                    let mut buf: Vec<u8> = Vec::new();
+                    buf.try_reserve_exact(n)
+                        .map_err(|_| crate::PyError::memory_error(""))?;
                     // interp_posix.py `read`: the syscall sits inside
                     // the `eintr_retry=True` loop, so an interrupted read runs
                     // the pending signal handlers and is re-issued rather than
@@ -3093,7 +3106,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _)
                             });
                         if ret >= 0 {
-                            buf.truncate(ret as usize);
+                            // Only the prefix the call reports was written.
+                            unsafe { buf.set_len(ret as usize) };
                             break buf;
                         }
                         crate::builtins::eintr_retry_with(
@@ -4391,15 +4405,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // wrapped to a smaller request.
                 let n = usize::try_from(n)
                     .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
+                // `os_urandom_impl` allocates the object before it fills it,
+                // so a size the allocator cannot meet is refused rather than
+                // reaching the entropy source.  `host_os::urandom` reserves
+                // its own buffer infallibly and ends the process there, so the
+                // buffer is reserved here and filled through the same
+                // `getrandom::fill` it would have used.
                 #[cfg(not(feature = "sandbox"))]
-                // Report entropy failures: absorbing one would return predictable bytes.
-                let buf = host_os::urandom(n).map_err(|e| io_err(e, ""))?;
+                let buf = {
+                    let mut buf = crate::builtins::try_vec_zeroed(n)?;
+                    // Report entropy failures: absorbing one would return
+                    // predictable bytes.
+                    getrandom::fill(&mut buf)
+                        .map_err(|e| io_err(std::io::Error::from(e), ""))?;
+                    buf
+                };
                 // Route host entropy through the trusted controller instead of
                 // reaching host getrandom directly.
                 #[cfg(feature = "sandbox")]
                 let buf = crate::host_seam::ops::urandom(n as i64)
                     .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                Ok(pyre_object::w_bytes_from_bytes(&buf))
+                let block = pyre_object::bytesobject::try_alloc_bytes_block(&buf)
+                    .ok_or_else(crate::builtins::reservation_failed)?;
+                Ok(pyre_object::bytesobject::w_bytes_from_block(block))
             },
             1,
         ),
