@@ -1574,14 +1574,18 @@ fn call_can_collect(op: &Op) -> bool {
 
 /// Static collecting-call positions whose gcmap-visible homes may be forwarded.
 /// Every `is_malloc` op (the whole `New..=Newunicode` range, string allocations
-/// included) routes through a collecting allocator; conservatively include
-/// residual calls too, since an eligible direct residual target may allocate or
-/// force, so it needs the same post-call home reload as the allocation helpers.
+/// included) routes through a collecting allocator. A residual call earns a
+/// position only where [`call_can_collect`] admits it, which is the predicate
+/// the reload side already applies: a home exists so a collection can forward
+/// the value, so a call that cannot collect would buy a home that nothing ever
+/// reloads, and its store-on-def and back-edge refresh are stores cranelift
+/// does not remove. A value live across some other collecting position still
+/// takes a home from that position.
 fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize> {
     ops.iter()
         .enumerate()
         .filter_map(|(i, op)| {
-            (op.opcode.is_call() || op.opcode.is_malloc())
+            ((op.opcode.is_call() && call_can_collect(op)) || op.opcode.is_malloc())
                 .then_some(i)
                 .or_else(|| {
                     (include_ca_collects && op.opcode == OpCode::CallAssemblerR).then_some(i)
