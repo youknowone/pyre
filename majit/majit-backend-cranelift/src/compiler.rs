@@ -9121,6 +9121,11 @@ pub struct CraneliftBackend {
     /// `Backend::set_next_frame_value_count_fn` — the compiling driver's
     /// `-live-` decoder for the `rd_numb` reads below.
     next_frame_value_count_fn: Option<fn(i32, i32) -> usize>,
+    /// Whether a bridge that closes onto its owner is re-emitted into the
+    /// owner's own function (`MAJIT_CL_BRIDGE_MERGE`). Read once here rather
+    /// than per compile so a test can drive the route without an environment
+    /// the rest of the process shares.
+    bridge_merge: bool,
     registered_call_assembler_tokens: IndexSet<u64>,
     registered_call_assembler_bridge_traces: IndexSet<u64>,
     /// llmodel.py: self.vtable_offset — byte offset for vtable in objects.
@@ -9379,6 +9384,7 @@ impl CraneliftBackend {
             next_trace_id: None,
             next_header_pc: None,
             next_frame_value_count_fn: None,
+            bridge_merge: std::env::var_os("MAJIT_CL_BRIDGE_MERGE").is_some(),
             registered_call_assembler_tokens: IndexSet::new(),
             registered_call_assembler_bridge_traces: IndexSet::new(),
             // llmodel.py:64-69: vtable_offset is None when gcremovetypeptr is
@@ -18036,7 +18042,15 @@ impl majit_backend::Backend for CraneliftBackend {
         // The out-of-line bridge above is attached and correct; this is the
         // faster route to the same guard when the bridge closes back onto the
         // loop it came from. A declined merge leaves it as the only route.
-        if std::env::var_os("MAJIT_CL_NO_BRIDGE_MERGE").is_none() {
+        //
+        // Off by default: the merged stream miscompiles. `synth/dict_set`,
+        // `synth/nested_break_not_hot` and `synth/loops_comprehension` fault,
+        // and `synth/exception_escape_hot_callee_tb_node_once` reaches the
+        // collector with an invalid type id, each of them only once a merge has
+        // fired and none of them with this gate unset. Sixteen of the
+        // cranelift suite's checks separate the two arms, so the route stays
+        // opt-in until that is understood.
+        if self.bridge_merge {
             let fail_index = fail_descr.fail_index_per_trace();
             let merged = self.merge_bridge_into_owner(
                 original_token,
@@ -20466,6 +20480,9 @@ mod tests {
     #[test]
     fn bridge_closing_onto_its_owner_merges_into_the_loop() {
         let mut backend = CraneliftBackend::new();
+        // The route is opt-in while it miscompiles; this test is what drives
+        // it, so it asks for it here instead of through the environment.
+        backend.bridge_merge = true;
         let loop_descr = make_label_descr(1_500_290);
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
