@@ -442,17 +442,22 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
 /// one, and it is why the entry point here stays the no-collect one until the
 /// root-set census is re-graded for liveness rather than for movement.
 unsafe fn alloc_items_block_gc(cap: usize) -> *mut ItemsBlock {
+    unsafe { try_alloc_items_block_gc(cap).unwrap_or_else(|| items_block_alloc_failed(cap)) }
+}
+
+/// [`alloc_items_block_gc`] for a capacity that came from Python.
+unsafe fn try_alloc_items_block_gc(cap: usize) -> Option<*mut ItemsBlock> {
     if itemsblock_gc_enabled() {
-        let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
+        let payload = try_items_block_layout(cap)?.size();
         if let Some(raw) = crate::gc_hook::try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID, payload)
             && !raw.is_null()
         {
             let block = raw as *mut ItemsBlock;
             unsafe { (*block).capacity = cap };
-            return block;
+            return Some(block);
         }
     }
-    unsafe { alloc_items_block(cap) }
+    unsafe { try_alloc_items_block(cap) }
 }
 
 /// List-construction allocator on the Phase L2 nursery path. Pins each
@@ -545,8 +550,25 @@ pub unsafe fn grow_list_items_block_gc(
     new_cap: usize,
     live_len: usize,
 ) -> *mut ItemsBlock {
+    unsafe {
+        try_grow_list_items_block_gc(old, new_cap, live_len)
+            .unwrap_or_else(|| items_block_alloc_failed(new_cap))
+    }
+}
+
+/// [`grow_list_items_block_gc`] for a capacity that came from Python.  The
+/// fresh block is the first step and the only fallible one, so a refusal
+/// returns before any barrier runs and leaves the list on its old block.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn try_grow_list_items_block_gc(
+    old: *mut ItemsBlock,
+    new_cap: usize,
+    live_len: usize,
+) -> Option<*mut ItemsBlock> {
     if !itemsblock_gc_enabled() {
-        return unsafe { grow_list_items_block(old, new_cap, live_len) };
+        return unsafe { try_grow_items_block(old, new_cap, live_len) };
     }
     let _roots = crate::gc_roots::push_roots();
     let old_slot = if old.is_null() {
@@ -567,7 +589,7 @@ pub unsafe fn grow_list_items_block_gc(
         Some(slot)
     };
     let new_block_slot = crate::gc_roots::shadow_stack_len();
-    let new_block = unsafe { alloc_items_block_gc(new_cap) };
+    let new_block = unsafe { try_alloc_items_block_gc(new_cap)? };
     let _ = crate::gc_roots::pin_root(new_block as PyObjectRef);
     // The ownership query is the safepoint, so it runs before the barrier and
     // the copy — see `alloc_list_items_block_gc` for why the barrier cannot
@@ -592,7 +614,7 @@ pub unsafe fn grow_list_items_block_gc(
     for i in live_len..new_cap {
         unsafe { *new_base.add(i) = PY_NULL };
     }
-    new_block
+    Some(new_block)
 }
 
 /// Tuple-construction allocator on the Phase L2 nursery path. Exact-size
@@ -691,16 +713,33 @@ pub unsafe fn alloc_cleared_ref_items_block_gc(cap: usize) -> Option<*mut ItemsB
 /// holds only the 8-byte capacity header (used by tuple — see
 /// [`alloc_tuple_items_block`] — for empty tuples).
 unsafe fn alloc_items_block(cap: usize) -> *mut ItemsBlock {
-    let layout = items_block_layout(cap);
+    unsafe { try_alloc_items_block(cap).unwrap_or_else(|| items_block_alloc_failed(cap)) }
+}
+
+/// [`alloc_items_block`] for a capacity that came from Python, where the
+/// caller has a `MemoryError` to report instead of the abort above.
+unsafe fn try_alloc_items_block(cap: usize) -> Option<*mut ItemsBlock> {
+    let layout = try_items_block_layout(cap)?;
     unsafe {
         let raw = alloc(layout);
         if raw.is_null() {
-            std::alloc::handle_alloc_error(layout);
+            return None;
         }
         let block = raw as *mut ItemsBlock;
         (*block).capacity = cap;
-        block
+        Some(block)
     }
+}
+
+/// The abort an infallible `ItemsBlock` allocation takes, so the fallible
+/// twins have one place to send a `None` for a caller with no failure edge.
+///
+/// A capacity whose layout does not even exist is reported against the bare
+/// header, the same stand-in [`alloc_typed_items_block`] uses.
+pub fn items_block_alloc_failed(cap: usize) -> ! {
+    std::alloc::handle_alloc_error(
+        try_items_block_layout(cap).unwrap_or_else(|| Layout::new::<ItemsBlock>()),
+    )
 }
 
 /// Deallocate an `ItemsBlock` previously allocated via
@@ -725,8 +764,16 @@ unsafe fn dealloc_items_block(block: *mut ItemsBlock) {
 }
 
 fn items_block_layout(cap: usize) -> Layout {
-    let total = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
-    Layout::from_size_align(total, std::mem::align_of::<ItemsBlock>()).expect("ItemsBlock layout")
+    try_items_block_layout(cap).expect("ItemsBlock layout")
+}
+
+/// [`items_block_layout`] with the size arithmetic checked: a capacity that
+/// came from Python can overflow the multiply, which wraps in release and
+/// hands back a layout far smaller than the block the caller then writes.
+fn try_items_block_layout(cap: usize) -> Option<Layout> {
+    let items = cap.checked_mul(std::mem::size_of::<PyObjectRef>())?;
+    let total = ITEMS_BLOCK_ITEMS_OFFSET.checked_add(items)?;
+    Layout::from_size_align(total, std::mem::align_of::<ItemsBlock>()).ok()
 }
 
 /// Return the items base pointer of an `ItemsBlock`.
@@ -750,7 +797,21 @@ unsafe fn grow_items_block(
     live_len: usize,
 ) -> *mut ItemsBlock {
     unsafe {
-        let fresh = alloc_items_block(new_cap);
+        try_grow_items_block(old, new_cap, live_len)
+            .unwrap_or_else(|| items_block_alloc_failed(new_cap))
+    }
+}
+
+/// [`grow_items_block`] for a capacity that came from Python.  The fresh block
+/// is the only fallible step and nothing is published before it, so a refusal
+/// leaves `old` exactly as it was.
+unsafe fn try_grow_items_block(
+    old: *mut ItemsBlock,
+    new_cap: usize,
+    live_len: usize,
+) -> Option<*mut ItemsBlock> {
+    unsafe {
+        let fresh = try_alloc_items_block(new_cap)?;
         let new_base = items_block_items_ptr(fresh);
         if !old.is_null() && live_len > 0 {
             std::ptr::copy_nonoverlapping(items_block_items_ptr(old), new_base, live_len);
@@ -759,7 +820,7 @@ unsafe fn grow_items_block(
         for i in live_len..fresh_cap {
             *new_base.add(i) = PY_NULL;
         }
-        fresh
+        Some(fresh)
     }
 }
 
@@ -839,18 +900,31 @@ pub unsafe fn try_alloc_typed_items_block(cap: usize, tid: u32) -> Option<*mut T
     let layout = try_typed_items_block_layout(cap)?;
     let payload = layout.size();
     if itemsblock_gc_enabled() {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, payload);
-        if !raw.is_null() {
-            let block = raw as *mut TypedItemsBlock;
-            unsafe {
-                (*block).capacity = cap;
-                std::ptr::write_bytes(
-                    typed_items_block_items_base(block),
-                    0,
-                    cap * std::mem::size_of::<u64>(),
-                );
+        match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_stable(
+            tid, payload,
+        )) {
+            crate::gc_hook::GcAllocOutcome::Allocated(raw) => {
+                let block = raw as *mut TypedItemsBlock;
+                unsafe {
+                    (*block).capacity = cap;
+                    std::ptr::write_bytes(
+                        typed_items_block_items_base(block),
+                        0,
+                        cap * std::mem::size_of::<u64>(),
+                    );
+                }
+                return Some(block);
             }
-            return Some(block);
+            // `try_gc_alloc_stable_raw` ends the process on this answer,
+            // because its callers meet a null by allocating outside the heap
+            // and a block holding managed references must never live there.  A
+            // typed block holds unboxed words and its capacity comes from
+            // Python, so the refusal is reported instead: nothing is allocated
+            // anywhere on this path and the caller raises `MemoryError`.
+            crate::gc_hook::GcAllocOutcome::Failed => return None,
+            // No heap owns the request -- before the GC is up, or in a unit
+            // test -- so the plain allocation below is the whole heap.
+            crate::gc_hook::GcAllocOutcome::NoRoute => {}
         }
     }
     unsafe {
@@ -881,7 +955,25 @@ pub unsafe fn grow_typed_items_block(
     tid: u32,
 ) -> *mut TypedItemsBlock {
     unsafe {
-        let fresh = alloc_typed_items_block(new_cap, tid);
+        try_grow_typed_items_block(old, new_cap, live_len, tid)
+            .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()))
+    }
+}
+
+/// [`grow_typed_items_block`] for a capacity that came from Python.  The fresh
+/// block is the first step and the only fallible one, so a refusal leaves
+/// `old` allocated and still owned by its list.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn try_grow_typed_items_block(
+    old: *mut TypedItemsBlock,
+    new_cap: usize,
+    live_len: usize,
+    tid: u32,
+) -> Option<*mut TypedItemsBlock> {
+    unsafe {
+        let fresh = try_alloc_typed_items_block(new_cap, tid)?;
         // `fresh` has no owner field yet, so nothing on the heap names it for
         // the span below. Old-gen is mark-sweep and a block born outside
         // `GcState::Marking` carries no `VISITED`, so the next cycle sweeps an
@@ -900,7 +992,7 @@ pub unsafe fn grow_typed_items_block(
         if !old.is_null() {
             dealloc_typed_items_block(old);
         }
-        crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock
+        Some(crate::gc_roots::shadow_stack_get(fresh_root) as *mut TypedItemsBlock)
     }
 }
 

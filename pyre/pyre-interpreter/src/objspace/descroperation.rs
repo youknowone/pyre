@@ -2225,15 +2225,20 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     // the copies are appended.  Holding the refs across `w_list_append` is
     // the same idiom `list_method_extend` uses for its iterable branch.
     let snapshot = w_list_items_copy_as_vec_mode(list, majit_metainterp::jit::we_are_jitted());
-    // The snapshot is a plain `Vec` and roots nothing, and
-    // `w_list_reserve_for_extend` allocates: publish both the receiver -- a
-    // `W_List` header, one of the two kinds a minor collection relocates --
-    // and the snapshot, then address them through their slots.
+    // The snapshot is a plain `Vec` and roots nothing, and the resize below
+    // allocates: publish both the receiver -- a `W_List` header, one of the two
+    // kinds a minor collection relocates -- and the snapshot, then address them
+    // through their slots.
     let roots = pyre_object::gc_roots::push_roots();
     let list_slot = roots.publish(&[list]);
     let base = roots.publish(&snapshot);
     roots.normalize(list_slot, 1 + snapshot.len());
-    pyre_object::listobject::w_list_reserve_for_extend(roots.get(list_slot), cap - len);
+    // `list_inplace_repeat_lock_held` sizes the whole result with one
+    // `list_resize` before it copies, so a count the machine cannot meet is
+    // refused here rather than walked as a trip count by the loop below.
+    if !pyre_object::listobject::w_list_try_resize(roots.get(list_slot), cap) {
+        return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    }
     for _ in 1..count {
         for k in 0..snapshot.len() {
             pyre_object::listobject::w_list_append_preallocated(

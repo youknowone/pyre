@@ -697,8 +697,11 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 // its three exact dict-view types; all use ordinary resize.
                 if exact_dict || pyre_object::dictmultiobject::is_dict_view(source) {
                     pyre_object::listobject::w_list_resize_for_extend(target, hint);
-                } else {
-                    pyre_object::listobject::w_list_reserve_for_extend(target, hint);
+                } else if !pyre_object::listobject::w_list_try_reserve_for_extend(target, hint) {
+                    // `list_extend_iter_lock_held` reserves the hint with the
+                    // ordinary `list_resize`, so a hint no allocation can serve
+                    // is refused before the iterator is walked.
+                    return Err(crate::PyError::memory_error(""));
                 }
             }
             loop {
