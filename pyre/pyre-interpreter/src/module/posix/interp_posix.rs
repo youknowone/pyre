@@ -1639,6 +1639,15 @@ fn create_environ() -> pyre_object::PyObjectRef {
         // _create_environ_mapping demands str keys/values and upper-cases the
         // keys itself. (_convertenviron: `space.newtext(key), newtext(value)`.)
         for (key, value) in host_os::vars_os() {
+            // `_wenviron` carries no name beginning with `=`: the C runtime
+            // keeps its own per-drive current-directory entries (`=Z:`) out of
+            // it, while `vars_os` reads the block those entries live in and
+            // splits at the second `=`.  Publishing one would put a name in
+            // `os.environ` that `putenv` and `unsetenv` both refuse, so
+            // `os.environ.clear()` could not run.
+            if key.as_encoded_bytes().first() == Some(&b'=') {
+                continue;
+            }
             // `_convertenviron`'s Windows arm reads `rwin32._wenviron_items()`,
             // the wide-char environment, and keeps those code units.
             // `fsdecode_os_str` carries them across with `from_wide`; a lossy
@@ -1686,10 +1695,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
             Ok(bytes)
         }
-        /// A name that is empty or contains `=` cannot be expressed in the
-        /// environment block.
+        /// The name check that answers with `ValueError`.
+        ///
+        /// `win32_putenv` refuses an empty name and searches for `=` from
+        /// index 1, because a leading `=` names one of the runtime's hidden
+        /// per-drive entries and is left to `_wputenv` to turn away.
+        /// Elsewhere the check is `os_putenv_impl`'s `strchr(name, '=')` over
+        /// the whole name, and an empty name is left to `setenv`.
         fn illegal_name(name: &[u8]) -> bool {
-            name.is_empty() || name.contains(&b'=')
+            if cfg!(windows) {
+                name.is_empty() || name[1.min(name.len())..].contains(&b'=')
+            } else {
+                name.contains(&b'=')
+            }
+        }
+        /// The refusal the host call makes for a name [`illegal_name`] lets
+        /// through -- a hidden `=NAME` entry on Windows, an empty name
+        /// elsewhere.  `_wputenv` and `setenv` report `EINVAL` for it, and
+        /// `set_var` / `remove_var` panic on such a key rather than returning,
+        /// so it is spelled here instead of reaching them.
+        fn refused_by_host(name: &[u8]) -> Option<crate::PyError> {
+            (name.is_empty() || name.contains(&b'=')).then(|| {
+                crate::PyError::os_error_syscall(libc::EINVAL, pyre_object::PY_NULL)
+            })
         }
         /// `win32_putenv` measures the whole `NAME=VALUE` entry it is about to
         /// hand the block and turns away one longer than `_MAX_ENV`, which is
@@ -1729,6 +1757,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let value = env_bytes(args[1])?;
                     #[cfg(windows)]
                     entry_fits(&name, &value)?;
+                    if let Some(err) = refused_by_host(&name) {
+                        return Err(err);
+                    }
                     unsafe {
                         host_os::set_var(os_str_from_bytes(&name), os_str_from_bytes(&value))
                     };
@@ -1744,18 +1775,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "unsetenv",
                 |args| {
                     let name = env_bytes(args[0])?;
-                    // ...while unsetenv leaves the same rejection to the
-                    // syscall, which reports EINVAL.
+                    // ...while on POSIX unsetenv leaves the same rejection to
+                    // the syscall, which reports EINVAL.  On Windows
+                    // `os_unsetenv_impl` reaches the very `win32_putenv`
+                    // `os.putenv` does, so the name is judged there and the
+                    // entry it would write is measured too.
                     if illegal_name(&name) {
-                        return Err(crate::PyError::os_error_syscall(
-                            libc::EINVAL,
-                            pyre_object::PY_NULL,
-                        ));
+                        return Err(if cfg!(windows) {
+                            crate::PyError::value_error("illegal environment variable name")
+                        } else {
+                            crate::PyError::os_error_syscall(libc::EINVAL, pyre_object::PY_NULL)
+                        });
                     }
-                    // `os_unsetenv_impl` reaches the same `win32_putenv`, so
-                    // the entry it would write is measured too.
                     #[cfg(windows)]
                     entry_fits(&name, b"")?;
+                    if let Some(err) = refused_by_host(&name) {
+                        return Err(err);
+                    }
                     unsafe { host_os::remove_var(os_str_from_bytes(&name)) };
                     Ok(pyre_object::w_none())
                 },
