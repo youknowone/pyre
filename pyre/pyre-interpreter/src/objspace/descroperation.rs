@@ -1972,10 +1972,14 @@ pub(crate) unsafe fn tuple_repeat(t: PyObjectRef, n: PyObjectRef) -> PyResult {
     items
         .try_reserve_exact(cap)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
-    for _ in 0..n {
-        for i in 0..len {
-            if let Some(item) = w_tuple_getitem(t, i as i64) {
-                items.push(item);
+    // `tuple_repeat` makes no copies for `input_size == 0`, so an empty
+    // receiver never walks the count as a trip count.
+    if len != 0 {
+        for _ in 0..n {
+            for i in 0..len {
+                if let Some(item) = w_tuple_getitem(t, i as i64) {
+                    items.push(item);
+                }
             }
         }
     }
@@ -2035,8 +2039,12 @@ pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(total)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
-    for _ in 0..count {
-        out.extend_from_slice(bytes);
+    // `unicode_repeat` answers a receiver of no characters before it copies,
+    // so an empty one never walks the count as a trip count.
+    if !bytes.is_empty() {
+        for _ in 0..count {
+            out.extend_from_slice(bytes);
+        }
     }
     let buf = Wtf8Buf::from_bytes(out).expect("repetition of WTF-8 is WTF-8");
     // Repetition churns fresh dynamic strings; make the result collectable.
@@ -2084,8 +2092,12 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.try_reserve_exact(cap)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
-    for _ in 0..count {
-        buf.extend_from_slice(data);
+    // `_PyBytes_Repeat` returns on `len_dest == 0`, so an empty receiver never
+    // walks the count as a trip count.
+    if !data.is_empty() {
+        for _ in 0..count {
+            buf.extend_from_slice(data);
+        }
     }
     Ok(if pyre_object::bytesobject::is_bytes(s) {
         pyre_object::bytesobject::w_bytes_from_bytes(&buf)
@@ -2163,10 +2175,14 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
     let list_slot = list_roots.publish(&[list]);
     list_roots.normalize(list_slot, 1);
     let mut rooted = pyre_object::gc_roots::RootedItems::new();
-    for _ in 0..count {
-        for i in 0..len {
-            if let Some(item) = w_list_getitem(list_roots.get(list_slot), i as i64) {
-                rooted.push(item);
+    // `list_repeat` answers `input_size == 0` before it copies, so an empty
+    // receiver never walks the count as a trip count.
+    if len != 0 {
+        for _ in 0..count {
+            for i in 0..len {
+                if let Some(item) = w_list_getitem(list_roots.get(list_slot), i as i64) {
+                    rooted.push(item);
+                }
             }
         }
     }

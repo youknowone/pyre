@@ -897,12 +897,16 @@ pub(crate) fn deque_repeat(
             None => total,
         })
         .map_err(|_| crate::PyError::memory_error(""))?;
-    for _ in 0..num {
-        items.extend_from_slice(&base);
-        if let Some(m) = maxlen
-            && items.len() > m
-        {
-            items.drain(0..items.len() - m);
+    // An empty receiver copies nothing, so the count is not walked as a trip
+    // count.
+    if !base.is_empty() {
+        for _ in 0..num {
+            items.extend_from_slice(&base);
+            if let Some(m) = maxlen
+                && items.len() > m
+            {
+                items.drain(0..items.len() - m);
+            }
         }
     }
     let ty = unsafe { w_instance_get_type(self_obj) };
