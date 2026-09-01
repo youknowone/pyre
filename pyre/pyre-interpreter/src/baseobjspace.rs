@@ -9942,9 +9942,9 @@ pub(crate) unsafe fn lookup_where_pair(
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
     if !majit_metainterp::jit::we_are_jitted() {
-        let value = lookup_in_type_where_uncached(w_type, name)?;
-        let class = lookup_where_class_uncached(w_type, name)?;
-        return Some((class, value));
+        // Outside a trace there is no residual boundary to keep, so one raw
+        // walk answers both halves at once.
+        return lookup_where(w_type, name);
     }
     // Traced code boxes the name so both residuals carry thin pointers only,
     // the way `lookup_in_type_uncached_split` does for the value half: the
