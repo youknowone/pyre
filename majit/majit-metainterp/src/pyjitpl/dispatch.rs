@@ -961,6 +961,16 @@ pub trait JitCodeSym {
         None
     }
 
+    /// Capacities used only by the host allocator for each virtualizable
+    /// identity in [`Self::recursive_fresh_entry_reds`].
+    ///
+    /// These are not portal reds. RPython's `do_recursive_call` passes the
+    /// portal's declared red boxes unchanged; allocation sizing belongs to
+    /// frame construction, not to the callee call signature.
+    fn recursive_fresh_entry_vable_capacities(&self) -> Option<Vec<i64>> {
+        None
+    }
+
     /// recursive-call recursive CALL_ASSEMBLER portal entry: the host-Rust allocator and
     /// deallocator for a fresh callee state.
     ///
@@ -1499,12 +1509,15 @@ where
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut *active.obj));
             active.info.tracing_before_residual_call(active.obj_ptr());
         }
+        ctx.materialize_tokenless_virtualizable_before_residual_call();
         let force_token = ctx.force_token();
-        ctx.vable_setfield_descr(
-            active.vable_opref,
-            force_token,
-            active.info.token_field_descr(),
-        );
+        if active.info.has_vable_token() {
+            ctx.vable_setfield_descr(
+                active.vable_opref,
+                force_token,
+                active.info.token_field_descr(),
+            );
+        }
         Some(active)
     }
 
@@ -1545,6 +1558,16 @@ where
         sym: &mut S,
         active: Option<ActiveStandardVirtualizable>,
     ) -> TraceAction {
+        // `prepare_standard_virtualizable_before_residual_call` reaches the
+        // materialize only through `active_standard_virtualizable(ctx)?`, so a
+        // `None` here means no store was recorded before the call.  The reload
+        // below still finds a box and a pointer through
+        // `standard_virtualizable_box`/`_ptr`, and
+        // `set_virtualizable_boxes_with_info` replaces every existing box, so
+        // reloading without that materialize gives the trace heap reads with no
+        // matching stores and reverts the loop-carried fields to their pre-call
+        // values.  Pair the two on one predicate.
+        let materialized = active.is_some();
         if let Some(active) = Self::escaped_standard_virtualizable(ctx, active) {
             // pyjitpl.py `self.load_fields_from_virtualizable()` runs
             // BEFORE the abort: the residual call forced the virtualizable and
@@ -1592,6 +1615,9 @@ where
                 resume_pc,
                 /* after_residual_call */ true,
             );
+            if materialized {
+                ctx.reload_tokenless_virtualizable_after_residual_call();
+            }
             TraceAction::Continue
         }
     }
@@ -2569,7 +2595,7 @@ where
     /// single-pass merge hook resumes native execution at the source loop exit.
     /// The scalar state handoff rides `single_pass_scalar_values` (published by
     /// the jitdriver Finish arm), so only the resume pc is captured here.
-    fn capture_single_pass_finish(&mut self, ctx: &mut TraceCtx) {
+    fn capture_single_pass_finish(&mut self, ctx: &mut TraceCtx, value: Option<Value>) {
         if self.outer_program_pc.is_none() || self.frames.len() != 1 {
             return;
         }
@@ -2584,6 +2610,8 @@ where
         {
             ctx.walk_final_pc = Some(pc);
         }
+        ctx.walk_finish_values.clear();
+        ctx.walk_finish_values.extend(value);
     }
 
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
@@ -3398,12 +3426,16 @@ where
         // freshly-allocated callee state — not the caller's live registers.
         // Greens are baked into the callee loop's green key, not passed as
         // call args.  `recursive_fresh_entry_reds` yields the fresh reds in
-        // `extract_live` order (scalars zeroed, then per virt array the
-        // `&state` identity Ref + length) together with an owner box keeping
+        // `extract_live` order (scalars zeroed, then the `&state` identity
+        // Ref) together with an owner box keeping
         // that state alive for the concrete `execute_recursive_assembler_int`
         // run.
         let (fresh_values, fresh_owner) = match sym.recursive_fresh_entry_reds() {
             Some(pair) => pair,
+            None => return TraceAction::Abort,
+        };
+        let fresh_capacities = match sym.recursive_fresh_entry_vable_capacities() {
+            Some(capacities) => capacities,
             None => return TraceAction::Abort,
         };
         let (alloc_fp, free_fp) = match sym.recursive_fresh_alloc_free_targets() {
@@ -3436,6 +3468,7 @@ where
         let mut red_values = Vec::with_capacity(fresh_values.len());
         let mut arg_types = Vec::with_capacity(fresh_values.len());
         let mut alloc_results: Vec<OpRef> = Vec::new();
+        let mut capacities = fresh_capacities.into_iter();
         let mut idx = 0;
         while idx < fresh_values.len() {
             match fresh_values[idx] {
@@ -3446,11 +3479,11 @@ where
                     idx += 1;
                 }
                 majit_ir::Value::Ref(_) => {
-                    // A virt array contributes a (`&state` Ref, length Int)
-                    // pair; the length is the allocator's capacity argument.
-                    let cap = match fresh_values.get(idx + 1) {
-                        Some(majit_ir::Value::Int(cap)) => *cap,
-                        _ => return TraceAction::Abort,
+                    // Allocation capacity is frame-construction metadata, not
+                    // an extra portal red (pyjitpl.py `do_recursive_call`).
+                    let cap = match capacities.next() {
+                        Some(cap) => cap,
+                        None => return TraceAction::Abort,
                     };
                     let cap_arg = OpRef::const_int(cap);
                     let alloc_result = ctx.call_ref_typed_with_effect(
@@ -3463,13 +3496,13 @@ where
                     args.push(alloc_result);
                     red_values.push(fresh_values[idx]);
                     arg_types.push(majit_ir::Type::Ref);
-                    args.push(cap_arg);
-                    red_values.push(majit_ir::Value::Int(cap));
-                    arg_types.push(majit_ir::Type::Int);
-                    idx += 2;
+                    idx += 1;
                 }
                 _ => return TraceAction::Abort,
             }
+        }
+        if capacities.next().is_some() {
+            return TraceAction::Abort;
         }
 
         // 8-step `do_residual_call(assembler_call=True)` protocol, mirroring
@@ -7078,7 +7111,7 @@ where
                 let (opref, concrete) = self.read_int_reg(src);
                 let target = self.frames.current_mut().return_i;
                 if target.is_none() {
-                    self.capture_single_pass_finish(ctx);
+                    self.capture_single_pass_finish(ctx, Some(Value::Int(concrete)));
                 }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
@@ -7115,7 +7148,7 @@ where
                 let opref = OpRef::ConstInt(value);
                 let target = self.frames.current_mut().return_i;
                 if target.is_none() {
-                    self.capture_single_pass_finish(ctx);
+                    self.capture_single_pass_finish(ctx, Some(Value::Int(value)));
                 }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
@@ -7148,7 +7181,10 @@ where
                 let (opref, concrete) = self.read_ref_reg(src);
                 let target = self.frames.current_mut().return_r;
                 if target.is_none() {
-                    self.capture_single_pass_finish(ctx);
+                    self.capture_single_pass_finish(
+                        ctx,
+                        Some(Value::Ref(majit_ir::GcRef(concrete as usize))),
+                    );
                 }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
@@ -7181,7 +7217,10 @@ where
                 let (opref, concrete) = self.read_float_reg(src);
                 let target = self.frames.current_mut().return_f;
                 if target.is_none() {
-                    self.capture_single_pass_finish(ctx);
+                    self.capture_single_pass_finish(
+                        ctx,
+                        Some(Value::Float(f64::from_bits(concrete as u64))),
+                    );
                 }
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
@@ -7210,7 +7249,7 @@ where
             }
             jitcode::insns::BC_VOID_RETURN => {
                 self.clear_exception();
-                self.capture_single_pass_finish(ctx);
+                self.capture_single_pass_finish(ctx, None);
                 if let Some(snapshot) = self.pop_exception_frame(ctx) {
                     sym.restore_inline_scalar_state(snapshot);
                 }
@@ -11944,13 +11983,13 @@ mod tests {
             let fresh: Box<Vec<i64>> = Box::new(vec![0i64; 12]);
             let base = &*fresh as *const Vec<i64> as usize;
             Some((
-                vec![
-                    Value::Int(0),
-                    Value::Ref(majit_ir::GcRef(base)),
-                    Value::Int(12),
-                ],
+                vec![Value::Int(0), Value::Ref(majit_ir::GcRef(base))],
                 fresh as Box<dyn std::any::Any>,
             ))
+        }
+
+        fn recursive_fresh_entry_vable_capacities(&self) -> Option<Vec<i64>> {
+            Some(vec![12])
         }
 
         fn recursive_fresh_alloc_free_targets(&self) -> Option<(*const (), *const ())> {
@@ -12015,8 +12054,8 @@ mod tests {
         // ... one residual free (CallN), ...
         let free_ops: Vec<_> = ops.iter().filter(|o| o.opcode == OpCode::CallN).collect();
         assert_eq!(free_ops.len(), 1, "one residual fresh-state free CallN");
-        // ... and exactly one CallAssemblerI carrying the three fresh reds
-        // (`stackpos`, `&state`, length).
+        // ... and exactly one CallAssemblerI carrying the two declared fresh
+        // reds (`stackpos`, `&state`). Capacity belongs to the allocator.
         let call_ops: Vec<_> = ops
             .iter()
             .filter(|o| o.opcode == OpCode::CallAssemblerI)
@@ -12029,8 +12068,8 @@ mod tests {
         let call_op = call_ops[0];
         assert_eq!(
             call_op.args.borrow().len(),
-            3,
-            "fresh reds in extract_live order: stackpos, &state, length",
+            2,
+            "fresh reds in extract_live order: stackpos, &state",
         );
         // The alloc is recorded before, and the free after, the call.
         let alloc_idx = ops.iter().position(|o| o.opcode == OpCode::CallR).unwrap();

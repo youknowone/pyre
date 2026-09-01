@@ -138,7 +138,23 @@ fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
                 }
             }
             b']' if state.a[state.pa as usize] != 0 => {
-                let target = find_matching_open(program, pc);
+                // rpython/jit/tl/braininterp.py
+                // `BrainInterpreter.interp_char`: keep the matching-bracket
+                // scan in the opcode body. Pulling it into a Rust helper turns
+                // an ordinary translated loop into an opaque slice-argument
+                // call and degrades this dispatch arm to an abort JitCode.
+                let mut need: i32 = 1;
+                let mut target = pc - 1;
+                while need > 0 {
+                    if program[target] == b']' {
+                        need += 1;
+                    } else if program[target] == b'[' {
+                        need -= 1;
+                    }
+                    if need > 0 {
+                        target -= 1;
+                    }
+                }
                 if target < pc {
                     can_enter_jit!(driver, target, &mut state, program, || {});
                 }
@@ -152,23 +168,6 @@ fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
     }
 
     state.a.iter().sum::<i64>() + state.b.iter().sum::<i64>()
-}
-
-/// Find the matching '[' for a ']' at the given position.
-fn find_matching_open(code: &[u8], close_pos: usize) -> usize {
-    let mut need: i32 = 1;
-    let mut p = close_pos - 1;
-    while need > 0 {
-        if code[p] == b']' {
-            need += 1;
-        } else if code[p] == b'[' {
-            need -= 1;
-        }
-        if need > 0 {
-            p -= 1;
-        }
-    }
-    p
 }
 
 pub struct JitDualInterp {
@@ -197,7 +196,6 @@ impl Default for JitDualInterp {
 mod tests {
     use super::*;
     use crate::interp;
-    use majit_metainterp::{RefusalKind, refusal_kind};
 
     /// `COMPILES` / `LAST_OPS_AFTER` are process-global, so under the default
     /// parallel libtest runner any concurrent `run` lands inside
@@ -242,11 +240,10 @@ mod tests {
     /// (`jitdriver.rs GuardResumeDecline::ReservedIdentitySlots`).
     ///
     /// Measured across this whole suite, debug and release: the trim's branch
-    /// is taken ZERO times and the decline fires ZERO times, because
-    /// `build_state_field_snapshot` is never reached with more than one frame
-    /// — `jit_tier_shape_gate` and `jit_tier_liveness_gate` are still
-    /// `#[ignore]`d and the `[` / `]` arms still lower degraded, so nothing
-    /// here records a guard inside an inlined dispatch arm.
+    /// is taken ZERO times and the decline fires ZERO times. The bracket arms
+    /// now lower and the tier gates compile a loop, but their dynamic guard
+    /// failures still occur at the dispatch/root frame rather than inside an
+    /// inlined arm, so this reserved sub-frame range is not captured.
     ///
     /// That is why both counters are gated at 0 rather than at "some". The
     /// trim replaces a sub-frame's int state-field slots with `Const(0)`, and
@@ -403,7 +400,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "enable after `jit_tier_shape_gate` proves the compiled body closes a loop"]
     fn jit_tier_liveness_gate() {
         let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
@@ -441,22 +437,10 @@ mod tests {
         let got = JitDualInterp::new().run(&program);
         assert_eq!(got, 2002, "fixture changed; the arm reading is moot");
 
-        // Equality over a named set, never `is_empty()`. Both arms are known
-        // abort stubs, so an emptiness assertion would be permanently red and
-        // discriminate nothing. Pinning the set catches a third degraded arm
-        // and also catches either of these two arms becoming lowerable.
-        //
-        // `b'['` JOINED THIS SET AS A REPAIR, NOT AS A REGRESSION. Before the
-        // three jit-state probes descended into `while`/`loop`, the scan in its
-        // body was scored inert and silently dropped, so the arm "lowered" with
-        // its zero-cell branch deleted. Refusing it is the honest outcome. Do
-        // NOT "fix" a future failure here by trimming the set back to
-        // `["b']'"]` — that spelling asserts the arm lowers, which is the state
-        // the deletion produced.
-        //
-        // If this fails because the set is now EMPTY, the lowering gaps may be
-        // FIXED. Do not re-record the vector: delete this pin and gate on the
-        // real body instead.
+        // Every opcode body now lowers. In particular, both bracket scans stay
+        // in the translated body like RPython `BrainInterpreter.interp_char`;
+        // byte literals and loop-carried local updates no longer turn either
+        // arm into an abort stub.
         let mut degraded: Vec<_> = majit_metainterp::degraded_dispatch_arms()
             .into_iter()
             .filter(|a| a.interp == "DualState")
@@ -464,46 +448,13 @@ mod tests {
         degraded.sort_unstable_by_key(|a| a.arm);
         let degraded_arms: Vec<&str> = degraded.iter().map(|a| a.arm).collect();
         println!("[tier] degraded_arms={degraded_arms:?}");
-        assert_eq!(
-            degraded_arms,
-            ["b'['", "b']'"],
-            "the degraded-arm set moved; every trace reaching an abort stub aborts"
-        );
-
-        let causes: Vec<(&str, RefusalKind)> = degraded
-            .iter()
-            .map(|a| (a.arm, refusal_kind(a.reason)))
-            .collect();
-        assert_eq!(
-            causes,
-            [
-                ("b'['", RefusalKind::GreenWriteback),
-                ("b']'", RefusalKind::UnlowerableStmt)
-            ],
-            "an arm still degrades, but a different mechanism is refusing it. \
-             `RefusalKind::Unclassified` means majit grew a refusal family the \
-             classifier does not know — add it in `majit-metainterp`, do not \
-             re-record this pin"
-        );
-
-        let close = degraded
-            .iter()
-            .find(|a| a.arm == "b']'")
-            .expect("b']' is pinned in the set above");
         assert!(
-            close.reason.contains("find_matching_open(program, pc)"),
-            "b']' refusal no longer names the unsupported matching-bracket call: {}",
-            close.reason
-        );
-        assert!(
-            close.reason.contains("pc = target"),
-            "b']' refusal no longer preserves the trailing green writeback: {}",
-            close.reason
+            degraded_arms.is_empty(),
+            "a dualtape opcode body still installs an abort stub: {degraded:?}"
         );
     }
 
     #[test]
-    #[ignore = "enable when the back-edge arm lowers and trace inputs use separate namespaces"]
     fn jit_tier_shape_gate() {
         let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);

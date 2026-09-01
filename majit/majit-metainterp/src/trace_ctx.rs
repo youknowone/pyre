@@ -581,6 +581,11 @@ pub struct TraceCtx {
     /// `recover` cannot reconstruct (loop-carried state held in a red bank but
     /// never written back to the shared heap). Empty unless single-pass.
     pub walk_final_reds: Vec<majit_ir::Value>,
+    /// Concrete payload of a root-frame FINISH reached by the tracing walk.
+    /// RPython's return Box carries this value intrinsically; state-field
+    /// synthetic register OpRefs do not all name recorder entries, so preserve
+    /// the value read from the live MIFrame beside the symbolic FINISH arg.
+    pub walk_finish_values: Vec<majit_ir::Value>,
     /// pyjitpl.py:1087 parity: quasi-immutable field read needs a
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
     /// Stores Some(orgpc) when pending.
@@ -1774,6 +1779,7 @@ impl TraceCtx {
             symbolic_residual_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
+            walk_finish_values: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
@@ -1872,6 +1878,7 @@ impl TraceCtx {
             symbolic_residual_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
+            walk_finish_values: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
             has_compiled_targets_fn: None,
@@ -2840,7 +2847,7 @@ impl TraceCtx {
     /// identity untouched. No-op when the heap pointer, `virtualizable_info`,
     /// or `virtualizable_values` is unavailable.
     pub fn synchronize_virtualizable(&self) {
-        self.write_virtualizable_back(true);
+        self.write_virtualizable_back();
     }
 
     /// The same write at the one moment the carve-out below does not apply:
@@ -2855,14 +2862,157 @@ impl TraceCtx {
     /// `JitState::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE` is how it
     /// says so.
     pub fn synchronize_virtualizable_after_guard_failure(&self) {
-        self.write_virtualizable_back(false);
+        self.write_virtualizable_back();
+    }
+
+    /// Materialize a tokenless state-field virtualizable before a residual
+    /// call that may mutate it.
+    ///
+    /// PyPy's translated virtualizable object carries `vable_token`; touching
+    /// it from the residual helper forces the register image to the object.
+    /// A `#[jit_interp(state_fields = ...)]` state is the interpreter's Rust
+    /// struct itself and has no spare token field. Emit the field/array stores
+    /// explicitly so the helper observes the live JIT values. The concrete
+    /// tracing image is synchronized first; the recorded stores provide the
+    /// same ordering in compiled code.
+    pub fn materialize_tokenless_virtualizable_before_residual_call(&mut self) {
+        let Some(info) = self.virtualizable_info.clone() else {
+            return;
+        };
+        if info.has_vable_token() {
+            return;
+        }
+        let Some(boxes) = self.virtualizable_boxes.clone() else {
+            return;
+        };
+        let Some(vable) = boxes.last().copied() else {
+            return;
+        };
+        let lengths = self.virtualizable_array_lengths.clone().unwrap_or_default();
+
+        self.synchronize_virtualizable();
+        // Walk the fields, not the boxes: `load_fields_from_virtualizable` and
+        // `reload_tokenless_virtualizable_after_residual_call` both `continue`
+        // past a `Type::Void` static field, so the flat vector is shorter than
+        // `static_fields` and its position is not the field index.  Enumerating
+        // the boxes would hand field *i*'s descr to a later field's box, and
+        // start the array section one slot per void field too late.
+        let mut flat_index = 0usize;
+        for (field_index, field) in info.static_fields.iter().enumerate() {
+            if field.field_type == Type::Void {
+                continue;
+            }
+            let Some(&value) = boxes.get(flat_index) else {
+                return;
+            };
+            flat_index += 1;
+            self.record_op_with_descr(
+                OpCode::SetfieldGc,
+                &[vable, value],
+                info.static_field_descr(field_index),
+            );
+        }
+        for (array_index, &length) in lengths.iter().enumerate() {
+            let array_ref = self.record_op_with_descr(
+                OpCode::GetfieldGcR,
+                &[vable],
+                info.array_pointer_field_descr(array_index),
+            );
+            let array_descr = info.array_item_descr(array_index);
+            for item_index in 0..length {
+                let Some(&value) = boxes.get(flat_index) else {
+                    return;
+                };
+                let index = self.const_int(item_index as i64);
+                self.record_op_with_descr(
+                    OpCode::SetarrayitemGc,
+                    &[array_ref, index, value],
+                    array_descr.clone(),
+                );
+                flat_index += 1;
+            }
+        }
+    }
+
+    /// Reload a tokenless state-field virtualizable after its residual helper.
+    ///
+    /// This is the non-aborting counterpart of
+    /// `load_fields_from_virtualizable`: the heap reads are recorded after the
+    /// call, so compiled code consumes the helper's runtime results rather
+    /// than constants from the tracing run.
+    pub fn reload_tokenless_virtualizable_after_residual_call(&mut self) {
+        let Some(info) = self.virtualizable_info.clone() else {
+            return;
+        };
+        if info.has_vable_token() {
+            return;
+        }
+        let Some(vable) = self.standard_virtualizable_box() else {
+            return;
+        };
+        let Some(vable_ptr) = self.standard_virtualizable_ptr() else {
+            return;
+        };
+        let lengths = self.virtualizable_array_lengths.clone().unwrap_or_default();
+        let capacity = info.static_fields.len() + lengths.iter().sum::<usize>() + 1;
+        let mut boxes = Vec::with_capacity(capacity);
+        let mut values = Vec::with_capacity(capacity);
+
+        for (field_index, field) in info.static_fields.iter().enumerate() {
+            let opcode = match field.field_type {
+                Type::Int => OpCode::GetfieldGcI,
+                Type::Ref => OpCode::GetfieldGcR,
+                Type::Float => OpCode::GetfieldGcF,
+                Type::Void => continue,
+            };
+            let bits = unsafe { info.read_field(vable_ptr as *const u8, field_index) };
+            let concrete = crate::pyjitpl::heap_value_for_pub(field.field_type, bits);
+            let opref =
+                self.record_op_with_descr(opcode, &[vable], info.static_field_descr(field_index));
+            self.set_opref_concrete(opref, concrete);
+            boxes.push(opref);
+            values.push(concrete);
+        }
+        for (array_index, &length) in lengths.iter().enumerate() {
+            let field_descr = info.array_pointer_field_descr(array_index);
+            let array_ref =
+                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable], field_descr.clone());
+            self.stamp_vable_array_base(
+                array_ref,
+                Some(Value::Ref(majit_ir::GcRef(vable_ptr))),
+                &field_descr,
+            );
+            let item_type = info.array_fields[array_index].item_type;
+            let item_opcode = match item_type {
+                Type::Int => OpCode::GetarrayitemGcI,
+                Type::Ref => OpCode::GetarrayitemGcR,
+                Type::Float => OpCode::GetarrayitemGcF,
+                Type::Void => continue,
+            };
+            let array_descr = info.array_item_descr(array_index);
+            for item_index in 0..length {
+                let index = self.const_int(item_index as i64);
+                let bits = unsafe {
+                    info.read_array_item(vable_ptr as *const u8, array_index, item_index)
+                };
+                let concrete = crate::pyjitpl::heap_value_for_pub(item_type, bits);
+                let opref = self.record_op_with_descr(
+                    item_opcode,
+                    &[array_ref, index],
+                    array_descr.clone(),
+                );
+                self.set_opref_concrete(opref, concrete);
+                boxes.push(opref);
+                values.push(concrete);
+            }
+        }
+        boxes.push(vable);
+        values.push(Value::Ref(majit_ir::GcRef(vable_ptr)));
+        self.set_virtualizable_boxes_with_info(boxes, values, &info, &lengths);
     }
 
     /// `virtualizable.py write_boxes` over the whole shadow.
-    ///
-    /// `skip_outer_owned_arrays` is the tracing-time carve-out described at
-    /// its own test below; the guard-failure caller clears it.
-    fn write_virtualizable_back(&self, skip_outer_owned_arrays: bool) {
+    fn write_virtualizable_back(&self) {
         let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };
@@ -2895,24 +3045,6 @@ impl TraceCtx {
             }
             array_bits.push(items);
             cursor += len;
-        }
-        // When the virtualizable array is a Rust `Vec` embedded by value in
-        // the interpreter's live state struct (`RustVec` storage), an outer
-        // executor (the macro-generated mainloop) owns that struct and writes
-        // it on every opcode. The trace's shadow is seeded from that heap and
-        // tracked for IR purposes only; flushing the shadow back here would
-        // clobber the outer executor's writes. The heap is authoritative, so
-        // skip the write-back during tracing — the resume path performs its
-        // own field-aware flush on guard failure.
-        if skip_outer_owned_arrays
-            && info.array_fields.iter().any(|a| {
-                matches!(
-                    a.storage,
-                    crate::virtualizable::VableArrayStorage::RustVec { .. }
-                )
-            })
-        {
-            return;
         }
         // Safety: `heap_ptr` is cached at trace/bridge entry from
         // `MetaInterp::vable_ptr`, which the JitState pins for the trace
@@ -2957,18 +3089,6 @@ impl TraceCtx {
         ) else {
             return;
         };
-        // `RustVec`-stored arrays are owned and rewritten by the outer
-        // executor on every opcode, so the shadow is deliberately not kept
-        // equal to the heap for them — the same carve-out
-        // `synchronize_virtualizable` makes before writing back.
-        if info.array_fields.iter().any(|a| {
-            matches!(
-                a.storage,
-                crate::virtualizable::VableArrayStorage::RustVec { .. }
-            )
-        }) {
-            return;
-        }
         let static_count = info.num_static_extra_boxes;
         let shadow_data_len = values.len().saturating_sub(1);
         if shadow_data_len < static_count {

@@ -2717,6 +2717,25 @@ impl FinishReturn {
             }
         }
     }
+
+    /// Drain the result of the tracing walk itself.  The dispatch JitCode has
+    /// already executed the source post-loop epilogue; returning here avoids
+    /// running that suffix again after the merge hook writes state back.
+    fn drain_single_pass(&self, driver_expr: &Expr) -> TokenStream {
+        let take = match self.kind {
+            FinishReturnKind::Int => quote! { take_single_pass_finish_int },
+            FinishReturnKind::Float => quote! { take_single_pass_finish_float },
+        };
+        let returned = match &self.cast_to {
+            Some(ty) => quote! { __finish_value as #ty },
+            None => quote! { __finish_value },
+        };
+        quote! {
+            if let Some(__finish_value) = #driver_expr.#take() {
+                return #returned;
+            }
+        }
+    }
 }
 
 /// Rewrite function body: replace jit_merge_point!() and can_enter_jit!() calls.
@@ -3093,6 +3112,11 @@ fn rewrite_body(
                     // (avoids the cold `__merge_*` call when not tracing).  It does NOT
                     // add a second merge-point dispatch — `driver.merge_point` guards
                     // again internally, but the closure runs only once.
+                    let single_pass_finish_drain = self
+                        .finish_return
+                        .as_ref()
+                        .map(|finish_return| finish_return.drain_single_pass(&driver))
+                        .unwrap_or_default();
                     let new_tokens: TokenStream = if let Some(state) = &args.state {
                         // Single-pass close: after the walk, if the CloseLoop
                         // populated a walk-final (pc, reds) snapshot, transfer
@@ -3208,7 +3232,14 @@ fn rewrite_body(
                                     // before the program end). A CloseLoop
                                     // back-edge keeps interpreting from the
                                     // merge-point pc.
+                                    // The drain belongs INSIDE the latch it
+                                    // reads.  Ahead of it, it fires on every
+                                    // single-pass close -- an ordinary
+                                    // `CloseLoop` back edge included -- and a
+                                    // stale value latch would return from the
+                                    // portal where the loop must keep running.
                                     if #driver.take_single_pass_finish() {
+                                        #single_pass_finish_drain
                                         break;
                                     }
                                     #pc = __sp_pc;
@@ -3461,8 +3492,22 @@ fn rewrite_body(
                             // `loop` the type `()` — so an unconditional
                             // emission stops such a body from compiling at all.
                             let single_pass_finish_exit: TokenStream = if self.single_pass_close {
+                                // Same latch, same drain as the merge-point
+                                // close: the dispatch JitCode has already run
+                                // the source post-loop epilogue, so breaking
+                                // without draining runs that suffix a second
+                                // time natively.  With no value published the
+                                // drain falls through and the `break` stands.
+                                let drain = self
+                                    .finish_return
+                                    .as_ref()
+                                    .map(|finish_return| {
+                                        finish_return.drain_single_pass(driver_expr)
+                                    })
+                                    .unwrap_or_default();
                                 quote! {
                                     if #driver_expr.take_single_pass_finish() {
+                                        #drain
                                         break;
                                     }
                                 }

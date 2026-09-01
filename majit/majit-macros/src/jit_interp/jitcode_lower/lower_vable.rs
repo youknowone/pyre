@@ -768,6 +768,29 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    /// Preserve a borrow of the live virtualizable as its existing ref input.
+    ///
+    /// RPython residual helpers receive the virtualizable object directly;
+    /// `call.py::getcalldescr` can then classify writes to redirected fields
+    /// as forcing the virtualizable. Rust needs an explicit borrow at the
+    /// concrete call site, but that borrow is representation-only: in JitCode
+    /// it is the same object reference, not a freshly computed integer
+    /// address. Restrict this identity rule to the configured virtualizable so
+    /// ordinary Rust references do not acquire ref semantics accidentally.
+    pub(super) fn lower_vable_reference(&self, expr: &Expr) -> Option<Binding> {
+        let config = self.config?;
+        let vable_var = config.vable_var.as_ref()?;
+        let reference = match expr {
+            Expr::Reference(reference) => reference,
+            _ => return None,
+        };
+        if !expr_matches_local_name(&reference.expr, vable_var) {
+            return None;
+        }
+        let binding = self.bindings.get(vable_var)?;
+        matches!(binding.kind, BindingKind::Ref).then(|| binding.clone())
+    }
+
     /// RPython jtransform.py:655 `hint(access_directly=True)` /
     /// `hint(fresh_virtualizable=True)`.
     ///
@@ -2189,6 +2212,24 @@ mod tests {
         let struct_path: syn::Path = syn::parse_str("Stack").expect("struct path");
         let member: syn::Member = syn::parse_str("head").expect("member");
         ref_field_witness_tokens(&map, key, &struct_path, &member).to_string()
+    }
+
+    #[test]
+    fn a_borrow_of_the_virtualizable_preserves_its_ref_binding() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("state".to_string());
+        config.vable_input_ref_reg = Some(4);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.install_vable_input_binding();
+        let expr: Expr = syn::parse_str("&mut state").expect("virtualizable borrow");
+
+        let binding = lowerer
+            .lower_vable_reference(&expr)
+            .expect("virtualizable borrow lowers");
+
+        assert_eq!(binding.reg, 4);
+        assert_eq!(binding.kind, BindingKind::Ref);
+        assert!(lowerer.op_metadata.is_empty());
     }
 
     /// A declared ref field admits the three spellings the lowering can

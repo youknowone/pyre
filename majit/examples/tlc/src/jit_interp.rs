@@ -20,6 +20,7 @@
 /// NEW, GETATTR, SETATTR, SEND) cause guard failure in RPython and are absent
 /// from this function, matching that behavior.
 use crate::interp::{self, ConstantPool};
+use majit_metainterp::virt_array::VirtArray;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ── State ──
@@ -65,17 +66,17 @@ impl BytecodeExt for [u8] {
 
 struct TlcState {
     stackpos: i64,
-    stack: Vec<i64>,
+    stack: VirtArray<i64>,
 }
 
 /// Rotates the live stack through a residual call.
 ///
-/// This mirrors the RPython TLC list operations. Because it mutates the
-/// virtualizable array through a raw pointer, the call is may-force and the
-/// dispatch arm remains degraded until the trace can reload those effects.
+/// This mirrors the RPython TLC list operations. The helper receives the live
+/// virtualizable object, so its may-force effect synchronizes redirected array
+/// fields before the residual mutation.
 #[majit_macros::jit_may_force]
-extern "C" fn tlc_roll(stack_ptr: usize, stackpos: i64, r: i64) {
-    let stack = unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stackpos as usize) };
+extern "C" fn tlc_roll(state: &mut TlcState, r: i64) {
+    let stack = &mut state.stack[..state.stackpos as usize];
     let len = stack.len();
     if r < -1 {
         // Move top element to position len+r (counted from bottom).
@@ -159,7 +160,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     // eventually popping, so peak stack depth is bounded by code length).
     let mut state = TlcState {
         stackpos: 0,
-        stack: vec![0i64; program.len()],
+        stack: VirtArray::filled(0i64, program.len()),
     };
 
     // RPython warmspot.py:281-289 — `make_jitcodes(); finish_setup(codewriter)`
@@ -272,8 +273,8 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
             }
             ROLL => {
                 let r = program[pc] as i8 as i64;
+                tlc_roll(&mut state, r);
                 pc += 1;
-                tlc_roll(state.stack.as_mut_ptr() as usize, state.stackpos, r);
             }
             PICK => {
                 let i = program[pc] as usize;
@@ -461,7 +462,7 @@ mod tests {
         let degraded: Vec<&str> = tlc_arms.iter().map(|a| a.arm).collect();
         assert_eq!(
             degraded,
-            ["PUSHARG", "ROLL"],
+            ["PUSHARG"],
             "the degraded-arm set moved. A NEW name means an arm silently \
              stopped lowering and every trace reaching it now aborts; a MISSING \
              name means that arm lowers again, so the abort that blocks the \
@@ -482,10 +483,7 @@ mod tests {
         }
         assert_eq!(
             causes,
-            [
-                ("PUSHARG", RefusalKind::UnlowerableStmt),
-                ("ROLL", RefusalKind::GreenWriteback),
-            ],
+            [("PUSHARG", RefusalKind::UnlowerableStmt)],
             "an arm still degrades but a different mechanism is refusing it. \
              `RefusalKind::Unclassified` on either side means majit grew a \
              refusal family the classifier does not know — add it in \

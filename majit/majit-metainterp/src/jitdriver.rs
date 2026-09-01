@@ -2879,6 +2879,24 @@ impl<S: JitState> JitDriver<S> {
                 // guard-failure resume uses for this outcome.  It reaches
                 // `build_meta` only as the `header_pc` the `#[jit_interp]`
                 // impl ignores, and the hook breaks before using it as a pc.
+                //
+                // Publish the scalar the chain returned.  A dispatch JitCode
+                // that lowered the source post-loop epilogue has already run it
+                // here, so the value IS the portal's result; leaving it unread
+                // makes the hook break and native Rust run that suffix a second
+                // time.  Void and Ref carry no scalar and leave the latch
+                // empty, which is the same break as before.
+                match &outcome {
+                    crate::jitexc::JitException::DoneWithThisFrameInt(v) => {
+                        self.meta.single_pass_finish_values =
+                            Some(core::iter::once(Value::Int(*v)).collect());
+                    }
+                    crate::jitexc::JitException::DoneWithThisFrameFloat(v) => {
+                        self.meta.single_pass_finish_values =
+                            Some(core::iter::once(Value::Float(*v)).collect());
+                    }
+                    _ => {}
+                }
                 writeback(state, usize::MAX);
                 self.meta.single_pass_finish = true;
                 Some(usize::MAX)
@@ -2941,6 +2959,26 @@ impl<S: JitState> JitDriver<S> {
     /// Consumes (`take`s) the flag.
     pub fn take_single_pass_finish(&mut self) -> bool {
         std::mem::replace(&mut self.meta.single_pass_finish, false)
+    }
+
+    /// Integer FINISH result produced by a single-pass tracing walk.
+    pub fn take_single_pass_finish_int(&mut self) -> Option<i64> {
+        let values = self.meta.single_pass_finish_values.take()?;
+        match values.first() {
+            Some(Value::Int(v)) => Some(*v),
+            Some(Value::Float(v)) => Some(v.to_bits() as i64),
+            _ => None,
+        }
+    }
+
+    /// Float FINISH result produced by a single-pass tracing walk.
+    pub fn take_single_pass_finish_float(&mut self) -> Option<f64> {
+        let values = self.meta.single_pass_finish_values.take()?;
+        match values.first() {
+            Some(Value::Float(v)) => Some(*v),
+            Some(Value::Int(v)) => Some(f64::from_bits(*v as u64)),
+            _ => None,
+        }
     }
 
     /// The FINISH arguments of the compiled run a `back_edge*` call just made,
@@ -4455,6 +4493,10 @@ impl<S: JitState> JitDriver<S> {
                     exit_with_exception,
                     exc_value,
                 } => {
+                    self.meta.single_pass_finish_values = self
+                        .meta
+                        .trace_ctx()
+                        .map(|ctx| ctx.walk_finish_values.iter().copied().collect());
                     // A terminal dispatch return is also a valid single-pass
                     // handoff: the interpreted function has returned, so native
                     // execution must EXIT the dispatch loop and run its own
@@ -4466,11 +4508,18 @@ impl<S: JitState> JitDriver<S> {
                     // `while pc < size` would exit on resume — when the terminal is
                     // the last opcode; a mid-program terminal would re-enter the
                     // loop body, so the exit is signalled explicitly.
+                    //
+                    // The flag is not conditional on that pc.  `Finish` IS the
+                    // interpreted function returning, so the dispatch loop has
+                    // to exit either way; a walk that published its finish
+                    // values without a final pc would otherwise leave the hook
+                    // with neither a break nor a resume and spin the native
+                    // loop.  Only the resume coordinate is pc-gated.
                     let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
                     if let Some(p) = pc {
                         self.meta.single_pass_outcome = Some((p, Vec::new()));
-                        self.meta.single_pass_finish = true;
                     }
+                    self.meta.single_pass_finish = true;
                     if let Some(sym) = self.sym.as_ref() {
                         let scalars = S::collect_scalar_state_field_values(sym);
                         self.meta.single_pass_scalar_values = Some(scalars);
