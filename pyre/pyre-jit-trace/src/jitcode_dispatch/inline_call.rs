@@ -25,6 +25,18 @@ struct BoundMethodInline {
     receiver: pyre_object::PyObjectRef,
 }
 
+/// The receiver and attribute name an inlined `__getattribute__` /
+/// `__getattr__` call was resolved for, carried into the callee walk so an
+/// `AttributeError` the hook raises can be given the `name` / `obj` pair
+/// `enrich_attribute_error` (`error.rs`) fills in.
+#[derive(Clone, Copy)]
+struct AttributeErrorInlineContext {
+    obj: OpRef,
+    obj_concrete: pyre_object::PyObjectRef,
+    name: OpRef,
+    name_concrete: pyre_object::PyObjectRef,
+}
+
 /// Where an element of a `defs_w` tuple lives, and therefore what the trace
 /// emits to read one.  `w_tuple_new` routes EVERY arity-2 tuple through
 /// `makespecialisedtuple2` (`specialisedtupleobject.py`), so a callee
@@ -4429,6 +4441,108 @@ fn inline_caller_py_pc_from_snapshot<Sym: WalkSym>(
     )
 }
 
+/// Fill in the `name` / `obj` pair on an `AttributeError` raised out of an
+/// inlined attribute hook, reproducing `enrich_attribute_error` (`error.rs`).
+///
+/// `StdObjSpace.getattr` (`objspace/std/objspace.py:711-716`) performs it on the
+/// `__getattr__` fallback call, and pyre's `getattr_str` (`baseobjspace.rs`)
+/// wraps the whole dispatch in it, so the `load_attr_fn` residual the hook
+/// routes replace reached it either way.  Without this the compiled iterations
+/// answer `e.name is None` where both the interpreter and a deopt answer the
+/// attribute name.
+///
+/// The pair is written with `SetfieldGc` rather than by calling the enricher:
+/// a call takes the exception as an argument and so forces the allocation the
+/// optimizer had removed, the cost `record_inline_exception_context` records as
+/// doubling the loops that catch without touching the object.  Both slots sit at
+/// one offset for every kind (`W_BaseException` is a single flattened struct), so
+/// the recording kind names the right bytes; only the descr identity the
+/// optimizer aliases on is narrower, as in `record_prepend_application_traceback`.
+fn record_inline_attribute_error_context<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    exc: OpRef,
+    exc_concrete: ConcreteValue,
+    attr: &AttributeErrorInlineContext,
+) -> Result<(), DispatchError> {
+    use pyre_interpreter::baseobjspace::ExceptionAttrSlot as Slot;
+    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+        return Ok(());
+    };
+    if exc_ptr.is_null() || !unsafe { pyre_object::is_exception(exc_ptr) } {
+        return Ok(());
+    }
+    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
+    if kind != pyre_object::interp_exceptions::ExcKind::AttributeError {
+        return Ok(());
+    }
+    let current_name = unsafe { pyre_object::interp_exceptions::w_exception_get_name(exc_ptr) };
+    let current_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(exc_ptr) };
+    let fills = current_name.is_null() && current_obj.is_null();
+    // A `Const` exception box freezes the recording iteration's address
+    // (`walker_record_guard_exception` pins every raise after the first one in a
+    // walk), so a field op through it would reach a stale object on every later
+    // iteration -- the shape `record_prepend_application_traceback` declines for
+    // the same reason.  The concrete write below still runs: this walk is the
+    // authoritative execution path.
+    if !exc.is_none() && !exc.is_constant() {
+        // Pin the branch `enrich_attribute_error` takes.  Both reads answer
+        // statically for the virtual an inlined `raise` builds -- the shape every
+        // hook constructing its own `AttributeError` produces -- so the guards
+        // cost nothing there and are real only for an exception that reached the
+        // walk from outside.
+        let read_name = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            exc,
+            crate::descr::w_exception_attr_slot_descr(kind, Slot::Name),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            read_name,
+            majit_ir::Value::Ref(majit_ir::GcRef(current_name as usize)),
+        );
+        let read_obj = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            exc,
+            crate::descr::w_exception_attr_slot_descr(kind, Slot::AttrObj),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            read_obj,
+            majit_ir::Value::Ref(majit_ir::GcRef(current_obj as usize)),
+        );
+        for (read, is_null) in [
+            (read_name, current_name.is_null()),
+            (read_obj, current_obj.is_null()),
+        ] {
+            let guard = if is_null {
+                OpCode::GuardIsnull
+            } else {
+                OpCode::GuardNonnull
+            };
+            walker_emit_fold_guard_with_snapshot(ctx, op_pc, guard, &[read])?;
+        }
+        if fills {
+            for (slot, value) in [(Slot::Name, attr.name), (Slot::AttrObj, attr.obj)] {
+                let descr = crate::descr::w_exception_attr_slot_descr(kind, slot);
+                let descr_index = descr.index();
+                ctx.trace_ctx
+                    .record_op_with_descr(OpCode::SetfieldGc, &[exc, value], descr);
+                ctx.trace_ctx
+                    .heapcache_setfield_cached(exc, descr_index, value);
+            }
+        }
+    }
+    if fills {
+        // The setters carry the host-side remembered-set barrier themselves;
+        // compiled `SetfieldGc` reference stores get `CondCallGcWb` from
+        // majit-gc's rewrite pass.
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_name(exc_ptr, attr.name_concrete);
+            pyre_object::interp_exceptions::w_exception_set_attr_obj(exc_ptr, attr.obj_concrete);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -4483,6 +4597,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         None,
         false,
         None,
+        None,
     )
 }
 
@@ -4535,6 +4650,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     intermediate_result: Option<&mut Option<(OpRef, ConcreteValue)>>,
     require_exact_int_result: bool,
     instance_next_foriter_green_key: Option<u64>,
+    attribute_error_context: Option<AttributeErrorInlineContext>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
@@ -7334,6 +7450,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
+            // Ahead of the traceback nodes, matching the interpreter order:
+            // `getattr_str` enriches as the error leaves the attribute
+            // dispatch, before the caller frame's `handle_exception` records a
+            // node for the opcode that made the call.
+            if let Some(attr) = attribute_error_context.as_ref() {
+                record_inline_attribute_error_context(ctx, op.pc, exc, exc_concrete, attr)?;
+            }
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
                 // trace runs compiled it catches the exception itself and this
@@ -8667,7 +8790,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     callee_args.push(name_const);
     callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
     let hook_const = ctx.trace_ctx.const_ref(w_func as i64);
-    let inlined = try_walker_inline_resolved_user_call(
+    let inlined = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -8692,6 +8815,22 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
         true,
         false,
         None,
+        None,
+        false,
+        None,
+        // pyre's `getattr_str` (`baseobjspace.rs`) enriches the whole
+        // `__getattribute__` / `__getattr__` chain, so the `load_attr_fn`
+        // residual this route replaces filled the pair in here as well.
+        // `StdObjSpace.getattr` (`objspace/std/objspace.py:668-670`) returns
+        // through `_handle_getattribute` without enriching, so the interpreter
+        // this trace has to agree with is ahead of upstream on this arm; the
+        // difference is the interpreter's to settle, not the trace's.
+        Some(AttributeErrorInlineContext {
+            obj,
+            obj_concrete: concrete_obj,
+            name: name_const,
+            name_concrete: name_obj,
+        }),
     )?;
     if inlined.is_none() {
         ctx.trace_ctx.cut_trace(pre_fold_pos);
@@ -8807,7 +8946,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     callee_args.push(name_const);
     callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
     let getattr_const = ctx.trace_ctx.const_ref(w_func as i64);
-    let inlined = try_walker_inline_resolved_user_call(
+    let inlined = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -8835,6 +8974,19 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         true,
         false,
         None,
+        None,
+        false,
+        None,
+        // `StdObjSpace.getattr` (`objspace/std/objspace.py:711-716`) wraps
+        // the `__getattr__` fallback call in `enrich_attribute_error`, which
+        // the `load_attr_fn` residual this route replaces reached through
+        // `getattr_str`.
+        Some(AttributeErrorInlineContext {
+            obj,
+            obj_concrete: concrete_obj,
+            name: name_const,
+            name_concrete: name_obj,
+        }),
     )?;
     if inlined.is_none() {
         ctx.trace_ctx.cut_trace(pre_fold_pos);
@@ -9145,6 +9297,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         Some(&mut result),
         true,
         None,
+        None,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -9389,6 +9542,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         None,
         false,
         Some(foriter_green_key),
+        None,
     );
     let inline_resume_pc = match inline {
         Ok(Some((DispatchOutcome::Continue, next))) => next,
