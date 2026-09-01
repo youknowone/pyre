@@ -22,6 +22,8 @@
 # which is why the reflected forms are asserted here beside the direct ones.
 #
 # Every expectation below is the value CPython 3.14 and PyPy both produce.
+import gc
+
 try:
     import pypyjit
 
@@ -30,6 +32,34 @@ except ImportError:
     pass
 
 failures = []
+
+
+class CollectingLen(set):
+    """A set subclass whose length is a Python call that collects.
+
+    `space.len_w` on either operand reaches this, so it is the window a dict
+    view -- which is nursery-allocated and therefore moves -- has to survive.
+    """
+
+    def __len__(self):
+        gc.collect(0)
+        return set.__len__(self)
+
+
+class CollectsOnIter:
+    """An iterable whose `__iter__` collects before yielding anything.
+
+    A generator's `iter()` runs no user code, so the receiver has to be rooted
+    before `space.iter(w_other)` for this shape rather than only around the
+    steps after it.
+    """
+
+    def __init__(self, items):
+        self.items = items
+
+    def __iter__(self):
+        gc.collect(0)
+        return iter(self.items)
 
 
 class Consumed:
@@ -152,6 +182,23 @@ def lazy_isdisjoint_cases():
     )
     # A non-iterable operand still raises from `iter`.
     check("isdisjoint_int", lambda: {1: "a"}.keys().isdisjoint(1), "!! TypeError")
+    # The receiver has to survive the collection `space.iter(w_other)` runs,
+    # and the view handed in is a temporary with nothing else holding it.
+    check(
+        "isdisjoint_collecting_iter_hit",
+        lambda: {1: "a", 2: "b"}.keys().isdisjoint(CollectsOnIter([2, 3])),
+        "False",
+    )
+    check(
+        "isdisjoint_collecting_iter_miss",
+        lambda: {1: "a", 2: "b"}.keys().isdisjoint(CollectsOnIter([7, 8])),
+        "True",
+    )
+    check(
+        "isdisjoint_collecting_len_operand",
+        lambda: {1: "a"}.keys().isdisjoint(CollectingLen({9})),
+        "True",
+    )
 
 
 def live_walk_cases():
@@ -219,6 +266,17 @@ def plain_comparison_cases():
     # A values view is not set-like, so the comparison never reaches the walk.
     check("set_eq_values_view", lambda: {1, 2} == a.values(), "False")
     check("values_view_eq_set", lambda: a.values() == {1, 2}, "False")
+    # Both length calls dispatch a Python `__len__` that collects, and the
+    # view on the other side is a temporary nothing else holds.
+    check("collecting_len_eq_view", lambda: CollectingLen({"a", "b"}) == a.keys(), "True")
+    check("view_eq_collecting_len", lambda: a.keys() == CollectingLen({"a", "b"}), "True")
+    check("collecting_len_lt_view", lambda: CollectingLen({"a"}) < a.keys(), "True")
+    check("collecting_len_le_view", lambda: CollectingLen({"a", "b"}) <= a.keys(), "True")
+    check("collecting_len_gt_view", lambda: CollectingLen({"a", "b", "c"}) > a.keys(), "True")
+    check("collecting_len_ge_view", lambda: CollectingLen({"a", "b"}) >= a.keys(), "True")
+    check("collecting_len_ne_view", lambda: CollectingLen({"a"}) != a.keys(), "True")
+    check("view_gt_collecting_len", lambda: a.keys() > CollectingLen({"a"}), "True")
+    check("view_ge_collecting_len", lambda: a.keys() >= CollectingLen({"a"}), "True")
 
 
 def main():

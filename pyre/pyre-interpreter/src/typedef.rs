@@ -9070,20 +9070,37 @@ pub(crate) fn dict_view_compare(
         // the bytecode dispatch, so emit it directly here.
         return Ok(pyre_object::w_not_implemented());
     }
-    let self_len = unsafe { crate::baseobjspace::len(self_view)? };
-    let other_len = unsafe { crate::baseobjspace::len(other)? };
-    let self_n = unsafe { pyre_object::w_int_get_value(self_len) };
-    let other_n = unsafe { pyre_object::w_int_get_value(other_len) };
+    // `len` reaches a user `__len__` whenever an operand is a set subclass
+    // that overrides it, and a dict view is `try_gc_alloc_nursery_raw` and so
+    // moves, so both operands are published before the first length call and
+    // read back from their slots afterwards.  Each length is reduced to its
+    // native value where it is taken, so the boxed int the first call returns
+    // is never held across the second.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.publish(&[self_view, other]);
+    roots.normalize(base, 2);
+    let self_n =
+        unsafe { pyre_object::w_int_get_value(crate::baseobjspace::len(roots.get(base))?) };
+    let other_n =
+        unsafe { pyre_object::w_int_get_value(crate::baseobjspace::len(roots.get(base + 1))?) };
+    let contained = |view_first: bool| -> Result<bool, crate::PyError> {
+        let (view, other) = if view_first {
+            (roots.get(base), roots.get(base + 1))
+        } else {
+            (roots.get(base + 1), roots.get(base))
+        };
+        dict_view_all_contained_in(view, other)
+    };
     let result = match op {
         // dictmultiobject.py descr_eq
-        DictViewCmp::Eq => self_n == other_n && dict_view_all_contained_in(self_view, other)?,
-        DictViewCmp::Ne => !(self_n == other_n && dict_view_all_contained_in(self_view, other)?),
+        DictViewCmp::Eq => self_n == other_n && contained(true)?,
+        DictViewCmp::Ne => !(self_n == other_n && contained(true)?),
         // dictmultiobject.py descr_lt
-        DictViewCmp::Lt => self_n < other_n && dict_view_all_contained_in(self_view, other)?,
-        DictViewCmp::Le => self_n <= other_n && dict_view_all_contained_in(self_view, other)?,
+        DictViewCmp::Lt => self_n < other_n && contained(true)?,
+        DictViewCmp::Le => self_n <= other_n && contained(true)?,
         // dictmultiobject.py descr_gt — flips direction.
-        DictViewCmp::Gt => self_n > other_n && dict_view_all_contained_in(other, self_view)?,
-        DictViewCmp::Ge => self_n >= other_n && dict_view_all_contained_in(other, self_view)?,
+        DictViewCmp::Gt => self_n > other_n && contained(false)?,
+        DictViewCmp::Ge => self_n >= other_n && contained(false)?,
     };
     Ok(pyre_object::w_bool_from(result))
 }
