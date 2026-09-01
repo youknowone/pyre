@@ -437,6 +437,41 @@ pub(crate) fn w_memoryview_new_simple_with_owner(
     }
 }
 
+/// `PyBuffer_FillInfo(&buf, NULL, start, len, 0, PyBUF_CONTIG)` followed by
+/// `PyMemoryView_FromBuffer`: a writable window over raw memory with no
+/// exporter behind it.
+///
+/// `_bufferedreader_raw_read` hands one to the raw stream's `readinto` so the
+/// read lands directly in the destination, and `_raw_read` does the same with
+/// `SimpleView(SubBuffer(buffer, start, length))`.  Either way no second buffer
+/// stands between the stream and the caller's memory.
+///
+/// Non-owning: there is no exporter to take an `_exports` count on, which is
+/// what the C original's "the buffer needn't be released as its object is
+/// NULL" says.  The window names memory the caller owns for the length of one
+/// call, so the caller releases the view when that call returns rather than
+/// leaving a stashed one able to write into memory that is gone.
+pub(crate) fn w_memoryview_new_raw_window(address: usize, length: usize) -> PyObjectRef {
+    use pyre_object::buffer::Buffer;
+    use pyre_object::bufferview::BufferView;
+    unsafe {
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+        let view = BufferView::Simple {
+            backing: Buffer::External {
+                w_obj: pyre_object::w_none(),
+                address,
+                size: length,
+                readonly: false,
+            },
+            w_obj: pyre_object::w_none(),
+            length: length as i64,
+        };
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        mv
+    }
+}
+
 /// Build the `W_MMap.readbuf_w`/`writebuf_w` view: one contiguous external
 /// byte window whose owner remains the mmap object.
 #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
