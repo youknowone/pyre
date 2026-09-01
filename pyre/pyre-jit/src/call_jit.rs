@@ -3369,7 +3369,15 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                 // `portal_body_result` error fall-through below and with
                 // `lib.rs::jit_exc_raise` — every backend's blackhole resume
                 // publishes the pending exception, not just cranelift.
-                store_jit_exception(exc_obj as i64);
+                //
+                // Both carriers, because `handle_jitexception` reaches this arm
+                // by `raise value` (warmspot.py:996-1003) into RPython's single
+                // ll exception state, which is caller-blind: the compiled
+                // `CALL_ASSEMBLER` reads it through the backend cells and the
+                // walker's trace-time `execute_varargs_call` reads it through
+                // `BH_LAST_EXC_VALUE`.  `clear_residual_call_exception` empties
+                // both, so arming both cannot leave one behind.
+                publish_residual_call_exception(exc_obj as i64);
             }
             Some(0) // garbage return — GUARD_NO_EXCEPTION will fire
         }
@@ -4734,7 +4742,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
         // `handle_blackhole_result`'s ExitFrameWithExceptionRef arm.
         Outcome::FinishedException(exc) => {
             if exc != 0 {
-                store_jit_exception(exc);
+                publish_residual_call_exception(exc);
             }
             0
         }
