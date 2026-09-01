@@ -196,19 +196,15 @@ unsafe fn memoryview_wrap_dims(dims: &[i64]) -> PyObjectRef {
     }
 }
 
-/// Allocate a `W_MemoryView` whose view DERIVES from an existing view — the
-/// copy (`W_MemoryView.copy`) and zero-copy slice (`new_slice`) constructors.
-/// PyPy hands the same immutable view object to the derived memoryview; pyre
-/// clones it into the new owner's box via `derive`.
+/// `W_MemoryView.copy` (`memoryobject.py`): allocate a new memoryview header
+/// and clone the source's immutable view into its owner box.
 ///
 /// GC-safety: the source memoryview is pinned across the header allocation
 /// (the sole collection point).  Its custom trace keeps every ref inside its
-/// off-heap box alive and updated in place, so `derive` — which must not
-/// allocate on the GC heap — runs on post-collection refs.
-unsafe fn w_memoryview_new_derived(
-    mv_src: PyObjectRef,
-    derive: impl FnOnce(&pyre_object::bufferview::BufferView) -> pyre_object::bufferview::BufferView,
-) -> PyObjectRef {
+/// off-heap box alive and updated in place, so the clone reads post-collection
+/// refs.  Keep this as a concrete operation, matching PyPy's `copy`, rather
+/// than passing a Rust closure through the translated graph.
+unsafe fn w_memoryview_copy_derived(mv_src: PyObjectRef) -> PyObjectRef {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
         let sp = pyre_object::gc_roots::shadow_stack_len();
@@ -219,7 +215,31 @@ unsafe fn w_memoryview_new_derived(
         // view pointing at storage the exporter is then free to reallocate.
         let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
         let r_src = pyre_object::gc_roots::shadow_stack_get(sp);
-        let view = derive(pyre_object::memoryview::w_memoryview_view(r_src));
+        let view = pyre_object::memoryview::w_memoryview_view(r_src).clone();
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        backing_exports_incref(pyre_object::memoryview::w_memoryview_view(mv).backing());
+        mv
+    }
+}
+
+/// `memoryview.descr_toreadonly` (`memoryobject.py`): wrap the live source
+/// view in `ReadonlyWrapper` and give the new memoryview its own export.
+/// This is deliberately separate from [`w_memoryview_copy_derived`], just as
+/// the two constructions are separate upstream; a callback-valued helper
+/// would manufacture an `FnOnce::call_once` graph with no RPython analogue.
+unsafe fn w_memoryview_readonly_derived(mv_src: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(mv_src);
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
+        let r_src = pyre_object::gc_roots::shadow_stack_get(sp);
+        let src_view = pyre_object::memoryview::w_memoryview_view(r_src);
+        let view = pyre_object::bufferview::BufferView::Readonly {
+            view: Box::new(src_view.clone()),
+            w_obj: src_view.w_obj(),
+        };
         let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
         pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
         backing_exports_incref(pyre_object::memoryview::w_memoryview_view(mv).backing());
@@ -689,7 +709,7 @@ fn w_memoryview_new_with_flags_impl(
             // `W_MemoryView.copy` shares the source's (immutable) view; the
             // clone preserves the variant, so copying a sliced / plain view
             // keeps its zero-copy window and derived geometry.
-            return Ok(w_memoryview_new_derived(w_obj, |v| v.clone()));
+            return Ok(w_memoryview_copy_derived(w_obj));
         }
         #[cfg(all(
             feature = "host_env",
@@ -1988,12 +2008,7 @@ fn memoryview_toreadonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             ));
         }
         // `ReadonlyWrapper(self.view)` (memoryobject.py).
-        Ok(w_memoryview_new_derived(mv, |v| {
-            pyre_object::bufferview::BufferView::Readonly {
-                view: Box::new(v.clone()),
-                w_obj: v.w_obj(),
-            }
-        }))
+        Ok(w_memoryview_readonly_derived(mv))
     }
 }
 

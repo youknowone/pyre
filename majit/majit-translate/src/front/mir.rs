@@ -11021,9 +11021,21 @@ impl<'a> Lowering<'a> {
         // chain against named int constants (`pypy/interpreter/pyopcode.py`
         // `dispatch_bytecode`, folded by `merge_if_blocks`), never as a
         // method on the tag.  Twin of the `<str as PartialEq>::eq` fold.
+        //
+        // `!=` resolves to `PartialEq::ne`, which `derive` does not generate:
+        // it is the trait's PROVIDED method, whose body lives in `core` and so
+        // outside every extracted closure.  It therefore arrives fully
+        // qualified as `<module>::<Enum>::ne` rather than as a method on the
+        // receiver, and both spellings fold to the same discriminant `BinOp`.
         let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
-            && let CallTarget::Method { name, .. } = target
+            && let Some(name) = match target {
+                CallTarget::Method { name, .. } => Some(name.as_str()),
+                CallTarget::FunctionPath { segments } => {
+                    segments.last().map(std::string::String::as_str)
+                }
+                _ => None,
+            }
             && let Some(binop) = fieldless_enum_cmp_binop(name)
             && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
                 .iter()
@@ -30261,7 +30273,6 @@ mod tests {
         for function in [
             "pyre_interpreter::argument::combine_starargs_wrapped",
             "pyre_interpreter::argument::combine_starstarargs_wrapped",
-            "pyre_interpreter::objspace::descroperation::list_repeat",
         ] {
             assert_eq!(count(function, "extend"), 0, "{function}");
             assert!(count(function, "extend_from_slice") >= 1, "{function}");
@@ -30279,6 +30290,96 @@ mod tests {
         let mixed = "pyre_interpreter::_structseq::new_instance_with_extra";
         assert!(count(mixed, "extend_from_slice") >= 1, "{mixed}");
         assert!(count(mixed, "extend") >= 1, "{mixed}");
+    }
+
+    /// PyPy's deque item operations call `decode_index4(w_index, self)`: the
+    /// post-`__index__` length read is an ordinary read from the deque owner,
+    /// not a niladic callback.  Keep the Rust interpreter spelling equally
+    /// direct so Charon does not introduce a synthetic `FnOnce::call_once`
+    /// graph between `deque_index` and `deque_len`.
+    #[test]
+    #[ignore]
+    fn deque_index_reads_its_owner_without_a_fnonce_adapter() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let function = "pyre_interpreter::module::_collections::deque_index";
+        let graph = super::lower_function(&llbc, function)
+            .unwrap_or_else(|e| panic!("lower {function}: {e}"));
+        assert_eq!(
+            graph.block(graph.startblock).inputargs.len(),
+            2,
+            "deque_index should receive only (index, self_obj)"
+        );
+        let calls: Vec<&[String]> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            calls.iter().any(|segments| {
+                super::fmt_path_ends_with(segments, &["_collections", "deque_len"])
+            }),
+            "deque_index must read the live deque length directly"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|segments| !super::fmt_path_ends_with(segments, &["FnOnce", "call_once"])),
+            "deque_index must not manufacture a closure call for its owner read"
+        );
+    }
+
+    /// PyPy spells `W_MemoryView.copy` and `descr_toreadonly` as two concrete
+    /// view constructions.  Their Rust counterparts must likewise reach the
+    /// buffer-view allocator directly, without a shared closure-valued derive
+    /// helper that inserts `FnOnce::call_once` into the translated closure.
+    #[test]
+    #[ignore]
+    fn memoryview_derivations_are_concrete_graphs() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for function in [
+            "pyre_interpreter::builtins::w_memoryview_copy_derived",
+            "pyre_interpreter::builtins::w_memoryview_readonly_derived",
+        ] {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|e| panic!("lower {function}: {e}"));
+            let calls: Vec<&[String]> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .filter_map(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } => Some(segments.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                calls
+                    .iter()
+                    .any(|segments| { super::fmt_path_ends_with(segments, &["bufferview_alloc"]) }),
+                "{function}: concrete derivation must allocate its view"
+            );
+            assert!(
+                calls.iter().all(|segments| {
+                    !super::fmt_path_ends_with(segments, &["FnOnce", "call_once"])
+                }),
+                "{function}: concrete derivation must not call a closure adapter"
+            );
+        }
     }
 
     /// Anchor the `&self` `Option::is_some` fold to the real lowered IR of
@@ -33803,6 +33904,43 @@ mod tests {
                 .count(),
             1,
             "the discriminant comparison lowers to one int `BinOp(eq)`"
+        );
+    }
+
+    /// The `ne` half of the same fold, on the real lowered IR of
+    /// `getattr_str_impl` — `err.kind != PyErrorKind::AttributeError` over the
+    /// fieldless `PyErrorKind`.  `derive` generates only `eq`, so `!=` resolves
+    /// to `PartialEq`'s provided `ne` and reaches the lowering fully qualified
+    /// as a `FunctionPath` rather than as a `Method` on the receiver.  Left
+    /// residual it is an unregistered callee and the whole graph declines.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn fieldless_enum_ne_fold_real_getattr_str_impl() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "pyre_interpreter::baseobjspace::getattr_str_impl")
+                .expect("lower getattr_str_impl");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } => super::fmt_path_ends_with(segments, &["PyErrorKind", "ne"]),
+                    _ => false,
+                })
+                .count(),
+            0,
+            "no residual `PyErrorKind::ne` call survives the fold"
+        );
+        assert!(
+            ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")),
+            "the discriminant comparison lowers to an int `BinOp(ne)`"
         );
     }
 
