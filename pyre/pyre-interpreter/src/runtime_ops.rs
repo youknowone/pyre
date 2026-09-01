@@ -760,10 +760,10 @@ pub fn binary_slice_values(
 ) -> Result<PyObjectRef, PyError> {
     unsafe {
         // `eval_slice_index` may run a user `__index__`, and every arm below
-        // allocates: a `list` / `dict` operand relocates across either.  The
-        // three operands are published as one livevar set and read back at the
-        // consumers that follow a collection point; a `str` / `tuple` receiver
-        // is proven non-moving by its type test, so those arms keep the word.
+        // allocates: any of the three operands relocates across either.  They
+        // are published as one livevar set, and each consumer that follows a
+        // collection point reads its operand back off the root slot — the
+        // receiver included, since its type says nothing about whether it moves.
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.base();
         let (start_slot, stop_slot) = (obj_slot + 1, obj_slot + 2);
@@ -818,7 +818,6 @@ pub fn binary_slice_values(
             // make a one-character slice cost the whole string.  A bound equal
             // to the count resolves to the end of the buffer, which is what
             // the `stop` default asks for.
-            let full = pyre_object::w_str_get_wtf8(obj);
             let len = pyre_object::w_str_len(obj) as i64;
             let s = if pyre_object::is_none(start) {
                 0
@@ -833,6 +832,12 @@ pub fn binary_slice_values(
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
+            // The payload view is a pointer derived from the receiver's value
+            // box, and a derived pointer is the one thing a root slot cannot
+            // track.  Take it, and the index storage beside it, after the last
+            // conversion — off the receiver that same conversion may have moved.
+            let obj = roots.get(obj_slot);
+            let full = pyre_object::w_str_get_wtf8(obj);
             let part = rustpython_wtf8::Wtf8::from_bytes(
                 &full.as_bytes()[pyre_object::w_str_index_to_byte(obj, s)
                     ..pyre_object::w_str_index_to_byte(obj, e)],
@@ -842,6 +847,10 @@ pub fn binary_slice_values(
             return Ok(pyre_object::w_str_from_wtf8_managed(part.to_wtf8_buf()));
         }
         if pyre_object::is_tuple(obj) {
+            // A tuple's length is fixed, so it is read before the bounds
+            // convert; the receiver word is not carried across one, because
+            // `eval_slice_index` may run a user `__index__` whose allocation
+            // moves the tuple.
             let len = pyre_object::w_tuple_len(obj) as i64;
             let s = if pyre_object::is_none(start) {
                 0
@@ -857,11 +866,13 @@ pub fn binary_slice_values(
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
             // The arity-2 specialisations box their payload on fetch, the same
-            // allocating fetch the `list` arm accumulates in root slots.
+            // allocating fetch the `list` arm accumulates in root slots — and
+            // that allocation sits inside this loop, so the receiver is read
+            // back on every iteration and not just once before it.
             let items_base = pyre_object::gc_roots::shadow_stack_len();
             let mut fetched = 0usize;
             for i in s..e {
-                if let Some(v) = pyre_object::w_tuple_getitem(obj, i as i64) {
+                if let Some(v) = pyre_object::w_tuple_getitem(roots.get(obj_slot), i as i64) {
                     let _ = roots.pin_root(v);
                     fetched += 1;
                 }

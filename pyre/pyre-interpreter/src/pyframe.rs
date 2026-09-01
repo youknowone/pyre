@@ -3137,10 +3137,18 @@ impl PyFrame {
         self.getorcreate_debug_data(init_lineno)
     }
 
-    /// PyPy-compatible alias for `code()`.
+    /// `pyframe.py PyFrame.getcode`: `hint(self.pycode, promote=True)`.
+    /// `pycode` is a virtualizable field, so a trace reads it as a box; the
+    /// promote is what makes the code object — and every code-invariant the
+    /// callers below read off it — a constant for the compiled loop.  The
+    /// undecorated [`PyFrame::code`] is the read for paths upstream reaches
+    /// through `self.pycode` directly.
     #[inline]
     pub fn getcode(&self) -> &CodeObject {
-        self.code()
+        let pycode = majit_metainterp::jit::promote(self.pycode);
+        unsafe {
+            &*(crate::w_code_get_ptr(pycode as pyre_object::PyObjectRef) as *const CodeObject)
+        }
     }
 
     /// PyPy-compatible `fget_code`.
@@ -5051,8 +5059,7 @@ impl PyFrame {
         let locals_roots = pyre_object::gc_roots::push_roots();
         let locals_slot = locals_roots.base();
         let _ = locals_roots.pin_root(w_locals);
-        let code_ptr = unsafe { pyframe_get_pycode(&*frame_anchor.live()) };
-        let code = unsafe { &*code_ptr };
+        let code = unsafe { (*frame_anchor.live()).getcode() };
         let numlocals = code.varnames.len();
 
         for i in 0..numlocals {
@@ -5156,8 +5163,7 @@ impl PyFrame {
         let locals_roots = pyre_object::gc_roots::push_roots();
         let locals_slot = locals_roots.base();
         let _ = locals_roots.pin_root(w_locals);
-        let code_ptr = unsafe { pyframe_get_pycode(&*frame_anchor.live()) };
-        let code = unsafe { &*code_ptr };
+        let code = unsafe { (*frame_anchor.live()).getcode() };
         let varnames = &code.varnames;
         let numlocals = varnames.len();
 
@@ -6174,6 +6180,31 @@ pub extern "C" fn jit_locals_dict_snapshot(w_locals: i64) -> i64 {
         pyre_object::gc_roots::shadow_stack_get(locals_slot),
     ) {
         Ok(()) => pyre_object::gc_roots::shadow_stack_get(snapshot_slot) as i64,
+        Err(_) => pyre_object::PY_NULL as i64,
+    }
+}
+
+/// `frame_locals_proxy_snapshot`'s extras-first half: copy `src` into `dst`
+/// before the fastlocal overlay.  A key that names no writable fast local
+/// lives only in `f_extra_locals`; the modelled `locals()` rebuild has to
+/// take that dict first or it drops the key.
+///
+/// Reports a failing update as `PY_NULL` so the guarded side exit re-runs
+/// the residual.  Returns `dst` on success so the slot chain can thread it.
+///
+/// # Safety
+/// `dst` and `src` must be live mappings.
+pub extern "C" fn jit_locals_dict_update(dst: i64, src: i64) -> i64 {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dst_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dst as PyObjectRef);
+    let src_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(src as PyObjectRef);
+    match crate::opcode_ops::dict_update_value(
+        pyre_object::gc_roots::shadow_stack_get(dst_slot),
+        pyre_object::gc_roots::shadow_stack_get(src_slot),
+    ) {
+        Ok(()) => pyre_object::gc_roots::shadow_stack_get(dst_slot) as i64,
         Err(_) => pyre_object::PY_NULL as i64,
     }
 }

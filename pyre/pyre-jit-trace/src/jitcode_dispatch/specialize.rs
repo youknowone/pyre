@@ -10962,6 +10962,16 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
 /// no blackhole image to hand them to,
 /// `run_blackhole_interp_to_cancel_tracing` has nowhere to resume, so the walk
 /// goes on recording exactly as it does there.
+/// Name the gate a `locals()` / `vars()` / `dir()` expansion declined at, so a
+/// census over a corpus attributes every refusal to one gate rather than
+/// re-deriving it by reading.  `arm` distinguishes the standard-virtualizable
+/// expansion from the inlined-callee one, which decline for different reasons.
+fn locals_expansion_declined(arm: &str, why: &str) {
+    if fbw_debug_abort_enabled() {
+        eprintln!("[decline-why] LOCALS-{arm} {why}");
+    }
+}
+
 fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -11061,19 +11071,21 @@ fn portal_slot_binder(
 /// unconditionally on a detected force — so this removes the boundary and
 /// leaves the barrier live for every shape it declines.
 ///
-/// Emitted shape, mirroring `pyframe.py:555-574` line by line:
-/// `guard_value(callable)`; the frame's own mapping, read as
+/// Emitted shape, mirroring `pyframe.py:555-574`: `guard_value(callable)`;
 /// `getorcreatedebug()` (the `debugdata` virtualizable field, answered from
-/// `virtualizable_boxes`) followed by `getfield_gc_r(w_locals)` under a
-/// non-null and exact-dict guard; one `getarrayitem_vable_r(frame,
-/// ConstInt(i))` per localsplus slot (the same lowering `emit_load_fast_ref!`
-/// already emits for LOAD_FAST); for a cell slot a `guard_class(Cell)` and one
-/// `getfield_gc_r(contents)` on top of it, which is the whole of
-/// `fast2locals`' cell half (pyframe.py:576-598); a `guard_isnull` /
-/// `guard_nonnull` pinning the bound-ness of whichever of the two the key
-/// takes; and a plain non-forcing `Call` per slot — `setitem_str` when bound,
-/// `delitem` when not.  None of those ops can reach
-/// `force_frame`, so nothing arms the vable protocol.
+/// `virtualizable_boxes`) followed by `getfield_gc_r(w_locals)` under the
+/// guard that pins which of the two mapping arms this is; one
+/// `getarrayitem_vable_r(frame, ConstInt(i))` per localsplus slot (the same
+/// lowering `emit_load_fast_ref!` already emits for LOAD_FAST); for a cell
+/// slot a `guard_class(Cell)` and one `getfield_gc_r(contents)` on top of it,
+/// which is the whole of `fast2locals`' cell half (pyframe.py:576-598); a
+/// `guard_isnull` / `guard_nonnull` pinning the bound-ness of whichever of the
+/// two the key takes; THEN the mapping itself, under its exact-dict guard on
+/// the frame-owned arm; and a plain non-forcing `Call` per slot —
+/// `setitem_str` when bound, `delitem` when not.  Every read and every guard
+/// precedes the mapping, so a guard that fails allocates nothing and leaves no
+/// half-rewritten mapping for the residual to redo.  None of those ops can
+/// reach `force_frame`, so nothing arms the vable protocol.
 ///
 /// The mapping is the FRAME's whenever the frame already carries one:
 /// `fast2locals` rewrites only the varname keys, so a foreign key — one an
@@ -11121,7 +11133,16 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    macro_rules! decline {
+        ($why:literal) => {{
+            locals_expansion_declined("PORTAL", $why);
+            return Ok(None);
+        }};
+    }
     // Plain zero-argument `bh_call_fn(callable, PY_NULL)` shape only.
+    // These four are "not this fold", the same silent `Ok(None)` `super()`
+    // uses for a non-matching CALL.  Naming them LOCALS-PORTAL would
+    // attribute every residual CallFn in the corpus to this arm.
     if r_args.len() != 2 {
         return Ok(None);
     }
@@ -11174,7 +11195,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         ctx.trace_ctx.standard_virtualizable_box(),
         ctx.trace_ctx.standard_virtualizable_ptr(),
     ) else {
-        return Ok(None);
+        decline!("no-standard-virtualizable");
     };
     // The frame `locals()` reports on is `ec.gettopframe_nohidden()`
     // (`interp_inspect.py:7-11`).  Resolve it the same way and require it to BE
@@ -11182,17 +11203,17 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // handed out through the backref chain, resolves elsewhere and declines.
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
-        return Ok(None);
+        decline!("no-exec-context");
     }
     let frame = unsafe { (*ec).gettopframe_nohidden() };
     if frame.is_null() || frame as usize != vable_ptr {
-        return Ok(None);
+        decline!("top-frame-not-the-virtualizable");
     }
     let frame_ref = unsafe { &*frame };
     let code_ptr = unsafe { pyre_interpreter::pyframe::pyframe_get_pycode(frame_ref) };
     let code_obj = unsafe { &*code_ptr };
     if !pyre_interpreter::PyFrame::code_locals_are_modelled_fastlocals(code_obj) {
-        return Ok(None);
+        decline!("not-modelled-fastlocals");
     }
     let numlocals = code_obj.varnames.len();
     // `fast2locals` binds one key per localsplus slot: `varnames` below
@@ -11238,23 +11259,23 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // `locals_cells_stack_w` is PyFrame's only virtualizable array
     // (`virtualizable_gen.rs arrays`), so array index 0 names it.
     let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
-        return Ok(None);
+        decline!("no-virtualizable-info");
     };
     let Some(lengths) = ctx
         .trace_ctx
         .virtualizable_array_lengths()
         .map(<[usize]>::to_vec)
     else {
-        return Ok(None);
+        decline!("no-virtualizable-array-lengths");
     };
     if info.num_arrays() != 1 || lengths.first().copied().unwrap_or(0) < nslots {
-        return Ok(None);
+        decline!("vable-array-shape-too-narrow");
     }
     let (Some(fdescr), Some(adescr)) = (
         info.array_field_descrs().first().cloned(),
         info.array_descrs.first().cloned(),
     ) else {
-        return Ok(None);
+        decline!("no-vable-array-descrs");
     };
     // `fast2locals` opens on `self.getorcreatedebug()` (pyframe.py) and
     // writes into ITS `w_locals`: the mapping is the FRAME's, carried across
@@ -11267,7 +11288,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         .trace_ctx
         .virtualizable_entry_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
     else {
-        return Ok(None);
+        decline!("no-debugdata-vable-entry");
     };
     // Read the mapping through the SHADOW's payload, which is what the emitted
     // `getfield_gc_r` reads, and require it to be the one the residual would
@@ -11285,24 +11306,24 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         unsafe { (*shadow_debugdata).w_locals }
     };
     if !std::ptr::eq(w_locals, frame_ref.get_w_locals()) {
-        return Ok(None);
+        decline!("shadow-mapping-not-the-frames");
     }
     // `f_extra_locals` is the OTHER half of what the residual reports.  A
     // proxy write whose key names no writable fast local lands there
     // (`framelocalsproxy_setitem`) and sets NEITHER `w_locals` nor a slot, and
-    // `frame_locals_proxy_snapshot` copies it in ahead of the fastlocals — so
-    // the mapping this fold rebuilds from slots alone would silently drop the
-    // key.  Decline while the frame carries any, read through the same shadow
-    // payload for the same reason `w_locals` is, and pin the null direction
-    // with a guard below so a write mid-loop side-exits instead.
+    // `frame_locals_proxy_snapshot` copies it in ahead of the fastlocals.
+    // Read through the same shadow payload as `w_locals`; a holder mismatch
+    // declines.  A present extras dict is copied into the rebuilt mapping
+    // before the slot overlay, the same extras-first order the snapshot uses.
     let w_extra_locals = if shadow_debugdata.is_null() {
         pyre_object::PY_NULL
     } else {
         unsafe { (*shadow_debugdata).w_extra_locals }
     };
-    if !w_extra_locals.is_null() || !frame_ref.get_extra_locals().is_null() {
-        return Ok(None);
+    if !std::ptr::eq(w_extra_locals, frame_ref.get_extra_locals()) {
+        decline!("shadow-extra-not-the-frames");
     }
+    let extras_present = !w_extra_locals.is_null();
     // Two shapes, each pinned by a guard so the compiled loop side-exits when
     // the frame moves to the other one:
     //
@@ -11327,7 +11348,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
                     && std::ptr::eq((*w_locals).w_class, canonical_dict)
             })
     {
-        return Ok(None);
+        decline!("frame-mapping-not-exact-dict");
     }
     // Resolve every slot's shadow entry BEFORE emitting anything, so a slot the
     // shadow cannot answer declines from a clean trace position.  The read is
@@ -11338,7 +11359,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     for i in 0..nslots {
         let flat = info.get_index_in_array(0, i, &lengths);
         let Some((slot_op, entry_value)) = ctx.trace_ctx.virtualizable_entry_at(flat) else {
-            return Ok(None);
+            decline!("slot-no-vable-entry");
         };
         // The value comes from the SHADOW, never from `locals_w!(frame)`.  An
         // unsynchronized virtualizable's heap array holds whatever the frame
@@ -11360,7 +11381,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             .unwrap_or(entry_value)
         {
             majit_ir::Value::Ref(gcref) => gcref.as_usize() as pyre_object::PyObjectRef,
-            _ => return Ok(None),
+            _ => decline!("slot-concrete-not-ref"),
         };
         let cell = is_cell_slot(i);
         let value = if cell {
@@ -11370,7 +11391,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             // second arm with its own guard, so decline instead -- the same
             // answer the callee arm gives at `cell-slot-not-a-cell`.
             if held.is_null() || !unsafe { pyre_object::is_cell(held) } {
-                return Ok(None);
+                decline!("cell-slot-not-a-cell");
             }
             unsafe { pyre_object::w_cell_get(held) }
         } else {
@@ -11382,7 +11403,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         // The fresh arm never held the key, so it skips the delete and needs
         // none.
         if cell && i >= numlocals && value.is_null() && frame_owned {
-            return Ok(None);
+            decline!("unbound-cell-slot-needs-delitem");
         }
         slots.push(PortalLocalSlot { value, cell });
     }
@@ -11419,6 +11440,17 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         } else {
             unsafe { pyre_object::w_dict_new() }
         });
+        let extras_failed = if extras_present {
+            let extra_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_extra_locals);
+            let updated = pyre_interpreter::pyframe::jit_locals_dict_update(
+                pyre_object::gc_roots::shadow_stack_get(locals_root) as i64,
+                pyre_object::gc_roots::shadow_stack_get(extra_slot) as i64,
+            );
+            (updated as pyre_object::PyObjectRef).is_null()
+        } else {
+            false
+        };
         let value_roots: Vec<usize> = slots
             .iter()
             .map(|modelled| {
@@ -11428,7 +11460,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             })
             .collect();
         let mut result = pyre_object::PY_NULL;
-        let mut slot_failed = false;
+        let mut slot_failed = extras_failed;
         for (i, &value_root) in value_roots.iter().enumerate() {
             let value = pyre_object::gc_roots::shadow_stack_get(value_root);
             let locals = pyre_object::gc_roots::shadow_stack_get(locals_root) as i64;
@@ -11476,7 +11508,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // publishing it; nothing has been emitted yet, so decline and let the
     // residual raise.
     if concrete_result.is_null() {
-        return Ok(None);
+        decline!("concrete-result-null");
     }
     let concrete_locals_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete_locals as usize));
 
@@ -11515,6 +11547,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // materialises its mapping mid-loop side-exits instead of going on writing
     // into the expansion's own dict.
     let mut field_op = None;
+    let mut extra_field_op = None;
     if debugdata_present {
         let op_ref = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -11530,52 +11563,32 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[op_ref])?;
         }
         field_op = Some(op_ref);
-        // `d.w_extra_locals` — the gate above required it absent, so the loop
-        // side-exits the moment an `f_locals` write puts a non-fast key there
-        // rather than going on publishing a mapping without it.
+        // `d.w_extra_locals` — extras-first copy when present, else pin
+        // absent so a mid-loop proxy write side-exits instead of dropping
+        // the new key.
         let extra_op = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             debugdata_op,
             crate::descr::frame_debug_data_w_extra_locals_descr(),
         );
         if !extra_op.is_constant() {
-            walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[extra_op])?;
+            let opcode = if extras_present {
+                OpCode::GuardNonnull
+            } else {
+                OpCode::GuardIsnull
+            };
+            walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[extra_op])?;
         }
+        extra_field_op = Some(extra_op);
     }
-    let mut dict_op = match field_op.filter(|_| frame_owned) {
-        Some(op_ref) => op_ref,
-        // pyframe.py `self.space.newdict(instance=True)` — the mapping
-        // `fast2locals` would have materialised, built here instead of
-        // modelling the store back into the debug payload.
-        None => ctx.trace_ctx.call_ref_typed_with_effect(
-            pyre_interpreter::pyframe::jit_locals_dict_new as *const (),
-            &[],
-            &[],
-            majit_ir::EffectInfo::new(
-                majit_ir::ExtraEffect::CannotRaise,
-                majit_ir::OopSpecIndex::None,
-            ),
-        ),
-    };
-    ctx.trace_ctx
-        .set_opref_concrete(dict_op, concrete_locals_value);
-    if frame_owned {
-        walker_guard_class(
-            ctx,
-            op.pc,
-            dict_op,
-            &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
-        )?;
-        walker_guard_exact_w_class(
-            ctx,
-            op.pc,
-            dict_op,
-            // Re-derived rather than reusing the gate's binding: the
-            // record-time rewrite above allocates, so this takes the address
-            // `dict` has NOW.
-            pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE),
-        )?;
-    }
+    // `w_cell_get` per cell slot, and every slot's own boundness guard, BEFORE
+    // the mapping is built: a guard that fails after a `newdict` side exits to
+    // a residual that allocates a second mapping, and one that fails after a
+    // store has already rewritten the frame's own mapping leaves the residual
+    // to redo the part that landed.  The reads touch no frame, so none of them
+    // can re-arm the escape this expansion exists to remove.
+    let mut value_ops: Vec<OpRef> = Vec::with_capacity(slots.len());
+    let mut index_consts: Vec<OpRef> = Vec::with_capacity(slots.len());
     for (i, modelled) in slots.iter().enumerate() {
         locals_expansion_cut_if_too_long(ctx, op.pc)?;
         // `self.locals_cells_stack_w[i]` — `jtransform.py:1877
@@ -11583,6 +11596,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         // emits for LOAD_FAST.  On the standard virtualizable this resolves to
         // `virtualizable_boxes[index]` and records no op.
         let index_const = ctx.trace_ctx.const_int(i as i64);
+        index_consts.push(index_const);
         let (slot_op, _) = ctx.trace_ctx.vable_getarrayitem_ref_indexed(
             op.pc,
             vable_op,
@@ -11609,9 +11623,8 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[slot_op])?;
         }
         // `w_cell_get` -- `Cell.contents`, the whole of `fast2locals`' cell
-        // half.  It touches no frame, so it cannot re-arm the escape this
-        // expansion exists to remove.  The compiled loop re-reads the slot, so
-        // the class the walk saw is stated rather than assumed.
+        // half.  The compiled loop re-reads the slot, so the class the walk saw
+        // is stated rather than assumed.
         let value_op = if modelled.cell {
             let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
             if !ctx.trace_ctx.heap_cache().is_class_known(slot_op) {
@@ -11648,6 +11661,71 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         } else {
             slot_op
         };
+        value_ops.push(value_op);
+    }
+    // The last read's guard lands after that loop's own check, so the mapping
+    // and the chain below would otherwise reach the opcode-level check in
+    // `mod.rs` unweighed.
+    locals_expansion_cut_if_too_long(ctx, op.pc)?;
+    let mut dict_op = match field_op.filter(|_| frame_owned) {
+        Some(op_ref) => op_ref,
+        // pyframe.py `self.space.newdict(instance=True)` — the mapping
+        // `fast2locals` would have materialised, built here instead of
+        // modelling the store back into the debug payload.
+        None => ctx.trace_ctx.call_ref_typed_with_effect(
+            pyre_interpreter::pyframe::jit_locals_dict_new as *const (),
+            &[],
+            &[],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        ),
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(dict_op, concrete_locals_value);
+    if frame_owned {
+        walker_guard_class(
+            ctx,
+            op.pc,
+            dict_op,
+            &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
+        )?;
+        walker_guard_exact_w_class(
+            ctx,
+            op.pc,
+            dict_op,
+            // Re-derived rather than reusing the gate's binding: the
+            // record-time rewrite above allocates, so this takes the address
+            // `dict` has NOW.
+            pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE),
+        )?;
+    }
+    if extras_present && let Some(extra_op) = extra_field_op {
+        // `frame_locals_proxy_snapshot`: extras first, then the fastlocal
+        // overlay.  The helper can raise (a user `__eq__` on a colliding
+        // key), so a PY_NULL return side-exits to the residual.
+        let updated = ctx.trace_ctx.call_ref_typed_with_effect(
+            pyre_interpreter::pyframe::jit_locals_dict_update as *const (),
+            &[dict_op, extra_op],
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[updated])?;
+        ctx.trace_ctx
+            .set_opref_concrete(updated, concrete_locals_value);
+        dict_op = updated;
+    }
+    for ((i, modelled), (&index_const, &value_op)) in slots
+        .iter()
+        .enumerate()
+        .zip(index_consts.iter().zip(&value_ops))
+    {
+        locals_expansion_cut_if_too_long(ctx, op.pc)?;
+        let bound = !modelled.value.is_null();
         // `pyframe.py:566-574` — a bound slot is stored, an unbound one
         // deleted.  The delete is what keeps a key from a since-unbound local
         // out of a mapping the frame carries across calls; on the fresh arm
@@ -11887,21 +11965,12 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     concrete_callable: pyre_object::PyObjectRef,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    /// Name the gate that declined.  Unlike the portal arm's decline, which
-    /// falls through to the generic residual, this one costs the caller its
-    /// whole inlined callee, so "the expansion models no part of this shape"
-    /// has to be attributable to one gate rather than re-derived by reading.
+    /// Name the gate that declined.  A decline here costs the caller its whole
+    /// inlined callee, so "the expansion models no part of this shape" has to
+    /// be attributable to one gate rather than re-derived by reading.
     macro_rules! decline {
         ($why:literal) => {{
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] LOCALS-IN-CALLEE {}", $why);
-            }
-            return Ok(None);
-        }};
-        ($why:literal, $($arg:tt)*) => {{
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] LOCALS-IN-CALLEE {}", format!($why, $($arg)*));
-            }
+            locals_expansion_declined("IN-CALLEE", $why);
             return Ok(None);
         }};
     }
