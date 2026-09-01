@@ -38,7 +38,7 @@ def explicit_step(a, b, s):
     return t
 
 
-print(one_arg(N))
+print(one_arg(N - 1))
 print(step_one(1, N))
 print(explicit_step(1, N, 1))
 print(explicit_step(0, N, 2))
