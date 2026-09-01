@@ -1151,7 +1151,13 @@ fn finish_current_frame_execution<Sym: WalkSym>(
     // post-store heapcache value against a still-pre-store concrete carrier.
     // `execute_and_record` would have applied the graph store while tracing;
     // mirror only that recording-time side effect here.
-    unsafe { (*concrete_frame).set_frame_finished_execution(true) };
+    //
+    // The top-level arm hands this a null carrier on purpose — the live red
+    // frame is transitioned by the no-replay commit, not by the walk — so the
+    // store belongs to an escaped inline callee alone.
+    if !concrete_frame.is_null() {
+        unsafe { (*concrete_frame).set_frame_finished_execution(true) };
+    }
 }
 
 fn recording_raise_keeps_existing_traceback<Sym: WalkSym>(
