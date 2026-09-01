@@ -6184,6 +6184,31 @@ pub extern "C" fn jit_locals_dict_snapshot(w_locals: i64) -> i64 {
     }
 }
 
+/// `frame_locals_proxy_snapshot`'s extras-first half: copy `src` into `dst`
+/// before the fastlocal overlay.  A key that names no writable fast local
+/// lives only in `f_extra_locals`; the modelled `locals()` rebuild has to
+/// take that dict first or it drops the key.
+///
+/// Reports a failing update as `PY_NULL` so the guarded side exit re-runs
+/// the residual.  Returns `dst` on success so the slot chain can thread it.
+///
+/// # Safety
+/// `dst` and `src` must be live mappings.
+pub extern "C" fn jit_locals_dict_update(dst: i64, src: i64) -> i64 {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dst_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dst as PyObjectRef);
+    let src_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(src as PyObjectRef);
+    match crate::opcode_ops::dict_update_value(
+        pyre_object::gc_roots::shadow_stack_get(dst_slot),
+        pyre_object::gc_roots::shadow_stack_get(src_slot),
+    ) {
+        Ok(()) => pyre_object::gc_roots::shadow_stack_get(dst_slot) as i64,
+        Err(_) => pyre_object::PY_NULL as i64,
+    }
+}
+
 /// Name whichever frame on the current call chain still points at a
 /// `locals_cells_stack_w` array a collection has already moved.
 ///

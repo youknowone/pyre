@@ -11311,19 +11311,19 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // `f_extra_locals` is the OTHER half of what the residual reports.  A
     // proxy write whose key names no writable fast local lands there
     // (`framelocalsproxy_setitem`) and sets NEITHER `w_locals` nor a slot, and
-    // `frame_locals_proxy_snapshot` copies it in ahead of the fastlocals — so
-    // the mapping this fold rebuilds from slots alone would silently drop the
-    // key.  Decline while the frame carries any, read through the same shadow
-    // payload for the same reason `w_locals` is, and pin the null direction
-    // with a guard below so a write mid-loop side-exits instead.
+    // `frame_locals_proxy_snapshot` copies it in ahead of the fastlocals.
+    // Read through the same shadow payload as `w_locals`; a holder mismatch
+    // declines.  A present extras dict is copied into the rebuilt mapping
+    // before the slot overlay, the same extras-first order the snapshot uses.
     let w_extra_locals = if shadow_debugdata.is_null() {
         pyre_object::PY_NULL
     } else {
         unsafe { (*shadow_debugdata).w_extra_locals }
     };
-    if !w_extra_locals.is_null() || !frame_ref.get_extra_locals().is_null() {
-        decline!("frame-has-extra-locals");
+    if !std::ptr::eq(w_extra_locals, frame_ref.get_extra_locals()) {
+        decline!("shadow-extra-not-the-frames");
     }
+    let extras_present = !w_extra_locals.is_null();
     // Two shapes, each pinned by a guard so the compiled loop side-exits when
     // the frame moves to the other one:
     //
@@ -11440,6 +11440,17 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         } else {
             unsafe { pyre_object::w_dict_new() }
         });
+        let extras_failed = if extras_present {
+            let extra_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_extra_locals);
+            let updated = pyre_interpreter::pyframe::jit_locals_dict_update(
+                pyre_object::gc_roots::shadow_stack_get(locals_root) as i64,
+                pyre_object::gc_roots::shadow_stack_get(extra_slot) as i64,
+            );
+            (updated as pyre_object::PyObjectRef).is_null()
+        } else {
+            false
+        };
         let value_roots: Vec<usize> = slots
             .iter()
             .map(|modelled| {
@@ -11449,7 +11460,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             })
             .collect();
         let mut result = pyre_object::PY_NULL;
-        let mut slot_failed = false;
+        let mut slot_failed = extras_failed;
         for (i, &value_root) in value_roots.iter().enumerate() {
             let value = pyre_object::gc_roots::shadow_stack_get(value_root);
             let locals = pyre_object::gc_roots::shadow_stack_get(locals_root) as i64;
@@ -11536,6 +11547,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // materialises its mapping mid-loop side-exits instead of going on writing
     // into the expansion's own dict.
     let mut field_op = None;
+    let mut extra_field_op = None;
     if debugdata_present {
         let op_ref = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -11551,17 +11563,23 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[op_ref])?;
         }
         field_op = Some(op_ref);
-        // `d.w_extra_locals` — the gate above required it absent, so the loop
-        // side-exits the moment an `f_locals` write puts a non-fast key there
-        // rather than going on publishing a mapping without it.
+        // `d.w_extra_locals` — extras-first copy when present, else pin
+        // absent so a mid-loop proxy write side-exits instead of dropping
+        // the new key.
         let extra_op = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             debugdata_op,
             crate::descr::frame_debug_data_w_extra_locals_descr(),
         );
         if !extra_op.is_constant() {
-            walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[extra_op])?;
+            let opcode = if extras_present {
+                OpCode::GuardNonnull
+            } else {
+                OpCode::GuardIsnull
+            };
+            walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[extra_op])?;
         }
+        extra_field_op = Some(extra_op);
     }
     // `w_cell_get` per cell slot, and every slot's own boundness guard, BEFORE
     // the mapping is built: a guard that fails after a `newdict` side exits to
@@ -11682,6 +11700,24 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             // `dict` has NOW.
             pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE),
         )?;
+    }
+    if extras_present && let Some(extra_op) = extra_field_op {
+        // `frame_locals_proxy_snapshot`: extras first, then the fastlocal
+        // overlay.  The helper can raise (a user `__eq__` on a colliding
+        // key), so a PY_NULL return side-exits to the residual.
+        let updated = ctx.trace_ctx.call_ref_typed_with_effect(
+            pyre_interpreter::pyframe::jit_locals_dict_update as *const (),
+            &[dict_op, extra_op],
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[updated])?;
+        ctx.trace_ctx
+            .set_opref_concrete(updated, concrete_locals_value);
+        dict_op = updated;
     }
     for ((i, modelled), (&index_const, &value_op)) in slots
         .iter()
