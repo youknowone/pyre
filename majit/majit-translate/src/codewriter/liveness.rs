@@ -139,11 +139,11 @@ pub fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
             continue;
         }
         let mut labels = Vec::new();
-        let mut merged_live: HashSet<Register> = HashSet::new();
+        let mut lives = Vec::new();
         while i < ops.len() {
             match &ops[i] {
                 FlatOp::Live { live_values } => {
-                    merged_live.extend(live_values.iter().copied());
+                    lives.push(live_values.clone());
                     i += 1;
                 }
                 FlatOp::Label(_) => {
@@ -154,6 +154,19 @@ pub fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
             }
         }
         result.extend(labels);
+        if lives.len() == 1 {
+            // RPython `remove_repeated_live`: a lone marker is moved after
+            // interleaved labels but otherwise preserved byte-for-byte. The
+            // union/sort step belongs only to a genuinely repeated run.
+            result.push(FlatOp::Live {
+                live_values: lives.pop().unwrap(),
+            });
+            continue;
+        }
+        let mut merged_live: HashSet<Register> = HashSet::new();
+        for live in lives {
+            merged_live.extend(live);
+        }
         // Stable order so the final bytecode encoding is reproducible.
         let mut merged: Vec<Register> = merged_live.into_iter().collect();
         merged.sort_by_key(|r| (r.kind as u8, r.index));
@@ -562,6 +575,31 @@ mod tests {
 
     use crate::flatten::FlatOp;
     use crate::model::{OpKind, SpaceOperation, ValueType};
+
+    #[test]
+    fn lone_live_marker_keeps_its_original_register_sequence() {
+        // RPython `remove_repeated_live`: labels move before a lone marker,
+        // but the marker itself bypasses the multi-marker set/sort path.
+        let live = vec![
+            Register::new(RegKind::Int, 2),
+            Register::new(RegKind::Int, 1),
+            Register::new(RegKind::Int, 2),
+        ];
+        let mut ops = vec![
+            FlatOp::Live {
+                live_values: live.clone(),
+            },
+            FlatOp::Label(Label(7)),
+        ];
+
+        remove_repeated_live(&mut ops);
+
+        assert!(matches!(ops.first(), Some(FlatOp::Label(Label(7)))));
+        assert!(matches!(
+            ops.get(1),
+            Some(FlatOp::Live { live_values }) if live_values == &live
+        ));
+    }
 
     #[test]
     fn basic_liveness() {

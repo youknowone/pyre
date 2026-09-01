@@ -644,9 +644,9 @@ impl Assembler {
             constants_f: state.constants_f,
             str_consts: state.str_consts,
             unit_variant_consts: state.unit_variant_consts,
-            c_num_regs_i: num_regs_i as u16,
-            c_num_regs_r: num_regs_r as u16,
-            c_num_regs_f: num_regs_f as u16,
+            c_num_regs_i: num_regs_i as u8,
+            c_num_regs_r: num_regs_r as u8,
+            c_num_regs_f: num_regs_f as u8,
             // self.startpoints, alllabels=self.alllabels,
             // resulttypes=self.resulttypes, ...)` — assembled jitcodes
             // always carry the recorded set, never `None`. Wrap in

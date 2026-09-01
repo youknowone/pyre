@@ -2656,15 +2656,20 @@ mod residual_call_not_dropped {
     }
 }
 
-/// A float comparison can lower as an integer value, but using it directly as
-/// a conditional guard must degrade until guard-bridge lowering is supported.
+/// `jtransform.py`'s `optimize_goto_if_not` keeps a float comparison as a
+/// value when it escapes, but fuses it into the branch when it is consumed
+/// only by the exitswitch.
 mod float_compare_branch_gate {
     use super::Bytecode;
-    use majit_metainterp::jitcode::insns::BC_FLOAT_GE;
+    use majit_metainterp::jitcode::insns::{
+        BC_FLOAT_GE, BC_GOTO_IF_NOT_FLOAT_GE, BC_GOTO_IF_NOT_INT_GE, BC_GOTO_IF_NOT_INT_IS_ZERO,
+    };
     use majit_metainterp::{Assembler, JitDriver};
 
     const OP_VALUE: u8 = 6;
     const OP_BRANCH: u8 = 7;
+    const OP_INT_BRANCH: u8 = 8;
+    const OP_NEGATED_BRANCH: u8 = 9;
 
     struct FloatCmpState {
         fa: f64,
@@ -2700,9 +2705,23 @@ mod float_compare_branch_gate {
             match opcode {
                 // Value form: float compare materialized to an int — lowers.
                 OP_VALUE => state.acc += (state.fa >= state.fb) as i64,
-                // Branch form: float compare feeding a guard — must abort.
+                // Branch form: lowers to goto_if_not_float_ge/ffL.
                 OP_BRANCH => {
                     if state.fa >= state.fb {
+                        state.acc += 1;
+                    }
+                }
+                // The same upstream optimization covers integer comparisons.
+                OP_INT_BRANCH => {
+                    if state.acc >= 0 {
+                        state.acc += 1;
+                    }
+                }
+                // An odd negation must not invert a float comparison: that
+                // would change the result for NaNs. PyPy materializes the
+                // comparison and fuses bool_not as int_is_zero instead.
+                OP_NEGATED_BRANCH => {
+                    if !(state.fa >= state.fb) {
                         state.acc += 1;
                     }
                 }
@@ -2713,7 +2732,7 @@ mod float_compare_branch_gate {
     }
 
     #[test]
-    fn float_compare_lowers_as_value_but_not_as_branch_guard() {
+    fn float_compare_lowers_as_value_and_fused_branch_guard() {
         let mut asm = Assembler::new();
         asm.set_canonical_liveness_triple(vec![2], vec![], vec![0, 1]);
         __prebuild_jitcode_liveness_dispatch_float_cmp(&mut asm);
@@ -2727,12 +2746,62 @@ mod float_compare_branch_gate {
             .filter_map(|descr| descr.as_jitcode())
             .map(|sub| sub.code.iter().filter(|&&b| b == BC_FLOAT_GE).count())
             .sum();
-        // The value-form arm emits exactly one float_ge; the branch-form arm
-        // must abort lowering (no float_ge feeding a guard), so the total is
-        // 1 rather than 2.
+        let guard_ge_count: usize = dispatch_jc
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_jitcode())
+            .map(|sub| {
+                sub.code
+                    .iter()
+                    .filter(|&&b| b == BC_GOTO_IF_NOT_FLOAT_GE)
+                    .count()
+            })
+            .sum();
+        let int_guard_ge_count: usize = dispatch_jc
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_jitcode())
+            .map(|sub| {
+                sub.code
+                    .iter()
+                    .filter(|&&b| b == BC_GOTO_IF_NOT_INT_GE)
+                    .count()
+            })
+            .sum();
+        let negated_guard_count: usize = dispatch_jc
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_jitcode())
+            .map(|sub| {
+                sub.code
+                    .iter()
+                    .filter(|&&b| b == BC_GOTO_IF_NOT_INT_IS_ZERO)
+                    .count()
+            })
+            .sum();
+        // The value and odd-negation arms retain float_ge/ff>i. The direct
+        // branch arm has no materialized boolean and emits the fused ffL
+        // exitswitch instead.
         assert_eq!(
-            ge_count, 1,
-            "float compare must lower as value but not as branch guard; float_ge={ge_count}"
+            ge_count, 2,
+            "only the escaping and negated float comparisons should materialize; \
+             float_ge={ge_count}"
+        );
+        assert_eq!(
+            guard_ge_count, 1,
+            "branch comparison must fuse; goto_if_not_float_ge={guard_ge_count}"
+        );
+        assert_eq!(
+            int_guard_ge_count, 1,
+            "integer branch comparison must fuse too; goto_if_not_int_ge={int_guard_ge_count}"
+        );
+        assert_eq!(
+            negated_guard_count, 1,
+            "odd float negation must preserve NaN semantics via int_is_zero; \
+             goto_if_not_int_is_zero={negated_guard_count}"
         );
     }
 }

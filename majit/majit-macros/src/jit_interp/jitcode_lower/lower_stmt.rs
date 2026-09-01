@@ -1457,8 +1457,18 @@ impl<'c> Lowerer<'c> {
     }
 
     pub(super) fn lower_config_call_stmt(&mut self, expr: &Expr) -> Option<()> {
-        let Expr::Call(call) = expr else {
-            return None;
+        // RPython `Transformer.rewrite_call` sees a method receiver as the
+        // first ordinary argument.  Normalize Rust method syntax through the
+        // same call-policy path as value-position calls instead of silently
+        // dropping a void/result-discarding method statement.
+        let normalized;
+        let call = match expr {
+            Expr::Call(call) => call,
+            Expr::MethodCall(method_call) => {
+                normalized = self.normalize_method_call(method_call)?;
+                &normalized
+            }
+            _ => return None,
         };
         let policy = self.resolve_call_policy(&call.func)?;
         if call.args.len() > MAX_HELPER_CALL_ARITY {

@@ -5862,9 +5862,13 @@ impl JitCodeBuilder {
             // descriptor banks are empty.
             str_consts: Vec::new(),
             unit_variant_consts: Vec::new(),
-            c_num_regs_i: self.num_regs_i,
-            c_num_regs_r: self.num_regs_r,
-            c_num_regs_f: self.num_regs_f,
+            // `jitcode.py JitCode.setup`: the three register counts are
+            // stored as one `chr` apiece.  The gate above proves these casts
+            // lossless; keeping the builder counters wide is useful only
+            // while detecting an unencodable source body.
+            c_num_regs_i: self.num_regs_i as u8,
+            c_num_regs_r: self.num_regs_r as u8,
+            c_num_regs_f: self.num_regs_f as u8,
             // RPython `assembler.py make_jitcode(startpoints=
             // self.startpoints, alllabels=self.alllabels, ...)` —
             // assembled jitcodes always carry the recorded set, never

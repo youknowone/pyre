@@ -5512,38 +5512,30 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 false
             };
             if view_set_like(a) && view_set_like(b) {
-                // A set operand stands in for itself; only a view is walked and
-                // hashed into one. Rebuilding a set from its own elements would
-                // hand each of them back to a user `__hash__`.
-                let as_set = |obj: PyObjectRef| -> Result<PyObjectRef, PyError> {
-                    if pyre_object::is_set_or_frozenset(obj) {
-                        return Ok(obj);
-                    }
-                    crate::builtins::builtin_set_from_items(
-                        &crate::type_methods::dict_view_snapshot(obj),
-                    )
+                // `SetLikeDictView` owns every one of these comparisons
+                // upstream: a set answers `NotImplemented` for a view, and the
+                // reflected call on the view side is what decides.  Reaching
+                // that method is what this arm stands in for, so it hands the
+                // pair to the same walk with the operator reflected when the
+                // view is the right-hand operand — rather than reducing both
+                // sides to sets, which answers from a snapshot taken before
+                // the first user `__eq__` and so cannot see that dict change
+                // size under the comparison.
+                use crate::typedef::DictViewCmp;
+                // At least one operand is a set here, so a view on the left is
+                // the whole test for which side the reflected call names as
+                // `self`.
+                let view_on_left = pyre_object::dictmultiobject::is_dict_view(a);
+                let op = match (op, view_on_left) {
+                    (CompareOp::Eq, _) => DictViewCmp::Eq,
+                    (CompareOp::Ne, _) => DictViewCmp::Ne,
+                    (CompareOp::Lt, true) | (CompareOp::Gt, false) => DictViewCmp::Lt,
+                    (CompareOp::Le, true) | (CompareOp::Ge, false) => DictViewCmp::Le,
+                    (CompareOp::Gt, true) | (CompareOp::Lt, false) => DictViewCmp::Gt,
+                    (CompareOp::Ge, true) | (CompareOp::Le, false) => DictViewCmp::Ge,
                 };
-                // Building the second set hashes every element it stores,
-                // which runs Python, and a set `as_set` had to mint is not
-                // held by anything else — it is old-gen, so it never moves,
-                // but an unreachable one is still swept.
-                let _roots = pyre_object::gc_roots::push_roots();
-                let a_set = as_set(a)?;
-                let a_set = pyre_object::gc_roots::pin_root(a_set);
-                let b_set = as_set(b)?;
-                let b_set = pyre_object::gc_roots::pin_root(b_set);
-                let la = pyre_object::w_set_len(a_set);
-                let lb = pyre_object::w_set_len(b_set);
-                let a_subset_b = || crate::typedef::set_is_subset_of(a_set, b_set);
-                let b_subset_a = || crate::typedef::set_is_subset_of(b_set, a_set);
-                return Ok(w_bool_from(match op {
-                    CompareOp::Eq => la == lb && a_subset_b()?,
-                    CompareOp::Ne => la != lb || !a_subset_b()?,
-                    CompareOp::Le => la <= lb && a_subset_b()?,
-                    CompareOp::Lt => la < lb && a_subset_b()?,
-                    CompareOp::Ge => la >= lb && b_subset_a()?,
-                    CompareOp::Gt => la > lb && b_subset_a()?,
-                }));
+                let (view, other) = if view_on_left { (a, b) } else { (b, a) };
+                return crate::typedef::dict_view_compare(view, other, op);
             }
         }
         // set / frozenset comparison — subset / superset / equality.

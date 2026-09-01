@@ -1779,12 +1779,11 @@ impl<'c> Lowerer<'c> {
         })
     }
 
-    /// Lower an `Expr::MethodCall` by mapping the receiver ident to its
-    /// canonical owning type (via `LowererConfig.state_type_name` /
-    /// `env_type_name`) and dispatching through the existing call-policy
-    /// table keyed on `<type>::<method>` segments. The receiver is lowered
-    /// as the first call argument so the owning type's `&self` parameter
-    /// gets a real register binding.
+    /// Normalize an `Expr::MethodCall` to the associated free-call shape used
+    /// by the codewriter call-policy machinery.  Both value- and
+    /// statement-position lowering call this helper: RPython
+    /// `Transformer.rewrite_call` receives the receiver as the first ordinary
+    /// argument and does not distinguish the two Rust surface syntaxes.
     ///
     /// Receiver-resolution policy: only the env parameter (`program`) and
     /// the state parameter (`state`) are accepted; any other receiver
@@ -1794,15 +1793,7 @@ impl<'c> Lowerer<'c> {
     /// preserves that fidelity. Arbitrary receivers cannot be resolved
     /// without the owning type identity, so they fall through.
     ///
-    /// Currently only the `Elidable*` Int policy family is supported
-    /// (the consumer set required for `Program::get_req_size`-shaped
-    /// helpers). Wrapped / inline / non-int return policies fall through;
-    /// extending them mirrors the corresponding `lower_call_value` arms
-    /// when needed.
-    ///
-    /// RPython parity: `jtransform.py:456-470 rewrite_op` (graph-identity
-    /// lookup) + `call.py getcalldescr`.
-    fn lower_method_call_value(&mut self, call: &ExprMethodCall) -> Option<Binding> {
+    pub(super) fn normalize_method_call(&self, call: &ExprMethodCall) -> Option<ExprCall> {
         let receiver_ident = match &*call.receiver {
             Expr::Path(ExprPath { path, .. }) => path.get_ident()?,
             _ => return None,
@@ -1815,89 +1806,34 @@ impl<'c> Lowerer<'c> {
             _ => return None,
         };
 
-        let method_segments = vec![type_name.clone(), call.method.to_string()];
-        let policy = self
-            .call_policies
-            .iter()
-            .find(|(p, _)| *p == method_segments)
-            .map(|(_, spec)| spec.clone())?;
-        let kind = match policy {
-            CallPolicySpec::Explicit(kind) => kind,
-            // Method-call inference is not supported; the policy table
-            // must declare the method explicitly.
-            CallPolicySpec::Infer => return None,
-        };
-
-        // Receiver counts as the first call argument; RPython
-        // `jtransform.py:456 rewrite_op` similarly threads `op.args[0]`
-        // (the receiver / first positional) ahead of the rest.
-        if call.args.len() + 1 > MAX_HELPER_CALL_ARITY {
-            return None;
-        }
-
-        let receiver_binding = self.lower_value_expr(&call.receiver)?;
-        let mut arg_bindings = Vec::with_capacity(call.args.len() + 1);
-        let mut depends_on_stack = receiver_binding.depends_on_stack;
-        arg_bindings.push(receiver_binding);
-        for arg in &call.args {
-            let binding = self.lower_value_expr(arg)?;
-            depends_on_stack |= binding.depends_on_stack;
-            arg_bindings.push(binding);
-        }
-
-        // Construct the `<Type>::<method>` path tokens for `add_fn_ptr`.
+        // Construct the `Type::method` function item.  Preserve an explicit
+        // method turbofish: `recv.method::<T>(x)` becomes
+        // `Type::method::<T>(recv, x)`.
         let type_ident = format_ident!("{}", type_name);
         let method_ident = &call.method;
-        let func_path = quote! { <#type_ident>::#method_ident };
-
-        let reg = self.alloc_reg();
-        let result_kind = BindingKind::Int;
-        match kind {
-            crate::jit_interp::CallPolicyKind::ElidableInt
-            | crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise
-            | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => {
-                let typed_args = typed_call_arg_tokens(&arg_bindings);
-                let __arg_regs: Vec<Register> =
-                    arg_bindings.iter().map(Register::from_binding).collect();
-                let arg_kinds: Vec<BindingKind> = arg_bindings.iter().map(|b| b.kind).collect();
-                let word_result_addr = word_result_addr_tokens(&func_path, &arg_kinds);
-                let call_stmt = match kind {
-                    crate::jit_interp::CallPolicyKind::ElidableInt => quote! {
-                        __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
-                    },
-                    crate::jit_interp::CallPolicyKind::ElidableIntCannotRaise => quote! {
-                        __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg);
-                    },
-                    crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => quote! {
-                        __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg);
-                    },
-                    _ => unreachable!(),
-                };
-                self.emit_op(
-                    OpMeta::linear(
-                        OpKind::Call,
-                        __arg_regs,
-                        vec![Register::new(result_kind, reg)],
-                    ),
-                    quote! {
-                        let __fn_idx = __builder.add_word_abi_fn_ptr(#word_result_addr);
-                        #call_stmt
-                    },
-                );
-            }
-            // Other policy kinds are not yet wired for method-call RHS.
-            // Consumers needing residual / may_force / wrapped / inline
-            // method-call lowering must add the corresponding arm here
-            // mirroring `lower_call_value`'s shape.
-            _ => return None,
-        }
-
-        Some(Binding {
-            reg,
-            kind: result_kind,
-            depends_on_stack,
-            struct_type: None,
+        let func: Expr = if let Some(turbofish) = &call.turbofish {
+            syn::parse_quote! { #type_ident::#method_ident #turbofish }
+        } else {
+            syn::parse_quote! { #type_ident::#method_ident }
+        };
+        let mut args = syn::punctuated::Punctuated::new();
+        args.push((*call.receiver).clone());
+        args.extend(call.args.iter().cloned());
+        Some(ExprCall {
+            attrs: call.attrs.clone(),
+            func: Box::new(func),
+            paren_token: call.paren_token,
+            args,
         })
+    }
+
+    /// Method syntax does not select a smaller policy/result-kind universe.
+    /// Reuse `lower_call_value` so residual, elidable, may-force, release-gil,
+    /// loop-invariant, wrapped, inline and inferred policies all keep the same
+    /// `Transformer.rewrite_call` contract.
+    fn lower_method_call_value(&mut self, call: &ExprMethodCall) -> Option<Binding> {
+        let normalized = self.normalize_method_call(call)?;
+        self.lower_call_value(&normalized)
     }
 
     fn lower_if_value(&mut self, expr_if: &ExprIf) -> Option<Binding> {
@@ -1905,10 +1841,8 @@ impl<'c> Lowerer<'c> {
             return Some(binding);
         }
 
-        let (cond, cond_negated) = self.lower_condition(&expr_if.cond)?;
-        if !matches!(cond.kind, BindingKind::Int) {
-            return None;
-        }
+        let cond = self.lower_condition(&expr_if.cond)?;
+        let cond_depends_on_stack = cond.depends_on_stack();
         let (_, else_expr) = expr_if.else_branch.as_ref()?;
         // A branch that fails to lower fails the whole if-expression as
         // unsupported (`?`): the codewriter lowers expressible ops exactly
@@ -1933,15 +1867,13 @@ impl<'c> Lowerer<'c> {
         let else_label = self.alloc_label();
         let end_label = self.alloc_label();
         let result_reg = self.alloc_reg();
-        let cond_reg = cond.reg;
-
         self.emit_aux(quote! { let #else_label = __builder.new_label(); });
         self.emit_aux(quote! { let #end_label = __builder.new_label(); });
         self.emit_op(
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
         );
-        self.emit_conditional_guard_negatable(cond_reg, &else_label, cond_negated);
+        self.emit_lowered_condition_guard(&cond, &else_label);
         self.append_lowered_sequence(then_seq);
         self.emit_op(
             OpMeta::linear(
@@ -1967,7 +1899,7 @@ impl<'c> Lowerer<'c> {
         Some(Binding {
             reg: result_reg,
             kind: BindingKind::Int,
-            depends_on_stack: cond.depends_on_stack
+            depends_on_stack: cond_depends_on_stack
                 || then_binding.depends_on_stack
                 || else_binding.depends_on_stack,
             struct_type: None,

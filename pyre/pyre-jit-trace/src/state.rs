@@ -12945,7 +12945,7 @@ mod tests {
             live.iter()
                 .copied()
                 .max()
-                .map_or(4u16, |m| (m as u16 + 1).max(4))
+                .map_or(4u8, |m| m.saturating_add(1).max(4))
         };
         let runtime_jc = {
             let inner = majit_metainterp::jitcode::JitCode::new("close_loop_args_test");
