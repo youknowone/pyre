@@ -1240,6 +1240,9 @@ function or global variable."#
         "getctype" => {
             "Return a string giving the C type 'cdecl', which may be itself a\nstring or a <ctype> object.  If 'replace_with' is given, it gives\nextra text to append (or insert for more complicated C types), like a\nvariable name, or '*' to get actually the C type 'pointer-to-cdecl'."
         }
+        "getwinerror" => {
+            "Return either the GetLastError() or the error number given by the\noptional 'code' argument, as a tuple '(code, message)'."
+        }
         "init_once" => {
             "init_once(function, tag): run function() once.  More precisely,\n'function()' is called the first time we see a given 'tag'.\n\nThe return value of function() is remembered and returned by the current\nand all future init_once() with the same tag.  If init_once() is called\nfrom multiple threads in parallel, all calls block until the execution\nof function() is done.  If function() raises an exception, it is\npropagated and nothing is cached."
         }
@@ -1322,10 +1325,17 @@ fn init_ffi_type(ns: PyObjectRef) {
             crate::make_builtin_function_with_doc(name, function, ffi_method_doc(name)),
         );
     }
+    // `ffi_obj.py` registers this one through `_extras` because it exists on
+    // win32 alone; its docstring is the same table entry every other method
+    // takes.
     #[cfg(windows)]
     store(
         "getwinerror",
-        crate::make_builtin_function("getwinerror", ffi_getwinerror),
+        crate::make_builtin_function_with_doc(
+            "getwinerror",
+            ffi_getwinerror,
+            ffi_method_doc("getwinerror"),
+        ),
     );
     let getter = crate::make_builtin_function_with_arity("errno", errno_get, 2);
     let setter = crate::make_builtin_function_with_arity("errno", errno_set, 3);
