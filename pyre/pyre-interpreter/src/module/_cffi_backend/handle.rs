@@ -15,10 +15,7 @@ pub fn newp_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             ct.name()
         )));
     }
-    let obj = cdataobj::new_cdata_handle(args[0], args[1]);
-    let ptr = super::hide_reveal::hide_object(obj);
-    cdataobj::cdata_arg(obj)?.ptr = ptr as usize;
-    Ok(obj)
+    Ok(cdataobj::new_cdata_handle(args[0], args[1]))
 }
 
 /// `handle.py from_handle` and `_reveal`.

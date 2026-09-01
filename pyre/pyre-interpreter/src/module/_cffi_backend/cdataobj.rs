@@ -38,12 +38,13 @@ pub const FLAVOR_CALLBACK: i64 = 9;
 
 /// `cdataobj.py W_CData` and the RPython subclasses sharing its typedef.
 #[crate::pyre_class("_cffi_backend._CDataBase")]
-// `W_CData._immutable_fields_` names `_ptr` and `ctype`; only `ctype` is
-// declared here.  `do_exit` clears `ptr`, which `_do_exit` does not, so a
-// trace that folded the address would keep using a freed one.  Declaring
-// `ctype` is what lets a call through a constant cdata fold its function
-// type, and with it the `cif_descr` behind it.
-#[majit_macros::jit_immutable_fields("ctype")]
+// `W_CData._immutable_fields_` names `_ptr` and `ctype`.  Declaring `ctype`
+// is what lets a call through a constant cdata fold its function type, and
+// with it the `cif_descr` behind it; declaring `ptr` folds the address the
+// call goes to.  The only write to `ptr` after construction is the one
+// `w_cdata_dealloc` makes on a GC-dead object, which no live reference can
+// read back.
+#[majit_macros::jit_immutable_fields("ctype", "ptr")]
 #[derive(Default)]
 pub struct W_CData {
     /// `W_CData.ctype`.
@@ -238,15 +239,16 @@ pub fn new_cdata_ptr_to_struct(
     new_cdata_full(ptr, w_ctype, FLAVOR_PTR_TO_STRUCT, -1, -1, w_structobj)
 }
 
-/// `W_CDataHandle.__init__`.
+/// `W_CDataHandle.__init__`, together with the `instantiate` /
+/// `hide_nonmovable_gcref` pair `newp_handle` performs ahead of it:
+/// `allocate_stable` supplies the non-moving address `hide_object` exposes,
+/// and the pointer is that address, so it is filled in after the allocation
+/// the way the late `W_CData.__init__` call does upstream.
 pub fn new_cdata_handle(w_ctype: PyObjectRef, w_keepalive: PyObjectRef) -> PyObjectRef {
-    // `allocate_stable` supplies the non-moving address that `hide_object`
-    // exposes.  Fill the pointer after allocation because it is the object's
-    // own address.
     let obj = new_cdata_full(0, w_ctype, FLAVOR_HANDLE, -1, -1, w_keepalive);
     W_CData::from_obj(obj)
         .expect("new_cdata_full returns a cdata")
-        .ptr = obj as usize;
+        .ptr = super::hide_reveal::hide_object(obj) as usize;
     obj
 }
 
@@ -843,8 +845,10 @@ fn do_exit(w_cdata: PyObjectRef) -> Result<(), PyError> {
                 add_memory_pressure(w_cdata, -cdata.datasize);
                 cdata.datasize = -1;
                 crate::executioncontext::may_ignore_finalizer(w_cdata);
+                // The freed address stays in `ptr`: reading a released
+                // cdata is the caller's error, and `datasize` is what makes
+                // a second release a no-op.
                 unsafe { libc::free(cdata.ptr as *mut libc::c_void) };
-                cdata.ptr = 0;
             }
         }
         FLAVOR_NEW_NONSTD => {
