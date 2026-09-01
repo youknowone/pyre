@@ -512,8 +512,19 @@ pub extern "C" fn jit_range_iter_new(current: i64, remaining: i64, step: i64) ->
 /// # Safety
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
-    let iter = obj as *mut W_IntRangeIterator;
     unsafe {
+        if is_range_iter_step_one_shape(obj) {
+            let iter = obj as *mut W_IntRangeOneArgIterator;
+            let current = (*iter).current;
+            if current < (*iter).stop {
+                // Advance before allocating: `w_int_new` can collect, and the
+                // cursor write must not land through a stale pointer.
+                (*iter).current = current + 1;
+                return Some(crate::intobject::w_int_new(current));
+            }
+            return None;
+        }
+        let iter = obj as *mut W_IntRangeIterator;
         if (*iter).remaining > 0 {
             let current = (*iter).current;
             let step = (*iter).step;
@@ -531,17 +542,141 @@ pub unsafe fn w_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// # Safety
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_has_next(obj: PyObjectRef) -> bool {
-    let iter = obj as *const W_IntRangeIterator;
-    unsafe { (*iter).remaining > 0 }
+    unsafe { w_range_iter_remaining(obj) > 0 }
 }
 
-/// Check if an object is a range iterator.
+/// `functional.py W_IntRangeStepOneIterator` — the shape `descr_iter` picks
+/// when the `range` was built without a step argument and does not start at
+/// zero.
+///
+/// Layout: `[ob_type | current: i64 | stop: i64 | start: i64]`
+/// `stop` is the sole `_immutable_fields_` entry, so a compiled loop hoists
+/// the bound and the per-iteration cursor work is one load, one add and one
+/// store — `step` is the constant 1 and `remaining` is derived as
+/// `stop - current`.
+#[pyre_class("range_iterator", type_id = 183, static_name = "RANGE_ITER_STEP_ONE")]
+pub struct W_IntRangeStepOneIterator {
+    pub current: i64,
+    pub stop: i64,
+    pub start: i64,
+}
+
+/// `functional.py W_IntRangeOneArgIterator` — the shape for `range(stop)`.
+/// Its values are always `>= 0`, which is the property the JIT reads off the
+/// class.
+///
+/// Layout: `[ob_type | current: i64 | stop: i64]`
+#[pyre_class("range_iterator", type_id = 184, static_name = "RANGE_ITER_ONE_ARG")]
+pub struct W_IntRangeOneArgIterator {
+    pub current: i64,
+    pub stop: i64,
+}
+
+pub const RANGE_ITER_STEP_ONE_CURRENT_OFFSET: usize =
+    std::mem::offset_of!(W_IntRangeStepOneIterator, current);
+pub const RANGE_ITER_STEP_ONE_STOP_OFFSET: usize =
+    std::mem::offset_of!(W_IntRangeStepOneIterator, stop);
+pub const RANGE_ITER_STEP_ONE_START_OFFSET: usize =
+    std::mem::offset_of!(W_IntRangeStepOneIterator, start);
+pub const RANGE_ITER_ONE_ARG_CURRENT_OFFSET: usize =
+    std::mem::offset_of!(W_IntRangeOneArgIterator, current);
+pub const RANGE_ITER_ONE_ARG_STOP_OFFSET: usize =
+    std::mem::offset_of!(W_IntRangeOneArgIterator, stop);
+
+/// Both `step == 1` shapes open with `current` then `stop`;
+/// `W_IntRangeStepOneIterator` only adds `start` behind them.  The cursor
+/// accessors below read that shared prefix through one of the two types, so
+/// the shapes need one implementation rather than two copies.
+const _: () = {
+    assert!(RANGE_ITER_STEP_ONE_CURRENT_OFFSET == RANGE_ITER_ONE_ARG_CURRENT_OFFSET);
+    assert!(RANGE_ITER_STEP_ONE_STOP_OFFSET == RANGE_ITER_ONE_ARG_STOP_OFFSET);
+};
+
+/// Allocate a `W_IntRangeStepOneIterator` positioned at `start`.
+///
+/// The header splits the two identities the way the specialised tuples do:
+/// `ob_type` is this shape's own static, which is what `GuardClass` compares
+/// and what lets a trace reach `stop` at a fixed offset, while `w_class` is
+/// the `range_iterator` tag, so all three machine-int shapes are one Python
+/// type.
+pub fn w_range_iter_step_one_new(start: i64, stop: i64) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let full = W_IntRangeStepOneIterator {
+        ob: PyObject {
+            ob_type: &RANGE_ITER_STEP_ONE_TYPE as *const PyType,
+            w_class: get_instantiate(&RANGE_ITER_TYPE),
+        },
+        current: start,
+        stop,
+        start,
+    };
+    crate::lltype::malloc_typed(full) as PyObjectRef
+}
+
+/// Allocate a `W_IntRangeOneArgIterator` positioned at zero.
+pub fn w_range_iter_one_arg_new(stop: i64) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let full = W_IntRangeOneArgIterator {
+        ob: PyObject {
+            ob_type: &RANGE_ITER_ONE_ARG_TYPE as *const PyType,
+            w_class: get_instantiate(&RANGE_ITER_TYPE),
+        },
+        current: 0,
+        stop,
+    };
+    crate::lltype::malloc_typed(full) as PyObjectRef
+}
+
+/// Whether `obj` is the `step == 1` shape.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_range_iter_step_one(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &RANGE_ITER_STEP_ONE_TYPE) }
+}
+
+/// Whether `obj` is the `range(stop)` shape.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_range_iter_one_arg(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &RANGE_ITER_ONE_ARG_TYPE) }
+}
+
+/// Whether `obj` is either `step == 1` shape — the ones whose whole cursor
+/// state is a `current` bounded by an immutable `stop`.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_range_iter_step_one_shape(obj: PyObjectRef) -> bool {
+    unsafe { is_range_iter_step_one(obj) || is_range_iter_one_arg(obj) }
+}
+
+/// Whether `obj` is the general three-field shape, and not one of the two
+/// `step == 1` specialisations.  The JIT needs this exact answer because the
+/// three layouts put different fields at the same offsets; interpreter code
+/// wants [`is_range_iter`], which answers for all three.
+///
+/// # Safety
+/// `obj` must be a valid, non-null pointer to a `PyObject`.
+#[inline]
+pub unsafe fn is_range_iter_general(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &RANGE_ITER_TYPE) }
+}
+
+/// Check if an object is a range iterator, in any of the three machine-int
+/// shapes — the `isinstance(w_obj, W_IntRangeIterator)` answer.
 ///
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_range_iter(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &RANGE_ITER_TYPE) }
+    unsafe {
+        is_range_iter_general(obj) || is_range_iter_step_one(obj) || is_range_iter_one_arg(obj)
+    }
 }
 
 /// Read the `(current, remaining, step)` triple of a range iterator.
@@ -549,8 +684,14 @@ pub unsafe fn is_range_iter(obj: PyObjectRef) -> bool {
 /// # Safety
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_fields(obj: PyObjectRef) -> (i64, i64, i64) {
-    let iter = obj as *const W_IntRangeIterator;
-    unsafe { ((*iter).current, (*iter).remaining, (*iter).step) }
+    unsafe {
+        if is_range_iter_step_one_shape(obj) {
+            let iter = obj as *const W_IntRangeOneArgIterator;
+            return ((*iter).current, (*iter).stop - (*iter).current, 1);
+        }
+        let iter = obj as *const W_IntRangeIterator;
+        ((*iter).current, (*iter).remaining, (*iter).step)
+    }
 }
 
 /// Count of elements not yet produced by a range iterator.
@@ -558,8 +699,14 @@ pub unsafe fn w_range_iter_fields(obj: PyObjectRef) -> (i64, i64, i64) {
 /// # Safety
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_remaining(obj: PyObjectRef) -> i64 {
-    let iter = obj as *const W_IntRangeIterator;
-    unsafe { (*iter).remaining }
+    unsafe {
+        if is_range_iter_step_one_shape(obj) {
+            let iter = obj as *const W_IntRangeOneArgIterator;
+            return (*iter).stop - (*iter).current;
+        }
+        let iter = obj as *const W_IntRangeIterator;
+        (*iter).remaining
+    }
 }
 
 /// Restore the machine range iterator's live cursor fields.
@@ -568,8 +715,14 @@ pub unsafe fn w_range_iter_remaining(obj: PyObjectRef) -> i64 {
 /// `obj` must point to a valid `W_IntRangeIterator`; `remaining` must be
 /// non-negative and `current` must be the value yielded next.
 pub unsafe fn w_range_iter_set_cursor(obj: PyObjectRef, current: i64, remaining: i64) {
-    let iter = obj as *mut W_IntRangeIterator;
     unsafe {
+        // The two `step == 1` shapes derive `remaining` from `stop`, which is
+        // immutable, so the cursor is the whole state they carry.
+        if is_range_iter_step_one_shape(obj) {
+            (*(obj as *mut W_IntRangeOneArgIterator)).current = current;
+            return;
+        }
+        let iter = obj as *mut W_IntRangeIterator;
         (*iter).current = current;
         (*iter).remaining = remaining;
     }
@@ -660,6 +813,83 @@ mod range_iter_tests {
         assert_eq!(RANGE_ITER_REMAINING_OFFSET, 24);
         assert_eq!(RANGE_ITER_STEP_OFFSET, 32);
     }
+
+    #[test]
+    fn test_range_iter_one_arg_walks_and_reports_itself_as_a_range_iter() {
+        let iter = w_range_iter_one_arg_new(3);
+        unsafe {
+            assert!(is_range_iter(iter));
+            assert!(is_range_iter_one_arg(iter));
+            assert!(!is_range_iter_general(iter));
+            assert_eq!(w_range_iter_fields(iter), (0, 3, 1));
+
+            for expected in 0..3 {
+                assert!(w_range_iter_has_next(iter));
+                let item = w_range_iter_next(iter).unwrap();
+                assert_eq!(w_int_get_value(item), expected);
+            }
+            assert!(!w_range_iter_has_next(iter));
+            assert!(w_range_iter_next(iter).is_none());
+            assert_eq!(w_range_iter_remaining(iter), 0);
+        }
+    }
+
+    #[test]
+    fn test_range_iter_step_one_walks_from_its_start() {
+        let iter = w_range_iter_step_one_new(5, 8);
+        unsafe {
+            assert!(is_range_iter(iter));
+            assert!(is_range_iter_step_one(iter));
+            assert_eq!(w_range_iter_fields(iter), (5, 3, 1));
+
+            for expected in 5..8 {
+                let item = w_range_iter_next(iter).unwrap();
+                assert_eq!(w_int_get_value(item), expected);
+            }
+            assert!(w_range_iter_next(iter).is_none());
+        }
+    }
+
+    #[test]
+    fn test_range_iter_set_cursor_moves_a_step_one_shape() {
+        let iter = w_range_iter_step_one_new(0, 10);
+        unsafe {
+            // The remaining count is derived from the immutable `stop`, so the
+            // cursor is the whole state a restore has to write.
+            w_range_iter_set_cursor(iter, 7, 3);
+            assert_eq!(w_range_iter_fields(iter), (7, 3, 1));
+            let item = w_range_iter_next(iter).unwrap();
+            assert_eq!(w_int_get_value(item), 7);
+        }
+    }
+
+    #[test]
+    fn test_promote_step_picks_the_iterator_shape() {
+        unsafe {
+            // `range(4)` — no step argument, starting at zero.
+            let one_arg = w_range_iter(w_range_new(
+                crate::intobject::w_int_new(0),
+                crate::intobject::w_int_new(4),
+                crate::intobject::w_int_new(1),
+                true,
+            ));
+            assert!(is_range_iter_one_arg(one_arg));
+
+            // `range(2, 6)` — no step argument, but not from zero.
+            let step_one = w_range_iter(w_range_new(
+                crate::intobject::w_int_new(2),
+                crate::intobject::w_int_new(6),
+                crate::intobject::w_int_new(1),
+                true,
+            ));
+            assert!(is_range_iter_step_one(step_one));
+
+            // `range(0, 4, 1)` — the step is one, but it was spelled out, so
+            // the promotion does not apply.
+            let general = w_range_iter(w_range_new_i64(0, 4, 1));
+            assert!(is_range_iter_general(general));
+        }
+    }
 }
 
 // ── Range sequence object ──
@@ -689,12 +919,18 @@ pub struct W_Range {
     pub stop: PyObjectRef,
     pub step: PyObjectRef,
     pub length: PyObjectRef,
+    /// `descr_new`'s `promote_step` — true when the constructor was given no
+    /// step argument.  `descr_iter` reads it to pick the `step == 1`
+    /// iterator shapes; a range built as `range(0, 10, 1)` carries a step of
+    /// one but not the promotion, and keeps the general iterator.
+    pub promote_step: bool,
 }
 
 pub const RANGE_START_OFFSET: usize = std::mem::offset_of!(W_Range, start);
 pub const RANGE_STOP_OFFSET: usize = std::mem::offset_of!(W_Range, stop);
 pub const RANGE_STEP_OFFSET: usize = std::mem::offset_of!(W_Range, step);
 pub const RANGE_LENGTH_OFFSET: usize = std::mem::offset_of!(W_Range, length);
+pub const RANGE_PROMOTE_STEP_OFFSET: usize = std::mem::offset_of!(W_Range, promote_step);
 
 /// Allocate a `W_Range` from three wrapped int/long bounds.  `step` must
 /// already be non-zero (the caller raises `ValueError` for a zero step
@@ -704,7 +940,12 @@ pub const RANGE_LENGTH_OFFSET: usize = std::mem::offset_of!(W_Range, length);
     clippy::not_unsafe_ptr_arg_deref,
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
 )]
-pub fn w_range_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> PyObjectRef {
+pub fn w_range_new(
+    start: PyObjectRef,
+    stop: PyObjectRef,
+    step: PyObjectRef,
+    promote_step: bool,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let start = crate::gc_roots::pin_root(start);
     let stop = crate::gc_roots::pin_root(stop);
@@ -727,15 +968,18 @@ pub fn w_range_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
         stop,
         step,
         length,
+        promote_step,
     })
 }
 
-/// Convenience constructor wrapping three machine-int bounds.
+/// Convenience constructor wrapping three machine-int bounds.  The explicit
+/// step spells `promote_step = false`, matching `range(start, stop, step)`.
 pub fn w_range_new_i64(start: i64, stop: i64, step: i64) -> PyObjectRef {
     w_range_new(
         crate::intobject::w_int_new(start),
         crate::intobject::w_int_new(stop),
         crate::intobject::w_int_new(step),
+        false,
     )
 }
 
@@ -744,6 +988,16 @@ pub fn w_range_new_i64(start: i64, stop: i64, step: i64) -> PyObjectRef {
 #[inline]
 pub unsafe fn is_w_range(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &RANGE_TYPE) }
+}
+
+/// `descr_new`'s `promote_step` — whether the range was built without a step
+/// argument.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Range`.
+#[inline]
+pub unsafe fn w_range_promote_step(obj: PyObjectRef) -> bool {
+    unsafe { (*(obj as *const W_Range)).promote_step }
 }
 
 /// # Safety
@@ -859,9 +1113,12 @@ pub unsafe fn w_range_bool(obj: PyObjectRef) -> bool {
     unsafe { !range_obj_to_bigint(w_range_length(obj)).is_zero() }
 }
 
-/// `descr_iter` — a `rangeiterator` (`W_IntRangeIterator`, machine-int and
-/// JIT-specializable) when every bound fits a machine word, otherwise a
-/// `longrange_iterator` (`W_LongRangeIterator`).
+/// `descr_iter` — a `rangeiterator` (machine-int and JIT-specializable) when
+/// every bound fits a machine word, otherwise a `longrange_iterator`
+/// (`W_LongRangeIterator`).
+///
+/// A promoted step picks one of the two `step == 1` shapes, whose `stop` is
+/// immutable and whose cursor needs no separate countdown.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_Range`.
@@ -877,6 +1134,18 @@ pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
         {
             let one_past = start as i128 + length as i128 * step as i128;
             if i64::try_from(one_past).is_ok() {
+                if w_range_promote_step(obj) {
+                    // The promotion is only spelled by `descr_new`'s missing
+                    // step argument, so `step` is one and `start + length` is
+                    // the end of the walk. An empty or backwards span would
+                    // make `stop` unreachable from `start` by +1 steps, so the
+                    // bound is rebuilt from the length rather than read back.
+                    let end = start + length;
+                    if start == 0 {
+                        return w_range_iter_one_arg_new(end);
+                    }
+                    return w_range_iter_step_one_new(start, end);
+                }
                 return w_range_iter_new(start, length, step);
             }
         }

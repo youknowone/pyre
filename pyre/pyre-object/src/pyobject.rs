@@ -480,9 +480,9 @@ pub const fn subclass_range_alias(type_id: u32, pytype: &'static PyType) -> Subc
 /// payloads ahead of them exist only there, so the group begins three ids
 /// later on Windows than anywhere else.
 #[cfg(all(not(target_arch = "wasm32"), windows))]
-const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 194;
+const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 196;
 #[cfg(all(not(target_arch = "wasm32"), not(windows)))]
-const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 191;
+const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 193;
 
 /// Canonical `rclass.OBJECT` inheritance census in GC registration order.
 ///
@@ -692,26 +692,31 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (180, Some(0)),
     (181, Some(0)),
     (182, Some(0)),
-    // Native-only type IDs 183 and 184 represent `posix.DirEntry` and
-    // `posix.ScandirIterator`, matching `build_gc`'s registration order.
-    #[cfg(not(target_arch = "wasm32"))]
+    // The two `step == 1` range-iterator shapes are unconditional, so they
+    // close the ungated block behind the code-object walks rather than joining
+    // the target-gated tail.
     (183, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (184, Some(0)),
-    // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
-    // extend the append-only native rclass tail; wasm omits the host TLS
-    // module and therefore the hierarchy entries as well. Sandbox filtering
-    // belongs to pyre-interpreter, which owns that module configuration.
+    // Native-only type IDs 185 and 186 represent `posix.DirEntry` and
+    // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
     (185, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (186, Some(0)),
+    // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
+    // extend the append-only native rclass tail; wasm omits the host TLS
+    // module and therefore the hierarchy entries as well. Sandbox filtering
+    // belongs to pyre-interpreter, which owns that module configuration.
     #[cfg(not(target_arch = "wasm32"))]
     (187, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (188, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (189, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (190, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (191, Some(0)),
     // `mmap.mmap` owns its native mapping payload — the duplicated fd on POSIX
     // and the file handle on Windows — and follows the optional SSL tail
     // wherever the module is compiled.  The gate must match the alias gate in
@@ -720,20 +725,20 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // A sandbox build has no `mmap` module either, so
     // `active_subclass_range_hierarchy` drops this entry along with SSL's.
     #[cfg(any(unix, windows))]
-    (190, Some(0)),
+    (192, Some(0)),
     // `_overlapped.Overlapped` owns the Windows OVERLAPPED record and its
     // retained Python buffers.  pyre-interpreter supplies the vtable alias;
     // the object layer owns only the append-only hierarchy slot.
     #[cfg(windows)]
-    (191, Some(0)),
+    (193, Some(0)),
     // `_winapi.Overlapped` owns a second Windows OVERLAPPED record, the one
     // waited on through an event of its own rather than a completion port.
     #[cfg(windows)]
-    (192, Some(0)),
+    (194, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload.
     // Its append-only vtable id follows both Windows overlapped owners.
     #[cfg(windows)]
-    (193, Some(0)),
+    (195, Some(0)),
     // `_cffi_backend` is absent on wasm32 and in sandbox builds.  Its thirteen
     // hierarchy slots sit at the tail because the interpreter's sandbox
     // filter can only remove a contiguous trailing slice.
@@ -1222,6 +1227,12 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(122, typed::<crate::interp_itertools::W_FilterFalse>()),
         subclass_range_alias(123, typed::<crate::interp_itertools::W_Pairwise>()),
         subclass_range_alias(124, typed::<crate::operation::_CallableIterator>()),
+        // The two `step == 1` range-iterator shapes do not follow W_Range: they
+        // register behind the unconditional code-object walks, the last block
+        // before `build_gc`'s target-gated tail, so their ids are the same on
+        // every target.
+        subclass_range_alias(183, typed::<crate::functional::W_IntRangeStepOneIterator>()),
+        subclass_range_alias(184, typed::<crate::functional::W_IntRangeOneArgIterator>()),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),

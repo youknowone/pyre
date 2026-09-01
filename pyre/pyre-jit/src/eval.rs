@@ -4173,6 +4173,25 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
     }
 
+    // The two `step == 1` iterator shapes.  Their ids are explicit
+    // (`type_id = 183` / `184`) because their descr groups bake them at
+    // compile time to guard and virtualize a FOR_ITER, and an explicit id only
+    // holds where registration order does: they are unconditional, so they
+    // close the ungated block here, ahead of the target-gated tail whose ids
+    // move per target.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::functional::W_IntRangeStepOneIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::functional::W_IntRangeOneArgIterator
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+
     // Register `posix.DirEntry`'s four inline GC edges and
     // `posix.ScandirIterator`'s entries-list edge. The entries in
     // `SUBCLASS_RANGE_HIERARCHY` and `all_subclass_range_aliases` are

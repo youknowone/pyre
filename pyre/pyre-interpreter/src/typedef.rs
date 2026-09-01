@@ -1119,6 +1119,20 @@ pub fn init_typeobjects() {
             &pyre_object::functional::RANGE_ITER_TYPE as *const PyType as usize,
             range_iterator_type as usize,
         );
+        // `functional.py` gives `W_IntRangeStepOneIterator` and
+        // `W_IntRangeOneArgIterator` the same `W_AbstractRangeIterator`
+        // typedef as the general shape.  Mapping all three internal statics to
+        // the one type object keeps `type()` identical across them, and the
+        // `set_instantiate` loop below stamps that object as the `w_class` a
+        // JIT-materialized iterator of either shape is born with.
+        reg.insert(
+            &pyre_object::functional::RANGE_ITER_STEP_ONE_TYPE as *const PyType as usize,
+            range_iterator_type as usize,
+        );
+        reg.insert(
+            &pyre_object::functional::RANGE_ITER_ONE_ARG_TYPE as *const PyType as usize,
+            range_iterator_type as usize,
+        );
         // rangeobject.c PyRange_Type carries no Py_TPFLAGS_BASETYPE, so
         // `range` is not an acceptable base class.
         let range_type = new_typeobject_with_base_and_layout(
