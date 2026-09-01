@@ -1392,10 +1392,91 @@ mod win_nt {
         }
     }
 
-    /// os._add_dll_directory. PyPy hands back a W_DLLCapsule; os.py only
-    /// round-trips the value into `_remove_dll_directory`, so the opaque
-    /// DLL_DIRECTORY_COOKIE pointer is returned as an int instead. host_env has
-    /// no AddDllDirectory wrapper, so call windows-sys directly.
+    /// The reserved instance-dictionary key the cookie object files its
+    /// `DLL_DIRECTORY_COOKIE` under, namespaced the way the capsule carrier in
+    /// `cpyext` namespaces its own payload.
+    const DLL_COOKIE_KEY: &str = "__pyre_dll_directory_cookie__";
+
+    /// The cookies `AddDllDirectory` has issued and `RemoveDllDirectory` has
+    /// not taken back.
+    ///
+    /// The one-shot state that stops a second removal is the cleared payload
+    /// below, the way `os__remove_dll_directory_impl` renames the capsule it
+    /// was handed.  This list answers the other half: the payload rides an
+    /// instance dictionary, which `object.__setattr__` can still write, and the
+    /// loader fail-fasts rather than raising on a pointer it never handed out,
+    /// so a removal checks the value here before the loader ever sees it.  A
+    /// directory added twice has two entries and takes two removals.
+    static LIVE_DLL_DIRECTORY_COOKIES: parking_lot::Mutex<Vec<usize>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// The type of the opaque value `_add_dll_directory` hands back.
+    ///
+    /// `os__add_dll_directory_impl` returns `PyCapsule_New(cookie, "DLL
+    /// directory cookie", NULL)`, and PyPy an `interp_posix.W_DLLCapsule`;
+    /// either way the point is that a caller cannot spell a cookie, because
+    /// `_remove_dll_directory` reinterprets what it is given as a pointer into
+    /// the loader's DLL-directory list.  The type publishes nothing and is
+    /// neither instantiable nor subclassable, so `_add_dll_directory` is the
+    /// only source of one.
+    fn dll_cookie_type() -> PyObjectRef {
+        static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("nt.DLLDirectoryCookie", |_ns| {});
+            unsafe {
+                pyre_object::typeobject::w_type_set_hasdict(tp, true);
+                pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
+                pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, false);
+            }
+            tp as usize
+        }) as PyObjectRef
+    }
+
+    /// Box `cookie`.  The carrier is pinned before the value is built, and both
+    /// are read back at the store: building the value allocates, and the store
+    /// materialises the dictionary, so either could move the other.
+    fn dll_cookie_new(cookie: usize) -> PyObjectRef {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(dll_cookie_type()));
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(cookie as i64));
+        crate::baseobjspace::setdictvalue_native(
+            pyre_object::gc_roots::shadow_stack_get(carrier_slot),
+            DLL_COOKIE_KEY,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        );
+        pyre_object::gc_roots::shadow_stack_get(carrier_slot)
+    }
+
+    /// The cookie `w_cookie` carries, or `None` when it is not one of the
+    /// objects `_add_dll_directory` returned — the `PyCapsule_IsValid(cookie,
+    /// "DLL directory cookie")` test.
+    fn dll_cookie_value(w_cookie: PyObjectRef) -> Option<usize> {
+        // The first call materialises the type, which allocates, so the
+        // argument is pinned across it and re-read: an unrooted local would be
+        // stale if that collection moved the object.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cookie_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_cookie);
+        let cookie_type = dll_cookie_type();
+        let w_cookie = pyre_object::gc_roots::shadow_stack_get(cookie_slot);
+        let is_cookie = match crate::typedef::r#type(w_cookie) {
+            Some(w_type) => w_type.as_ptr() == cookie_type,
+            None => false,
+        };
+        if !is_cookie {
+            return None;
+        }
+        crate::baseobjspace::getdictvalue_native(w_cookie, DLL_COOKIE_KEY)
+            .filter(|&value| unsafe { pyre_object::is_int(value) })
+            .map(|value| unsafe { pyre_object::w_int_get_value(value) } as usize)
+    }
+
+    /// os._add_dll_directory. `os__add_dll_directory_impl` hands the
+    /// `DLL_DIRECTORY_COOKIE` back inside a capsule and os.py only round-trips
+    /// that object into `_remove_dll_directory`. host_env has no
+    /// AddDllDirectory wrapper, so call windows-sys directly.
     pub fn _add_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
         let (path, _, resolved) = arg_path(args, "_add_dll_directory")?;
@@ -1409,10 +1490,22 @@ mod win_nt {
                 resolved.w_path(),
             ));
         }
-        Ok(pyre_object::w_int_new(cookie as usize as i64))
+        LIVE_DLL_DIRECTORY_COOKIES.lock().push(cookie as usize);
+        Ok(dll_cookie_new(cookie as usize))
     }
 
-    /// os._remove_dll_directory — takes the cookie returned above.
+    /// os._remove_dll_directory — takes the object `_add_dll_directory`
+    /// returned, and returns None.
+    ///
+    /// `os__remove_dll_directory_impl` opens by rejecting anything else with a
+    /// TypeError, then renames the capsule so the same value cannot be removed
+    /// twice.  Both guards carry their weight: `_AddedDllDirectory.__exit__`
+    /// calls `close()` unconditionally, so a `with` block that closes early
+    /// reaches the second removal by ordinary means.
+    ///
+    /// [3.14-spec] `interp_posix.py _remove_dll_directory` answers the removal
+    /// with `space.newbool(...)`, reports a failure as `False` rather than
+    /// raising, and has no invalidation at all.
     pub fn _remove_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         use windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory;
         let Some(&arg) = args.first() else {
@@ -1420,9 +1513,53 @@ mod win_nt {
                 "_remove_dll_directory() missing required argument 'cookie'",
             ));
         };
-        let cookie = (crate::baseobjspace::int_w(arg)? as usize) as *mut std::ffi::c_void;
-        let ok = unsafe { RemoveDllDirectory(cookie) };
-        Ok(pyre_object::w_bool_from(ok != 0))
+        let not_a_cookie = || {
+            crate::PyError::type_error("Provided cookie was not returned from os.add_dll_directory")
+        };
+        // The argument is read back from the shadow stack at each use: reading
+        // its cookie can materialise the type, and clearing it below stores
+        // into its dictionary, either of which may move it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cookie_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(arg);
+        let w_cookie = || pyre_object::gc_roots::shadow_stack_get(cookie_slot);
+        let cookie = dll_cookie_value(w_cookie()).ok_or_else(not_a_cookie)?;
+        // Only a cookie the loader actually issued reaches `RemoveDllDirectory`:
+        // the payload rides an instance dictionary that `object.__setattr__` can
+        // still write, and the loader fail-fasts on a pointer it never handed
+        // out.  The Win32 error is read while the lock is still held, since
+        // releasing it may enter the OS and overwrite `GetLastError`.
+        let failure = {
+            let mut live = LIVE_DLL_DIRECTORY_COOKIES.lock();
+            let index = live
+                .iter()
+                .position(|&issued| issued == cookie)
+                .ok_or_else(not_a_cookie)?;
+            live.swap_remove(index);
+            if unsafe { RemoveDllDirectory(cookie as *mut std::ffi::c_void) } != 0 {
+                None
+            } else {
+                // The capsule is renamed only after a successful removal, so a
+                // failed one leaves the cookie usable.
+                let error = std::io::Error::last_os_error();
+                live.push(cookie);
+                Some(error)
+            }
+        };
+        match failure {
+            Some(error) => Err(io_err(&error, "")),
+            None => {
+                // `PyCapsule_SetName(cookie, NULL)`: the object stops carrying a
+                // cookie at all, so a second removal is refused even where the
+                // loader has since reissued that pointer for another directory.
+                crate::baseobjspace::setdictvalue_native(
+                    w_cookie(),
+                    DLL_COOKIE_KEY,
+                    pyre_object::w_none(),
+                );
+                Ok(pyre_object::w_none())
+            }
+        }
     }
 
     /// os._supports_virtual_terminal — whether stderr's console mode carries
