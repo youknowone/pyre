@@ -5,6 +5,13 @@
 //! concrete values, following all code paths (not just the traced one).
 //!
 //! This is the RPython equivalent of `rpython/jit/metainterp/blackhole.py`.
+//!
+//! The `resume_in_blackhole` entry itself lives with its caller, as
+//! `pyre_jit::eval::resume_in_blackhole_from_exit_layout`: it needs the
+//! backend's exit layout plus the driver's `vinfo`/`vrefinfo`/`ginfo`, none
+//! of which this crate can name.  What this module owns is everything it
+//! calls into — `blackhole_from_resumedata`, `prepare_resume_from_failure`
+//! and `run_forever`.
 
 use crate::jitexc::JitException;
 use indexmap::IndexMap;
@@ -3264,51 +3271,6 @@ pub fn convert_and_run_from_pyjitpl(
     );
     majit_gc::shadow_stack::pop_resume_ref_roots_to(roots_depth);
     outcome
-}
-
-/// blackhole.py resume_in_blackhole
-///
-/// Resume execution in the blackhole interpreter after a compiled
-/// code guard failure. Builds a frame chain from resume data, extracts
-/// exception from deadframe, and runs the chain to completion.
-///
-/// `resolve_jitcode` is `metainterp_sd.jitcodes[jitcode_pos]` in RPython.
-pub fn resume_in_blackhole(
-    builder: &mut BlackholeInterpBuilder,
-    resolve_jitcode: &dyn Fn(i32, i32) -> Option<crate::resume::ResolvedJitCode>,
-    rd_numb: &[u8],
-    rd_consts: &[majit_ir::Const],
-    all_liveness: &[u8],
-    deadframe: &[i64],
-    deadframe_exc: i64,
-) -> JitException {
-    // blackhole.py:1786-1792
-    let null_alloc = crate::resume::NullAllocator;
-    let bh = crate::resume::blackhole_from_resumedata(
-        builder,
-        resolve_jitcode,
-        rd_numb,
-        rd_consts,
-        all_liveness,
-        deadframe,
-        None, // deadframe_types
-        None, // rd_virtuals
-        None, // rd_guard_pendingfields
-        None, // vrefinfo
-        None, // vinfo
-        None, // ginfo
-        None, // virtualizable_identity_override
-        None, // all_virtuals
-        &null_alloc,
-    );
-
-    let (bh, _virtualizable_ptr) = bh;
-
-    // blackhole.py:1794
-    let current_exc = BlackholeInterpreter::prepare_resume_from_failure(deadframe_exc);
-
-    // blackhole.py:1795
-    run_forever(builder, bh, current_exc)
 }
 
 #[cfg(test)]
