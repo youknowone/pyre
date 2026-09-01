@@ -3287,6 +3287,37 @@ mod tests {
     }
 
     #[test]
+    fn consider_string_char_add_uses_somechar_string_mro() {
+        for char_first in [false, true] {
+            let ann = mk_ann();
+            let mut string_var = Variable::named("s");
+            let mut char_var = Variable::named("c");
+            let mut string = SomeString::new(false, true);
+            string.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("left")));
+            let mut character = SomeChar::new(true);
+            character.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(" ")));
+            ann.setbinding(&mut string_var, SomeValue::String(string));
+            ann.setbinding(&mut char_var, SomeValue::Char(character));
+            let args = if char_first {
+                vec![Hlvalue::Variable(char_var), Hlvalue::Variable(string_var)]
+            } else {
+                vec![Hlvalue::Variable(string_var), Hlvalue::Variable(char_var)]
+            };
+            let result = HLOperation::new(OpKind::Add, args)
+                .consider(&ann)
+                .unwrap()
+                .unwrap();
+            let SomeValue::String(result) = result else {
+                panic!("string/char add must widen to SomeString")
+            };
+            assert_eq!(
+                result.inner.base.const_box.expect("constant add").value,
+                ConstValue::byte_str(if char_first { " left" } else { "left " })
+            );
+        }
+    }
+
+    #[test]
     fn consider_bytearray_add_returns_bytearray() {
         let ann = mk_ann();
         let mut v0 = Variable::named("b0");

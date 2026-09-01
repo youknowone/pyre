@@ -8702,15 +8702,14 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Option::<&T>::copied` / `Option::<T>::cloned` on an `Option`
-                // receiver — reading the referent value out of an `Option<&T>`
-                // is an identity in the lifted value model (`&T` and `T` are one
-                // GC pointer word, and `Option<&T>` / `Option<T>` share the
-                // niche discriminant + word layout), so alias the destination to
-                // the receiver instead of emitting a `copied` method call the
-                // rtyper cannot route on the classdef-less `Option` receiver.
+                // `Option::as_ref` / `Option::<&T>::copied` /
+                // `Option::<T>::cloned` on an `Option` receiver are identities
+                // in the lifted value model: `T` and `&T` are the same value
+                // word and the Option tag is unchanged.  Alias the destination
+                // instead of emitting a method call the rtyper cannot route on
+                // the foreign Option receiver.
                 if args.len() == 1
-                    && self.is_option_copied_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
+                    && self.is_option_value_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
                 {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -8836,8 +8835,8 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc));
                 let index_leg = args.len() == 2
                     && (workspace_index
-                        || (self.is_vec_index_call(&reg)
-                            && (!is_vec_index_mut_regular(&reg, self.llbc)
+                        || (self.is_vec_index_call(&reg, second_arg_ty.as_ref())
+                            && (!is_vec_index_mut_call(&reg, second_arg_ty.as_ref(), self.llbc)
                                 || add_dest_used_only_as_single_deref(self.body, dest_local)))
                         || (self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
                             && (!self.is_slice_scalar_index_mut_call(&reg)
@@ -12568,8 +12567,8 @@ impl<'a> Lowering<'a> {
     /// indirection is added by `rtype_getitem` / `rtype_setitem` rather than
     /// the front end.  Delegates to the free [`is_vec_index_regular`] so the
     /// same gate is shared with the deferred-write liveness pre-pass.
-    fn is_vec_index_call(&self, reg: &RegularCall) -> bool {
-        is_vec_index_regular(reg, self.llbc)
+    fn is_vec_index_call(&self, reg: &RegularCall, index_ty: Option<&TyRef>) -> bool {
+        is_vec_index_regular_with_callsite(reg, index_ty, self.llbc)
     }
 
     /// `core::slice::index::SliceIndex<usize>::index(_mut)` — scalar slice
@@ -13312,15 +13311,19 @@ impl<'a> Lowering<'a> {
             && tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc)
     }
 
-    /// `Option::<&T>::copied` / `Option::<T: Clone>::cloned` — reads the
-    /// referent value out of an `Option<&T>` to yield an `Option<T>`.  In the
-    /// lifted value model a `&T` and a `T` are the same one GC pointer word
+    /// `Option::as_ref` / `Option::<&T>::copied` /
+    /// `Option::<T: Clone>::cloned` — changes only whether a pointer-niche
+    /// payload is borrowed or read through that borrow.  In the lifted value
+    /// model a `&T` and a pointer-shaped `T` are the same one GC pointer word
     /// (`slice_first`'s payload note: the front has no pointer-to-slot op, so a
     /// `.first()` payload is already the element VALUE, and `Option<&T>` /
     /// `Option<T>` share the niche discriminant + one-word representation), so
-    /// `.copied()` / `.cloned()` is an identity on the receiver.  Without the
-    /// intercept the call keeps a `CallTarget::Method` `copied` getattr the
-    /// rtyper cannot route on the classdef-less `Option` receiver (the `getattr
+    /// all three are identities on the receiver.  `as_ref` is additionally
+    /// gated to a pointer-niche receiver and destination: an arbitrary
+    /// `Option<T>` can be wider than `Option<&T>` and must keep its real
+    /// projection.  Without the intercept the call keeps a
+    /// `CallTarget::Method` (`as_ref`/`copied`/`cloned`) getattr the rtyper
+    /// cannot route on the classdef-less `Option` receiver (the `getattr
     /// (opt, "copied")` census wall — e.g. `_codecs::lookup_codec`'s
     /// `args.first().copied()`, `split_builtin_kwargs`'s
     /// `positional.first().copied()`).  Bind the destination to the receiver
@@ -13331,7 +13334,7 @@ impl<'a> Lowering<'a> {
     /// identity — has a non-`Option` receiver/dest and keeps its ordinary
     /// lowering.  (`Option::clone` on a `Copy` payload is itself an identity, so
     /// the `cloned` arm is sound for the `Option` family.)
-    fn is_option_copied_identity(
+    fn is_option_value_identity(
         &self,
         reg: &RegularCall,
         first_arg_ty: Option<&TyRef>,
@@ -13347,11 +13350,24 @@ impl<'a> Lowering<'a> {
         let Some(leaf) = np.rsplit("::").next() else {
             return false;
         };
-        if !matches!(leaf, "copied" | "cloned") {
+        if !matches!(leaf, "as_ref" | "copied" | "cloned") {
             return false;
         }
-        first_arg_ty.is_some_and(|ty| crate::front::result_exc::tyref_is_option(ty, self.llbc))
-            && crate::front::result_exc::tyref_is_option(dest_ty, self.llbc)
+        let receiver_is_option = first_arg_ty.is_some_and(|ty| {
+            crate::front::result_exc::tyref_is_option(ty, self.llbc)
+                || crate::front::result_exc::tyref_is_option_ref(ty, self.llbc)
+        });
+        if !receiver_is_option {
+            return false;
+        }
+        if leaf != "as_ref" {
+            return crate::front::result_exc::tyref_is_option(dest_ty, self.llbc);
+        }
+        let Some(receiver_ty) = first_arg_ty.and_then(|ty| self.tyref_peel_ref_to_pointee(ty))
+        else {
+            return false;
+        };
+        self.tyref_is_niche_option_ptr(&receiver_ty) && self.tyref_is_niche_option_ptr(dest_ty)
     }
 
     /// `alloc::fmt::format(args)` (the `format!` macro's String producer)
@@ -18562,16 +18578,30 @@ fn constants_call_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
 /// derives the call key (`impl_method_owner_for_fundecl`).  Free so the
 /// same gate is shared by the call-lowering intercept and the deferred-write
 /// liveness pre-pass.
-fn vec_index_regular_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
+/// Resolve the scalar Vec index leaf from either source Charon preserves.
+///
+/// Most calls carry the concrete `Index<I>` substitution in
+/// `RegularCall.generics.types[1]`.  A few monomorphized call sites instead
+/// retain only the actual index operand type; `bind_builtin_kwargs` is the
+/// important one, and leaving its `Vec::index` calls opaque makes the whole
+/// builtin gateway miss the RPython rlist `getitem` path.  Both spellings are
+/// the same upstream operation, so accept either integer-bank proof while
+/// continuing to reject `Range*` (Ref-bank) indices.
+fn vec_index_regular_leaf_with_callsite(
+    reg: &RegularCall,
+    index_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> Option<&'static str> {
     let leaf = vec_index_regular_unchecked_leaf(reg, llbc)?;
-    let int_indexed = reg
+    let generic_index_is_scalar = reg
         .generics
         .get("types")
         .and_then(serde_json::Value::as_array)
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
         .is_some_and(|t| vec_index_type_is_scalar(&t, llbc));
-    int_indexed.then_some(leaf)
+    (generic_index_is_scalar || index_ty.is_some_and(|ty| vec_index_type_is_scalar(ty, llbc)))
+        .then_some(leaf)
 }
 
 /// The Vec Index/IndexMut leaf before classifying its index argument.  Scalar
@@ -18628,19 +18658,16 @@ fn vec_index_type_is_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
     )
 }
 
-/// Whether a [`RegularCall`] is a `Vec<T>` `index` **or** `index_mut` on an
-/// integer index (see [`vec_index_regular_leaf`]).
-fn is_vec_index_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
-    vec_index_regular_leaf(reg, llbc).is_some()
+fn is_vec_index_regular_with_callsite(
+    reg: &RegularCall,
+    index_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> bool {
+    vec_index_regular_leaf_with_callsite(reg, index_ty, llbc).is_some()
 }
 
-/// Whether a [`RegularCall`] is specifically a `Vec<T>::index_mut` on an
-/// integer index — the write half, which yields a `&mut T` and so must pass
-/// the single-deref escape guard before it may be devirtualized to an
-/// `ArrayWrite` (the read leaf `index` yields a value copy and needs no
-/// guard).
-fn is_vec_index_mut_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
-    vec_index_regular_leaf(reg, llbc) == Some("index_mut")
+fn is_vec_index_mut_call(reg: &RegularCall, index_ty: Option<&TyRef>, llbc: &Llbc) -> bool {
+    vec_index_regular_leaf_with_callsite(reg, index_ty, llbc) == Some("index_mut")
 }
 
 /// Whether a statically-resolved [`RegularCall`] is `<*mut T>::add` /
@@ -19194,7 +19221,7 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
         // for a write the intercept declined to lift would leave the base
         // undefined.
         let is_deferred_write_producer = is_workspace_index_regular(reg, llbc)
-            || (is_vec_index_mut_regular(reg, llbc)
+            || (is_vec_index_mut_call(reg, call.args.get(1).and_then(operand_tyref), llbc)
                 && add_dest_used_only_as_single_deref(body, p as usize))
             || is_list_items_elem_ptr_add_parts(
                 reg,
