@@ -11328,10 +11328,11 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // (`framelocalsproxy_setitem`) and sets NEITHER `w_locals` nor a slot, so
     // the mapping this fold rebuilds from slots alone would silently drop the
     // key.  Read through the same shadow payload as `w_locals`; a holder
-    // mismatch declines.  A present extras dict is copied into the rebuilt
-    // mapping before the slot overlay, so a slot that also names the key wins,
-    // and the null direction is pinned by a guard below so a write mid-loop
-    // side-exits instead.
+    // mismatch declines.  A present extras dict is merged AFTER the slot chain
+    // and skips a key the slots already bound, which is the order and the
+    // precedence `frame_locals_proxy_snapshot` gives the two halves; the null
+    // direction is pinned by a guard below so a write mid-loop side-exits
+    // instead.
     let w_extra_locals = if shadow_debugdata.is_null() {
         pyre_object::PY_NULL
     } else {
@@ -11448,6 +11449,11 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // leaves the residual free to redo it with the same outcome.
     let (concrete_locals, concrete_result) = {
         let _roots = pyre_object::gc_roots::push_roots();
+        // Pinned before the mapping below, because materialising that mapping
+        // allocates and the extras merge runs after the slot chain, which
+        // allocates on every store.
+        let extra_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_extra_locals);
         let locals_root = pyre_object::gc_roots::shadow_stack_len();
         // Re-read rather than reuse the gate's `w_locals`: the slot resolution
         // above sits between the two, so the pin takes the address the frame
@@ -11457,17 +11463,6 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         } else {
             unsafe { pyre_object::w_dict_new() }
         });
-        let extras_failed = if extras_present {
-            let extra_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_extra_locals);
-            let updated = pyre_interpreter::pyframe::jit_locals_dict_update(
-                pyre_object::gc_roots::shadow_stack_get(locals_root) as i64,
-                pyre_object::gc_roots::shadow_stack_get(extra_slot) as i64,
-            );
-            (updated as pyre_object::PyObjectRef).is_null()
-        } else {
-            false
-        };
         let value_roots: Vec<usize> = slots
             .iter()
             .map(|modelled| {
@@ -11477,7 +11472,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             })
             .collect();
         let mut result = pyre_object::PY_NULL;
-        let mut slot_failed = extras_failed;
+        let mut slot_failed = false;
         for (i, &value_root) in value_roots.iter().enumerate() {
             let value = pyre_object::gc_roots::shadow_stack_get(value_root);
             let locals = pyre_object::gc_roots::shadow_stack_get(locals_root) as i64;
@@ -11501,6 +11496,16 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
                 slot_failed = true;
                 break;
             }
+        }
+        // `frame_locals_proxy_snapshot` appends `f_extra_locals` AFTER the
+        // fastlocals and keeps the fastlocal wherever both name one key, so the
+        // merge runs with the whole slot chain already behind it.
+        if !slot_failed && extras_present {
+            let updated = pyre_interpreter::pyframe::jit_locals_dict_update(
+                pyre_object::gc_roots::shadow_stack_get(locals_root) as i64,
+                pyre_object::gc_roots::shadow_stack_get(extra_root) as i64,
+            );
+            slot_failed = (updated as pyre_object::PyObjectRef).is_null();
         }
         if !slot_failed {
             let locals = pyre_object::gc_roots::shadow_stack_get(locals_root);
@@ -11580,9 +11585,9 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             walker_emit_fold_guard_with_snapshot(ctx, op.pc, opcode, &[op_ref])?;
         }
         field_op = Some(op_ref);
-        // `d.w_extra_locals` — extras-first copy when present, else pin
-        // absent so a mid-loop proxy write side-exits instead of dropping
-        // the new key.
+        // `d.w_extra_locals` — read here so the merge below the slot chain
+        // has it, and pinned absent when there is none so a mid-loop proxy
+        // write side-exits instead of dropping the new key.
         let extra_op = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             debugdata_op,
@@ -11718,24 +11723,6 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE),
         )?;
     }
-    if extras_present && let Some(extra_op) = extra_field_op {
-        // `frame_locals_proxy_snapshot`: extras first, then the fastlocal
-        // overlay.  The helper can raise (a user `__eq__` on a colliding
-        // key), so a PY_NULL return side-exits to the residual.
-        let updated = ctx.trace_ctx.call_ref_typed_with_effect(
-            pyre_interpreter::pyframe::jit_locals_dict_update as *const (),
-            &[dict_op, extra_op],
-            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-            majit_ir::EffectInfo::new(
-                majit_ir::ExtraEffect::CannotRaise,
-                majit_ir::OopSpecIndex::None,
-            ),
-        );
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[updated])?;
-        ctx.trace_ctx
-            .set_opref_concrete(updated, concrete_locals_value);
-        dict_op = updated;
-    }
     for ((i, modelled), (&index_const, &value_op)) in slots
         .iter()
         .enumerate()
@@ -11796,6 +11783,27 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
             // publishing it; side-exit so the residual re-runs and raises.
             walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[dict_op])?;
         }
+    }
+    // `frame_locals_proxy_snapshot` appends `f_extra_locals` AFTER the
+    // fastlocals, so the merge is emitted with the whole slot chain in front of
+    // it and the mapping already carries the fastlocal for any key both halves
+    // name.  The helper can raise (a user `__eq__` on a colliding key), so a
+    // PY_NULL return side-exits to the residual.
+    if extras_present && let Some(extra_op) = extra_field_op {
+        locals_expansion_cut_if_too_long(ctx, op.pc)?;
+        let updated = ctx.trace_ctx.call_ref_typed_with_effect(
+            pyre_interpreter::pyframe::jit_locals_dict_update as *const (),
+            &[dict_op, extra_op],
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[updated])?;
+        ctx.trace_ctx
+            .set_opref_concrete(updated, concrete_locals_value);
+        dict_op = updated;
     }
     // Asked again with the loop behind it: the check above runs BEFORE a slot
     // emits, so the last slot's own ops -- and the tail below -- would

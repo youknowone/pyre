@@ -6525,12 +6525,17 @@ pub extern "C" fn jit_locals_dict_snapshot(w_locals: i64) -> i64 {
     }
 }
 
-/// The modelled `locals()` rebuild's extras half: copy `src` into `dst` before
-/// the fastlocal overlay.  A key that names no writable fast local lives only
+/// The modelled `locals()` rebuild's extras half: append `src` to `dst` once
+/// the fastlocals are in.  A key that names no writable fast local lives only
 /// in `f_extra_locals`, so the rebuild has to take that dict or it drops the
-/// key, and the overlay then gives a slot that names it the slot's value.
+/// key; a key both halves carry keeps the fastlocal, because that is the one
+/// `framelocalsproxy_getitem` answers with.
 ///
-/// Reports a failing update as `PY_NULL` so the guarded side exit re-runs
+/// It runs [`merge_extra_locals`], the half [`PyFrame::frame_locals_proxy_snapshot`]
+/// runs, so the trace and the eval loop cannot order or resolve the two halves
+/// differently.
+///
+/// Reports a failing merge as `PY_NULL` so the guarded side exit re-runs
 /// the residual.  Returns `dst` on success so the slot chain can thread it.
 ///
 /// # Safety
@@ -6541,7 +6546,7 @@ pub extern "C" fn jit_locals_dict_update(dst: i64, src: i64) -> i64 {
     let _ = pyre_object::gc_roots::pin_root(dst as PyObjectRef);
     let src_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(src as PyObjectRef);
-    match crate::opcode_ops::dict_update_value(
+    match merge_extra_locals(
         pyre_object::gc_roots::shadow_stack_get(dst_slot),
         pyre_object::gc_roots::shadow_stack_get(src_slot),
     ) {
