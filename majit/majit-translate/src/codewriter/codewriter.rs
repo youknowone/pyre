@@ -321,13 +321,8 @@ impl CodeWriter {
         let outcome = match dual_gate_outcome {
             Ok(result) => result,
             Err(payload) => {
-                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                    (*s).to_string()
-                } else if let Some(s) = payload.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "<unrecognised panic payload>".to_string()
-                };
+                let msg = crate::annotator::model::panic_payload_text(&*payload)
+                    .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
                 if crate::translator::rtyper::cutover::is_known_unported(&msg) {
                     Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(
                         format!("registry build panicked: {msg}"),

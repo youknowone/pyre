@@ -3024,6 +3024,57 @@ impl fmt::Display for AnnotatorError {
 
 impl std::error::Error for AnnotatorError {}
 
+/// Read a caught panic payload as text.
+///
+/// Upstream's handlers catch a typed exception and read its fields —
+/// `annrpython.py:530` catches `AnnotatorError` to attach `source`,
+/// `rtyper.py:493` catches `TyperError` to attach `where` — and the message
+/// text is produced once, at the terminal report (`annrpython.py:244`,
+/// `'\n-----'.join(str(e) for e in self.errors)`). A pyre unwind carries
+/// either the error object or an already-formatted string, so the object is
+/// read first and the string is the fallback.
+///
+/// Every consumer of an annotator unwind must go through this one reader.
+/// A site that hand-rolls `downcast_ref::<String>` reads an object payload
+/// as "unrecognised", and the dual gate then treats a routine unported
+/// subject as a real bug because [`crate::translator::rtyper::cutover::is_known_unported`]
+/// never sees the message.
+///
+/// `None` is reserved for a payload that is neither — each caller keeps its
+/// own wording for that case.
+pub fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    if let Some(err) = payload.downcast_ref::<AnnotatorError>() {
+        return Some(err.to_string());
+    }
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return Some(text.clone());
+    }
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        return Some((*text).to_string());
+    }
+    None
+}
+
+impl AnnotatorError {
+    /// Name the annotator entry point that was driving when this error
+    /// surfaced, without changing the error's class.
+    ///
+    /// Upstream raises `AnnotatorError` from inside `compute_at_fixpoint`
+    /// and `complete_pending_blocks` and lets it propagate as itself; the
+    /// class is what tells a handler which half of the translator failed,
+    /// and `rtyper.py:493` keeps `TyperError` separate for the other half.
+    /// A caller that reformats one into the other erases that distinction,
+    /// after which the stage is recoverable only by matching substrings of
+    /// the rendered text.
+    pub fn in_stage(mut self, stage: &str) -> Self {
+        self.msg = Some(match self.msg.take() {
+            Some(msg) => format!("{stage} failed: {msg}"),
+            None => format!("{stage} failed"),
+        });
+        self
+    }
+}
+
 // ---------------------------------------------------------------------------
 // union() dispatch (A4.6) — model.py + binaryop.py pair().union().
 // ---------------------------------------------------------------------------
