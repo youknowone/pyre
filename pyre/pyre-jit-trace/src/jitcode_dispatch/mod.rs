@@ -8279,6 +8279,10 @@ struct LibffiCallPlan {
 /// argument slot a `CALL_RELEASE_GIL` can carry here, and a result kind that
 /// disagrees with the residual's own destination bank means the jitcode and
 /// the cif describe different calls.
+///
+/// `module/mod.rs` gates `_cffi_backend` on the same two conditions the
+/// attribute names.
+#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 fn libffi_call_plan(cif_description: usize, dst_bank: char) -> Option<LibffiCallPlan> {
     use pyre_interpreter::module::_cffi_backend::jit_libffi::{self, kind, types};
 
@@ -8340,6 +8344,17 @@ fn libffi_call_plan(cif_description: usize, dst_bank: char) -> Option<LibffiCall
         result_signed,
         result_size,
     })
+}
+
+/// `pyjitpl.py`'s `assert self.staticdata.has_libffi_call`, which its own
+/// comment describes as "an 'assert' that constant-folds away the rest of
+/// this function if the codewriter didn't produce any OS_LIBFFI_CALL at
+/// all".  `_cffi_backend` is the only producer of that oopspec, so a build
+/// without it reads no `CIF_DESCRIPTION` and declines to the same
+/// `resbox is None` fallthrough an unsupported kind takes.
+#[cfg(any(feature = "sandbox", target_arch = "wasm32"))]
+fn libffi_call_plan(_cif_description: usize, _dst_bank: char) -> Option<LibffiCallPlan> {
+    None
 }
 
 fn direct_call_release_gil<Sym: WalkSym>(
