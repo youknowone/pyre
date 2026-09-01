@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=11
+# pyre-check: max-pypy-ratio=4
 def loop_with_two_backedges(n):
     high = 0
     for i in range(n):
@@ -9,6 +9,6 @@ def loop_with_two_backedges(n):
     return high
 
 
-result = loop_with_two_backedges(4000)
+result = loop_with_two_backedges(10952000)
 assert result == 6
 print(result)

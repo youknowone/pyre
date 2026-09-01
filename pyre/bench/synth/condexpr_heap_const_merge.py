@@ -1,10 +1,8 @@
-# pyre-check: max-pypy-ratio=38
-# pypy's exec time stays pinned to the startup-subtraction floor at this
-# size, so the ratio is not a measurement; the trip count is what makes
-# PYRE's side one. At the 1000 it was recorded with, the loop never reached
-# the JIT at all -- `loops_compiled=0` on every backend -- so the gate was
-# reading two interpreters' startup. The ceiling is four times the slowest
-# observed (9.4x), the way `type_dict_surrogate` records its own.
+# pyre-check: max-pypy-ratio=4.2
+# The trip count answers two ends at once.  The loop has to run long enough to
+# reach the JIT, or the merge this fixture exists for never happens; and pypy's
+# own execution has to clear FLOOR_GATE_MIN_BASELINE_S, or the ratio divides
+# the floor constant instead of a measurement and neither bound arms.
 #
 # `insert_renamings` skipped any arg whose `as_variable()` equalled
 # `last_exception` / `last_exc_value`.  A Constant has `as_variable() == None`,
@@ -18,7 +16,7 @@
 # shapes are kept for the small-vs-heap contrast, and `ce_big` is correct even
 # when the branch never diverges (the merge structure alone triggered the
 # drop).  Pure arithmetic -> deterministic checksum.
-N = 128000
+N = 10880000
 
 
 def ce_small():
