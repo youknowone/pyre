@@ -341,10 +341,16 @@ fn cpa7<
 /// which part of the signature is unrepresentable. Do not add callers: use the
 /// checked publishers above, and if a helper does not fit, change the helper.
 ///
-/// What "cannot express" costs, measured on this host: a caller that reads one
-/// result register from a function returning `Option<*mut T>` receives `1` for
-/// `Some(p)` and `0` for `None` — never `p`. A wrong pointer that passes a
-/// null check, not a crash.
+/// What "cannot express" costs differs by which half of the signature is
+/// unrepresentable. An unrepresentable result reads one register: a function
+/// returning `Option<*mut T>` answers `1` for `Some(p)` and `0` for `None` —
+/// never `p`, a wrong pointer that passes a null check rather than a crash.
+/// An unrepresentable parameter is worse. The executor writes one word per
+/// `arg_types()` entry, so the second half of a fat pointer is whatever the
+/// caller happened to leave in that register, and a callee that reads it as a
+/// length dereferences an address nothing chose. Publish those through
+/// [`push_abi_unsound_argument_fnaddr`] instead, which names them for
+/// [`is_abi_unsound_argument_residual`].
 fn push_abi_unsound_fnaddr(
     entries: &mut Vec<(&'static str, i64)>,
     full_path: &'static str,
@@ -364,6 +370,36 @@ fn push_abi_unsound_alias_pair(
     push_raw_fnaddr(entries, root_path, fnptr);
 }
 
+/// Argument half of [`push_abi_unsound_fnaddr`]: the part of the signature the
+/// residual ABI cannot express is a parameter rather than the result.
+///
+/// The address is collected as it is published, so
+/// [`is_abi_unsound_argument_residual`] answers from the same site that states
+/// the reason. A second list keyed by name would be a copy of this
+/// classification that nothing keeps in step with it.
+fn push_abi_unsound_argument_fnaddr(
+    entries: &mut Vec<(&'static str, i64)>,
+    abi_unsound_arguments: &mut Vec<i64>,
+    full_path: &'static str,
+    fnptr: *const (),
+) {
+    abi_unsound_arguments.push(fnptr as i64);
+    push_raw_fnaddr(entries, full_path, fnptr);
+}
+
+/// Alias-pair form of [`push_abi_unsound_argument_fnaddr`].
+fn push_abi_unsound_argument_alias_pair(
+    entries: &mut Vec<(&'static str, i64)>,
+    abi_unsound_arguments: &mut Vec<i64>,
+    module_path: &'static str,
+    root_path: &'static str,
+    fnptr: *const (),
+) {
+    abi_unsound_arguments.push(fnptr as i64);
+    push_raw_fnaddr(entries, module_path, fnptr);
+    push_raw_fnaddr(entries, root_path, fnptr);
+}
+
 /// Append one `(path, address)` row, dropping a null address.
 ///
 /// Every published address reaches this function through one of three kinds
@@ -371,7 +407,7 @@ fn push_abi_unsound_alias_pair(
 /// publishers above (`p*` / `pa*` / `cp*` / `cpa*` / `up*` / `upa*`), which
 /// read the signature; [`push_word_accessor_alias_pair`], whose address was
 /// checked by `runtime_ops`'s `word_fn_addr!` before the arity lookup erased
-/// it; and the two `push_abi_unsound_*` hatches, which name the part of the
+/// it; and the `push_abi_unsound_*` hatches, which name the part of the
 /// signature the residual ABI cannot express. A new caller belongs in the
 /// first group — a raw call here publishes an address nothing checked, and a
 /// mismatch surfaces as a wrong register count at trace-time call, not as a
@@ -774,7 +810,31 @@ pub fn is_rerunnable_bookkeeping_residual(addr: usize) -> bool {
 /// source analyzer (`runtime_ops::foo`) and the crate-root re-export path
 /// (`foo`) that pyre's runtime helper code often calls directly.
 pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
+    build_jit_trace_fnaddrs().0
+}
+
+/// True for an address published through [`push_abi_unsound_argument_fnaddr`]:
+/// a helper at least one of whose parameters is wider than the single machine
+/// word a residual argument slot carries.
+///
+/// An inline sub-walk consults this before executing such a residual. The
+/// walk's recorded trace is committed and compiled, and the executor supplies
+/// one word per `arg_types()` entry, so running the helper reads a register
+/// the model never wrote; declining the descent leaves the call to the
+/// interpreter, which passes the argument whole.
+pub fn is_abi_unsound_argument_residual(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    ADDRS
+        .get_or_init(|| build_jit_trace_fnaddrs().1)
+        .contains(&(addr as i64))
+}
+
+/// [`jit_trace_fnaddrs`] and the [`is_abi_unsound_argument_residual`] set,
+/// which the publication sites fill in one pass.
+fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     let mut entries = Vec::new();
+    let mut abi_unsound_arguments = Vec::new();
 
     pa1(
         &mut entries,
@@ -1150,8 +1210,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     let w_list_new_object: fn(Vec<pyre_object::PyObjectRef>) -> pyre_object::PyObjectRef =
         pyre_object::listobject::w_list_new_object;
     // ABI-UNSOUND: `Vec<PyObjectRef>` is three words by value; a residual argument slot is one.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_object::listobject::w_list_new_object",
         "pyre_object::w_list_new_object",
         w_list_new_object as *const (),
@@ -1458,15 +1519,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         w_str_first_surrogate,
     );
     // ABI-UNSOUND: `RBigInt` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_object::longobject::w_long_new",
         "pyre_object::w_long_new",
         pyre_object::longobject::w_long_new as *const (),
     );
     // ABI-UNSOUND: `RBigInt` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_object::longobject::w_long_new_fresh_rbigint_handle",
         "pyre_object::w_long_new_fresh_rbigint_handle",
         pyre_object::longobject::w_long_new_fresh_rbigint_handle as *const (),
@@ -1496,15 +1559,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyre_object::bytearrayobject::w_bytearray_new,
     );
     // ABI-UNSOUND: `&[u8]` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_object::bytearrayobject::w_bytearray_from_bytes",
         "pyre_object::w_bytearray_from_bytes",
         pyre_object::bytearrayobject::w_bytearray_from_bytes as *const (),
     );
     // ABI-UNSOUND: `W_DictObject` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_object::dictmultiobject::alloc_dict_object",
         "pyre_object::alloc_dict_object",
         pyre_object::dictmultiobject::alloc_dict_object as *const (),
@@ -1552,14 +1617,20 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // the residual call resolves.
     let emit_stdout: fn(&[u8]) = crate::host_seam::emit_stdout;
     // ABI-UNSOUND: `&[u8]` is a fat pointer (ptr+len); a residual argument slot is one word.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_interpreter::host_seam::emit_stdout",
         "pyre_interpreter::emit_stdout",
         emit_stdout as *const (),
     );
     // ABI-UNSOUND: `&[u8]` is a fat pointer (ptr+len); a residual argument slot is one word.
-    push_abi_unsound_fnaddr(&mut entries, "emit_stdout", emit_stdout as *const ());
+    push_abi_unsound_argument_fnaddr(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "emit_stdout",
+        emit_stdout as *const (),
+    );
     // `w_set_new` / `w_frozenset_new` are `#[dont_look_inside]` for the same
     // host `IndexMap::new` storage-box reason; bind their zero-arg
     // `fn() -> PyObjectRef` so the residual calls resolve.
@@ -1601,15 +1672,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `wtf8_surrogate_key_str_object` wraps the cold lone-surrogate
     // `to_wtf8_buf` + `w_str_from_wtf8` into one objectptr call.
     // ABI-UNSOUND: `&Wtf8 (a fat pointer)` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_object::dictmultiobject::wtf8_key_is_utf8",
         "pyre_object::wtf8_key_is_utf8",
         pyre_object::dictmultiobject::wtf8_key_is_utf8 as *const (),
     );
     // ABI-UNSOUND: `&Wtf8 (a fat pointer)` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_object::dictmultiobject::wtf8_surrogate_key_str_object",
         "pyre_object::wtf8_surrogate_key_str_object",
         pyre_object::dictmultiobject::wtf8_surrogate_key_str_object as *const (),
@@ -1664,15 +1737,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyre_object::dictmultiobject::w_module_dict_new,
     );
     // ABI-UNSOUND: `&str` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_object::module::w_module_new_aliasing_dict",
         "pyre_object::w_module_new_aliasing_dict",
         pyre_object::module::w_module_new_aliasing_dict as *const (),
     );
     // ABI-UNSOUND: `FunctionName` does not fit one residual slot.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_interpreter::function::function_new_impl",
         "pyre_interpreter::function_new_impl",
         crate::function::function_new_impl as *const (),
@@ -1864,8 +1939,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     let sys_modules_registry_get: fn(&str) -> Option<pyre_object::PyObjectRef> =
         crate::importing::sys_modules_registry_get;
     // ABI-UNSOUND: `&str` is a fat pointer and `Option<PyObjectRef>` is two words.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_interpreter::importing::sys_modules_registry_get",
         "pyre_interpreter::sys_modules_registry_get",
         sys_modules_registry_get as *const (),
@@ -1947,8 +2023,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // thread-identity read.
     let emit_stdout: fn(&[u8]) = crate::host_seam::emit_stdout;
     // ABI-UNSOUND: `&[u8]` is a fat pointer (ptr+len); a residual argument slot is one word.
-    push_abi_unsound_alias_pair(
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_interpreter::host_seam::emit_stdout",
         "pyre_interpreter::emit_stdout",
         emit_stdout as *const (),
@@ -3377,8 +3454,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // proxy type singletons (twins of `w_type` / `w_object`).
     let set_call_error: fn(crate::PyError) = crate::call::set_call_error;
     // ABI-UNSOUND: `PyError` is passed by value and is wider than a word.
-    push_abi_unsound_fnaddr(
+    push_abi_unsound_argument_fnaddr(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_interpreter::call::set_call_error",
         set_call_error as *const (),
     );
@@ -3908,7 +3986,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `_ll_2_str_eq_nonnull`'s body in `majit-metainterp::blackhole`
     // once pyre grows the backing GC struct.
 
-    entries
+    (entries, abi_unsound_arguments)
 }
 
 /// Build-time addresses of the prebuilt static `PyType` singletons that
@@ -4604,7 +4682,7 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_list_write_barrier, is_pyframe_operand_stack_accessor,
+        is_abi_unsound_argument_residual, is_list_write_barrier, is_pyframe_operand_stack_accessor,
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
         jit_trace_fnaddrs,
     };
@@ -4633,6 +4711,33 @@ mod tests {
             bindings["pyre_interpreter::stack_check::pyre_stack_too_big_slowpath"] as usize
         ));
         assert!(!is_rerunnable_bookkeeping_residual(0));
+    }
+
+    /// The set is filled by the publication sites, so the way to lose a helper
+    /// out of it is not a typo in a name but a site moved back to the
+    /// result-half publisher: the address then reads as sound and a sub-walk
+    /// executes a helper whose second argument word nothing wrote. Pin one
+    /// entry from each publisher form, and pin a checked publisher's address
+    /// in the same module that must NOT be in the set.
+    #[test]
+    fn is_abi_unsound_argument_residual_matches_the_published_helpers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for path in [
+            "pyre_object::dictmultiobject::wtf8_key_is_utf8",
+            "pyre_object::wtf8_surrogate_key_str_object",
+            "pyre_interpreter::host_seam::emit_stdout",
+            "emit_stdout",
+            "pyre_interpreter::call::set_call_error",
+        ] {
+            assert!(
+                is_abi_unsound_argument_residual(bindings[path] as usize),
+                "{path} is published with an argument wider than a residual slot"
+            );
+        }
+        assert!(!is_abi_unsound_argument_residual(
+            bindings["pyre_object::dictmultiobject::w_dict_len"] as usize
+        ));
+        assert!(!is_abi_unsound_argument_residual(0));
     }
 
     #[test]

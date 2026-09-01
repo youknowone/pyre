@@ -46,6 +46,27 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ),
     // `pyframe.py` `fast2locals`.
     ("fast2locals", "pyframe.py fast2locals"),
+    // `typeobject.py` `lookup_starting_at`, the MRO-suffix walk `super`
+    // attribute lookup runs.  Without the hint `look_inside_graph` rejects the
+    // graph for its loop and the whole lookup is one opaque residual.
+    //
+    // This is the descent-scope history in the file header repeating.  The hint
+    // let the walk reach `wtf8_key_is_utf8`, published through
+    // `jit_fnaddr.rs`'s ABI-unsound hatch because `&Wtf8` is two machine words
+    // against the residual ABI's one, and executing it during the sub-walk
+    // faulted.  Unlike the sret case, the callee cannot be published correctly
+    // — the residual ABI has no fat-pointer argument at all — so the descent
+    // declines at it instead (`is_abi_unsound_argument_residual`).
+    //
+    // Evidence for the descent-scope change: with that decline in place
+    // `zero_arg_super_attr` matches its committed dynasm `.jitstats` baseline
+    // on every counter, and the corpus gates unchanged against its baselines
+    // with `fbw_rolled_back_with_effects` zero — a `JITSTATS_BADNESS_FIELDS`
+    // member in `check.py`, gated corpus-wide, so a rise anywhere is a red.
+    (
+        "super_getattribute_wtf8",
+        "typeobject.py lookup_starting_at",
+    ),
     // No upstream counterpart by name; the loop is a bounded scan of a
     // fixed-size argument slice.
     ("leading_non_null_count", "flat builtin-keyword ABI scan"),

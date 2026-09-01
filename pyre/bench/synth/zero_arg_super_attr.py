@@ -1,6 +1,6 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
-# pyre-check: spec-folds=load_deref,load_super_attr,load_super_attr_descent,super_attr_unwrap
+# pyre-check: spec-folds=load_deref,load_super_attr,super_attr_unwrap
 # Zero-argument `super().val()` with the loop INSIDE the super-bearing method,
 # in the `for` spelling — the `for` twin of `load_super_attr.py`.
 #
@@ -33,6 +33,13 @@
 # The ceiling is fitted to what that measurement reads: 1.5x on dynasm and
 # 1.7x on cranelift, carried with room for a slower host.
 # `load_super_attr.py` carries the same 3 for the same family.
+#
+# `load_super_attr_descent` is not among them.  The descent walks the MRO
+# suffix and reaches `wtf8_key_is_utf8`, whose `&Wtf8` argument is two machine
+# words against the residual ABI's one, so the sub-walk declines at that call
+# rather than run it: the fold is consulted once per trace and fires zero
+# times.  Naming it here would gate on a fold that cannot fire until the
+# wtf8-keyed dict family takes a key that is one word wide.
 #
 try:
     import pypyjit
