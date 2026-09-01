@@ -703,6 +703,67 @@ static INSNS_BYTE_TO_OPNAME: LazyLock<HashMap<u8, String>> = LazyLock::new(|| {
     map
 });
 
+/// Opcode bytes the runtime assembler allocated after `INSNS_BYTE_TO_OPNAME`
+/// was fixed.
+///
+/// `assembler.py:220` grows `Assembler.insns` with `setdefault(key,
+/// len(self.insns))`, so upstream's table is whatever the run has emitted so
+/// far.  Pyre freezes the build-time half into `insns.bin` and lets
+/// `record_insn_key` allocate the rest on demand — the `USE_C_FORM` shapes
+/// (`int_sub/ci>i`, `goto_if_not_int_gt/icL`, ...) have no fixed `BC_*` byte
+/// and only appear once a graph uses them.  Those bytes must reach
+/// [`decode_op_at`] too: it resolves every opcode through the byte -> opname
+/// map, and an unknown byte makes the whole body undecodable, which the
+/// callers read as "assume the worst" (`replay_unscannable`, every frame slot
+/// written).
+///
+/// Keys are leaked so the decoder can keep handing out `&'static str` exactly
+/// as it does for the build-time table.  The set is small and bounded by the
+/// unreserved opcode bytes.
+static RUNTIME_INSNS_BYTE_TO_OPNAME: LazyLock<std::sync::RwLock<HashMap<u8, &'static str>>> =
+    LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// Publish one runtime-allocated `(opname/argcodes, byte)` pair to the decoder.
+///
+/// Idempotent, and asserts the mapping stays one-to-one for a byte the
+/// build-time table does not already own.
+pub fn publish_runtime_insn(key: &str, byte: u8) {
+    if INSNS_BYTE_TO_OPNAME.contains_key(&byte) {
+        debug_assert_eq!(
+            INSNS_BYTE_TO_OPNAME.get(&byte).map(String::as_str),
+            Some(key),
+            "publish_runtime_insn: byte {byte} is already the build-time table's"
+        );
+        return;
+    }
+    let mut table = RUNTIME_INSNS_BYTE_TO_OPNAME
+        .write()
+        .expect("runtime insn table poisoned");
+    match table.get(&byte) {
+        Some(existing) => assert_eq!(
+            *existing, key,
+            "publish_runtime_insn: byte {byte} maps to both {existing:?} and {key:?} \
+             (assembler.py:220 keeps Assembler.insns 1:1)"
+        ),
+        None => {
+            table.insert(byte, Box::leak(key.to_string().into_boxed_str()));
+        }
+    }
+}
+
+/// Resolve an opcode byte to its `opname/argcodes` key, consulting the
+/// build-time table first and then whatever the runtime assembler published.
+fn key_for_opcode_byte(byte: u8) -> Option<&'static str> {
+    if let Some(key) = INSNS_BYTE_TO_OPNAME.get(&byte) {
+        return Some(key.as_str());
+    }
+    RUNTIME_INSNS_BYTE_TO_OPNAME
+        .read()
+        .expect("runtime insn table poisoned")
+        .get(&byte)
+        .copied()
+}
+
 /// RPython `setup_insns(insns)` — full opname → opcode-byte table.
 pub fn insns_opname_to_byte() -> &'static indexmap::IndexMap<String, u8> {
     &INSNS_OPNAME_TO_BYTE
@@ -2091,7 +2152,7 @@ fn pyre_p_payload_len(opname: &str, code: &[u8], cursor: usize) -> Option<usize>
 /// `blackhole.py` (`bhimpl_live(pc): return pc + OFFSET_SIZE`).
 pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
     let opcode_byte = *code.get(pc)?;
-    let key: &'static str = INSNS_BYTE_TO_OPNAME.get(&opcode_byte)?.as_str();
+    let key: &'static str = key_for_opcode_byte(opcode_byte)?;
     let (opname, argcodes) = split_key(key);
 
     let mut cursor = pc + 1;
