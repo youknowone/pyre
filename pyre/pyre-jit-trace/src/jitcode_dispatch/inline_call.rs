@@ -973,23 +973,27 @@ fn collect_descent_effect_aware_blockers(
         record_reachable_blocker(out, blocker, entry_effect || effect);
     }
     let memo = descent_blocker_summary(jitcode_index);
-    eprintln!(
-        "[builtin-inline-summary] jitcode={jitcode_index} may_effect={} free={:?} after={:?} not_walked={}",
-        memo.may_execute_effect,
-        memo.blocker_effect_free.map(|b| format!("{b:#x}")),
-        memo.blocker_after_effect.map(|b| format!("{b:#x}")),
-        memo.body_not_walked
-    );
-    if let Some(pc) = memo.first_effect_pc {
-        let (opname, descr) = crate::jitcode_runtime::decode_op_at(jitcode.code.as_slice(), pc)
-            .map(|d| {
-                let descr = descr_operand_index(jitcode.code.as_slice(), &d);
-                (d.opname, descr)
-            })
-            .unwrap_or(("?", None));
+    // Per-jitcode summaries (and the decode feeding them) are debug-abort
+    // output; inline-diag alone keeps the recursive walk quiet.
+    if fbw_debug_abort_enabled() {
         eprintln!(
-            "[builtin-inline-first-effect] jitcode={jitcode_index} pc={pc} op={opname} descr={descr:?}"
+            "[builtin-inline-summary] jitcode={jitcode_index} may_effect={} free={:?} after={:?} not_walked={}",
+            memo.may_execute_effect,
+            memo.blocker_effect_free.map(|b| format!("{b:#x}")),
+            memo.blocker_after_effect.map(|b| format!("{b:#x}")),
+            memo.body_not_walked
         );
+        if let Some(pc) = memo.first_effect_pc {
+            let (opname, descr) = crate::jitcode_runtime::decode_op_at(jitcode.code.as_slice(), pc)
+                .map(|d| {
+                    let descr = descr_operand_index(jitcode.code.as_slice(), &d);
+                    (d.opname, descr)
+                })
+                .unwrap_or(("?", None));
+            eprintln!(
+                "[builtin-inline-first-effect] jitcode={jitcode_index} pc={pc} op={opname} descr={descr:?}"
+            );
+        }
     }
     for (callee, caller_effect) in callees {
         collect_descent_effect_aware_blockers(callee, entry_effect || caller_effect, visited, out);
