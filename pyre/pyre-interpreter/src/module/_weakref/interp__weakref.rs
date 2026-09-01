@@ -11,6 +11,7 @@
 
 use crate::{PyError, make_builtin_function, make_builtin_function_with_arity};
 use pyre_object::*;
+use rustpython_wtf8::Wtf8Buf;
 
 use std::sync::OnceLock;
 
@@ -371,6 +372,10 @@ pub fn weakref_type() -> PyObjectRef {
 ///     **proxy_typedef_dict)
 /// W_Proxy.typedef.acceptable_as_base_class = False
 /// ```
+///
+/// `__hash__` departs from that quote: `_PyWeakref_ProxyType` leaves
+/// `tp_hash` NULL while filling `tp_richcompare`, so slot inheritance never
+/// copies `object`'s hash in and the attribute reads as `None`.
 fn init_proxy_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -379,11 +384,14 @@ fn init_proxy_type(ns: PyObjectRef) {
             crate::typedef::make_new_descr(descr__new__proxy),
         )
     };
+    // A NULL `tp_hash` reads back as `__hash__ is None`, and the generic
+    // hash path then reports `unhashable type: 'weakref.ProxyType'` where
+    // `W_Proxy.descr__hash__` raises a bare `unhashable type`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity("__hash__", proxy_descr__hash__, 1),
+            pyre_object::w_none(),
         )
     };
     unsafe {
@@ -394,7 +402,7 @@ fn init_proxy_type(ns: PyObjectRef) {
         )
     };
     // **proxy_typedef_dict — interp__weakref.py.
-    register_proxy_typedef_dict(ns, /*include_comparisons=*/ true);
+    register_proxy_typedef_dict(ns);
 }
 
 /// `dont_look_inside`: the `PROXY_TYPE` process-global `OnceLock` read has
@@ -428,6 +436,12 @@ pub fn proxy_type() -> PyObjectRef {
 ///     **callable_proxy_typedef_dict)
 /// W_CallableProxy.typedef.acceptable_as_base_class = False
 /// ```
+///
+/// Two departures from that quote, both taken from
+/// `_PyWeakref_CallableProxyType`: `tp_hash` stays NULL (see
+/// [`init_proxy_type`]), and `tp_richcompare` is `proxy_richcompare`, the
+/// same slot the non-callable proxy installs, so the comparison rows of
+/// [`register_proxy_typedef_dict`] land on this typedef too.
 fn init_callable_proxy_type(ns: PyObjectRef) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -436,11 +450,13 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
             crate::typedef::make_new_descr(descr__new__callableproxy),
         )
     };
+    // `unhashable type: 'weakref.CallableProxyType'`, for the reason given
+    // in `init_proxy_type`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity("__hash__", proxy_descr__hash__, 1),
+            pyre_object::w_none(),
         )
     };
     unsafe {
@@ -457,10 +473,9 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
             make_builtin_function("__call__", callable_proxy_descr__call__),
         )
     };
-    // **callable_proxy_typedef_dict — interp__weakref.py. Comparison
-    // ops are excluded (interp__weakref.py:390-391 only writes them to
-    // `proxy_typedef_dict`).
-    register_proxy_typedef_dict(ns, /*include_comparisons=*/ false);
+    // **callable_proxy_typedef_dict — interp__weakref.py, plus the
+    // comparison rows PyPy writes only to `proxy_typedef_dict`.
+    register_proxy_typedef_dict(ns);
 }
 
 /// `dont_look_inside` for the same reason as [`proxy_type`].
@@ -837,46 +852,100 @@ pub fn dereference(w_ref: PyObjectRef) -> PyObjectRef {
 ///             state = "; to '%s'" % (typename,)
 ///     return self.getrepr(space, self.typedef.name, state)
 /// ```
+///
+/// The state follows `weakref_repr` / `proxy_repr` rather than the quote
+/// above: `; to '<fully qualified referent type>' at <referent address>`,
+/// closing with ` (<name>)` when a reference's referent answers a string
+/// `__name__`.  The flavour is the typedef's name and never the receiver's
+/// own class: both proxy types report `weakproxy`, and a `ref` subclass
+/// reports `weakref`.
 pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let w_self = args[0];
+    let is_proxy = is_w_abstract_proxy(w_self);
     // PyPy's interp2app gateway types W_WeakrefBase.descr__repr__ as a
     // `weakref-or-proxy` method before entering this shared body.
-    if !is_w_weakref(w_self) && !is_w_abstract_proxy(w_self) {
+    if !is_w_weakref(w_self) && !is_proxy {
         return Err(PyError::type_error(format!(
             "'weakref-or-proxy' object expected, got '{}' instead",
             crate::baseobjspace::object_functionstr_type_name(w_self)
         )));
     }
-    let w_obj = dereference(w_self);
-    let type_name = unsafe {
-        match crate::typedef::r#type(w_self) {
-            Some(tp) if std::ptr::eq(tp.as_ptr(), weakref_type()) => "weakref",
-            Some(tp) if std::ptr::eq(tp.as_ptr(), proxy_type()) => "weakproxy",
-            Some(tp) if std::ptr::eq(tp.as_ptr(), callable_proxy_type()) => "weakcallableproxy",
-            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()),
-            None => "weakref",
+    let type_name = if is_proxy { "weakproxy" } else { "weakref" };
+    // The `__name__` lookup below can run a user-defined property, which
+    // allocates.  Pin the reference and its referent across it and read both
+    // back out of their slots, so a collection that moves either one cannot
+    // leave a stale address in the repr.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_self);
+    let w_obj = dereference(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    if w_obj.is_null() || unsafe { pyre_object::is_none(w_obj) } {
+        return Ok(pyre_object::w_str_new_managed(&format!(
+            "<{type_name} at {}; dead>",
+            crate::display::repr_addr(pyre_object::gc_roots::shadow_stack_get(self_slot) as usize)
+        )));
+    }
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    // `weakref_repr` closes the state with the referent's own `__name__`;
+    // `proxy_repr` has no such suffix.
+    let name = if is_proxy {
+        Wtf8Buf::new()
+    } else {
+        referent_name_suffix(pyre_object::gc_roots::shadow_stack_get(obj_slot))?
+    };
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    // The referent's type is spelled with `%T`, the `<module>.<qualname>`
+    // form, where `getname` gives the bare name.
+    let objtype_name = unsafe {
+        match crate::typedef::r#type(w_obj) {
+            Some(tp) => crate::baseobjspace::type_fully_qualified_name(tp.as_ptr()),
+            None => "object".to_string(),
         }
     };
-    let state = if w_obj.is_null() || unsafe { pyre_object::is_none(w_obj) } {
-        "; dead".to_string()
-    } else {
-        let objtype_name = unsafe {
-            match crate::typedef::r#type(w_obj) {
-                Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-                None => "object".to_string(),
-            }
-        };
-        format!("; to '{}'", objtype_name)
+    // The state also carries the referent's own address, which `getrepr`
+    // does not.
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        crate::display::wtf8_format!(
+            format!(
+                "<{type_name} at {}; to '{objtype_name}' at {}",
+                crate::display::repr_addr(
+                    pyre_object::gc_roots::shadow_stack_get(self_slot) as usize
+                ),
+                crate::display::repr_addr(w_obj as usize),
+            ),
+            name,
+            ">",
+        ),
+    ))
+}
+
+/// `weakref_repr`'s trailing ` (<name>)`: the referent's `__name__` resolved
+/// through `_PyObject_LookupSpecial`, which reads the type alone, so neither
+/// an instance-dict entry nor a forwarding `__getattr__` can invent one
+/// (`test_weakref.py test_repr_failure_gh99184`).  Empty when the type
+/// defines no `__name__` and when the answer is not a `str`.
+///
+/// A `__name__` that raises propagates here.  `weakref_repr` leaves that
+/// error indicator set and returns a repr regardless, which `repr()` then
+/// reports as an unrelated `SystemError`; the exception the lookup actually
+/// raised is the useful one.
+fn referent_name_suffix(w_obj: PyObjectRef) -> Result<Wtf8Buf, PyError> {
+    let looked_up = unsafe { crate::baseobjspace::lookup_special(w_obj, "__name__")? };
+    let Some(w_name) = looked_up else {
+        return Ok(Wtf8Buf::new());
     };
-    let addr = w_self as usize;
-    // W_WeakrefBase.descr__repr__ delegates to W_Root.getrepr, whose result
-    // is `space.newtext(...)` for refs and both proxy kinds, live or dead.
-    Ok(pyre_object::w_str_new_managed(&format!(
-        "<{} at {}{}>",
-        type_name,
-        crate::display::repr_addr(addr),
-        state
-    )))
+    if !unsafe { pyre_object::is_str(w_name) } {
+        return Ok(Wtf8Buf::new());
+    }
+    // The name is written with `%U`, which spells it as it stands; copying it
+    // out through a `&str` dropped one holding a lone surrogate.  Owned rather
+    // than borrowed because the repr allocates after this returns.
+    let mut suffix = Wtf8Buf::new();
+    suffix.push_str(" (");
+    suffix.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_name) });
+    suffix.push_str(")");
+    Ok(suffix)
 }
 
 /// pypy/module/_weakref/interp__weakref.py descr__init__weakref
@@ -1336,15 +1405,10 @@ pub fn getweakrefs(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 //
 // pypy/module/_weakref/interp__weakref.py:311-417
 
-/// pypy/module/_weakref/interp__weakref.py W_Proxy.descr__hash__
-///
-/// ```python
-/// def descr__hash__(self, space):
-///     raise oefmt(space.w_TypeError, "unhashable type")
-/// ```
-pub fn proxy_descr__hash__(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    Err(PyError::type_error("unhashable type".to_string()))
-}
+// `W_Proxy.descr__hash__` / `W_CallableProxy.descr__hash__`
+// (interp__weakref.py) raise a bare `unhashable type`.  Both typedefs bind
+// `__hash__` to `None` instead — see `init_proxy_type` — so the generic hash
+// path names the type, as a NULL `tp_hash` does on the proxy types.
 
 /// pypy/module/_weakref/interp__weakref.py W_CallableProxy.descr__call__
 ///
@@ -1401,9 +1465,13 @@ pub fn proxy(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// def descr__new__proxy(space, w_subtype, w_obj, w_callable=None):
 ///     raise oefmt(space.w_TypeError, "cannot create 'weakproxy' instances")
 /// ```
+///
+/// The name in the message is the type's own, not PyPy's internal typedef
+/// name: `type_call` formats `"cannot create '%s' instances"` from `tp_name`
+/// when `tp_new` is NULL, and the proxy type is named `weakref.ProxyType`.
 pub fn descr__new__proxy(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Err(PyError::type_error(
-        "cannot create 'weakproxy' instances".to_string(),
+        "cannot create 'weakref.ProxyType' instances".to_string(),
     ))
 }
 
@@ -1414,9 +1482,11 @@ pub fn descr__new__proxy(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> 
 ///     raise oefmt(space.w_TypeError,
 ///                 "cannot create 'weakcallableproxy' instances")
 /// ```
+///
+/// Named after the type itself, for the reason given in `descr__new__proxy`.
 pub fn descr__new__callableproxy(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Err(PyError::type_error(
-        "cannot create 'weakcallableproxy' instances".to_string(),
+        "cannot create 'weakref.CallableProxyType' instances".to_string(),
     ))
 }
 
@@ -1432,6 +1502,9 @@ pub fn descr__new__callableproxy(_args: &[PyObjectRef]) -> Result<PyObjectRef, P
 ///                     "weakly referenced object no longer exists")
 ///     return w_obj
 /// ```
+///
+/// `proxy_check_ref` spells the same text hyphenated, and that is the
+/// wording every dead-proxy operation reports.
 pub fn force(proxy: PyObjectRef) -> Result<PyObjectRef, PyError> {
     if !is_w_abstract_proxy(proxy) {
         return Ok(proxy);
@@ -1439,7 +1512,7 @@ pub fn force(proxy: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let w_obj = dereference(proxy);
     if w_obj.is_null() || unsafe { pyre_object::is_none(w_obj) } {
         return Err(PyError::reference_error(
-            "weakly referenced object no longer exists".to_string(),
+            "weakly-referenced object no longer exists".to_string(),
         ));
     }
     Ok(w_obj)
@@ -1555,7 +1628,22 @@ proxy_binary_reflected!(proxy_rmod, crate::baseobjspace::mod_);
 // `space.pow`, whose forward/reverse dance lets `__rpow__` answer; the
 // three-arg form hands off to `space.pow3`, which consults only the
 // forward `__pow__` (descroperation.py:450) and never the reflected slot.
+/// `wrap_ternaryfunc`'s count check, written here rather than declared at the
+/// registration: the modulo operand is optional, so the slice is two or three
+/// long and there is no single arity for the gateway to enforce.  Without it
+/// the reads below ran off the end of a short slice.
+fn proxy_pow_arity(args: &[PyObjectRef]) -> Result<(), PyError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(PyError::type_error(format!(
+            "expected 1 or 2 arguments, got {}",
+            args.len().saturating_sub(1)
+        )));
+    }
+    Ok(())
+}
+
 pub fn proxy_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    proxy_pow_arity(args)?;
     let w_obj0 = force(args[0])?;
     let w_obj1 = force(args[1])?;
     let has_modulo =
@@ -1568,6 +1656,7 @@ pub fn proxy_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 pub fn proxy_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    proxy_pow_arity(args)?;
     // interp__weakref.py:382-385 — reflected wrapper swaps the first
     // two operands; the modulo argument keeps its slot.
     let w_obj0 = force(args[0])?;
@@ -1849,13 +1938,15 @@ pub fn proxy_delete(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 /// pypy/module/_weakref/interp__weakref.py:356-395 register the entries
-/// of `proxy_typedef_dict` (and, with `include_comparisons=true`, the
-/// six comparison ops registered only on `proxy_typedef_dict`).
+/// of `proxy_typedef_dict`, plus the six comparison ops.
 ///
-/// Called from `init_proxy_type` (`include_comparisons=true`) and
-/// `init_callable_proxy_type` (`include_comparisons=false`) so the two
-/// typedefs end up with the same set of methods PyPy generates.
-fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
+/// Called from both `init_proxy_type` and `init_callable_proxy_type`, so the
+/// two typedefs end up with the same set of methods.  PyPy writes the
+/// comparison ops to `proxy_typedef_dict` alone; both `_PyWeakref_ProxyType`
+/// and `_PyWeakref_CallableProxyType` install `proxy_richcompare`, and
+/// without it `p == referent` on a callable proxy falls through to identity
+/// and ordering names the proxy type instead of the referents.
+fn register_proxy_typedef_dict(ns: PyObjectRef) {
     // Forward + reflected binary arithmetic — interp__weakref.py:376-389.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -2347,52 +2438,51 @@ fn register_proxy_typedef_dict(ns: PyObjectRef, include_comparisons: bool) {
         )
     };
 
-    // interp__weakref.py:390-391 — comparison ops are registered only on
-    // `proxy_typedef_dict`, not `callable_proxy_typedef_dict`.
-    if include_comparisons {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__lt__",
-                make_builtin_function_with_arity("__lt__", proxy_lt, 2),
-            )
-        };
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__le__",
-                make_builtin_function_with_arity("__le__", proxy_le, 2),
-            )
-        };
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__gt__",
-                make_builtin_function_with_arity("__gt__", proxy_gt, 2),
-            )
-        };
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__ge__",
-                make_builtin_function_with_arity("__ge__", proxy_ge, 2),
-            )
-        };
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__eq__",
-                make_builtin_function_with_arity("__eq__", proxy_eq, 2),
-            )
-        };
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__ne__",
-                make_builtin_function_with_arity("__ne__", proxy_ne, 2),
-            )
-        };
-    }
+    // `proxy_richcompare` — the same slot on both proxy typedefs.  The
+    // `ObjSpace.MethodTable` loop in interp__weakref.py writes these rows to
+    // `proxy_typedef_dict` only.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__lt__",
+            make_builtin_function_with_arity("__lt__", proxy_lt, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__le__",
+            make_builtin_function_with_arity("__le__", proxy_le, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__gt__",
+            make_builtin_function_with_arity("__gt__", proxy_gt, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ge__",
+            make_builtin_function_with_arity("__ge__", proxy_ge, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__eq__",
+            make_builtin_function_with_arity("__eq__", proxy_eq, 2),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", proxy_ne, 2),
+        )
+    };
 }
 
 /// Serialize the proxy-delegation tests. They resolve attributes and methods
@@ -2449,7 +2539,7 @@ mod tests {
         assert_eq!(err.kind, crate::PyErrorKind::ReferenceError);
         assert_eq!(
             err.message_text(),
-            "weakly referenced object no longer exists"
+            "weakly-referenced object no longer exists"
         );
     }
 
@@ -2787,32 +2877,60 @@ mod tests {
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 123456);
     }
 
-    /// pypy/module/_weakref/interp__weakref.py:390-391 — comparison ops
-    /// land on `proxy_typedef_dict` only, never on
-    /// `callable_proxy_typedef_dict`.  The complete object TypeDef exposes
-    /// the four ordering slots too, so test the class that supplied the MRO
-    /// hit: the ordinary proxy supplies its forwarding operation, while the
-    /// callable proxy reaches `object`'s NotImplemented operation.
+    /// `proxy_richcompare` sits on both proxy types, so each typedef — not
+    /// the inherited `object` operation — must supply the MRO hit for every
+    /// comparison slot.  The `ObjSpace.MethodTable` loop in
+    /// interp__weakref.py writes these rows to `proxy_typedef_dict` alone.
     #[test]
-    fn test_comparison_ops_only_on_weakproxy() {
+    fn test_comparison_ops_on_both_proxy_typedefs() {
         let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let weakproxy = proxy_type();
         let callable = callable_proxy_type();
         unsafe {
-            for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
-                let (weak_source, _) =
-                    crate::baseobjspace::lookup_where_pair(weakproxy, name).unwrap();
-                assert!(std::ptr::eq(weak_source, weakproxy));
-                let (callable_source, _) =
-                    crate::baseobjspace::lookup_where_pair(callable, name).unwrap();
-                assert!(std::ptr::eq(callable_source, crate::typedef::w_object()));
+            for tp in [weakproxy, callable] {
+                for name in ["__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"] {
+                    let (source, _) = crate::baseobjspace::lookup_where_pair(tp, name).unwrap();
+                    assert!(std::ptr::eq(source, tp));
+                }
+                // Forwarded ops should land on both typedefs.
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__add__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__len__").is_some());
             }
-            // Forwarded ops should land on both typedefs.
-            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__add__").is_some());
-            assert!(crate::baseobjspace::lookup_in_type(callable, "__add__").is_some());
-            assert!(crate::baseobjspace::lookup_in_type(weakproxy, "__len__").is_some());
-            assert!(crate::baseobjspace::lookup_in_type(callable, "__len__").is_some());
+        }
+    }
+
+    /// `weakref_repr` / `proxy_repr`: the flavour is the typedef's name, and
+    /// a live state carries the referent's fully qualified type followed by
+    /// its address.
+    #[test]
+    fn test_repr_names_typedef_flavour_and_referent_address() {
+        let _g = super::lock_proxy_tests();
+        crate::typedef::init_typeobjects();
+        let referent = pyre_object::w_str_new("weakref target");
+        let weakref = W_Weakref_new(weakref_type(), referent, PY_NULL);
+        let text = unsafe { pyre_object::w_str_get_value(descr__repr__(&[weakref]).unwrap()) };
+        assert!(text.starts_with("<weakref at 0x"), "{text}");
+        assert!(text.contains("; to 'str' at 0x"), "{text}");
+
+        let proxy = W_Proxy_new(referent, PY_NULL);
+        let text = unsafe { pyre_object::w_str_get_value(descr__repr__(&[proxy]).unwrap()) };
+        assert!(text.starts_with("<weakproxy at 0x"), "{text}");
+        assert!(text.contains("; to 'str' at 0x"), "{text}");
+    }
+
+    /// Neither proxy type carries a hash: `__hash__` reads as `None`, the
+    /// way a NULL `tp_hash` does on `_PyWeakref_ProxyType` /
+    /// `_PyWeakref_CallableProxyType`.
+    #[test]
+    fn test_proxy_hash_is_none() {
+        let _g = super::lock_proxy_tests();
+        crate::typedef::init_typeobjects();
+        unsafe {
+            for tp in [proxy_type(), callable_proxy_type()] {
+                let w_hash = crate::baseobjspace::lookup_in_type(tp, "__hash__").unwrap();
+                assert!(pyre_object::is_none(w_hash));
+            }
         }
     }
 }

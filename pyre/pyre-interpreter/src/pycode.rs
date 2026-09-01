@@ -2658,6 +2658,13 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         ));
     }
     let mut code = unsafe { (*code_ptr).clone() };
+    // `code.replace` declares `co_nlocals` as
+    // `int(c_default="((PyCodeObject *)self)->co_nlocals")`, so an omitted
+    // keyword carries the RECEIVER's count into the constructor's
+    // `co_nlocals != len(co_varnames)` check.  Read it before any override
+    // runs: taking it from the already-replaced `code.varnames` would make
+    // that check vacuous and accept a `co_varnames` of a different length.
+    let inherited_nlocals = code.varnames.len();
     let mut firstlineno_raw = unsafe { (*(w_self as *const PyCode)).co_firstlineno_raw };
     let mut filename_bytes = unsafe {
         let ptr = (*(w_self as *const PyCode)).filename_bytes;
@@ -2691,9 +2698,10 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     if let Some(v) = get("co_kwonlyargcount") {
         code.kwonlyarg_count = unsafe { read_code_u32(v, "co_kwonlyargcount")? };
     }
-    let requested_nlocals = get("co_nlocals")
-        .map(|v| unsafe { read_code_u32(v, "co_nlocals") })
-        .transpose()?;
+    let nlocals = match get("co_nlocals") {
+        Some(v) => unsafe { read_code_u32(v, "co_nlocals")? as usize },
+        None => inherited_nlocals,
+    };
     if let Some(v) = get("co_stacksize") {
         code.max_stackdepth = unsafe { read_code_u32(v, "co_stacksize")? };
     }
@@ -2758,7 +2766,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         (code.instructions, co_code_bytes) = unsafe { read_code_units(v)? };
     }
 
-    if requested_nlocals.is_some_and(|n| n as usize != code.varnames.len()) {
+    if nlocals != code.varnames.len() {
         return Err(crate::PyError::value_error(
             "code: co_nlocals != len(co_varnames)",
         ));

@@ -1972,10 +1972,14 @@ pub(crate) unsafe fn tuple_repeat(t: PyObjectRef, n: PyObjectRef) -> PyResult {
     items
         .try_reserve_exact(cap)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
-    for _ in 0..n {
-        for i in 0..len {
-            if let Some(item) = w_tuple_getitem(t, i as i64) {
-                items.push(item);
+    // `tuple_repeat` makes no copies for `input_size == 0`, so an empty
+    // receiver never walks the count as a trip count.
+    if len != 0 {
+        for _ in 0..n {
+            for i in 0..len {
+                if let Some(item) = w_tuple_getitem(t, i as i64) {
+                    items.push(item);
+                }
             }
         }
     }
@@ -2035,8 +2039,12 @@ pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(total)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
-    for _ in 0..count {
-        out.extend_from_slice(bytes);
+    // `unicode_repeat` answers a receiver of no characters before it copies,
+    // so an empty one never walks the count as a trip count.
+    if !bytes.is_empty() {
+        for _ in 0..count {
+            out.extend_from_slice(bytes);
+        }
     }
     let buf = Wtf8Buf::from_bytes(out).expect("repetition of WTF-8 is WTF-8");
     // Repetition churns fresh dynamic strings; make the result collectable.
@@ -2084,8 +2092,12 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.try_reserve_exact(cap)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
-    for _ in 0..count {
-        buf.extend_from_slice(data);
+    // `_PyBytes_Repeat` returns on `len_dest == 0`, so an empty receiver never
+    // walks the count as a trip count.
+    if !data.is_empty() {
+        for _ in 0..count {
+            buf.extend_from_slice(data);
+        }
     }
     Ok(if pyre_object::bytesobject::is_bytes(s) {
         pyre_object::bytesobject::w_bytes_from_bytes(&buf)
@@ -2163,10 +2175,14 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
     let list_slot = list_roots.publish(&[list]);
     list_roots.normalize(list_slot, 1);
     let mut rooted = pyre_object::gc_roots::RootedItems::new();
-    for _ in 0..count {
-        for i in 0..len {
-            if let Some(item) = w_list_getitem(list_roots.get(list_slot), i as i64) {
-                rooted.push(item);
+    // `list_repeat` answers `input_size == 0` before it copies, so an empty
+    // receiver never walks the count as a trip count.
+    if len != 0 {
+        for _ in 0..count {
+            for i in 0..len {
+                if let Some(item) = w_list_getitem(list_roots.get(list_slot), i as i64) {
+                    rooted.push(item);
+                }
             }
         }
     }
@@ -2209,15 +2225,20 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     // the copies are appended.  Holding the refs across `w_list_append` is
     // the same idiom `list_method_extend` uses for its iterable branch.
     let snapshot = w_list_items_copy_as_vec_mode(list, majit_metainterp::jit::we_are_jitted());
-    // The snapshot is a plain `Vec` and roots nothing, and
-    // `w_list_reserve_for_extend` allocates: publish both the receiver -- a
-    // `W_List` header, one of the two kinds a minor collection relocates --
-    // and the snapshot, then address them through their slots.
+    // The snapshot is a plain `Vec` and roots nothing, and the resize below
+    // allocates: publish both the receiver -- a `W_List` header, one of the two
+    // kinds a minor collection relocates -- and the snapshot, then address them
+    // through their slots.
     let roots = pyre_object::gc_roots::push_roots();
     let list_slot = roots.publish(&[list]);
     let base = roots.publish(&snapshot);
     roots.normalize(list_slot, 1 + snapshot.len());
-    pyre_object::listobject::w_list_reserve_for_extend(roots.get(list_slot), cap - len);
+    // `list_inplace_repeat_lock_held` sizes the whole result with one
+    // `list_resize` before it copies, so a count the machine cannot meet is
+    // refused here rather than walked as a trip count by the loop below.
+    if !pyre_object::listobject::w_list_try_resize(roots.get(list_slot), cap) {
+        return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    }
     for _ in 1..count {
         for k in 0..snapshot.len() {
             pyre_object::listobject::w_list_append_preallocated(
@@ -3087,6 +3108,42 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> boo
     dunder_overridden(obj, fwd, t) || dunder_overridden(obj, rev, t)
 }
 
+/// `update_one_slot`'s duplicated-slotdef rule.  `slotdefs` names `__add__`
+/// twice — once at `nb_add`, once at `sq_concat` — and `__mul__` twice, at
+/// `nb_multiply` and `sq_repeat`.  A type whose entry for the name is the
+/// sequence wrapper is left with the numeric half NULL, and a subclass that
+/// writes no method of its own inherits that NULL, so `binary_op1` never
+/// offers the sequence as a numeric operand and the other one answers alone:
+/// `SS('a') + IntR(1)` is the `int` subclass's `__radd__` and `SS('a') *
+/// IntR(2)` its `__rmul__`, not a concat refusal and not a repetition.
+///
+/// Only a subclass that writes the dunder in Python installs the generic slot
+/// and takes part, which is what the `dunder_overridden` test below asks.
+///
+/// `dont_look_inside` for the reason its neighbours carry it: the builtin
+/// base type statics are loaded here, and a traced caller would otherwise
+/// carry an unresolvable `LoadStatic`.
+#[majit_macros::dont_look_inside]
+unsafe fn sequence_numeric_slot_is_null(obj: PyObjectRef, dunder: &str) -> bool {
+    let tp: *const pyre_object::PyType = if is_str(obj) {
+        &pyre_object::STR_TYPE
+    } else if is_list(obj) {
+        &pyre_object::LIST_TYPE
+    } else if is_tuple(obj) {
+        &pyre_object::TUPLE_TYPE
+    } else if pyre_object::bytesobject::is_bytes(obj) {
+        &pyre_object::bytesobject::BYTES_TYPE
+    } else if pyre_object::bytearrayobject::is_bytearray(obj) {
+        &pyre_object::bytearrayobject::BYTEARRAY_TYPE
+    } else {
+        return false;
+    };
+    let Some(t) = crate::typedef::gettypefor(tp) else {
+        return false;
+    };
+    !dunder_overridden(obj, dunder, t.as_ptr())
+}
+
 /// `needs_seq_binop_dispatch` for the `sq_repeat` branches of [`mul`], where
 /// only one operand is the sequence: a subclass that overrides the multiply
 /// specials relative to its own builtin base has to run that override instead
@@ -3294,11 +3351,43 @@ unsafe fn try_reflected_binary_special(
 }
 
 pub(crate) unsafe fn str_concat_type_error(rhs: PyObjectRef) -> PyError {
-    let name = crate::typedef::r#type(rhs).map_or_else(
+    let name = unsafe { concat_operand_name(rhs) };
+    PyError::type_error(format!("can only concatenate str (not \"{name}\") to str"))
+}
+
+/// The operand name every `sq_concat` refusal below spells.
+unsafe fn concat_operand_name(obj: PyObjectRef) -> String {
+    crate::typedef::r#type(obj).map_or_else(
         || "object".to_owned(),
         |w_type| crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
-    );
-    PyError::type_error(format!("can only concatenate str (not \"{name}\") to str"))
+    )
+}
+
+/// `list_concat`'s refusal.  It names the base rather than the receiver's own
+/// type, so a `list` subclass still reports `list` on the left.
+unsafe fn list_concat_type_error(rhs: PyObjectRef) -> PyError {
+    let name = unsafe { concat_operand_name(rhs) };
+    PyError::type_error(format!(
+        "can only concatenate list (not \"{name}\") to list"
+    ))
+}
+
+/// `tuple_concat`'s refusal, the same shape as `list_concat`'s.
+unsafe fn tuple_concat_type_error(rhs: PyObjectRef) -> PyError {
+    let name = unsafe { concat_operand_name(rhs) };
+    PyError::type_error(format!(
+        "can only concatenate tuple (not \"{name}\") to tuple"
+    ))
+}
+
+/// `bytes_concat`'s refusal, which it raises when either operand fails
+/// `PyObject_GetBuffer`.  Unlike the two above it names both operands by
+/// their own `tp_name`, so a `bytes` subclass reports itself on the right of
+/// `to`.
+unsafe fn bytes_concat_type_error(lhs: PyObjectRef, rhs: PyObjectRef) -> PyError {
+    let lhs_name = unsafe { concat_operand_name(lhs) };
+    let rhs_name = unsafe { concat_operand_name(rhs) };
+    PyError::type_error(format!("can't concat {rhs_name} to {lhs_name}"))
 }
 
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -3309,7 +3398,12 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__add__", "__radd__");
+        // A sequence left operand has no `nb_add` to offer, so the numeric
+        // override runs the right operand's alone; the concat branches below
+        // are `PyNumber_Add`'s `sq_concat` fall-through and already reach
+        // `__radd__` before refusing.
         if numeric_override
+            && !sequence_numeric_slot_is_null(a, "__add__")
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
         {
@@ -3365,6 +3459,26 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             }
             return list_concat(a, b);
         }
+        if is_list(a) {
+            // [3.14-spec] `PyNumber_Add` reaches the left operand's
+            // `sq_concat` once `nb_add` has declined both ways, and
+            // `list_concat` refuses a non-list by name there.  PyPy
+            // `W_ListObject.descr_add` returns NotImplemented instead and
+            // `_make_binop_impl` emits its generic operator error.
+            //
+            // A subclass that writes its own `__add__` keeps the generic
+            // wording either way: its `slot_nb_add` stands in for the base's
+            // `sq_concat`, so nothing reaches this refusal.
+            let list_type = crate::typedef::gettypefor(&pyre_object::LIST_TYPE);
+            let uses_builtin_add = list_type
+                .is_some_and(|list_type| !dunder_overridden(a, "__add__", list_type.as_ptr()));
+            if uses_builtin_add {
+                if let Some(result) = try_reflected_binary_special(&mut a, &mut b, "__radd__")? {
+                    return Ok(result);
+                }
+                return Err(list_concat_type_error(b));
+            }
+        }
         if is_tuple(a) && is_tuple(b) {
             if needs_seq_binop_dispatch(a, b, SeqBase::Tuple, "__add__", "__radd__")
                 && let Some(result) =
@@ -3373,6 +3487,18 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
                 return Ok(result);
             }
             return tuple_concat(a, b);
+        }
+        if is_tuple(a) {
+            // `tuple_concat`, the same shape as the list branch above.
+            let tuple_type = crate::typedef::gettypefor(&pyre_object::TUPLE_TYPE);
+            let uses_builtin_add = tuple_type
+                .is_some_and(|tuple_type| !dunder_overridden(a, "__add__", tuple_type.as_ptr()));
+            if uses_builtin_add {
+                if let Some(result) = try_reflected_binary_special(&mut a, &mut b, "__radd__")? {
+                    return Ok(result);
+                }
+                return Err(tuple_concat_type_error(b));
+            }
         }
         // `bytes`/`bytearray` `__add__` accepts any buffer on the right (a
         // memoryview included), and the result type follows the left operand:
@@ -3395,9 +3521,11 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             {
                 return Ok(result);
             }
-            // A non-buffer rhs is rejected with the generic operator TypeError
-            // (bytes `descr_add` returns NotImplemented), not "can't concat".
-            return Err(binop_type_error(symbol, a, b));
+            // [3.14-spec] `bytes_concat` reaches its own refusal when
+            // `PyObject_GetBuffer` fails on the right operand.  PyPy
+            // `W_BytesObject.descr_add` returns NotImplemented and
+            // `_make_binop_impl` emits the generic operator error instead.
+            return Err(bytes_concat_type_error(a, b));
         }
         // Forward `__add__` + reflected `__radd__` per
         // `descroperation.py:_make_binop_impl` — try_dispatch_binary_special
@@ -3491,7 +3619,10 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__mul__", "__rmul__");
+        // As in [`binop_add_impl`]: a sequence operand carries no
+        // `nb_multiply`, so only the other operand's runs here.
         if numeric_override
+            && !sequence_numeric_slot_is_null(a, "__mul__")
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
         {
@@ -3522,31 +3653,41 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         {
             return Ok(result);
         }
-        if is_str(a) && is_int_or_long(b) {
-            return str_repeat(a, b);
-        }
-        if is_int_or_long(a) && is_str(b) {
-            return str_repeat(b, a);
-        }
-        if is_list(a) && is_int_or_long(b) {
-            return list_repeat(a, b);
-        }
-        if is_int_or_long(a) && is_list(b) {
-            return list_repeat(b, a);
-        }
-        // tupleobject.py descr_mul
-        if is_tuple(a) && is_int_or_long(b) {
-            return tuple_repeat(a, b);
-        }
-        if is_int_or_long(a) && is_tuple(b) {
-            return tuple_repeat(b, a);
-        }
-        // bytesobject.py descr_mul / bytearrayobject.py descr_mul
-        if pyre_object::bytesobject::is_bytes_like(a) && is_int_or_long(b) {
-            return bytes_repeat(a, b);
-        }
-        if is_int_or_long(a) && pyre_object::bytesobject::is_bytes_like(b) {
-            return mul(b, a);
+        // `PyNumber_Multiply` reaches `sq_repeat` only once `binary_op1` has
+        // declined, and a builtin sequence contributes nothing to that call,
+        // so a count that is a numeric subclass writing `__mul__`/`__rmul__`
+        // is the only operand offered and answers first.  The repeat runs at
+        // the tail of this function when it declines.
+        let count_answers_first = numeric_override
+            && (sequence_numeric_slot_is_null(a, "__mul__")
+                || sequence_numeric_slot_is_null(b, "__mul__"));
+        if !count_answers_first {
+            if is_str(a) && is_int_or_long(b) {
+                return str_repeat(a, b);
+            }
+            if is_int_or_long(a) && is_str(b) {
+                return str_repeat(b, a);
+            }
+            if is_list(a) && is_int_or_long(b) {
+                return list_repeat(a, b);
+            }
+            if is_int_or_long(a) && is_list(b) {
+                return list_repeat(b, a);
+            }
+            // tupleobject.py descr_mul
+            if is_tuple(a) && is_int_or_long(b) {
+                return tuple_repeat(a, b);
+            }
+            if is_int_or_long(a) && is_tuple(b) {
+                return tuple_repeat(b, a);
+            }
+            // bytesobject.py descr_mul / bytearrayobject.py descr_mul
+            if pyre_object::bytesobject::is_bytes_like(a) && is_int_or_long(b) {
+                return bytes_repeat(a, b);
+            }
+            if is_int_or_long(a) && pyre_object::bytesobject::is_bytes_like(b) {
+                return mul(b, a);
+            }
         }
         // `PyNumber_Multiply`: none of the builtin sequences implements
         // `nb_multiply`, so their `__mul__` / `__rmul__` slot wrappers take no
@@ -5641,16 +5782,26 @@ pub fn pos_inner(a: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_unaryop(a, "__pos__")? {
             return Ok(result);
         }
-        if a.is_null() {
-            return Err(PyError::type_error(
-                "unsupported operand type for unary pos: 'NoneType'",
-            ));
-        }
-        Err(PyError::type_error(format!(
-            "unsupported operand type for unary pos: '{}'",
-            crate::baseobjspace::object_functionstr_type_name(a),
-        )))
+        Err(bad_operand_type("unary +", a))
     }
+}
+
+/// [3.14-spec] `UNARY_FUNC`'s refusal, `bad operand type for unary -: '<T>'`,
+/// spelled with the operator.  `_make_unaryop_impl` builds its wording from the
+/// symbol column of `ObjSpace.MethodTable`, which carries the *name* `neg` and
+/// `pos` for those two rows and the symbol only for `invert`, so PyPy answers
+/// `unsupported operand type for unary neg`.  Measured against 3.14.2;
+/// `abs_bad_operand` already words the fourth arm of the same macro this way.
+///
+/// A null receiver reaches here from the callers below, which reserve it for
+/// `None`.
+fn bad_operand_type(descr: &str, a: PyObjectRef) -> PyError {
+    let type_name = if a.is_null() {
+        "NoneType".to_string()
+    } else {
+        crate::baseobjspace::object_functionstr_type_name(a)
+    };
+    PyError::type_error(format!("bad operand type for {descr}: '{type_name}'"))
 }
 
 /// Unary negation.
@@ -5705,15 +5856,7 @@ pub fn neg_inner(a: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_unaryop(a, "__neg__")? {
             return Ok(result);
         }
-        if a.is_null() {
-            return Err(PyError::type_error(
-                "unsupported operand type for unary neg: 'NoneType'",
-            ));
-        }
-        Err(PyError::type_error(format!(
-            "unsupported operand type for unary neg: '{}'",
-            crate::baseobjspace::object_functionstr_type_name(a),
-        )))
+        Err(bad_operand_type("unary -", a))
     }
 }
 
@@ -5781,10 +5924,7 @@ pub fn invert_inner(a: PyObjectRef) -> PyResult {
         if let Some(result) = try_instance_unaryop(a, "__invert__")? {
             return Ok(result);
         }
-        Err(PyError::type_error(format!(
-            "unsupported operand type for unary ~: '{}'",
-            crate::baseobjspace::object_functionstr_type_name(a),
-        )))
+        Err(bad_operand_type("unary ~", a))
     }
 }
 

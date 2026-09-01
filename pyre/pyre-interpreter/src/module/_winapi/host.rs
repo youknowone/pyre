@@ -91,7 +91,11 @@ pub(super) fn wide_or_none(
 }
 
 /// The UTF-16 units of a `str`, without a terminator.
-fn wide_units(w_text: PyObjectRef) -> Vec<u16> {
+///
+/// This is what `PyUnicode_AsWideCharString` hands back: the text as spelled,
+/// so an unpaired surrogate stays the code unit it is instead of being refused
+/// the way a strict utf-8 encode refuses it.
+pub(super) fn wide_units(w_text: PyObjectRef) -> Vec<u16> {
     unsafe { pyre_object::w_str_get_wtf8(w_text) }
         .encode_wide()
         .collect()

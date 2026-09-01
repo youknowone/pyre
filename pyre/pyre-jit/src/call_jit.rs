@@ -6522,8 +6522,8 @@ pub extern "C" fn bh_set_update_fn(set: i64, iterable: i64) -> i64 {
 }
 
 /// DICT_UPDATE residual (`dict_update` HLOp → `residual_call_r_v`).  Runs
-/// `dict.update(source)` with the ismapping gate through the shared
-/// `opcode_ops::dict_update_value`; `dict` is peeked and mutated in
+/// `PyDict_Update` and the handler's own non-mapping rewrite through the
+/// shared `opcode_ops::dict_update_value`; `dict` is peeked and mutated in
 /// place.  A `keys()`/`__getitem__`/`__hash__` can run Python
 /// (`MayForce`).  Void result.
 pub extern "C" fn bh_dict_update_fn(dict: i64, source: i64) -> i64 {

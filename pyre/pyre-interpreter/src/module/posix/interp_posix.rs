@@ -1392,10 +1392,91 @@ mod win_nt {
         }
     }
 
-    /// os._add_dll_directory. PyPy hands back a W_DLLCapsule; os.py only
-    /// round-trips the value into `_remove_dll_directory`, so the opaque
-    /// DLL_DIRECTORY_COOKIE pointer is returned as an int instead. host_env has
-    /// no AddDllDirectory wrapper, so call windows-sys directly.
+    /// The reserved instance-dictionary key the cookie object files its
+    /// `DLL_DIRECTORY_COOKIE` under, namespaced the way the capsule carrier in
+    /// `cpyext` namespaces its own payload.
+    const DLL_COOKIE_KEY: &str = "__pyre_dll_directory_cookie__";
+
+    /// The cookies `AddDllDirectory` has issued and `RemoveDllDirectory` has
+    /// not taken back.
+    ///
+    /// The one-shot state that stops a second removal is the cleared payload
+    /// below, the way `os__remove_dll_directory_impl` renames the capsule it
+    /// was handed.  This list answers the other half: the payload rides an
+    /// instance dictionary, which `object.__setattr__` can still write, and the
+    /// loader fail-fasts rather than raising on a pointer it never handed out,
+    /// so a removal checks the value here before the loader ever sees it.  A
+    /// directory added twice has two entries and takes two removals.
+    static LIVE_DLL_DIRECTORY_COOKIES: parking_lot::Mutex<Vec<usize>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    /// The type of the opaque value `_add_dll_directory` hands back.
+    ///
+    /// `os__add_dll_directory_impl` returns `PyCapsule_New(cookie, "DLL
+    /// directory cookie", NULL)`, and PyPy an `interp_posix.W_DLLCapsule`;
+    /// either way the point is that a caller cannot spell a cookie, because
+    /// `_remove_dll_directory` reinterprets what it is given as a pointer into
+    /// the loader's DLL-directory list.  The type publishes nothing and is
+    /// neither instantiable nor subclassable, so `_add_dll_directory` is the
+    /// only source of one.
+    fn dll_cookie_type() -> PyObjectRef {
+        static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CELL.get_or_init(|| {
+            let tp = crate::typedef::make_builtin_type("nt.DLLDirectoryCookie", |_ns| {});
+            unsafe {
+                pyre_object::typeobject::w_type_set_hasdict(tp, true);
+                pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
+                pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, false);
+            }
+            tp as usize
+        }) as PyObjectRef
+    }
+
+    /// Box `cookie`.  The carrier is pinned before the value is built, and both
+    /// are read back at the store: building the value allocates, and the store
+    /// materialises the dictionary, so either could move the other.
+    fn dll_cookie_new(cookie: usize) -> PyObjectRef {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(dll_cookie_type()));
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(cookie as i64));
+        crate::baseobjspace::setdictvalue_native(
+            pyre_object::gc_roots::shadow_stack_get(carrier_slot),
+            DLL_COOKIE_KEY,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        );
+        pyre_object::gc_roots::shadow_stack_get(carrier_slot)
+    }
+
+    /// The cookie `w_cookie` carries, or `None` when it is not one of the
+    /// objects `_add_dll_directory` returned — the `PyCapsule_IsValid(cookie,
+    /// "DLL directory cookie")` test.
+    fn dll_cookie_value(w_cookie: PyObjectRef) -> Option<usize> {
+        // The first call materialises the type, which allocates, so the
+        // argument is pinned across it and re-read: an unrooted local would be
+        // stale if that collection moved the object.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cookie_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_cookie);
+        let cookie_type = dll_cookie_type();
+        let w_cookie = pyre_object::gc_roots::shadow_stack_get(cookie_slot);
+        let is_cookie = match crate::typedef::r#type(w_cookie) {
+            Some(w_type) => w_type.as_ptr() == cookie_type,
+            None => false,
+        };
+        if !is_cookie {
+            return None;
+        }
+        crate::baseobjspace::getdictvalue_native(w_cookie, DLL_COOKIE_KEY)
+            .filter(|&value| unsafe { pyre_object::is_int(value) })
+            .map(|value| unsafe { pyre_object::w_int_get_value(value) } as usize)
+    }
+
+    /// os._add_dll_directory. `os__add_dll_directory_impl` hands the
+    /// `DLL_DIRECTORY_COOKIE` back inside a capsule and os.py only round-trips
+    /// that object into `_remove_dll_directory`. host_env has no
+    /// AddDllDirectory wrapper, so call windows-sys directly.
     pub fn _add_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
         let (path, _, resolved) = arg_path(args, "_add_dll_directory")?;
@@ -1409,10 +1490,22 @@ mod win_nt {
                 resolved.w_path(),
             ));
         }
-        Ok(pyre_object::w_int_new(cookie as usize as i64))
+        LIVE_DLL_DIRECTORY_COOKIES.lock().push(cookie as usize);
+        Ok(dll_cookie_new(cookie as usize))
     }
 
-    /// os._remove_dll_directory — takes the cookie returned above.
+    /// os._remove_dll_directory — takes the object `_add_dll_directory`
+    /// returned, and returns None.
+    ///
+    /// `os__remove_dll_directory_impl` opens by rejecting anything else with a
+    /// TypeError, then renames the capsule so the same value cannot be removed
+    /// twice.  Both guards carry their weight: `_AddedDllDirectory.__exit__`
+    /// calls `close()` unconditionally, so a `with` block that closes early
+    /// reaches the second removal by ordinary means.
+    ///
+    /// [3.14-spec] `interp_posix.py _remove_dll_directory` answers the removal
+    /// with `space.newbool(...)`, reports a failure as `False` rather than
+    /// raising, and has no invalidation at all.
     pub fn _remove_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         use windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory;
         let Some(&arg) = args.first() else {
@@ -1420,9 +1513,53 @@ mod win_nt {
                 "_remove_dll_directory() missing required argument 'cookie'",
             ));
         };
-        let cookie = (crate::baseobjspace::int_w(arg)? as usize) as *mut std::ffi::c_void;
-        let ok = unsafe { RemoveDllDirectory(cookie) };
-        Ok(pyre_object::w_bool_from(ok != 0))
+        let not_a_cookie = || {
+            crate::PyError::type_error("Provided cookie was not returned from os.add_dll_directory")
+        };
+        // The argument is read back from the shadow stack at each use: reading
+        // its cookie can materialise the type, and clearing it below stores
+        // into its dictionary, either of which may move it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cookie_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(arg);
+        let w_cookie = || pyre_object::gc_roots::shadow_stack_get(cookie_slot);
+        let cookie = dll_cookie_value(w_cookie()).ok_or_else(not_a_cookie)?;
+        // Only a cookie the loader actually issued reaches `RemoveDllDirectory`:
+        // the payload rides an instance dictionary that `object.__setattr__` can
+        // still write, and the loader fail-fasts on a pointer it never handed
+        // out.  The Win32 error is read while the lock is still held, since
+        // releasing it may enter the OS and overwrite `GetLastError`.
+        let failure = {
+            let mut live = LIVE_DLL_DIRECTORY_COOKIES.lock();
+            let index = live
+                .iter()
+                .position(|&issued| issued == cookie)
+                .ok_or_else(not_a_cookie)?;
+            live.swap_remove(index);
+            if unsafe { RemoveDllDirectory(cookie as *mut std::ffi::c_void) } != 0 {
+                None
+            } else {
+                // The capsule is renamed only after a successful removal, so a
+                // failed one leaves the cookie usable.
+                let error = std::io::Error::last_os_error();
+                live.push(cookie);
+                Some(error)
+            }
+        };
+        match failure {
+            Some(error) => Err(io_err(&error, "")),
+            None => {
+                // `PyCapsule_SetName(cookie, NULL)`: the object stops carrying a
+                // cookie at all, so a second removal is refused even where the
+                // loader has since reissued that pointer for another directory.
+                crate::baseobjspace::setdictvalue_native(
+                    w_cookie(),
+                    DLL_COOKIE_KEY,
+                    pyre_object::w_none(),
+                );
+                Ok(pyre_object::w_none())
+            }
+        }
     }
 
     /// os._supports_virtual_terminal — whether stderr's console mode carries
@@ -1502,6 +1639,15 @@ fn create_environ() -> pyre_object::PyObjectRef {
         // _create_environ_mapping demands str keys/values and upper-cases the
         // keys itself. (_convertenviron: `space.newtext(key), newtext(value)`.)
         for (key, value) in host_os::vars_os() {
+            // `_wenviron` carries no name beginning with `=`: the C runtime
+            // keeps its own per-drive current-directory entries (`=Z:`) out of
+            // it, while `vars_os` reads the block those entries live in and
+            // splits at the second `=`.  Publishing one would put a name in
+            // `os.environ` that `putenv` and `unsetenv` both refuse, so
+            // `os.environ.clear()` could not run.
+            if key.as_encoded_bytes().first() == Some(&b'=') {
+                continue;
+            }
             // `_convertenviron`'s Windows arm reads `rwin32._wenviron_items()`,
             // the wide-char environment, and keeps those code units.
             // `fsdecode_os_str` carries them across with `from_wide`; a lossy
@@ -1549,10 +1695,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
             Ok(bytes)
         }
-        /// A name that is empty or contains `=` cannot be expressed in the
-        /// environment block.
+        /// The name check that answers with `ValueError`.
+        ///
+        /// `win32_putenv` refuses an empty name and searches for `=` from
+        /// index 1, because a leading `=` names one of the runtime's hidden
+        /// per-drive entries and is left to `_wputenv` to turn away.
+        /// Elsewhere the check is `os_putenv_impl`'s `strchr(name, '=')` over
+        /// the whole name, and an empty name is left to `setenv`.
         fn illegal_name(name: &[u8]) -> bool {
-            name.is_empty() || name.contains(&b'=')
+            if cfg!(windows) {
+                name.is_empty() || name[1.min(name.len())..].contains(&b'=')
+            } else {
+                name.contains(&b'=')
+            }
+        }
+        /// The refusal the host call makes for a name [`illegal_name`] lets
+        /// through -- a hidden `=NAME` entry on Windows, an empty name
+        /// elsewhere.  `_wputenv` and `setenv` report `EINVAL` for it, and
+        /// `set_var` / `remove_var` panic on such a key rather than returning,
+        /// so it is spelled here instead of reaching them.
+        fn refused_by_host(name: &[u8]) -> Option<crate::PyError> {
+            (name.is_empty() || name.contains(&b'=')).then(|| {
+                crate::PyError::os_error_syscall(libc::EINVAL, pyre_object::PY_NULL)
+            })
         }
         /// `win32_putenv` measures the whole `NAME=VALUE` entry it is about to
         /// hand the block and turns away one longer than `_MAX_ENV`, which is
@@ -1592,6 +1757,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let value = env_bytes(args[1])?;
                     #[cfg(windows)]
                     entry_fits(&name, &value)?;
+                    if let Some(err) = refused_by_host(&name) {
+                        return Err(err);
+                    }
                     unsafe {
                         host_os::set_var(os_str_from_bytes(&name), os_str_from_bytes(&value))
                     };
@@ -1607,18 +1775,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "unsetenv",
                 |args| {
                     let name = env_bytes(args[0])?;
-                    // ...while unsetenv leaves the same rejection to the
-                    // syscall, which reports EINVAL.
+                    // ...while on POSIX unsetenv leaves the same rejection to
+                    // the syscall, which reports EINVAL.  On Windows
+                    // `os_unsetenv_impl` reaches the very `win32_putenv`
+                    // `os.putenv` does, so the name is judged there and the
+                    // entry it would write is measured too.
                     if illegal_name(&name) {
-                        return Err(crate::PyError::os_error_syscall(
-                            libc::EINVAL,
-                            pyre_object::PY_NULL,
-                        ));
+                        return Err(if cfg!(windows) {
+                            crate::PyError::value_error("illegal environment variable name")
+                        } else {
+                            crate::PyError::os_error_syscall(libc::EINVAL, pyre_object::PY_NULL)
+                        });
                     }
-                    // `os_unsetenv_impl` reaches the same `win32_putenv`, so
-                    // the entry it would write is measured too.
                     #[cfg(windows)]
                     entry_fits(&name, b"")?;
+                    if let Some(err) = refused_by_host(&name) {
+                        return Err(err);
+                    }
                     unsafe { host_os::remove_var(os_str_from_bytes(&name)) };
                     Ok(pyre_object::w_none())
                 },
@@ -3078,10 +3251,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         "read: negative size",
                     ));
                 }
-                let n = n_signed as usize;
+                // `os_read_impl` then clamps the request to `_PY_READ_MAX`
+                // before it allocates, and `_Py_read` clamps it again.
+                // Unclamped, the whole request reaches the allocator, and a
+                // Windows `n > INT_MAX` reaches the C runtime as EINVAL
+                // instead of data.
+                let n = n_signed.min(crate::builtins::PY_READ_MAX) as usize;
                 #[cfg(not(feature = "sandbox"))]
                 let buf = {
-                    let mut buf = vec![0u8; n];
+                    // `PyBytes_FromStringAndSize(NULL, length)` reserves the
+                    // whole request up front and reports a failure it cannot
+                    // satisfy as MemoryError; an infallible `vec![0u8; n]`
+                    // aborts the process there instead.  The block stays
+                    // uninitialised until the read reports how much of it was
+                    // filled, so nothing writes the tail either.
+                    let mut buf: Vec<u8> = Vec::new();
+                    buf.try_reserve_exact(n)
+                        .map_err(|_| crate::PyError::memory_error(""))?;
                     // interp_posix.py `read`: the syscall sits inside
                     // the `eintr_retry=True` loop, so an interrupted read runs
                     // the pending signal handlers and is re-issued rather than
@@ -3093,7 +3279,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _)
                             });
                         if ret >= 0 {
-                            buf.truncate(ret as usize);
+                            // Only the prefix the call reports was written.
+                            unsafe { buf.set_len(ret as usize) };
                             break buf;
                         }
                         crate::builtins::eintr_retry_with(
@@ -4391,15 +4578,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // wrapped to a smaller request.
                 let n = usize::try_from(n)
                     .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
+                // `os_urandom_impl` allocates the object before it fills it,
+                // so a size the allocator cannot meet is refused rather than
+                // reaching the entropy source.  `host_os::urandom` reserves
+                // its own buffer infallibly and ends the process there, so the
+                // buffer is reserved here and filled through the same
+                // `getrandom::fill` it would have used.
                 #[cfg(not(feature = "sandbox"))]
-                // Report entropy failures: absorbing one would return predictable bytes.
-                let buf = host_os::urandom(n).map_err(|e| io_err(e, ""))?;
+                let buf = {
+                    let mut buf = crate::builtins::try_vec_zeroed(n)?;
+                    // Report entropy failures: absorbing one would return
+                    // predictable bytes.
+                    getrandom::fill(&mut buf)
+                        .map_err(|e| io_err(std::io::Error::from(e), ""))?;
+                    buf
+                };
                 // Route host entropy through the trusted controller instead of
                 // reaching host getrandom directly.
                 #[cfg(feature = "sandbox")]
                 let buf = crate::host_seam::ops::urandom(n as i64)
                     .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                Ok(pyre_object::w_bytes_from_bytes(&buf))
+                let block = pyre_object::bytesobject::try_alloc_bytes_block(&buf)
+                    .ok_or_else(crate::builtins::reservation_failed)?;
+                Ok(pyre_object::bytesobject::w_bytes_from_block(block))
             },
             1,
         ),

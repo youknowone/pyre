@@ -114,6 +114,39 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "locals_plus_value",
         "fast2locals' scan of the same locals-plus array, read through the proxy",
     ),
+    // The undeduplicated `keys` / `values` / `items` scan behind the same
+    // proxy, and the count `__len__` answers without materializing anything.
+    // Both are bounded by the very `locals_plus_names` array `fast2locals`
+    // walks; each pairs that green scan with an extras half that is bounded by
+    // a dict length instead, which is why the extras half lives in its own
+    // unhinted function (`pin_extra_locals_entries`) and stays a residual call.
+    //
+    // `entry_count` is named for what it counts rather than `length` because
+    // this table matches by leaf and `length` is already the leaf of
+    // `bufferview::BufferView::length`.
+    //
+    // Evidence for the descent-scope change: this is the `*_nohidden`
+    // argument, not the `frame_locals_proxy_snapshot` one.  Neither graph
+    // holds a jitcode in the generated metadata artefact -- `jit_metadata.json`
+    // lists no `pin_entries`, and its one `length` jitcode resolves through
+    // `symbolic_fnaddr_paths` to `bufferview::BufferView::length` -- so
+    // admitting them and their callee closures reaches nothing the portal BFS
+    // already walks.  Measured on the tree carrying both attributes:
+    // `pyre/check.py` ran the full corpus on dynasm and cranelift, every
+    // committed per-fixture jitstats baseline held except the seven this
+    // Windows workstation also moves at `origin/main` with identical deltas,
+    // and `fbw_rolled_back_with_effects` stayed zero -- it is a
+    // `JITSTATS_BADNESS_FIELDS` member in `check.py`, so it is gated
+    // corpus-wide rather than per fixture and a rise anywhere would have been
+    // a red rather than a statistic.
+    (
+        "pin_entries",
+        "fast2locals' scan of the same locals-plus array, undeduplicated",
+    ),
+    (
+        "entry_count",
+        "fast2locals' scan of the same locals-plus array, counted only",
+    ),
     // `pyopcode.py` `dispatch_bytecode` is `@jit.unroll_safe`; its
     // EXTENDED_ARG loop is split here into the interpreter decoder and the
     // two scalar projections consumed by `eval_loop_jit`.  The projections

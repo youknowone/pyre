@@ -126,7 +126,10 @@ pub mod overlapped;
 mod process {
     use pyre_object::{PyObjectRef, w_int_new, w_none, w_tuple_new};
     use rustpython_host_env::winapi as host_winapi;
+    use rustpython_wtf8::Wtf8Buf;
+    use widestring::WideCString;
     use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal, LCMAP_UPPERCASE};
 
     use super::{IntArg, handle_w, w_handle, win32_err};
 
@@ -271,6 +274,41 @@ mod process {
         .map_err(win32_err)
     }
 
+    /// The invariant locale's `LCMAP_UPPERCASE` mapping of an environment
+    /// name, which is the key the block is ordered by
+    /// (`sortenvironmentkey`).  The mapped names are compared the way two
+    /// `str` are, which is code point order, so the mapping comes back as
+    /// WTF-8: byte order over that is exactly code point order.
+    ///
+    /// `str::to_uppercase` cannot stand in for it.  `ß` → `SS`, `ı` → `I` and
+    /// `ﬁ` → `FI` fold two names Win32 keeps apart into one, and the block
+    /// would then carry only the later of the pair.
+    ///
+    /// `LCMapStringEx` reports `ERROR_INVALID_PARAMETER` for an empty name,
+    /// and that is the error an empty name raises.
+    fn environment_sort_key(name: &[u16]) -> Result<Wtf8Buf, crate::PyError> {
+        // `LOCALE_NAME_INVARIANT` is the empty locale name.
+        let mapped = host_winapi::lc_map_string_ex(&WideCString::new(), LCMAP_UPPERCASE, name)
+            .map_err(win32_err)?;
+        Ok(Wtf8Buf::from_wide(&mapped))
+    }
+
+    /// Whether two environment names are one name, which is the ordinal
+    /// case-insensitive match `CompareStringOrdinal` makes.  Both are passed
+    /// by length, so neither has to be terminated.
+    fn environment_names_equal(left: &[u16], right: &[u16]) -> bool {
+        let result = unsafe {
+            CompareStringOrdinal(
+                left.as_ptr(),
+                left.len() as i32,
+                right.as_ptr(),
+                right.len() as i32,
+                1,
+            )
+        };
+        result == CSTR_EQUAL
+    }
+
     /// The environment block `CreateProcess` takes: every `KEY=value` in
     /// order, each terminated, the whole thing terminated again
     /// (`getenvironment`).
@@ -280,7 +318,16 @@ mod process {
     /// `MutableMapping` rather than a dict.  `keys()` names the variables and
     /// each one is subscripted for its value, so a mapping that computes its
     /// values gets to.
+    ///
+    /// The names are ordered and folded before any of them is subscripted
+    /// (`normalize_environment`): the block Win32 reads has to be sorted, and
+    /// a name spelled twice under different casing is one variable, whose
+    /// last spelling — and that spelling's value — is the one carried.  Names
+    /// and values travel as UTF-16 throughout, so an unpaired surrogate
+    /// reaches the child as the code unit it is.
     fn environment_block(w_env: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
+        const EQUALS: u16 = b'=' as u16;
+
         // What a subscript cannot be taken from is no mapping.
         if unsafe { crate::baseobjspace::lookup(w_env, "__getitem__") }.is_none() {
             return Err(crate::PyError::type_error(
@@ -300,31 +347,97 @@ mod process {
         let _env_roots = pyre_object::gc_roots::push_roots();
         let env_slot = pyre_object::gc_roots::pin_roots(&[w_env]);
         let keys_base = pyre_object::gc_roots::pin_roots(&keys);
-        let mut entries = Vec::with_capacity(keys.len());
+
+        // Each name with its sort key and the slot its key object sits in.
+        // Nothing here holds an object, so the subscripts below are free to
+        // collect.
+        let mut names = Vec::with_capacity(keys.len());
         for i in 0..keys.len() {
+            let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
+            if !unsafe { pyre_object::is_str(w_key) } {
+                // The sort maps the name through `PyUnicode_AsWideCharString`,
+                // which answers a name that is no string with
+                // `PyErr_BadArgument` rather than a message of its own.
+                return Err(crate::PyError::type_error(
+                    "bad argument type for built-in operation",
+                ));
+            }
+            let name = super::host::wide_units(w_key);
+            let sort_key = environment_sort_key(&name)?;
+            names.push((sort_key, i, name));
+        }
+        // Stable, so names that map alike keep the order the mapping gave
+        // them and the last of the run is the one kept below.
+        names.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut entries = Vec::with_capacity(names.len());
+        let mut names = names.into_iter().peekable();
+        while let Some((_, index, name)) = names.next() {
+            // A name the next one matches is shadowed by it
+            // (`dedup_environment_keys`), and a shadowed name is never
+            // subscripted at all.
+            if let Some((_, _, next)) = names.peek() {
+                // `compare_string_ordinal` spells both operands with
+                // `PyUnicode_AsWideCharString(str, NULL)`, which refuses a
+                // name carrying a NUL before the comparison happens.  The
+                // refusal therefore reaches names the per-entry scan below
+                // never gets to; the last name enters no comparison and so is
+                // spelled only there.
+                if name.contains(&0) || next.contains(&0) {
+                    return Err(crate::PyError::value_error("embedded null character"));
+                }
+                if environment_names_equal(&name, next) {
+                    continue;
+                }
+            }
             let _entry_roots = pyre_object::gc_roots::push_roots();
             let w_value = crate::baseobjspace::getitem(
                 pyre_object::gc_roots::shadow_stack_get(env_slot),
-                pyre_object::gc_roots::shadow_stack_get(keys_base + i),
+                pyre_object::gc_roots::shadow_stack_get(keys_base + index),
             )?;
             let value_slot = pyre_object::gc_roots::pin_roots(&[w_value]);
-            let key = crate::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(
-                keys_base + i,
-            ))?
-            .to_string();
+            let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+            // A value that is no string is reported only once the whole
+            // mapping has been read, which is where `getenvironment` reports
+            // it — after `normalize_environment` has subscripted every name.
             let value =
-                crate::baseobjspace::text_w(pyre_object::gc_roots::shadow_stack_get(value_slot))?
-                    .to_string();
-            entries.push((key, value));
+                unsafe { pyre_object::is_str(w_value) }.then(|| super::host::wide_units(w_value));
+            entries.push((name, value));
         }
-        host_winapi::build_environment_block(entries).map_err(|e| {
-            crate::PyError::value_error(match e {
-                host_winapi::BuildEnvironmentBlockError::ContainsNul => "embedded null character",
-                host_winapi::BuildEnvironmentBlockError::IllegalName => {
-                    "illegal environment variable name"
-                }
-            })
-        })
+
+        let mut block = Vec::new();
+        for (name, value) in entries {
+            let Some(value) = value else {
+                return Err(crate::PyError::type_error(
+                    "environment can only contain strings",
+                ));
+            };
+            if name.contains(&0) || value.contains(&0) {
+                return Err(crate::PyError::value_error("embedded null character"));
+            }
+            // The `=` is looked for from the second unit on, because a name
+            // that starts with one is a hidden per-drive variable and the
+            // block is allowed to carry it.  A code unit search is the code
+            // point search `PyUnicode_FindChar` makes: `=` is in the basic
+            // plane, and the second unit of an astral name is a low surrogate
+            // rather than any character.
+            if name.is_empty() || name[1..].contains(&EQUALS) {
+                return Err(crate::PyError::value_error(
+                    "illegal environment variable name",
+                ));
+            }
+            block.extend_from_slice(&name);
+            block.push(EQUALS);
+            block.extend_from_slice(&value);
+            block.push(0);
+        }
+        // A block ends with two NULs — one for the last string and one for
+        // the block — so an empty one is the two on their own.
+        if block.is_empty() {
+            block.push(0);
+        }
+        block.push(0);
+        Ok(block)
     }
 
     /// Read one of `STARTUPINFO`'s fields.  A field left as `None` is the

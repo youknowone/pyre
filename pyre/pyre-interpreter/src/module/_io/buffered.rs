@@ -207,28 +207,35 @@ impl W_BufferedReader {
         Ok(pos)
     }
 
-    /// `BufferedMixin._raw_read`: use the raw stream's `readinto` protocol,
-    /// validate its result, then copy the exact returned window into the
-    /// object's ByteBuffer-equivalent storage.
-    fn raw_read(&mut self, start: usize, length: usize) -> Result<usize, crate::PyError> {
-        let temp = pyre_object::bytearrayobject::w_bytearray_new(length);
+    /// `BufferedMixin._raw_read`: hand the raw stream's `readinto` a writable
+    /// window over `[dest, dest + length)` and validate what it reports.
+    ///
+    /// `_bufferedreader_raw_read` fills a `Py_buffer` over `start` and wraps it
+    /// in a memoryview, and `_raw_read` wraps a `SubBuffer` of the destination
+    /// in a `SimpleView`; either way the read lands where the caller wants it
+    /// and no second buffer is allocated or copied through.
+    fn raw_read(&mut self, dest: *mut u8, length: usize) -> Result<usize, crate::PyError> {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(self.self_obj());
-        let _ = pyre_object::gc_roots::pin_root(temp);
-        let sp = pyre_object::gc_roots::shadow_stack_len() - 2;
-        let result = super::call_method_result(
+        let sp = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let _ = pyre_object::gc_roots::pin_root(crate::builtins::w_memoryview_new_raw_window(
+            dest as usize,
+            length,
+        ));
+        let outcome = super::call_method_result(
             self.w_raw,
             "readinto",
             &[pyre_object::gc_roots::shadow_stack_get(sp + 1)],
-        )?;
+        );
+        // The window names memory this call borrowed, so it is closed whatever
+        // the outcome rather than left writable to a raw stream that kept it.
+        let _ =
+            crate::builtins::memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(sp + 1)]);
+        let result = outcome?;
         if unsafe { pyre_object::is_none(result) } {
             return Err(make_blocking_error());
         }
         let size = raw_readinto_size(result, length)?;
-        let temp = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-        let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(temp) };
-        let buffer = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(self.buffer) };
-        buffer[start..start + size].copy_from_slice(&data[..size]);
         if self.abs_pos != -1 {
             self.abs_pos += size as i64;
         }
@@ -243,7 +250,11 @@ impl W_BufferedReader {
             self.read_end as usize
         };
         let length = self.buffer_size as usize - start;
-        let size = self.raw_read(start, length)?;
+        // `_bufferedreader_fill_buffer` reads into `self->buffer + start`.
+        let dest = unsafe {
+            pyre_object::bytearrayobject::w_bytearray_data_mut(self.buffer)[start..].as_mut_ptr()
+        };
+        let size = self.raw_read(dest, length)?;
         if size > 0 {
             self.read_end = (start + size) as i64;
             self.raw_pos = self.read_end;
@@ -330,7 +341,13 @@ impl W_BufferedReader {
         if n <= current_size {
             return Ok(self.read_fast(n));
         }
-        let mut output = Vec::with_capacity(n);
+        // `_bufferedreader_read_generic` sizes its result with
+        // `PyBytes_FromStringAndSize(NULL, n)`: one fallible reservation of the
+        // requested length, whose failure is a `MemoryError`, and every whole
+        // block the raw stream still owes lands directly in it.  Reserving
+        // without filling is what lets a request the machine can only promise
+        // -- `read(1 << 36)` on a short file -- answer at all.
+        let mut output = crate::builtins::try_vec_with_capacity::<u8>(n)?;
         if current_size > 0 {
             let start = self.pos as usize;
             output.extend_from_slice(&self.buffer_bytes(start, start + current_size));
@@ -340,35 +357,32 @@ impl W_BufferedReader {
 
         let mut remaining = n - output.len();
         while remaining >= self.buffer_size as usize {
+            // `MINUS_LAST_BLOCK`: every whole block still wanted bypasses the
+            // stream's buffer and is read in one go, leaving the last partial
+            // block to the buffer below.
             let block = self.buffer_size as usize * (remaining / self.buffer_size as usize);
-            let temp = pyre_object::bytearrayobject::w_bytearray_new(block);
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(self.self_obj());
-            let _ = pyre_object::gc_roots::pin_root(temp);
-            let sp = pyre_object::gc_roots::shadow_stack_len() - 2;
-            let result = super::call_method_result(
-                self.w_raw,
-                "readinto",
-                &[pyre_object::gc_roots::shadow_stack_get(sp + 1)],
-            )?;
-            if unsafe { pyre_object::is_none(result) } {
-                return if output.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(output))
-                };
-            }
-            let size = raw_readinto_size(result, block)?;
+            // `out + written`: the whole reservation above is the destination,
+            // so the block lands in it with nothing copied afterwards.  The
+            // reservation is exact and never exceeded, so the pointer stays
+            // valid for every pass.
+            let written = output.len();
+            let dest = unsafe { output.as_mut_ptr().add(written) };
+            let size = match self.raw_read(dest, block) {
+                Ok(size) => size,
+                Err(error) if is_blocking_error(&error) => {
+                    return if output.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(output))
+                    };
+                }
+                Err(error) => return Err(error),
+            };
             if size == 0 {
                 return Ok(Some(output));
             }
-            let temp = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-            let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(temp) };
-            output.extend_from_slice(&data[..size]);
+            unsafe { output.set_len(written + size) };
             remaining -= size;
-            if self.abs_pos != -1 {
-                self.abs_pos += size as i64;
-            }
         }
 
         self.pos = 0;
@@ -398,14 +412,19 @@ impl W_BufferedReader {
     }
 
     fn read_size(&mut self, size: i64) -> Result<PyObjectRef, crate::PyError> {
+        // `_io__Buffered_read_impl` refuses the length before it looks at the
+        // stream, so a closed file still answers a bad length with the length's
+        // own message.
+        if size < -1 {
+            // [3.14-spec] zero is a valid length there; PyPy `read_w` still
+            // says "positive".
+            return Err(crate::PyError::value_error(
+                "read length must be non-negative or -1",
+            ));
+        }
         self.check_closed("read of closed file")?;
         if size == -1 {
             return self.with_lock(Self::read_all_unlocked);
-        }
-        if size < -1 {
-            return Err(crate::PyError::value_error(
-                "read length must be positive or -1",
-            ));
         }
         let size = size as usize;
         if let Some(result) = self.read_fast(size) {
@@ -437,26 +456,19 @@ impl W_BufferedReader {
                 if size > this.buffer_size {
                     this.reader_reset_buf();
                     let requested = size as usize;
-                    let temp = pyre_object::bytearrayobject::w_bytearray_new(requested);
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let _ = pyre_object::gc_roots::pin_root(this.self_obj());
-                    let _ = pyre_object::gc_roots::pin_root(temp);
-                    let temp_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                    let result = super::call_method_result(
-                        this.w_raw,
-                        "readinto",
-                        &[pyre_object::gc_roots::shadow_stack_get(temp_slot)],
-                    )?;
-                    if unsafe { pyre_object::is_none(result) } {
-                        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
-                    }
-                    let read = raw_readinto_size(result, requested)?;
-                    if this.abs_pos != -1 {
-                        this.abs_pos += read as i64;
-                    }
-                    let temp = pyre_object::gc_roots::shadow_stack_get(temp_slot);
-                    let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(temp) };
-                    return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data[..read]));
+                    // `_io__Buffered_read1_impl` allocates the whole request
+                    // with `PyBytes_FromStringAndSize(NULL, n)` and fills it
+                    // from a single raw read.
+                    let mut out = crate::builtins::try_vec_with_capacity::<u8>(requested)?;
+                    let read = match this.raw_read(out.as_mut_ptr(), requested) {
+                        Ok(read) => read,
+                        // `r == -2` there -- the raw stream would have blocked
+                        // -- is read as zero bytes, not as an error.
+                        Err(error) if is_blocking_error(&error) => 0,
+                        Err(error) => return Err(error),
+                    };
+                    unsafe { out.set_len(read) };
+                    return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out));
                 }
                 this.reader_reset_buf();
                 this.pos = 0;
@@ -509,31 +521,19 @@ impl W_BufferedReader {
             while written < requested {
                 let remaining = requested - written;
                 if remaining > this.buffer_size as usize {
-                    let temp = pyre_object::bytearrayobject::w_bytearray_new(remaining);
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let _ = pyre_object::gc_roots::pin_root(this.self_obj());
-                    let _ = pyre_object::gc_roots::pin_root(temp);
-                    let sp = pyre_object::gc_roots::shadow_stack_len() - 2;
-                    let result = super::call_method_result(
-                        this.w_raw,
-                        "readinto",
-                        &[pyre_object::gc_roots::shadow_stack_get(sp + 1)],
-                    )?;
-                    if unsafe { pyre_object::is_none(result) } {
-                        break;
-                    }
-                    let size = raw_readinto_size(result, remaining)?;
+                    // `_buffered_readinto_generic` reads into
+                    // `buf.buf + written`, so the raw stream fills the caller's
+                    // own buffer and nothing is copied afterwards.
+                    let dest = (unsafe { target.as_mut_slice() })[written..].as_mut_ptr();
+                    let size = match this.raw_read(dest, remaining) {
+                        Ok(size) => size,
+                        Err(error) if is_blocking_error(&error) => break,
+                        Err(error) => return Err(error),
+                    };
                     if size == 0 {
                         break;
                     }
-                    let temp = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                    let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(temp) };
-                    (unsafe { target.as_mut_slice() })[written..written + size]
-                        .copy_from_slice(&data[..size]);
                     written += size;
-                    if this.abs_pos != -1 {
-                        this.abs_pos += size as i64;
-                    }
                     if read_once {
                         break;
                     }
@@ -600,7 +600,9 @@ impl W_BufferedReader {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(w_raw);
         let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let buffer = pyre_object::bytearrayobject::w_bytearray_new(buffer_size as usize);
+        // `_buffered_init` reports a buffer it cannot allocate as
+        // `MemoryError`, and `buffer_size` came from Python.
+        let buffer = super::try_new_buffer(buffer_size as usize)?;
         self.w_raw = pyre_object::gc_roots::shadow_stack_get(raw_slot);
         self.buffer = buffer;
         self.buffer_size = buffer_size;

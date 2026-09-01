@@ -697,8 +697,11 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 // its three exact dict-view types; all use ordinary resize.
                 if exact_dict || pyre_object::dictmultiobject::is_dict_view(source) {
                     pyre_object::listobject::w_list_resize_for_extend(target, hint);
-                } else {
-                    pyre_object::listobject::w_list_reserve_for_extend(target, hint);
+                } else if !pyre_object::listobject::w_list_try_reserve_for_extend(target, hint) {
+                    // `list_extend_iter_lock_held` reserves the hint with the
+                    // ordinary `list_resize`, so a hint no allocation can serve
+                    // is refused before the iterator is walked.
+                    return Err(crate::PyError::memory_error(""));
                 }
             }
             loop {
@@ -1901,7 +1904,7 @@ fn format_render(
             format_spec.clone()
         };
 
-        // `_convert_field` — `!s`/`!r`/`!a` apply str / repr / ascii before
+        // `do_conversion` — `!s`/`!r`/`!a` apply str / repr / ascii before
         // the format spec; any other conversion char is an error.  `!s`
         // preserves WTF-8 so a lone surrogate passes through unchanged.
         let converted = match conversion_spec {
@@ -1910,9 +1913,14 @@ fn format_render(
                 's' => pyre_object::w_str_from_wtf8(unsafe { crate::py_str_wtf8(val)? }),
                 'r' => pyre_object::w_str_from_wtf8(unsafe { crate::py_repr_wtf8(val)? }),
                 'a' => pyre_object::w_str_new(&crate::builtins::py_ascii(val)?),
-                c => {
+                // `\0` is the sentinel for a field with no conversion
+                // requested, so a literal NUL conversion character formats the
+                // field as if the `!` had not been written.
+                '\0' => val,
+                _ => {
                     return Err(crate::PyError::value_error(format!(
-                        "Unknown conversion specifier {c}"
+                        "Unknown conversion specifier {}",
+                        unknown_conversion_display(*cp)
                     )));
                 }
             },
@@ -1940,9 +1948,10 @@ fn codepoint_slice(codepoints: &[CodePoint], start: usize, end: usize) -> Wtf8Bu
     out
 }
 
-/// `newformat.py:TemplateFormatter._do_build_string/_parse_field`.
-/// Braces inside the first-part item lookup (`{[{]}`) are ordinary key text;
-/// braces after `:`/`!` are recursive format markup.
+/// `newformat.py:TemplateFormatter._do_build_string`, splitting each field
+/// the way `unicode_format.h parse_field` does.  Braces inside the
+/// first-part item lookup (`{[{]}`) are ordinary key text; braces after `:`
+/// are recursive format markup.
 fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError> {
     let s: Vec<CodePoint> = fmt.code_points().collect();
     let end = s.len();
@@ -1981,86 +1990,100 @@ fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError>
         }
 
         i += 1;
-        let field_start = i;
-        let mut nested = 1usize;
-        let mut in_second_part = false;
-        while i < end {
-            let c = s[i];
-            if c == '{' {
-                nested += 1;
-            } else if c == '}' {
-                nested -= 1;
-                if nested == 0 {
-                    break;
-                }
-            } else if c == '[' && !in_second_part {
-                i += 1;
-                while i < end && s[i] != ']' {
-                    i += 1;
-                }
-                continue;
-            } else if c == ':' || c == '!' {
-                in_second_part = true;
-            }
-            i += 1;
-        }
-        if nested != 0 {
-            return Err(crate::PyError::value_error(
-                "expected '}' before end of string",
-            ));
-        }
-        let field_end = i;
-
-        let mut cursor = field_start;
-        let mut field_name_end = field_end;
-        let mut conversion_spec = None;
-        let mut spec_start = field_end;
-        while cursor < field_end {
-            let c = s[cursor];
-            if c == ':' || c == '!' {
-                field_name_end = cursor;
-                if c == '!' {
-                    cursor += 1;
-                    if cursor == field_end {
-                        return Err(crate::PyError::value_error(
-                            "end of string while looking for conversion specifier",
-                        ));
-                    }
-                    conversion_spec = Some(s[cursor]);
-                    cursor += 1;
-                    if cursor < field_end {
-                        if s[cursor] != ':' {
-                            return Err(crate::PyError::value_error(
-                                "expected ':' after conversion specifier",
-                            ));
-                        }
-                        cursor += 1;
-                    }
-                } else {
-                    cursor += 1;
-                }
-                spec_start = cursor;
-                break;
-            } else if c == '[' {
-                while cursor + 1 < field_end && s[cursor + 1] != ']' {
-                    cursor += 1;
-                }
-            } else if c == '{' {
-                return Err(crate::PyError::value_error("unexpected '{' in field name"));
-            }
-            cursor += 1;
-        }
-        parts.push(PyPyFormatPart::Field {
-            field_name: codepoint_slice(&s, field_start, field_name_end),
-            conversion_spec,
-            format_spec: codepoint_slice(&s, spec_start, field_end),
-        });
-        i += 1;
+        parts.push(parse_field(&s, &mut i, end)?);
     }
     if !literal.is_empty() {
         parts.push(PyPyFormatPart::Literal(literal));
     }
     Ok(parts)
+}
+
+/// `unicode_format.h parse_field`: split the replacement field beginning at
+/// `*i` — already past its `{` — into name, conversion character and format
+/// spec, leaving `*i` just past the field's closing `}`.
+///
+/// The name ends at the end of the string or at a `:` / `!`; a `[` suspends
+/// that search until the matching `]`, so a `:` inside an item key is key
+/// text.  The single code point after a `!` is the conversion character
+/// whatever it is — a `{` or `}` there is consumed as one rather than read as
+/// markup — and the spec that may follow it runs to the `}` that balances the
+/// field, so a nested `{...}` stays inside the spec.
+fn parse_field(
+    s: &[CodePoint],
+    i: &mut usize,
+    end: usize,
+) -> Result<PyPyFormatPart, crate::PyError> {
+    let field_start = *i;
+    let mut c = CodePoint::from_char('\0');
+    while *i < end {
+        c = s[*i];
+        *i += 1;
+        if c == '{' {
+            return Err(crate::PyError::value_error("unexpected '{' in field name"));
+        }
+        if c == '[' {
+            while *i < end && s[*i] != ']' {
+                *i += 1;
+            }
+            continue;
+        }
+        if c == '}' || c == ':' || c == '!' {
+            break;
+        }
+    }
+    let field_name = codepoint_slice(s, field_start, *i - 1);
+    let mut conversion_spec = None;
+    let format_spec = 'field: {
+        if c == '}' {
+            break 'field Wtf8Buf::new();
+        }
+        if c != ':' && c != '!' {
+            return Err(crate::PyError::value_error(
+                "expected '}' before end of string",
+            ));
+        }
+        if c == '!' {
+            if *i == end {
+                return Err(crate::PyError::value_error(
+                    "end of string while looking for conversion specifier",
+                ));
+            }
+            conversion_spec = Some(s[*i]);
+            *i += 1;
+            if *i < end {
+                let c = s[*i];
+                *i += 1;
+                if c == '}' {
+                    break 'field Wtf8Buf::new();
+                }
+                if c != ':' {
+                    return Err(crate::PyError::value_error(
+                        "expected ':' after conversion specifier",
+                    ));
+                }
+            }
+        }
+        let spec_start = *i;
+        let mut count = 1usize;
+        while *i < end {
+            let c = s[*i];
+            *i += 1;
+            if c == '{' {
+                count += 1;
+            } else if c == '}' {
+                count -= 1;
+                if count == 0 {
+                    break 'field codepoint_slice(s, spec_start, *i - 1);
+                }
+            }
+        }
+        return Err(crate::PyError::value_error("unmatched '{' in format spec"));
+    };
+    Ok(PyPyFormatPart::Field {
+        field_name,
+        conversion_spec,
+        format_spec,
+    })
 }
 
 /// Fetch positional argument `idx`, raising the `str.format` IndexError for
@@ -2247,6 +2270,15 @@ fn parse_spec(spec: &Wtf8) -> Result<ParsedSpec, crate::PyError> {
             }
             i += 1;
         } else {
+            // `parse_internal_render_format_spec` counts a grouping marker as
+            // consumed precision, so a dot followed by neither digits nor one
+            // is the error; it is reported while parsing, ahead of the
+            // presentation code the spec ends with.
+            if i == precision_start {
+                return Err(crate::PyError::value_error(
+                    "Format specifier missing precision",
+                ));
+            }
             precision = Some(p);
         }
     }
@@ -2289,11 +2321,13 @@ fn parse_spec(spec: &Wtf8) -> Result<ParsedSpec, crate::PyError> {
 /// `newformat.py:_parse_spec` rejects a second grouping marker before choosing
 /// a presentation type, and rejects trailing code points as one invalid spec.
 /// Python 3.14 permits a grouping marker after the precision dot as well, so
-/// apply the same ordering to that new slot.
+/// apply the same ordering to that new slot.  `default_type` is the
+/// presentation code the lane falls back to when the spec names none.
 fn validate_python314_spec_shape(
     p: &ParsedSpec,
     spec: &Wtf8,
     type_name: &str,
+    default_type: char,
 ) -> Result<(), crate::PyError> {
     if let Some(first) = p.grouping
         && matches!(p.ty, ',' | '_')
@@ -2330,7 +2364,39 @@ fn validate_python314_spec_shape(
             "Invalid format specifier '{spec}' for object of type '{type_name}'"
         )));
     }
+    // `_parse_spec` validates a requested grouping option against the
+    // presentation code while parsing the spec, before the value's own type
+    // decides which codes it can render.  PEP 378 allows both separators on
+    // the decimal and floating codes; PEP 515 adds `_` to the bin/oct/hex
+    // radices, where it groups every four digits rather than three.
+    //
+    // The presentation code the switch reads is the one the parse settled on,
+    // so an omitted slot carries the lane's own default: `'d'` for an integer
+    // and `'s'` for a string, both of which decide the pairing differently
+    // from the float lanes' `'\0'`.
+    let ty = if p.ty == '\0' { default_type } else { p.ty };
+    if let Some(separator) = p.grouping
+        && !matches!(ty, 'd' | 'e' | 'f' | 'g' | 'E' | 'G' | '%' | 'F' | '\0')
+        && !(separator == '_' && matches!(ty, 'b' | 'o' | 'x' | 'X'))
+    {
+        return Err(invalid_thousands_separator_type(separator, ty));
+    }
+    if ty == 'n'
+        && let Some(separator) = p.fractional_grouping
+    {
+        return Err(invalid_thousands_separator_type(separator, ty));
+    }
     Ok(())
+}
+
+/// `invalid_thousands_separator_type`: report a grouping option the
+/// presentation code does not accept.  A code outside printable ASCII is
+/// spelled as its own escape, the way `unknown_presentation_type` spells one.
+fn invalid_thousands_separator_type(specifier: char, presentation_type: char) -> crate::PyError {
+    crate::PyError::value_error(format!(
+        "Cannot specify '{specifier}' with '{}'.",
+        unknown_code_display(presentation_type)
+    ))
 }
 
 /// Component spec used by CPython's complex advanced formatter.  Width and
@@ -2360,19 +2426,31 @@ fn complex_component_spec(p: &ParsedSpec, sign: char) -> String {
         spec.push('.');
         spec.push(grouping);
     }
-    if p.ty != '\0' {
-        spec.push(p.ty);
+    // `format_complex_internal` turns an omitted presentation type into `'r'`
+    // and only then, when a precision was supplied, into `'g'`.  The float
+    // lane's own omitted type carries `Py_DTSF_ADD_DOT_0`, which shortens the
+    // point at which `'g'` flips to exponent form by one significant digit, so
+    // naming `'g'` here is what keeps the lanes off that flag.
+    let ty = if p.ty == '\0' && p.precision.is_some() {
+        'g'
+    } else {
+        p.ty
+    };
+    if ty != '\0' {
+        spec.push(ty);
     }
     spec
 }
 
-/// Format one real/imaginary lane.  Complex's omitted presentation type is
-/// repr-like (integral doubles lose float's trailing `.0`); an alternate form
-/// deliberately retains it.
+/// Format one real/imaginary lane.  `repr_type` is `format_complex_internal`'s
+/// `'r'` mode — an omitted presentation type with no precision — which renders
+/// through the float lane's omitted type and then drops the trailing `.0` that
+/// `Py_DTSF_ADD_DOT_0` appended.  An alternate form keeps the point the flag
+/// asks for, but not the digit after it.
 fn format_complex_component(
     value: f64,
     spec: &Wtf8,
-    default_type: bool,
+    repr_type: bool,
     alternate: bool,
 ) -> Result<String, crate::PyError> {
     let rendered = if value.is_nan() || value.is_infinite() {
@@ -2384,8 +2462,11 @@ fn format_complex_component(
         .as_str()
         .expect("numeric formatting always produces UTF-8")
         .to_string();
-    if default_type && !alternate && text.ends_with(".0") {
-        text.truncate(text.len() - 2);
+    if repr_type && let Some(head) = text.strip_suffix(".0") {
+        text.truncate(head.len());
+        if alternate {
+            text.push('.');
+        }
     }
     Ok(text)
 }
@@ -2722,21 +2803,13 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
     let parsed = rustpython_common::format::FormatSpec::parse(spec)
         .map_err(|e| format_spec_err(e, spec, type_name, true))?;
     let p = parse_spec(spec)?;
-    if p.precision.is_some() || p.fractional_grouping.is_some() {
+    // `format_long_internal` refuses a precision and nothing else: the
+    // fractional grouping marker has no fraction to separate here, so
+    // `.,`/`._` (which leave the precision unset) render like a bare spec.
+    if p.precision.is_some() {
         return Err(crate::PyError::value_error(
             "Precision not allowed in integer format specifier",
         ));
-    }
-    // newformat.py validates a requested grouping option against the
-    // presentation code before reporting that an otherwise unknown code is
-    // unsupported: `format(3, ",s")` names the illegal comma/`s` pairing.
-    if let Some(separator) = p.grouping
-        && !matches!(p.ty, '\0' | 'd' | 'b' | 'o' | 'x' | 'X' | 'n')
-    {
-        return Err(crate::PyError::value_error(format!(
-            "Cannot specify '{separator}' with '{}'.",
-            p.ty
-        )));
     }
     // The group size a separator implies is not part of the radix: `_get_locale`
     // derives it from the presentation code, and for `'n'` it comes out of the
@@ -2755,19 +2828,6 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
             )));
         }
     };
-    if let Some(separator) = p.grouping {
-        let allowed = match separator {
-            ',' => radix == 10 && p.ty != 'n',
-            '_' => p.ty != 'n',
-            _ => false,
-        };
-        if !allowed {
-            let ty = if p.ty == '\0' { 'd' } else { p.ty };
-            return Err(crate::PyError::value_error(format!(
-                "Cannot specify '{separator}' with '{ty}'."
-            )));
-        }
-    }
 
     // Keep the parsed value live so syntax validation cannot be optimized
     // away independently from rendering.
@@ -2869,6 +2929,17 @@ fn unknown_code_display(c: char) -> String {
 fn unknown_code_point_display(cp: CodePoint) -> String {
     match cp.to_char() {
         Some(c) if ('\u{21}'..='\u{7f}').contains(&c) => c.to_string(),
+        _ => format!("\\x{:x}", cp.to_u32()),
+    }
+}
+
+/// Render an unknown `!` conversion character for `do_conversion`'s message.
+/// Its printable-ASCII window stops one code point earlier than
+/// [`unknown_code_point_display`]'s: `do_conversion` escapes 0x7f, while
+/// `unknown_presentation_type` prints it verbatim.
+fn unknown_conversion_display(cp: CodePoint) -> String {
+    match cp.to_char() {
+        Some(c) if ('\u{21}'..'\u{7f}').contains(&c) => c.to_string(),
         _ => format!("\\x{:x}", cp.to_u32()),
     }
 }
@@ -3187,7 +3258,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
                 pyre_object::w_long_get_value(val)
             };
             let p = parse_spec(spec)?;
-            validate_python314_spec_shape(&p, spec, &type_name)?;
+            validate_python314_spec_shape(&p, spec, &type_name, 'd')?;
             let parsed = FormatSpec::parse(&p.engine_spec);
             if p.no_neg_zero && matches!(p.ty, '\0' | 'b' | 'c' | 'd' | 'o' | 'x' | 'X' | 'n') {
                 // pypy/objspace/std/newformat.py format_int_or_long:
@@ -3237,7 +3308,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
         }
         if let Some((re, im)) = crate::objspace::descroperation::complex_val(val) {
             let p = parse_spec(spec)?;
-            validate_python314_spec_shape(&p, spec, "complex")?;
+            validate_python314_spec_shape(&p, spec, "complex", '\0')?;
             FormatSpec::parse(&p.engine_spec)
                 .map_err(|e| format_spec_err(e, spec, "complex", false))?;
             if p.fill == '0' {
@@ -3256,7 +3327,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
             if p.ty != '\0' && !matches!(p.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n') {
                 return Err(crate::PyError::value_error(format!(
                     "Unknown format code '{}' for object of type 'complex'",
-                    p.ty
+                    unknown_code_display(p.ty)
                 )));
             }
             let align = p.align.unwrap_or('>');
@@ -3276,6 +3347,10 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
             // (sign / alternate / grouping / precision / type) are applied
             // to each float, while alignment and width pad the joined value.
             let default_type = p.ty == '\0';
+            // `format_complex_internal` keeps `'r'` only while no precision was
+            // given; a precision demotes the lanes to plain `'g'`.  The parens
+            // and the omitted real part are decided by the type alone.
+            let repr_type = default_type && p.precision.is_none();
             let real_sign = p.sign.unwrap_or('-');
             let real_spec = complex_component_spec(&p, real_sign);
             let imag_sign = if default_type && re == 0.0 && re.is_sign_positive() {
@@ -3285,9 +3360,9 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
             };
             let imag_spec = complex_component_spec(&p, imag_sign);
             let real_text =
-                format_complex_component(re, real_spec.as_str().into(), default_type, p.alt_form)?;
+                format_complex_component(re, real_spec.as_str().into(), repr_type, p.alt_form)?;
             let imag_text =
-                format_complex_component(im, imag_spec.as_str().into(), default_type, p.alt_form)?;
+                format_complex_component(im, imag_spec.as_str().into(), repr_type, p.alt_form)?;
             let text = if default_type && re == 0.0 && re.is_sign_positive() {
                 format!("{imag_text}j")
             } else if default_type {
@@ -3300,12 +3375,13 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
         }
         if pyre_object::is_str(val) {
             let full = pyre_object::w_str_get_wtf8(val);
-            // The shared string formatter rejects grouping and numeric types
-            // but not a sign or `=` alignment, which are also disallowed for
-            // strings.
-            reject_string_sign_align(spec)?;
             let p = parse_spec(spec)?;
-            validate_python314_spec_shape(&p, spec, "str")?;
+            validate_python314_spec_shape(&p, spec, "str", 's')?;
+            // `format_string_internal` refuses these after the spec has been
+            // parsed and validated as a whole.  The shared string formatter
+            // rejects grouping and numeric types but not a sign or `=`
+            // alignment, which are also disallowed for strings.
+            reject_string_sign_align(spec)?;
             if p.no_neg_zero {
                 return Err(crate::PyError::value_error(
                     "Negative zero coercion (z) not allowed in string format specifier",
@@ -3552,27 +3628,13 @@ fn format_nonfinite(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
 /// for their exact messages; the type and grouping-with-`n` checks are
 /// applied on top.
 fn validate_float_spec(spec: &Wtf8, p: &ParsedSpec) -> Result<(), crate::PyError> {
-    validate_python314_spec_shape(p, spec, "float")?;
+    validate_python314_spec_shape(p, spec, "float", '\0')?;
     rustpython_common::format::FormatSpec::parse(&p.engine_spec)
         .map_err(|e| format_spec_err(e, spec, "float", false))?;
     if !matches!(p.ty, '\0' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%') {
         return Err(crate::PyError::value_error(format!(
             "Unknown format code '{}' for object of type 'float'",
             unknown_code_display(p.ty)
-        )));
-    }
-    if let Some(sep) = p.grouping
-        && p.ty == 'n'
-    {
-        return Err(crate::PyError::value_error(format!(
-            "Cannot specify '{sep}' with 'n'."
-        )));
-    }
-    if let Some(sep) = p.fractional_grouping
-        && p.ty == 'n'
-    {
-        return Err(crate::PyError::value_error(format!(
-            "Cannot specify '{sep}' with 'n'."
         )));
     }
     Ok(())
@@ -4877,6 +4939,16 @@ fn decode_utf16_impl(
     final_: bool,
 ) -> Result<(Wtf8Buf, usize, i32), crate::PyError> {
     let (big_endian, mut pos, byteorder) = resolve_bom(data, false, fixed_be);
+    // [3.14-spec] PyPy `str_decode_utf_16_helper` reports its caller-supplied
+    // `public_encoding_name` (normally `utf16`).
+    // `PyUnicode_DecodeUTF16Stateful` at v3.14.6 selects the effective
+    // `utf-16-le` / `utf-16-be` name from the byte order it settled on, the way
+    // the utf-32 sibling below does.
+    let codec = if matches!(codec, "utf16" | "utf-16") {
+        if big_endian { "utf-16-be" } else { "utf-16-le" }
+    } else {
+        codec
+    };
     // A custom error handler may replace exc.object; the loop then resumes
     // from the new bytes (`buf`), re-evaluating `len` each iteration.
     let mut buf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
@@ -4952,9 +5024,11 @@ fn decode_utf32_impl(
     // [3.14-spec] PyPy `str_decode_utf_32_helper` reports its caller-supplied
     // `public_encoding_name` (normally `utf32`).
     // `PyUnicode_DecodeUTF32Stateful` at v3.14.6 selects the effective
-    // `utf-32-le` / `utf-32-be` name after BOM resolution; that name is
-    // observable as `UnicodeDecodeError.encoding`.
-    let codec = if fixed_be.is_none() && matches!(codec, "utf32" | "utf-32") {
+    // `utf-32-le` / `utf-32-be` name from the byte order it settled on —
+    // whether that came from a BOM, from the caller's `byteorder` argument,
+    // or from the platform default — and that name is observable as
+    // `UnicodeDecodeError.encoding`.
+    let codec = if matches!(codec, "utf32" | "utf-32") {
         if big_endian { "utf-32-be" } else { "utf-32-le" }
     } else {
         codec

@@ -437,6 +437,41 @@ pub(crate) fn w_memoryview_new_simple_with_owner(
     }
 }
 
+/// `PyBuffer_FillInfo(&buf, NULL, start, len, 0, PyBUF_CONTIG)` followed by
+/// `PyMemoryView_FromBuffer`: a writable window over raw memory with no
+/// exporter behind it.
+///
+/// `_bufferedreader_raw_read` hands one to the raw stream's `readinto` so the
+/// read lands directly in the destination, and `_raw_read` does the same with
+/// `SimpleView(SubBuffer(buffer, start, length))`.  Either way no second buffer
+/// stands between the stream and the caller's memory.
+///
+/// Non-owning: there is no exporter to take an `_exports` count on, which is
+/// what the C original's "the buffer needn't be released as its object is
+/// NULL" says.  The window names memory the caller owns for the length of one
+/// call, so the caller releases the view when that call returns rather than
+/// leaving a stashed one able to write into memory that is gone.
+pub(crate) fn w_memoryview_new_raw_window(address: usize, length: usize) -> PyObjectRef {
+    use pyre_object::buffer::Buffer;
+    use pyre_object::bufferview::BufferView;
+    unsafe {
+        let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+        let view = BufferView::Simple {
+            backing: Buffer::External {
+                w_obj: pyre_object::w_none(),
+                address,
+                size: length,
+                readonly: false,
+            },
+            w_obj: pyre_object::w_none(),
+            length: length as i64,
+        };
+        let view_ptr = pyre_object::memoryview::bufferview_alloc(view);
+        pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
+        mv
+    }
+}
+
 /// Build the `W_MMap.readbuf_w`/`writebuf_w` view: one contiguous external
 /// byte window whose owner remains the mmap object.
 #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
@@ -6312,40 +6347,19 @@ pub(crate) fn type_new_set_hash_if_eq(ns: PyObjectRef) {
     }
 }
 
-/// CPython `type_new_set_classdict`: every new class owns a `__doc__` entry,
-/// using None when its namespace has no docstring. A declared `__doc__` slot
-/// is the sole exception because the class variable would collide with its
-/// member descriptor.
-pub(crate) fn type_new_set_doc(ns: PyObjectRef) -> crate::PyResult {
-    // Each lookup interns its key, and the caller's root slot tracks the
-    // caller's own copy of the moving namespace rather than this by-value
-    // parameter, so the word is pinned here and read back at every use.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(ns);
-    if unsafe {
-        pyre_object::w_dict_getitem_str(pyre_object::gc_roots::shadow_stack_get(ns_slot), "__doc__")
+/// `type_dict_set_doc` (`type_ready_fill_dict`): every new class owns a
+/// `__doc__` entry, using None when its namespace supplied no docstring.
+///
+/// This runs on the finished type, after the slot descriptors and the
+/// `__dict__` / `__weakref__` getsets have been installed, so a defaulted
+/// entry lands behind them in `cls.__dict__`.  A `__doc__` declared in
+/// `__slots__` therefore already owns the name by the time this looks, and
+/// its member descriptor stands.
+pub(crate) fn type_dict_set_doc(w_type: PyObjectRef) {
+    if crate::type_dict_contains(w_type, "__doc__") {
+        return;
     }
-    .is_some()
-    {
-        return Ok(pyre_object::w_none());
-    }
-    // `create_all_slots` owns iteration of `__slots__`.  In particular, it
-    // must consume a one-shot iterator exactly once.  Defer the default doc
-    // entry whenever slots are present; `create_all_slots` installs it after
-    // collecting the complete slot-name sequence if `__doc__` was not among
-    // those names.
-    if unsafe {
-        pyre_object::w_dict_getitem_str(
-            pyre_object::gc_roots::shadow_stack_get(ns_slot),
-            "__slots__",
-        )
-    }
-    .is_none()
-    {
-        type_ns_store(ns_slot, "__doc__", pyre_object::w_none());
-    }
-    Ok(pyre_object::w_none())
+    crate::type_dict_store(w_type, "__doc__", pyre_object::w_none());
 }
 
 /// PyPy `typeobject.py:223-235 W_TypeObject.__init__`: consume the compiler's
@@ -6384,6 +6398,21 @@ pub(crate) fn type_new_take_qualname(w_type: PyObjectRef, ns: PyObjectRef) -> cr
     Ok(pyre_object::w_none())
 }
 
+/// `type_new_set_classcell` / `type_new_set_classdictcell` refuse a namespace
+/// entry that is not a cell.  The offending type is spelled with `%.200R`,
+/// i.e. the repr of the type object rather than its bare name.
+pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyError {
+    let name = match crate::typedef::r#type(value) {
+        Some(w_valtype) => unsafe {
+            crate::baseobjspace::type_repr_qualified_name(w_valtype.as_ptr())
+        },
+        None => crate::error::type_name_of(value),
+    };
+    crate::PyError::type_error(format!(
+        "{key} must be a nonlocal cell, not <class '{name}'>"
+    ))
+}
+
 fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
@@ -6397,23 +6426,32 @@ fn type_descr_new_with_metaclass(
         let w_namespace_dict = args[2];
         // typeobject.py:_check_new_args — validate the three public
         // arguments before attempting to copy or normalise any of them.
+        //
+        // `type_new` spells the same three checks as a single
+        // `PyArg_ParseTuple(args, "UO!O!:type.__new__", ...)`, and it is the
+        // `:type.__new__` suffix that names the callable in the messages
+        // getargs builds, so they say `type.__new__()` on every entry point —
+        // a bare `type(...)` call, `type.__new__` invoked directly, and a
+        // metaclass such as `ABCMeta`.  The `O!` checks are `PyObject_
+        // TypeCheck`, so a tuple subclass is an accepted `bases` and a dict
+        // subclass an accepted namespace; neither is silently coerced.
         if !unsafe { crate::baseobjspace::isinstance_str_w(name_obj) } {
             return Err(crate::PyError::type_error(format!(
-                "type() argument 1 must be string, not {}",
-                unsafe { pyre_object::type_name_of(name_obj) }
+                "type.__new__() argument 1 must be str, not {}",
+                crate::error::type_name_of(name_obj)
             )));
         }
         if !unsafe { is_tuple(bases) } {
             return Err(crate::PyError::type_error(format!(
-                "type() argument 2 must be tuple, not {}",
-                unsafe { pyre_object::type_name_of(bases) }
+                "type.__new__() argument 2 must be tuple, not {}",
+                crate::error::type_name_of(bases)
             )));
         }
         let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
         if !unsafe { crate::baseobjspace::isinstance_w(w_namespace_dict, w_dict_type) } {
             return Err(crate::PyError::type_error(format!(
-                "type() argument 3 must be dict, not {}",
-                unsafe { pyre_object::type_name_of(w_namespace_dict) }
+                "type.__new__() argument 3 must be dict, not {}",
+                crate::error::type_name_of(w_namespace_dict)
             )));
         }
         let w_ns_backing = unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
@@ -6426,24 +6464,6 @@ fn type_descr_new_with_metaclass(
                     "type name must not contain null characters",
                 ));
             }
-        }
-        // typeobject.py `type.__new__` — `isinstance_w(w_bases, w_tuple)` and
-        // `isinstance_w(w_dict, w_dict)`: bases must be a tuple and the
-        // namespace a dict (subclasses of each are accepted, e.g. a dict
-        // subclass namespace); neither is silently coerced.
-        let w_tuple_type = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
-        if !unsafe { crate::baseobjspace::isinstance_w(bases, w_tuple_type) } {
-            return Err(crate::PyError::type_error(format!(
-                "type() argument 2 must be tuple, not {}",
-                crate::baseobjspace::object_functionstr_type_name(bases)
-            )));
-        }
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { crate::baseobjspace::isinstance_w(w_namespace_dict, w_dict_type) } {
-            return Err(crate::PyError::type_error(format!(
-                "type() argument 3 must be dict, not {}",
-                crate::baseobjspace::object_functionstr_type_name(w_namespace_dict)
-            )));
         }
         let name = crate::baseobjspace::str_utf8_w(name_obj)?;
 
@@ -6515,6 +6535,11 @@ fn type_descr_new_with_metaclass(
         // (CPython consumes them here rather than storing them).
         let mut classcell_root = None;
         let mut classdictcell_root = None;
+        // `_PyDict_HasOnlyStringKeys(type->tp_dict)` decides the
+        // `RuntimeWarning` reported once the type is ready.  Only this copy
+        // can introduce such a key; every later pass installs descriptors
+        // under interned names.
+        let mut has_non_string_key = false;
         // `type.__new__` accepts any `dict` subclass as the namespace
         // (the check is `PyDict_Check`, not `PyDict_CheckExact`); resolve
         // the dict backing so e.g. an `enum._EnumDict` class body is
@@ -6529,7 +6554,6 @@ fn type_descr_new_with_metaclass(
                 let _ = pyre_object::gc_roots::pin_root(key);
                 let _ = pyre_object::gc_roots::pin_root(value);
             }
-            let mut has_non_string_key = false;
             for index in 0..items.len() {
                 let key = pyre_object::gc_roots::shadow_stack_get(item_root + index * 2);
                 let value = pyre_object::gc_roots::shadow_stack_get(item_root + index * 2 + 1);
@@ -6544,15 +6568,7 @@ fn type_descr_new_with_metaclass(
                     .is_some_and(|key| key.as_str() == Ok("__classcell__"))
                 {
                     if !unsafe { pyre_object::is_cell(value) } {
-                        let tp_name = match unsafe { crate::typedef::r#type(value) } {
-                            Some(tp) => {
-                                unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string()
-                            }
-                            None => "object".to_string(),
-                        };
-                        return Err(crate::PyError::type_error(format!(
-                            "__classcell__ must be a nonlocal cell, not {tp_name}"
-                        )));
+                        return Err(cell_slot_type_error("__classcell__", value));
                     }
                     let root = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(value);
@@ -6563,22 +6579,16 @@ fn type_descr_new_with_metaclass(
                     .as_ref()
                     .is_some_and(|key| key.as_str() == Ok("__classdictcell__"))
                 {
-                    if unsafe { pyre_object::is_cell(value) } {
-                        let root = pyre_object::gc_roots::shadow_stack_len();
-                        let _ = pyre_object::gc_roots::pin_root(value);
-                        classdictcell_root = Some(root);
+                    if !unsafe { pyre_object::is_cell(value) } {
+                        return Err(cell_slot_type_error("__classdictcell__", value));
                     }
+                    let root = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(value);
+                    classdictcell_root = Some(root);
                     continue;
                 }
                 let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
                 unsafe { pyre_object::w_dict_store(class_ns, key, value) };
-            }
-            if has_non_string_key {
-                crate::warn::warn_category(
-                    &format!("type '{}' has a non-string key in its dictionary", name),
-                    "RuntimeWarning",
-                    1,
-                )?;
             }
         }
         // typeobject.py:ensure_common_attributes / ensure_module_attr.  Direct
@@ -6632,11 +6642,9 @@ fn type_descr_new_with_metaclass(
         {
             return Err(crate::PyError::type_error(format!(
                 "type __qualname__ must be a str, not {}",
-                unsafe { pyre_object::type_name_of(qualname) }
+                crate::error::type_name_of(qualname)
             )));
         }
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        type_new_set_doc(class_ns)?;
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         type_new_set_hash_if_eq(class_ns);
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
@@ -6746,6 +6754,9 @@ fn type_descr_new_with_metaclass(
         type_new_take_qualname(w_type, pyre_object::gc_roots::shadow_stack_get(dict_root))?;
         // typeobject.py create_all_slots parity.
         unsafe { crate::call::create_all_slots(w_type, w_effective_bases)? };
+        // `type_ready_fill_dict` defaults the doc entry once the slot and
+        // instance descriptors own their names.
+        type_dict_set_doc(w_type);
         // rclass.py:739-743 — set w_class (typeptr) at allocation time.
         // For type objects, w_class is the metaclass (type(C) → Meta).
         // baseobjspace.py getclass() returns the metatype.
@@ -6780,6 +6791,17 @@ fn type_descr_new_with_metaclass(
             }
         }
 
+        // `type_new_impl` reports a namespace the class body filled with a
+        // key that is not a string once the type is ready, and before
+        // `type_new_set_names` runs.
+        if has_non_string_key {
+            crate::warn::warn_category(
+                &format!("non-string key in the __dict__ of class {name}"),
+                "RuntimeWarning",
+                1,
+            )?;
+        }
+
         // _set_names (typeobject.py) — call `__set_name__(owner, name)`
         // on each descriptor in the type's FINAL `__dict__` (`w_type.dict_w`),
         // i.e. the filtered namespace with `__classcell__`/`__classdictcell__`
@@ -6806,12 +6828,12 @@ fn type_descr_new_with_metaclass(
                 .flat_map(|&(key, value)| [key, value]),
         );
         let owner_slot = pyre_object::gc_roots::pin_roots(&livevars);
+        // `PyDict_Next` walks every entry, so a descriptor stored under a
+        // non-string key gets its `__set_name__` call too.
         for index in 0..set_name_entries.len() {
             let key = pyre_object::gc_roots::shadow_stack_get(owner_slot + 1 + index * 2);
-            if unsafe { pyre_object::is_str(key) } {
-                let value = pyre_object::gc_roots::shadow_stack_get(owner_slot + 2 + index * 2);
-                unsafe { crate::baseobjspace::set_name(w_type, key, value) }?;
-            }
+            let value = pyre_object::gc_roots::shadow_stack_get(owner_slot + 2 + index * 2);
+            unsafe { crate::baseobjspace::set_name(w_type, key, value) }?;
         }
 
         // type_new_init_subclass — fire __init_subclass__ with the
@@ -11276,11 +11298,32 @@ fn unicode_to_decimal_w(
 /// source object, not the whitespace-trimmed or Unicode-normalized buffer the
 /// number parser consumes internally.
 fn invalid_int_literal(w_source: PyObjectRef, base: u32) -> crate::PyError {
-    let source_repr = unsafe { crate::display::py_repr_wtf8(w_source) }
+    // `%.200R` clips the rendering at 200 code points, closing quote included
+    // — a long literal is reported unterminated.
+    const MAX_REPR_CODE_POINTS: usize = 200;
+    // `_PyLong_FromBytes` renders the buffer it was handed through a fresh
+    // `PyBytes_FromStringAndSize`, so a `bytearray` — or a subclass of either
+    // — reports its contents as `b'-'` rather than its own repr.
+    let rendered = if unsafe { pyre_object::bytesobject::is_bytes_like(w_source) } {
+        // Copy the contents out before allocating: the source is free to move
+        // while the new object is built.
+        let clipped = unsafe {
+            let data = pyre_object::bytesobject::bytes_like_data(w_source);
+            data[..data.len().min(MAX_REPR_CODE_POINTS)].to_vec()
+        };
+        pyre_object::bytesobject::w_bytes_from_bytes(&clipped)
+    } else {
+        w_source
+    };
+    let source_repr = unsafe { crate::display::py_repr_wtf8(rendered) }
         .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<unprintable>".to_string()));
+    let mut clipped = rustpython_wtf8::Wtf8Buf::new();
+    for point in source_repr.code_points().take(MAX_REPR_CODE_POINTS) {
+        clipped.push(point);
+    }
     crate::PyError::value_error(crate::display::wtf8_format!(
         format!("invalid literal for int() with base {base}: "),
-        source_repr
+        clipped
     ))
 }
 
@@ -11861,6 +11904,16 @@ pub fn reservation_failed() -> crate::PyError {
     crate::PyError::memory_error("")
 }
 
+/// `_PY_READ_MAX` — the largest count one raw read is asked for.
+///
+/// `read(2)`'s count is an `int` on Windows, and a count above `INT_MAX` fails
+/// with `EINVAL` on macOS, so both clamp there; elsewhere the whole
+/// `Py_ssize_t` range goes through untouched.
+#[cfg(any(windows, target_os = "macos"))]
+pub const PY_READ_MAX: i64 = i32::MAX as i64;
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const PY_READ_MAX: i64 = isize::MAX as i64;
+
 /// An empty `Vec` with room for `count` elements, reserved fallibly.
 ///
 /// A builtin that sizes its storage from a Python-supplied count —
@@ -11872,6 +11925,18 @@ pub fn try_vec_with_capacity<T>(count: usize) -> Result<Vec<T>, crate::PyError> 
     let mut out = Vec::new();
     out.try_reserve_exact(count)
         .map_err(|_| reservation_failed())?;
+    Ok(out)
+}
+
+/// A zero-filled `Vec<u8>` of `count` bytes, for a `count` that came from
+/// Python.
+///
+/// `vec![0u8; count]` reaches Rust's infallible allocator, which ends the
+/// process where `PyBytes_FromStringAndSize(NULL, count)` answers
+/// `MemoryError`.
+pub fn try_vec_zeroed(count: usize) -> Result<Vec<u8>, crate::PyError> {
+    let mut out = try_vec_with_capacity::<u8>(count)?;
+    out.resize(count, 0);
     Ok(out)
 }
 
@@ -16475,30 +16540,69 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(dict)
 }
 
-/// util.py `_classdir` — union `getattr(klass, '__dict__')`'s keys with,
-/// recursively, `_classdir(base)` for each base in `getattr(klass,
-/// '__bases__')`.  Both attributes are read through the attribute protocol so
-/// a metaclass that customizes `__dict__`/`__bases__` access participates.
-unsafe fn classdir_into(
-    w_cls: PyObjectRef,
-    names: &mut Vec<Wtf8Buf>,
-) -> Result<(), crate::PyError> {
-    unsafe { classdir_recurse(w_cls, names) }
+/// The `dir()` accumulator: the dict `merge_class_dict` merges into.
+///
+/// Names are collected as the key objects they are, whatever their type —
+/// filtering non-strings out here is what would keep `dir()` from raising the
+/// `TypeError` its final sort owes for a class namespace holding one.  The
+/// dict is what dedups them, and it is reached through a shadow-stack slot
+/// because a store hashes its key (arbitrary Python for a non-string one) and
+/// may grow the accumulator.
+fn dir_names_new() -> usize {
+    let names = pyre_object::w_dict_new();
+    let names_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(names);
+    names_slot
 }
 
-unsafe fn classdir_recurse(
-    w_cls: PyObjectRef,
-    names: &mut Vec<Wtf8Buf>,
-) -> Result<(), crate::PyError> {
+/// `PyDict_Update(dict, classdict)` — add every key `keys` yields.
+fn dir_names_update(names_slot: usize, keys: Vec<PyObjectRef>) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let keys_slot = pyre_object::gc_roots::pin_roots(&keys);
+    for index in 0..keys.len() {
+        let key = pyre_object::gc_roots::shadow_stack_get(keys_slot + index);
+        let names = pyre_object::gc_roots::shadow_stack_get(names_slot);
+        unsafe { pyre_object::w_dict_store(names, key, pyre_object::w_none()) };
+    }
+}
+
+/// `PyDict_Keys(dict)` — the collected names in first-seen order.  `dir()`
+/// sorts them afterwards; `object.__dir__` / `type.__dir__` hand them back as
+/// they stand.
+fn dir_names_list(names_slot: usize) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let names = pyre_object::gc_roots::shadow_stack_get(names_slot);
+    let collected: Vec<PyObjectRef> = unsafe { pyre_object::w_dict_items(names) }
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    let keys_slot = pyre_object::gc_roots::pin_roots(&collected);
+    let keys = (0..collected.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(keys_slot + index))
+        .collect();
+    w_list_new(keys)
+}
+
+/// util.py `_classdir` / `merge_class_dict` — union `getattr(klass,
+/// '__dict__')`'s keys with, recursively, `_classdir(base)` for each base in
+/// `getattr(klass, '__bases__')`.  Both attributes are read through the
+/// attribute protocol so a metaclass that customizes `__dict__`/`__bases__`
+/// access participates.
+unsafe fn classdir_into(w_cls: PyObjectRef, names_slot: usize) -> Result<(), crate::PyError> {
+    unsafe { classdir_recurse(w_cls, names_slot) }
+}
+
+unsafe fn classdir_recurse(w_cls: PyObjectRef, names_slot: usize) -> Result<(), crate::PyError> {
+    // The class and its bases are read across calls that run Python, so the
+    // receiver is published rather than carried in a Rust local.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_cls);
     // getattr(klass, '__dict__', None): names.update(ns).  This is deliberately
     // iterable-driven, not dict-only: app-level PyPy accepts any iterable here.
     match crate::baseobjspace::getattr_str(w_cls, "__dict__") {
         Ok(w_ns) if !w_ns.is_null() && !unsafe { pyre_object::is_none(w_ns) } => {
-            for k in collect_iterable(w_ns)? {
-                if unsafe { pyre_object::is_str(k) } {
-                    names.push(unsafe { pyre_object::w_str_get_wtf8(k) }.to_owned());
-                }
-            }
+            dir_names_update(names_slot, collect_iterable(w_ns)?);
         }
         Ok(_) => {}
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {}
@@ -16506,10 +16610,15 @@ unsafe fn classdir_recurse(
     }
 
     // getattr(klass, '__bases__', None): for base in bases.
+    let w_cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
     match crate::baseobjspace::getattr_str(w_cls, "__bases__") {
         Ok(bases) if !bases.is_null() && !unsafe { pyre_object::is_none(bases) } => {
-            for base in collect_iterable(bases)? {
-                unsafe { classdir_recurse(base, names) }?;
+            let bases = collect_iterable(bases)?;
+            let _base_roots = pyre_object::gc_roots::push_roots();
+            let bases_slot = pyre_object::gc_roots::pin_roots(&bases);
+            for index in 0..bases.len() {
+                let base = pyre_object::gc_roots::shadow_stack_get(bases_slot + index);
+                unsafe { classdir_recurse(base, names_slot) }?;
             }
         }
         Ok(_) => {}
@@ -16525,7 +16634,8 @@ unsafe fn classdir_recurse(
 /// class namespace.  `dir(obj)` sorts the result after invoking this special
 /// method; `object.__dir__(obj)` itself only promises a list.
 pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let mut names: Vec<Wtf8Buf> = Vec::new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let names_slot = dir_names_new();
     unsafe {
         let mut w_dict = crate::baseobjspace::getdict(obj)?;
         // `method.__dir__` forwards the underlying function's instance
@@ -16538,26 +16648,21 @@ pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate:
             }
         }
         if !w_dict.is_null() && pyre_object::is_dict(w_dict) {
-            for (key, _) in pyre_object::w_dict_items(w_dict) {
-                if pyre_object::is_str(key) {
-                    names.push(pyre_object::w_str_get_wtf8(key).to_owned());
-                }
-            }
+            dir_names_update(
+                names_slot,
+                pyre_object::w_dict_items(w_dict)
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect(),
+            );
         }
         if let Some(w_type) = crate::typedef::r#type(obj)
             && pyre_object::is_type(w_type.as_ptr())
         {
-            classdir_into(w_type.as_ptr(), &mut names)?;
+            classdir_into(w_type.as_ptr(), names_slot)?;
         }
     }
-    names.sort();
-    names.dedup();
-    Ok(w_list_new(
-        names
-            .into_iter()
-            .map(pyre_object::w_str_from_wtf8)
-            .collect(),
-    ))
+    Ok(dir_names_list(names_slot))
 }
 
 /// util.py `_classdir` / typeobject.py:1234 `descr__dir__`.
@@ -16567,16 +16672,10 @@ pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate:
 /// not part of the result.  Keep this as the direct `type.__dir__` target so
 /// installing that descriptor does not make `dir()` redispatch recursively.
 pub(crate) fn type_dir_default(w_type: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let mut names: Vec<Wtf8Buf> = Vec::new();
-    unsafe { classdir_into(w_type, &mut names) }?;
-    names.sort();
-    names.dedup();
-    Ok(w_list_new(
-        names
-            .into_iter()
-            .map(pyre_object::w_str_from_wtf8)
-            .collect(),
-    ))
+    let _roots = pyre_object::gc_roots::push_roots();
+    let names_slot = dir_names_new();
+    unsafe { classdir_into(w_type, names_slot) }?;
+    Ok(dir_names_list(names_slot))
 }
 
 /// The tail of no-argument `dir()`: a locals mapping's sorted key set.
@@ -16692,7 +16791,8 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if unsafe { pyre_object::is_generic_alias(obj) } {
         return crate::_pypy_generic_alias::dir_list(obj);
     }
-    let mut names: Vec<Wtf8Buf> = Vec::new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let names_slot = dir_names_new();
     unsafe {
         if pyre_object::is_module(obj) {
             // Route through `w_module.w_dict` so dict-subclass-backed
@@ -16702,8 +16802,8 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // `pypy/interpreter/module.py Module.getdict()` returns
             // the dict directly regardless of subclass; pyre branches
             // on the underlying shape:
-            //   - exact `W_DictObject` → `w_dict_str_entries_wtf8` returns
-            //     the storage-proxy union view in one call, keeping
+            //   - exact `W_DictObject` → `w_dict_items` returns the
+            //     storage-proxy union view in one call, keeping
             //     lone-surrogate global names.
             //   - dict subclass instance → iterate keys via the
             //     standard `iter()` protocol so the subclass's
@@ -16721,24 +16821,24 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     return builtin_sorted(&[result]);
                 }
                 if pyre_object::is_dict(w_dict) {
-                    for (name, _) in pyre_object::dictmultiobject::w_dict_str_entries_wtf8(w_dict) {
-                        names.push(name);
-                    }
+                    dir_names_update(
+                        names_slot,
+                        pyre_object::w_dict_items(w_dict)
+                            .into_iter()
+                            .map(|(key, _)| key)
+                            .collect(),
+                    );
                 } else if let Ok(keys_iter) = crate::baseobjspace::iter(w_dict)
                     && let Ok(keys) = crate::builtins::collect_iterable(keys_iter)
                 {
-                    for k in keys {
-                        if pyre_object::is_str(k) {
-                            names.push(pyre_object::w_str_get_wtf8(k).to_owned());
-                        }
-                    }
+                    dir_names_update(names_slot, keys);
                 }
             }
         } else if pyre_object::is_type(obj) {
             // util.py `_classdir` (`type.__dir__`, typeobject.py:1234) —
             // the class's `__dict__` keys unioned with `_classdir` of each
             // base, recursively.
-            classdir_into(obj, &mut names)?;
+            classdir_into(obj, names_slot)?;
         } else if pyre_object::is_instance(obj) {
             // util.py `_objectdir` (`object.__dir__`) — use ordinary
             // `getattr(obj, '__dict__'/'__class__', None)`, not raw layout
@@ -16752,11 +16852,13 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 Err(e) => return Err(e),
             };
             if let Some(w_dict) = w_dict {
-                for (k, _) in pyre_object::w_dict_items(w_dict) {
-                    if pyre_object::is_str(k) {
-                        names.push(pyre_object::w_str_get_wtf8(k).to_owned());
-                    }
-                }
+                dir_names_update(
+                    names_slot,
+                    pyre_object::w_dict_items(w_dict)
+                        .into_iter()
+                        .map(|(key, _)| key)
+                        .collect(),
+                );
             }
             let w_class = match crate::baseobjspace::getattr_str(obj, "__class__") {
                 Ok(w_class) => Some(w_class),
@@ -16766,7 +16868,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             if let Some(w_class) = w_class
                 && pyre_object::is_type(w_class)
             {
-                classdir_into(w_class, &mut names)?;
+                classdir_into(w_class, names_slot)?;
             }
         } else {
             // Fallback `_objectdir` (util.py) for builtin W_Root types
@@ -16774,16 +16876,13 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // W_Root subclasses own a typed dictionary field even though
             // `is_instance()` is false, so use W_Root.getdict + _classdir
             // rather than assuming this whole branch has no instance dict.
-            return object_dir_default(obj);
+            return builtin_sorted(&[object_dir_default(obj)?]);
         }
     }
-    names.sort();
-    names.dedup();
-    let items: Vec<_> = names
-        .into_iter()
-        .map(pyre_object::w_str_from_wtf8)
-        .collect();
-    Ok(w_list_new(items))
+    // `_dir_object` sorts what `__dir__` returned, so a namespace holding a
+    // key that does not order against a `str` raises from the comparison
+    // rather than being filtered away.
+    builtin_sorted(&[dir_names_list(names_slot)])
 }
 
 /// `operation.py id(space, w_object)` — `space.id`, then the
@@ -19873,9 +19972,7 @@ fn fd_read(fd: i32, n: usize) -> Result<Option<Vec<u8>>, crate::PyError> {
     // reaches here as a request the allocator cannot meet.  `os.read` sizes
     // its buffer through `rffi.scoped_alloc_buffer`, which raises
     // `MemoryError`; an infallible `vec![0; n]` would abort the process.
-    let mut out = Vec::new();
-    out.try_reserve_exact(n)
-        .map_err(|_| crate::PyError::memory_error("out of memory"))?;
+    let mut out = try_vec_with_capacity::<u8>(n)?;
     out.resize(n, 0);
     loop {
         let got = match fd_read_into(fd, &mut out) {
@@ -20011,7 +20108,10 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             Some(value) if unsafe { pyre_object::is_none(value) } => None,
             Some(value) => {
                 let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(value)?)?;
-                (value >= 0).then_some(value as usize)
+                // `_io_FileIO_read_impl` clamps the request to `_PY_READ_MAX`
+                // before it allocates, so a size past it reads that much
+                // rather than failing to reserve the whole of it.
+                (value >= 0).then_some(value.min(PY_READ_MAX) as usize)
             }
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
@@ -20713,11 +20813,12 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let encoding_slot = opener_slot - 4;
     let buffering_slot = opener_slot - 5;
 
-    // A buffering value outside the machine-int range is an OverflowError, not a
-    // silent fallback to default buffering, so index through `space_index_w`
-    // rather than the negative-preserving sentinel converter.
-    let mut buffering =
-        crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(buffering_slot))?;
+    // `_io_open`'s `buffering` is an Argument Clinic `int`, so a value the C type
+    // cannot hold is an OverflowError rather than a silent fallback to default
+    // buffering.  The later `_blksize` clamp keeps the wider Rust type.
+    let mut buffering = i64::from(crate::baseobjspace::index_c_int_w(
+        pyre_object::gc_roots::shadow_stack_get(buffering_slot),
+    )?);
 
     for (name, slot) in [
         ("encoding", encoding_slot),
@@ -21896,9 +21997,85 @@ fn float_round_ndigits(v: f64, ndigits: i64) -> f64 {
             .parse::<f64>()
             .unwrap_or(v)
     } else {
-        let factor = 10f64.powi((-ndigits) as i32);
-        round_half_even(v / factor) * factor
+        round_to_power_of_ten(v, (-ndigits) as u32)
     }
+}
+
+/// Round `v` to the nearest multiple of `10^k`, ties to even, and answer the
+/// double nearest that decimal.
+///
+/// `double_round` gets this by rounding the exact decimal expansion exactly
+/// once — `_Py_dg_dtoa(v, 3, ndigits, ...)` then `_Py_dg_strtod`. Scaling by
+/// `10f64.powi(k)` instead rounds twice: the quotient is already the nearest
+/// double to `v / 10^k`, so a value whose exact quotient sits just off a tie
+/// can be pushed onto it, and the multiply back adds a second error —
+/// `round(7.378703e20, -1)` landed a ulp high that way.
+///
+/// The expansion is read off `trunc()`, which is exact, plus one bit saying
+/// whether anything was dropped: only the digits at and left of the rounding
+/// position decide the answer, and everything to the right of the point can
+/// only break a tie.
+fn round_to_power_of_ten(v: f64, k: u32) -> f64 {
+    if !v.is_finite() {
+        return v;
+    }
+    let truncated = v.trunc();
+    let has_fraction = v != truncated;
+    // `truncated` is integer-valued, so rendering it with no fractional digits
+    // is exact however large it is.
+    let digits = format!("{:.0}", truncated.abs());
+    let k = k as usize;
+    let (head, tail) = if digits.len() > k {
+        digits.split_at(digits.len() - k)
+    } else {
+        ("", digits.as_str())
+    };
+    // Compare the discarded suffix against half of `10^k`. Both sides are
+    // rendered at width `k`, so the comparison is the numeric one.
+    let mut discarded = vec![b'0'; k - tail.len()];
+    discarded.extend_from_slice(tail.as_bytes());
+    let mut half = vec![b'0'; k];
+    half[0] = b'5';
+    let round_up = match discarded.cmp(&half) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // An exact tie in the integer digits is only a tie when nothing was
+        // dropped after the point; otherwise the value is above the midpoint.
+        std::cmp::Ordering::Equal => {
+            has_fraction || head.as_bytes().last().is_some_and(|d| (d - b'0') % 2 == 1)
+        }
+    };
+    let mut rounded = head.as_bytes().to_vec();
+    if round_up {
+        increment_decimal_digits(&mut rounded);
+    }
+    let mut text = String::with_capacity(rounded.len() + k + 1);
+    if v.is_sign_negative() {
+        text.push('-');
+    }
+    // An empty head is the whole value rounding away, which still has to spell
+    // a number for the parse below.
+    text.push_str(if rounded.is_empty() {
+        "0"
+    } else {
+        std::str::from_utf8(&rounded).unwrap_or("0")
+    });
+    text.extend(std::iter::repeat_n('0', k));
+    // Rounding up can carry past the largest double, which the caller reports
+    // as `rounded value too large to represent`.
+    text.parse::<f64>().unwrap_or(v)
+}
+
+/// Add one to a decimal digit string in place, growing it on carry-out.
+fn increment_decimal_digits(digits: &mut Vec<u8>) {
+    for digit in digits.iter_mut().rev() {
+        if *digit < b'9' {
+            *digit += 1;
+            return;
+        }
+        *digit = b'0';
+    }
+    digits.insert(0, b'1');
 }
 
 /// Whether the receiver's `__round__` is still one of the two the builtin
@@ -22374,7 +22551,19 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
         // underscore removal and parsing, including strict surrogate
         // rejection.
         let s = unicode_to_decimal_w(a)?;
-        let (r, i) = parse_complex_str(&s).ok_or_else(|| {
+        // `_Py_string_to_number_with_underscores` validates the separators
+        // itself and reports a misplaced one under its own wording, naming the
+        // *original* argument rather than the decimal-normalized copy; only a
+        // string that survives that pass reaches `complex_from_string_inner`
+        // and its "malformed" message.
+        let Some(cleaned) = strip_numeric_underscores(&s) else {
+            let source_repr = unsafe { crate::display::py_repr_wtf8(a)? };
+            return Err(crate::PyError::value_error(crate::display::wtf8_format!(
+                "could not convert string to complex: ",
+                source_repr
+            )));
+        };
+        let (r, i) = parse_complex_str(&cleaned).ok_or_else(|| {
             crate::PyError::new(
                 crate::PyErrorKind::ValueError,
                 "complex() arg is a malformed string".to_string(),
@@ -22712,7 +22901,7 @@ mod tests {
         assert_eq!(error.kind, crate::PyErrorKind::TypeError);
         assert_eq!(
             error.message_text(),
-            "instance layout conflicts in multiple inheritance"
+            "multiple bases have instance lay-out conflict"
         );
 
         let arithmetic = lookup_exc_class("ArithmeticError").unwrap();
@@ -22728,7 +22917,7 @@ mod tests {
         assert_eq!(error.kind, crate::PyErrorKind::TypeError);
         assert_eq!(
             error.message_text(),
-            "instance layout conflicts in multiple inheritance"
+            "multiple bases have instance lay-out conflict"
         );
     }
 

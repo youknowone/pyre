@@ -134,7 +134,9 @@ cached_type!(CFIELD, cfield_type, || {
         type_ns_store(
             ns,
             "__set__",
-            crate::make_builtin_function("__set__", cfield_set),
+            // `cfield_set` reads its value out of the slice, so the arity is
+            // declared rather than left to the body.
+            crate::make_builtin_function_with_arity("__set__", cfield_set, 3),
         );
         type_ns_store(
             ns,
@@ -198,6 +200,22 @@ cached_type!(POINTER_BASE, pointer_base_type, || {
     finish_element_base(tp, pycpointertype_type());
     super::finish_cpython_type(tp, "_ctypes", true)
 });
+
+/// The receiver test the `Array` descriptors are checked against —
+/// `wrapperdescr_call`'s `_PyObject_RealIsSubclass(Py_TYPE(self),
+/// PyDescr_TYPE(descr))` with `PyCArray_Type` as `d_type`.  Every element
+/// type builds its own subtype, so the test has to accept subclasses;
+/// `isinstance_w` reads the native `w_class` and walks the MRO, which is
+/// what the class hierarchy discriminates here — every cdata shares one
+/// Rust layout.
+pub(crate) fn is_array_instance(obj: PyObjectRef) -> bool {
+    unsafe { crate::baseobjspace::isinstance_w(obj, array_type()) }
+}
+
+/// The same test against `PyCPointer_Type` for the `_Pointer` descriptors.
+pub(crate) fn is_pointer_instance(obj: PyObjectRef) -> bool {
+    unsafe { crate::baseobjspace::isinstance_w(obj, pointer_base_type()) }
+}
 
 fn install_new(ns: PyObjectRef, f: crate::gateway::BuiltinCodeFn) {
     type_ns_store(ns, "__new__", crate::typedef::make_new_descr(f));
@@ -336,15 +354,19 @@ fn init_array_base(ns: PyObjectRef) {
         "__len__",
         crate::make_builtin_function("__len__", array_len),
     );
+    // These two read their key and value straight out of the slice, so the
+    // declared arity is what stands between a short call and an
+    // out-of-bounds read: `(c_int * 3).__getitem__(1)` aborted the
+    // interpreter rather than raising.
     type_ns_store(
         ns,
         "__getitem__",
-        crate::make_builtin_function("__getitem__", array_getitem),
+        crate::make_builtin_function_with_arity("__getitem__", array_getitem, 2),
     );
     type_ns_store(
         ns,
         "__setitem__",
-        crate::make_builtin_function("__setitem__", array_setitem),
+        crate::make_builtin_function_with_arity("__setitem__", array_setitem, 3),
     );
 }
 
@@ -355,15 +377,17 @@ fn init_pointer_base(ns: PyObjectRef) {
         "__init__",
         crate::make_builtin_function("__init__", pointer_init),
     );
+    // Indexed the same way `_ctypes.Array`'s pair is, and unguarded the same
+    // way before the arity was declared.
     type_ns_store(
         ns,
         "__getitem__",
-        crate::make_builtin_function("__getitem__", pointer_getitem),
+        crate::make_builtin_function_with_arity("__getitem__", pointer_getitem, 2),
     );
     type_ns_store(
         ns,
         "__setitem__",
-        crate::make_builtin_function("__setitem__", pointer_setitem),
+        crate::make_builtin_function_with_arity("__setitem__", pointer_setitem, 3),
     );
     type_ns_store(
         ns,

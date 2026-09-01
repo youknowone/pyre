@@ -397,13 +397,21 @@ impl W_ListObject {
     /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)` for the Object
     /// strategy: publish an exact-capacity, zero-length RPython list backing.
     unsafe fn object_resize_capacity(obj: PyObjectRef, capacity: usize) -> PyObjectRef {
+        Self::try_object_resize_capacity(obj, capacity)
+            .unwrap_or_else(|| crate::object_array::items_block_alloc_failed(capacity))
+    }
+
+    /// [`W_ListObject::object_resize_capacity`] for a capacity that came from
+    /// Python: the fresh block is the only fallible step and it precedes every
+    /// store, so a refusal leaves the list on the block it already had.
+    unsafe fn try_object_resize_capacity(obj: PyObjectRef, capacity: usize) -> Option<PyObjectRef> {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
         let list = &*(obj as *const W_ListObject);
         assert!(capacity >= list.length_relaxed());
         if capacity == list.object_items_capacity() {
-            return obj;
+            return Some(obj);
         }
         if capacity == 0 {
             list_write_barrier(obj);
@@ -412,13 +420,19 @@ impl W_ListObject {
             let old = list.items;
             list.items = std::ptr::null_mut();
             dealloc_list_items_block(old);
-            return crate::gc_roots::shadow_stack_get(obj_slot);
+            return Some(crate::gc_roots::shadow_stack_get(obj_slot));
         }
         list_write_barrier(obj);
         let block_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &*(obj as *const W_ListObject);
-        let block = grow_list_items_block_gc(list.items, capacity, list.length_relaxed());
+        // A refusal here leaves the barrier above spent on a list that keeps
+        // its old block: one extra remembered-set entry, and nothing else.
+        let block = crate::object_array::try_grow_list_items_block_gc(
+            list.items,
+            capacity,
+            list.length_relaxed(),
+        )?;
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         list_write_barrier(obj);
@@ -427,7 +441,7 @@ impl W_ListObject {
         let old = list.items;
         list.items = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
         dealloc_list_items_block(old);
-        crate::gc_roots::shadow_stack_get(obj_slot)
+        Some(crate::gc_roots::shadow_stack_get(obj_slot))
     }
 
     /// Grow `bytes_items` to accommodate at least `min_cap` slots — the
@@ -469,13 +483,21 @@ impl W_ListObject {
 
     /// RPython `_ll_list_resize_hint_really` for BytesListStrategy.
     unsafe fn bytes_resize_capacity(obj: PyObjectRef, capacity: usize) -> PyObjectRef {
+        Self::try_bytes_resize_capacity(obj, capacity)
+            .unwrap_or_else(|| crate::object_array::items_block_alloc_failed(capacity))
+    }
+
+    /// [`W_ListObject::bytes_resize_capacity`] for a capacity that came from
+    /// Python: the fresh block is the only fallible step and it precedes every
+    /// store, so a refusal leaves the list on the block it already had.
+    unsafe fn try_bytes_resize_capacity(obj: PyObjectRef, capacity: usize) -> Option<PyObjectRef> {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
         let list = &*(obj as *const W_ListObject);
         assert!(capacity >= list.bytes_items.len());
         if capacity == list.bytes_items.heap_capacity() {
-            return obj;
+            return Some(obj);
         }
         if capacity == 0 {
             let list = &mut *(obj as *mut W_ListObject);
@@ -483,14 +505,19 @@ impl W_ListObject {
             list.bytes_items.block = std::ptr::null_mut();
             list.bytes_items.set_len(0);
             dealloc_list_items_block(old);
-            return crate::gc_roots::shadow_stack_get(obj_slot);
+            return Some(crate::gc_roots::shadow_stack_get(obj_slot));
         }
         list_write_barrier(obj);
         let block_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &*(obj as *const W_ListObject);
-        let block =
-            grow_list_items_block_gc(list.bytes_items.block, capacity, list.bytes_items.len());
+        // A refusal here leaves the barrier above spent on a list that keeps
+        // its old block: one extra remembered-set entry, and nothing else.
+        let block = crate::object_array::try_grow_list_items_block_gc(
+            list.bytes_items.block,
+            capacity,
+            list.bytes_items.len(),
+        )?;
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         list_write_barrier(obj);
@@ -499,7 +526,7 @@ impl W_ListObject {
         let old = list.bytes_items.block;
         list.bytes_items.block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
         dealloc_list_items_block(old);
-        crate::gc_roots::shadow_stack_get(obj_slot)
+        Some(crate::gc_roots::shadow_stack_get(obj_slot))
     }
 
     /// Publish an already-built `BytesArray` as this list's `bytes_items`,
@@ -550,13 +577,21 @@ impl W_ListObject {
 
     /// RPython `_ll_list_resize_hint_really` for AsciiListStrategy.
     unsafe fn ascii_resize_capacity(obj: PyObjectRef, capacity: usize) -> PyObjectRef {
+        Self::try_ascii_resize_capacity(obj, capacity)
+            .unwrap_or_else(|| crate::object_array::items_block_alloc_failed(capacity))
+    }
+
+    /// [`W_ListObject::ascii_resize_capacity`] for a capacity that came from
+    /// Python: the fresh block is the only fallible step and it precedes every
+    /// store, so a refusal leaves the list on the block it already had.
+    unsafe fn try_ascii_resize_capacity(obj: PyObjectRef, capacity: usize) -> Option<PyObjectRef> {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
         let list = &*(obj as *const W_ListObject);
         assert!(capacity >= list.ascii_items.len());
         if capacity == list.ascii_items.heap_capacity() {
-            return obj;
+            return Some(obj);
         }
         if capacity == 0 {
             let list = &mut *(obj as *mut W_ListObject);
@@ -564,14 +599,19 @@ impl W_ListObject {
             list.ascii_items.block = std::ptr::null_mut();
             list.ascii_items.set_len(0);
             dealloc_list_items_block(old);
-            return crate::gc_roots::shadow_stack_get(obj_slot);
+            return Some(crate::gc_roots::shadow_stack_get(obj_slot));
         }
         list_write_barrier(obj);
         let block_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &*(obj as *const W_ListObject);
-        let block =
-            grow_list_items_block_gc(list.ascii_items.block, capacity, list.ascii_items.len());
+        // A refusal here leaves the barrier above spent on a list that keeps
+        // its old block: one extra remembered-set entry, and nothing else.
+        let block = crate::object_array::try_grow_list_items_block_gc(
+            list.ascii_items.block,
+            capacity,
+            list.ascii_items.len(),
+        )?;
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         list_write_barrier(obj);
@@ -580,7 +620,7 @@ impl W_ListObject {
         let old = list.ascii_items.block;
         list.ascii_items.block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
         dealloc_list_items_block(old);
-        crate::gc_roots::shadow_stack_get(obj_slot)
+        Some(crate::gc_roots::shadow_stack_get(obj_slot))
     }
 
     /// Publish an already-built AsciiListStrategy backing array with the
@@ -2970,17 +3010,7 @@ pub unsafe fn w_list_resize_hint(obj: PyObjectRef, newsize: i64) -> bool {
 
     let newsize = usize::try_from(newsize).unwrap_or(0);
 
-    let current = match list.strategy {
-        ListStrategy::Object => list.object_items_capacity(),
-        ListStrategy::Integer | ListStrategy::IntOrFloat => list.int_items.heap_capacity(),
-        ListStrategy::Float => list.float_items.heap_capacity(),
-        ListStrategy::Bytes => list.bytes_items.heap_capacity(),
-        ListStrategy::Ascii => list.ascii_items.heap_capacity(),
-        ListStrategy::Empty
-        | ListStrategy::Size
-        | ListStrategy::SimpleRange
-        | ListStrategy::Range => unreachable!(),
-    };
+    let current = strategy_capacity(list).expect("strategy carries a backing array");
     let requested = newsize.max(list.live_len());
     let target = if requested > current {
         let extra = if requested < 9 { 3 } else { 6 };
@@ -2997,62 +3027,144 @@ pub unsafe fn w_list_resize_hint(obj: PyObjectRef, newsize: i64) -> bool {
         return true;
     };
 
+    resize_backing_to(obj, root_base, target)
+}
+
+/// The slots the list's current strategy has room for, or `None` for one that
+/// carries no backing array at all.
+///
+/// # Safety
+/// `list` must be a valid `W_ListObject`.
+unsafe fn strategy_capacity(list: &W_ListObject) -> Option<usize> {
+    Some(match list.strategy {
+        ListStrategy::Object => list.object_items_capacity(),
+        ListStrategy::Integer | ListStrategy::IntOrFloat => list.int_items.heap_capacity(),
+        ListStrategy::Float => list.float_items.heap_capacity(),
+        ListStrategy::Bytes => list.bytes_items.heap_capacity(),
+        ListStrategy::Ascii => list.ascii_items.heap_capacity(),
+        ListStrategy::Empty
+        | ListStrategy::Size
+        | ListStrategy::SimpleRange
+        | ListStrategy::Range => return None,
+    })
+}
+
+/// Publish a backing of exactly `target` slots for the list's current
+/// strategy, reporting an allocation the machine cannot meet.
+///
+/// The shared tail of [`w_list_resize_hint`] and [`w_list_try_resize`]: those
+/// two differ only in the capacity policy that picks `target`.
+///
+/// # Safety
+/// `obj` must be a valid `W_ListObject` pinned at `root_base` with its guard
+/// held, and its strategy must be one that carries a backing array.
+unsafe fn resize_backing_to(obj: PyObjectRef, root_base: usize, target: usize) -> bool {
+    let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
-        ListStrategy::Object => {
-            let _ = W_ListObject::object_resize_capacity(obj, target);
-        }
-        ListStrategy::Integer | ListStrategy::IntOrFloat => {
-            let old = list.int_items.block;
-            let len = list.int_items.len();
-            if target == 0 {
-                crate::object_array::dealloc_typed_items_block(old);
-                let obj = crate::gc_roots::shadow_stack_get(root_base);
-                let list = &mut *(obj as *mut W_ListObject);
-                list.int_items.block = std::ptr::null_mut();
-                list.int_items.set_len(0);
-            } else {
-                let fresh = crate::object_array::grow_typed_items_block(
-                    old,
-                    target,
-                    len,
-                    crate::object_array::gc_int_array_gc_type_id(),
-                );
-                let obj = crate::gc_roots::shadow_stack_get(root_base);
-                (*(obj as *mut W_ListObject)).int_items.block = fresh;
-            }
-        }
-        ListStrategy::Float => {
-            let old = list.float_items.block;
-            let len = list.float_items.len();
-            if target == 0 {
-                crate::object_array::dealloc_typed_items_block(old);
-                let obj = crate::gc_roots::shadow_stack_get(root_base);
-                let list = &mut *(obj as *mut W_ListObject);
-                list.float_items.block = std::ptr::null_mut();
-                list.float_items.set_len(0);
-            } else {
-                let fresh = crate::object_array::grow_typed_items_block(
-                    old,
-                    target,
-                    len,
+        ListStrategy::Object => W_ListObject::try_object_resize_capacity(obj, target).is_some(),
+        ListStrategy::Integer | ListStrategy::IntOrFloat | ListStrategy::Float => {
+            // The Integer and Float strategies share one `TypedItemsBlock`
+            // resize and differ only in the field it lands in and the array
+            // token it carries.
+            let float = matches!(list.strategy, ListStrategy::Float);
+            let (old, len, tid) = if float {
+                (
+                    list.float_items.block,
+                    list.float_items.len(),
                     crate::object_array::gc_float_array_gc_type_id(),
-                );
-                let obj = crate::gc_roots::shadow_stack_get(root_base);
-                (*(obj as *mut W_ListObject)).float_items.block = fresh;
+                )
+            } else {
+                (
+                    list.int_items.block,
+                    list.int_items.len(),
+                    crate::object_array::gc_int_array_gc_type_id(),
+                )
+            };
+            let fresh = if target == 0 {
+                crate::object_array::dealloc_typed_items_block(old);
+                std::ptr::null_mut()
+            } else {
+                let Some(fresh) =
+                    crate::object_array::try_grow_typed_items_block(old, target, len, tid)
+                else {
+                    return false;
+                };
+                fresh
+            };
+            let obj = crate::gc_roots::shadow_stack_get(root_base);
+            let list = &mut *(obj as *mut W_ListObject);
+            if float {
+                list.float_items.block = fresh;
+                if target == 0 {
+                    list.float_items.set_len(0);
+                }
+            } else {
+                list.int_items.block = fresh;
+                if target == 0 {
+                    list.int_items.set_len(0);
+                }
             }
+            true
         }
-        ListStrategy::Bytes => {
-            let _ = W_ListObject::bytes_resize_capacity(obj, target);
-        }
-        ListStrategy::Ascii => {
-            let _ = W_ListObject::ascii_resize_capacity(obj, target);
-        }
+        ListStrategy::Bytes => W_ListObject::try_bytes_resize_capacity(obj, target).is_some(),
+        ListStrategy::Ascii => W_ListObject::try_ascii_resize_capacity(obj, target).is_some(),
         ListStrategy::Empty
         | ListStrategy::Size
         | ListStrategy::SimpleRange
         | ListStrategy::Range => unreachable!(),
     }
+}
+
+/// CPython `list_resize` for a growth the caller must be able to refuse:
+/// reserve the backing for `newsize` slots and report an allocation the
+/// machine cannot meet, where the append path aborts.
+///
+/// `list_inplace_repeat_lock_held` sizes the whole result with one
+/// `list_resize` before it copies anything, and `ll_inplace_mul` the same with
+/// one `_ll_resize`; both surface a refusal as `MemoryError`, so the count is
+/// never walked as a loop trip.
+///
+/// Returns false only for that refusal.  A `newsize` the block already covers
+/// is `list_resize`'s "failure is impossible if newsize <= self.allocated"
+/// case and answers true without touching the array.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_list_try_resize(obj: PyObjectRef, newsize: usize) -> bool {
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &mut *(obj as *mut W_ListObject);
+    // A strategy with no backing array has nothing to size; the range ones
+    // inherit `BaseRangeListStrategy._resize_hint`'s documented no-op.
+    let Some(current) = strategy_capacity(list) else {
+        return true;
+    };
+    let old_size = list.live_len();
+    let target = list.resized_allocation(old_size, newsize);
+    if target > current && !resize_backing_to(obj, root_base, target) {
+        return false;
+    }
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    (*(obj as *mut W_ListObject)).allocated = target as isize;
     true
+}
+
+/// The capacity `list.extend` reserves for `extra` more items, or `None` where
+/// the sum it would need does not fit and the reservation is skipped.
+///
+/// # Safety
+/// `list` must be a valid `W_ListObject` with its guard held.
+unsafe fn reserve_for_extend_target(list: &W_ListObject, extra: usize) -> Option<usize> {
+    if list.allocated == 0 {
+        return Some((extra + 1) & !1);
+    }
+    let old_size = list.live_len();
+    old_size
+        .checked_add(extra)
+        .map(|new_size| list.resized_allocation(old_size, new_size))
 }
 
 /// Reserve CPython's logical slots before `list.extend` consumes its source.
@@ -3065,12 +3177,45 @@ pub unsafe fn w_list_reserve_for_extend(obj: PyObjectRef, extra: usize) {
     }
     let _list_guard = w_list_lock(obj);
     let list = &mut *(obj as *mut W_ListObject);
-    let old_size = list.live_len();
-    if list.allocated == 0 {
-        list.allocated = ((extra + 1) & !1) as isize;
-    } else if let Some(new_size) = old_size.checked_add(extra) {
-        list.allocated = list.resized_allocation(old_size, new_size) as isize;
+    if let Some(target) = reserve_for_extend_target(list, extra) {
+        list.allocated = target as isize;
     }
+}
+
+/// [`w_list_reserve_for_extend`] for an `extra` the source chose: size the
+/// backing as well, and report an allocation the machine cannot meet.
+///
+/// `list_extend_iter_lock_held` reserves with the ordinary `list_resize`,
+/// whose failure the extend reports as `MemoryError`.  A `__length_hint__` is
+/// the one input to that reservation a Python object picks, so it is the one
+/// that can name a length no allocation can serve.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_list_try_reserve_for_extend(obj: PyObjectRef, extra: usize) -> bool {
+    if extra == 0 {
+        return true;
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let root_base = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _list_guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    let list = &mut *(obj as *mut W_ListObject);
+    let Some(target) = reserve_for_extend_target(list, extra) else {
+        return true;
+    };
+    // A strategy with no backing array has nothing to size, and the append
+    // that follows is what moves it off that strategy.
+    if let Some(current) = strategy_capacity(list)
+        && target > current
+        && !resize_backing_to(obj, root_base, target)
+    {
+        return false;
+    }
+    let obj = crate::gc_roots::shadow_stack_get(root_base);
+    (*(obj as *mut W_ListObject)).allocated = target as isize;
+    true
 }
 
 /// `list_extend_set` / `list_extend_dict` use ordinary `list_resize` even

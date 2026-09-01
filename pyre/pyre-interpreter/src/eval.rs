@@ -4905,9 +4905,12 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── DictUpdate ──
-    // pypy/interpreter/pyopcode.py DICT_UPDATE — `space.ismapping_w`
-    // gate then `dict.update(source)`. Non-mapping operand surfaces
-    // "'<T>' object is not a mapping" (TypeError).
+    // [3.14-spec] `inst(DICT_UPDATE)` runs `PyDict_Update` and rewrites an
+    // `AttributeError` it surfaced to "'<T>' object is not a mapping", so a
+    // user `keys()` raising one reads the same way.  `PyFrame.DICT_UPDATE`
+    // gates `space.ismapping_w` ahead of the update instead and lets such an
+    // error through.  `dict_update_value` is the wrapper that draws the line
+    // where 3.14 does.
     fn dict_update(&mut self, i: usize) -> Result<(), PyError> {
         let source = self.pop();
         let dict = PyFrame::peek_at(self, i - 1);

@@ -119,22 +119,57 @@ pub fn bytes_block_gc_type_id() -> u32 {
 /// Falls back to a plain allocation before the GC is up or in a unit test,
 /// where the block is immortal, as the storage box's `malloc_raw` fallback is.
 pub fn alloc_bytes_block(bytes: &[u8]) -> *mut BytesBlock {
-    let size = BYTES_BLOCK_CHARS_OFFSET + bytes.len();
+    try_alloc_bytes_block(bytes)
+        .unwrap_or_else(|| std::alloc::handle_alloc_error(bytes_block_layout(bytes.len())))
+}
+
+/// Where a bytes block comes from.
+enum BlockRoute {
+    /// The managed heap served it.
+    Managed(*mut u8),
+    /// No heap owns the request — before the GC is up, or in a unit test — so
+    /// the caller allocates it and the block is immortal.
+    Raw,
+    /// A heap owns the request and could not meet it.
+    Refused,
+}
+
+/// Ask the managed heap for a `size`-byte block.
+///
+/// `try_gc_alloc_stable_raw` ends the process on the third answer, because its
+/// callers meet a null by allocating outside the heap and a block holding
+/// managed references must never live there.  A bytes block holds none, and its
+/// size comes from Python, so the refusal is reported instead — nothing is
+/// allocated anywhere on that path, and the caller raises the `MemoryError`
+/// `collect_and_reserve` raises.
+fn route_bytes_block(size: usize) -> BlockRoute {
     let tid = bytes_block_gc_type_id();
-    let raw = if tid != 0 {
-        crate::gc_hook::try_gc_alloc_stable_raw(tid, size)
-    } else {
-        std::ptr::null_mut()
-    };
-    let block = if raw.is_null() {
-        let layout = bytes_block_layout(bytes.len());
+    if tid == 0 {
+        return BlockRoute::Raw;
+    }
+    match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_stable(tid, size))
+    {
+        crate::gc_hook::GcAllocOutcome::Allocated(raw) => BlockRoute::Managed(raw),
+        crate::gc_hook::GcAllocOutcome::Failed => BlockRoute::Refused,
+        crate::gc_hook::GcAllocOutcome::NoRoute => BlockRoute::Raw,
+    }
+}
+
+/// [`alloc_bytes_block`] for a length that came from Python, answering `None`
+/// where its twin ends the process.
+///
+/// `bytes(sys.maxsize)` reaches the allocator with a request it cannot meet,
+/// and `PyBytes_FromStringAndSize` reports that as `MemoryError`.
+pub fn try_alloc_bytes_block(bytes: &[u8]) -> Option<*mut BytesBlock> {
+    let size = BYTES_BLOCK_CHARS_OFFSET + bytes.len();
+    let block = match route_bytes_block(size) {
+        BlockRoute::Managed(raw) => raw,
+        BlockRoute::Refused => return None,
         // SAFETY: the layout is non-zero — the header alone occupies a word.
-        unsafe { std::alloc::alloc(layout) }
-    } else {
-        raw
+        BlockRoute::Raw => unsafe { std::alloc::alloc(bytes_block_layout(bytes.len())) },
     };
     if block.is_null() {
-        std::alloc::handle_alloc_error(bytes_block_layout(bytes.len()));
+        return None;
     }
     // SAFETY: `block` names `size` writable bytes, which is the header
     // followed by `bytes.len()` char slots.
@@ -146,7 +181,48 @@ pub fn alloc_bytes_block(bytes: &[u8]) -> *mut BytesBlock {
             std::ptr::addr_of_mut!((*block).chars) as *mut u8,
             bytes.len(),
         );
-        block
+        Some(block)
+    }
+}
+
+/// Whether a bytes object of `len` chars is one a `Py_ssize_t` can measure,
+/// which `_PyBytes_FromSize` refuses with `OverflowError` before it allocates.
+pub fn bytes_length_fits(len: usize) -> bool {
+    len <= isize::MAX as usize - BYTES_BLOCK_CHARS_OFFSET
+}
+
+/// [`try_alloc_bytes_block`] for a block of `len` NUL bytes, which is the one
+/// allocation `_PyBytes_FromSize(size, 1)` makes.
+pub fn try_alloc_bytes_block_zeroed(len: usize) -> Option<*mut BytesBlock> {
+    let size = BYTES_BLOCK_CHARS_OFFSET + len;
+    let block = match route_bytes_block(size) {
+        BlockRoute::Managed(raw) => {
+            // SAFETY: `raw` names `size` writable bytes, and the managed heap
+            // makes no promise about what they hold.
+            unsafe { std::ptr::write_bytes(raw, 0, size) };
+            raw
+        }
+        BlockRoute::Refused => return None,
+        BlockRoute::Raw => {
+            // A length that overruns the address space has no layout at all,
+            // and is the same refusal as one the allocator declines.
+            let layout =
+                std::alloc::Layout::from_size_align(size, std::mem::align_of::<BytesBlock>())
+                    .ok()?;
+            // `PyObject_Calloc` — a large block's pages arrive zero already, so
+            // asking the allocator for them beats writing `len` NULs over them.
+            // SAFETY: the layout is non-zero — the header alone occupies a word.
+            unsafe { std::alloc::alloc_zeroed(layout) }
+        }
+    };
+    if block.is_null() {
+        return None;
+    }
+    // SAFETY: `block` names the header followed by `len` zeroed char slots.
+    unsafe {
+        let block = block as *mut BytesBlock;
+        (*block).length = len;
+        Some(block)
     }
 }
 
@@ -239,7 +315,11 @@ impl crate::lltype::GcType for W_BytesObject {
 /// allocation, so the JIT residualises the call.
 #[majit_macros::dont_look_inside]
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
-    let len = bytes.len();
+    build_bytes(bytes.len(), alloc_bytes_block(bytes))
+}
+
+/// Wrap `data`, the block the bytes were copied into, in its `W_BytesObject`.
+fn build_bytes(len: usize, data: *mut BytesBlock) -> PyObjectRef {
     // `build_list_storage` (listobject.rs) states the rule the block obeys:
     // old-gen is mark-sweep, so a block with no heap edge yet is sweepable
     // rather than merely immobile, and it has to be rooted across every later
@@ -249,7 +329,6 @@ pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     // their slots once the last allocation is behind them.
     let _roots = crate::gc_roots::push_roots();
     let data_slot = crate::gc_roots::shadow_stack_len();
-    let data = alloc_bytes_block(bytes);
     let _ = crate::gc_roots::pin_root(data as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(&BYTES_TYPE));

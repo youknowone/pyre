@@ -507,6 +507,19 @@ pub(crate) fn register_builtin_error_handlers() {
     });
 }
 
+/// `_PyCodec_Lookup` reached for its refusal alone — `unicode_check_encoding_errors`
+/// discards the codec it finds and keeps only the `unknown encoding` raise.
+///
+/// Declines while `codec_need_encodings` still stands, the way that check
+/// declines until the filesystem codec is set: a lookup here would drive the
+/// `encodings` import that is still bringing the registry into existence.
+pub(crate) fn validate_encoding(encoding: &str) -> Result<(), crate::PyError> {
+    if with_codec_state(|state| state.codec_need_encodings) {
+        return Ok(());
+    }
+    lookup_codec(&[w_str_new(encoding)]).map(|_| ())
+}
+
 /// `interp_codecs.py lookup_error`.  The direct codec loops implement
 /// the eight built-ins themselves; custom handlers live in the same registry
 /// dict PyPy uses and are returned verbatim.
@@ -2533,7 +2546,7 @@ crate::py_module! {
                 final_,
                 false,
                 Some(true),
-                "utf16-be",
+                "utf-16-be",
                 "utf_16_be_decode",
             )
         }
@@ -2554,7 +2567,7 @@ crate::py_module! {
                 final_,
                 false,
                 Some(false),
-                "utf16-le",
+                "utf-16-le",
                 "utf_16_le_decode",
             )
         }
@@ -2596,7 +2609,7 @@ crate::py_module! {
                 final_,
                 true,
                 Some(true),
-                "utf32-be",
+                "utf-32-be",
                 "utf_32_be_decode",
             )
         }
@@ -2617,7 +2630,7 @@ crate::py_module! {
                 final_,
                 true,
                 Some(false),
-                "utf32-le",
+                "utf-32-le",
                 "utf_32_le_decode",
             )
         }

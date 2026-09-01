@@ -2184,6 +2184,11 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "bytes_iterator" => pyre_object::is_seq_iter,
         "bytearray_iterator" => pyre_object::is_seq_iter,
         "memory_iterator" => pyre_object::is_seq_iter,
+        // Without the layout test every `array.array` descriptor reads a
+        // foreign receiver through `W_Array`: the itemsize getter hands back
+        // whatever bytes sit at that offset and `w_array_len` divides the
+        // buffer length by it.
+        "array.array" => pyre_object::interp_array::is_array,
         "array.arrayiterator" => pyre_object::is_seq_iter,
         "list_iterator" => pyre_object::is_list_iter,
         "list_reverseiterator" => pyre_object::is_list_reverse_iter,
@@ -2212,8 +2217,84 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "types.SimpleNamespace" => crate::module::sys::vm::is_simple_namespace,
         "property" => pyre_object::descriptor::is_property,
         "super" => pyre_object::descriptor::is_super,
+        // These four publish their methods through `#[pyre_methods]`, whose
+        // generated wrapper answers a foreign receiver with its own
+        // `got wrong receiver type` wording, or trips its arity guard first
+        // and never reaches the receiver test at all.  `mmap.mmap` raised
+        // nothing whatever: `mmap.mmap.close(1)` read an `int` as a mapping.
+        "_io.BytesIO" => crate::module::_io::is_bytesio,
+        "_io.StringIO" => crate::module::_io::is_stringio,
+        "collections.deque" => crate::module::_collections::is_deque,
+        "mmap.mmap" => mmap_layout,
+    }
+    macro_rules! owners_named {
+        ($($key:literal as $tp:literal => $pred:path),+ $(,)?) => {
+            match type_name {
+                $($key => {
+                    static OWNER: crate::gateway::MethodOwner = crate::gateway::MethodOwner {
+                        type_name: $tp,
+                        is_instance: Some(|obj| unsafe { $pred(obj) }),
+                    };
+                    return Some(&OWNER);
+                })+
+                _ => {}
+            }
+        };
+    }
+    // `_ctypes` builds its two element bases as heap types, whose `name` is
+    // the bare one `__name__` reports, so a dotted key would rename them.
+    // The `tp_name` their descriptors are refused by is spelled here instead:
+    // `descriptor '__getitem__' requires a '_ctypes.Array' object`, while
+    // `stamp_method_owners` still qualifies the methods as `Array.__getitem__`
+    // from its last component.
+    owners_named! {
+        "Array" as "_ctypes.Array" => ctypes_array_layout,
+        "_Pointer" as "_ctypes._Pointer" => ctypes_pointer_layout,
     }
     Some(untested_method_owner(type_name))
+}
+
+/// `_ctypes.Array`'s layout test.  The module is not built under `sandbox`
+/// nor without `host_env`, where the type is never created either, so the row
+/// above is dead there rather than wrong.
+fn ctypes_array_layout(obj: PyObjectRef) -> bool {
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    {
+        crate::module::_ctypes::metaclass::is_array_instance(obj)
+    }
+    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
+/// `_ctypes._Pointer`'s layout test, gated the same way.
+fn ctypes_pointer_layout(obj: PyObjectRef) -> bool {
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    {
+        crate::module::_ctypes::metaclass::is_pointer_instance(obj)
+    }
+    #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
+/// `mmap.mmap`'s layout test.  The module is not built for wasm32 or under
+/// `sandbox`, where the type is never created either, so the row above is
+/// dead there rather than wrong.
+fn mmap_layout(obj: PyObjectRef) -> bool {
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    {
+        crate::module::mmap::interp_mmap::has_mmap_layout(obj)
+    }
+    #[cfg(any(target_arch = "wasm32", feature = "sandbox"))]
+    {
+        let _ = obj;
+        false
+    }
 }
 
 /// The `MethodOwner` for a builtin type with no entry in the table above.
@@ -2450,6 +2531,12 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
         };
         if !carrier.is_null() && crate::function::is_function(carrier) {
             crate::function::function_set_new_self(carrier, type_obj);
+            // The call path reaches the `BuiltinCode`, not the `Function`, so
+            // `tp_new_wrapper`'s tests need the same type on the code object.
+            let code = crate::function::getcode(carrier) as PyObjectRef;
+            if !code.is_null() && crate::gateway::is_builtin_code(code) {
+                crate::gateway::builtin_code_set_new_self(code, type_obj);
+            }
         }
     }
     // typeobject.py:1738-1742 — `if isinstance(descrvalue, GetSetProperty):
@@ -5355,15 +5442,20 @@ fn init_zip_type(ns: PyObjectRef) {
 ///         raise TypeError("%N.__new__(%N) is not safe, use %N.__new__()", ...)
 ///     return w_subtype
 /// ```
-pub(crate) fn check_user_subclass(
+pub(crate) fn check_new_subtype(
     w_self: PyObjectRef,
     w_subtype: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     if w_subtype.is_null() || !unsafe { pyre_object::is_type(w_subtype) } {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
+        // `tp_new_wrapper` names the offending argument's type after the
+        // sentence; `check_user_subclass` writes the same suffix quoted
+        // (`('%T')`).  Unquoted, as `subclass_to_tag`'s own copy of this
+        // refusal already writes it.
         return Err(crate::PyError::type_error(format!(
-            "{}.__new__(X): X is not a type object",
+            "{}.__new__(X): X is not a type object ({})",
             self_name,
+            crate::type_methods::arg_type_name(w_subtype),
         )));
     }
     if std::ptr::eq(w_subtype, w_self) {
@@ -5380,7 +5472,29 @@ pub(crate) fn check_user_subclass(
             self_name, sub_name, sub_name, self_name,
         )));
     }
-    // typeobject.py:520-523 — layout safety. The base allocator only knows
+    Ok(())
+}
+
+/// [`check_new_subtype`] plus the layout test that closes `object.__new__(dict)`.
+///
+/// The two are separated because only the first half applies where a
+/// constructor is reached to *build* an instance: `type_call` invokes
+/// `type->tp_new(type, ...)` directly rather than through the `__new__`
+/// descriptor, so `tp_new_wrapper`'s layout test never sees an ordinary
+/// `T(...)`.  `class VS(ValueError, StopIteration)` is what the difference
+/// costs: `StopIteration`'s `value` gives VS a layout typedef that
+/// `ValueError`'s does not match, where the wrapper's own criterion — the
+/// `tp_new` the most-derived static base carries — finds both answering
+/// `BaseException.__new__` and allows it.
+pub(crate) fn check_user_subclass(
+    w_self: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    check_new_subtype(w_self, w_subtype)?;
+    if std::ptr::eq(w_subtype, w_self) {
+        return Ok(());
+    }
+    // typedef.py layout safety. The base allocator only knows
     // how to fill the parent layout; if the subtype introduces extra slots
     // (different layout typedef), allocating through it would corrupt the
     // foreign layout.
@@ -11144,6 +11258,70 @@ fn readonly_attribute(descr: pyre_object::PyObjectRef) -> crate::PyError {
     }
 }
 
+/// `descr_check` — the receiver a getset was published for has to be an
+/// instance of the owning type.  `getset_get` and `getset_set` both run it
+/// ahead of the accessor, and ahead of the missing-accessor refusal, so a
+/// receiver of the wrong type answers for itself however the descriptor is
+/// reached.
+///
+/// The accessors registered against a builtin type read the receiver's
+/// payload without re-testing it, so this is what stands between a foreign
+/// receiver and a wild read: `memoryview.__dict__['format'].__get__(1)` was
+/// walking an `int` as a view.
+///
+/// `GetSetProperty` carries no such gate — `descr_property_get` reaches
+/// `fget` directly and leaves the test to whichever accessor declares a
+/// `reqcls` — which is why the hand-built descriptors, the ones with no
+/// `reqcls`, were unguarded.  `w_objclass`, stamped for exactly those by
+/// `copy_for_type`, is the `d_type` the check needs.
+unsafe fn getset_descr_check(
+    w_self: PyObjectRef,
+    w_obj: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let owner = unsafe { getset_descriptor_owner(w_self) };
+    if owner.is_null()
+        || (!w_obj.is_null() && unsafe { crate::baseobjspace::isinstance_w(w_obj, owner) })
+    {
+        return Ok(());
+    }
+    Err(getset_descr_mismatch(w_self, w_obj, owner))
+}
+
+/// The refusal `getset_set` and `getset_get` raise for a getset that carries
+/// no accessor: `attribute '{name}' of '{owner}' objects is not writable`,
+/// and `readable` on the read side.  The type named is the descriptor's
+/// owner, not the receiver's own; a delete of a setter-less getset reaches
+/// `getset_set` with a null value, so it reports `writable` as well.
+///
+/// `readonly_attribute` stays the fallback for a descriptor that was never
+/// bound to an owner and so cannot name one.
+fn getset_missing_accessor(
+    descr: pyre_object::PyObjectRef,
+    owner: pyre_object::PyObjectRef,
+    verb: &str,
+) -> crate::PyError {
+    let name_obj = read_descr_name(descr);
+    let name = if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
+        unsafe { pyre_object::w_str_get_value(name_obj) }
+    } else {
+        "?"
+    };
+    let owner_name = unsafe { pyre_object::w_type_get_name(owner) };
+    crate::PyError::attribute_error(format!(
+        "attribute '{name}' of '{owner_name}' objects is not {verb}"
+    ))
+}
+
+/// Either refusal above, chosen by whether the descriptor names an owner.
+fn getset_no_accessor(descr: pyre_object::PyObjectRef, verb: &str) -> crate::PyError {
+    let owner = unsafe { getset_descriptor_owner(descr) };
+    if owner.is_null() {
+        readonly_attribute(descr)
+    } else {
+        getset_missing_accessor(descr, owner, verb)
+    }
+}
+
 /// CPython 3.14 `slotdefs[]`'s single `tp_descr_get` wrapper definition.
 /// Every builtin descriptor type below publishes the same positional-only
 /// surface; keeping it here mirrors the one `TPSLOT(__get__, ...)` row rather
@@ -11189,6 +11367,10 @@ pub(crate) fn getset_property_get(
         // typedef.py return self
         return Ok(w_self);
     }
+    // `getset_get` runs `descr_check` before it reads `d_getset->get`; the
+    // `w_obj is None` hack above is what stands in for `descr_get_trampoline`
+    // handing a null receiver straight back.
+    unsafe { getset_descr_check(w_self, w_obj) }?;
     // typedef.py try: return self.fget(self, space, w_obj)
     //                    except DescrMismatch: descr_call_mismatch(...)
     let reqcls = read_reqcls(w_self);
@@ -11205,7 +11387,7 @@ pub(crate) fn getset_property_get(
     }
     let fget = read_fget(w_self);
     if fget.is_null() {
-        return Err(readonly_attribute(w_self));
+        return Err(getset_no_accessor(w_self, "readable"));
     }
     // typedef.py calls the getter as `self.fget(self, space, w_obj)` — an
     // interp-level call, not `space.call_function`.  Every `GetSetProperty`
@@ -11315,9 +11497,13 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                     let w_self = args[0];
                     let w_obj = args[1];
                     let w_value = args[2];
+                    // `getset_set` runs `descr_setcheck` ahead of the
+                    // missing-setter refusal, so a receiver that is wrong in
+                    // both respects reports itself rather than the setter.
+                    unsafe { getset_descr_check(w_self, w_obj) }?;
                     let fset = read_fset(w_self);
                     if fset.is_null() || unsafe { pyre_object::is_none(fset) } {
-                        return Err(readonly_attribute(w_self));
+                        return Err(getset_no_accessor(w_self, "writable"));
                     }
                     let reqcls = read_reqcls(w_self);
                     if !reqcls.is_null()
@@ -11364,8 +11550,18 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                 |args| {
                     let w_self = args[0];
                     let w_obj = args[1];
+                    unsafe { getset_descr_check(w_self, w_obj) }?;
                     let fdel = read_fdel(w_self);
                     if fdel.is_null() || unsafe { pyre_object::is_none(fdel) } {
+                        // A delete reaches `getset_set` with a null value, so
+                        // a getset with no setter either refuses as one that
+                        // is not writable...
+                        let fset = read_fset(w_self);
+                        if fset.is_null() || unsafe { pyre_object::is_none(fset) } {
+                            return Err(getset_no_accessor(w_self, "writable"));
+                        }
+                        // ...or runs the setter, whose own refusal for a null
+                        // value is the setter's to word.
                         // typedef.py:404-405:
                         //   raise oefmt(space.w_AttributeError,
                         //       "cannot delete '%s' attribute of immutable type '%N'",
@@ -25173,6 +25369,27 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     Ok(pyre_object::w_str_from_wtf8_managed(s))
 }
 
+/// `unicode_check_encoding_errors` — the name check `PyUnicode_Decode` runs
+/// ahead of its own empty-input return, which is what leaves `b''.decode('nope')`
+/// answering `''` in a release build and raising under `-X dev`.  Outside
+/// development mode the whole check is skipped; the two exempt lists are the
+/// names whose lookup it declines to pay for, and it matches them unnormalized.
+fn unicode_check_encoding_errors(encoding: &str, errors: &str) -> Result<(), crate::PyError> {
+    if !crate::importing::dev_mode_flag() {
+        return Ok(());
+    }
+    if !matches!(encoding, "utf-8" | "utf8" | "ascii") {
+        crate::module::_codecs::validate_encoding(encoding)?;
+    }
+    if !matches!(
+        errors,
+        "strict" | "ignore" | "replace" | "surrogateescape" | "surrogatepass"
+    ) {
+        crate::module::_codecs::validate_error_handler(errors)?;
+    }
+    Ok(())
+}
+
 /// Decode `data` under `encoding`/`errors` into a WTF-8 string, dispatching on
 /// the codec name the same way `bytes.decode` does.
 pub(crate) fn decode_bytes_to_wtf8(
@@ -25181,6 +25398,16 @@ pub(crate) fn decode_bytes_to_wtf8(
     errors: &str,
 ) -> Result<Wtf8Buf, crate::PyError> {
     let err_mode = errors;
+    // [3.14-spec] `PyUnicode_Decode` orders the name check, then the empty-input
+    // return, then the dispatch, so nothing below is reached for empty `data`
+    // and the codec name goes unread there.  `str_decode_utf_8` and its
+    // neighbours are entered from `PyUnicode_Decode` only once the size test has
+    // passed, so PyPy has no counterpart to the return and answers
+    // `LookupError` for every name.
+    unicode_check_encoding_errors(encoding, errors)?;
+    if data.is_empty() {
+        return Ok(Wtf8Buf::new());
+    }
     // The codec name is matched with case folded and `_` read as `-`.  Every
     // caller inside the runtime, and `bytes.decode`'s own default, already
     // spells it that way, so the rewrite is the exception and only it pays
@@ -25193,30 +25420,6 @@ pub(crate) fn decode_bytes_to_wtf8(
     } else {
         std::borrow::Cow::Borrowed(encoding)
     };
-    if crate::importing::dev_mode_flag()
-        && matches!(
-            enc_lower.as_ref(),
-            "utf-8"
-                | "utf8"
-                | "u8"
-                | "ascii"
-                | "us-ascii"
-                | "646"
-                | "latin-1"
-                | "latin1"
-                | "iso-8859-1"
-                | "8859"
-                | "raw-unicode-escape"
-                | "utf-16"
-                | "utf-16-le"
-                | "utf-16-be"
-                | "utf-32"
-                | "utf-32-le"
-                | "utf-32-be"
-        )
-    {
-        crate::module::_codecs::validate_error_handler(errors)?;
-    }
     let s = match enc_lower.as_ref() {
         "utf-8" | "utf8" | "u8" => decode_utf8_with_errors(data, err_mode)?,
         "ascii" | "us-ascii" | "646" => {
@@ -25477,9 +25680,17 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         // newbytesdata_w_tail: a successful `__index__` supplies a count of
         // NUL bytes; TypeError falls through to the buffer/iterable path.
         if let Some(count) = bytes_count_from_index(arg)? {
-            let mut zeros = crate::builtins::try_vec_with_capacity(count)?;
-            zeros.resize(count, 0u8);
-            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&zeros));
+            // `_PyBytes_FromSize` refuses a length it could not measure
+            // before it reaches the allocator.
+            if !pyre_object::bytesobject::bytes_length_fits(count) {
+                return Err(crate::PyError::overflow_error("byte string is too large"));
+            }
+            // The block is the only copy: `w_bytes_from_bytes` would allocate
+            // a second one of the same size, and it ends the process rather
+            // than raising when that one cannot be met.
+            let block = pyre_object::bytesobject::try_alloc_bytes_block_zeroed(count)
+                .ok_or_else(crate::builtins::reservation_failed)?;
+            return Ok(pyre_object::bytesobject::w_bytes_from_block(block));
         }
         // `_convert_from_buffer_or_iterable`: acquire a read-only buffer
         // before trying the iterable path.  This includes Python 3.14's
@@ -25782,7 +25993,12 @@ fn bytearray_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     let fresh = bytearray_descr_init_value(args, args[0])?;
     if !std::ptr::eq(fresh, args[0]) {
-        let data = unsafe { pyre_object::bytesobject::bytes_like_data(fresh).to_vec() };
+        // The receiver takes its own copy of what the value came back as, and
+        // the length came from Python, so the copy is reserved fallibly:
+        // `to_vec` ends the process where `PyByteArray_Resize` raises.
+        let source = unsafe { pyre_object::bytesobject::bytes_like_data(fresh) };
+        let mut data = crate::builtins::try_vec_with_capacity::<u8>(source.len())?;
+        data.extend_from_slice(source);
         if !data.is_empty() {
             unsafe {
                 crate::builtins::bytearray_check_exports(args[0])?;
@@ -29008,18 +29224,6 @@ fn async_generator_set_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     generator_set_name_common(args, true, 2)
 }
 
-/// Python 3.14 `PyObject_GenericSetAttr` error for the read-only members in
-/// `gen_getsetlist`. PyPy's `GetSetProperty` reports `readonly attribute
-/// 'name'`; the selected 3.14 surface includes the owning type as well.
-fn generator_readonly_attribute(args: &[PyObjectRef]) -> crate::PyResult {
-    let descr = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    let name_obj = read_descr_name(descr);
-    let name = unsafe { pyre_object::w_str_get_value_opt(name_obj) }.unwrap_or("<unknown>");
-    Err(crate::PyError::attribute_error(format!(
-        "attribute '{name}' of 'generator' objects is not writable"
-    )))
-}
-
 /// CPython 3.14 `gen_sizeof`, over PyPy's generator-owned `pycode`.
 fn generator_descr_sizeof(args: &[PyObjectRef]) -> crate::PyResult {
     crate::type_methods::arity_no_args(args, "__sizeof__")?;
@@ -29204,18 +29408,17 @@ fn init_generator_type(ns: PyObjectRef) {
         ("gi_code", generator_get_code as DunderFn),
         ("gi_yieldfrom", generator_get_yieldfrom as DunderFn),
     ] {
-        let setter =
-            make_builtin_function_with_arity(name, generator_readonly_attribute as DunderFn, 3);
-        let deleter =
-            make_builtin_function_with_arity(name, generator_readonly_attribute as DunderFn, 2);
+        // The read-only members of `gen_getsetlist` carry no setter at all:
+        // `getset_set` words their refusal from the descriptor, and reaches
+        // it only once the receiver has answered `descr_setcheck`.
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
                 make_getset_property_named(
                     make_builtin_function_with_arity(name, getter, 2),
-                    setter,
-                    deleter,
+                    pyre_object::PY_NULL,
+                    pyre_object::PY_NULL,
                     name,
                 ),
             )

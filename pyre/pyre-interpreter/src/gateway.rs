@@ -676,6 +676,13 @@ pub struct BuiltinCode {
     /// is not one.  `'static` like the rest, so it is neither a Drop
     /// obligation nor a GC pointer.
     pub wrapper: *const WrapperCall,
+    /// `tp_new_wrapper`'s `self` — the type whose `tp_new` this code is, or
+    /// null for every builtin that is not a `__new__` carrier.  It is the same
+    /// value `Function::w_new_self` holds, stamped from the same place, and it
+    /// sits outside `gc_ptr_offsets` for the same reason that one does: a
+    /// defining type is a static-region `W_TypeObject` that is never
+    /// nursery-relocated.
+    pub new_self: PyObjectRef,
 }
 
 /// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
@@ -778,6 +785,7 @@ fn builtin_code_new_full(
         owner: std::ptr::null(),
         module: "",
         wrapper: std::ptr::null(),
+        new_self: pyre_object::PY_NULL,
     }) as PyObjectRef
 }
 
@@ -863,6 +871,105 @@ pub unsafe fn builtin_code_set_owner(obj: PyObjectRef, owner: &'static MethodOwn
     unsafe { (*(obj as *mut BuiltinCode)).owner = owner };
 }
 
+/// Record the type a `__new__` carrier belongs to, so the call path can run
+/// `tp_new_wrapper`'s tests against it.  Stamped beside
+/// `function_set_new_self`, from which it takes both its value and its
+/// first-writer rule: an inherited `__new__` keeps the ancestor's stamp.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`; `w_type` to a valid type.
+pub unsafe fn builtin_code_set_new_self(obj: PyObjectRef, w_type: PyObjectRef) {
+    unsafe {
+        let code = &mut *(obj as *mut BuiltinCode);
+        if code.new_self.is_null() {
+            code.new_self = w_type;
+        }
+    }
+}
+
+/// `tp_new_wrapper`'s tests for a first argument that is not the defining type.
+///
+/// The arity refusal is the wrapper's own; the two that follow it — non-type
+/// and not-a-subtype — are `check_new_subtype`, where PyPy keeps them and
+/// which `object.__new__` and `int.__new__` already reach.
+///
+/// The layout test that closes `object.__new__(dict)` is deliberately not run
+/// here.  `type_call` reaches `type->tp_new` directly rather than through the
+/// `__new__` descriptor, so an ordinary `T(...)` never meets it, and pyre
+/// routes construction through this very carrier: applying it would refuse
+/// `class VS(ValueError, StopIteration)` at `VS('done')`.  The constructors
+/// that need it keep calling `check_user_subclass` themselves.
+///
+/// `dont_look_inside` because the caller is descended into: the message
+/// formatting, the MRO walk and the layout reads all belong on the cold side
+/// of an opaque call rather than in each caller's JitCode.
+#[cold]
+#[majit_macros::dont_look_inside]
+fn tp_new_wrapper_check(
+    new_self: PyObjectRef,
+    cls: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if cls.is_null() {
+        let name = unsafe { pyre_object::w_type_get_name(new_self) };
+        return Err(crate::PyError::type_error(format!(
+            "{name}.__new__(): not enough arguments"
+        )));
+    }
+    crate::typedef::check_new_subtype(new_self, cls)?;
+    Ok(pyre_object::PY_NULL)
+}
+
+/// `method_check_args`'s `descr_check` half: the receiver a descriptor was
+/// published for has to be present and of the owning type.
+///
+/// It runs ahead of the clinic's argument parsing, so a call that is wrong in
+/// both respects reports the receiver — `BytesIO.seek(1, 2, 3, 4)` names the
+/// `int`, not the count, and `deque.appendleft(x=1)` reports the missing
+/// receiver rather than the keyword.
+///
+/// # Safety
+/// `code` must point to a valid `BuiltinCode`.
+pub(crate) unsafe fn builtin_code_check_receiver(
+    code: *const BuiltinCode,
+    positional: &[PyObjectRef],
+) -> Result<(), crate::PyError> {
+    // A `__new__` carrier takes the class to instantiate where a method takes
+    // its receiver, so it is `tp_new_wrapper`'s tests that apply, not
+    // `descr_check`'s.  The two are exclusive: `stamp_method_owners` leaves a
+    // carrier's `owner` null.
+    let new_self = unsafe { (*code).new_self };
+    if !new_self.is_null() {
+        let cls = positional.first().copied().unwrap_or(pyre_object::PY_NULL);
+        // Constructing the defining type itself is the common call and passes
+        // every test, so it answers on a pointer compare and never reaches the
+        // walks below.  `check_user_subclass` early-returns on the same
+        // identity; the test is repeated here to keep the whole cold path,
+        // messages included, behind one opaque call.
+        if !std::ptr::eq(cls, new_self) {
+            tp_new_wrapper_check(new_self, cls)?;
+        }
+        return Ok(());
+    }
+    let owner = unsafe { (*code).owner };
+    if owner.is_null() {
+        return Ok(());
+    }
+    // `bind_kwargs_to_signature` lays out every declared slot and leaves the
+    // ones the call did not fill as `PY_NULL`, so a descriptor invoked with no
+    // receiver at all arrives with its `self` slot present but empty.  Reading
+    // that slot as an argument reported a missing receiver as a foreign one,
+    // and let a receiverless call past an owner carrying no layout test.
+    let receiver = positional.first().copied().filter(|r| !r.is_null());
+    let owner = unsafe { &*owner };
+    let accepted = matches!(receiver, Some(receiver)
+        if owner.is_instance.is_none_or(|is_instance| is_instance(receiver)));
+    if accepted {
+        return Ok(());
+    }
+    receiver_mismatch(owner.type_name, unsafe { (*code).name }, receiver)?;
+    Ok(())
+}
+
 /// Invoke a `BuiltinCode` after applying the receiver and arity checks its
 /// registration requires.  Every dispatch path — the interpreter's call paths,
 /// the JIT's residual call, and the bound-method fast paths — goes through
@@ -889,20 +996,11 @@ pub unsafe fn builtin_code_call(
     // the positional slice: counting it as the receiver would report the
     // keyword dict as the object the descriptor was called on.
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let receiver = positional.first().copied();
-    let owner = unsafe { (*code).owner };
-    if !owner.is_null() {
-        let owner = unsafe { &*owner };
-        let accepted = matches!(receiver, Some(receiver)
-            if owner.is_instance.is_none_or(|is_instance| is_instance(receiver)));
-        if !accepted {
-            return Err(receiver_mismatch(
-                owner,
-                unsafe { (*code).name },
-                positional,
-            ));
-        }
-    }
+    unsafe { builtin_code_check_receiver(code, positional) }?;
+    // The receiver the two argument refusals below name, read the same way
+    // the check above reads it: an unfilled `self` slot is `PY_NULL`, not an
+    // argument the call supplied.
+    let receiver = positional.first().copied().filter(|r| !r.is_null());
     // eval.py:16-23 — a `fast_natural_arity` of 0..=4 is the exact positional
     // count the implementation was registered for; `HOPELESS`,
     // `PASSTHROUGHARGS1` and the `FLATPYCALL` bit all exceed 4.  A body with a
@@ -1013,6 +1111,23 @@ fn no_keyword_arguments(code: &BuiltinCode, receiver: Option<PyObjectRef>) -> cr
 /// name first (`f = MyList([1]).append`) produces the other callable kind and
 /// reports `MyList.append()`; pyre hands out one callable kind and so takes
 /// the declaring class, the form both call syntaxes reach.
+/// The qualifier a descriptor of `type_name` reports itself under.
+///
+/// `type_ready_fill_dict` names a static type's methods after the last
+/// component of `tp_name`, so `array.array.tolist.__qualname__` is
+/// `array.tolist` and `_io.BytesIO.getvalue.__qualname__` is
+/// `BytesIO.getvalue`.  The wordings that name the *type* rather than the
+/// callable keep the whole `tp_name` instead — `descriptor 'tolist' for
+/// 'array.array' objects` — so only the qualified-name forms come through
+/// here.  Undotted names pass through unchanged.
+///
+/// Only a `tp_name` is shortened this way.  A class object read off the
+/// receiver already carries its own `__qualname__`, whose dots are part of
+/// the name.
+fn method_qualifier(type_name: &str) -> &str {
+    type_name.rsplit('.').next().unwrap_or(type_name)
+}
+
 fn builtin_names(
     code: &BuiltinCode,
     receiver: Option<PyObjectRef>,
@@ -1022,11 +1137,14 @@ fn builtin_names(
         None if code.module.is_empty() || code.module == "builtins" => code.name.to_string(),
         None => format!("{}.{}", code.module, code.name),
         Some(owner) => {
+            // `meth_get__qualname__` reads the receiver class's own
+            // `__qualname__`, which keeps every dot a nested or dotted class
+            // name carries; only a static type's `tp_name` is shortened.
             let ty = match receiver {
                 Some(r) if unsafe { pyre_object::typeobject::is_type(r) } => unsafe {
-                    pyre_object::w_type_get_name(r)
+                    pyre_object::w_type_get_qualname(r)
                 },
-                _ => owner.type_name,
+                _ => method_qualifier(owner.type_name),
             };
             format!("{ty}.{}", code.name)
         }
@@ -1192,15 +1310,38 @@ pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
 
 /// Build the TypeError an unbound descriptor raises for a missing or
 /// foreign receiver.  Cold: it runs only on the failing call.
+///
+/// `ty` is the owning type's `tp_name`, which `descr_check` spells whole
+/// while `_PyObject_FunctionStr` shortens it to the last component, so
+/// `_io.BytesIO.getvalue` reports `unbound method BytesIO.getvalue() needs
+/// an argument` but `descriptor 'getvalue' for '_io.BytesIO' objects`.
+///
+/// A `getset_descriptor` refuses through `descr_check` as well, and its
+/// property name is not a slot name, so it takes the same two method
+/// wordings rather than the slot-wrapper pair.
+///
+/// `dont_look_inside` for the reason `method_arity_failure` and
+/// `method_noarg_failure` carry it: the four wordings are built here so that
+/// none of the formatting reaches a generated wrapper's JitCode, and the
+/// residual reports its refusal through its own exception link rather than
+/// handing the caller a `PyError` to materialise.  The refusal is the only
+/// answer, so the `Ok` half is unreachable and the callers spell it `?`.
 #[cold]
 #[inline(never)]
-fn receiver_mismatch(owner: &MethodOwner, name: &str, args: &[PyObjectRef]) -> crate::PyError {
-    let ty = owner.type_name;
+#[majit_macros::dont_look_inside]
+pub(crate) fn receiver_mismatch(
+    ty: &str,
+    name: &str,
+    receiver: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     let slot_wrapper = is_slot_wrapper(ty, name);
-    let message = match args.first() {
+    let message = match receiver {
         None if slot_wrapper => format!("descriptor '{name}' of '{ty}' object needs an argument"),
-        None => format!("unbound method {ty}.{name}() needs an argument"),
-        Some(&receiver) => {
+        None => format!(
+            "unbound method {}.{name}() needs an argument",
+            method_qualifier(ty)
+        ),
+        Some(receiver) => {
             let received = crate::baseobjspace::object_functionstr_type_name(receiver);
             if slot_wrapper {
                 format!("descriptor '{name}' requires a '{ty}' object but received a '{received}'")
@@ -1211,7 +1352,7 @@ fn receiver_mismatch(owner: &MethodOwner, name: &str, args: &[PyObjectRef]) -> c
             }
         }
     };
-    crate::PyError::type_error(message)
+    Err(crate::PyError::type_error(message))
 }
 
 /// eval.py:16-23 — read `fast_natural_arity` from a BuiltinCode.

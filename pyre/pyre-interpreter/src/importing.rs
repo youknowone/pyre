@@ -677,6 +677,11 @@ pub fn install_builtin_modules() {
     // COM and is therefore present only on an unsandboxed Windows host.
     #[cfg(all(windows, not(feature = "sandbox")))]
     pyre_install_module!(_wmi);
+    // `_uuidmodule.c` is built from rpcrt4 on Windows and libuuid elsewhere;
+    // only the Windows half is ported, and it reads the host's network card,
+    // so it belongs with the other host-access modules.
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    pyre_install_module!(_uuid);
     // PyPy's `lib_pypy/_overlapped.py`: asyncio's proactor backend owns one
     // OVERLAPPED record per operation and reaches the Win32/WinSock calls
     // through this Windows-only builtin.

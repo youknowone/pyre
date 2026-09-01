@@ -7,7 +7,7 @@
 #
 # `framelocalsproxy_setitem` sends such a key to `FrameDebugData.w_extra_locals`
 # and touches neither a fast slot nor `w_locals`, and
-# `frame_locals_proxy_snapshot` copies that dict in ahead of the fastlocals.
+# `frame_locals_proxy_snapshot` appends that dict after the fastlocals.
 # Both `locals()` folds rebuild the mapping WITHOUT it -- the callee arm from
 # `CalleeLocalsShadow`, the portal arm from the virtualizable's slot array --
 # so each needs its own gate on `w_extra_locals` rather than reading a null
@@ -20,6 +20,11 @@
 # tracer answers from the inlined callee's shadow, and `probe_portal_extra`
 # calls it in the compiled loop's own frame, where it answers from the standard
 # virtualizable.  `dir()` rides the same gate through its sorted-names tail.
+#
+# `probe_portal_extra` also pins the ORDER the two halves land in: the portal
+# fold merged `f_extra_locals` before the fastlocal chain and answered
+# `['extra_key', 'n', 'y', 'last', 'i']` where the interpreter -- and CPython --
+# answer `['n', 'y', 'last', 'i', 'extra_key']`.
 #
 # `probe_plain` carries no proxy write at all, so the fold still FIRES there.
 # It is what keeps the fixture honest: the two gates above are declines, and a
@@ -60,13 +65,17 @@ def probe_callee_extra():
     return last
 
 
-def probe_portal_extra():
+def probe_portal_extra(n):
     y = 0
     sys._getframe().f_locals[KEY] = 1
     last = None
-    for i in range(N):
+    for i in range(n):
         y = i
-        last = sorted(locals())
+        # Unsorted: `framelocalsproxy_keys` reports the localsplus slots in
+        # `co_localsplusnames` order and only then walks `f_extra_locals`, so
+        # the ORDER is part of the answer and a rebuild that merges the extras
+        # first hands back a differently-keyed dict.
+        last = list(locals())
     return last
 
 
@@ -87,10 +96,20 @@ def main():
     rc |= report("vars() in callee", vars_names, expected_callee)
     rc |= report("dir() in callee", dir_names, expected_callee)
 
+    # `n` is the first localsplus slot, then the body's own three, then the
+    # proxy-written key.
+    expected_portal = ["n", "y", "last", "i", KEY]
     rc |= report(
         "locals() in the compiled loop's own frame",
-        probe_portal_extra(),
-        [KEY, "i", "last", "y"],
+        probe_portal_extra(N),
+        expected_portal,
+    )
+    # The same frame walked once, so a fold that reorders the two halves is
+    # separated from a snapshot that does.
+    rc |= report(
+        "locals() in an uncompiled loop's own frame",
+        probe_portal_extra(1),
+        expected_portal,
     )
 
     if rc:

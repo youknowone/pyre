@@ -30,6 +30,16 @@ pub fn text_io_wrapper_type() -> PyObjectRef {
     textio::type_object()
 }
 
+/// Whether `obj` has the `W_BytesIO` layout, including a Python subclass.
+pub(crate) fn is_bytesio(obj: PyObjectRef) -> bool {
+    W_BytesIO::from_obj(obj).is_some()
+}
+
+/// Whether `obj` has the `W_StringIO` layout, including a Python subclass.
+pub(crate) fn is_stringio(obj: PyObjectRef) -> bool {
+    W_StringIO::from_obj(obj).is_some()
+}
+
 // CPython 3.14 raised the public and constructor default from 8 KiB to
 // 128 KiB.  Keep one module-owned value shared by every buffered type.
 pub(crate) const DEFAULT_BUFFER_SIZE: i64 = 128 * 1024;
@@ -157,6 +167,19 @@ pub(crate) fn unsupported(message: &str) -> crate::PyError {
         Ok(exc) => unsafe { crate::PyError::from_exc_object(exc) },
         Err(error) => error,
     }
+}
+
+/// A zero-filled `bytearray` of `size` bytes, for a `size` that came from
+/// Python.
+///
+/// `w_bytearray_new` reaches Rust's infallible allocator, which aborts the
+/// process instead of unwinding, so `f.read1(1 << 44)` or
+/// `BufferedReader(raw, 1 << 44)` terminates the interpreter where
+/// `PyBytes_FromStringAndSize(NULL, n)` and `_buffered_init`'s `PyMem_Malloc`
+/// answer `MemoryError`.
+pub(crate) fn try_new_buffer(size: usize) -> Result<PyObjectRef, crate::PyError> {
+    pyre_object::bytearrayobject::w_bytearray_try_new(size)
+        .ok_or_else(crate::builtins::reservation_failed)
 }
 
 pub(crate) fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
@@ -1087,7 +1110,10 @@ fn rawiobase_read(args: &[PyObjectRef]) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_obj);
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::bytearrayobject::w_bytearray_new(size));
+    // `_io__RawIOBase_read_impl` sizes its buffer with
+    // `PyByteArray_FromStringAndSize(NULL, n)`, whose failure is a
+    // `MemoryError`.
+    let _ = pyre_object::gc_roots::pin_root(try_new_buffer(size)?);
     let length = call_method_result(
         pyre_object::gc_roots::shadow_stack_get(sp),
         "readinto",
