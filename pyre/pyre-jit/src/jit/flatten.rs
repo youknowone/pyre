@@ -17,6 +17,7 @@
 //! that appears inside a tuple.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use majit_ir::Descr;
 use majit_translate::codewriter::flatten::reorder_renaming_list;
@@ -403,6 +404,12 @@ impl SwitchDictDescr {
 /// `_labels` and the assembler sees a finalised runtime descr.
 #[derive(Debug, Clone)]
 pub enum DescrOperand {
+    /// `call.py CallControl.get_jitcode`'s `JitCode`, which is itself an
+    /// `AbstractDescr` in RPython and is therefore the leading `d` operand of
+    /// every `inline_call_*` emitted by `jtransform.py
+    /// handle_regular_call`.  The runtime wrapper owns the per-body descr
+    /// pool needed when a Python-code JitCode embeds a translated helper.
+    JitCode(Arc<majit_metainterp::jitcode::JitCode>),
     /// Runtime descr already materialised as `BhDescr`.
     Bh(BhDescr),
     /// SSARepr-side `SwitchDictDescr` before `attach()`; liveness reads
@@ -3642,26 +3649,23 @@ pub struct LoweringContext {
     /// codewriter pushes back onto the stack.  `jit_set_function_attribute`
     /// stamps a typed field (`Plain` — runs no user code, never raises).
     pub set_function_attribute_fn_idx: u16,
-    /// `unary_negative_fn` descrs-pool index.  UNARY_NEGATIVE records the
-    /// flowspace `neg(value)` op (operation.py) lowered to
-    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
-    /// [`lower_unary_negative_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
-    /// shape); `bh_unary_negative_fn` computes `-value` (a user `__neg__`
-    /// may force virtualizables → `MayForce`).
+    /// `unary_negative_fn` descrs-pool index.  It is the fallback used only
+    /// when the source-translator body for flowspace `neg(value)` is absent;
+    /// [`lower_unary_negative_hlop_to_insn`] normally emits the canonical
+    /// `inline_call_r_r` to that body.  The fallback may invoke user `__neg__`
+    /// and therefore remains `MayForce`.
     pub unary_negative_fn_idx: u16,
-    /// `unary_invert_fn` descrs-pool index.  UNARY_INVERT records the
-    /// object-space `invert(value)` op (pyopcode.py:653) lowered to
-    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
-    /// [`lower_unary_invert_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
-    /// shape); `bh_unary_invert_fn` computes `~value` (a user `__invert__`
-    /// may force virtualizables → `MayForce`).
+    /// `unary_invert_fn` descrs-pool index.  It is the fallback used only when
+    /// the source-translator body for object-space `invert(value)` is absent;
+    /// [`lower_unary_invert_hlop_to_insn`] normally emits the canonical
+    /// `inline_call_r_r` to that body.  The fallback may invoke user
+    /// `__invert__` and therefore remains `MayForce`.
     pub unary_invert_fn_idx: u16,
-    /// `unary_positive_fn` descrs-pool index.  UNARY_POSITIVE records the
-    /// object-space `pos(value)` op (pyopcode.py:649) lowered to
-    /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
-    /// [`lower_unary_positive_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
-    /// shape); `bh_unary_positive_fn` computes `+value` (a user `__pos__`
-    /// may force virtualizables → `MayForce`).
+    /// `unary_positive_fn` descrs-pool index.  It is the fallback used only
+    /// when the source-translator body for object-space `pos(value)` is absent;
+    /// [`lower_unary_positive_hlop_to_insn`] normally emits the canonical
+    /// `inline_call_r_r` to that body.  The fallback may invoke user `__pos__`
+    /// and therefore remains `MayForce`.
     pub unary_positive_fn_idx: u16,
     /// `load_common_constant_fn` descrs-pool index.  LOAD_COMMON_CONSTANT
     /// records the `load_common_constant(disc)` HLOp lowered to
@@ -6435,11 +6439,27 @@ where
     ))
 }
 
+fn build_orthodox_inline_call_r_r(
+    canonical_path: &'static str,
+    value: Operand,
+    dst_reg: Register,
+) -> Option<Insn> {
+    let jitcode = pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(canonical_path)?;
+    Some(Insn::op_with_result(
+        "inline_call_r_r",
+        vec![
+            Operand::descr(DescrOperand::JitCode(jitcode)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![value])),
+        ],
+        dst_reg,
+    ))
+}
+
 /// Lower the UNARY_NEGATIVE flowspace op `neg(value)` → `result: Ref`
-/// (operation.py:466) to `residual_call_r_r(ConstInt(unary_negative_fn_idx),
-/// ListR([value]), Descr) → reg`, the single-Ref
-/// [`lower_format_simple_hlop_to_insn`] shape. `bh_unary_negative_fn`
-/// computes `-value`; a user `__neg__` may force virtualizables → `MayForce`.
+/// (operation.py:466) to the canonical
+/// `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by RPython's
+/// `jtransform.py handle_regular_call`.  A build without the translated
+/// `descroperation::neg` body retains the MayForce residual fallback.
 ///
 /// Returns `None` for non-`neg` opnames so the caller can fall through to
 /// other lowering arms.
@@ -6461,6 +6481,13 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if let Some(insn) = build_orthodox_inline_call_r_r(
+        "pyre_interpreter::objspace::descroperation::neg",
+        value.clone(),
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.unary_negative_fn_idx,
         vec![value],
@@ -6472,10 +6499,11 @@ where
 
 /// Lower the UNARY_INVERT object-space op `invert(value)` → `result: Ref`
 /// (pyopcode.py `unaryoperation("invert")`) to
-/// `residual_call_r_r(ConstInt(unary_invert_fn_idx), ListR([value]),
-/// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
-/// `bh_unary_invert_fn` computes `~value`; a user `__invert__` may force
-/// virtualizables → `MayForce`.
+/// the canonical `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by
+/// RPython's `jtransform.py handle_regular_call`.  This lets the ordinary
+/// inline-call dispatcher trace `descroperation::invert` rather than asking a
+/// residual-call specialization to rediscover it.  A build without that
+/// translated body retains the `bh_unary_invert_fn` MayForce fallback.
 ///
 /// Returns `None` for non-`invert` opnames so the caller can fall
 /// through to other lowering arms.
@@ -6497,6 +6525,13 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if let Some(insn) = build_orthodox_inline_call_r_r(
+        "pyre_interpreter::objspace::descroperation::invert",
+        value.clone(),
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.unary_invert_fn_idx,
         vec![value],
@@ -6508,10 +6543,10 @@ where
 
 /// Lower the UNARY_POSITIVE object-space op `pos(value)` → `result: Ref`
 /// (pyopcode.py `unaryoperation("pos")`) to
-/// `residual_call_r_r(ConstInt(unary_positive_fn_idx), ListR([value]),
-/// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
-/// `bh_unary_positive_fn` computes `+value`; a user `__pos__` may force
-/// virtualizables → `MayForce`.
+/// the canonical `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by
+/// RPython's `jtransform.py handle_regular_call`.  A build without the
+/// translated `descroperation::pos` body retains the MayForce residual
+/// fallback.
 ///
 /// Returns `None` for non-`pos` opnames so the caller can fall through
 /// to other lowering arms.
@@ -6533,6 +6568,13 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if let Some(insn) = build_orthodox_inline_call_r_r(
+        "pyre_interpreter::objspace::descroperation::pos",
+        value.clone(),
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.unary_positive_fn_idx,
         vec![value],
@@ -13346,12 +13388,13 @@ mod tests {
         }
     }
 
-    /// Shared body for the single-Ref unary HLOp lowerings (`invert`, `pos`,
-    /// `not_`): each records `<op_name>(value)` and lowers to
-    /// `residual_call_r_r(ConstInt(expected_fn_idx), ListR([value]), Descr)`
-    /// returning reg. `lower` selects the specific `lower_unary_*_hlop_to_insn`.
-    fn assert_unary_lowering_emits_residual(
+    /// Shared body for the single-Ref unary HLOp lowerings.  An orthodox
+    /// source body lowers to canonical `inline_call_r_r`; a compile-only build
+    /// without generated bodies, and operations without an inline target,
+    /// retain the residual fallback.
+    fn assert_unary_lowering_emits_inline_or_residual(
         op_name: &str,
+        canonical_path: Option<&'static str>,
         expected_fn_idx: i64,
         lower: impl FnOnce(
             &super::super::flow::SpaceOperation,
@@ -13389,12 +13432,24 @@ mod tests {
                 args,
                 result,
             } => {
-                assert_eq!(opname, "residual_call_r_r");
-                assert!(
-                    matches!(args[0], Operand::ConstInt(idx) if idx == expected_fn_idx),
-                    "{op_name}_fn pool index {expected_fn_idx}, got {:?}",
-                    args[0]
-                );
+                let target_present = canonical_path.is_some_and(|path| {
+                    pyre_jit_trace::jitcode_runtime::pathed_runtime_jitcode_cached(path).is_some()
+                });
+                if target_present {
+                    assert_eq!(opname, "inline_call_r_r");
+                    assert!(
+                        matches!(args[0], Operand::Descr(ref descr) if matches!(&**descr, DescrOperand::JitCode(_))),
+                        "{op_name} inline target, got {:?}",
+                        args[0]
+                    );
+                } else {
+                    assert_eq!(opname, "residual_call_r_r");
+                    assert!(
+                        matches!(args[0], Operand::ConstInt(idx) if idx == expected_fn_idx),
+                        "{op_name}_fn pool index {expected_fn_idx}, got {:?}",
+                        args[0]
+                    );
+                }
                 match &args[1] {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Ref);
@@ -13419,33 +13474,58 @@ mod tests {
     }
 
     #[test]
-    fn lower_unary_invert_hlop_emits_unary_invert_fn_residual() {
-        // MayForce — a user `__invert__` may run Python.
-        assert_unary_lowering_emits_residual("invert", 109, |op, ctx, gr, lc| {
-            super::lower_unary_invert_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
-        });
+    fn lower_unary_negative_hlop_emits_inline_call_or_residual_fallback() {
+        assert_unary_lowering_emits_inline_or_residual(
+            "neg",
+            Some("pyre_interpreter::objspace::descroperation::neg"),
+            112,
+            |op, ctx, gr, lc| {
+                super::lower_unary_negative_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+            },
+        );
     }
 
     #[test]
-    fn lower_unary_positive_hlop_emits_unary_positive_fn_residual() {
-        // MayForce — a user `__pos__` may run Python.
-        assert_unary_lowering_emits_residual("pos", 118, |op, ctx, gr, lc| {
-            super::lower_unary_positive_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
-        });
+    fn lower_unary_invert_hlop_emits_inline_call_or_residual_fallback() {
+        assert_unary_lowering_emits_inline_or_residual(
+            "invert",
+            Some("pyre_interpreter::objspace::descroperation::invert"),
+            109,
+            |op, ctx, gr, lc| {
+                super::lower_unary_invert_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+            },
+        );
+    }
+
+    #[test]
+    fn lower_unary_positive_hlop_emits_inline_call_or_residual_fallback() {
+        assert_unary_lowering_emits_inline_or_residual(
+            "pos",
+            Some("pyre_interpreter::objspace::descroperation::pos"),
+            118,
+            |op, ctx, gr, lc| {
+                super::lower_unary_positive_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+            },
+        );
     }
 
     #[test]
     fn lower_list_to_tuple_hlop_emits_list_to_tuple_fn_residual() {
         // MayForce — allocates a fresh tuple / non-list raises TypeError.
-        assert_unary_lowering_emits_residual("list_to_tuple", 125, |op, ctx, gr, lc| {
-            super::lower_list_to_tuple_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
-        });
+        assert_unary_lowering_emits_inline_or_residual(
+            "list_to_tuple",
+            None,
+            125,
+            |op, ctx, gr, lc| {
+                super::lower_list_to_tuple_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+            },
+        );
     }
 
     #[test]
     fn lower_unary_not_hlop_emits_unary_not_fn_residual() {
         // MayForce — a user `__bool__` / `__len__` may run Python.
-        assert_unary_lowering_emits_residual("not_", 110, |op, ctx, gr, lc| {
+        assert_unary_lowering_emits_inline_or_residual("not_", None, 110, |op, ctx, gr, lc| {
             super::lower_unary_not_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
         });
     }
