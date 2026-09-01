@@ -3383,6 +3383,23 @@ pub(crate) unsafe fn needs_set_binop_dispatch(a: PyObjectRef, b: PyObjectRef) ->
         || (pyre_object::is_set_or_frozenset(b) && !is_exact_setlike(b))
 }
 
+/// [`pyre_object::is_exact_builtin_instance`] with the class word promoted:
+/// `jit.promote(w_type)` as `W_TypeObject.lookup` spells it, so the trace
+/// pins `w_class` with a `guard_value` and the test against the payload's
+/// canonical class folds.  A null `w_class` (the read-only singletons) is
+/// exact by the same rule as the unpromoted predicate.
+#[inline]
+unsafe fn is_exact_builtin_instance_promoted(a: PyObjectRef) -> bool {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(a) {
+        return true;
+    }
+    if a.is_null() {
+        return false;
+    }
+    let w_class = majit_metainterp::jit::promote((*a).w_class);
+    w_class.is_null() || std::ptr::eq(w_class, pyre_object::get_instantiate(&*(*a).ob_type))
+}
+
 /// Unary analog: true when numeric operand `a` overrides the unary
 /// special named by `op` relative to its builtin base.
 #[majit_macros::dont_look_inside]
@@ -3396,10 +3413,21 @@ pub(crate) unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, op: UnaryDun
 /// Call the overriding unary special on a numeric subclass operand before
 /// the Rust fast path.  Returns `None` when `a` is an exact builtin
 /// numeric or does not override `op`, so the caller falls through.
+///
+/// The exact-builtin answer is decided on the traced graph, ahead of the
+/// `dont_look_inside` probe: `space.lookup(w_obj, name)` promotes the
+/// receiver's type, and the promoted class is what makes the lookup fold at
+/// trace time.  pyre's Python-level class is `w_class`, so that is the word
+/// promoted; the payload class comes from `ob_type`, which the codewriter
+/// already turns into `guard_class`.  With both pinned, the comparison is a
+/// constant and an exact builtin operand never records the probe at all.
 unsafe fn try_numeric_unaryop_override(
     a: PyObjectRef,
     op: UnaryDunder,
 ) -> Result<Option<PyObjectRef>, PyError> {
+    if is_exact_builtin_instance_promoted(a) {
+        return Ok(None);
+    }
     if !needs_numeric_unaryop_dispatch(a, op) {
         return Ok(None);
     }
@@ -5853,7 +5881,11 @@ impl CompareOp {
 }
 
 /// Unary positive (`+a`).
-
+///
+/// `inline(never)` is load-bearing: rustc otherwise folds this body into its
+/// one-call wrapper and the codewriter never mints the graph a trace descends
+/// (`specialize.rs try_walker_orthodox_unary`).
+#[inline(never)]
 pub fn pos(a: PyObjectRef) -> PyResult {
     unsafe {
         if let Some(result) = try_numeric_unaryop_override(a, UnaryDunder::Pos)? {
@@ -5944,7 +5976,11 @@ fn bad_operand_type(descr: &str, a: PyObjectRef) -> PyError {
 }
 
 /// Unary negation.
-
+///
+/// `inline(never)` is load-bearing: rustc otherwise folds this body into its
+/// one-call wrapper and the codewriter never mints the graph a trace descends
+/// (`specialize.rs try_walker_orthodox_unary`).
+#[inline(never)]
 pub fn neg(a: PyObjectRef) -> PyResult {
     unsafe {
         if let Some(result) = try_numeric_unaryop_override(a, UnaryDunder::Neg)? {
@@ -6024,7 +6060,11 @@ pub(crate) fn bool_invert_deprecation_text() -> PyObjectRef {
 }
 
 /// Unary bitwise inversion.
-
+///
+/// `inline(never)` is load-bearing: rustc otherwise folds this body into its
+/// one-call wrapper and the codewriter never mints the graph a trace descends
+/// (`specialize.rs try_walker_orthodox_unary`).
+#[inline(never)]
 pub fn invert(a: PyObjectRef) -> PyResult {
     unsafe {
         if let Some(result) = try_numeric_unaryop_override(a, UnaryDunder::Invert)? {
