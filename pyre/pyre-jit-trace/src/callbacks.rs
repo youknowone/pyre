@@ -6,7 +6,7 @@
 
 use pyre_interpreter::CodeObject;
 use pyre_object::PyObjectRef;
-use std::cell::Cell;
+use std::sync::OnceLock;
 
 /// Callback table populated by pyre-jit at initialization.
 ///
@@ -50,24 +50,35 @@ pub struct CallJitCallbacks {
 unsafe impl Send for CallJitCallbacks {}
 unsafe impl Sync for CallJitCallbacks {}
 
-thread_local! {
-    static CALLBACKS: Cell<Option<&'static CallJitCallbacks>> = const { Cell::new(None) };
-}
+// RPython's translated helper addresses live on MetaInterpStaticData: one
+// immutable table shared by every execution context. The callbacks route
+// thread-specific operations (notably `driver_pair`) through their functions;
+// duplicating the table itself per thread only makes a newly-created Python
+// thread observe an uninitialized module.
+static CALLBACKS: OnceLock<&'static CallJitCallbacks> = OnceLock::new();
 
 /// Register the callback table. Called once from pyre-jit's eval init.
 pub fn init(cb: &'static CallJitCallbacks) {
-    CALLBACKS.with(|c| c.set(Some(cb)));
+    if CALLBACKS.set(cb).is_err() {
+        assert!(
+            std::ptr::eq(*CALLBACKS.get().unwrap(), cb),
+            "CallJitCallbacks initialized twice with different tables"
+        );
+    }
 }
 
 /// Get the callback table. Panics if not initialized.
 #[inline]
 pub fn get() -> &'static CallJitCallbacks {
-    CALLBACKS.with(|c| c.get().expect("CallJitCallbacks not initialized"))
+    CALLBACKS
+        .get()
+        .copied()
+        .expect("CallJitCallbacks not initialized")
 }
 
 /// Optional callback table lookup for cold paths that can fall back to
 /// skeleton-only behavior in tests before pyre-jit initializes callbacks.
 #[inline]
 pub fn try_get() -> Option<&'static CallJitCallbacks> {
-    CALLBACKS.with(|c| c.get())
+    CALLBACKS.get().copied()
 }
