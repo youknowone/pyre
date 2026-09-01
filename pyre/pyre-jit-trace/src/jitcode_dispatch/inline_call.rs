@@ -1235,18 +1235,21 @@ fn residual_call_is_effect_free(descr_index: usize) -> bool {
 }
 
 /// The arm targets of the `switch/id` whose descr is `descr_index`, in key
-/// order, or `None` when the descr is not a switch table.
+/// order, or `None` when the descr is not a switch table or a listed key
+/// does not resolve to a target.
 fn switch_descr_targets(descr_index: usize) -> Option<Vec<usize>> {
     let descrs = crate::jitcode_runtime::descr_ref_table();
     let descr = descrs.at(descr_index)?;
     let switch = descr.as_switch_descr()?;
-    Some(
-        switch
-            .const_keys_in_order()
-            .iter()
-            .filter_map(|&key| switch.lookup(key))
-            .collect(),
-    )
+    // Every listed key must resolve: dropping one would narrow the successor
+    // set, and a region this scan does not traverse is a region it wrongly
+    // reports clean.  An unresolved key therefore widens the whole answer to
+    // `None`.
+    switch
+        .const_keys_in_order()
+        .iter()
+        .map(|&key| switch.lookup(key))
+        .collect()
 }
 
 /// Evaluate the Int result of the small, side-effect-free opcode family the
