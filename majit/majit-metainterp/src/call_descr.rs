@@ -103,8 +103,16 @@ impl CallDescr for MetaCallDescr {
     fn result_size(&self) -> usize {
         self.result_size
     }
+    /// `descr.py is_result_signed()` — `result_flag == FLAG_SIGNED`.
+    ///
+    /// `result_flag` is derived from the RAW result char, not from the
+    /// normalised one: only `'i'` consults `result_signed`, and `'S'` takes
+    /// FLAG_UNSIGNED while `'L'` takes FLAG_FLOAT even though they normalise
+    /// to `Int` and `Float`.  The constructor's `result_signed` argument is
+    /// `is_ffi_type_signed` at a dynamic call site, which answers `kind != 'u'`
+    /// and so says `true` for a float; the derivation is what discards it.
     fn is_result_signed(&self) -> bool {
-        self.result_signed
+        self.result_class == 'i' && self.result_signed
     }
     fn get_extra_info(&self) -> &EffectInfo {
         self.effect_info.get()
