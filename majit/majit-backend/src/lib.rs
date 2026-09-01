@@ -3529,15 +3529,17 @@ pub trait Backend: Send {
 
     /// `LLtypeMixin.bh_strhash` computes the RPython content hash.
     fn bh_strhash(&self, string_ptr: i64) -> i64 {
-        let length = self.bh_strlen(string_ptr) as usize;
-        if length == 0 {
-            return -1;
-        }
-        let mut x = self.bh_strgetitem(string_ptr, 0) << 7;
-        for index in 0..length {
-            x = 1_000_003i64.wrapping_mul(x) ^ self.bh_strgetitem(string_ptr, index as i64);
-        }
-        x ^ length as i64
+        blackhole_cached_hash(string_ptr, || {
+            let length = self.bh_strlen(string_ptr) as usize;
+            if length == 0 {
+                return -1;
+            }
+            let mut x = self.bh_strgetitem(string_ptr, 0) << 7;
+            for index in 0..length {
+                x = 1_000_003i64.wrapping_mul(x) ^ self.bh_strgetitem(string_ptr, index as i64);
+            }
+            x ^ length as i64
+        })
     }
     /// model.py bh_call_i(func, args_i, args_r, args_f, calldescr).
     /// `llmodel.py:816 call_stub_i`: ABI-correct dispatch via the shared
@@ -3691,15 +3693,17 @@ pub trait Backend: Send {
 
     /// `LLtypeMixin.bh_unicodehash` computes the RPython content hash.
     fn bh_unicodehash(&self, string_ptr: i64) -> i64 {
-        let length = self.bh_unicodelen(string_ptr) as usize;
-        if length == 0 {
-            return -1;
-        }
-        let mut x = self.bh_unicodegetitem(string_ptr, 0) << 7;
-        for index in 0..length {
-            x = 1_000_003i64.wrapping_mul(x) ^ self.bh_unicodegetitem(string_ptr, index as i64);
-        }
-        x ^ length as i64
+        blackhole_cached_hash(string_ptr, || {
+            let length = self.bh_unicodelen(string_ptr) as usize;
+            if length == 0 {
+                return -1;
+            }
+            let mut x = self.bh_unicodegetitem(string_ptr, 0) << 7;
+            for index in 0..length {
+                x = 1_000_003i64.wrapping_mul(x) ^ self.bh_unicodegetitem(string_ptr, index as i64);
+            }
+            x ^ length as i64
+        })
     }
     /// model.py: bh_copystrcontent(src, dst, srcstart, dststart, length)
     fn bh_copystrcontent(&self, src: i64, dst: i64, srcstart: i64, dststart: i64, length: i64) {
@@ -4145,6 +4149,34 @@ pub fn we_are_jitted() -> bool {
 /// own `cast_instance_to_gcref(memory_error)` fallback for that case.
 static MEMORY_ERROR_PROVIDER: std::sync::OnceLock<fn() -> i64> = std::sync::OnceLock::new();
 
+/// `LLHelpers.ll_strhash` / `LLHelpers._ll_strhash`: the first Signed word of
+/// an RPython STR or UNICODE is a zero-sentinel hash cache.  The selected hash
+/// is stored there, with zero replaced by 29872897 so a computed value is
+/// distinguishable from the sentinel.
+///
+/// PyPy relies on process serialization here.  Pyre's CPython-3.14t contract
+/// permits concurrent readers, so the same one-word owner is accessed
+/// atomically rather than duplicated in a side table.
+fn blackhole_cached_hash(string_ptr: i64, compute: impl FnOnce() -> i64) -> i64 {
+    assert_ne!(string_ptr, 0, "blackhole string hash: null string");
+    let cache = unsafe { &*(string_ptr as usize as *const std::sync::atomic::AtomicIsize) };
+    let cached = cache.load(std::sync::atomic::Ordering::Acquire);
+    if cached != 0 {
+        return cached as i64;
+    }
+    let computed = compute() as isize;
+    let computed = if computed == 0 { 29_872_897 } else { computed };
+    match cache.compare_exchange(
+        0,
+        computed,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => computed as i64,
+        Err(winner) => winner as i64,
+    }
+}
+
 /// Install the `memory_error` singleton provider.  Called once from
 /// pyre-jit's `install_jit_call_bridge` after the interpreter has
 /// initialized the exception type registry.
@@ -4463,6 +4495,30 @@ mod tests {
         // to a non-null pointer (the singleton).  Either way, the
         // accessor must not panic when called before registration.
         let _ = memory_error_singleton_ref();
+    }
+
+    #[test]
+    fn blackhole_string_hash_uses_rpython_cache_and_zero_substitute() {
+        #[repr(C)]
+        struct Header {
+            hash: std::sync::atomic::AtomicIsize,
+            len: usize,
+        }
+
+        let header = Header {
+            hash: std::sync::atomic::AtomicIsize::new(0),
+            len: 0,
+        };
+        let ptr = (&header as *const Header) as i64;
+        assert_eq!(blackhole_cached_hash(ptr, || 0), 29_872_897);
+        assert_eq!(
+            header.hash.load(std::sync::atomic::Ordering::Acquire),
+            29_872_897
+        );
+        assert_eq!(
+            blackhole_cached_hash(ptr, || panic!("cached hash recomputed")),
+            29_872_897
+        );
     }
 
     #[test]

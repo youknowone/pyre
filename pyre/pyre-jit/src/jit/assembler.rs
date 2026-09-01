@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock};
 
 use indexmap::IndexMap;
 use majit_ir::IndexMapExt;
-use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder};
+use majit_metainterp::jitcode::{JitCallArg, JitCode, JitCodeBuilder, JitCodeIntOperand};
 use vecset::VecSet;
 
 use super::flatten::{DescrOperand, Insn, Kind, ListOfKind, Operand, Register, SSARepr, TLabel};
@@ -45,11 +45,12 @@ pub struct NumRegs {
 pub struct Assembler {
     /// `assembler.py` `self.insns = {}`.
     ///
-    /// RPython grows this dict in `write_insn()` with dense opcode ids.
-    /// pyre still emits majit's fixed runtime bytecodes, so the mirror here
-    /// records only the actually-emitted well-known keys with their runtime
-    /// opcode byte. That is sufficient for the lazy `finish_setup` cache
-    /// refresh in `pyre_jit_trace::state`.
+    /// RPython grows this dict in `write_insn()` with one opcode id per shape.
+    /// Pyre reuses majit's reserved byte for a serialized well-known shape and
+    /// lazily allocates an unreserved byte for a runtime-only shape such as a
+    /// `USE_C_FORM` combination.  In both cases only shapes actually emitted
+    /// by this assembler enter the map consumed by the lazy `finish_setup`
+    /// cache refresh in `pyre_jit_trace::state`.
     insns: IndexMap<String, u8>,
     /// `assembler.py` `self.all_liveness = []`.
     all_liveness: Vec<u8>,
@@ -368,7 +369,7 @@ impl Assembler {
                         }
                     }
                 }
-                self.record_insn_key(opname, args, result.as_ref());
+                let opcode_byte = self.record_insn_key(opname, args, result.as_ref());
                 // `assembler.py:197-206` registers descrs inline during op
                 // encoding into `Assembler.descrs`. pyre's runtime
                 // codewriter has no descr-consuming ops today, so no
@@ -377,7 +378,7 @@ impl Assembler {
                 // `BlackholeInterpBuilder.descrs` pool (`blackhole.py:
                 // 102-103 setup_descrs`), not a per-jitcode duplicate.
                 CURRENT_DISPATCH_OP.with(|cur| cur.borrow_mut().replace_range(.., opname));
-                dispatch_op(state, opname, args, result.as_ref());
+                dispatch_op(state, opname, args, result.as_ref(), opcode_byte);
             }
         }
     }
@@ -497,18 +498,41 @@ impl Assembler {
         pos
     }
 
-    fn record_insn_key(&mut self, opname: &str, args: &[Operand], result: Option<&Register>) {
+    fn record_insn_key(
+        &mut self,
+        opname: &str,
+        args: &[Operand],
+        result: Option<&Register>,
+    ) -> Option<u8> {
         if is_adapter_only_helper_call_family(opname) {
-            return;
+            return None;
         }
         let key = if opname == super::flatten::OPNAME_LIVE {
             "live/".to_string()
         } else {
             insn_key(opname, args, result)
         };
-        if let Some(&opcode) = WELLKNOWN_BH_INSNS.get(key.as_str()) {
-            self.insns.entry_or_insert_with(key, || opcode);
+        if let Some(&opcode) = self.insns.get(&key) {
+            return Some(opcode);
         }
+        let opcode = WELLKNOWN_BH_INSNS
+            .get(key.as_str())
+            .copied()
+            .unwrap_or_else(|| {
+                // assembler.py `self.insns.setdefault(key, len(self.insns))`,
+                // adjusted only for pyre's serialized fixed-byte reservation.
+                // Allocate an opcode for the shape that actually appeared; do not
+                // reserve the Cartesian product of every USE_C_FORM variant.
+                (0u16..=u8::MAX as u16)
+                    .map(|value| value as u8)
+                    .find(|value| {
+                        !majit_translate::insns::is_reserved_opcode_byte(*value)
+                            && !self.insns.values().any(|used| used == value)
+                    })
+                    .unwrap_or_else(|| panic!("runtime assembler opcode space exhausted for {key}"))
+            });
+        self.insns.insert(key, opcode);
+        Some(opcode)
     }
 }
 
@@ -719,6 +743,7 @@ fn dispatch_op(
     opname: &str,
     args: &[Operand],
     result: Option<&Register>,
+    opcode_byte: Option<u8>,
 ) {
     match opname {
         "goto" => {
@@ -733,46 +758,106 @@ fn dispatch_op(
             state.builder.goto_if_not_int_is_true(cond, label_id);
         }
         "goto_if_not_int_eq" => {
-            let lhs = expect_reg(&args[0], Kind::Int);
-            let rhs = expect_reg(&args[1], Kind::Int);
+            let lhs = expect_jitcode_int_operand(state, &args[0], true);
+            let rhs = expect_jitcode_int_operand(state, &args[1], true);
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
-            state.builder.goto_if_not_int_eq(lhs, rhs, label_id);
+            match (lhs, rhs) {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                    state.builder.goto_if_not_int_eq(lhs, rhs, label_id)
+                }
+                _ => state.builder.goto_if_not_int_operands(
+                    opcode_byte.expect("short goto_if_not_int_eq opcode"),
+                    lhs,
+                    rhs,
+                    label_id,
+                ),
+            }
         }
         "goto_if_not_int_ne" => {
-            let lhs = expect_reg(&args[0], Kind::Int);
-            let rhs = expect_reg(&args[1], Kind::Int);
+            let lhs = expect_jitcode_int_operand(state, &args[0], true);
+            let rhs = expect_jitcode_int_operand(state, &args[1], true);
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
-            state.builder.goto_if_not_int_ne(lhs, rhs, label_id);
+            match (lhs, rhs) {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                    state.builder.goto_if_not_int_ne(lhs, rhs, label_id)
+                }
+                _ => state.builder.goto_if_not_int_operands(
+                    opcode_byte.expect("short goto_if_not_int_ne opcode"),
+                    lhs,
+                    rhs,
+                    label_id,
+                ),
+            }
         }
         "goto_if_not_int_lt" => {
-            let lhs = expect_reg(&args[0], Kind::Int);
-            let rhs = expect_reg(&args[1], Kind::Int);
+            let lhs = expect_jitcode_int_operand(state, &args[0], true);
+            let rhs = expect_jitcode_int_operand(state, &args[1], true);
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
-            state.builder.goto_if_not_int_lt(lhs, rhs, label_id);
+            match (lhs, rhs) {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                    state.builder.goto_if_not_int_lt(lhs, rhs, label_id)
+                }
+                _ => state.builder.goto_if_not_int_operands(
+                    opcode_byte.expect("short goto_if_not_int_lt opcode"),
+                    lhs,
+                    rhs,
+                    label_id,
+                ),
+            }
         }
         "goto_if_not_int_le" => {
-            let lhs = expect_reg(&args[0], Kind::Int);
-            let rhs = expect_reg(&args[1], Kind::Int);
+            let lhs = expect_jitcode_int_operand(state, &args[0], true);
+            let rhs = expect_jitcode_int_operand(state, &args[1], true);
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
-            state.builder.goto_if_not_int_le(lhs, rhs, label_id);
+            match (lhs, rhs) {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                    state.builder.goto_if_not_int_le(lhs, rhs, label_id)
+                }
+                _ => state.builder.goto_if_not_int_operands(
+                    opcode_byte.expect("short goto_if_not_int_le opcode"),
+                    lhs,
+                    rhs,
+                    label_id,
+                ),
+            }
         }
         "goto_if_not_int_gt" => {
-            let lhs = expect_reg(&args[0], Kind::Int);
-            let rhs = expect_reg(&args[1], Kind::Int);
+            let lhs = expect_jitcode_int_operand(state, &args[0], true);
+            let rhs = expect_jitcode_int_operand(state, &args[1], true);
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
-            state.builder.goto_if_not_int_gt(lhs, rhs, label_id);
+            match (lhs, rhs) {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                    state.builder.goto_if_not_int_gt(lhs, rhs, label_id)
+                }
+                _ => state.builder.goto_if_not_int_operands(
+                    opcode_byte.expect("short goto_if_not_int_gt opcode"),
+                    lhs,
+                    rhs,
+                    label_id,
+                ),
+            }
         }
         "goto_if_not_int_ge" => {
-            let lhs = expect_reg(&args[0], Kind::Int);
-            let rhs = expect_reg(&args[1], Kind::Int);
+            let lhs = expect_jitcode_int_operand(state, &args[0], true);
+            let rhs = expect_jitcode_int_operand(state, &args[1], true);
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
-            state.builder.goto_if_not_int_ge(lhs, rhs, label_id);
+            match (lhs, rhs) {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                    state.builder.goto_if_not_int_ge(lhs, rhs, label_id)
+                }
+                _ => state.builder.goto_if_not_int_operands(
+                    opcode_byte.expect("short goto_if_not_int_ge opcode"),
+                    lhs,
+                    rhs,
+                    label_id,
+                ),
+            }
         }
         "goto_if_not_int_is_zero" => {
             let cond = expect_reg(&args[0], Kind::Int);
@@ -1436,12 +1521,19 @@ fn dispatch_op(
                 "uint_ge" => majit_ir::OpCode::UintGe,
                 _ => unreachable!(),
             };
-            state.builder.record_binop_i(
-                dst,
-                opcode,
-                expect_reg(&args[0], Kind::Int),
-                expect_reg(&args[1], Kind::Int),
-            );
+            let lhs = expect_jitcode_int_operand(state, &args[0], use_c_form(opname));
+            let rhs = expect_jitcode_int_operand(state, &args[1], use_c_form(opname));
+            match (lhs, rhs) {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                    state.builder.record_binop_i(dst, opcode, lhs, rhs)
+                }
+                _ => state.builder.record_binop_i_operands(
+                    dst,
+                    opcode_byte.expect("short integer binop opcode"),
+                    lhs,
+                    rhs,
+                ),
+            }
         }
         "int_neg" | "int_invert" => {
             let dst = expect_result_reg(result, Kind::Int, "int unary needs result");
@@ -2063,6 +2155,19 @@ fn expect_int_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
     }
 }
 
+fn expect_jitcode_int_operand(
+    state: &mut AssemblyState,
+    op: &Operand,
+    allow_short: bool,
+) -> JitCodeIntOperand {
+    match op {
+        Operand::ConstInt(value) if allow_short && (-128..=127).contains(value) => {
+            JitCodeIntOperand::ShortConst(*value as i8)
+        }
+        _ => JitCodeIntOperand::Register(expect_int_reg_or_pool(state, op)),
+    }
+}
+
 /// Normalize a `ConstRef` value before it enters the jitcode `constants_r`
 /// pool.  A tagged small-int immediate would be baked verbatim as a
 /// `ConstPtr(GcRef(tagged))` that an in-trace `GuardClass` derefs as a heap
@@ -2406,6 +2511,50 @@ mod tests {
         assert_eq!(insns.get("live/"), wellknown.get("live/"));
         assert_eq!(insns.get("ref_return/r"), wellknown.get("ref_return/r"));
         assert_eq!(insns.get("goto/L"), wellknown.get("goto/L"));
+    }
+
+    #[test]
+    fn assemble_allocates_only_the_short_constant_shapes_that_appear() {
+        let mut assembler = Assembler::new();
+        let mut ssarepr = SSARepr::new("short_constants");
+        ssarepr.insns.push(Insn::op_with_result(
+            "int_sub",
+            vec![Operand::ConstInt(48), Operand::Register(r(Kind::Int, 1))],
+            r(Kind::Int, 2),
+        ));
+        ssarepr.insns.push(Insn::op(
+            "goto_if_not_int_gt",
+            vec![
+                Operand::Register(r(Kind::Int, 2)),
+                Operand::ConstInt(2),
+                Operand::TLabel(TLabel::new("done")),
+            ],
+        ));
+        ssarepr.insns.push(Insn::Label(Label::new("done")));
+        ssarepr.insns.push(Insn::op(
+            "ref_return",
+            vec![Operand::Register(r(Kind::Ref, 0))],
+        ));
+
+        let jitcode = assembler.assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 3,
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+        let insns = assembler.insns_snapshot();
+        let sub = *insns.get("int_sub/ci>i").expect("short lhs key");
+        let branch = *insns
+            .get("goto_if_not_int_gt/icL")
+            .expect("short rhs branch key");
+        assert_ne!(sub, branch);
+        assert!(!majit_translate::insns::is_reserved_opcode_byte(sub));
+        assert!(!majit_translate::insns::is_reserved_opcode_byte(branch));
+        assert_eq!(jitcode.code[0], sub);
+        assert_eq!(jitcode.code[4], branch);
     }
 
     #[test]

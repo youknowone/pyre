@@ -3527,7 +3527,15 @@ impl majit_backend::Backend for WasmBackend {
         let len_offset = arraydescr
             .array_len_offset()
             .expect("bh_new_array requires ArrayDescr.lendescr");
+        // descr.py `ArrayDescr.get_type_id(): assert self.tid` — allocation
+        // requires a real GC type id; tid=0 means the descr never went through
+        // `gc.py:548 set_type_id` and the GC tracer would lack the per-item
+        // visit shape.  The dynasm and cranelift runners assert the same.
         let type_id = arraydescr.resolve_gc_tid();
+        assert!(
+            type_id != 0,
+            "bh_new_array requires ArrayDescr.tid (descr.py:340) — got 0"
+        );
         let Some(payload_size) = itemsize
             .checked_mul(length)
             .and_then(|items| base_size.checked_add(items))
