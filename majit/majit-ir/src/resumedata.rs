@@ -386,9 +386,21 @@ pub fn decode_tagged_value(
                 RebuiltValue::Unassigned
             } else {
                 let idx = (val - TAG_CONST_OFFSET) as usize;
-                // resume.py/1571/1583 self.consts[num - TAG_CONST_OFFSET]
-                // — the Const carries its type with it.
-                let c = rd_consts.get(idx).copied().unwrap_or(Const::Int(0));
+                // resume.py:1554/1571/1583 `self.consts[num -
+                // TAG_CONST_OFFSET]` — a plain index, so an out-of-range
+                // number is an `IndexError` there.  The Const carries its type
+                // with it, which is why there is no defaulting answer to give:
+                // `Const::Int(0)` is a well-formed integer zero, so a bridge
+                // rebuilt from a truncated `rd_consts` would run on it instead
+                // of failing, while `ResumeDataDirectReader`'s `decode_int` /
+                // `decode_ref` panic on the very same index.
+                let Some(c) = rd_consts.get(idx).copied() else {
+                    panic!(
+                        "decode_tagged_value: TAGCONST index {idx} is past the \
+                         guard's {} consts (tagged {tagged})",
+                        rd_consts.len(),
+                    );
+                };
                 RebuiltValue::Const(c)
             }
         }
