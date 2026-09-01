@@ -2145,8 +2145,15 @@ mod tests {
 
     /// pypy/interpreter/argument.py:97-103 — non-iterable star arg
     /// surfaces "argument after * must be an iterable".
+    ///
+    /// Rejecting the operand runs `space.iter`, whose `__iter__` probe is a
+    /// type-MRO `lookup`; that lookup needs `init_typeobjects()` to have
+    /// populated the W_TypeObject MRO, and its hash-hook install is what
+    /// enters the runtime thread this test's method-cache probe needs a GIL
+    /// from.
     #[test]
     fn combine_starargs_wrapped_non_iterable_raises() {
+        crate::typedef::init_typeobjects();
         let mut args: Vec<PyObjectRef> = vec![];
         let stararg = pyre_object::w_int_new(42); // ints aren't iterable
         let err = combine_starargs_wrapped(&mut args, stararg, pyre_object::PY_NULL)
@@ -2363,9 +2370,12 @@ mod tests {
 
     /// pypy/interpreter/argument.py:97-103 — non-iterable `*` arg
     /// surfaces as `Err(PyError)` from `Arguments::new` rather than the
-    /// previous `unimplemented!()` panic.
+    /// previous `unimplemented!()` panic.  The rejection takes the same
+    /// `space.iter` route as the test above, so it needs the same
+    /// `init_typeobjects()`.
     #[test]
     fn new_with_w_stararg_non_iterable_returns_err() {
+        crate::typedef::init_typeobjects();
         let pos: [PyObjectRef; 0] = [];
         let stararg = pyre_object::w_int_new(42); // not iterable
         match Arguments::new(&pos, None, None, Some(stararg), None, false, None) {
