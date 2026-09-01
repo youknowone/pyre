@@ -6516,6 +6516,13 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
 /// returns `None` when `obj` is not a bound super or the walk finds nothing,
 /// so the caller falls through to ordinary attribute lookup.  Taken by WTF-8
 /// so a name carrying a lone surrogate reaches the same walk as any other.
+///
+/// `@unroll_safe` (typeobject.py:460 `lookup_starting_at`): the MRO-suffix walk
+/// is a loop, and `look_inside_graph` (policy.py) rejects a loop-bearing graph.
+/// The hint clears `contains_loop` before that test, so the graph stays in the
+/// candidate set, mints a jitcode, and the walker unrolls the walk instead of
+/// leaving the call an opaque residual.
+#[majit_macros::unroll_safe]
 unsafe fn super_getattribute_wtf8(
     obj: PyObjectRef,
     name: &Wtf8,
@@ -6538,7 +6545,18 @@ unsafe fn super_getattribute_wtf8(
             return Ok(None);
         }
         let mut past_super = false;
-        for &t in (*mro_ptr).as_slice() {
+        // `rlist.py ll_listnext` walks an lltype array as a length read, a
+        // bounds test and an index advance, and `mro_ptr` is already
+        // `Ptr(GcArray(OBJECTPTR))` here.  Spelled that way the walk lowers to
+        // `arraylen_gc` plus `getarrayitem_gc_r`; the borrowed-slice `for`
+        // leaves the iterator construction and its `next` residual calls that
+        // carry no jitcode, and a sub-walk refuses a residual it cannot name.
+        // A range `for` is no better: `front::range_iter` reroutes it onto the
+        // same iterator token.
+        let mut index = 0i64;
+        while index < (*mro_ptr).len() as i64 {
+            let t = (&*mro_ptr)[index as usize];
+            index += 1;
             if std::ptr::eq(t, super_type) {
                 past_super = true;
                 continue;
