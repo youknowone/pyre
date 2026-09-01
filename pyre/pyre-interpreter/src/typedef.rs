@@ -25680,9 +25680,17 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         // newbytesdata_w_tail: a successful `__index__` supplies a count of
         // NUL bytes; TypeError falls through to the buffer/iterable path.
         if let Some(count) = bytes_count_from_index(arg)? {
-            let mut zeros = crate::builtins::try_vec_with_capacity(count)?;
-            zeros.resize(count, 0u8);
-            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&zeros));
+            // `_PyBytes_FromSize` refuses a length it could not measure
+            // before it reaches the allocator.
+            if !pyre_object::bytesobject::bytes_length_fits(count) {
+                return Err(crate::PyError::overflow_error("byte string is too large"));
+            }
+            // The block is the only copy: `w_bytes_from_bytes` would allocate
+            // a second one of the same size, and it ends the process rather
+            // than raising when that one cannot be met.
+            let block = pyre_object::bytesobject::try_alloc_bytes_block_zeroed(count)
+                .ok_or_else(crate::builtins::reservation_failed)?;
+            return Ok(pyre_object::bytesobject::w_bytes_from_block(block));
         }
         // `_convert_from_buffer_or_iterable`: acquire a read-only buffer
         // before trying the iterable path.  This includes Python 3.14's
@@ -25985,7 +25993,12 @@ fn bytearray_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     let fresh = bytearray_descr_init_value(args, args[0])?;
     if !std::ptr::eq(fresh, args[0]) {
-        let data = unsafe { pyre_object::bytesobject::bytes_like_data(fresh).to_vec() };
+        // The receiver takes its own copy of what the value came back as, and
+        // the length came from Python, so the copy is reserved fallibly:
+        // `to_vec` ends the process where `PyByteArray_Resize` raises.
+        let source = unsafe { pyre_object::bytesobject::bytes_like_data(fresh) };
+        let mut data = crate::builtins::try_vec_with_capacity::<u8>(source.len())?;
+        data.extend_from_slice(source);
         if !data.is_empty() {
             unsafe {
                 crate::builtins::bytearray_check_exports(args[0])?;
