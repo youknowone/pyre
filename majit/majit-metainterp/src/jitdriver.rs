@@ -539,6 +539,22 @@ pub fn no_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_BRIDGE").is_some())
 }
+/// `MAJIT_SKIP_BRIDGES=a,b,...` (diagnostic): decline exactly the listed
+/// `MAJIT_MAX_BRIDGES` sequence numbers and take every other one.  Where the
+/// fuel limit answers "the first N are sound", this answers "is number N the
+/// one that corrupts, or is the corruption cumulative" — a distinction the
+/// limit cannot draw, because declining N also declines everything after it.
+/// Off by default; an unparsable entry is ignored rather than reported, since
+/// the variable exists only for a bisect the operator is reading anyway.
+fn bridge_fuel_skipped(n: u64) -> bool {
+    static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        std::env::var("MAJIT_SKIP_BRIDGES")
+            .map(|v| v.split(',').filter_map(|p| p.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    })
+    .contains(&n)
+}
 /// `MAJIT_MAX_BRIDGES=N` (diagnostic): allow the first N bridge compilations
 /// and behave as `MAJIT_NO_BRIDGE` from then on.  Bisecting N names the bridge
 /// whose compilation first produces a wrong value, at seconds per run rather
@@ -563,6 +579,12 @@ pub fn bridge_fuel_take() -> bool {
     static USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = USED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n >= limit {
+        return false;
+    }
+    if bridge_fuel_skipped(n) {
+        if std::env::var_os("MAJIT_BRIDGE_FUEL_LOG").is_some() {
+            eprintln!("@@@FUEL bridge #{n} SKIPPED");
+        }
         return false;
     }
     if std::env::var_os("MAJIT_BRIDGE_FUEL_LOG").is_some() {
@@ -5366,63 +5388,34 @@ impl<S: JitState> JitDriver<S> {
         // position to re-enter at; every other JitState resumes through its
         // own frontend.
         let dispatch = self.dispatch_jitcode().cloned()?;
-        // OPEN, and the cut below is a MASK rather than the boundary. It
-        // refuses a guard whose deferred writes span more than one virtual,
-        // and at the parameter table's `trace_eagerness` a self-interpreting
-        // workload is byte-exact with it in place. Lowering that parameter —
-        // nothing else — reproduces the same class of wrong answer WITH the
-        // cut in place, deterministically, from one setting downwards.
+        // The cut below is a MASK, not a boundary. It refuses a guard whose
+        // deferred writes span more than one virtual, and the wrong answers
+        // that motivated it are not this entry's to begin with: they are made
+        // at the CLOSE, by the shape of the loop the bridge closes onto.
         //
-        // What that reproduction settles, and what it overturns:
+        // A jitdriver that drops `unroll` from its pass list compiles every
+        // loop through the simple-loop path, and that path mints ONE target
+        // token — nothing in front of it, and no virtual state on it. The
+        // loop's own closing JUMP still carries the traced iteration's
+        // constants: `remove_consts_and_duplicates` records a `SAME_AS` for
+        // each one, and the rewrite pass folds it straight back. Some of those
+        // slots are ones the body never reads, so the label is specialized to
+        // their constants while declaring plain boxes, and an entry supplying
+        // a different value in one of them keeps it for a single iteration and
+        // loses it to the back edge. Upstream never has that shape to enter:
+        // `compile_loop` peels, keeps the unspecialized preamble as
+        // `target_tokens[0]`, and gives the peeled label a virtual state, so
+        // `unroll.py jump_to_existing_trace` either matches that state or
+        // falls back to the preamble. Without the peel there is no preamble to
+        // fall back to and no state to match.
         //
-        //   * declining EVERY guard-resume entry restores the correct output
-        //     at every `trace_eagerness` tried, and also with the cut widened
-        //     to serve every deferred-write guard. This entry is the necessary
-        //     component; the virtual count is not.
-        //   * `MAJIT_MAX_BRIDGES` bisects the reproduction to one entry, and
-        //     that entry carries NO deferred writes and NO virtuals at all.
-        //     Seventy-one guard-resume entries precede it and are sound. The
-        //     shape this comment used to blame — a two-node push chain whose
-        //     outer virtual names the inner and whose one deferred write is
-        //     the list head — is what the cut refuses, not what corrupts.
+        // Guard-resume entries are implicated only because they are the
+        // bridges that close onto such a loop; rebuilding from resume data is
+        // not itself what corrupts, which is why declining every one of them
+        // removes the wrong answer at a cost no policy would pay.
         //
-        // What the corrupting entry records is a bridge that closes with a
-        // JUMP into an already-compiled loop, and it passes a VARIABLE in the
-        // argument position that every other close in the same run fills with
-        // a literal — one of a handful of literals, each the value the loop
-        // behind that target token was specialized on. The bridge's own
-        // guards prove only that the variable is not one OTHER literal.
-        //
-        // Nothing in this frontend's close path proves the incoming state
-        // satisfies the target label: `unroll.py jump_to_existing_trace` is
-        // where upstream generates the guards that make a specialized label
-        // safe to enter, and its per-target-token log is EMPTY for this
-        // workload — with the unroll pass enabled as well as without it.
-        // Enabling that pass changes which bytes come out wrong and not that
-        // they are wrong, so the missing pass is not by itself the account.
-        //
-        // Also measured out, in the same reproduction:
-        //
-        //   * a `GuardRequirement` whose box is not reachable from the jump
-        //     arguments emits nothing and is skipped rather than declined —
-        //     a real hole, but declining on it fires on no target token here
-        //     and leaves every wrong byte unchanged,
-        //   * `rd_locs.len()` equals `num_failargs` on every guard in the
-        //     refused census, so no failarg resolves through the deadframe's
-        //     out-of-range identity-slot fallback,
-        //   * the bridge's inputargs are contiguous and cover every failarg,
-        //   * the rewrite lowers a resumed `New` to the headerless nursery
-        //     opcode, so materialized objects come from the frontend's own
-        //     pool at the offsets their descrs carry, and
-        //   * the collector is not involved: the wrong bytes are identical
-        //     with collection disabled, the run performs none, and the
-        //     frontend's own structural invariant stays silent. What the
-        //     served entry produces is a wrong VALUE on an intact structure.
-        //
-        // The cut stays because it is measured to halve this frontend's
-        // guard failures and because widening it is measured to produce a
-        // wrong answer at the shipped parameter; it is NOT a soundness
-        // argument, and the entry above it is where the account is still owed.
+        // The cut stays because it halves this frontend's guard failures. It
+        // is NOT a soundness argument, and it is not what makes an entry safe.
         //
         // Sited here rather than in the ladder below because
         // `compile.py ResumeGuardDescr.handle_fail` runs ONE of resume.py's

@@ -403,6 +403,13 @@ cover the condition they diagnose.
 - Default polarity: **OFF**; unset, empty, and `0` disable it.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_SKIP_BRIDGES`
+
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
+- Accessor: `bridge_fuel_skipped()`
+- What it does: `MAJIT_SKIP_BRIDGES=a,b,...`: decline exactly the listed `MAJIT_MAX_BRIDGES` sequence numbers and take every other one, so a bisect can ask whether one numbered bridge corrupts on its own or whether the corruption is cumulative. The fuel limit cannot answer that, because declining number N also declines everything after it.
+- Retirement condition: Remove with `MAJIT_MAX_BRIDGES`, once a compiled bridge cannot produce a value the same guard's blackhole resume would not.
+
 ### `MAJIT_SMALLIR`
 
 - Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
