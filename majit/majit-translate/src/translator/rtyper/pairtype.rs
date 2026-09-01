@@ -384,6 +384,23 @@ fn dispatch_convert_from_to(
         (FunctionRepr, FunctionsPBCRepr) => {
             super::rpbc::pair_function_repr_functions_pbc_convert_from_to(r_from, r_to, v, llops)
         }
+        // rpbc.py — pairtype(MultipleFrozenPBCRepr,
+        // FunctionRepr).convert_from_to: a frozen-PBC pointer feeding a
+        // constant-function repr drops its runtime value and materialises
+        // the target's own `s_pbc.const` at Void.
+        //
+        // The other five frozen-PBC pairs upstream registers
+        // (`MultipleFrozenPBCRepr` × `MultipleUnrelatedFrozenPBCRepr` /
+        // `MultipleFrozenPBCRepr`, `SingleFrozenPBCRepr` ×
+        // `MultipleFrozenPBCRepr`, `MultipleFrozenPBCReprBase` ×
+        // `SingleFrozenPBCRepr`, `FunctionRepr` ×
+        // `MultipleFrozenPBCRepr`) are still unported. The
+        // `MultipleFrozenPBCReprBase` one additionally needs that base in
+        // `pair_mro`, which currently sends both `Multiple*` reprs
+        // straight to `Repr`.
+        (MultipleFrozenPBCRepr, FunctionRepr) => {
+            super::rpbc::pair_multiple_frozen_pbc_function_repr_convert_from_to(r_to)
+        }
         // rpbc.py — pairtype(FunctionsPBCRepr,
         // FunctionsPBCRepr).convert_from_to: upstream identity if
         // `r_fpbc1.lowleveltype == r_fpbc2.lowleveltype`, else
