@@ -1791,6 +1791,24 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(result)
 }
 
+/// What a `string_at`/`wstring_at` read that `host_env` refuses to attempt
+/// raises.  Neither one checks the address it is handed — `strlen`,
+/// `PyBytes_FromStringAndSize` and `PyUnicode_FromWideChar` are simply given
+/// the pointer — so NULL is a bad address like any other and the fence names
+/// it the way it names the rest.
+#[cfg(all(windows, target_env = "msvc"))]
+fn declined_read(address: usize) -> crate::PyError {
+    super::seh::access_violation_reading(address)
+}
+
+/// Where no fence can catch a fault there is no access violation to report,
+/// so a read `host_env` refuses to attempt raises the refusal itself rather
+/// than taking the process down over it.
+#[cfg(not(all(windows, target_env = "msvc")))]
+fn declined_read(_address: usize) -> crate::PyError {
+    crate::PyError::value_error("NULL pointer access")
+}
+
 fn internal_string_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Err(crate::PyError::type_error("string_at() missing address"));
@@ -1801,14 +1819,36 @@ fn internal_string_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         .map(crate::baseobjspace::int_w)
         .transpose()?
         .unwrap_or(-1);
-    // CPython's bytes allocation rejects impossible PyBytes sizes before the
+    // `PyBytes_FromStringAndSize` rejects an impossible size before the
     // pointer converter runs.  Keep that ordering for huge explicit sizes.
     if size > isize::MAX as i64 / 2 {
         return Err(crate::PyError::memory_error("size too large"));
     }
     let address = argument_address(args[0])?;
-    let value = host_ctypes::string_at(address, size as isize)
-        .map_err(|_| crate::PyError::value_error("NULL pointer access"))?;
+    // `PyBytes_FromStringAndSize` copies nothing for a zero size, so the
+    // address is never dereferenced and need not be readable at all.
+    if size == 0 {
+        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
+    }
+    // Only `-1` asks for the length to be measured; any other negative size
+    // reaches `PyBytes_FromStringAndSize`, which refuses it before it copies,
+    // so the address is not read for that either.
+    if size < -1 {
+        return Err(crate::PyError::system_error(
+            "Negative size passed to PyBytes_FromStringAndSize",
+        ));
+    }
+    // `_string_at = PYFUNCTYPE(py_object, c_void_p, c_int)(_string_at_addr)`,
+    // so the read runs as an ordinary foreign call and the `__try` around
+    // `ffi_call` is what stands between a bad address and the process.
+    let read = super::seh::guard(|| host_ctypes::string_at(address, size as isize))?;
+    let value = match read {
+        Ok(value) => value,
+        Err(host_ctypes::StringAtError::NullPointer) => return Err(declined_read(address)),
+        Err(host_ctypes::StringAtError::TooLong) => {
+            return Err(crate::PyError::memory_error("size too large"));
+        }
+    };
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&value))
 }
 
@@ -1826,8 +1866,33 @@ fn internal_wstring_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         return Err(crate::PyError::overflow_error("size too large"));
     }
     let address = argument_address(args[0])?;
-    let value = host_ctypes::wstring_at(address, size as isize)
-        .map_err(|_| crate::PyError::value_error("NULL pointer access"))?;
+    // `PyUnicode_FromWideChar` copies nothing for a zero size, so the address
+    // is never dereferenced and need not be readable at all.
+    if size == 0 {
+        return Ok(pyre_object::w_str_from_wtf8(rustpython_wtf8::Wtf8Buf::new()));
+    }
+    // A negative size other than `-1` reaches `find_maxchar_surrogates` as the
+    // range `[ptr, ptr + size)`, whose end precedes its start, so nothing is
+    // read and `PyUnicode_New` refuses the length.  An address low enough for
+    // that end to wrap past it is the exception: there the scan runs away from
+    // `ptr`, which is what the read below does for a negative size as well.
+    if size < -1 {
+        let end =
+            address.wrapping_add((size as isize as usize).wrapping_mul(size_of::<libc::wchar_t>()));
+        if end <= address {
+            return Err(crate::PyError::system_error(
+                "Negative size passed to PyUnicode_New",
+            ));
+        }
+    }
+    let read = super::seh::guard(|| host_ctypes::wstring_at(address, size as isize))?;
+    let value = match read {
+        Ok(value) => value,
+        Err(host_ctypes::StringAtError::NullPointer) => return Err(declined_read(address)),
+        Err(host_ctypes::StringAtError::TooLong) => {
+            return Err(crate::PyError::overflow_error("size too large"));
+        }
+    };
     Ok(pyre_object::w_str_from_wtf8(value))
 }
 

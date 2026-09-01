@@ -283,15 +283,18 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             } else {
                 -1
             };
-            let bytes =
-                rustpython_host_env::ctypes::string_at(ptr, size as isize).map_err(|e| {
-                    use rustpython_host_env::ctypes::StringAtError as S;
-                    let msg = match e {
-                        S::NullPointer => "NULL pointer access",
-                        S::TooLong => "size too large",
-                    };
-                    crate::PyError::os_error(format!("string_at: {msg}"))
-                })?;
+            // The address comes from the caller, so the read faults as
+            // readily as any foreign call's does and needs the same fence.
+            let read =
+                super::seh::guard(|| rustpython_host_env::ctypes::string_at(ptr, size as isize))?;
+            let bytes = read.map_err(|e| {
+                use rustpython_host_env::ctypes::StringAtError as S;
+                let msg = match e {
+                    S::NullPointer => "NULL pointer access",
+                    S::TooLong => "size too large",
+                };
+                crate::PyError::os_error(format!("string_at: {msg}"))
+            })?;
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
         }),
     );

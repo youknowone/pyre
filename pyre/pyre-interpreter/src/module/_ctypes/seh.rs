@@ -19,7 +19,7 @@ pub(super) fn guard<T, F: FnOnce() -> T>(body: F) -> Result<T, crate::PyError> {
 }
 
 #[cfg(all(windows, target_env = "msvc"))]
-pub(super) use msvc::guard;
+pub(super) use msvc::{access_violation_reading, guard};
 
 #[cfg(all(windows, target_env = "msvc"))]
 mod msvc {
@@ -42,6 +42,18 @@ mod msvc {
             arg: *mut c_void,
             out: *mut Record,
         ) -> i32;
+    }
+
+    /// The exception the fence would have made of a read at `address` that
+    /// faulted, for a read that is refused before it is attempted rather than
+    /// one the fence caught: nothing dereferences the address, so no
+    /// structured exception is ever raised to be filtered.
+    pub(in super::super) fn access_violation_reading(address: usize) -> crate::PyError {
+        exception(&Record {
+            code: windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION as u32,
+            info: [0, address as u64],
+            ninfo: 2,
+        })
     }
 
     pub(in super::super) fn guard<T, F: FnOnce() -> T>(body: F) -> Result<T, crate::PyError> {
@@ -93,15 +105,16 @@ mod msvc {
             win::EXCEPTION_ACCESS_VIOLATION => {
                 // `ExceptionInformation[0]` is the access that faulted and
                 // `[1]` the address it named.  `%p` is ill-defined, so
-                // `PyUnicode_FromFormat` prints it as wide as a pointer and
-                // puts the `0x` in front of it itself.
+                // `PyUnicode_FromFormat` puts the `0x` in front of it itself
+                // and leaves the digits as the CRT printed them — as wide as
+                // a pointer, in upper case.
                 let verb = if record.info[0] == 0 {
                     "reading"
                 } else {
                     "writing"
                 };
                 format!(
-                    "exception: access violation {verb} 0x{:0width$x}",
+                    "exception: access violation {verb} 0x{:0width$X}",
                     record.info[1],
                     width = size_of::<usize>() * 2
                 )
