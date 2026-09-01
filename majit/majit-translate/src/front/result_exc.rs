@@ -1536,9 +1536,10 @@ fn rewire_one_call_site(
         // what the rtyper colours and what flows on to `returnblock`.
         //
         // Leaving it `Ref` is not a cosmetic mislabel; it is the whole
-        // disagreement `call.py:230` ("the call result must have the same
-        // concretetype as FUNC.RESULT") exists to prevent, and it lands on
-        // BOTH sides of this graph:
+        // disagreement `CallControl.getcalldescr` (`call.py`) exists to
+        // prevent — it refuses a call whose `op.result.concretetype`
+        // differs from its `FUNC.RESULT` — and it lands on BOTH sides of
+        // this graph:
         //
         //   - inside, the call emits `inline_call_r_r` while the callee's
         //     transformed CFG `int_return`s, and the metainterp's

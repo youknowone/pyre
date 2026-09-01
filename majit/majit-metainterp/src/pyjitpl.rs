@@ -14197,18 +14197,19 @@ impl<M: Clone> MetaInterp<M> {
         }
         // compile.py: BridgeCompileData carries the trace/runtime boxes into
         // `UnrollOptimizer.optimize_bridge`, whose first operation is
-        // unroll.py:187 `trace = trace.get_iter()`.  In the Rust port the
-        // CompileData dispatch is flattened into this method (compile.rs
-        // `CompileData`), so build its short-lived view over that iterator's
-        // canonical `Rc<Op>` objects.  Building a separate `TreeLoop` from
+        // `trace = trace.get_iter()`.  In the Rust port the CompileData
+        // dispatch is flattened into this method (compile.rs `CompileData`),
+        // so build its short-lived view over that iterator's canonical
+        // `Rc<Op>` objects.  Building a separate `TreeLoop` from
         // `bridge_ops.to_vec()` here used to allocate one throw-away `Rc<Op>`
         // for every recorded operation, immediately before TraceIterator
         // allocated the real fresh objects consumed by the optimizer.
         let bridge_runtime_boxes: Vec<OpRef> =
             Self::closing_jump_runtime_boxes(bridge_ops, bridge_inputargs);
-        // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
-        // ResOperation objects in a disjoint OpRef namespace
-        // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
+        // `UnrollOptimizer.optimize_bridge`'s `trace = trace.get_iter()`: mint
+        // fresh InputArg / ResOperation objects in a disjoint OpRef namespace
+        // (`TraceIterator.__init__`, `opencoder.py`:
+        // `self.inputargs = [rop.inputarg_from_tp(arg.type) for ...]`).
         let prepared = prepare_bridge_trace_for_optimizer(
             bridge_ops,
             bridge_inputargs,
@@ -16715,7 +16716,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             // pyjitpl.py: frame.cleanup_registers().
             frame.cleanup_registers();
-            // pyjitpl.py:2477: self.free_frames_list.append(frame).
+            // `MetaInterp.popframe`'s `self.free_frames_list.append(frame)`.
             self.free_frames_list.push(frame);
         }
         // Mirror the TraceCtx inline-depth counter so trace recorder
