@@ -3537,10 +3537,12 @@ fn call_with_kwargs_in_ctx_impl(
         }
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
-        // The `function`, `memoryview`, deque iterator, and `_lzma` stream
+        // The `function`, `memoryview`, `_cffi_backend.buffer`, deque iterator,
+        // and `_lzma` stream
         // types are non-acceptable-as-base too, but their `tp_new` functions
         // accept keywords: FunctionType has `kwdefaults=...`, CPython 3.14
-        // exposes `memoryview(object=...)`, the deque iterator constructors
+        // exposes `memoryview(object=...)`, PyPy's `MiniBuffer___new__`
+        // accepts `cdata=` and `size=`, the deque iterator constructors
         // accept (and ignore) `index=...`, both `_lzma` constructors take
         // `format=`/`preset=`/`filters=`, and `select.kevent` takes the six
         // `ident=`/`filter=`/`flags=`/`fflags=`/`data=`/`udata=` names.
@@ -3551,26 +3553,36 @@ fn call_with_kwargs_in_ctx_impl(
         let is_kevent = std::ptr::eq(current_type(), crate::module::select::kevent_type());
         #[cfg(feature = "sandbox")]
         let is_kevent = false;
-        let accepts_keywords_despite_nonbase =
-            std::ptr::eq(
-                current_type(),
-                crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
-            ) || std::ptr::eq(
-                current_type(),
-                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
-            ) || std::ptr::eq(
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        let is_cffi_buffer = std::ptr::eq(
+            current_type(),
+            crate::module::_cffi_backend::cbuffer::buffer_type(),
+        );
+        #[cfg(any(feature = "sandbox", target_arch = "wasm32"))]
+        let is_cffi_buffer = false;
+        let accepts_keywords_despite_nonbase = std::ptr::eq(
+            current_type(),
+            crate::typedef::gettypeobject(&crate::FUNCTION_TYPE),
+        ) || std::ptr::eq(
+            current_type(),
+            crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+        ) || is_cffi_buffer
+            || std::ptr::eq(
                 current_type(),
                 crate::module::_collections::deque_iter::public_type(),
-            ) || std::ptr::eq(
+            )
+            || std::ptr::eq(
                 current_type(),
                 crate::module::_collections::deque_rev_iter::public_type(),
-            ) || std::ptr::eq(
+            )
+            || std::ptr::eq(
                 current_type(),
                 crate::module::_contextvars::context_var_type(),
-            ) || std::ptr::eq(current_type(), crate::module::_lzma::compressor_type())
-                || std::ptr::eq(current_type(), crate::module::_lzma::decompressor_type())
-                || is_kevent
-                || crate::_structseq::is_structseq_type(current_type());
+            )
+            || std::ptr::eq(current_type(), crate::module::_lzma::compressor_type())
+            || std::ptr::eq(current_type(), crate::module::_lzma::decompressor_type())
+            || is_kevent
+            || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(current_type()) }

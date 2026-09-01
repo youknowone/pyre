@@ -159,6 +159,15 @@ fn upa1<A1: ResidualSlot, R: ResidualRet>(
 }
 
 #[inline]
+fn up1<A1: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    path: &'static str,
+    f: unsafe fn(A1) -> R,
+) {
+    push_raw_fnaddr(entries, path, f as *const ());
+}
+
+#[inline]
 fn cp1<A1: ResidualSlot, R: ResidualRet>(
     entries: &mut Vec<(&'static str, i64)>,
     full_path: &'static str,
@@ -858,6 +867,219 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::runtime_ops::jit_next,
     );
 
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    {
+        // `_cffi_backend` — the residual leaves of a traced `W_CTypeFunc._call`:
+        // the raw exchange-buffer block, the errno swap around the foreign call
+        // (`rposix._errno_before` / `_errno_after`), and the libffi call itself.
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::cdataobj::raw_malloc_varsize_char",
+            crate::module::_cffi_backend::cdataobj::raw_malloc_varsize_char,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::cdataobj::raw_free",
+            crate::module::_cffi_backend::cdataobj::raw_free,
+        );
+        p0(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::cerrno::errno_before",
+            crate::module::_cffi_backend::cerrno::errno_before,
+        );
+        p0(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::cerrno::errno_after",
+            crate::module::_cffi_backend::cerrno::errno_after,
+        );
+        up1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::ctypefunc::get_mustfree_flag",
+            crate::module::_cffi_backend::ctypefunc::get_mustfree_flag,
+        );
+        // `jit_libffi` reaches a trace through two families: the `CIF_DESCRIPTION`
+        // readers a walked `jit_ffi_call` folds against, and the per-result-kind
+        // `libffi_call` oopspec leaves it ends in.  Both spellings of each path
+        // are published because the bodies live in the module's cfg-selected
+        // inner module and are re-exported from the file.
+        upa1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_size",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_size",
+            crate::module::_cffi_backend::jit_libffi::exchange_size,
+        );
+        upa1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_result",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_result",
+            crate::module::_cffi_backend::jit_libffi::exchange_result,
+        );
+        upa2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_arg",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_arg",
+            crate::module::_cffi_backend::jit_libffi::exchange_arg,
+        );
+        upa1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::rtype",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::rtype",
+            crate::module::_cffi_backend::jit_libffi::rtype,
+        );
+        upa1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::nargs",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::nargs",
+            crate::module::_cffi_backend::jit_libffi::nargs,
+        );
+        upa1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::types::getkind",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::types::getkind",
+            crate::module::_cffi_backend::jit_libffi::types::getkind,
+        );
+        upa1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::types::getsize",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::types::getsize",
+            crate::module::_cffi_backend::jit_libffi::types::getsize,
+        );
+        upa3(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_int",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_int",
+            crate::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_int,
+        );
+        upa3(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_float",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_float",
+            crate::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_float,
+        );
+        upa3(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_singlefloat",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_singlefloat",
+            crate::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_singlefloat,
+        );
+        upa3(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_void",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_void",
+            crate::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_void,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::cdataobj::raw_ptradd",
+            crate::module::_cffi_backend::cdataobj::raw_ptradd,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::cdataobj::raw_read_ptr",
+            crate::module::_cffi_backend::cdataobj::raw_read_ptr,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_i8",
+            crate::module::_cffi_backend::misc::raw_read_i8,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_u8",
+            crate::module::_cffi_backend::misc::raw_read_u8,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_i8",
+            crate::module::_cffi_backend::misc::raw_write_i8,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_u8",
+            crate::module::_cffi_backend::misc::raw_write_u8,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_i16",
+            crate::module::_cffi_backend::misc::raw_read_i16,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_u16",
+            crate::module::_cffi_backend::misc::raw_read_u16,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_i16",
+            crate::module::_cffi_backend::misc::raw_write_i16,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_u16",
+            crate::module::_cffi_backend::misc::raw_write_u16,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_i32",
+            crate::module::_cffi_backend::misc::raw_read_i32,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_u32",
+            crate::module::_cffi_backend::misc::raw_read_u32,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_i32",
+            crate::module::_cffi_backend::misc::raw_write_i32,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_u32",
+            crate::module::_cffi_backend::misc::raw_write_u32,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_i64",
+            crate::module::_cffi_backend::misc::raw_read_i64,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_u64",
+            crate::module::_cffi_backend::misc::raw_read_u64,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_i64",
+            crate::module::_cffi_backend::misc::raw_write_i64,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_u64",
+            crate::module::_cffi_backend::misc::raw_write_u64,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_f32",
+            crate::module::_cffi_backend::misc::raw_read_f32,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_f32",
+            crate::module::_cffi_backend::misc::raw_write_f32,
+        );
+        p1(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_read_f64",
+            crate::module::_cffi_backend::misc::raw_read_f64,
+        );
+        p2(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::misc::raw_write_f64",
+            crate::module::_cffi_backend::misc::raw_write_f64,
+        );
+    }
+
     // `unpackiterable_driver` (jd1) portal callees.  Its extracted body
     // (`_unpackiterable_unknown_length`) residual-calls `next(w_iterator)` and
     // `drain_list_append(items, w_item)` directly in source, so the codewriter
@@ -1165,6 +1387,28 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::gc_roots::reload_top_root",
         "pyre_object::reload_top_root",
         pyre_object::gc_roots::reload_top_root_jit_abi,
+    );
+    // The scope-local pair a bracket body spells as `roots.pin_root(w)` /
+    // `roots.get(slot)`: the same pin through the cached cell, and its
+    // read-back half.  The codewriter names an inherent method by its
+    // crate-stripped path, so that spelling is the alias.
+    let scope_pin_root: fn(
+        &pyre_object::gc_roots::RootScope,
+        pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef = pyre_object::gc_roots::RootScope::pin_root;
+    pa2(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::pin_root",
+        "gc_roots::RootScope::pin_root",
+        scope_pin_root,
+    );
+    let scope_get: fn(&pyre_object::gc_roots::RootScope, usize) -> pyre_object::PyObjectRef =
+        pyre_object::gc_roots::RootScope::get;
+    pa2(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::get",
+        "gc_roots::RootScope::get",
+        scope_get,
     );
     // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
     // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through
@@ -4430,6 +4674,26 @@ mod tests {
                     .strip_suffix(short)
                     .is_some_and(|prefix| prefix.ends_with("::"))
         }
+        /// One path is the other with a single interior segment removed —
+        /// the shape an inner module's own path has against the re-export
+        /// from the module that publishes it.  A one-segment deletion cannot
+        /// relate two paths of equal length, so a substitution like
+        /// `module::a::f` against `module::b::f` stays two functions.
+        fn drops_one_segment(a: &str, b: &str) -> bool {
+            // A path with a segment removed is strictly shorter in bytes, so
+            // byte length orders the pair the same way segment count does.
+            let (short, long) = if a.len() > b.len() { (b, a) } else { (a, b) };
+            let short: Vec<&str> = short.split("::").collect();
+            let long: Vec<&str> = long.split("::").collect();
+            if long.len() != short.len() + 1 {
+                return false;
+            }
+            (0..long.len()).any(|i| {
+                let mut without = long.clone();
+                without.remove(i);
+                without == short
+            })
+        }
         fn split_head(path: &str) -> Option<(&str, &str)> {
             path.split_once("::")
         }
@@ -4446,7 +4710,7 @@ mod tests {
         // rule: `module::a::type_object` and `module::b::type_object` would
         // read as aliases while address-keyed patching between them stays
         // ambiguous. Those are related by no suffix here and are reported.
-        if extends(a, b) {
+        if extends(a, b) || drops_one_segment(a, b) {
             return true;
         }
         match (split_head(a), split_head(b)) {
@@ -4472,6 +4736,13 @@ mod tests {
         assert!(are_alias_spellings(
             "module::_io::stringio::type_object",
             "pyre_interpreter::module::_io::stringio::type_object",
+        ));
+        // An inner module's own path beside the re-export the enclosing
+        // module publishes: `jit_libffi` defines its cfg-selected bodies in
+        // `imp` and re-exports them, and the LLBC carries both spellings.
+        assert!(are_alias_spellings(
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::exchange_size",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::exchange_size",
         ));
         // Two crates cannot re-export one another's item, so identical module
         // paths under different crates are two functions, not two spellings.

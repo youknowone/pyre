@@ -72,7 +72,7 @@ pub fn read_global_var(w_glob: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let _ = roots.pin_root(w_glob);
     let ptr = fetch_global_var_addr(roots.get(glob_slot))?;
     let ct = ctypeobj::ctype_arg(glob_arg(roots.get(glob_slot))?.w_ctype)?;
-    unsafe { ctypeobj::convert_to_object(ct, ptr) }
+    unsafe { ctypeobj::convert_to_object(ct, ptr as usize) }
 }
 
 /// `W_GlobSupport.write_global_var`.
@@ -84,7 +84,7 @@ pub fn write_global_var(w_glob: PyObjectRef, w_newvalue: PyObjectRef) -> Result<
     let _ = roots.pin_root(w_newvalue);
     let ptr = fetch_global_var_addr(roots.get(glob_slot))?;
     let ct = ctypeobj::ctype_arg(glob_arg(roots.get(glob_slot))?.w_ctype)?;
-    unsafe { ctypeobj::convert_from_object(ct, ptr, roots.get(value_slot)) }
+    unsafe { ctypeobj::convert_from_object(ct, ptr as usize, roots.get(value_slot)) }
 }
 
 /// `W_GlobSupport.address`.
@@ -94,7 +94,7 @@ pub fn address(w_glob: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let _ = roots.pin_root(w_glob);
     let ptr = fetch_global_var_addr(roots.get(glob_slot))?;
     let w_ctypeptr = newtype::new_pointer_type(glob_arg(roots.get(glob_slot))?.w_ctype)?;
-    Ok(cdataobj::new_cdata(ptr, w_ctypeptr))
+    Ok(cdataobj::new_cdata(ptr as usize, w_ctypeptr))
 }
 
 static GLOB_TYPE_OBJ: OnceLock<usize> = OnceLock::new();

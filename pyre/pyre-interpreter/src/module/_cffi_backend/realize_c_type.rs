@@ -251,6 +251,12 @@ pub fn realize_global_int(
 /// Temporary representation of an `OP_FUNCTION` that has not yet been
 /// required to be a pointer-to-function.
 #[crate::pyre_class("_cffi_backend.__RawFuncType")]
+// `W_RawFuncType._immutable_fields_`: `prepare_nostruct_fnptr` fills these
+// three in once, before any caller can read them, and nothing writes them
+// again.  A call through a promoted raw function type folds its
+// `nostruct_ctype` — and with it the function type's `cif_descr` — to a trace
+// constant only because of this declaration.
+#[majit_macros::jit_immutable_fields("nostruct_ctype", "nostruct_locs", "nostruct_nargs")]
 #[derive(Default)]
 pub struct W_RawFuncType {
     pub opcodes: *mut parse_c_type::OpcodeT,

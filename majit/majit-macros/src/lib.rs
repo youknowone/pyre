@@ -595,7 +595,12 @@ fn rpython_attribute_const_for(
             ("_jit_cannot_raise_", true, true),
         ],
         "look_inside" => &[("_jit_look_inside_", true, false)],
-        "jit_loop_invariant" => &[("_jit_loop_invariant_", true, false)],
+        "jit_loop_invariant" => &[
+            ("_jit_loop_invariant_", true, false),
+            // rlib/jit.py loop_invariant calls dont_look_inside(func):
+            // the attribute implies the callee is opaque to the tracer.
+            ("_jit_look_inside_", false, false),
+        ],
         // `rlib/jit.py def unroll_safe` emits no policy fn, so a
         // sibling const would be rejected in a trait impl — `unroll_safe`
         // decorates those (`majit-macros/tests/macros.rs` `NameCollider`).

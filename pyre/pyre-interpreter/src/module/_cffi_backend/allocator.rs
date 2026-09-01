@@ -68,14 +68,14 @@ pub fn allocate(
             raw_ct.name()
         )));
     }
-    if raw.ptr.is_null() {
+    if raw.ptr == 0 {
         return Err(PyError::new(
             crate::PyErrorKind::MemoryError,
             "alloc() returned NULL",
         ));
     }
     if allocator.should_clear_after_alloc != 0 {
-        unsafe { std::ptr::write_bytes(raw.ptr, 0, datasize.max(0) as usize) };
+        unsafe { std::ptr::write_bytes(raw.ptr as *mut u8, 0, datasize.max(0) as usize) };
     }
     let result = cdataobj::new_cdata_nonstd(
         raw.ptr,

@@ -38,8 +38,8 @@ pub fn new_cdata_iter(w_cdata: PyObjectRef) -> Result<PyObjectRef, PyError> {
     Ok(W_CDataIter::allocate_stable(W_CDataIter {
         ctitem: roots.get(item_slot),
         cdata: roots.get(cdata_slot),
-        next: start,
-        stop: unsafe { start.offset((length * item.size) as isize) },
+        next: start as *mut u8,
+        stop: unsafe { (start as *mut u8).offset((length * item.size) as isize) },
         ..Default::default()
     }))
 }
@@ -94,5 +94,5 @@ fn next_w(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         .ok_or_else(|| PyError::system_error("iterator without an item type"))?;
     let result = it.next;
     it.next = unsafe { it.next.offset(item.size as isize) };
-    unsafe { ctypeobj::convert_to_object(item, result) }
+    unsafe { ctypeobj::convert_to_object(item, result as usize) }
 }

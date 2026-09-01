@@ -998,6 +998,28 @@ pub enum OpKind {
         /// (descr.py:359). See `ArrayRead::nolength`.
         nolength: bool,
     },
+    /// `raw_load_{i,f}` — one element read out of raw (non-GC) memory at a
+    /// byte offset (`jtransform.py:1165-1171 rewrite_op_raw_load`).  The
+    /// descr is `arraydescrof(rffi.CArray(T))`: no length header, item
+    /// width and signedness from `T` — carried here explicitly because
+    /// [`ValueType`] collapses widths.
+    RawLoad {
+        base: crate::flowspace::model::Variable,
+        offset: crate::flowspace::model::Variable,
+        item_ty: ValueType,
+        itemsize: usize,
+        is_item_signed: bool,
+    },
+    /// `raw_store_{i,f}` (`jtransform.py:1156-1163 rewrite_op_raw_store`).
+    /// See [`OpKind::RawLoad`] for the descr shape.
+    RawStore {
+        base: crate::flowspace::model::Variable,
+        offset: crate::flowspace::model::Variable,
+        value: crate::flowspace::model::Variable,
+        item_ty: ValueType,
+        itemsize: usize,
+        is_item_signed: bool,
+    },
     /// RPython: getinteriorfield_gc_i/r/f — read a field of an array-of-structs element.
     /// effectinfo.py:313-325: generates "readinteriorfield" effect.
     /// effectinfo.py:327-340: also implicitly generates "readarray" effect.

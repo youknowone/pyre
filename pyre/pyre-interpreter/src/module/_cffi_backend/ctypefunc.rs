@@ -30,8 +30,9 @@ pub const MUSTFREE_FILE: u8 = 2;
 /// # Safety
 /// `data` must be an argument slot of an exchange buffer whose ctype is a
 /// pointer, so the byte before it belongs to this argument.
-pub unsafe fn get_mustfree_flag(data: *const u8) -> u8 {
-    unsafe { data.sub(1).read() }
+#[majit_macros::dont_look_inside_cannot_raise]
+pub unsafe fn get_mustfree_flag(data: usize) -> u8 {
+    unsafe { (data as *const u8).sub(1).read() }
 }
 
 /// `ctypefunc.py set_mustfree_flag`.
@@ -91,31 +92,60 @@ pub fn fargs_of(ct: &W_CType) -> Vec<PyObjectRef> {
 }
 
 /// `W_CTypeFunc.call` — the entry `W_CData.call` reaches.
-pub fn call(
-    ct: &W_CType,
-    funcaddr: *mut u8,
-    args_w: &[PyObjectRef],
-) -> Result<PyObjectRef, PyError> {
-    if funcaddr.is_null() {
+///
+/// The non-variadic arm is the one a trace follows: the function type is
+/// promoted, so its argument count, cif block and result type are trace
+/// constants and [`do_call`] unrolls against them.  A variadic call builds
+/// its cif per call and stays opaque, as `call_varargs` does.
+pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    // `self = jit.promote(self)`.
+    let ct: &W_CType = unsafe { &*majit_metainterp::jit::promote(ct as *const W_CType) };
+    if funcaddr == 0 {
         return Err(PyError::runtime_error(format!(
             "cannot call null function pointer from cdata '{}'",
             ct.name()
         )));
     }
-    let fargs = fargs_of(ct);
-    if !ct.cif_descr.is_null() {
-        if args_w.len() != fargs.len() {
+    let nargs = fargs_len(ct.fargs);
+    if ct.cif_descr != 0 {
+        if args_w.len() != nargs {
             return Err(PyError::type_error(format!(
                 "'{}' expects {} arguments, got {}",
                 ct.name(),
-                fargs.len(),
+                nargs,
                 args_w.len()
             )));
         }
-        return do_call(&fargs, ct.ctitem, ct.cif_descr, funcaddr, args_w);
+        return do_call(ct.fargs, ct.ctitem, ct.cif_descr, funcaddr, args_w);
     }
-    // `W_CTypeFunc.call_varargs` — the cif depends on what was passed, so it
-    // is built for this call and freed with it.
+    call_varargs(ct, funcaddr, args_w)
+}
+
+/// `len(self.fargs)` — the declared argument count of a function type.
+fn fargs_len(w_fargs: PyObjectRef) -> usize {
+    if w_fargs.is_null() {
+        return 0;
+    }
+    unsafe { pyre_object::tupleobject::w_tuple_len(w_fargs) }
+}
+
+/// `self.fargs[i]` — the declared ctype of argument `i`.
+fn farg(w_fargs: PyObjectRef, i: usize) -> PyObjectRef {
+    match unsafe { pyre_object::tupleobject::w_tuple_getitem(w_fargs, i as i64) } {
+        Some(w_farg) => w_farg,
+        None => pyre_object::PY_NULL,
+    }
+}
+
+/// `W_CTypeFunc.call_varargs` — the cif depends on what was passed, so it is
+/// built for this call and freed with it.
+#[majit_macros::dont_look_inside]
+fn call_varargs(
+    ct: &W_CType,
+    funcaddr: usize,
+    args_w: &[PyObjectRef],
+) -> Result<PyObjectRef, PyError> {
+    let fargs = fargs_of(ct);
     if args_w.len() < fargs.len() {
         return Err(PyError::type_error(format!(
             "'{}' expects at least {} arguments, got {}",
@@ -126,7 +156,13 @@ pub fn call(
     }
     let fvarargs = complete_argtypes(&fargs, args_w)?;
     let cif = build_cif_descr(&fvarargs, ct.ctitem, ct.abi, Some(fargs.len()))?;
-    let result = do_call(&fvarargs, ct.ctitem, cif, funcaddr, args_w);
+    // `new_ctypefunc_completing_argtypes` hands `_call` a function type whose
+    // `fargs` is the completed list; here the completed tuple stands in for
+    // it.  Every ctype is non-moving, so the tuple's items stay valid, and
+    // the tuple itself is pinned for the call.
+    let roots = pyre_object::gc_roots::push_roots();
+    let w_fvarargs = roots.pin_root(pyre_object::tupleobject::w_tuple_new(fvarargs));
+    let result = do_call(w_fvarargs, ct.ctitem, cif, funcaddr, args_w);
     unsafe { free_cif_descr(cif) };
     result
 }
@@ -152,22 +188,20 @@ fn complete_argtypes(
     Ok(fvarargs)
 }
 
-/// How much of the exchange buffer an ordinary signature needs.  Anything
-/// larger falls back to the heap.
-const STACK_EXCHANGE_SIZE: usize = 256;
-
-/// The stack half of the exchange buffer.  `malloc` hands back memory aligned
-/// for any type; a bare `[u8; N]` is only byte-aligned, and the buffer holds
-/// `double`, `long double` and pointers, so the alignment is spelled out here.
-#[repr(C, align(16))]
-struct ExchangeBuf([u8; STACK_EXCHANGE_SIZE]);
-
 /// `W_CTypeFunc._call` — fill the exchange buffer, call, read the result out.
+///
+/// The `try`/`finally` of the original is spelled as a labelled body whose
+/// outcome both arms of the closing `match` release: a `Result` built before
+/// the release ran could not be returned through it, so each arm builds its
+/// own after releasing.  `@jit.unroll_safe`: the argument loop runs
+/// `len(self.fargs)` times, a trace constant once the function type is
+/// promoted.
+#[majit_macros::unroll_safe]
 fn do_call(
-    fargs: &[PyObjectRef],
+    w_fargs: PyObjectRef,
     w_fresult: PyObjectRef,
-    cif: *mut u8,
-    funcaddr: *mut u8,
+    cif: usize,
+    funcaddr: usize,
     args_w: &[PyObjectRef],
 ) -> Result<PyObjectRef, PyError> {
     let fresult = ctypeobj::ctype_arg(w_fresult)?;
@@ -175,55 +209,76 @@ fn do_call(
     // receives is a native copy no collector rewrites, so the arguments are
     // read back out of the shadow stack rather than out of `args_w`.
     let roots = pyre_object::gc_roots::push_roots();
-    let args_slot = roots.base();
+    let fargs_slot = roots.base();
+    let _ = roots.pin_root(w_fargs);
+    let args_slot = fargs_slot + 1;
     for &w_arg in args_w {
         let _ = roots.pin_root(w_arg);
     }
     let size = unsafe { exchange_size(cif) };
-    let mut stack_buffer = std::mem::MaybeUninit::<ExchangeBuf>::uninit();
-    let mut heap_buffer = std::ptr::null_mut();
-    let buffer = if size <= STACK_EXCHANGE_SIZE {
-        stack_buffer.as_mut_ptr().cast::<u8>()
-    } else {
-        heap_buffer = cdataobj::raw_alloc(size as i64, false)?;
-        heap_buffer
-    };
+    let buffer = cdataobj::raw_malloc_varsize_char(size);
+    if buffer == 0 {
+        return Err(PyError::new(
+            crate::PyErrorKind::MemoryError,
+            "out of memory",
+        ));
+    }
     let mut mustfree_max_plus_1 = 0usize;
-    let called = (|| -> Result<PyObjectRef, PyError> {
+    let called = 'body: {
         for i in 0..args_w.len() {
-            let data = unsafe { buffer.add(exchange_arg(cif, i)) };
-            let argtype = ctypeobj::ctype_arg(fargs[i])?;
-            if unsafe {
-                ctypeobj::convert_argument_from_object(argtype, data, roots.get(args_slot + i))?
+            let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
+            let argtype = match ctypeobj::ctype_arg(farg(roots.get(fargs_slot), i)) {
+                Ok(argtype) => argtype,
+                Err(e) => break 'body Err(e),
+            };
+            match unsafe {
+                ctypeobj::convert_argument_from_object(argtype, data, roots.get(args_slot + i))
             } {
-                mustfree_max_plus_1 = i + 1;
+                Ok(true) => mustfree_max_plus_1 = i + 1,
+                Ok(false) => {}
+                Err(e) => break 'body Err(e),
             }
         }
-        // `clibffi.py jit_ffi_call` swaps the thread's alternate errno into
-        // the C runtime around every foreign call.
+        // `clibffi.py c_ffi_call` carries `save_err=RFFI_ERR_ALL |
+        // RFFI_ALT_ERRNO`, which swaps the thread's alternate errno into the C
+        // runtime around the foreign call.  Pyre spells that swap as its own
+        // two calls rather than as a flag the callee reads.
         super::cerrno::errno_before();
-        unsafe { invoke(cif, funcaddr, buffer, args_w.len()) };
+        unsafe { jit_ffi_call(cif, funcaddr, buffer) };
         super::cerrno::errno_after();
-        let resultdata = unsafe { buffer.add(exchange_result(cif)) };
+        let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
         unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
-    })();
+    };
+    match called {
+        Ok(w_res) => {
+            release_arguments(roots.get(fargs_slot), cif, buffer, mustfree_max_plus_1);
+            Ok(w_res)
+        }
+        Err(e) => {
+            release_arguments(roots.get(fargs_slot), cif, buffer, mustfree_max_plus_1);
+            Err(e)
+        }
+    }
+}
+
+/// The `finally` of `W_CTypeFunc._call`: free what the converted pointer
+/// arguments allocated, then the exchange buffer itself.
+#[majit_macros::unroll_safe]
+fn release_arguments(w_fargs: PyObjectRef, cif: usize, buffer: usize, mustfree_max_plus_1: usize) {
     for i in 0..mustfree_max_plus_1 {
-        let Some(argtype) = ctypeobj::ctype_at(fargs[i]) else {
+        let Some(argtype) = ctypeobj::ctype_at(farg(w_fargs, i)) else {
             continue;
         };
         if argtype.kind != ctypeobj::KIND_POINTER {
             continue;
         }
-        let data = unsafe { buffer.add(exchange_arg(cif, i)) };
+        let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
         if unsafe { get_mustfree_flag(data) } == MUSTFREE_FREE {
-            let raw = unsafe { data.cast::<*mut u8>().read_unaligned() };
-            unsafe { libc::free(raw.cast::<libc::c_void>()) };
+            let raw = cdataobj::raw_read_ptr(data);
+            cdataobj::raw_free(raw);
         }
     }
-    if !heap_buffer.is_null() {
-        unsafe { libc::free(heap_buffer.cast::<libc::c_void>()) };
-    }
-    called
+    cdataobj::raw_free(buffer);
 }
 
 // ── the CIF_DESCRIPTION block ───────────────────────────────────────────
@@ -237,77 +292,10 @@ fn do_call(
     ),
     not(any(target_env = "musl", target_env = "sgx"))
 ))]
-mod cif {
+pub(crate) mod cif {
+    use super::super::jit_libffi::{CifDescription, SIZE_OF_FFI_ARG, exchange_args, header};
     use super::{PyError, PyObjectRef, W_CType, ctypeobj};
-    use libffi::low::{CodePtr, ffi_abi, ffi_cif, ffi_type, type_tag, types};
-
-    /// `jit_libffi.py CIF_DESCRIPTION`.  An array of `nargs` exchange offsets
-    /// follows the record; `atypes` and any struct `ffi_type` follow that, all
-    /// inside the one block this describes.
-    #[repr(C)]
-    pub struct CifDescription {
-        pub cif: ffi_cif,
-        pub abi: ffi_abi,
-        pub nargs: usize,
-        pub rtype: *mut ffi_type,
-        pub atypes: *mut *mut ffi_type,
-        pub exchange_size: usize,
-        pub exchange_result: usize,
-    }
-
-    /// `jit_libffi.py SIZE_OF_FFI_ARG`.
-    const SIZE_OF_FFI_ARG: usize = std::mem::size_of::<libffi::low::ffi_arg>();
-
-    unsafe fn header(cif: *mut u8) -> &'static mut CifDescription {
-        unsafe { &mut *cif.cast::<CifDescription>() }
-    }
-
-    unsafe fn exchange_args(cif: *mut u8) -> *mut usize {
-        unsafe {
-            cif.add(std::mem::size_of::<CifDescription>())
-                .cast::<usize>()
-        }
-    }
-
-    pub unsafe fn exchange_size(cif: *mut u8) -> usize {
-        unsafe { header(cif).exchange_size }
-    }
-
-    pub unsafe fn exchange_result(cif: *mut u8) -> usize {
-        unsafe { header(cif).exchange_result }
-    }
-
-    pub unsafe fn exchange_arg(cif: *mut u8, i: usize) -> usize {
-        unsafe { exchange_args(cif).add(i).read() }
-    }
-
-    /// `jit_libffi.py jit_ffi_call_impl_any` — point the argument array at the
-    /// slots the exchange buffer already holds and hand libffi the result slot.
-    ///
-    /// # Safety
-    /// `buffer` must be an exchange buffer this `cif` describes, filled with
-    /// `nargs` converted arguments, and `funcaddr` must be the entry point the
-    /// cif was prepared for.
-    pub unsafe fn invoke(cif: *mut u8, funcaddr: *mut u8, buffer: *mut u8, nargs: usize) {
-        let argptrs = buffer.cast::<*mut std::ffi::c_void>();
-        for i in 0..nargs {
-            unsafe {
-                argptrs
-                    .add(i)
-                    .write(buffer.add(exchange_arg(cif, i)).cast::<std::ffi::c_void>())
-            };
-        }
-        let resultdata = unsafe { buffer.add(exchange_result(cif)) };
-        let descr = unsafe { header(cif) };
-        unsafe {
-            libffi::low::call_return_into(
-                &raw mut descr.cif,
-                CodePtr::from_ptr(funcaddr.cast::<std::ffi::c_void>()),
-                argptrs,
-                resultdata.cast::<std::ffi::c_void>(),
-            );
-        }
-    }
+    use libffi::low::{ffi_abi, ffi_type, type_tag, types};
 
     /// `CifDescrBuilder` — the two-pass bump allocator that measures the block
     /// and then fills it.
@@ -596,7 +584,7 @@ mod cif {
         w_fresult: PyObjectRef,
         abi: i64,
         nfixedargs: Option<usize>,
-    ) -> Result<*mut u8, PyError> {
+    ) -> Result<usize, PyError> {
         let mut builder = Builder {
             fargs,
             w_fresult,
@@ -607,10 +595,10 @@ mod cif {
         };
         builder.build()?;
         let rawmem = super::cdataobj::raw_alloc(builder.nb_bytes as i64, true)?;
-        builder.bufferp = rawmem;
+        builder.bufferp = rawmem as *mut u8;
         builder.nb_bytes = 0;
         if let Err(e) = builder.build() {
-            unsafe { libc::free(rawmem.cast::<libc::c_void>()) };
+            unsafe { libc::free(rawmem as *mut libc::c_void) };
             return Err(e);
         }
 
@@ -628,12 +616,12 @@ mod cif {
             }
             let atype = unsafe { builder.atypes.add(i).read() };
             offset = align_arg(align_to(offset, atype));
-            unsafe { exchange_args(rawmem).add(i).write(offset) };
+            unsafe { exchange_args(rawmem as usize).add(i).write(offset) };
             offset += unsafe { (*atype).size };
         }
 
         // `CifDescrBuilder.fb_extra_fields`, then `jit_ffi_prep_cif`.
-        let descr = unsafe { header(rawmem) };
+        let descr = unsafe { header(rawmem as usize) };
         descr.abi = abi as ffi_abi;
         descr.nargs = nargs;
         descr.rtype = builder.rtype;
@@ -653,20 +641,20 @@ mod cif {
             None => unsafe { libffi::low::prep_cif(cif, abi, nargs, rtype, atypes) },
         };
         if prepared.is_err() {
-            unsafe { libc::free(rawmem.cast::<libc::c_void>()) };
+            unsafe { libc::free(rawmem as *mut libc::c_void) };
             return Err(PyError::system_error(
                 "libffi failed to build this function type",
             ));
         }
-        Ok(rawmem)
+        Ok(rawmem as usize)
     }
 
     /// `W_CTypeFunc.__del__` — the block is one allocation.
     ///
     /// # Safety
     /// `cif` must come from [`build_cif_descr`] and not be in use.
-    pub unsafe fn free_cif_descr(cif: *mut u8) {
-        unsafe { libc::free(cif.cast::<libc::c_void>()) };
+    pub unsafe fn free_cif_descr(cif: usize) {
+        unsafe { libc::free(cif as *mut libc::c_void) };
     }
 }
 
@@ -679,7 +667,7 @@ mod cif {
     ),
     not(any(target_env = "musl", target_env = "sgx"))
 )))]
-mod cif {
+pub(crate) mod cif {
     use super::{PyError, PyObjectRef};
 
     /// No libffi on this target, so no foreign call can be described.
@@ -688,28 +676,14 @@ mod cif {
         _w_fresult: PyObjectRef,
         _abi: i64,
         _nfixedargs: Option<usize>,
-    ) -> Result<*mut u8, PyError> {
+    ) -> Result<usize, PyError> {
         Err(PyError::not_implemented(
             "this platform has no libffi, so a C function cannot be called",
         ))
     }
 
-    pub unsafe fn free_cif_descr(_cif: *mut u8) {}
-
-    pub unsafe fn exchange_size(_cif: *mut u8) -> usize {
-        0
-    }
-
-    pub unsafe fn exchange_result(_cif: *mut u8) -> usize {
-        0
-    }
-
-    pub unsafe fn exchange_arg(_cif: *mut u8, _i: usize) -> usize {
-        0
-    }
-
-    pub unsafe fn invoke(_cif: *mut u8, _funcaddr: *mut u8, _buffer: *mut u8, _nargs: usize) {}
+    pub unsafe fn free_cif_descr(_cif: usize) {}
 }
 
+use super::jit_libffi::{exchange_arg, exchange_result, exchange_size, jit_ffi_call};
 pub use cif::{build_cif_descr, free_cif_descr};
-use cif::{exchange_arg, exchange_result, exchange_size, invoke};

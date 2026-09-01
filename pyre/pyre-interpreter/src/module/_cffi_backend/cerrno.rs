@@ -25,6 +25,7 @@ pub fn set_errno(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 /// `rposix._errno_before(RFFI_ALT_ERRNO)`.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn errno_before() {
     let value = SAVED_ALT_ERRNO.with(Cell::get);
     #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
@@ -36,6 +37,7 @@ pub fn errno_before() {
 }
 
 /// `rposix._errno_after(RFFI_ALT_ERRNO)`.
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn errno_after() {
     // `_errno_after` reads LastError before errno because reading errno may
     // itself overwrite the Windows error state.

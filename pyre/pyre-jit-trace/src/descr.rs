@@ -344,6 +344,33 @@ fn get_or_create_array_descr_with_full_id(
     arc
 }
 
+/// `cpu.arraydescrof(rffi.CArray(TYPE))` for a raw C array of `item_size`
+/// bytes per element — the descr shape `ffisupport.py _get_ffi2descr_dict`
+/// hands back for one libffi argument slot.
+///
+/// A `CArray` has no header and no length field, so `base_size` is zero and
+/// the index a `GETARRAYITEM_RAW` carries scales straight by `item_size`.
+/// The identity string is the one the codewriter stamps on the raw
+/// load/store descrs of the same width, so a store recorded through the
+/// codewriter and a read recorded here land on one cache slot and the
+/// virtual raw buffer sees a single descr per width.
+pub fn raw_carray_descr(item_type: Type, item_size: usize, is_item_signed: bool) -> DescrRef {
+    let prefix = match item_type {
+        Type::Float => "f",
+        _ if is_item_signed => "i",
+        _ => "u",
+    };
+    get_or_create_array_descr_with_full_id(
+        0,
+        item_size,
+        0,
+        item_type,
+        is_item_signed,
+        None,
+        Some(format!("majit::raw_carray_{prefix}{}", item_size * 8)),
+    )
+}
+
 impl Descr for PyreFieldDescr {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)

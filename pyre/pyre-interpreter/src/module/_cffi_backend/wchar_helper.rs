@@ -13,7 +13,8 @@ use super::misc;
 pub unsafe fn utf8_from_char32(ptr: *const u8, length: i64) -> Result<(Wtf8Buf, i64), PyError> {
     let mut out = Wtf8Buf::new();
     for i in 0..length {
-        let ordinal = unsafe { misc::read_raw_unsigned_data(ptr.offset((i * 4) as isize), 4)? };
+        let ordinal =
+            unsafe { misc::read_raw_unsigned_data((ptr.offset((i * 4) as isize)) as usize, 4)? };
         let ordinal = ordinal as u32;
         let Some(point) = CodePoint::from_u32(ordinal) else {
             return Err(PyError::value_error(format!(
@@ -35,11 +36,13 @@ pub unsafe fn utf8_from_char16(ptr: *const u8, length: i64) -> Result<(Wtf8Buf, 
     let mut result_length = length;
     while i < length {
         let mut ordinal =
-            unsafe { misc::read_raw_unsigned_data(ptr.offset((i * 2) as isize), 2)? } as u32;
+            unsafe { misc::read_raw_unsigned_data((ptr.offset((i * 2) as isize)) as usize, 2)? }
+                as u32;
         i += 1;
         if (0xD800..=0xDBFF).contains(&ordinal) && i < length {
-            let low =
-                unsafe { misc::read_raw_unsigned_data(ptr.offset((i * 2) as isize), 2)? } as u32;
+            let low = unsafe {
+                misc::read_raw_unsigned_data((ptr.offset((i * 2) as isize)) as usize, 2)?
+            } as u32;
             if (0xDC00..=0xDFFF).contains(&low) {
                 ordinal = (((ordinal & 0x3ff) << 10) | (low & 0x3ff)) + 0x10000;
                 i += 1;
@@ -59,7 +62,10 @@ unsafe fn measure_length(ptr: *const u8, unit_size: i64, maxlen: i64) -> Result<
     let mut result = 0;
     while maxlen < 0 || result < maxlen {
         if unsafe {
-            misc::read_raw_unsigned_data(ptr.offset((result * unit_size) as isize), unit_size)?
+            misc::read_raw_unsigned_data(
+                (ptr.offset((result * unit_size) as isize)) as usize,
+                unit_size,
+            )?
         } == 0
         {
             break;
@@ -100,7 +106,7 @@ pub unsafe fn utf8_to_char32(
     for (i, point) in value.code_points().enumerate() {
         unsafe {
             misc::write_raw_unsigned_data(
-                target.offset((i * 4) as isize),
+                (target.offset((i * 4) as isize)) as usize,
                 u64::from(point.to_u32()),
                 4,
             )?
@@ -108,7 +114,11 @@ pub unsafe fn utf8_to_char32(
     }
     if add_final_zero {
         unsafe {
-            misc::write_raw_unsigned_data(target.offset((target_length * 4) as isize), 0, 4)?
+            misc::write_raw_unsigned_data(
+                (target.offset((target_length * 4) as isize)) as usize,
+                0,
+                4,
+            )?
         };
     }
     Ok(())
@@ -131,12 +141,12 @@ pub unsafe fn utf8_to_char16(
             ordinal -= 0x10000;
             unsafe {
                 misc::write_raw_unsigned_data(
-                    target.offset((at * 2) as isize),
+                    (target.offset((at * 2) as isize)) as usize,
                     u64::from(0xd800 | (ordinal >> 10)),
                     2,
                 )?;
                 misc::write_raw_unsigned_data(
-                    target.offset(((at + 1) * 2) as isize),
+                    (target.offset(((at + 1) * 2) as isize)) as usize,
                     u64::from(0xdc00 | (ordinal & 0x3ff)),
                     2,
                 )?;
@@ -145,7 +155,7 @@ pub unsafe fn utf8_to_char16(
         } else {
             unsafe {
                 misc::write_raw_unsigned_data(
-                    target.offset((at * 2) as isize),
+                    (target.offset((at * 2) as isize)) as usize,
                     u64::from(ordinal),
                     2,
                 )?
@@ -155,7 +165,9 @@ pub unsafe fn utf8_to_char16(
     }
     debug_assert_eq!(at, target_length);
     if add_final_zero {
-        unsafe { misc::write_raw_unsigned_data(target.offset((at * 2) as isize), 0, 2)? };
+        unsafe {
+            misc::write_raw_unsigned_data((target.offset((at * 2) as isize)) as usize, 0, 2)?
+        };
     }
     Ok(())
 }

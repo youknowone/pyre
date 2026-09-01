@@ -4652,6 +4652,42 @@ fn write_vable_field_ref_reg<Sym: WalkSym>(
     Ok(())
 }
 
+/// One raw integer element read of `itemsize` bytes at `addr`, widened to
+/// `i64` by the descr's signedness — the `bhimpl_raw_load_i` width dispatch.
+///
+/// # Safety
+/// `addr` must name readable memory of at least `itemsize` bytes.
+unsafe fn raw_load_int(addr: *const u8, itemsize: usize, signed: bool) -> i64 {
+    unsafe {
+        match (itemsize, signed) {
+            (1, true) => i64::from(addr.cast::<i8>().read_unaligned()),
+            (1, false) => i64::from(addr.read_unaligned()),
+            (2, true) => i64::from(addr.cast::<i16>().read_unaligned()),
+            (2, false) => i64::from(addr.cast::<u16>().read_unaligned()),
+            (4, true) => i64::from(addr.cast::<i32>().read_unaligned()),
+            (4, false) => i64::from(addr.cast::<u32>().read_unaligned()),
+            (8, _) => addr.cast::<i64>().read_unaligned(),
+            _ => panic!("raw_load descr itemsize {itemsize} is not a minted width"),
+        }
+    }
+}
+
+/// Store counterpart of [`raw_load_int`] — `bhimpl_raw_store_i`.
+///
+/// # Safety
+/// `addr` must name writable memory of at least `itemsize` bytes.
+unsafe fn raw_store_int(addr: *mut u8, itemsize: usize, value: i64) {
+    unsafe {
+        match itemsize {
+            1 => addr.write_unaligned(value as u8),
+            2 => addr.cast::<u16>().write_unaligned(value as u16),
+            4 => addr.cast::<u32>().write_unaligned(value as u32),
+            8 => addr.cast::<i64>().write_unaligned(value),
+            _ => panic!("raw_store descr itemsize {itemsize} is not a minted width"),
+        }
+    }
+}
+
 /// Int-bank twin of [`read_ref_reg_concrete`] (Int-bank concrete shadow).
 /// Reads the Int-bank slot at the operand index from
 /// `ctx.concrete_registers_i`.  Returns `ConcreteValue::Null` for
@@ -4691,6 +4727,24 @@ pub(crate) fn read_float_reg_concrete<Sym: WalkSym>(
             Value::Float(v) => ConcreteValue::Float(v),
             _ => ConcreteValue::Null,
         })
+}
+
+/// Float-valued store counterpart of [`raw_store_int`] —
+/// `bhimpl_raw_store_f`.
+///
+/// # Safety
+/// `addr` must name writable memory of at least `itemsize` bytes.
+unsafe fn raw_store_float(addr: *mut u8, itemsize: usize, value: f64) {
+    unsafe {
+        match itemsize {
+            8 => addr.cast::<f64>().write_unaligned(value),
+            // A single-precision element is not a Float-bank value:
+            // `jit_libffi.py types` keeps the `'S'` kind residual for that
+            // reason, and `_handle_raw_access_call` mints no float width but
+            // `f64`.
+            _ => panic!("raw_store_f descr itemsize {itemsize} is not a minted width"),
+        }
+    }
 }
 
 /// Int-bank twin of [`write_ref_reg`] (Int-bank concrete shadow).  Writes an Int
@@ -7989,6 +8043,320 @@ fn clear_walk_exception<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
     ctx.clear_last_exc_value();
 }
 
+/// `pyjitpl.py MetaInterp.direct_libffi_call` — the `OS_LIBFFI_CALL`
+/// sub-case of the forces-virtual-or-virtualizable branch, ahead of the
+/// release-gil and may-force ones.
+///
+/// ```python
+/// def direct_libffi_call(self, argboxes, valueconst, orig_calldescr):
+///     assert self.staticdata.has_libffi_call
+///     box_cif_description = argboxes[1]
+///     if not isinstance(box_cif_description, ConstInt):
+///         return None     # cannot be handled by direct_libffi_call()
+///     cif_description = box_cif_description.getint()
+///     ...
+///     calldescr = self.cpu.calldescrof_dynamic(cif_description, extrainfo)
+///     if calldescr is None:
+///         return None     # cannot be handled by direct_libffi_call()
+///     box_exchange_buffer = argboxes[3]
+///     for i in range(cif_description.nargs):
+///         kind, descr, itemsize = get_arg_descr(self.cpu, cif_description.atypes[i])
+///         ofs = cif_description.exchange_args[i]
+///         assert ofs % itemsize == 0
+///         ...record GETARRAYITEM_RAW_I / _F...
+///     c_saveall = ConstInt(rffi.RFFI_ERR_ALL | rffi.RFFI_ALT_ERRNO)
+///     opnum = rop.call_release_gil_for_descr(orig_calldescr)
+///     return self.history.record_nospec(opnum,
+///                                       [c_saveall, argboxes[2]] + arg_boxes,
+///                                       valueconst, calldescr)
+/// ```
+///
+/// The recorded call takes the argument *values* instead of the buffer, so
+/// the buffer itself never reaches a call and can stay virtual; the result
+/// is written back into it by the `raw_store` that follows the call in
+/// `jit_libffi.rs`'s `_do_ffi_call_*`.
+///
+/// Every "cannot be handled" answer is [`LibffiCallOutcome::Declined`],
+/// which puts the caller back on the release-gil / may-force selection —
+/// the same fallthrough upstream's `if resbox is None:` takes.  Beyond that the shape is
+/// [`direct_call_release_gil`]'s: the helper still runs concretely on the
+/// original `allboxes`, the heapcache is still invalidated on the
+/// corresponding `CALL_MAY_FORCE_*`, and the same two guards close it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+)]
+fn direct_libffi_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    ei: &majit_ir::EffectInfo,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+    pc: usize,
+    caller: &'static str,
+) -> Result<LibffiCallOutcome, DispatchError> {
+    // pyjitpl.py: box_cif_description = argboxes[1]; if not ConstInt: return None
+    let Some(cif_box) = allboxes.get(1).copied() else {
+        return Ok(LibffiCallOutcome::Declined);
+    };
+    let Some(majit_ir::Value::Int(cif_description)) = cif_box.inline_const_to_value() else {
+        return Ok(LibffiCallOutcome::Declined);
+    };
+    if cif_description <= 0 {
+        return Ok(LibffiCallOutcome::Declined);
+    }
+    let cif_description = cif_description as usize;
+    // pyjitpl.py: box_exchange_buffer = argboxes[3]
+    let (Some(func_addr_box), Some(exchange_buffer_box)) =
+        (allboxes.get(2).copied(), allboxes.get(3).copied())
+    else {
+        return Ok(LibffiCallOutcome::Declined);
+    };
+    // `cpu.calldescrof_dynamic(cif_description, extrainfo)` returns None on
+    // any kind the backend cannot carry (`ffisupport.py get_call_descr_dynamic`
+    // catching `UnsupportedKind`), and so does this.
+    let Some(plan) = libffi_call_plan(cif_description, dst_bank) else {
+        return Ok(LibffiCallOutcome::Declined);
+    };
+
+    // pyjitpl.py `vable_and_vrefs_before_residual_call` — libffi is
+    // unconditionally a forces sub-case, so no gate; see
+    // [`direct_call_release_gil`] for the IR-vs-heap split.
+    maybe_walker_vable_and_vrefs_before_residual_call(ctx, pc);
+
+    // pyjitpl.py: one GETARRAYITEM_RAW per non-void argument, reading the
+    // slot the argument conversion already stored into.
+    let mut arg_boxes: Vec<OpRef> = Vec::with_capacity(plan.args.len());
+    for arg in &plan.args {
+        let index = ctx.trace_ctx.const_int(arg.index);
+        let arg_descr = crate::descr::raw_carray_descr(arg.item_type, arg.item_size, arg.signed);
+        let opcode = match arg.item_type {
+            Type::Float => OpCode::GetarrayitemRawF,
+            _ => OpCode::GetarrayitemRawI,
+        };
+        arg_boxes.push(ctx.trace_ctx.record_op_with_descr(
+            opcode,
+            &[exchange_buffer_box, index],
+            arg_descr,
+        ));
+    }
+
+    // pyjitpl.py: "for now, any call via libffi saves and restores
+    // everything (that is, errno and SetLastError/GetLastError on Windows).
+    // Note these flags match the ones in clibffi.ll_callback".
+    let c_saveall = ctx.trace_ctx.const_int(
+        majit_translate::translator::rtyper::lltypesystem::rffi::RFFI_ERR_ALL
+            | majit_translate::translator::rtyper::lltypesystem::rffi::RFFI_ALT_ERRNO,
+    );
+    // pyjitpl.py: opnum = rop.call_release_gil_for_descr(orig_calldescr),
+    // asserted equal to the one the dynamic descr selects.
+    let opcode = match dst_bank {
+        'i' => OpCode::CallReleaseGilI,
+        'f' => OpCode::CallReleaseGilF,
+        'v' => OpCode::CallReleaseGilN,
+        _ => unreachable!(
+            "{caller}: dst_bank '{dst_bank}' reached direct_libffi_call, but \
+             libffi_call_plan admits only the 'i' / 'f' / 'v' result kinds \
+             resoperation.py:1240-1248 gives a CALL_RELEASE_GIL opcode"
+        ),
+    };
+    let calldescr = majit_metainterp::make_call_descr_sized_with_effect(
+        &plan.arg_types,
+        plan.result_type,
+        plan.result_signed,
+        plan.result_size,
+        ei.clone(),
+    );
+    let mut new_args = Vec::with_capacity(arg_boxes.len() + 2);
+    new_args.push(c_saveall);
+    new_args.push(func_addr_box);
+    new_args.extend_from_slice(&arg_boxes);
+    // Record-then-execute, as in `direct_call_release_gil`: the FBW walker
+    // records before it runs the helper, and the result back-patches
+    // `recorded`.
+    let recorded = ctx
+        .trace_ctx
+        .record_op_with_descr(opcode, &new_args, calldescr);
+
+    // pyjitpl.py step 2 / step 5 both key on the corresponding
+    // `CALL_MAY_FORCE_*`, on the ORIGINAL `allboxes` and the ORIGINAL descr:
+    // what actually runs is the `jit_ffi_call_impl_*` helper the jitcode
+    // named, not the C function the recorded op names.
+    let mayforce_opnum = match dst_bank {
+        'i' => OpCode::CallMayForceI,
+        'f' => OpCode::CallMayForceF,
+        'v' => OpCode::CallMayForceN,
+        _ => unreachable!("dst_bank validated above"),
+    };
+    let resid_exec = try_execute_residual_call_via_executor(
+        ctx,
+        mayforce_opnum,
+        allboxes,
+        call_descr,
+        recorded,
+        pc,
+        None,
+    )?;
+    let resid_raised = match resid_exec {
+        ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::Declined(cause) => {
+            fbw_abort_nested_unjournaled_residual(ctx, pc, Some(cause))?;
+            fbw_mark_unjournaled_effect(cause);
+            false
+        }
+    };
+    debug_assert!(
+        !resid_raised || ei.check_can_raise(false),
+        "{caller}: libffi helper raised on a `!can_raise` EI — \
+         EffectInfo claim/reality mismatch"
+    );
+    ctx.trace_ctx
+        .heapcache_invalidate_caches_varargs(mayforce_opnum, Some(ei), allboxes);
+    if dst_bank != 'v' {
+        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, recorded)?;
+    }
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    if ei.check_can_raise(false) {
+        if resid_raised {
+            walker_record_guard_exception(ctx, pc);
+            let exc = ctx
+                .last_exc_value()
+                .expect("resid_raised implies last_exc_value seeded by the Err branch");
+            let exc_concrete = ctx.last_exc_value_concrete();
+            return Ok(LibffiCallOutcome::Raised(DispatchOutcome::SubRaise {
+                exc,
+                exc_concrete,
+            }));
+        }
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    }
+    Ok(LibffiCallOutcome::Recorded)
+}
+
+/// What [`direct_libffi_call`] did, in the three shapes the caller has to
+/// tell apart: upstream's `resbox is None` fallthrough, its recorded
+/// specialization, and the raising arm that stops the walk.
+pub(crate) enum LibffiCallOutcome {
+    /// `return None  # cannot be handled by direct_libffi_call()`.  The
+    /// caller goes on to the release-gil / may-force selection.
+    Declined,
+    /// The `CALL_RELEASE_GIL_*` and both of the forces branch's guards were
+    /// recorded; the caller has nothing left to do for this residual.
+    Recorded,
+    /// The concretely-executed helper raised, so nothing after the call is
+    /// recorded onto this arm.
+    Raised(DispatchOutcome),
+}
+
+/// One argument of a libffi call as the trace records it:
+/// `ffisupport.py get_arg_descr`'s `(kind, descr, itemsize)` triple plus the
+/// index into the exchange buffer that `descr` scales.
+struct LibffiArg {
+    item_type: Type,
+    item_size: usize,
+    signed: bool,
+    index: i64,
+}
+
+/// What `cpu.calldescrof_dynamic` needs off a `CIF_DESCRIPTION`, and what
+/// the per-argument `GETARRAYITEM_RAW` records need.
+struct LibffiCallPlan {
+    args: Vec<LibffiArg>,
+    arg_types: Vec<Type>,
+    result_type: Type,
+    result_signed: bool,
+    result_size: usize,
+}
+
+/// `ffisupport.py get_call_descr_dynamic` + `get_arg_descr`, read straight
+/// off the `CIF_DESCRIPTION` block at `cif_description`.
+///
+/// `None` is `UnsupportedKind`: a struct passed by value, a `long double`, a
+/// single-float, and a `long long` wider than a machine word have no
+/// argument slot a `CALL_RELEASE_GIL` can carry here, and a result kind that
+/// disagrees with the residual's own destination bank means the jitcode and
+/// the cif describe different calls.
+///
+/// `module/mod.rs` gates `_cffi_backend` on the same two conditions the
+/// attribute names.
+#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+fn libffi_call_plan(cif_description: usize, dst_bank: char) -> Option<LibffiCallPlan> {
+    use pyre_interpreter::module::_cffi_backend::jit_libffi::{self, kind, types};
+
+    // `ffi_result = cif_description.rtype; reskind = get_ffi_type_kind(...)`.
+    let rtype = unsafe { jit_libffi::rtype(cif_description) };
+    let reskind = unsafe { types::getkind(rtype) };
+    // `if reskind == 'v': result_size = 0 else: intmask(ffi_result.c_size)`;
+    // `is_ffi_type_signed` answers `kind != 'u'`.
+    let (result_type, result_signed) = match reskind {
+        kind::VOID if dst_bank == 'v' => (Type::Void, false),
+        kind::SIGNED if dst_bank == 'i' => (Type::Int, true),
+        kind::UNSIGNED if dst_bank == 'i' => (Type::Int, false),
+        kind::FLOAT if dst_bank == 'f' => (Type::Float, true),
+        _ => return None,
+    };
+    let result_size = if reskind == kind::VOID {
+        0
+    } else {
+        unsafe { types::getsize(rtype) }
+    };
+    let nargs = unsafe { jit_libffi::nargs(cif_description) };
+    let mut args = Vec::with_capacity(nargs);
+    let mut arg_types = Vec::with_capacity(nargs);
+    for i in 0..nargs {
+        let atype = unsafe { jit_libffi::atype(cif_description, i) };
+        let argkind = unsafe { types::getkind(atype) };
+        // `_get_ffi2descr_dict`: an integer argument keys on its own size, a
+        // float on `('f', 0)`.  `('v', 0)` is the one entry that carries no
+        // descr — the argument occupies no slot and is skipped.
+        let (item_type, item_size, signed) = match argkind {
+            kind::VOID => continue,
+            kind::SIGNED => (Type::Int, unsafe { types::getsize(atype) }, true),
+            kind::UNSIGNED => (Type::Int, unsafe { types::getsize(atype) }, false),
+            kind::FLOAT => (Type::Float, 8, false),
+            _ => return None,
+        };
+        if item_size == 0 {
+            return None;
+        }
+        // `ofs = cif_description.exchange_args[i]; assert ofs % itemsize == 0`
+        // — the index a `GETARRAYITEM_RAW` carries is that offset in items,
+        // so an offset the item size does not divide has no such spelling.
+        let ofs = unsafe { jit_libffi::exchange_arg(cif_description, i) };
+        if ofs % item_size != 0 {
+            return None;
+        }
+        args.push(LibffiArg {
+            item_type,
+            item_size,
+            signed,
+            index: i64::try_from(ofs / item_size).ok()?,
+        });
+        arg_types.push(item_type);
+    }
+    Some(LibffiCallPlan {
+        args,
+        arg_types,
+        result_type,
+        result_signed,
+        result_size,
+    })
+}
+
+/// `pyjitpl.py`'s `assert self.staticdata.has_libffi_call`, which its own
+/// comment describes as "an 'assert' that constant-folds away the rest of
+/// this function if the codewriter didn't produce any OS_LIBFFI_CALL at
+/// all".  `_cffi_backend` is the only producer of that oopspec, so a build
+/// without it reads no `CIF_DESCRIPTION` and declines to the same
+/// `resbox is None` fallthrough an unsupported kind takes.
+#[cfg(any(feature = "sandbox", target_arch = "wasm32"))]
+fn libffi_call_plan(_cif_description: usize, _dst_bank: char) -> Option<LibffiCallPlan> {
+    None
+}
+
 fn direct_call_release_gil<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     ei: &majit_ir::EffectInfo,
@@ -8216,23 +8584,16 @@ pub(crate) unsafe fn resolve_inlinable_callee(
 ///
 /// Returns the resolved `__call__` alongside the class it was found through and
 /// that class's version tag, which is what pins the lookup: the walker's
-/// counterpart of `space.lookup` promoting the type.  A `__call__` that is not
-/// a plain inlinable function — a builtin slot, a `classmethod`, another
-/// callable object — has no body to walk and declines here, exactly as
-/// `resolve_inlinable_callee` declines a non-`Function` callee.
+/// counterpart of `space.lookup` promoting the type.  What kind of callable the
+/// answer is — an app-level function to inline, a builtin gateway to descend
+/// into — is the caller's question; a lookup this cannot pin (an unversioned
+/// class, a class whose `__call__` is `type.__call__`) declines here.
 ///
 /// # Safety
 /// `callable` must be a valid object.
-unsafe fn resolve_instance_dunder_call(
+unsafe fn lookup_instance_dunder_call(
     callable: pyre_object::PyObjectRef,
-) -> Option<(
-    pyre_object::PyObjectRef,
-    pyre_object::PyObjectRef,
-    u64,
-    *const (),
-    usize,
-    bool,
-)> {
+) -> Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef, u64)> {
     if callable.is_null() {
         return None;
     }
@@ -8253,6 +8614,28 @@ unsafe fn resolve_instance_dunder_call(
         return None;
     }
     let method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__call__") }?;
+    Some((method, w_class, version_tag))
+}
+
+/// [`lookup_instance_dunder_call`] narrowed to an app-level `__call__` the
+/// walker can inline.  A `__call__` that is not a plain inlinable function — a
+/// `classmethod`, another callable object — has no body to walk and declines
+/// here, exactly as `resolve_inlinable_callee` declines a non-`Function`
+/// callee; a builtin gateway `__call__` is `try_walker_inline_builtin_call`'s.
+///
+/// # Safety
+/// `callable` must be a valid object.
+unsafe fn resolve_instance_dunder_call(
+    callable: pyre_object::PyObjectRef,
+) -> Option<(
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    u64,
+    *const (),
+    usize,
+    bool,
+)> {
+    let (method, w_class, version_tag) = unsafe { lookup_instance_dunder_call(callable) }?;
     let (w_code, nparams, has_closure) = unsafe { resolve_inlinable_callee(method) }?;
     Some((method, w_class, version_tag, w_code, nparams, has_closure))
 }
@@ -9237,6 +9620,14 @@ fn walker_box_int<Sym: WalkSym>(
 ) -> Result<OpRef, DispatchError> {
     let _ = (op_pc, value);
     Ok(crate::state::wrapint(ctx.trace_ctx, raw))
+}
+
+/// Float twin of [`walker_box_int`]: records the `NEW_WITH_VTABLE +
+/// SETFIELD_GC` pair for a `W_FloatObject` so the box stays virtualizable.
+/// There is no tagged float representation, so the boxed concrete is just the
+/// heap pointer and no counterpart to [`box_int_concrete`] is needed.
+fn walker_box_float<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, raw: OpRef) -> OpRef {
+    crate::state::wrapfloat(ctx.trace_ctx, raw)
 }
 
 /// Concrete counterpart to [`walker_box_int`]. The op is now a heap
@@ -11684,17 +12075,39 @@ fn handle<Sym: WalkSym>(
         "setfield_gc_f/rfd" => setfield_gc_via_heapcache(code, op, ctx, 'f'),
         // Raw memory carries no heapcache bookkeeping: where the `_gc_`
         // family consults and updates the cache, `pyjitpl.py`'s raw pair
-        // only records.
+        // only records into the cache-free path.
         //
         //   def opimpl_raw_load_i(self, addrbox, offsetbox, arraydescr):
         //       return self.execute_with_descr(rop.RAW_LOAD_I, arraydescr,
         //                                      addrbox, offsetbox)
         //
+        // `execute_with_descr` executes the load as well as recording it,
+        // and the walk is the execution: the address was produced by
+        // residual calls the walk ran natively, so when both operands carry
+        // concretes the load is performed against the live memory and the
+        // result shadow gets the loaded word.  Without concretes the result
+        // stays `Null` and readers decline instead of consuming a value the
+        // walker did not observe.
         // Operand layout `iid>i`: 1B base + 1B offset + 2B descr + 1B dst.
         "raw_load_i/iid>i" => {
             let base = read_int_reg(code, op, 0, ctx)?;
             let offset = read_int_reg(code, op, 1, ctx)?;
             let descr = read_descr(code, op, 2, ctx)?;
+            let concrete = match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                read_int_reg_concrete(code, op, 1, ctx),
+                descr.as_array_descr(),
+            ) {
+                (ConcreteValue::Int(b), ConcreteValue::Int(o), Some(ad)) => {
+                    let addr = b.wrapping_add(o) as usize as *const u8;
+                    // SAFETY: the walk already executed the residuals that
+                    // produced `addr`, so it names live raw memory of at
+                    // least `item_size` bytes.
+                    let value = unsafe { raw_load_int(addr, ad.item_size(), ad.is_item_signed()) };
+                    ConcreteValue::Int(value)
+                }
+                _ => ConcreteValue::Null,
+            };
             // pyjitpl.py `opimpl_raw_load_i`.
             ctx.trace_ctx
                 .profiler()
@@ -11706,10 +12119,38 @@ fn handle<Sym: WalkSym>(
                 ctx.trace_ctx
                     .record_op_with_descr(OpCode::RawLoadI, &[base, offset], descr);
             let dst = code[op.pc + 5] as usize;
-            // The walk never performed the load, so the result carries no
-            // recording-time concrete and readers decline instead of
-            // consuming a value the walker did not observe.
-            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
+            write_int_reg(ctx, op.pc, dst, result, concrete)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // Float twin: `opimpl_raw_load_f`.  The Float bank carries no
+        // concrete shadow, so this arm records without executing; a float
+        // consumer that needs the concrete value declines downstream.
+        // Operand layout `iid>f`: 1B base + 1B offset + 2B descr + 1B dst.
+        "raw_load_f/iid>f" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let offset = read_int_reg(code, op, 1, ctx)?;
+            let descr = read_descr(code, op, 2, ctx)?;
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawLoadF, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawLoadF, majit_metainterp::counters::RECORDED_OPS);
+            let result =
+                ctx.trace_ctx
+                    .record_op_with_descr(OpCode::RawLoadF, &[base, offset], descr);
+            let dst = code[op.pc + 5] as usize;
+            let len = ctx.registers_f.len();
+            let slot = ctx
+                .registers_f
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            *slot = result;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // `_opimpl_raw_store` delegates to `execute_raw_store`:
@@ -11717,14 +12158,82 @@ fn handle<Sym: WalkSym>(
         //   self.execute_and_record(rop.RAW_STORE, arraydescr,
         //                           addrbox, offsetbox, valuebox)
         //
-        // Records and nothing else — no cache update, no result register.
+        // `execute_and_record` performs the store as well as recording it,
+        // and the walk is the execution: skipping the store would hand the
+        // rest of the walked body a buffer the program never filled.  A
+        // non-concrete operand therefore declines the walk instead of
+        // continuing past a lost store.  No cache update, no result
+        // register.
         // Operand layout `iiid`: 1B base + 1B offset + 1B value + 2B descr.
         "raw_store_i/iiid" => {
             let base = read_int_reg(code, op, 0, ctx)?;
             let offset = read_int_reg(code, op, 1, ctx)?;
             let value = read_int_reg(code, op, 2, ctx)?;
             let descr = read_descr(code, op, 3, ctx)?;
+            match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                read_int_reg_concrete(code, op, 1, ctx),
+                read_int_reg_concrete(code, op, 2, ctx),
+                descr.as_array_descr(),
+            ) {
+                (ConcreteValue::Int(b), ConcreteValue::Int(o), ConcreteValue::Int(v), Some(ad)) => {
+                    let addr = b.wrapping_add(o) as usize as *mut u8;
+                    // SAFETY: same contract as the raw_load arm — the walk
+                    // executed the residuals that produced `addr`.
+                    unsafe { raw_store_int(addr, ad.item_size(), v) };
+                }
+                _ => {
+                    return Err(DispatchError::UnsupportedOpname {
+                        pc: op.pc,
+                        key: "raw_store_i/iiid non-concrete operand",
+                    });
+                }
+            }
             // pyjitpl.py `_opimpl_raw_store`.
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawStore, majit_metainterp::counters::OPS);
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::RawStore, majit_metainterp::counters::RECORDED_OPS);
+            ctx.trace_ctx
+                .record_op_with_descr(OpCode::RawStore, &[base, offset, value], descr);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // Float twin of `raw_store_i`, under the same execute-as-you-walk
+        // contract: the walk performs the store, so a non-concrete operand
+        // declines rather than continue past a lost write.  The value's
+        // concrete f64 comes from the Float bank's OpRef carrier.
+        // Operand layout `iifd`: 1B base + 1B offset + 1B value + 2B descr.
+        "raw_store_f/iifd" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let offset = read_int_reg(code, op, 1, ctx)?;
+            let value = read_float_reg(code, op, 2, ctx)?;
+            let descr = read_descr(code, op, 3, ctx)?;
+            match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                read_int_reg_concrete(code, op, 1, ctx),
+                read_float_reg_concrete(code, op, 2, ctx),
+                descr.as_array_descr(),
+            ) {
+                (
+                    ConcreteValue::Int(b),
+                    ConcreteValue::Int(o),
+                    ConcreteValue::Float(v),
+                    Some(ad),
+                ) => {
+                    let addr = b.wrapping_add(o) as usize as *mut u8;
+                    // SAFETY: same contract as the raw_store_i arm — the walk
+                    // executed the residuals that produced `addr`.
+                    unsafe { raw_store_float(addr, ad.item_size(), v) };
+                }
+                _ => {
+                    return Err(DispatchError::UnsupportedOpname {
+                        pc: op.pc,
+                        key: "raw_store_f/iifd non-concrete operand",
+                    });
+                }
+            }
             ctx.trace_ctx
                 .profiler()
                 .count_ops(OpCode::RawStore, majit_metainterp::counters::OPS);

@@ -3654,6 +3654,29 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     } else {
         (callable_operand, method_form.then_some(null_or_self))
     };
+    // `descroperation.py DescrOperation.call_args`'s third arm: a callable
+    // that is neither a `Function` nor a `Method` dispatches through
+    // `space.lookup(w_obj, '__call__')`, bound to the object.  When that
+    // `__call__` is a builtin gateway, the wrapper is entered below with the
+    // instance as its receiver, and the lookup is pinned on the instance's
+    // class the way `space.lookup` promotes the type.  An app-level `__call__`
+    // belongs to `try_walker_inline_call`'s `resolve_instance_dunder_call`.
+    let mut instance_call_class = None;
+    // A type-dict `__call__` installed from a `BuiltinCode` is a slot wrapper:
+    // the same `Function` carrier under `SLOT_WRAPPER_TYPE`, so the carrier
+    // test admits it and the `Function.code` read below is the same load.
+    let (callable, receiver) =
+        if method_form || bound_method || unsafe { pyre_interpreter::is_function(callable) } {
+            (callable, receiver)
+        } else {
+            match unsafe { lookup_instance_dunder_call(callable) } {
+                Some((method, w_class, version_tag)) => {
+                    instance_call_class = Some((w_class, version_tag));
+                    (method, Some(callable_operand))
+                }
+                None => (callable, receiver),
+            }
+        };
     // Every decline below is silent otherwise, and they are not
     // interchangeable: `not is_function` is a class call or another
     // non-Function callable, while `no jitcode for address` names a builtin
@@ -3688,7 +3711,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             }
         };
     }
-    if !unsafe { pyre_interpreter::is_function(callable) } {
+    if !unsafe { pyre_interpreter::is_function_carrier(callable) } {
         builtin_inline_decline!("not is_function", 0usize);
         return Ok(None);
     }
@@ -3877,6 +3900,22 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
 
     let mut callable_guard_op = r_args[0];
     let mut receiver_op = method_form.then_some(r_args[1]);
+    if let Some((w_class, version_tag)) = instance_call_class {
+        // The promoted-class lookup shape: the class and its version tag
+        // together fix the `__call__` answer, so the wrapper this call
+        // dispatches to is a constant of the pinned class rather than a field
+        // the `GuardValue` below would have to read off the operand.
+        walker_guard_exception_attr_slot(
+            ctx,
+            op.pc,
+            r_args[0],
+            callable_operand,
+            w_class,
+            version_tag,
+        )?;
+        callable_guard_op = ctx.trace_ctx.const_ref(callable as i64);
+        receiver_op = Some(r_args[0]);
+    }
     if bound_method {
         // pypy/interpreter/function.py `_Method._immutable_fields_`:
         // guard the carrier layout, read both fields live, and only promote
@@ -11302,6 +11341,38 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
+
+    // The `w_int_new` boundary of `dispatch_inline_call_dir_kind`, for the
+    // float box.  `w_float_new`'s translated body builds the whole
+    // `W_FloatObject` and writes it into the collector block in one copy;
+    // that is neither the `malloc_typed` shape `fuse_boxing_alloc` rewrites
+    // into a `NewWithVtable` nor a field-wise store sequence, so the header
+    // constructor and the copy both stay symbolic funcptr calls the sub-walk
+    // cannot record.  Take the helper call as the allocation intrinsic here,
+    // where the rtyper has already replaced `malloc(W_FloatObject)`.
+    let is_w_float_new = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+        .is_some_and(|jc| jc.name == "w_float_new" && jc.code.as_ptr() == sub_body.code.as_ptr());
+    if is_w_float_new
+        && dst_bank == 'r'
+        && int_args.is_empty()
+        && ref_args.is_empty()
+        && float_args.len() == 1
+        && let ConcreteValue::Float(value) = concrete_from_recorded_opref(ctx, float_args[0])
+    {
+        let boxed = walker_box_float(ctx, float_args[0]);
+        ctx.trace_ctx.set_opref_concrete(
+            boxed,
+            majit_ir::Value::Ref(majit_ir::GcRef(
+                pyre_object::floatobject::w_float_new(value) as usize,
+            )),
+        );
+        let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
+        let ConcreteValue::Ref(boxed_shadow) = concrete_from_recorded_opref(ctx, boxed) else {
+            unreachable!("the stamped concrete of a float box is a Ref")
+        };
+        write_ref_reg(ctx, op.pc, dst, boxed, ConcreteValue::Ref(boxed_shadow))?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
 
     let callee_result = run_sub_jitcode_walk(
         ctx,

@@ -51,7 +51,11 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
     let main_module = pyre_object::w_module_new_aliasing_dict("__main__", canonical);
     importing::set_sys_module("__main__", main_module);
 
-    eval_with_jit(&mut frame, None).map_err(|e| format!("execution error: {}", e.message))?;
+    // An `AssertionError` a program raises is object-backed, so its `message`
+    // field is empty and only `message_text` derives the text from
+    // `exc_object`.
+    eval_with_jit(&mut frame, None)
+        .map_err(|e| format!("execution error: {}", e.message_text()))?;
     Ok(())
 }
 
@@ -67,9 +71,9 @@ fn run_on_worker(program: &'static str, name: &'static str) {
 /// One program covering every part of `_cffi_backend` the module answers
 /// today, transcribed from `extra_tests/cffi_tests/test_c.py`.
 ///
-/// It is a single `#[test]` on purpose: the module memoises every ctype in
-/// process-global caches and roots it for the process, so a second program
-/// in the same process would meet those caches holding addresses into the
+/// It is a single `#[test]` on purpose: the module's primitive/singleton
+/// `UniqueCache` entries and weak-value cache carriers are process-global, so
+/// a second program in the same process would meet roots registered with the
 /// heap `reset_gc_fresh_for_test` has already replaced.  Each section runs
 /// through `exec` and reports on its own, so one run names every failure
 /// rather than only the first.
@@ -931,6 +935,57 @@ fn the_module_answers_every_ctype_family_it_has_ported() {
         "ffi = FFI()\n",
         "raises_str(ValueError, 'cannot call FFI.__init__() more than once', ffi.__init__, 'mymod', 0x2601, b'')\n",
         "raises_str(ImportError, \"cffi out-of-line Python module 'bad' has unknown version 0x2594\", lambda: FFI('bad', _version=0x2594, _types=b''))\n",
+        "''')\n",
+        "_run('''huge_structure_keeps_ssize_max''', r'''",
+        "BChar = new_primitive_type('char')\n",
+        "BArray = new_array_type(new_pointer_type(BChar), sys.maxsize)\n",
+        "assert sizeof(BArray) == sys.maxsize\n",
+        "BStruct = new_struct_type('struct huge')\n",
+        "complete_struct_or_union(BStruct, [('a1', BArray, -1)])\n",
+        "assert sizeof(BStruct) == sys.maxsize\n",
+        "''')\n",
+        "_run('''ffi_derived_types_are_weakly_cached''', r'''",
+        "import gc, weakref\n",
+        "ffi = FFI()\n",
+        "t1 = ffi.typeof('unsigned short int **')\n",
+        "t2 = ffi.typeof('unsigned short int *')\n",
+        "w1 = weakref.ref(t1)\n",
+        "w2 = weakref.ref(t2)\n",
+        "del t1, ffi\n",
+        "gc.collect()\n",
+        "assert w1() is None\n",
+        "assert w2() is t2\n",
+        "ffi = FFI()\n",
+        "assert ffi.typeof(ffi.new('unsigned short int **')[0]) is t2\n",
+        "''')\n",
+        "_run('''function_ctype_weak_cache_survives_gc_address_reuse''', r'''",
+        "import gc\n",
+        "for offset in range(4):\n",
+        "    ffi = FFI()\n",
+        "    cb = ffi.callback('int(int)', lambda value, offset=offset: value + offset)\n",
+        "    assert cb(10) == 10 + offset\n",
+        "    del cb, ffi\n",
+        "    gc.collect()\n",
+        "    junk = [[] for _ in range(256)]\n",
+        "ffi = FFI()\n",
+        "cb = ffi.callback('int(int)', lambda value: value + 42)\n",
+        "assert cb(10) == 52\n",
+        "''')\n",
+        "_run('''ffi_docs_parser_bytes_and_buffer_keywords_match_pypy''', r'''",
+        "ffi = FFI()\n",
+        "for name in dir(FFI):\n",
+        "    value = getattr(FFI, name)\n",
+        "    if type(value) is type(FFI.new) and not name.startswith('_'):\n",
+        "        assert value.__doc__, name\n",
+        "try:\n",
+        "    ffi.cast('\\t\\n\\x01\\x1f~\\x7f\\x80\\xff', 0)\n",
+        "except ffi.error as e:\n",
+        "    assert str(e) == 'identifier expected\\n  ??~?????\\n  ^', repr(str(e))\n",
+        "else:\n",
+        "    raise AssertionError('expected parser error')\n",
+        "a = ffi.new('signed char[]', [5, 6, 7])\n",
+        "assert ffi.buffer(a)[:] == b'\\x05\\x06\\x07'\n",
+        "assert ffi.buffer(cdata=a, size=2)[:] == b'\\x05\\x06'\n",
         "''')\n",
         "if _failures:\n",
         "    raise AssertionError('; '.join(_failures))\n",

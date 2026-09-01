@@ -9623,6 +9623,13 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "raw_store_i/iiid".to_string(),
         majit_translate::insns::BC_RAW_STORE_I,
     );
+    // `raw_store_f/iifd` — the float-valued store (`rewrite_op_raw_store`
+    // picks the value's kind).  `handler_raw_store_f` is wired below; the
+    // byte needs the same resume-forward registration as `raw_store_i`.
+    insns.insert(
+        "raw_store_f/iifd".to_string(),
+        majit_translate::insns::BC_RAW_STORE_F,
+    );
     // `raw_load_i/iid>i` — the read-side companion the wasmi kernel emits for
     // the store's out-of-bounds memory-preserving no-op readback.  Same
     // resume-forward requirement as `raw_store_i` above.

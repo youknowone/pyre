@@ -2276,6 +2276,35 @@ fn run_hint_step_with_descrs(
     regs_i: &mut [OpRef],
     descr_pool: &[DescrRef],
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    run_hint_step_full(
+        code,
+        tc,
+        regs_r,
+        concrete_r,
+        regs_i,
+        &mut [],
+        &mut [],
+        descr_pool,
+    )
+}
+
+/// The banks an arm that reads the Int-bank concrete shadow or the Float
+/// bank needs, which the two shorthands above leave empty.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one parameter per register bank the walk context carries; \
+              bundling them would hide which bank a test leaves empty"
+)]
+fn run_hint_step_full(
+    code: &[u8],
+    tc: &mut TraceCtx,
+    regs_r: &mut [OpRef],
+    concrete_r: &mut [ConcreteValue],
+    regs_i: &mut [OpRef],
+    concrete_i: &mut [ConcreteValue],
+    regs_f: &mut [OpRef],
+    descr_pool: &[DescrRef],
+) -> Result<(DispatchOutcome, usize), DispatchError> {
     // Guard-emitting arms need a resolvable outer resume coordinate for the
     // snapshot; record-only arms ignore these two fields.
     let outer_jitcode_index = test_outer_resume_jitcode_index();
@@ -2288,9 +2317,9 @@ fn run_hint_step_with_descrs(
         session: &session,
         registers_r: regs_r,
         registers_i: regs_i,
-        registers_f: &mut [],
+        registers_f: regs_f,
         concrete_registers_r: concrete_r,
-        concrete_registers_i: &mut [],
+        concrete_registers_i: concrete_i,
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
         is_authoritative_executor: false,
@@ -2705,27 +2734,49 @@ fn raw_load_i_records_the_load_against_the_descr() {
     );
 }
 
+/// The walk executes a raw store as well as recording it, so the target has
+/// to be memory the test owns and every operand has to carry a concrete —
+/// `_opimpl_raw_store` goes through `execute_and_record`, and skipping the
+/// store would hand the rest of the walked body a buffer nothing filled.
 #[test]
-fn raw_store_i_records_the_store_and_writes_no_register() {
+fn raw_store_i_records_the_store_and_performs_it() {
     let byte = *insns_opname_to_byte()
         .get("raw_store_i/iiid")
         .expect("`raw_store_i/iiid` must be in insns table");
     // `iiid`: 1B base + 1B offset + 1B value + 2B descr.
     let code = [byte, 0x00, 0x01, 0x02, 0x00, 0x00];
-    let descr_pool = vec![crate::descr::w_int_size_descr()];
+    let descr_pool = vec![crate::descr::raw_carray_descr(majit_ir::Type::Int, 8, true)];
+    let mut cell = [0u8; 16];
+    let addr = cell.as_mut_ptr() as i64;
     let mut tc = fresh_trace_ctx();
-    let base = tc.const_int(0x1000);
+    let base = tc.const_int(addr);
     let offset = tc.const_int(8);
     let value = tc.const_int(42);
     let mut regs_i = [base, offset, value];
-    let (outcome, next_pc) =
-        run_hint_step_with_descrs(&code, &mut tc, &mut [], &mut [], &mut regs_i, &descr_pool)
-            .expect("`raw_store_i/iiid` must dispatch");
+    let mut concrete_i = [
+        ConcreteValue::Int(addr),
+        ConcreteValue::Int(8),
+        ConcreteValue::Int(42),
+    ];
+    let (outcome, next_pc) = run_hint_step_full(
+        &code,
+        &mut tc,
+        &mut [],
+        &mut [],
+        &mut regs_i,
+        &mut concrete_i,
+        &mut [],
+        &descr_pool,
+    )
+    .expect("`raw_store_i/iiid` must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(
         next_pc, 6,
         "`iiid` consumes 3 register bytes plus a 2B descr"
     );
+    // SAFETY: the slot the store just wrote, at the descr's item width.
+    let stored = unsafe { std::ptr::read_unaligned(cell.as_ptr().add(8).cast::<i64>()) };
+    assert_eq!(stored, 42, "the walk performs the store it records");
     let last = tc.ops().last().expect("recorded op must exist");
     assert_eq!(last.opcode, majit_ir::OpCode::RawStore);
     assert_eq!(
@@ -2738,6 +2789,64 @@ fn raw_store_i_records_the_store_and_writes_no_register() {
     assert_eq!(
         regs_i,
         [base, offset, value],
+        "a raw store leaves every register untouched"
+    );
+}
+
+/// Float twin of the above: the value comes from the Float bank and the
+/// descr names a `CArray(Float)`.
+#[test]
+fn raw_store_f_records_the_store_and_performs_it() {
+    let byte = *insns_opname_to_byte()
+        .get("raw_store_f/iifd")
+        .expect("`raw_store_f/iifd` must be in insns table");
+    // `iifd`: 1B base + 1B offset + 1B float-bank value + 2B descr.
+    let code = [byte, 0x00, 0x01, 0x00, 0x00, 0x00];
+    let descr_pool = vec![crate::descr::raw_carray_descr(
+        majit_ir::Type::Float,
+        8,
+        false,
+    )];
+    let mut cell = [0u8; 16];
+    let addr = cell.as_mut_ptr() as i64;
+    let mut tc = fresh_trace_ctx();
+    let base = tc.const_int(addr);
+    let offset = tc.const_int(8);
+    let value = tc.const_float(1.5f64.to_bits() as i64);
+    let mut regs_i = [base, offset];
+    let mut concrete_i = [ConcreteValue::Int(addr), ConcreteValue::Int(8)];
+    let mut regs_f = [value];
+    let (outcome, next_pc) = run_hint_step_full(
+        &code,
+        &mut tc,
+        &mut [],
+        &mut [],
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+    )
+    .expect("`raw_store_f/iifd` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(
+        next_pc, 6,
+        "`iifd` consumes 3 register bytes plus a 2B descr"
+    );
+    // SAFETY: the slot the store just wrote, at the descr's item width.
+    let stored = unsafe { std::ptr::read_unaligned(cell.as_ptr().add(8).cast::<f64>()) };
+    assert_eq!(stored, 1.5, "the walk performs the store it records");
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::RawStore);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![base, offset, value],
+    );
+    assert_eq!(
+        regs_f,
+        [value],
         "a raw store leaves every register untouched"
     );
 }
@@ -13621,7 +13730,6 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         Type::Float,
         majit_ir::ExtraEffect::ElidableCannotRaise,
     );
-    let recorded = tc.record_op_with_descr(majit_ir::OpCode::CallPureF, &allboxes, descr.clone());
     let call_descr = descr.as_call_descr().expect("CallPureF descr");
 
     // Same shape as the Int sibling above, which DOES fold — so a failure here
@@ -13637,8 +13745,6 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         tc.const_int(40),
         tc.const_int(2),
     ];
-    let int_recorded =
-        tc.record_op_with_descr(majit_ir::OpCode::CallPureI, &int_boxes, int_descr.clone());
     let int_call_descr = int_descr.as_call_descr().expect("CallPureI descr");
 
     let mut regs_i: Vec<OpRef> = Vec::new();
@@ -13677,29 +13783,49 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    try_fold_pure_call_via_executor(
+    // Record and fold one call at a time, as the dispatchers do: the fold
+    // cuts back to the position taken before the record, so a second op
+    // recorded in between would be cut away with it.
+    let float_pos = wc.trace_ctx.get_trace_position();
+    let recorded =
+        wc.trace_ctx
+            .record_op_with_descr(majit_ir::OpCode::CallPureF, &allboxes, descr.clone());
+    let folded_f = try_fold_pure_call_via_executor(
         &mut wc,
         majit_ir::OpCode::CallPureF,
         &allboxes,
         call_descr,
+        descr.clone(),
+        float_pos,
         recorded,
     );
-    try_fold_pure_call_via_executor(
+    let int_pos = wc.trace_ctx.get_trace_position();
+    let int_recorded = wc.trace_ctx.record_op_with_descr(
+        majit_ir::OpCode::CallPureI,
+        &int_boxes,
+        int_descr.clone(),
+    );
+    let folded_i = try_fold_pure_call_via_executor(
         &mut wc,
         majit_ir::OpCode::CallPureI,
         &int_boxes,
         int_call_descr,
+        int_descr.clone(),
+        int_pos,
         int_recorded,
     );
     drop(wc);
 
+    // Every argbox is a `Const`, so `record_result_of_call_pure` takes the
+    // `pyjitpl.py:3566` arm: the call is cut back out and the result comes
+    // back as the constant itself.
     assert_eq!(
-        tc.box_value(int_recorded),
+        folded_i.inline_const_to_value(),
         Some(majit_ir::Value::Int(42)),
         "control: the Int sibling folds, so the fixture reaches the executor",
     );
     assert_eq!(
-        tc.box_value(recorded),
+        folded_f.inline_const_to_value(),
         Some(majit_ir::Value::Float(3.5)),
         "halve_f64_for_walker_test(7) == 3.5; reading the integer return \
          register would stamp the argument 7 instead",

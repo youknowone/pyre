@@ -33,6 +33,9 @@ pub mod heaptracker;
 // `assembler.py:Assembler.insns`; pyre serializes bytecode across build
 // and runtime, so the dynamic upstream table is materialized here.
 pub mod insns;
+// `l[start:]` for the rich-`OpKind` spine — mints `ll_listslice_startonly`.
+pub mod getslice;
+pub mod iter_lower;
 pub mod jitcode;
 pub mod jtransform;
 pub mod longlong;

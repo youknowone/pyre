@@ -1,11 +1,10 @@
 //! Building ctypes — PyPy:
 //! `pypy/module/_cffi_backend/newtype.py`.
 //!
-//! `newtype.py` memoises through `UniqueCache` plus a weak `_pointer_type` /
-//! `_array_types` on each ctype.  Here every ctype is rooted for the process
-//! (see [`super::ctypeobj::new_ctype`]), so the memo can be a plain map: a
-//! program declares a bounded set of C types once, and pointer compatibility
-//! is decided by object identity, which only a memo can keep true.
+//! `newtype.py` memoises primitives and singleton ctypes strongly through
+//! `UniqueCache`, while pointer, array and function ctypes are weakly cached.
+//! The same ownership split matters here: pointer compatibility uses identity,
+//! but an otherwise-unreferenced derived ctype must still be collectable.
 
 use crate::PyError;
 use pyre_object::PyObjectRef;
@@ -135,13 +134,10 @@ fn primitive_cache() -> &'static Mutex<HashMap<&'static str, usize>> {
 
 /// `UniqueCache.ctvoid`.
 static VOID_TYPE: OnceLock<usize> = OnceLock::new();
-
-/// `W_CTypePointer._array_types`, keyed by the pointer ctype's address and
-/// the array length.
-fn array_cache() -> &'static Mutex<HashMap<(usize, i64), usize>> {
-    static CACHE: OnceLock<Mutex<HashMap<(usize, i64), usize>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
+/// `UniqueCache.ctvoidp`.
+static VOID_POINTER_TYPE: OnceLock<usize> = OnceLock::new();
+/// `UniqueCache.ctchara`.
+static CHAR_ARRAY_TYPE: OnceLock<usize> = OnceLock::new();
 
 /// `newtype.py _new_primitive_type`.
 pub fn new_primitive_type(name: &str) -> Result<PyObjectRef, PyError> {
@@ -204,6 +200,7 @@ pub fn new_primitive_type(name: &str) -> Result<PyObjectRef, PyError> {
         -1,
         flags,
     );
+    ctypeobj::root_forever(obj);
     let mut cache = primitive_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -220,7 +217,7 @@ fn wchar_is_signed() -> bool {
 /// `newtype.py new_void_type`.
 pub fn new_void_type() -> PyObjectRef {
     *VOID_TYPE.get_or_init(|| {
-        ctypeobj::new_ctype(
+        let obj = ctypeobj::new_ctype(
             ctypeobj::KIND_VOID,
             -1,
             "void",
@@ -229,28 +226,42 @@ pub fn new_void_type() -> PyObjectRef {
             pyre_object::PY_NULL,
             -1,
             0,
-        ) as usize
+        );
+        ctypeobj::root_forever(obj);
+        obj as usize
     }) as PyObjectRef
 }
 
 /// `newtype.py _new_voidp_type`.
 pub fn new_voidp_type() -> Result<PyObjectRef, PyError> {
-    new_pointer_type(new_void_type())
+    if let Some(&cached) = VOID_POINTER_TYPE.get() {
+        return Ok(cached as PyObjectRef);
+    }
+    let obj = new_pointer_type(new_void_type())?;
+    ctypeobj::root_forever(obj);
+    Ok(*VOID_POINTER_TYPE.get_or_init(|| obj as usize) as PyObjectRef)
 }
 
 /// `newtype.py _new_chara_type`.
 pub fn new_chara_type() -> Result<PyObjectRef, PyError> {
+    if let Some(&cached) = CHAR_ARRAY_TYPE.get() {
+        return Ok(cached as PyObjectRef);
+    }
     let w_char = new_primitive_type("char")?;
     let w_charp = new_pointer_type(w_char)?;
-    new_array_type(w_charp, -1)
+    let obj = new_array_type(w_charp, -1)?;
+    ctypeobj::root_forever(obj);
+    Ok(*CHAR_ARRAY_TYPE.get_or_init(|| obj as usize) as PyObjectRef)
 }
 
 /// `newtype.py _new_pointer_type` — `W_CType._pointer_type`'s memo, which
 /// `convert_from_object` relies on to decide pointer compatibility.
 pub fn new_pointer_type(w_ctitem: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let ctitem = ctypeobj::ctype_arg(w_ctitem)?;
-    if !ctitem.pointer_type.is_null() {
-        return Ok(ctitem.pointer_type);
+    let cached =
+        unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(ctitem.pointer_type) };
+    if !cached.is_null() {
+        return Ok(cached);
     }
     // `W_CTypePointer.__init__`: an array's pointer needs the parenthesised
     // spelling so `int(*)[5]` does not read as `int *[5]`.
@@ -286,9 +297,18 @@ pub fn new_pointer_type(w_ctitem: PyObjectRef) -> Result<PyObjectRef, PyError> {
     );
     // Re-read the item: building the pointer allocated, and the memo must
     // land on the object the caller named.
-    let ctitem = ctypeobj::ctype_arg(w_ctitem)?;
-    ctitem.pointer_type = obj;
-    Ok(obj)
+    let roots = pyre_object::gc_roots::push_roots();
+    let item_slot = roots.base();
+    let _ = roots.pin_root(w_ctitem);
+    let obj_slot = item_slot + 1;
+    let _ = roots.pin_root(obj);
+    let weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(roots.get(obj_slot));
+    let weak_slot = obj_slot + 1;
+    let _ = roots.pin_root(weak);
+    let ctitem = ctypeobj::ctype_arg(roots.get(item_slot))?;
+    ctitem.pointer_type = roots.get(weak_slot);
+    pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(item_slot).cast::<u8>());
+    Ok(roots.get(obj_slot))
 }
 
 /// `W_CTypePtrOrArray.accept_str` — whether a `bytes` initialises it.
@@ -305,13 +325,13 @@ pub fn new_array_type(w_ctptr: PyObjectRef, length: i64) -> Result<PyObjectRef, 
     if ctptr.kind != ctypeobj::KIND_POINTER {
         return Err(PyError::type_error("first arg must be a pointer ctype"));
     }
-    let key = (w_ctptr as usize, length);
+    if !ctptr.array_types.is_null()
+        && let Some(weak) =
+            unsafe { pyre_object::dictmultiobject::w_dict_getitem(ctptr.array_types, length) }
     {
-        let cache = array_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(&existing) = cache.get(&key) {
-            return Ok(existing as PyObjectRef);
+        let cached = unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(weak) };
+        if !cached.is_null() {
+            return Ok(cached);
         }
     }
     let ctitem = super::ctypeptr::item_of(ctptr)?;
@@ -345,10 +365,27 @@ pub fn new_array_type(w_ctptr: PyObjectRef, length: i64) -> Result<PyObjectRef, 
     // `W_CTypeArray.ctptr`, re-read for the same reason as above.
     let array = ctypeobj::ctype_arg(obj)?;
     array.ctptr = w_ctptr;
-    let mut cache = array_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(*cache.entry(key).or_insert(obj as usize) as PyObjectRef)
+    let roots = pyre_object::gc_roots::push_roots();
+    let pointer_slot = roots.base();
+    let _ = roots.pin_root(w_ctptr);
+    let array_slot = pointer_slot + 1;
+    let _ = roots.pin_root(obj);
+    let weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(roots.get(array_slot));
+    let weak_slot = array_slot + 1;
+    let _ = roots.pin_root(weak);
+    let ctptr = ctypeobj::ctype_arg(roots.get(pointer_slot))?;
+    if ctptr.array_types.is_null() {
+        ctptr.array_types = pyre_object::dictmultiobject::w_dict_new();
+        pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(pointer_slot).cast::<u8>());
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem(
+            ctptr.array_types,
+            length,
+            roots.get(weak_slot),
+        )
+    };
+    Ok(roots.get(array_slot))
 }
 
 /// `W_CTypePointer.cache_array_type` — the `T[]` a slice of a `T *` reads
@@ -771,7 +808,11 @@ pub fn complete_struct_or_union(
 
     // As in C, a structure whose size would be zero is one byte instead; a
     // manually-specified total size of zero is still honoured.
-    let alignedsize = ((byteoffsetmax + alignment - 1) & !(alignment - 1)).max(1);
+    // The rounding is machine-word arithmetic: `newtype.py` computes it in
+    // RPython `Signed`, which wraps.  A `char[sys.maxsize]` field rounds
+    // `MAX + 1 - 1` at alignment one and has to come back as `MAX`.
+    let alignedsize =
+        (byteoffsetmax.wrapping_add(alignment).wrapping_sub(1) & !(alignment - 1)).max(1);
     let totalsize = if totalsize < 0 {
         alignedsize
     } else {
@@ -902,16 +943,16 @@ pub fn new_enum_type(
         let written = unsafe {
             ctypeobj::convert_from_object(
                 ctypeobj::ctype_arg(roots.get(base_slot))?,
-                probe,
+                probe as usize,
                 roots.get(values_slot + i),
             )
         };
         if let Err(e) = written {
-            unsafe { libc::free(probe.cast::<libc::c_void>()) };
+            unsafe { libc::free(probe as *mut libc::c_void) };
             return Err(e);
         }
     }
-    unsafe { libc::free(probe.cast::<libc::c_void>()) };
+    unsafe { libc::free(probe as *mut libc::c_void) };
 
     let basectype = ctypeobj::ctype_arg(roots.get(base_slot))?;
     let w_ctype = ctypeobj::new_ctype(
@@ -947,13 +988,60 @@ pub fn new_enum_type(
 
 // ── function types ──────────────────────────────────────────────────────
 
-/// `UniqueCache.functions` — keyed by the result ctype, the argument ctypes,
-/// the ellipsis flag and the ABI, all of which decide the type's identity.
-type FunctionKey = (usize, Vec<usize>, bool, i64);
+/// `UniqueCache.functions` — a list of weak dictionaries keyed by the
+/// identity hash.  Each dictionary carries at most one value for a hash;
+/// collisions spill into the next dictionary and are resolved by comparing
+/// the live function ctype's fields.
+///
+/// The native value is the stable address of a registered root slot, not the
+/// weakref box's address: the collector moves the box and rewrites that slot.
+type FunctionCache = Vec<HashMap<isize, usize>>;
 
-fn function_cache() -> &'static Mutex<HashMap<FunctionKey, usize>> {
-    static CACHE: OnceLock<Mutex<HashMap<FunctionKey, usize>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn function_cache() -> &'static Mutex<FunctionCache> {
+    static CACHE: OnceLock<Mutex<FunctionCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// `newtype.py _func_key_hash` with `compute_identity_hash` represented by
+/// stable ctype addresses.
+fn function_key_hash(
+    fargs: &[PyObjectRef],
+    w_fresult: PyObjectRef,
+    ellipsis: bool,
+    abi: i64,
+) -> isize {
+    let mut hash = w_fresult as isize;
+    for &w_arg in fargs {
+        hash = hash.wrapping_mul(1_000_003) ^ w_arg as isize;
+    }
+    hash ^ isize::from(ellipsis).wrapping_add((2isize).wrapping_mul(abi as isize))
+}
+
+fn rooted_weakref_at(root_slot: usize) -> PyObjectRef {
+    unsafe { *(root_slot as *const usize) as PyObjectRef }
+}
+
+fn function_type_matches(
+    w_ctype: PyObjectRef,
+    fargs: &[PyObjectRef],
+    w_fresult: PyObjectRef,
+    ellipsis: bool,
+    abi: i64,
+) -> bool {
+    let Some(ctype) = ctypeobj::ctype_at(w_ctype) else {
+        return false;
+    };
+    if ctype.kind != ctypeobj::KIND_FUNC
+        || ctype.ctitem != w_fresult
+        || ctype.has(ctypeobj::F_ELLIPSIS) != ellipsis
+        || ctype.abi != abi
+        || unsafe { pyre_object::w_tuple_len(ctype.fargs) } != fargs.len()
+    {
+        return false;
+    }
+    fargs.iter().enumerate().all(|(index, &expected)| {
+        (unsafe { pyre_object::w_tuple_getitem(ctype.fargs, index as i64) }) == Some(expected)
+    })
 }
 
 /// `newtype.py new_function_type`.
@@ -991,18 +1079,22 @@ pub fn build_function_type(
     ellipsis: bool,
     abi: i64,
 ) -> Result<PyObjectRef, PyError> {
-    let key: FunctionKey = (
-        w_fresult as usize,
-        fargs.iter().map(|&a| a as usize).collect(),
-        ellipsis,
-        abi,
-    );
+    let func_hash = function_key_hash(fargs, w_fresult, ellipsis, abi);
     {
         let cache = function_cache()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(&existing) = cache.get(&key) {
-            return Ok(existing as PyObjectRef);
+        for weakdict in cache.iter() {
+            if let Some(&root_slot) = weakdict.get(&func_hash) {
+                let existing = unsafe {
+                    pyre_object::weakref::w_gc_weakref_box_or_strong_deref(rooted_weakref_at(
+                        root_slot,
+                    ))
+                };
+                if function_type_matches(existing, fargs, w_fresult, ellipsis, abi) {
+                    return Ok(existing);
+                }
+            }
         }
     }
     let fresult = ctypeobj::ctype_arg(w_fresult)?;
@@ -1050,8 +1142,53 @@ pub fn build_function_type(
             Err(e) => return Err(e),
         }
     }
+    let weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(roots.get(ctype_slot));
     let mut cache = function_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(*cache.entry(key).or_insert(roots.get(ctype_slot) as usize) as PyObjectRef)
+    // A concurrent builder may have published the same live function type
+    // while this one was being constructed.  Preserve PyPy's unique result.
+    for weakdict in cache.iter() {
+        if let Some(&existing_root_slot) = weakdict.get(&func_hash) {
+            let existing = unsafe {
+                pyre_object::weakref::w_gc_weakref_box_or_strong_deref(rooted_weakref_at(
+                    existing_root_slot,
+                ))
+            };
+            if function_type_matches(existing, fargs, w_fresult, ellipsis, abi) {
+                return Ok(existing);
+            }
+        }
+    }
+    for weakdict in cache.iter_mut() {
+        match weakdict.get(&func_hash).copied() {
+            None => {
+                let root_slot = ctypeobj::root_forever_slot(weak) as usize;
+                weakdict.insert(func_hash, root_slot);
+                return Ok(roots.get(ctype_slot));
+            }
+            Some(existing_root_slot) => {
+                let existing_weak = rooted_weakref_at(existing_root_slot);
+                let dead = unsafe {
+                    pyre_object::weakref::w_gc_weakref_box_or_strong_deref(existing_weak).is_null()
+                };
+                if dead {
+                    if unsafe {
+                        pyre_object::weakref::w_gc_weakref_box_retarget(
+                            existing_weak,
+                            roots.get(ctype_slot),
+                        )
+                    } {
+                        return Ok(roots.get(ctype_slot));
+                    }
+                    let root_slot = ctypeobj::root_forever_slot(weak) as usize;
+                    weakdict.insert(func_hash, root_slot);
+                    return Ok(roots.get(ctype_slot));
+                }
+            }
+        }
+    }
+    let root_slot = ctypeobj::root_forever_slot(weak) as usize;
+    cache.push(HashMap::from([(func_hash, root_slot)]));
+    Ok(roots.get(ctype_slot))
 }

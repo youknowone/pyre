@@ -541,6 +541,13 @@ pub const BC_SETARRAYITEM_GC_I_C: u8 = 227;
 // takes the next free byte.
 pub const BC_RAW_STORE_I: u8 = 228;
 
+// `raw_store_f/iifd` — `blackhole.py bhimpl_raw_store_f`
+// (`@arguments("cpu", "i", "i", "f", "d")`): the float-valued sibling of
+// `BC_RAW_STORE_I`.  `rewrite_op_raw_store` picks the value's kind, so a
+// `double` written through a raw address (the libffi exchange buffer's
+// float result among them) needs its own byte.
+pub const BC_RAW_STORE_F: u8 = 235;
+
 // pyre-only `abort/>r` — Ref-result variant of `abort/` (BC_ABORT = 13)
 // emitted by `Assembler::encode_op`'s default branch when an `OpKind::
 // Abort { result_kind: Ref }` reaches the assembler.  Lives in
@@ -1122,8 +1129,10 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // Raw memory store — `blackhole.py:1504-1509`
     // `bhimpl_raw_store_{i,f}` (`@arguments("cpu", "i", "i", "i"|"f",
     // "d")`): raw address + byte offset + value + arraydescr.  The
-    // handler is wired in `blackhole.rs` (`handler_raw_store_i`).
+    // handlers are wired in `blackhole.rs` (`handler_raw_store_i` /
+    // `handler_raw_store_f`).
     m.insert("raw_store_i/iiid", BC_RAW_STORE_I);
+    m.insert("raw_store_f/iifd", BC_RAW_STORE_F);
 
     // GC indexed load — `blackhole.py:1519-1525`
     // `bhimpl_gc_load_indexed_{i,f}` (`@arguments("cpu", "r", "i", "i",

@@ -297,7 +297,7 @@ pub fn rawaddressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         ));
     }
     let offset = crate::baseobjspace::int_w(a[2])?;
-    let ptr = unsafe { cdata.ptr.offset(offset as isize) };
+    let ptr = cdata.ptr.wrapping_add_signed(offset as isize);
     Ok(cdataobj::new_cdata(ptr, a[0]))
 }
 
@@ -373,7 +373,7 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         }
     };
     Ok(cdataobj::new_cdata_from_buffer(
-        ptr,
+        ptr as usize,
         arraylength,
         w_ctype,
         roots.get(object_slot),
@@ -491,7 +491,7 @@ fn unsafe_escaping_ptr_for_ptr_or_array(cdata: &W_CData) -> Result<*mut u8, PyEr
             ct.name()
         )));
     }
-    Ok(cdata.ptr)
+    Ok(cdata.ptr as *mut u8)
 }
 
 /// `func.py release` — `W_CData.enter_exit(exit_now=True)`.

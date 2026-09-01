@@ -38,12 +38,21 @@ pub const FLAVOR_CALLBACK: i64 = 9;
 
 /// `cdataobj.py W_CData` and the RPython subclasses sharing its typedef.
 #[crate::pyre_class("_cffi_backend._CDataBase")]
+// `W_CData._immutable_fields_` names `_ptr` and `ctype`.  Declaring `ctype`
+// is what lets a call through a constant cdata fold its function type, and
+// with it the `cif_descr` behind it; declaring `ptr` folds the address the
+// call goes to.  The only write to `ptr` after construction is the one
+// `w_cdata_dealloc` makes on a GC-dead object, which no live reference can
+// read back.
+#[majit_macros::jit_immutable_fields("ctype", "ptr")]
 #[derive(Default)]
 pub struct W_CData {
     /// `W_CData.ctype`.
     pub ctype: PyObjectRef,
-    /// `W_CData._ptr`.
-    pub ptr: *mut u8,
+    /// `W_CData._ptr` — `rffi.CCHARP`.  A raw-flavour pointer is
+    /// integer-kind, so the address belongs in the integer register bank
+    /// rather than among the references a collector traces and rewrites.
+    pub ptr: usize,
     /// Which RPython subclass this is; one of the `FLAVOR_*`.
     pub flavor: i64,
     /// `W_CDataNewOwning.allocated_length` for an owning cdata,
@@ -67,8 +76,14 @@ pub struct W_CData {
 }
 
 impl W_CData {
+    // Spelled as a `match` rather than `Option::ok_or_else`: the closure the
+    // combinator takes is a callee of its own, and a traced `W_CData.call`
+    // would stop at it.
     fn ctype_ref(&self) -> Result<&'static mut W_CType, PyError> {
-        ctypeobj::ctype_at(self.ctype).ok_or_else(|| PyError::system_error("cdata without a ctype"))
+        match ctypeobj::ctype_at(self.ctype) {
+            Some(ct) => Ok(ct),
+            None => Err(PyError::system_error("cdata without a ctype")),
+        }
     }
 
     /// `W_CData._sizeof` and the overrides of it.
@@ -164,30 +179,31 @@ impl W_CData {
                     pyre_object::w_str_get_value(w_repr)
                 }))
             }
-            _ => unsafe { ct.extra_repr(self.ptr) },
+            _ => unsafe { ct.extra_repr(self.ptr as *const u8) },
         }
     }
 }
 
 /// `@unwrap_spec(w_cdata=cdataobj.W_CData)`.
 pub fn cdata_arg(w_cdata: PyObjectRef) -> Result<&'static mut W_CData, PyError> {
-    W_CData::from_obj(w_cdata).ok_or_else(|| {
-        PyError::type_error(format!(
+    match W_CData::from_obj(w_cdata) {
+        Some(cdata) => Ok(cdata),
+        None => Err(PyError::type_error(format!(
             "expected a cdata object, got '{}'",
             crate::type_methods::arg_type_name(w_cdata)
-        ))
-    })
+        ))),
+    }
 }
 
 // ── construction ────────────────────────────────────────────────────────
 
 /// `cdataobj.py W_CData(space, ptr, ctype)` — a view that owns no memory.
-pub fn new_cdata(ptr: *mut u8, w_ctype: PyObjectRef) -> PyObjectRef {
+pub fn new_cdata(ptr: usize, w_ctype: PyObjectRef) -> PyObjectRef {
     new_cdata_full(ptr, w_ctype, FLAVOR_STATIC, -1, -1, pyre_object::PY_NULL)
 }
 
 /// `cdataobj.py W_CDataSliced(space, ptr, ctype, length)`.
-pub fn new_cdata_sliced(ptr: *mut u8, w_ctype: PyObjectRef, length: i64) -> PyObjectRef {
+pub fn new_cdata_sliced(ptr: usize, w_ctype: PyObjectRef, length: i64) -> PyObjectRef {
     new_cdata_full(
         ptr,
         w_ctype,
@@ -216,29 +232,23 @@ pub fn new_cdata_mem(w_ctype: PyObjectRef) -> Result<PyObjectRef, PyError> {
 /// `W_CDataPtrToStructOrUnion.__init__` — a pointer that co-owns the cdata
 /// really holding the struct.
 pub fn new_cdata_ptr_to_struct(
-    ptr: *mut u8,
+    ptr: usize,
     w_ctype: PyObjectRef,
     w_structobj: PyObjectRef,
 ) -> PyObjectRef {
     new_cdata_full(ptr, w_ctype, FLAVOR_PTR_TO_STRUCT, -1, -1, w_structobj)
 }
 
-/// `W_CDataHandle.__init__`.
+/// `W_CDataHandle.__init__`, together with the `instantiate` /
+/// `hide_nonmovable_gcref` pair `newp_handle` performs ahead of it:
+/// `allocate_stable` supplies the non-moving address `hide_object` exposes,
+/// and the pointer is that address, so it is filled in after the allocation
+/// the way the late `W_CData.__init__` call does upstream.
 pub fn new_cdata_handle(w_ctype: PyObjectRef, w_keepalive: PyObjectRef) -> PyObjectRef {
-    // `allocate_stable` supplies the non-moving address that `hide_object`
-    // exposes.  Fill the pointer after allocation because it is the object's
-    // own address.
-    let obj = new_cdata_full(
-        std::ptr::null_mut(),
-        w_ctype,
-        FLAVOR_HANDLE,
-        -1,
-        -1,
-        w_keepalive,
-    );
+    let obj = new_cdata_full(0, w_ctype, FLAVOR_HANDLE, -1, -1, w_keepalive);
     W_CData::from_obj(obj)
         .expect("new_cdata_full returns a cdata")
-        .ptr = obj.cast::<u8>();
+        .ptr = super::hide_reveal::hide_object(obj) as usize;
     obj
 }
 
@@ -246,7 +256,7 @@ pub fn new_cdata_handle(w_ctype: PyObjectRef, w_keepalive: PyObjectRef) -> PyObj
 /// `w_keepalive` for `w_callable`, `w_destructor` for `w_onerror`, and
 /// `length` for the raw side-block address.
 pub fn new_cdata_callback(
-    ptr: *mut u8,
+    ptr: usize,
     w_ctype: PyObjectRef,
     w_callable: PyObjectRef,
     w_onerror: PyObjectRef,
@@ -272,7 +282,7 @@ pub fn new_cdata_callback(
 
 /// `W_CDataFromBuffer.__init__`.
 pub fn new_cdata_from_buffer(
-    ptr: *mut u8,
+    ptr: usize,
     length: i64,
     w_ctype: PyObjectRef,
     w_keepalive: PyObjectRef,
@@ -302,7 +312,7 @@ pub fn new_cdata_from_buffer(
 
 /// `W_CDataGCP.__init__`.
 pub fn new_cdata_gcp(
-    ptr: *mut u8,
+    ptr: usize,
     w_ctype: PyObjectRef,
     w_original: PyObjectRef,
     w_destructor: PyObjectRef,
@@ -321,7 +331,7 @@ pub fn new_cdata_gcp(
 
 /// `W_CDataNewNonStd.__init__`.
 pub fn new_cdata_nonstd(
-    ptr: *mut u8,
+    ptr: usize,
     w_ctype: PyObjectRef,
     length: i64,
     w_raw_cdata: PyObjectRef,
@@ -352,7 +362,7 @@ pub unsafe fn new_cdata_copy(
     size: i64,
 ) -> Result<PyObjectRef, PyError> {
     let ptr = raw_alloc(size, false)?;
-    unsafe { std::ptr::copy_nonoverlapping(source, ptr, size.max(0) as usize) };
+    unsafe { std::ptr::copy_nonoverlapping(source, ptr as *mut u8, size.max(0) as usize) };
     Ok(new_cdata_full(
         ptr,
         w_ctype,
@@ -396,7 +406,7 @@ pub fn new_cdata_owning(
 }
 
 fn new_cdata_full(
-    ptr: *mut u8,
+    ptr: usize,
     w_ctype: PyObjectRef,
     flavor: i64,
     length: i64,
@@ -430,7 +440,7 @@ fn new_cdata_full(
 
 /// `W_CDataNewStd.__init__` for an allocator-selected raw block.
 pub fn new_cdata_full_for_allocator(
-    ptr: *mut u8,
+    ptr: usize,
     w_ctype: PyObjectRef,
     length: i64,
     datasize: i64,
@@ -457,7 +467,51 @@ pub fn add_memory_pressure(w_cdata: PyObjectRef, size: i64) {
 /// `lltype.malloc(rffi.CCHARP.TO, size, flavor='raw')`.  A zero-size request
 /// still returns a distinct address, so `newp` on an empty array does not
 /// hand back NULL.
-pub fn raw_alloc(size: i64, zero: bool) -> Result<*mut u8, PyError> {
+/// `lltype.malloc(rffi.CCHARP.TO, size, flavor='raw')` — the raw block a
+/// traced caller allocates; the JIT sees it as the `raw_malloc_varsize_char`
+/// residual (`support.py ll_raw_malloc_varsize_char`).  Zero on exhaustion;
+/// the caller raises the MemoryError.
+///
+/// The whole raw-memory family below spells its addresses `usize` rather
+/// than `*mut u8`.  `getkind(Ptr(TO))` answers `int` whenever `TO._gckind`
+/// is `raw` (`history.py`), which is what puts a raw block address in the
+/// integer register bank and lets `raw_ptradd` be an `int_add` over it.
+/// `*mut u8` cannot carry that: it is this tree's erased spelling of a
+/// *managed* object — the parameter type of every GC hook, the return type
+/// of every GC allocator, and the pointee of every root slot — so it banks
+/// as a reference the collector traces and rewrites.  A raw block is
+/// neither traced nor moved, and the two must not share a spelling.
+#[majit_macros::oopspec("raw_malloc_varsize_char(size)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_malloc_varsize_char(size: usize) -> usize {
+    unsafe { libc::malloc(size.max(1)) as usize }
+}
+
+/// `lltype.free(ptr, flavor='raw')` — the `raw_free` residual
+/// (`support.py ll_raw_free`).
+#[majit_macros::oopspec("raw_free(ptr)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_free(ptr: usize) {
+    unsafe { libc::free(ptr as *mut libc::c_void) }
+}
+
+/// `rffi.ptradd` — advance a raw byte address without a memory access
+/// (`direct_ptradd` residual shape).
+#[majit_macros::oopspec("raw_ptradd(ptr, offset)")]
+#[majit_macros::elidable_cannot_raise]
+pub fn raw_ptradd(ptr: usize, offset: usize) -> usize {
+    ptr.wrapping_add(offset)
+}
+
+/// One pointer-sized load out of an exchange-buffer argument slot
+/// (`rffi.cast(rffi.CCHARPP, data)[0]`).
+#[majit_macros::oopspec("raw_read_ptr(data)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_read_ptr(data: usize) -> usize {
+    unsafe { (data as *const usize).read_unaligned() }
+}
+
+pub fn raw_alloc(size: i64, zero: bool) -> Result<usize, PyError> {
     if size < 0 {
         return Err(PyError::value_error("negative allocation size"));
     }
@@ -475,7 +529,7 @@ pub fn raw_alloc(size: i64, zero: bool) -> Result<*mut u8, PyError> {
             "out of memory",
         ));
     }
-    Ok(ptr.cast::<u8>())
+    Ok(ptr as usize)
 }
 
 /// `lltype.free(self._ptr, flavor='raw')` in the light finalizers of
@@ -489,11 +543,11 @@ pub unsafe fn w_cdata_dealloc(obj: PyObjectRef) {
         // Clear the slot before releasing it: the release is a `Box::from_raw`,
         // so a second sweep of the same object must find nothing left to free.
         let side_block = std::mem::replace(&mut cdata.length, 0);
-        unsafe { super::ccallback::free_callback_side_block(side_block, cdata.ptr) };
+        unsafe { super::ccallback::free_callback_side_block(side_block, cdata.ptr as *mut u8) };
     } else if matches!(cdata.flavor, FLAVOR_MEM | FLAVOR_NEW_STD) && cdata.datasize >= 0 {
-        unsafe { libc::free(cdata.ptr.cast::<libc::c_void>()) };
+        unsafe { libc::free(cdata.ptr as *mut libc::c_void) };
     }
-    cdata.ptr = std::ptr::null_mut();
+    cdata.ptr = 0;
     cdata.datasize = -1;
 }
 
@@ -618,7 +672,7 @@ fn init_cdata_type(ns: PyObjectRef) {
     // `__call__` and `__exit__` take a variable number of arguments.
     store(
         "__call__",
-        crate::make_builtin_function("__call__", cdata_call),
+        crate::make_builtin_function("__call__", __majit_wrap_cdata_call),
     );
     store(
         "__exit__",
@@ -650,7 +704,7 @@ fn cdata_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
     Ok(pyre_object::boolobject::w_bool_from(unsafe {
-        ctypeobj::nonzero(ct, cdata.ptr)?
+        ctypeobj::nonzero(ct, cdata.ptr as *const u8)?
     }))
 }
 
@@ -658,21 +712,21 @@ fn cdata_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 fn cdata_int(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
-    unsafe { ctypeobj::cast_to_int(ct, cdata.ptr) }
+    unsafe { ctypeobj::cast_to_int(ct, cdata.ptr as *const u8) }
 }
 
 /// `W_CData.float`.
 fn cdata_float(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
-    unsafe { ctypeobj::float(ct, cdata.ptr) }
+    unsafe { ctypeobj::float(ct, cdata.ptr as *const u8) }
 }
 
 /// `W_CData.complex`.
 fn cdata_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
-    unsafe { ctypeobj::complex(ct, cdata.ptr) }
+    unsafe { ctypeobj::complex(ct, cdata.ptr as *const u8) }
 }
 
 /// `W_CData.len`.
@@ -791,8 +845,10 @@ fn do_exit(w_cdata: PyObjectRef) -> Result<(), PyError> {
                 add_memory_pressure(w_cdata, -cdata.datasize);
                 cdata.datasize = -1;
                 crate::executioncontext::may_ignore_finalizer(w_cdata);
-                unsafe { libc::free(cdata.ptr.cast::<libc::c_void>()) };
-                cdata.ptr = std::ptr::null_mut();
+                // The freed address stays in `ptr`: reading a released
+                // cdata is the caller's error, and `datasize` is what makes
+                // a second release a no-op.
+                unsafe { libc::free(cdata.ptr as *mut libc::c_void) };
             }
         }
         FLAVOR_NEW_NONSTD => {
@@ -858,7 +914,20 @@ fn cdata_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 /// `W_CData.call`.
-fn cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+///
+/// Named `__majit_wrap_*` and published below: `BuiltinCode.func` is a PBC
+/// whose family `builtin_wrapper_indirect_graphs` builds out of exactly the
+/// wrapper paths that carry a registered graph, and a traced cdata call
+/// reaches this body through `bytecode_for_address` on the function's
+/// address.  Registered under any other name it has no member in that family,
+/// and every `cdata(...)` stays a `bh_call_fn` residual with the argument
+/// conversions and the foreign call opaque behind it.
+pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    // A gateway body reads its argument count before any argument; the
+    // walker locates the argument array's item descriptor by that order.
+    if args.is_empty() {
+        return Err(PyError::type_error("__call__ needs a cdata receiver"));
+    }
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
     if ct.kind == ctypeobj::KIND_FUNC {
@@ -870,12 +939,21 @@ fn cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     )))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_cdata_call: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_cdata_call)),
+        func: __majit_wrap_cdata_call,
+    };
+
 /// `W_CData.getattr`.
 fn cdata_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
     let field = ctypeobj::getcfield(ct, crate::baseobjspace::text_w(args[1])?, "read")?;
-    unsafe { super::ctypestruct::read(field, cdata.ptr, args[0]) }
+    unsafe { super::ctypestruct::read(field, cdata.ptr as *mut u8, args[0]) }
 }
 
 /// `W_CData.setattr`.
@@ -888,7 +966,7 @@ fn cdata_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
     let field = ctypeobj::getcfield(ct, crate::baseobjspace::text_w(args[1])?, "write")?;
-    unsafe { super::ctypestruct::write(field, cdata.ptr, roots.get(value_slot))? };
+    unsafe { super::ctypestruct::write(field, cdata.ptr as *mut u8, roots.get(value_slot))? };
     Ok(pyre_object::w_none())
 }
 
@@ -914,10 +992,7 @@ fn compare_mode(w_self: PyObjectRef, w_other: PyObjectRef) -> Result<CompareMode
         .is_some_and(|ct| !ct.is_primitive());
     if self_is_ptr && other_is_ptr {
         let other = other.expect("other_is_ptr implies a cdata");
-        return Ok(CompareMode::Addresses(
-            cdata.ptr as usize,
-            other.ptr as usize,
-        ));
+        return Ok(CompareMode::Addresses(cdata.ptr, other.ptr));
     }
     if self_is_ptr || other_is_ptr {
         return Ok(CompareMode::Incomparable);
@@ -983,7 +1058,12 @@ fn cdata_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     let item = ctypeobj::ctype_at(ct.ctitem)
         .ok_or_else(|| PyError::system_error("indexed ctype without an item type"))?;
-    unsafe { ctypeobj::convert_to_object(item, cdata.ptr.offset((i * item.size) as isize)) }
+    unsafe {
+        ctypeobj::convert_to_object(
+            item,
+            cdata.ptr.wrapping_add_signed((i * item.size) as isize),
+        )
+    }
 }
 
 /// `W_CData.setitem`.
@@ -1008,7 +1088,7 @@ fn cdata_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     unsafe {
         ctypeobj::convert_from_object(
             item,
-            cdata.ptr.offset((i * item.size) as isize),
+            cdata.ptr.wrapping_add_signed((i * item.size) as isize),
             roots.get(value_slot),
         )?;
     }
@@ -1032,7 +1112,7 @@ fn check_subscript_index(cdata: &W_CData, i: i64) -> Result<&'static mut W_CType
                         ct.name()
                     )));
                 }
-            } else if cdata.ptr.is_null() {
+            } else if cdata.ptr == 0 {
                 return Err(PyError::runtime_error(format!(
                     "cannot dereference null pointer from cdata '{}'",
                     ct.name()
@@ -1131,7 +1211,7 @@ fn do_getslice(w_self: PyObjectRef, w_slice: PyObjectRef) -> Result<PyObjectRef,
         .ok_or_else(|| PyError::system_error("array without an item type"))?
         .size;
     let cdata = cdata_arg(roots.get(self_slot))?;
-    let ptr = unsafe { cdata.ptr.offset((start * item_size) as isize) };
+    let ptr = cdata.ptr.wrapping_add_signed((start * item_size) as isize);
     Ok(new_cdata_sliced(ptr, roots.get(array_slot), length))
 }
 
@@ -1153,7 +1233,7 @@ fn do_setslice(
         .ok_or_else(|| PyError::system_error("pointer without an item type"))?;
     let item_size = item.size;
     let cdata = cdata_arg(w_self)?;
-    let target = unsafe { cdata.ptr.offset((start * item_size) as isize) };
+    let target = cdata.ptr.wrapping_add_signed((start * item_size) as isize);
 
     // The fast path: copying from an array of exactly the item type.
     if let Some(source) = W_CData::from_obj(w_value)
@@ -1166,7 +1246,11 @@ fn do_setslice(
         && source.array_length()? == length
     {
         unsafe {
-            std::ptr::copy_nonoverlapping(source.ptr, target, (item_size * length) as usize);
+            std::ptr::copy_nonoverlapping(
+                source.ptr as *const u8,
+                target as *mut u8,
+                (item_size * length) as usize,
+            );
         }
         return Ok(());
     }
@@ -1192,7 +1276,9 @@ fn do_setslice(
                     value.len()
                 )));
             }
-            unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), target, value.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(value.as_ptr(), target as *mut u8, value.len())
+            };
             return Ok(());
         }
     }
@@ -1215,8 +1301,8 @@ fn do_setslice(
             }
             Err(err) => return Err(err),
         }
-        let element = unsafe { target.offset((i * item_size) as isize) };
-        unsafe { ctypeobj::convert_from_object(item, element, roots.get(item_slot))? };
+        let element = target.wrapping_add_signed((i * item_size) as isize);
+        unsafe { ctypeobj::convert_from_object(item, element as usize, roots.get(item_slot))? };
     }
     match crate::baseobjspace::next(roots.get(iter_slot)) {
         Ok(_) => Err(PyError::value_error(format!(
@@ -1283,7 +1369,7 @@ fn add_or_sub(
 ) -> Result<PyObjectRef, PyError> {
     let i = sign * crate::baseobjspace::getindex_w(w_other)?;
     let cdata = cdata_arg(w_self)?;
-    ctypeobj::add(cdata.ctype, cdata.ptr, i)
+    ctypeobj::add(cdata.ctype, cdata.ptr as *mut u8, i)
 }
 
 // ── module-level entry points that read a cdata ─────────────────────────
@@ -1306,7 +1392,7 @@ pub fn unpack(w_cdata: PyObjectRef, length: i64) -> Result<PyObjectRef, PyError>
     if length < 0 {
         return Err(PyError::value_error("'length' cannot be negative"));
     }
-    if cdata.ptr.is_null() {
+    if cdata.ptr == 0 {
         let w_repr = crate::builtins::builtin_repr(&[w_cdata])?;
         return Err(PyError::runtime_error(format!(
             "cannot use unpack() on {}",
@@ -1315,5 +1401,5 @@ pub fn unpack(w_cdata: PyObjectRef, length: i64) -> Result<PyObjectRef, PyError>
     }
     let item = ctypeobj::ctype_at(ct.ctitem)
         .ok_or_else(|| PyError::system_error("pointer without an item type"))?;
-    super::ctypeptr::unpack_ptr(ct, item, cdata.ptr, length)
+    super::ctypeptr::unpack_ptr(ct, item, cdata.ptr as *mut u8, length)
 }

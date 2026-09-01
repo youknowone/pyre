@@ -371,12 +371,16 @@ fn ffi_bad_type(w_ffi: PyObjectRef, input_text: &str) -> PyError {
     if input_text.len() > 500 {
         return ffi_error(errmsg);
     }
+    // `W_FFIObject._ffi_bad_type` works over the UTF-8 bytes handed to the C
+    // parser.  A non-ASCII code point therefore contributes one `?` per byte,
+    // and `c_error_location` indexes that same byte stream.
     let printable: String = input_text
-        .chars()
-        .map(|c| {
-            if (' '..'\x7f').contains(&c) {
-                c
-            } else if c == '\t' || c == '\n' {
+        .as_bytes()
+        .iter()
+        .map(|&byte| {
+            if (b' '..b'\x7f').contains(&byte) {
+                byte as char
+            } else if byte == b'\t' || byte == b'\n' {
                 ' '
             } else {
                 '?'
@@ -565,7 +569,7 @@ fn ffi_addressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         }
     }
     let cdata = cdataobj::cdata_arg(roots.get(base + 1))?;
-    let ptr = unsafe { cdata.ptr.offset(offset as isize) };
+    let ptr = cdata.ptr.wrapping_add_signed(offset as isize);
     let ptr_type = newtype::new_pointer_type(w_ctype)?;
     Ok(cdataobj::new_cdata(ptr, ptr_type))
 }
@@ -1191,6 +1195,97 @@ pub fn ffi_type_object() -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// `W_FFIObject.descr_*.__doc__` — `interp2app` publishes these literals on
+/// the built-in methods.  Rust functions have no app-level function object,
+/// so the TypeDef registration supplies the upstream text explicitly.
+fn ffi_method_doc(name: &str) -> &'static str {
+    match name {
+        "addressof" => {
+            r#"Limited equivalent to the '&' operator in C:
+
+1. ffi.addressof(<cdata 'struct-or-union'>) returns a cdata that is a
+pointer to this struct or union.
+
+2. ffi.addressof(<cdata>, field-or-index...) returns the address of a
+field or array item inside the given structure or array, recursively
+in case of nested structures or arrays.
+
+3. ffi.addressof(<library>, "name") returns the address of the named
+function or global variable."#
+        }
+        "alignof" => {
+            "Return the natural alignment size in bytes of the argument.\nIt can be a string naming a C type, or a 'cdata' instance."
+        }
+        "callback" => {
+            "Return a callback object or a decorator making such a callback object.\n'cdecl' must name a C function pointer type.  The callback invokes the\nspecified 'python_callable' (which may be provided either directly or\nvia a decorator).  Important: the callback object must be manually\nkept alive for as long as the callback may be invoked from the C code."
+        }
+        "cast" => {
+            "Similar to a C cast: returns an instance of the named C\ntype initialized with the given 'source'.  The source is\ncasted between integers or pointers of any type."
+        }
+        "dlclose" => {
+            "Close a library obtained with ffi.dlopen().  After this call, access to\n\"functions or variables from the library will fail (possibly with a\nsegmentation fault)."
+        }
+        "dlopen" => {
+            "Load and return a dynamic library identified by 'name'.  The standard\nC library can be loaded by passing None.\n\nNote that functions and types declared with 'ffi.cdef()' are not\nlinked to a particular library, just like C headers.  In the library\nwe only look for the actual (untyped) symbols at the time of their\nfirst access."
+        }
+        "from_buffer" => {
+            "Return a <cdata 'char[]'> that points to the data of the given Python\nobject, which must support the buffer interface.  Note that this is\nnot meant to be used on the built-in types str or unicode\n(you can build 'char[]' arrays explicitly) but only on objects\ncontaining large quantities of raw data in some other format, like\n'array.array' or numpy arrays."
+        }
+        "from_handle" => {
+            "Cast a 'void *' back to a Python object.  Must be used *only* on the\npointers returned by new_handle(), and *only* as long as the exact\ncdata object returned by new_handle() is still alive (somewhere else\nin the program).  Failure to follow these rules will crash."
+        }
+        "gc" => {
+            "Return a new cdata object that points to the same data.\nLater, when this new cdata object is garbage-collected,\n'destructor(old_cdata_object)' will be called."
+        }
+        "getctype" => {
+            "Return a string giving the C type 'cdecl', which may be itself a\nstring or a <ctype> object.  If 'replace_with' is given, it gives\nextra text to append (or insert for more complicated C types), like a\nvariable name, or '*' to get actually the C type 'pointer-to-cdecl'."
+        }
+        "getwinerror" => {
+            "Return either the GetLastError() or the error number given by the\noptional 'code' argument, as a tuple '(code, message)'."
+        }
+        "init_once" => {
+            "init_once(function, tag): run function() once.  More precisely,\n'function()' is called the first time we see a given 'tag'.\n\nThe return value of function() is remembered and returned by the current\nand all future init_once() with the same tag.  If init_once() is called\nfrom multiple threads in parallel, all calls block until the execution\nof function() is done.  If function() raises an exception, it is\npropagated and nothing is cached."
+        }
+        "integer_const" => {
+            "Get the value of an integer constant.\n\n'ffi.integer_const(\"xxx\")' is equivalent to 'lib.xxx' if xxx names an\ninteger constant.  The point of this function is limited to use cases\nwhere you have an 'ffi' object but not any associated 'lib' object."
+        }
+        "list_types" => {
+            "Returns the user type names known to this FFI instance.\nThis returns a tuple containing three lists of names:\n(typedef_names, names_of_structs, names_of_unions)"
+        }
+        "memmove" => {
+            "ffi.memmove(dest, src, n) copies n bytes of memory from src to dest.\n\nLike the C function memmove(), the memory areas may overlap;\napart from that it behaves like the C function memcpy().\n\n'src' can be any cdata ptr or array, or any Python buffer object.\n'dest' can be any cdata ptr or array, or a writable Python buffer\nobject.  The size to copy, 'n', is always measured in bytes.\n\nUnlike other methods, this one supports all Python buffer including\nbyte strings and bytearrays---but it still does not support\nnon-contiguous buffers."
+        }
+        "new" => {
+            "Allocate an instance according to the specified C type and return a\npointer to it.  The specified C type must be either a pointer or an\narray: ``new('X *')`` allocates an X and returns a pointer to it,\nwhereas ``new('X[n]')`` allocates an array of n X'es and returns an\narray referencing it (which works mostly like a pointer, like in C).\nYou can also use ``new('X[]', n)`` to allocate an array of a\nnon-constant length n.\n\nThe memory is initialized following the rules of declaring a global\nvariable in C: by default it is zero-initialized, but an explicit\ninitializer can be given which can be used to fill all or part of the\nmemory.\n\nWhen the returned <cdata> object goes out of scope, the memory is\nfreed.  In other words the returned <cdata> object has ownership of\nthe value of type 'cdecl' that it points to.  This means that the raw\ndata can be used as long as this object is kept alive, but must not be\nused for a longer time.  Be careful about that when copying the\npointer to the memory somewhere else, e.g. into another structure."
+        }
+        "new_allocator" => {
+            "Return a new allocator, i.e. a function that behaves like ffi.new()\nbut uses the provided low-level 'alloc' and 'free' functions.\n\n'alloc' is called with the size as argument.  If it returns NULL, a\nMemoryError is raised.  'free' is called with the result of 'alloc'\nas argument.  Both can be either Python functions or directly C\nfunctions.  If 'free' is None, then no free function is called.\nIf both 'alloc' and 'free' are None, the default is used.\n\nIf 'should_clear_after_alloc' is set to False, then the memory\nreturned by 'alloc' is assumed to be already cleared (or you are\nfine with garbage); otherwise CFFI will clear it.\n        "
+        }
+        "new_handle" => {
+            "Return a non-NULL cdata of type 'void *' that contains an opaque\nreference to the argument, which can be any Python object.  To cast it\nback to the original object, use from_handle().  You must keep alive\nthe cdata object returned by new_handle()!"
+        }
+        "offsetof" => {
+            "Return the offset of the named field inside the given structure or\narray, which must be given as a C type name.  You can give several\nfield names in case of nested structures.  You can also give numeric\nvalues which correspond to array items, in case of an array type."
+        }
+        "release" => {
+            "Release now the resources held by a 'cdata' object from ffi.new(),\nffi.gc() or ffi.from_buffer().  The cdata object must not be used\nafterwards.\n\n'ffi.release(cdata)' is equivalent to 'cdata.__exit__()'."
+        }
+        "sizeof" => {
+            "Return the size in bytes of the argument.\nIt can be a string naming a C type, or a 'cdata' instance."
+        }
+        "string" => {
+            "Return a Python string (or unicode string) from the 'cdata'.  If\n'cdata' is a pointer or array of characters or bytes, returns the\nnull-terminated string.  The returned string extends until the first\nnull character, or at most 'maxlen' characters.  If 'cdata' is an\narray then 'maxlen' defaults to its length.\n\nIf 'cdata' is a pointer or array of wchar_t, returns a unicode string\nfollowing the same rules.\n\nIf 'cdata' is a single character or byte or a wchar_t, returns it as a\nstring or unicode string.\n\nIf 'cdata' is an enum, returns the value of the enumerator as a\nstring, or 'NUMBER' if the value is out of range."
+        }
+        "typeof" => {
+            "Parse the C type given as a string and return the\ncorresponding <ctype> object.\nIt can also be used on 'cdata' instance to get its C type."
+        }
+        "unpack" => {
+            "Unpack an array of C data of the given length,\nreturning a Python string/unicode/list.\n\nIf 'cdata' is a pointer to 'char', returns a byte string.\nIt does not stop at the first null.  This is equivalent to:\nffi.buffer(cdata, length)[:]\n\nIf 'cdata' is a pointer to 'wchar_t', returns a unicode string.\n'length' is measured in wchar_t's; it is not the size in bytes.\n\nIf 'cdata' is a pointer to anything else, returns a list of\n'length' items.  This is a faster equivalent to:\n[cdata[i] for i in range(length)]"
+        }
+        _ => "",
+    }
+}
+
 fn init_ffi_type(ns: PyObjectRef) {
     let store = |name: &str, value: PyObjectRef| unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
@@ -1225,12 +1320,22 @@ fn init_ffi_type(ns: PyObjectRef) {
         ("typeof", ffi_typeof),
         ("unpack", ffi_unpack),
     ] {
-        store(name, crate::make_builtin_function(name, function));
+        store(
+            name,
+            crate::make_builtin_function_with_doc(name, function, ffi_method_doc(name)),
+        );
     }
+    // `ffi_obj.py` registers this one through `_extras` because it exists on
+    // win32 alone; its docstring is the same table entry every other method
+    // takes.
     #[cfg(windows)]
     store(
         "getwinerror",
-        crate::make_builtin_function("getwinerror", ffi_getwinerror),
+        crate::make_builtin_function_with_doc(
+            "getwinerror",
+            ffi_getwinerror,
+            ffi_method_doc("getwinerror"),
+        ),
     );
     let getter = crate::make_builtin_function_with_arity("errno", errno_get, 2);
     let setter = crate::make_builtin_function_with_arity("errno", errno_set, 3);

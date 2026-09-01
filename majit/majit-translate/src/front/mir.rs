@@ -3232,7 +3232,7 @@ impl std::error::Error for LowerError {}
 /// name it explicitly instead. Without a name `arraydescrof_concrete`
 /// returns no descr-set key, `canonicalize_keyed_descrs` drops the whole
 /// set, and the callee's `EffectInfo` degrades to `EF_RANDOM_EFFECTS`.
-const OBJECT_REF_GCARRAY_TYPE_ID: &str = "majit::object_ref_gcarray";
+pub(crate) const OBJECT_REF_GCARRAY_TYPE_ID: &str = "majit::object_ref_gcarray";
 /// PyPy `BytesListStrategy` / `AsciiListStrategy` expose `SomeString`
 /// elements, while `rmodel.externalvsinternal(..., gcref=True)` stores those
 /// GC pointers in `GcArray(GCREF)`.  The logical list identity must therefore
@@ -24440,17 +24440,27 @@ fn const_tuple_field_index(elem: &ProjectionElem) -> Option<u64> {
 }
 
 fn const_eval_unop(kind: &serde_json::Value, v: ConstLit) -> Option<ConstLit> {
-    match (operator_name(kind)?, v) {
+    let name = operator_name(kind)?;
+    // A scalar int→int cast reads the operand's bits, and the two integer
+    // carriers hold the same bits, so one evaluation serves both spellings
+    // (`b'v' as i64` starts from an unsigned literal).  The destination's
+    // own signedness is restored by `const_narrow_to_target`.
+    let cast_bits = match v {
+        ConstLit::Int(n) => Some(n),
+        ConstLit::UInt(n) => Some(n as i64),
+        _ => None,
+    };
+    if let ("Cast", Some(bits)) = (name, cast_bits) {
+        // Truncate / re-extend to the target width so `expr as uN` folds
+        // exactly.
+        let scalar = kind.as_object()?.get("Cast")?.get("Scalar")?.as_array()?;
+        return const_cast_int(bits, scalar.get(1)?).map(ConstLit::Int);
+    }
+    match (name, v) {
         ("Neg", ConstLit::Int(n)) => n.checked_neg().map(ConstLit::Int),
         ("Not", ConstLit::Bool(b)) => Some(ConstLit::Bool(!b)),
         ("Not", ConstLit::Int(n)) => Some(ConstLit::Int(!n)),
         ("Not", ConstLit::UInt(n)) => Some(ConstLit::UInt(!n)),
-        ("Cast", ConstLit::Int(n)) => {
-            // Scalar int→int cast: truncate / re-extend to the target
-            // width so `expr as uN` folds exactly.
-            let scalar = kind.as_object()?.get("Cast")?.get("Scalar")?.as_array()?;
-            const_cast_int(n, scalar.get(1)?).map(ConstLit::Int)
-        }
         _ => None,
     }
 }

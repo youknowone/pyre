@@ -139,6 +139,32 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "decode_instruction_forward_packed",
         "pyopcode.py dispatch_bytecode EXTENDED_ARG loop (opcode/oparg projection)",
     ),
+    // `ctypefunc.py W_CTypeFunc._call` carries `@jit.unroll_safe`, and the two
+    // halves it is split into here both take it: the body that converts the
+    // arguments into the libffi exchange buffer, and the `finally` that
+    // releases what those conversions allocated.  Both loops are bounded by
+    // `len(self.fargs)`, which is a trace constant once the function type is
+    // promoted off a constant cdata.
+    //
+    // Same class of evidence as `locals_plus_value`, and NOT the `*_nohidden`
+    // argument: both bodies are REACHED — each holds a jitcode in the
+    // generated metadata artefact — so unreachability proves nothing and the
+    // corpus is what has to answer.  Measured on the tree that carries these
+    // attributes, `pyre/check.py --backend dynasm` ran the whole synthetic and
+    // macro corpus with every committed per-fixture jitstats baseline
+    // unchanged.  That covers `fbw_rolled_back_with_effects` corpus-wide
+    // rather than per fixture, because it is a `JITSTATS_BADNESS_FIELDS`
+    // member in `check.py`, so a rise anywhere would have been a red rather
+    // than a statistic.  The run's one failure was
+    // `synth/load_name_builtin_cell_fold`'s pypy ratio against the
+    // `max-pypy-ratio=1` that fixture carried at the time; `bench: lengthen
+    // sub-50ms synthetic fixtures` raised it to 2.5 on main, and the measured
+    // 1.6x passes the replacement.
+    ("do_call", "ctypefunc.py W_CTypeFunc._call"),
+    (
+        "release_arguments",
+        "ctypefunc.py W_CTypeFunc._call's finally block",
+    ),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`

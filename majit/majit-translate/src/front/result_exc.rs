@@ -844,6 +844,14 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::New { .. }
         | OpKind::NewWithVtable { .. } => Vec::new(),
 
+        OpKind::RawLoad { base, offset, .. } => vec![base.clone(), offset.clone()],
+        OpKind::RawStore {
+            base,
+            offset,
+            value,
+            ..
+        } => vec![base.clone(), offset.clone(), value.clone()],
+
         OpKind::FieldRead { base, .. }
         | OpKind::VableFieldRead { base, .. }
         | OpKind::VableForce { base }

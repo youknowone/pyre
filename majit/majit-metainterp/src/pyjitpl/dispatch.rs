@@ -2759,41 +2759,6 @@ where
         }
     }
 
-    /// Hard-fail invariant: `pyjitpl.py do_residual_call` calls
-    /// `direct_libffi_call(allboxes, c_result, descr)` whenever
-    /// `effectinfo.oopspecindex == EffectInfo.OS_LIBFFI_CALL`, returning
-    /// either a hand-rebuilt `call_release_gil_for_descr` op (jit_libffi
-    /// CIF descriptor + dynamic calldescr) or `None` for fallback.  Pyre
-    /// does NOT yet implement this branch — the prerequisites are:
-    ///
-    ///   * `jit_libffi`: `CIF_DESCRIPTION_P` layout, `nargs` / `atypes`
-    ///     / `exchange_args` access, `RFFI_ERR_ALL | RFFI_ALT_ERRNO`
-    ///     constant pair (`pyjitpl.py:3611-3667`).
-    ///   * `cpu.calldescrof_dynamic` to derive a per-call dynamic descr
-    ///     from the CIF (`pyjitpl.py:3630`).
-    ///   * `get_arg_descr` from `rpython.jit.backend.llsupport.ffisupport`
-    ///     to translate per-arg `kind/descr/itemsize` triples
-    ///     (`pyjitpl.py:3638-3656`).
-    ///   * Producer surface: pyre has no `_rawffi` / `_cffi_backend`
-    ///     equivalent, so no codewriter currently emits an oopspec of
-    ///     `OS_LIBFFI_CALL`.  Until those land, this invariant ensures
-    ///     the dispatch hole stays fail-loud rather than dormant.
-    ///
-    /// TODO: line-by-line port of `direct_libffi_call`
-    /// is gated on the libffi infrastructure above; the invariant
-    /// surfaces any future producer that emits the oopspec without the
-    /// matching dispatcher implementation.
-    fn assert_no_libffi_call_oopspec(effectinfo: &majit_ir::descr::EffectInfo) {
-        if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::LibffiCall {
-            panic!(
-                "OS_LIBFFI_CALL canonical dispatch not implemented in pyre — \
-                 see Self::assert_no_libffi_call_oopspec for the porting prerequisites \
-                 (pyjitpl.py:3611-3667 direct_libffi_call requires jit_libffi, \
-                 cpu.calldescrof_dynamic, get_arg_descr)."
-            );
-        }
-    }
-
     fn finish_residual_call_exception_path(
         &mut self,
         ctx: &mut TraceCtx,
@@ -7404,12 +7369,15 @@ where
                         return TraceAction::Abort;
                     }
                 } else {
-                    // pyjitpl.py do_residual_call: OS_LIBFFI_CALL
-                    // gets the `direct_libffi_call` shortcut.  Pyre lacks the
-                    // jit_libffi infrastructure to honour it — see
-                    // `assert_no_libffi_call_oopspec` for the convergence
-                    // path.
-                    Self::assert_no_libffi_call_oopspec(effectinfo);
+                    // `pyjitpl.py do_residual_call`'s `OS_LIBFFI_CALL` hook answers
+                    // `None  # cannot be handled by direct_libffi_call()` on this
+                    // layer: rebuilding the call out of its `CIF_DESCRIPTION`
+                    // needs a `MetaInterp`, which this jitcode machine does not
+                    // hold.  That is upstream's own fallthrough — the release-gil
+                    // / may-force selection below is what it falls through to.
+                    // The specialization lives in
+                    // `MetaInterp::direct_libffi_call` and in the pyre-jit-trace
+                    // walker's residual-call dispatchers.
                     let is_release_gil = effectinfo.is_call_release_gil();
                     let is_forces = effectinfo.check_forces_virtual_or_virtualizable();
                     let is_loopinvariant =
@@ -7515,9 +7483,9 @@ where
                     //    call_release_gil_target) into the trace IR
                     //    instead of re-deriving the default for the opcode.
                     //    The OS_LIBFFI_CALL pre-hook
-                    //    (`pyjitpl.py:2059-2061`) is invariant-checked at
-                    //    the top of this branch — see
-                    //    `assert_no_libffi_call_oopspec`.
+                    //    (`pyjitpl.py:2059-2061`) declines at the top of this
+                    //    branch, so the calldescr reaching here is the
+                    //    original one.
                     let effect_info = calldescr.extra_info.clone();
                     if is_release_gil {
                         ctx.call_release_gil_void_typed_with_effect(
@@ -7720,8 +7688,15 @@ where
                     }
                     let _ = dst;
                 } else {
-                    // pyjitpl.py do_residual_call OS_LIBFFI_CALL hook.
-                    Self::assert_no_libffi_call_oopspec(effectinfo);
+                    // `pyjitpl.py do_residual_call`'s `OS_LIBFFI_CALL` hook answers
+                    // `None  # cannot be handled by direct_libffi_call()` on this
+                    // layer: rebuilding the call out of its `CIF_DESCRIPTION`
+                    // needs a `MetaInterp`, which this jitcode machine does not
+                    // hold.  That is upstream's own fallthrough — the release-gil
+                    // / may-force selection below is what it falls through to.
+                    // The specialization lives in
+                    // `MetaInterp::direct_libffi_call` and in the pyre-jit-trace
+                    // walker's residual-call dispatchers.
                     let is_release_gil = effectinfo.is_call_release_gil();
                     let is_forces = effectinfo.check_forces_virtual_or_virtualizable();
                     let is_loopinvariant =
@@ -8029,8 +8004,15 @@ where
                              (resoperation.py:1243-1244 `# no such thing`)"
                         );
                     }
-                    // pyjitpl.py do_residual_call OS_LIBFFI_CALL hook.
-                    Self::assert_no_libffi_call_oopspec(effectinfo);
+                    // `pyjitpl.py do_residual_call`'s `OS_LIBFFI_CALL` hook answers
+                    // `None  # cannot be handled by direct_libffi_call()` on this
+                    // layer: rebuilding the call out of its `CIF_DESCRIPTION`
+                    // needs a `MetaInterp`, which this jitcode machine does not
+                    // hold.  That is upstream's own fallthrough — the release-gil
+                    // / may-force selection below is what it falls through to.
+                    // The specialization lives in
+                    // `MetaInterp::direct_libffi_call` and in the pyre-jit-trace
+                    // walker's residual-call dispatchers.
                     let is_forces = effectinfo.check_forces_virtual_or_virtualizable();
                     let is_loopinvariant =
                         effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
@@ -8272,8 +8254,15 @@ where
                     }
                     let _ = dst;
                 } else {
-                    // pyjitpl.py do_residual_call OS_LIBFFI_CALL hook.
-                    Self::assert_no_libffi_call_oopspec(effectinfo);
+                    // `pyjitpl.py do_residual_call`'s `OS_LIBFFI_CALL` hook answers
+                    // `None  # cannot be handled by direct_libffi_call()` on this
+                    // layer: rebuilding the call out of its `CIF_DESCRIPTION`
+                    // needs a `MetaInterp`, which this jitcode machine does not
+                    // hold.  That is upstream's own fallthrough — the release-gil
+                    // / may-force selection below is what it falls through to.
+                    // The specialization lives in
+                    // `MetaInterp::direct_libffi_call` and in the pyre-jit-trace
+                    // walker's residual-call dispatchers.
                     let is_release_gil = effectinfo.is_call_release_gil();
                     let is_forces = effectinfo.check_forces_virtual_or_virtualizable();
                     let is_loopinvariant =

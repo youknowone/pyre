@@ -85,13 +85,18 @@ pub const F_WITH_PACKED_CHANGE: i64 = 1 << 15;
 
 /// `ctypeobj.py W_CType` and the RPython subclasses that share its typedef.
 ///
-/// `UniqueCache` caches every ctype and reaches the derived ones through weak
-/// references (`W_CType._pointer_type`, `W_CTypePointer._array_types`), so a
-/// ctype dies once the last user does.  pyre holds them strongly and roots
-/// them for the process instead: the memo has to survive because
-/// `convert_from_object` decides pointer compatibility by object identity,
-/// and a ctype is a small, bounded population that a program declares once.
+/// `UniqueCache` keeps primitive/singleton ctypes strongly and reaches derived
+/// ctypes through weak references (`W_CType._pointer_type`,
+/// `W_CTypePointer._array_types`).  Thus a derived ctype dies with its last
+/// user while a repeated constructor still returns the live memoized object.
 #[crate::pyre_class("_cffi_backend.CType")]
+// `W_CTypePtrOrArray._immutable_fields_` names `ctitem`, and
+// `W_CTypeFunc._immutable_fields_` names `fargs[*]`, `abi` and `cif_descr`:
+// each is written once, when the type is created, and every later reader only
+// reads it.  The `cif_descr` declaration is what lets a call through a
+// constant function type fold `exchange_size` / `exchange_args[i]` /
+// `exchange_result` to trace constants.
+#[majit_macros::jit_immutable_fields("ctitem", "fargs", "abi", "cif_descr")]
 pub struct W_CType {
     /// `W_CType.size` — the size of an instance, or -1 when unknown.
     pub size: i64,
@@ -108,9 +113,13 @@ pub struct W_CType {
     /// `W_CTypePtrOrArray.ctitem` — what a pointer points to, what an array
     /// holds.  `PY_NULL` on every other kind.
     pub ctitem: PyObjectRef,
-    /// `W_CType._pointer_type` — the pointer *to* this type, which
-    /// `new_pointer_type` memoises here.  `PY_NULL` until one is asked for.
+    /// `W_CType._pointer_type` — the GC weakref box for the pointer *to* this
+    /// type.  `PY_NULL` until one is asked for.
     pub pointer_type: PyObjectRef,
+    /// `W_CTypePointer._array_types` — the pointer-owned weak-value mapping
+    /// from lengths to array ctypes.  `PY_NULL` on non-pointers and before the
+    /// first array type is requested.
+    pub array_types: PyObjectRef,
     /// `W_CTypeArray.ctptr` — the pointer this array was built from, whose
     /// `ctitem` is the array's item type.  `PY_NULL` on every other kind.
     /// It is not `pointer_type`: the pointer to an `int[5]` is `int(*)[5]`,
@@ -126,9 +135,14 @@ pub struct W_CType {
     /// `W_CTypeFunc.abi`, the `FFI_*` calling convention.
     pub abi: i64,
     /// `W_CTypeFunc.cif_descr` — the `ffi_cif` this function type was
-    /// prepared with, built once here rather than once per call.  Null for a
+    /// prepared with, built once here rather than once per call.  Zero for a
     /// variadic function, whose cif depends on the arguments actually passed.
-    pub cif_descr: *mut u8,
+    ///
+    /// `CIF_DESCRIPTION` is a raw-flavour block, so `CIF_DESCRIPTION_P` is an
+    /// integer-kind pointer (`getkind(Ptr(TO))` answers `int` when
+    /// `TO._gckind` is `raw`) and the address belongs in the integer register
+    /// bank, not among the references a collector traces and rewrites.
+    pub cif_descr: usize,
     /// `W_CTypeStructOrUnion._fields_list` — a list of [`super::ctypestruct::W_CField`]
     /// in declaration order.  `PY_NULL` while the struct is opaque or lazy.
     pub fields_list: PyObjectRef,
@@ -314,7 +328,7 @@ impl W_CType {
             // `W_CTypePrimitive.extra_repr` — `repr(convert_to_object(cdata))`.
             let roots = pyre_object::gc_roots::push_roots();
             let ob_slot = roots.base();
-            let _ = roots.pin_root(unsafe { convert_to_object(self, cdata)? });
+            let _ = roots.pin_root(unsafe { convert_to_object(self, cdata as usize)? });
             let w_repr = crate::builtins::builtin_repr(&[roots.get(ob_slot)])?;
             return Ok(unsafe { pyre_object::w_str_get_value(w_repr) }.to_string());
         }
@@ -341,19 +355,21 @@ pub fn ctype_of(cdata: &W_CData) -> Option<&'static mut W_CType> {
 
 /// `@unwrap_spec(w_ctype=ctypeobj.W_CType)`.
 pub fn ctype_arg(w_ctype: PyObjectRef) -> Result<&'static mut W_CType, PyError> {
-    ctype_at(w_ctype).ok_or_else(|| {
-        PyError::type_error(format!(
+    // A `match`, not `Option::ok_or_else`: the combinator's closure is a
+    // callee a traced caller would stop at.
+    match ctype_at(w_ctype) {
+        Some(ct) => Ok(ct),
+        None => Err(PyError::type_error(format!(
             "expected a ctype object, got '{}'",
             crate::type_methods::arg_type_name(w_ctype)
-        ))
-    })
+        ))),
+    }
 }
 
 // ── construction ────────────────────────────────────────────────────────
 
-/// Build a ctype and root it for the process.  Every ctype is memoised, so
-/// none of them is ever garbage: rooting once at birth is what lets the
-/// caches hold plain addresses.
+/// Build a GC-managed ctype.  `UniqueCache` roots only its strong primitive
+/// and singleton entries; derived caches retain weakref boxes instead.
 pub fn new_ctype(
     kind: i64,
     size: i64,
@@ -375,12 +391,12 @@ pub fn new_ctype(
         align,
         ctitem: roots.get(ctitem_slot),
         pointer_type: pyre_object::PY_NULL,
+        array_types: pyre_object::PY_NULL,
         ctptr: pyre_object::PY_NULL,
         length,
         flags,
         ..Default::default()
     });
-    root_forever(obj);
     obj
 }
 
@@ -398,12 +414,13 @@ impl Default for W_CType {
             align: -1,
             ctitem: pyre_object::PY_NULL,
             pointer_type: pyre_object::PY_NULL,
+            array_types: pyre_object::PY_NULL,
             ctptr: pyre_object::PY_NULL,
             length: -1,
             flags: 0,
             fargs: pyre_object::PY_NULL,
             abi: 0,
-            cif_descr: std::ptr::null_mut(),
+            cif_descr: 0,
             fields_list: pyre_object::PY_NULL,
             fields_dict: pyre_object::PY_NULL,
             enumerators2values: pyre_object::PY_NULL,
@@ -414,19 +431,29 @@ impl Default for W_CType {
     }
 }
 
-/// The rooted slots the ctype caches name.  A ctype is born through
-/// `allocate_stable`, so it never relocates and the cache can hold its plain
-/// address; the slot exists so the collector sees the object as live.
+/// Strong roots owned by `UniqueCache`: primitive/singleton ctypes and the
+/// weakref boxes held by process-global weak-value cache containers.  Ctypes
+/// are born through `allocate_stable`, so cached addresses never relocate.
 static ROOTED_CTYPES: std::sync::Mutex<Vec<Box<usize>>> = std::sync::Mutex::new(Vec::new());
 
 pub fn root_forever(obj: PyObjectRef) {
+    let _ = root_forever_slot(obj);
+}
+
+/// Register a process-lifetime root and return the stable address of its slot.
+/// The collector rewrites the value in this slot when `obj` moves; native
+/// cache containers must read through this address instead of retaining the
+/// object's original address.
+pub fn root_forever_slot(obj: PyObjectRef) -> *const usize {
     let mut slot = Box::new(obj as usize);
     let root_slot = (&raw mut *slot) as *mut *mut u8;
     unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
+    let stable_slot = (&raw const *slot) as *const usize;
     ROOTED_CTYPES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(slot);
+    stable_slot
 }
 
 // ── the dispatchers the RPython hierarchy spells as overrides ───────────
@@ -435,12 +462,18 @@ pub fn root_forever(obj: PyObjectRef) {
 ///
 /// # Safety
 /// `cdata` must be readable for `ct.size` bytes.
-pub unsafe fn convert_to_object(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyError> {
+pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRef, PyError> {
     match ct.kind {
         // `W_CTypeFunc(W_CTypePtrBase)` inherits the same conversion.
-        KIND_POINTER | KIND_FUNC => Ok(super::ctypeptr::pointer_convert_to_object(ct, cdata)),
-        KIND_ARRAY => Ok(super::ctypeptr::array_convert_to_object(ct, cdata)),
-        KIND_STRUCT | KIND_UNION => super::ctypestruct::convert_to_object(ct, cdata),
+        KIND_POINTER | KIND_FUNC => Ok(super::ctypeptr::pointer_convert_to_object(
+            ct,
+            cdata as *const u8,
+        )),
+        KIND_ARRAY => Ok(super::ctypeptr::array_convert_to_object(
+            ct,
+            cdata as *const u8,
+        )),
+        KIND_STRUCT | KIND_UNION => super::ctypestruct::convert_to_object(ct, cdata as *const u8),
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_to_object(ct, cdata) },
         _ => Err(PyError::type_error(format!(
             "cannot return a cdata '{}'",
@@ -456,13 +489,13 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: *const u8) -> Result<PyObje
 /// `cdata` must be readable for `ct.size` bytes unless the ctype is `void`.
 pub unsafe fn copy_and_convert_to_object(
     ct: &W_CType,
-    cdata: *const u8,
+    cdata: usize,
 ) -> Result<PyObjectRef, PyError> {
     if ct.kind == KIND_VOID {
         return Ok(pyre_object::w_none());
     }
     if ct.is_struct_or_union() {
-        return unsafe { super::ctypestruct::copy_and_convert_to_object(ct, cdata) };
+        return unsafe { super::ctypestruct::copy_and_convert_to_object(ct, cdata as *const u8) };
     }
     unsafe { convert_to_object(ct, cdata) }
 }
@@ -473,17 +506,19 @@ pub unsafe fn copy_and_convert_to_object(
 /// `cdata` must be writable for `ct.size` bytes.
 pub unsafe fn convert_from_object(
     ct: &W_CType,
-    cdata: *mut u8,
+    cdata: usize,
     w_ob: PyObjectRef,
 ) -> Result<(), PyError> {
     match ct.kind {
         // `W_CTypeFunc(W_CTypePtrBase)` inherits the same conversion.
         KIND_POINTER | KIND_FUNC => unsafe {
-            super::ctypeptr::pointer_convert_from_object(ct, cdata, w_ob)
+            super::ctypeptr::pointer_convert_from_object(ct, cdata as *mut u8, w_ob)
         },
-        KIND_ARRAY => unsafe { super::ctypeptr::array_convert_from_object(ct, cdata, w_ob) },
+        KIND_ARRAY => unsafe {
+            super::ctypeptr::array_convert_from_object(ct, cdata as *mut u8, w_ob)
+        },
         KIND_STRUCT | KIND_UNION => unsafe {
-            super::ctypestruct::convert_from_object(ct, cdata, w_ob)
+            super::ctypestruct::convert_from_object(ct, cdata as *mut u8, w_ob)
         },
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_from_object(ct, cdata, w_ob) },
         _ => Err(PyError::type_error(format!(
@@ -562,7 +597,7 @@ pub unsafe fn float(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyErr
 /// `cdata` must be readable for `ct.size` bytes.
 pub unsafe fn complex(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyError> {
     if ct.kind == KIND_PRIM_COMPLEX {
-        return unsafe { super::ctypeprim::convert_to_object(ct, cdata) };
+        return unsafe { super::ctypeprim::convert_to_object(ct, cdata as usize) };
     }
     Err(PyError::type_error(format!(
         "complex() not supported on cdata '{}'",
@@ -600,7 +635,7 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
     let ct = ctype_of(cdata).ok_or_else(|| PyError::type_error("expected a cdata object"))?;
     match ct.kind {
         KIND_POINTER | KIND_ARRAY => super::ctypeptr::string(w_cdata, maxlen),
-        _ if ct.has(F_ENUM) => unsafe { super::ctypeenum::string(ct, cdata.ptr) },
+        _ if ct.has(F_ENUM) => unsafe { super::ctypeenum::string(ct, cdata.ptr as *const u8) },
         _ if ct.is_primitive() => super::ctypeprim::string(w_cdata, maxlen),
         _ => Err(unexpected_string_argument(ct)),
     }
@@ -615,11 +650,13 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
 /// byte just before it when the ctype is a pointer.
 pub unsafe fn convert_argument_from_object(
     ct: &W_CType,
-    cdata: *mut u8,
+    cdata: usize,
     w_ob: PyObjectRef,
 ) -> Result<bool, PyError> {
     if ct.kind == KIND_POINTER {
-        return unsafe { super::ctypeptr::pointer_convert_argument_from_object(ct, cdata, w_ob) };
+        return unsafe {
+            super::ctypeptr::pointer_convert_argument_from_object(ct, cdata as *mut u8, w_ob)
+        };
     }
     unsafe { convert_from_object(ct, cdata, w_ob)? };
     Ok(false)

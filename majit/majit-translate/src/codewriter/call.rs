@@ -3085,6 +3085,18 @@ impl CallControl {
         self.insert_function_graph_indexed(path, graph);
     }
 
+    /// Whether a graph is registered under `path`.
+    pub fn has_function_graph(&self, path: &CallPath) -> bool {
+        self.function_graphs.contains_key(path)
+    }
+
+    /// Admit `path` as a candidate after `find_all_graphs` has run — for a
+    /// helper graph minted during transformation (`codewriter::getslice`),
+    /// which the BFS could not have reached.
+    pub fn add_candidate_graph(&mut self, path: CallPath) {
+        self.candidate_graphs.insert(path);
+    }
+
     /// Register a free function graph together with its hints.
     /// `hints` mirror RPython `func._jit_*_` / `_elidable_function_`
     /// attributes; they are consulted by
@@ -8948,6 +8960,8 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } | OpKind::ArrayLen { .. } => {
             RaiseClass::No
         }
+        // RPython LL: raw_load, raw_store → cannot raise
+        OpKind::RawLoad { .. } | OpKind::RawStore { .. } => RaiseClass::No,
         // RPython LL: getinteriorfield_gc, setinteriorfield_gc → cannot raise
         OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => RaiseClass::No,
         // RPython LL: int_add, int_sub, int_lt, int_and, etc → cannot raise
