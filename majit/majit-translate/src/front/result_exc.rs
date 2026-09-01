@@ -1992,6 +1992,23 @@ fn catch_and_rewrap(
         Some(ExitSwitch::LastException),
         vec![Link::new_mixed(value_args, n_id, None), exc_link],
     );
+    // The normal arm above wrapped `r` in a fresh `Ok` shell, which is a
+    // statement about what `r` now IS: the raw payload the transformed
+    // callee returns, not the `Result` it returned before.  Retype the call
+    // to match, the same narrowing the diamond and tail-forward arms perform
+    // (`narrow_call_result_ty`).  Without it the call keeps the shell's
+    // `Ref`, so a callee that `int_return`s is invoked through
+    // `inline_call_*_r` and the returned value has no destination in the int
+    // bank — and the `Ok` shell built here would be handed the register the
+    // caller never wrote.
+    //
+    // Gated on `has_r` for the same reason the shells are: when the result
+    // does not flow along the original exit there is no payload to speak of
+    // and nothing consumes the call's type.  Placed last, after this rule's
+    // final mutation, so a decline still leaves the graph untouched.
+    if has_r {
+        narrow_call_result_ty(graph, a, r, payload_ty.clone());
+    }
     Ok(())
 }
 

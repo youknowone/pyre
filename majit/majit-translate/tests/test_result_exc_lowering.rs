@@ -146,6 +146,52 @@ fn a_tail_forwarding_wrapper_retypes_its_calls_to_the_payload() {
     );
 }
 
+/// The catch-and-rewrap fallback rebuilds the shell from the call's result,
+/// which means that result IS the payload — so the call has to be retyped
+/// like the diamond and tail-forward arms do.
+///
+/// `int_w` is `Result<i64, PyError>`; its consumers here match on the shell
+/// by hand rather than through `?`, so the site takes `catch_and_rewrap`.
+/// Left `Ref`, the call is emitted as `inline_call_*_r` against a callee that
+/// `int_return`s (the returned value then has no destination in the int
+/// bank), and the `Ok` shell the rewrite builds is handed a register the
+/// caller never wrote.
+#[test]
+fn a_rewrapped_call_site_retypes_its_call_to_the_payload() {
+    for name in [
+        "pyre_interpreter::baseobjspace::_check_len_result",
+        "pyre_interpreter::baseobjspace::getindex_w_index",
+        "pyre_interpreter::baseobjspace::index_int_w_preserve_negative",
+    ] {
+        let graph = lower_function(interp(), name).expect("lower");
+        let mut seen = 0usize;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    result_ty,
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if segments.last().map(String::as_str) != Some("int_w") {
+                    continue;
+                }
+                seen += 1;
+                assert_eq!(
+                    *result_ty,
+                    majit_translate::model::ValueType::Int,
+                    "{name}: the rewrap rebuilds `Ok(r)` from the call result, so \
+                     the call declares int_w's `i64` payload -- not the `Result` \
+                     shell (`Ref`, which is what this reads before the retype)"
+                );
+            }
+        }
+        assert!(seen >= 1, "{name} calls int_w");
+    }
+}
+
 #[test]
 fn pop_value_lowers_to_raise_links() {
     let llbc = interp();
