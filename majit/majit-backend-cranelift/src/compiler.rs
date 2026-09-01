@@ -5679,6 +5679,21 @@ fn resolve_opref_or_imm(
     use_declared_var_or_panic(builder, opref, "resolve_opref_or_imm")
 }
 
+/// The frame slot each of an attached bridge's inputargs is read from, in
+/// bridge inputarg order — `rebuild_faillocs_from_descr` decoded onto this
+/// guard by `collect_guards`.
+///
+/// An empty `bridge_source_slots` is the plain-identity case, the one
+/// `emit_attached_bridge_dispatch` skips its compaction for: the descr carries
+/// no `rd_locs`, so the k-th entry value is the k-th logical fail arg.
+fn bridge_entry_slots(info: &GuardInfo, arity: usize) -> Vec<usize> {
+    if info.bridge_source_slots.is_empty() {
+        (0..arity).collect()
+    } else {
+        info.bridge_source_slots.clone()
+    }
+}
+
 fn resolve_failarg_opref(
     builder: &mut FunctionBuilder,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -7203,6 +7218,336 @@ fn emit_attached_loop_dispatch(
 ///   1. save result to jf_frame[0]
 ///   2. MOV [ebp + jf_descr], faildescrindex
 ///   3. _call_footer
+/// A bridge whose closing JUMP lands on a LABEL of the loop it attaches to,
+/// merged into that loop's own cranelift function rather than left as a
+/// separate one.
+///
+/// `patch_jump_for_descr` gives the same shape a jump: the guard branches into
+/// the bridge and the bridge's `closing_jump` branches back, both inside one
+/// code blob with the values in registers. Cranelift cannot jump between
+/// functions, so a bridge kept out of line costs two function entries and a
+/// jitframe round trip per crossing. Merging restores the branch.
+///
+/// The wasm backend carries the same construct as `codegen::InlinedBridge`,
+/// with the placement bookkeeping wasm's structured control flow needs; the two
+/// merges share `value_id_end` and the id rebase, and will be unified once this
+/// side is proven.
+struct MergedRegion {
+    /// Per-trace fail index of the owner guard that enters this region.
+    source_fail_index: u32,
+    /// The region's own inputargs, positionally the owner guard's live fail
+    /// args (`bridge_source_slots`).
+    inputargs: Vec<InputArg>,
+    ops: Vec<Op>,
+    /// The constant pool registered for the region's own trace. A pool is
+    /// per-trace (`Backend::set_constants_pool` names the next compile) and its
+    /// keys are in that trace's value numbering, so the merge rebases them with
+    /// the region.
+    constants: majit_ir::ConstMap<majit_ir::Const>,
+    /// Where this region's reference constants start in the merged trace's
+    /// `GcTable`. The rewrite indexes each stream's table from zero, so every
+    /// `LoadFromGcTable` the region carries is shifted onto its own extension of
+    /// the owner's. Zero on a region as recorded, set when it is prepared.
+    gc_table_base: i64,
+}
+
+impl Clone for MergedRegion {
+    fn clone(&self) -> Self {
+        Self {
+            source_fail_index: self.source_fail_index,
+            // `InputArg` is not `Clone`: a copy has to be minted, not shared.
+            inputargs: self
+                .inputargs
+                .iter()
+                .map(InputArg::fresh_value_copy)
+                .collect(),
+            ops: self.ops.clone(),
+            constants: self.constants.clone(),
+            gc_table_base: self.gc_table_base,
+        }
+    }
+}
+
+/// Where one merged region landed in the merged stream.
+struct MergedRegionEntry {
+    source_fail_index: u32,
+    /// Index in the merged `ops` of the region's first operation.
+    ops_start: usize,
+    /// Value ids the region's inputargs occupy after the rebase, in order.
+    inputarg_ids: Vec<u32>,
+}
+
+/// The owner's stream with every region appended to it.
+struct MergedStream {
+    inputargs: Vec<InputArg>,
+    ops: Vec<Op>,
+    constants: majit_ir::ConstMap<majit_ir::Const>,
+    entries: Vec<MergedRegionEntry>,
+}
+
+/// Regions one loop takes before further merges are declined. Each merge
+/// re-emits the owner's function, so the cost of the next one grows with the
+/// stream; the cap bounds both that and the code size a hot loop reaches.
+const MAX_MERGED_REGIONS: usize = 8;
+
+/// Operations the merged stream may reach before further merges are declined.
+const MAX_MERGED_OPS: usize = 4096;
+
+/// Whether `bridge` leaves through a LABEL that `owner` publishes, with the
+/// arity that LABEL was compiled at.
+///
+/// That is what makes the merge worth taking: `do_compile`'s Jump lowering
+/// resolves such a target to a local block and emits a plain `jump`, so the
+/// region's exit becomes a branch. A JUMP naming a LABEL of another loop, or
+/// naming one of these with a different arg count, still lowers as an external
+/// jump — a tail call through the frame — and merging buys nothing.
+fn bridge_closes_onto(owner_ops: &[Op], bridge_ops: &[Op]) -> bool {
+    let label_arity: IndexMap<u32, usize> = owner_ops
+        .iter()
+        .filter(|op| op.opcode == OpCode::Label)
+        .filter_map(|op| op.getdescr().map(|d| (d.index(), op.num_args())))
+        .collect();
+    if label_arity.is_empty() {
+        return false;
+    }
+    bridge_ops.iter().any(|op| {
+        op.opcode == OpCode::Jump
+            && op.getdescr().is_some_and(|d| {
+                label_arity
+                    .get(&d.index())
+                    .is_some_and(|&arity| arity == op.num_args())
+            })
+    })
+}
+
+/// Whether `r` names an ordinary value id — the only kind a merge renumbers.
+///
+/// Everything else passes through a rebase untouched and stays out of the width
+/// the next region is offset by: a constant carries an inline payload and has no
+/// id at all, a `TempVar` id lives in the reserved sentinel strip above
+/// `VALUE_ID_LIMIT`, and a result-less op's `pos` is a *typed* none —
+/// `op_typed(OpRef::NONE.raw(), Void)` builds `VoidOp(u32::MAX)`, which the
+/// `OpRef::None` variant match in `is_none()` does not catch, so the raw is what
+/// has to be tested.
+fn names_a_value_id(r: OpRef) -> bool {
+    !r.is_constant() && r.raw() < OpRef::VALUE_ID_LIMIT
+}
+
+/// One past the highest value id `inputargs` and `ops` name.
+fn value_id_end(inputargs: &[InputArg], ops: &[Op]) -> u32 {
+    let mut end: u32 = 0;
+    let widen = |r: OpRef, end: &mut u32| {
+        if names_a_value_id(r) && r.raw() + 1 > *end {
+            *end = r.raw() + 1;
+        }
+    };
+    for ia in inputargs {
+        if ia.index + 1 > end {
+            end = ia.index + 1;
+        }
+    }
+    for op in ops {
+        widen(op.pos.get(), &mut end);
+        for a in op.getarglist().iter() {
+            widen(a.to_opref(), &mut end);
+        }
+        if let Some(fa) = op.getfailargs() {
+            for a in fa.iter() {
+                widen(a.to_opref(), &mut end);
+            }
+        }
+    }
+    end
+}
+
+/// Move every value id `region` defines or reads up by `offset`, returning the
+/// rebased ops, inputargs and the width of the id range they now occupy.
+///
+/// The owner and each region are separately recorded traces, so both number
+/// their values from zero and their ids overlap. A region is entered with the
+/// owner's live guard values and leaves through the owner's loop header, so an
+/// id it shares with an owner value that is live across the back edge would
+/// overwrite that value for every following iteration. Rebasing onto a disjoint
+/// range is what makes the merged stream's single value namespace sound.
+///
+/// What is and is not renumbered is `names_a_value_id`.
+fn rebase_merged_region(
+    region: &MergedRegion,
+    offset: u32,
+) -> Result<(Vec<InputArg>, Vec<Op>, u32), BackendError> {
+    use majit_ir::operand::Operand;
+
+    let shift = |r: OpRef| -> OpRef {
+        if names_a_value_id(r) {
+            r.with_raw(r.raw() + offset)
+        } else {
+            r
+        }
+    };
+
+    let width = value_id_end(&region.inputargs, &region.ops);
+    // `with_raw` keeps the variant, but readers classify by raw payload, so an
+    // id shifted to or past the limit reads as a constant. Decline instead: the
+    // merged stream is an optimization, and no renumbering is correct once the
+    // region's range no longer fits below the limit.
+    if offset
+        .checked_add(width)
+        .is_none_or(|end| end > OpRef::VALUE_ID_LIMIT)
+    {
+        return Err(BackendError::Unsupported(format!(
+            "cranelift backend: merged region value ids exceed the value-id \
+             space (offset {offset}, width {width})"
+        )));
+    }
+    let inputargs: Vec<InputArg> = region
+        .inputargs
+        .iter()
+        .map(|ia| InputArg::from_type(ia.tp, ia.index + offset))
+        .collect();
+    // `Op::clone` gives the copy its own arg/failarg slots, but the operands in
+    // them keep pointing at the region's original producers, whose `pos` this
+    // must not touch — the region is retained for the next re-emission. So each
+    // moved reference is rebound to a synthetic producer carrying the new id.
+    let ops: Vec<Op> = region.ops.to_vec();
+    for op in &ops {
+        op.pos.set(shift(op.pos.get()));
+        // The rewrite indexed this region's reference constants from zero
+        // against its own table; `prepare_and_merge_regions` appended that table
+        // to the owner's, so the index has to move with it.
+        if op.opcode == OpCode::LoadFromGcTable
+            && region.gc_table_base != 0
+            && let Some(majit_ir::Value::Int(index)) = op.arg(0).const_value()
+        {
+            op.setarg(
+                0,
+                Operand::const_from_value(majit_ir::Value::Int(index + region.gc_table_base)),
+            );
+        }
+        for (i, arg) in op.getarglist().iter().enumerate() {
+            let before = arg.to_opref();
+            let after = shift(before);
+            if after != before {
+                op.setarg(i, Operand::bound_from_opref(after));
+            }
+        }
+        if let Some(mut fail_args) = op.getfailargs() {
+            let mut moved = false;
+            for slot in fail_args.iter_mut() {
+                let before = slot.to_opref();
+                let after = shift(before);
+                if after != before {
+                    *slot = Operand::bound_from_opref(after);
+                    moved = true;
+                }
+            }
+            if moved {
+                op.setfailargs(fail_args);
+            }
+        }
+    }
+    Ok((inputargs, ops, width))
+}
+
+/// Refuse a merge whose region cannot be entered on block parameters.
+///
+/// The out-of-line bridge takes its inputargs out of jitframe slots, so a slot
+/// list that does not line up one-for-one with them still works there — the
+/// loader reads what the recovery stub wrote. A region entered by a branch has
+/// no such indirection: every inputarg must have exactly one live fail arg of
+/// the owner guard behind it. Decline instead of emitting a jump whose arity or
+/// operands the region's entry does not match.
+fn check_region_entry_slots(
+    region_entries: &[MergedRegionEntry],
+    guard_infos: &[GuardInfo],
+) -> Result<(), BackendError> {
+    for entry in region_entries {
+        let arity = entry.inputarg_ids.len();
+        let decline = |why: &str| {
+            Err(BackendError::Unsupported(format!(
+                "cranelift backend: merged region off guard {} {why}",
+                entry.source_fail_index
+            )))
+        };
+        let Some(info) = guard_infos
+            .iter()
+            .find(|info| info.fail_index == entry.source_fail_index)
+        else {
+            return decline("has no guard in the merged stream");
+        };
+        let slots = bridge_entry_slots(info, arity);
+        if slots.len() != arity {
+            return decline(&format!(
+                "reads {} entry value(s) for {arity} inputarg(s)",
+                slots.len()
+            ));
+        }
+        if slots
+            .iter()
+            .any(|&slot| info.fail_arg_refs.get(slot).is_none_or(|r| r.is_none()))
+        {
+            return decline("reads a fail-arg hole");
+        }
+    }
+    Ok(())
+}
+
+/// Append every region to the owner's stream, each rebased off the ids the
+/// owner and the earlier regions already use.
+///
+/// Append-only, as the wasm merge is: a region's ops are the tail of the merged
+/// stream, so the owner's own guards keep the fail indices they were compiled
+/// with and every dispatch cell keyed by one still names the same guard.
+fn merge_regions(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    regions: &[MergedRegion],
+    constants: &majit_ir::ConstMap<majit_ir::Const>,
+) -> Result<MergedStream, BackendError> {
+    let merged_inputargs: Vec<InputArg> =
+        inputargs.iter().map(InputArg::fresh_value_copy).collect();
+    let mut merged_ops: Vec<Op> = ops.to_vec();
+    let mut merged_constants = constants.clone();
+    let mut entries = Vec::with_capacity(regions.len());
+    let mut next_value_id = value_id_end(inputargs, ops);
+    for region in regions {
+        let (region_inputargs, region_ops, width) = rebase_merged_region(region, next_value_id)?;
+        // The pool is keyed by value position for a folded value with no
+        // producing op, so rebasing the region's ids moved its reads off its own
+        // entries. Replay that window at the offset, and drop a key another
+        // trace left inside it; keys outside the window are left alone, because
+        // rewriting them would overwrite the entries the owner's own operations
+        // read.
+        for id in 0..width {
+            match region.constants.get(&id) {
+                Some(c) => {
+                    merged_constants.insert(id + next_value_id, c.clone());
+                }
+                None => {
+                    merged_constants.shift_remove(&(id + next_value_id));
+                }
+            }
+        }
+        next_value_id += width;
+        entries.push(MergedRegionEntry {
+            source_fail_index: region.source_fail_index,
+            ops_start: merged_ops.len(),
+            inputarg_ids: region_inputargs.iter().map(|ia| ia.index).collect(),
+        });
+        // The region's own inputargs deliberately stay out of `merged_inputargs`:
+        // a region is entered on block parameters, so counting them into
+        // `num_inputs` would grow the entry layout every caller of this loop
+        // passes and every `input_types` check made against it. `do_compile`
+        // declares their variables off `MergedRegionEntry::inputarg_ids`.
+        merged_ops.extend(region_ops);
+    }
+    Ok(MergedStream {
+        inputargs: merged_inputargs,
+        ops: merged_ops,
+        constants: merged_constants,
+        entries,
+    })
+}
+
 /// Move every block that only a guard exit can reach out of the trace body.
 ///
 /// `write_pending_failure_recoveries` parity: RPython assembles the whole
@@ -7269,7 +7614,43 @@ fn emit_guard_exit(
     ref_root_base_ofs: i32,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
+    region_blocks: &IndexMap<u32, Block>,
 ) {
+    // A bridge merged into this function (`MergedRegion`) replaces the whole
+    // exit: `patch_jump_for_descr` rewrites the guard's branch to enter the
+    // bridge, so the failure-recovery stub never runs on a bridge hit, and here
+    // the bridge is in the same function, so its entry values ride block
+    // parameters instead of a jitframe round trip. Everything below —
+    // fail-arg publish, gcmap, write barrier, descr store, the dispatch
+    // cells — is the out-of-line path only.
+    if let Some(&region_block) = region_blocks.get(&info.fail_index) {
+        // `compile_bridge` filtered the bridge's inputargs by
+        // `inputargs_and_holes`, so the region takes the guard's LIVE fail args
+        // in `rd_locs` order — the same list `emit_attached_bridge_dispatch`
+        // compacts the frame slots into for the out-of-line bridge.
+        // `check_region_entry_slots` already refused the merge unless every one
+        // of these slots exists and holds a live fail arg.
+        let arity = builder.block_params(region_block).len();
+        let vals: Vec<CValue> = bridge_entry_slots(info, arity)
+            .iter()
+            .map(|&slot| info.fail_arg_refs[slot])
+            .map(|arg_ref| {
+                resolve_failarg_opref(
+                    builder,
+                    constants,
+                    jf_ptr,
+                    ref_root_slots,
+                    stale_ref_vars,
+                    demoted_failarg_slots,
+                    ref_root_base_ofs,
+                    arg_ref,
+                )
+            })
+            .collect();
+        let args = block_args_to(builder, region_block, &vals);
+        builder.ins().jump(region_block, &args);
+        return;
+    }
     // _push_all_regs_to_frame / save_into_mem parity:
     // store fail_args to jf_frame[slot]
     //
@@ -7536,6 +7917,26 @@ fn emit_guard_exit(
 
 // Compiled loop data
 
+/// Everything `do_compile` needs to emit this loop's function again.
+///
+/// Kept because a bridge that closes back onto the loop is merged into it
+/// (`MergedRegion`), and the merge is append-only: each re-emission replays the
+/// owner's own stream plus every region taken so far.
+struct ReemitInputs {
+    inputargs: Vec<InputArg>,
+    ops: Vec<Op>,
+    /// The pool the owner's own compile was given. Each region's pool is merged
+    /// onto this one by `merge_regions`, never into it.
+    constants: majit_ir::ConstMap<majit_ir::Const>,
+    invalidation_flag_ptr: Option<usize>,
+    /// The compiling driver's one-shot `set_next_frame_value_count_fn`. A
+    /// re-emission is the same trace compiled again, so it has to decode the
+    /// `-live-` marker with the same counter the first emission used rather
+    /// than fall back to the process-global callback.
+    frame_value_count_fn: Option<fn(i32, i32) -> usize>,
+    regions: Vec<MergedRegion>,
+}
+
 struct CompiledLoop {
     trace_id: u64,
     input_types: Vec<Type>,
@@ -7576,12 +7977,35 @@ struct CompiledLoop {
     /// `register_fail_descrs`), because a bridge's `CompiledLoop` is
     /// consumed into `BridgeData` and would otherwise drop the table.
     gc_table: Option<Arc<majit_gc::GcTable>>,
+    /// The stream this loop was emitted from, for a later merge. `None` on a
+    /// trace no merge applies to — a bridge, or a loop whose re-emission has
+    /// been declined.
+    reemit: RefCell<Option<ReemitInputs>>,
+    /// Set once a re-emission carrying one more merged region has been
+    /// installed. Readers reach the live code through `current`.
+    ///
+    /// The superseded link is kept rather than dropped: its code can still be
+    /// running (the merge is installed from the host while a deopt is being
+    /// serviced, but a frame entered earlier returns through the old body), and
+    /// the arena range it occupies is owned by the `CompiledLoopToken` for the
+    /// life of the token either way.
+    superseded_by: OnceLock<Box<CompiledLoop>>,
 }
 
 unsafe impl Send for CompiledLoop {}
 unsafe impl Sync for CompiledLoop {}
 
 impl CompiledLoop {
+    /// The live code for this loop: the last re-emission installed, or this one
+    /// when none has been.
+    fn current(&self) -> &CompiledLoop {
+        let mut cur = self;
+        while let Some(next) = cur.superseded_by.get() {
+            cur = next;
+        }
+        cur
+    }
+
     #[inline]
     fn terminal_exit_layouts_ref(&self) -> &Vec<TerminalExitLayout> {
         unsafe { &*self.terminal_exit_layouts.get() }
@@ -8430,10 +8854,8 @@ fn run_compiled_code_inner(
 struct GuardInfo {
     /// Source operation whose failure layout this metadata describes.
     source_op_index: usize,
-    #[expect(
-        dead_code,
-        reason = "guard metadata keeps the assigned fail index alongside emitted layouts"
-    )]
+    /// This exit's ordinal within the trace, the number a `ResumeGuardDescr`
+    /// is keyed by and the one a merged region names as its `source_fail_index`.
     fail_index: u32,
     can_have_bridge: bool,
     fail_arg_refs: Vec<OpRef>,
@@ -8820,6 +9242,7 @@ impl CraneliftBackend {
             .compiled
             .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)
         {
             Some(c) => c,
             None => return,
@@ -8830,6 +9253,7 @@ impl CraneliftBackend {
                 .compiled
                 .get()
                 .and_then(|c| c.downcast_ref::<CompiledLoop>())
+                .map(CompiledLoop::current)
             {
                 for prev_d in &prev_compiled.fail_descrs {
                     if fail_descr_has_bridge(as_fd(prev_d)) {
@@ -9500,6 +9924,210 @@ impl CraneliftBackend {
         deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner)
     }
 
+    /// Merge a bridge that closes back onto its owner's loop into that loop's
+    /// own function, and install the re-emission.
+    ///
+    /// `patch_jump_for_descr` makes a bridge hit a jump: the guard branches into
+    /// the bridge and `closing_jump` branches back, one code blob, values in
+    /// registers. Cranelift cannot jump between functions, so an out-of-line
+    /// bridge pays two function entries and two jitframe round trips per
+    /// crossing — measured at 5.5ns against dynasm's 0.28ns on a loop taking the
+    /// bridge every seventh iteration. Emitting the bridge inside the owner
+    /// restores the branch.
+    ///
+    /// This is the cranelift half of what the wasm backend does with
+    /// `install_inline_region`; wasm defers the merge behind an entry count
+    /// because its re-emission rebuilds a whole module, while a cranelift
+    /// re-emission is one function.
+    ///
+    /// `Err` names why the merge was declined and leaves the owner exactly as it
+    /// was, for a caller that still has the out-of-line bridge to reach the
+    /// guard through.
+    fn merge_bridge_into_owner(
+        &mut self,
+        original_token: &JitCellToken,
+        source_fail_index: u32,
+        inputargs: &[InputArg],
+        ops: &[Op],
+        constants: majit_ir::ConstMap<majit_ir::Const>,
+    ) -> Result<(), &'static str> {
+        if original_token.is_invalidated() {
+            return Err("owner invalidated");
+        }
+        // A region carrying a CALL_ASSEMBLER would put a call site into the
+        // merged stream that `install_call_assembler_expectations` was never
+        // told about for this caller. Decline rather than re-derive the merged
+        // expectation set: the out-of-line bridge is already correct.
+        if ops.iter().any(|op| {
+            matches!(
+                op.opcode,
+                OpCode::CallAssemblerI
+                    | OpCode::CallAssemblerR
+                    | OpCode::CallAssemblerF
+                    | OpCode::CallAssemblerN
+            )
+        }) {
+            return Err("region calls assembler");
+        }
+        let Some(owner) = original_token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)
+        else {
+            return Err("owner not compiled");
+        };
+        // Taken, not borrowed: a re-emission that fails must leave the owner
+        // without retained inputs rather than invite the same failing merge on
+        // the next bridge.
+        let Some(mut seed) = owner.reemit.borrow_mut().take() else {
+            return Err("owner has no retained stream");
+        };
+        let declined = if ops.iter().any(|op| op.opcode == OpCode::Label) {
+            // A region is entered through the block its owner guard branches
+            // to, never through a header of its own. A LABEL inside one would
+            // take over `loop_block`, the preamble split and the entry
+            // `br_table` — all of which belong to the owner loop.
+            Some("region carries a LABEL")
+        } else if seed.regions.len() >= MAX_MERGED_REGIONS {
+            Some("region budget spent")
+        } else if seed.ops.len()
+            + seed.regions.iter().map(|r| r.ops.len()).sum::<usize>()
+            + ops.len()
+            > MAX_MERGED_OPS
+        {
+            Some("op budget spent")
+        } else if !bridge_closes_onto(&seed.ops, ops) {
+            Some("bridge does not close onto the owner")
+        } else {
+            None
+        };
+        if let Some(why) = declined {
+            *owner.reemit.borrow_mut() = Some(seed);
+            return Err(why);
+        }
+        seed.regions.push(MergedRegion {
+            source_fail_index,
+            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            ops: ops.to_vec(),
+            constants,
+            gc_table_base: 0,
+        });
+        self.constants = seed.constants.clone();
+        // A re-emission is the same trace, not a new one. Its identity is what
+        // every descr the merged stream re-stamps carries, and what the
+        // metainterp looks this loop up by, so it has to be the owner's.
+        self.next_trace_id = Some(owner.trace_id);
+        self.next_header_pc = Some(owner.header_pc);
+        self.next_frame_value_count_fn = seed.frame_value_count_fn;
+        let compiled = self.do_compile(
+            &seed.inputargs,
+            &seed.ops,
+            seed.invalidation_flag_ptr,
+            None,
+            owner.caller_prefix_layout.as_ref(),
+            &seed.regions,
+        );
+        // `do_compile` consumes all three, but only past the validation it can
+        // fail at; clear them so a declined merge leaves nothing for the next
+        // compile to inherit.
+        self.next_trace_id = None;
+        self.next_header_pc = None;
+        self.next_frame_value_count_fn = None;
+        let Ok(mut compiled) = compiled else {
+            seed.regions.pop();
+            *owner.reemit.borrow_mut() = Some(seed);
+            return Err("merged stream did not compile");
+        };
+        compiled.green_key = original_token.green_key();
+        if register_call_assembler_target(original_token, &compiled, self.attached_descr_ptrs())
+            .is_err()
+            || install_call_assembler_expectations(
+                CallAssemblerCallerId::RootLoop(original_token.number),
+                &seed.ops,
+            )
+            .is_err()
+        {
+            // The owner's own registration still names the superseded body,
+            // which is live and correct; nothing was published for the new one.
+            seed.regions.pop();
+            *owner.reemit.borrow_mut() = Some(seed);
+            return Err("merged stream could not be published");
+        }
+        self.register_fail_descrs(original_token, &compiled.fail_descrs);
+        if let Some(table) = compiled.gc_table.clone() {
+            self.register_gc_table(original_token, table);
+        }
+        {
+            let clt = original_token.compiled_loop_token_expect();
+            for descr in &compiled.fail_descrs {
+                let fd = as_fd(descr);
+                if !(fd.is_resume_guard() || fd.is_resume_guard_copied()) {
+                    continue;
+                }
+                fd.set_rd_loop_token_clt(
+                    std::sync::Arc::clone(&clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>
+                );
+            }
+            clt.asmmemmgr_blocks.lock().extend(
+                compiled
+                    .asm_memory_blocks
+                    .drain(..)
+                    .map(|block| Box::new(block) as Box<dyn std::any::Any + Send>),
+            );
+        }
+        // The re-emission carries the retained stream forward: the next merge
+        // replays the owner plus every region taken so far.
+        *compiled.reemit.borrow_mut() = Some(seed);
+        match owner.superseded_by.set(Box::new(compiled)) {
+            Ok(()) => Ok(()),
+            Err(_) => Err("owner already superseded"),
+        }
+    }
+
+    /// Prepare every region the way `do_compile` prepared the owner, then
+    /// rebase and append them.
+    ///
+    /// A region is prepared in the value and constant namespace it was recorded
+    /// and first compiled in, the same one the standalone bridge used, so the
+    /// rewrite's fresh positions land above that region's own high-water mark
+    /// and are carried onto the owner's range by the single rebase below.
+    ///
+    /// `gcrefs` is the owner's reference-constant table, extended per region;
+    /// each region's `LoadFromGcTable` index is shifted onto its extension.
+    fn prepare_and_merge_regions(
+        &mut self,
+        inputargs: &[InputArg],
+        owner_ops: &[Op],
+        regions: &[MergedRegion],
+        gcrefs: &mut Vec<GcRef>,
+    ) -> Result<MergedStream, BackendError> {
+        let mut prepared = Vec::with_capacity(regions.len());
+        for region in regions {
+            validate_call_assembler_rewrite_prereqs(&region.ops)?;
+            let owner_constants = std::mem::replace(&mut self.constants, region.constants.clone());
+            let (ops, region_gcrefs) = self.prepare_ops_for_compile(
+                &region.inputargs,
+                &region.ops,
+                &self.constants.clone(),
+            );
+            let constants = std::mem::replace(&mut self.constants, owner_constants);
+            prepared.push(MergedRegion {
+                source_fail_index: region.source_fail_index,
+                inputargs: region
+                    .inputargs
+                    .iter()
+                    .map(InputArg::fresh_value_copy)
+                    .collect(),
+                ops,
+                constants,
+                gc_table_base: gcrefs.len() as i64,
+            });
+            gcrefs.extend(region_gcrefs);
+        }
+        merge_regions(inputargs, owner_ops, &prepared, &self.constants)
+    }
+
     fn do_compile(
         &mut self,
         inputargs: &[InputArg],
@@ -9507,11 +10135,49 @@ impl CraneliftBackend {
         invalidation_flag_ptr: Option<usize>,
         source_guard: Option<(u64, u32)>,
         caller_layout: Option<&ExitRecoveryLayout>,
+        regions: &[MergedRegion],
     ) -> Result<CompiledLoop, BackendError> {
+        // Captured before the merge and the GC rewrite shadow them: a
+        // re-emission replays the owner's OWN stream and pool, with every region
+        // appended again from scratch.
+        let reemit = source_guard.is_none().then(|| ReemitInputs {
+            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            ops: ops.to_vec(),
+            constants: self.constants.clone(),
+            invalidation_flag_ptr,
+            // Read before the one-shot below consumes it.
+            frame_value_count_fn: self.next_frame_value_count_fn,
+            regions: regions.to_vec(),
+        });
         validate_call_assembler_rewrite_prereqs(ops)?;
-        let (prepared_ops, gcrefs) =
+        let (owner_prepared, mut gcrefs) =
             self.prepare_ops_for_compile(inputargs, ops, &self.constants.clone());
-        let ops = prepared_ops.as_slice();
+        // Every region is appended already prepared, and only then: the rewrite
+        // is what fixes a stream's op count — it inserts a `LoadFromGcTable`
+        // ahead of the op whose constant it replaces, and expands a nursery
+        // allocation in place — so preparing after the append would leave every
+        // `MergedRegionEntry::ops_start` naming an op the rewrite had moved.
+        // Everything downstream sees one trace, which is what the OpRef
+        // validation and the guard collection need.
+        let merged = if regions.is_empty() {
+            None
+        } else {
+            Some(self.prepare_and_merge_regions(
+                inputargs,
+                &owner_prepared,
+                regions,
+                &mut gcrefs,
+            )?)
+        };
+        let (inputargs, ops) = match merged.as_ref() {
+            Some(m) => (m.inputargs.as_slice(), m.ops.as_slice()),
+            None => (inputargs, owner_prepared.as_slice()),
+        };
+        if let Some(m) = merged.as_ref() {
+            self.constants = m.constants.clone();
+        }
+        let region_entries: &[MergedRegionEntry] =
+            merged.as_ref().map_or(&[], |m| m.entries.as_slice());
         // assembler.py:793-824 parity: build the per-loop gc_table from
         // the rewrite's reference-constant list. Its base address is baked
         // by the `LoadFromGcTable` genop; the strong `Arc` is moved into
@@ -10171,6 +10837,18 @@ impl CraneliftBackend {
             var_types.insert(ia.index, cl_types::I64);
             declared_vars.insert(ia.index);
         }
+        // A merged region's inputargs are bound by the branch its owner guard
+        // takes, not by the entry prologue, so they are declared here rather
+        // than joining `inputargs`. I64 for the same reason the loop above
+        // declares its own: a trace entry carries every value as a raw 64-bit
+        // word, and this must run before the op-argument loop below, which
+        // would otherwise type them off their OpRef variant.
+        for entry in region_entries {
+            for &id in &entry.inputarg_ids {
+                var_types.insert(id, cl_types::I64);
+                declared_vars.insert(id);
+            }
+        }
         // Declare variables for op results
         for (op_idx, op) in ops.iter().enumerate() {
             if op.result_type() != Type::Void {
@@ -10458,6 +11136,27 @@ impl CraneliftBackend {
         };
 
         let mut guard_idx: usize = 0;
+        // One entry block per merged region, keyed by the fail index of the
+        // owner guard that enters it. `emit_guard_exit` branches here instead
+        // of publishing an exit; the block's parameters carry the guard's live
+        // fail args, which is the whole point of merging — the out-of-line
+        // bridge takes the same values through jitframe slots.
+        let region_blocks: IndexMap<u32, Block> = region_entries
+            .iter()
+            .map(|entry| {
+                let block = builder.create_block();
+                for _ in 0..entry.inputarg_ids.len() {
+                    builder.append_block_param(block, cl_types::I64);
+                }
+                // A region runs only when its guard fails, which is why the
+                // guard had a bridge compiled for it at all. It is colder than
+                // the body and warmer than a deadframe exit; cranelift has one
+                // bit, and the body is what must stay contiguous.
+                builder.set_cold_block(block);
+                (entry.source_fail_index, block)
+            })
+            .collect();
+        check_region_entry_slots(region_entries, &guard_infos)?;
         let mut last_ovf_flag: Option<CValue> = None;
         let _nursery_inline_count: usize = 0; // reserved for future bridge inline support
 
@@ -10649,8 +11348,29 @@ impl CraneliftBackend {
             // lowers to below — lands in that op's span, and the emitted bytes
             // are unaffected either way. Only the dump reads the mapping back,
             // so the regions are recorded only when it is asked for.
+            //
+            // Set before the region entry below for the same reason it is set
+            // before the LABEL plumbing: the block a merged region opens is
+            // this op's own code, so it belongs in this op's span.
             if dump_offsets {
                 builder.set_srcloc(cranelift_codegen::ir::SourceLoc::new(op_idx as u32));
+            }
+            // A merged region's ops are the tail of the stream, so the walk
+            // reaches them after the owner's own JUMP has terminated its block.
+            // Open the region's block here and bind its inputargs from the
+            // parameters its entering guard passed.
+            if let Some(entry) = region_entries
+                .iter()
+                .find(|entry| entry.ops_start == op_idx)
+            {
+                let block = region_blocks[&entry.source_fail_index];
+                builder.switch_to_block(block);
+                builder.seal_block(block);
+                for (i, &value_id) in entry.inputarg_ids.iter().enumerate() {
+                    let param = builder.block_params(block)[i];
+                    builder.def_var(var(value_id), param);
+                }
+                preamble_phase = false;
             }
             if let Some((_, label_block)) = label_blocks
                 .iter()
@@ -11229,6 +11949,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11264,6 +11985,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11316,6 +12038,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11370,6 +12093,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11416,6 +12140,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11469,6 +12194,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11531,6 +12257,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11569,6 +12296,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11618,6 +12346,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11723,6 +12452,7 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
+                            &region_blocks,
                         );
 
                         builder.switch_to_block(cont_block);
@@ -11763,6 +12493,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11786,6 +12517,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     // Create a continuation block for subsequent ops (dead code).
@@ -11840,6 +12572,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -11951,6 +12684,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -12116,6 +12850,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
 
                     builder.switch_to_block(cont_block);
@@ -14499,6 +15234,7 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
+                            &region_blocks,
                         );
                     }
                 }
@@ -14518,6 +15254,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
                 }
 
@@ -14674,6 +15411,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -14707,6 +15445,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
+                        &region_blocks,
                     );
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -15795,6 +16534,8 @@ impl CraneliftBackend {
             label_block_id += 1;
         }
         Ok(CompiledLoop {
+            reemit: RefCell::new(reemit),
+            superseded_by: OnceLock::new(),
             trace_id,
             input_types: trace_info.input_types.clone(),
             header_pc,
@@ -16930,7 +17671,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
-        let mut compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None)?;
+        let mut compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None, &[])?;
         compiled.green_key = token.green_key();
         let info = AsmInfo {
             code_addr: compiled.code_ptr as usize,
@@ -17059,6 +17800,9 @@ impl majit_backend::Backend for CraneliftBackend {
         }
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
+        // `do_compile` takes the pool, so the copy the merge needs has to be
+        // made before the out-of-line compile below consumes it.
+        let bridge_constants = self.constants.clone();
         let invalidated_arc = original_token.mint_bridge_invalidation_flag();
         let flag_ptr =
             Arc::as_ptr(&invalidated_arc) as *const std::sync::atomic::AtomicBool as usize;
@@ -17066,6 +17810,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .compiled
             .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)
             .ok_or_else(|| {
                 BackendError::CompilationFailed("original token has no compiled loop".to_string())
             })?;
@@ -17115,6 +17860,7 @@ impl majit_backend::Backend for CraneliftBackend {
             Some(flag_ptr),
             Some((source_trace_id, fail_descr.fail_index_per_trace())),
             caller_layout.as_ref(),
+            &[],
         );
         let mut compiled = compiled?;
         // Same invariant as the loop path above: skipping would free the arena
@@ -17247,6 +17993,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     .compiled
                     .get()
                     .and_then(|c| c.downcast_ref::<CompiledLoop>())
+                    .map(CompiledLoop::current)
                     && let Some(prev_descr) = find_fail_descr_in_fail_descrs(
                         &prev_compiled.fail_descrs,
                         source_trace_id,
@@ -17286,6 +18033,30 @@ impl majit_backend::Backend for CraneliftBackend {
             }
         }
 
+        // The out-of-line bridge above is attached and correct; this is the
+        // faster route to the same guard when the bridge closes back onto the
+        // loop it came from. A declined merge leaves it as the only route.
+        if std::env::var_os("MAJIT_CL_NO_BRIDGE_MERGE").is_none() {
+            let fail_index = fail_descr.fail_index_per_trace();
+            let merged = self.merge_bridge_into_owner(
+                original_token,
+                fail_index,
+                inputargs,
+                ops,
+                bridge_constants,
+            );
+            if std::env::var_os("MAJIT_CL_BRIDGE_MERGE_LOG").is_some() {
+                let outcome = match merged {
+                    Ok(()) => "merged".to_string(),
+                    Err(why) => format!("declined: {why}"),
+                };
+                eprintln!(
+                    "[cl-merge] loop {} guard {fail_index}: {outcome}",
+                    original_token.number
+                );
+            }
+        }
+
         Ok(info)
     }
 
@@ -17303,7 +18074,8 @@ impl majit_backend::Backend for CraneliftBackend {
         let compiled = token
             .compiled
             .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>());
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current);
         if let Some(compiled) = compiled {
             for (i, &hash) in hashes.iter().enumerate() {
                 if let Some(descr) = compiled.fail_descrs.get(i) {
@@ -17340,7 +18112,8 @@ impl majit_backend::Backend for CraneliftBackend {
         let compiled = token
             .compiled
             .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>());
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current);
         if let Some(compiled) = compiled {
             // Use recursive search matching compiled_bridge_fail_descr_layouts.
             let source_descr = find_fail_descr_in_fail_descrs(
@@ -17371,11 +18144,13 @@ impl majit_backend::Backend for CraneliftBackend {
         let old_compiled = old_token
             .compiled
             .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>());
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current);
         let new_compiled = new_token
             .compiled
             .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>());
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current);
         let (Some(old), Some(new)) = (old_compiled, new_compiled) else {
             return;
         };
@@ -17429,7 +18204,8 @@ impl majit_backend::Backend for CraneliftBackend {
             .get()
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
-            .expect("compiled data is not CompiledLoop");
+            .expect("compiled data is not CompiledLoop")
+            .current();
 
         Self::execute_with_inputs(compiled, FrameInputs::Values(args))
     }
@@ -17445,7 +18221,8 @@ impl majit_backend::Backend for CraneliftBackend {
             .get()
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
-            .expect("compiled data is not CompiledLoop");
+            .expect("compiled data is not CompiledLoop")
+            .current();
 
         // `llmodel.py:306-315` unwraps each argument at the store into the
         // frame slot, so the values go from the caller's list to the frame in
@@ -17464,7 +18241,8 @@ impl majit_backend::Backend for CraneliftBackend {
             .get()
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
-            .expect("compiled data is not CompiledLoop");
+            .expect("compiled data is not CompiledLoop")
+            .current();
 
         Self::execute_with_inputs(compiled, FrameInputs::Ints(args))
     }
@@ -17479,7 +18257,8 @@ impl majit_backend::Backend for CraneliftBackend {
             .get()
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
-            .expect("compiled data is not CompiledLoop");
+            .expect("compiled data is not CompiledLoop")
+            .current();
 
         // llmodel.py `execute_token` parity (raw-output variant).
         // PyPy's `execute_token` performs one `func(ll_frame, ...)` call
@@ -17744,7 +18523,8 @@ impl majit_backend::Backend for CraneliftBackend {
         let compiled = token
             .compiled
             .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)?;
         Some(build_per_trace_layouts(
             &compiled.fail_descrs,
             compiled.trace_id,
@@ -17760,7 +18540,8 @@ impl majit_backend::Backend for CraneliftBackend {
         let original_compiled = original_token
             .compiled
             .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)?;
         // Use recursive search to find fail_descrs nested inside bridges.
         let source_descr = find_fail_descr_in_fail_descrs(
             &original_compiled.fail_descrs,
@@ -17783,7 +18564,8 @@ impl majit_backend::Backend for CraneliftBackend {
         let compiled = token
             .compiled
             .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)?;
         if compiled.trace_id == trace_id {
             return Some(build_per_trace_layouts(
                 &compiled.fail_descrs,
@@ -17800,7 +18582,8 @@ impl majit_backend::Backend for CraneliftBackend {
         let compiled = token
             .compiled
             .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)?;
         Some(compiled.terminal_exit_layouts_ref().clone())
     }
 
@@ -17813,7 +18596,8 @@ impl majit_backend::Backend for CraneliftBackend {
         let original_compiled = original_token
             .compiled
             .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)?;
         let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
             let fd = as_fd(descr);
             fd.fail_index() == source_fail_index && fd.trace_id() == source_trace_id
@@ -17831,7 +18615,8 @@ impl majit_backend::Backend for CraneliftBackend {
         let compiled = token
             .compiled
             .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)?;
         if compiled.trace_id == trace_id {
             return Some(compiled.terminal_exit_layouts_ref().clone());
         }
@@ -17846,7 +18631,8 @@ impl majit_backend::Backend for CraneliftBackend {
         let compiled = token
             .compiled
             .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)?;
         if compiled.trace_id == trace_id {
             return Some(CompiledTraceInfo {
                 trace_id: compiled.trace_id,
@@ -17873,6 +18659,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .compiled
             .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)
         else {
             return false;
         };
@@ -19666,6 +20453,122 @@ mod tests {
         let moved = backend.get_ref_value(&frame, 0);
         assert_ne!(moved, root);
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0004);
+    }
+
+    /// A bridge whose JUMP closes back onto its owner's LABEL is merged into
+    /// the owner's own function (`merge_bridge_into_owner`), so the guard
+    /// branches into it instead of publishing a jitframe and dispatching
+    /// through the bridge cache — `patch_jump_for_descr`'s effect.
+    ///
+    /// The region carries a guard of its own, so this also covers a merged
+    /// guard taking a fail index past every one the owner already owns, and a
+    /// constant-pool window rebased onto the owner's pool.
+    #[test]
+    fn bridge_closing_onto_its_owner_merges_into_the_loop() {
+        let mut backend = CraneliftBackend::new();
+        let loop_descr = make_label_descr(1_500_290);
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(1)),
+        ]);
+        let loop_ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+                loop_descr.clone(),
+            ),
+            // i > 0
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                2,
+            ),
+            guard,
+            // i - 1
+            mk_op(
+                OpCode::IntSub,
+                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                3,
+            ),
+            // s + 10
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(1), OpRef::int_op(102)],
+                4,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(3), OpRef::int_op(4)],
+                OpRef::NONE.raw(),
+                loop_descr.clone(),
+            ),
+        ];
+        let mut loop_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        loop_constants.insert(100, 0);
+        loop_constants.insert(101, 1);
+        loop_constants.insert(102, 10);
+        backend.set_constants(loop_constants);
+
+        let token = JitCellToken::new(1_500_291);
+        backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
+
+        // i counts 3, 2, 1 down to 0 while s takes 10 per iteration; the guard
+        // fails on i == 0 with s == 30.
+        let failed = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
+        assert_eq!(backend.get_int_value(&failed, 0), 0);
+        assert_eq!(backend.get_int_value(&failed, 1), 30);
+        let guard_descr =
+            get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
+
+        // s + 100, taken while it stays under 500, then back through the LABEL.
+        let bridge_guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
+        bridge_guard.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::int_op(2)),
+        ]);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(1), OpRef::int_op(110)],
+                2,
+            ),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(2), OpRef::int_op(111)], 3),
+            bridge_guard,
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0), OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+                loop_descr,
+            ),
+        ];
+        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        bridge_constants.insert(110, 100);
+        bridge_constants.insert(111, 500);
+        backend.set_constants(bridge_constants);
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
+            .unwrap();
+
+        let owner = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .expect("loop should be compiled");
+        assert!(
+            owner.superseded_by.get().is_some(),
+            "a bridge closing onto its owner's LABEL should have been merged"
+        );
+
+        backend.set_constants(indexmap::IndexMap::new());
+        // 30 -> 130 -> 230 -> 330 -> 430 -> 530, where the region's own guard
+        // fails and publishes its fail args.
+        let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(backend.get_int_value(&frame, 1), 530);
     }
 
     /// `demoted_failarg_slots` is trace-global while `loop_phi_keep` is per
