@@ -7009,6 +7009,17 @@ fn build_function(
                     }
                 }
 
+                // The check `rewrite.py` `_gen_call_malloc_gc` puts after a
+                // collecting malloc: the vtable and class-word stores below
+                // address the result directly and must not run on a NULL.
+                emit_memory_error_check(
+                    &mut sink,
+                    value_types,
+                    vi,
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
                 if !OpRef::raw_is_constant(vi) {
                     // llmodel.py write_int_at_mem(res, vtable_offset,
                     // WORD, vtable). The `ob_type` field is pointer-width: 4
@@ -7443,6 +7454,18 @@ fn build_function(
                         sink.local_set(value_types.local(vi));
                     }
                 }
+                // The check `rewrite.py` `_gen_call_malloc_gc` puts after a
+                // collecting malloc. Here the helper writes the length field
+                // itself, so the NULL escapes into the following item stores
+                // rather than into a store this arm emits.
+                emit_memory_error_check(
+                    &mut sink,
+                    value_types,
+                    vi,
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
                 // `wasm_jit_alloc_array` collects; reload other live Refs. The
                 // inline-bump paths already emitted this inside their slow arms.
                 if residual_type_base.is_none()
@@ -8855,6 +8878,75 @@ fn exit_fail_args(op: &Op) -> Vec<OpRef> {
     op.getfailargs()
         .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
         .unwrap_or_else(|| op.getarglist().iter().map(|a| a.to_opref()).collect())
+}
+
+/// x86/assembler.py `genop_discard_check_memory_error`: the NULL test
+/// `rewrite.py` `_gen_call_malloc_gc` attaches to every collecting malloc.
+/// wasm lowers `New` / `NewArray` itself in place of the GC rewrite, so it owes
+/// itself the same check — address 0 is ordinary linear memory here, so the
+/// vtable, class-word and item stores that follow an allocation would corrupt
+/// it silently rather than fault.
+///
+/// The failing arm is `_build_propagate_exception_path` in this backend's exit
+/// spelling. `_store_and_reset_exception` moves the `MemoryError` the
+/// allocation helper published (`lib.rs` `oom_signal_if_zero`) out of the
+/// shared cells and into the frame's first exit slot, `frame[0]` takes the
+/// reserved `exit_frame_with_exception_descr_ref` exit, and the function
+/// returns its frame pointer. It returns rather than branching to the hot-exit
+/// block because the epilogue there dispatches on a per-guard bridge cell, and
+/// this exit belongs to no guard and owns no cell.
+///
+/// A collecting helper can move the frame before it fails, so local 0 is
+/// reloaded on this arm; the reload reads the shadow-stack top, so a caller
+/// that already reloaded pays nothing for the second one.
+///
+/// Two configurations cannot deliver the exception and trap instead of
+/// reporting a wrong one: a cpu that was never handed
+/// `exit_frame_with_exception_descr_ref`, whose exit would resolve to a bare
+/// finish and hand the exception back as the loop's result (the same choice
+/// the cranelift sibling's `emit_memory_error_check` makes for an unattached
+/// `propagate_exception_descr`), and a `MemoryError` provider that was never
+/// registered, whose exit slot would carry a null reference into the
+/// frontend's re-raise.
+fn emit_memory_error_check(
+    sink: &mut PeepSink<'_, '_>,
+    value_types: &ValueLocals,
+    vi: u32,
+    residual_type_base: Option<u32>,
+    ca_reload_fn_ptr: i64,
+    jf_top_addr: Option<u32>,
+) {
+    if OpRef::raw_is_constant(vi) {
+        return;
+    }
+    sink.local_get(value_types.local(vi));
+    sink.i64_eqz();
+    sink.if_(BlockType::Empty);
+    if crate::failguard::exit_frame_with_exception_attached() {
+        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+        sink.local_get(0);
+        sink.i32_const(crate::jit_exc_value_addr() as i32);
+        sink.i64_load(mem64(0));
+        sink.i64_store(mem64(FRAME_SLOT_BASE));
+        sink.i32_const(crate::jit_exc_value_addr() as i32);
+        sink.i64_const(0);
+        sink.i64_store(mem64(0));
+        sink.i32_const(crate::jit_exc_type_addr() as i32);
+        sink.i64_const(0);
+        sink.i64_store(mem64(0));
+        sink.local_get(0);
+        sink.i64_load(mem64(FRAME_SLOT_BASE));
+        sink.i64_eqz();
+        sink.if_(BlockType::Empty);
+        sink.unreachable();
+        sink.end();
+        emit_guard_fail_index_store(sink, crate::failguard::FINISH_EXIT_INDEX_EXC);
+        sink.local_get(0);
+        sink.return_();
+    } else {
+        sink.unreachable();
+    }
+    sink.end();
 }
 
 fn emit_guard_fail_index_store(sink: &mut PeepSink<'_, '_>, guard_idx: u32) {

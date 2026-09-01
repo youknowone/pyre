@@ -2321,6 +2321,38 @@ fn test_true_void_int_ref_call_uses_void_result_type_without_drop() {
 }
 
 #[test]
+fn an_allocation_is_followed_by_a_memory_error_check() {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(1));
+    new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
+    let ops = vec![
+        new_op,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, _guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    let mut seq: Vec<String> = Vec::new();
+    count_operators(&bytes, |op| seq.push(format!("{op:?}")));
+    // `rewrite.py` `_gen_call_malloc_gc` puts a NULL test after every
+    // collecting malloc, and the peephole pass fuses the arm's store-then-read
+    // of the result into a `local.tee`. Only the test itself is asserted: which
+    // of the two failing arms follows it turns on whether the cpu has been
+    // handed an `exit_frame_with_exception_descr_ref`, which a backend-only
+    // module build has not.
+    let checked = seq.windows(4).any(|w| {
+        w[0].starts_with("CallIndirect")
+            && w[1].starts_with("LocalTee")
+            && w[2] == "I64Eqz"
+            && w[3].starts_with("If")
+    });
+    assert!(checked, "the allocation emitted no NULL test: {seq:#?}");
+}
+
+#[test]
 fn test_true_void_family_does_not_shift_new_call_type() {
     use majit_ir::descr::SimpleSizeDescr;
     use std::sync::Arc;
