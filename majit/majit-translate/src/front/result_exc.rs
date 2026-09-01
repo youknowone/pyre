@@ -1525,6 +1525,35 @@ fn rewire_one_call_site(
                  switches would read garbage"
             ));
         }
+        // The forward needs no CFG rewrite — but it does need the same
+        // retyping the diamond arm performs, and for the same reason.
+        // `front::mir` types every aggregate `Ref`, so the call declares
+        // the `Result` shell; once the callee is transformed it hands
+        // back `T` and the raise travels the exception edge, so the value
+        // crossing this link is the payload.  Narrow the call's declared
+        // result to `T` exactly as the diamond's `collapse_pos0_read` arm
+        // does (`narrow_call_result_ty` below), so the payload's kind is
+        // what the rtyper colours and what flows on to `returnblock`.
+        //
+        // Leaving it `Ref` is not a cosmetic mislabel; it is the whole
+        // disagreement `call.py:230` ("the call result must have the same
+        // concretetype as FUNC.RESULT") exists to prevent, and it lands on
+        // BOTH sides of this graph:
+        //
+        //   - inside, the call emits `inline_call_r_r` while the callee's
+        //     transformed CFG `int_return`s, and the metainterp's
+        //     `typed_return_without_caller_destination` fires because the
+        //     caller encoded NO_RETURN_REG in the int bank;
+        //   - outside, this graph's own returnblock inherits the `Ref` and
+        //     `graph_result_kind` reports `r` (`codewriter.rs`
+        //     `result_type = declared_kind.unwrap_or(cfg_kind)`), so every
+        //     `?`-site calling it — whose diamond DID narrow to `T` —
+        //     emits `_i` against an `r` calldescr.
+        //
+        // A wrapper whose every return is such a forward (`is_true`) is the
+        // shape that shows both at once, which is why the two mismatch
+        // classes are one defect and not two.
+        narrow_call_result_ty(graph, a, r, payload_ty.clone());
         return Ok(SiteOutcome::TailForward);
     }
     let (b, r_b) =
