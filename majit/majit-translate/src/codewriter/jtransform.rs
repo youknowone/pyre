@@ -7965,6 +7965,11 @@ fn join_blocks(graph: &mut FunctionGraph) {
             entry_count[link.target.0] += 1;
         }
     }
+    // `mkentrymap` seeds a synthetic entry link into `graph.startblock`.
+    // Counting it keeps a start block whose only in-edge is a backedge from
+    // reading as single-entry; `joinable` would otherwise absorb the graph's
+    // entry into its own predecessor and empty it.
+    entry_count[graph.startblock.0] += 1;
     let mut seen = vec![false; graph.blocks.len()];
     seen[graph.startblock.0] = true;
     let mut stack: Vec<(usize, usize)> = (0..graph.blocks[graph.startblock.0].exits.len())
