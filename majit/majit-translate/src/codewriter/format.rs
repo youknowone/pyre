@@ -543,6 +543,9 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
         OpKind::RecursiveCall { result_kind, .. } => {
             format!("recursive_call_{result_kind}")
         }
+        // The Debug fallback below would spell it "guardclass"; the
+        // canonical opname carries the underscore.
+        OpKind::GuardClass { .. } => "guard_class".to_string(),
         // For the rest, fall back on a stable Debug-derived discriminant.
         other => format!("{:?}", other)
             .split('{')
