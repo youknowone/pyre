@@ -336,9 +336,10 @@ fn stopiteration_exitcase() -> ExitCase {
 }
 
 /// Split the nullable-pointer form of an Option switch into `(None, Some)`.
-/// `front::mir::lower_niche_option_switch` closes `ptr != null` through
-/// `set_branch`, so false is None and true is Some.  This is the flow-graph
-/// shape RPython itself uses for a maybe-null pointer (`ptr_nonzero`).
+/// `front::mir::lower_niche_option_switch` closes the identity-null predicate
+/// `((ptr is null) == false)` through `set_branch`, so false is None and true
+/// is Some.  This is the flow-graph shape RPython itself uses for a maybe-null
+/// pointer (`ptr_nonzero`).
 fn split_niche_bool_exits(exits: &[Link], name: &str) -> Result<(Link, Link), String> {
     if exits.len() != 2 {
         return Err(format!(
@@ -570,7 +571,9 @@ fn rewire_one_next_site(
     // Block C has one of the two representation-faithful Option tests:
     //
     // * aggregate Option: `d = opt.__discriminant`; switch 0/1;
-    // * one-word niche Option: `d = bool(opt != null_mut())`; switch false/true.
+    // * one-word niche Option: `d = bool((opt is null_mut()) == false)`;
+    //   switch false/true.  The direct `opt != null_mut()` spelling is also
+    //   accepted for artefacts extracted before the identity-null fold.
     //
     // The latter is `ptr_nonzero` in an RPython graph. Rust uses it for a
     // by-value array/Vec iterator whose T is itself a non-null pointer. The
@@ -610,64 +613,125 @@ fn rewire_one_next_site(
         let branch_value_vars = vec![disc_var.clone()];
         (none_link, some_link, true, branch_value_vars)
     } else {
-        // Find `ne(opt_c, null)` and prove the other operand is the
-        // adjacent pure `core::ptr::null_mut` source the niche fold emits.
-        let (ne_idx, ne_var, null_var) = graph.blocks[c]
-                .operations
-                .iter()
+        // The current MIR fold preserves PyPy identity semantics for
+        // nullable strings/lists: `is_none = opt is null; d = is_none ==
+        // false`.  This is the same `ptr_nonzero` predicate as the older
+        // direct `ne(opt, null)` spelling, but unlike value inequality it
+        // remains valid for every pointer repr.  Recognise both exact pure
+        // forms; accepting an arbitrary boolean chain here could reverse the
+        // None/Some arms and would not be a faithful `ll_listnext` rewrite.
+        let ops = &graph.blocks[c].operations;
+        let direct =
+            ops.iter()
                 .enumerate()
                 .find_map(|(i, op)| match (&op.kind, op.result.as_ref()) {
-                    (
-                        OpKind::BinOp {
-                            op,
-                            lhs,
-                            rhs,
-                            ..
-                        },
-                        Some(result),
-                    ) if op == "ne" && (*lhs == opt_c || *rhs == opt_c) => Some((
-                        i,
-                        result.clone(),
-                        if *lhs == opt_c {
-                            rhs.clone()
-                        } else {
-                            lhs.clone()
-                        },
-                    )),
+                    (OpKind::BinOp { op, lhs, rhs, .. }, Some(result))
+                        if op == "ne" && (*lhs == opt_c || *rhs == opt_c) =>
+                    {
+                        Some((
+                            vec![i],
+                            result.clone(),
+                            if *lhs == opt_c {
+                                rhs.clone()
+                            } else {
+                                lhs.clone()
+                            },
+                            vec![result.clone()],
+                        ))
+                    }
                     _ => None,
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "{name}: block {c} lacks both an Option __discriminant read and a nullable-pointer test"
-                    )
+                });
+        let identity_inversion = || {
+            let (is_idx, is_none, null_var) =
+                ops.iter().enumerate().find_map(|(i, op)| {
+                    match (&op.kind, op.result.as_ref()) {
+                        (OpKind::BinOp { op, lhs, rhs, .. }, Some(result))
+                            if op == "is_" && (*lhs == opt_c || *rhs == opt_c) =>
+                        {
+                            Some((
+                                i,
+                                result.clone(),
+                                if *lhs == opt_c {
+                                    rhs.clone()
+                                } else {
+                                    lhs.clone()
+                                },
+                            ))
+                        }
+                        _ => None,
+                    }
                 })?;
-        let null_idx = graph.blocks[c]
-            .operations
-            .iter()
-            .enumerate()
-            .find_map(|(i, op)| {
-                (op.result.as_ref() == Some(&null_var)
-                    && matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
-                            args,
-                            ..
-                        } if args.is_empty()
-                            && segments == &["core", "ptr", "null_mut"]
-                    ))
-                .then_some(i)
-            })
-            .ok_or_else(|| {
-                format!("{name}: block {c} nullable-pointer test has no null_mut source")
+            let (false_idx, false_var) = ops.iter().enumerate().find_map(|(i, op)| {
+                matches!(op.kind, OpKind::ConstBool(false))
+                    .then(|| op.result.clone().map(|v| (i, v)))
+                    .flatten()
             })?;
+            let (eq_idx, disc_var) = ops.iter().enumerate().find_map(|(i, op)| {
+                match (&op.kind, op.result.as_ref()) {
+                    (OpKind::BinOp { op, lhs, rhs, .. }, Some(result))
+                        if op == "eq"
+                            && ((*lhs == is_none && *rhs == false_var)
+                                || (*rhs == is_none && *lhs == false_var)) =>
+                    {
+                        Some((i, result.clone()))
+                    }
+                    _ => None,
+                }
+            })?;
+            Some((
+                vec![is_idx, false_idx, eq_idx],
+                disc_var.clone(),
+                null_var,
+                vec![is_none, false_var, disc_var],
+            ))
+        };
+        let (mut pure_indices, disc_var, null_var, mut branch_value_vars) = direct
+            .or_else(identity_inversion)
+            .ok_or_else(|| {
+                format!(
+                    "{name}: block {c} lacks both an Option __discriminant read and a nullable-pointer test"
+                )
+            })?;
+        // `push_niche_null_ptr` may have to recast the raw null to the
+        // Option payload's concrete pointer repr (for example Wtf8Buf's
+        // translated StringRepr).  RPython's `convert_const(None)` performs
+        // the same repr adaptation.  Follow only an exact chain of pure
+        // cast-pointer aliases back to `null_mut`; any other producer is not
+        // evidence of the None sentinel and declines.
+        let mut null_source = null_var;
+        let mut null_indices = Vec::new();
+        loop {
+            let (idx, op) = ops
+                .iter()
+                .enumerate()
+                .find(|(_, op)| op.result.as_ref() == Some(&null_source))
+                .ok_or_else(|| {
+                    format!("{name}: block {c} nullable-pointer test has no null_mut source")
+                })?;
+            null_indices.push(idx);
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } if args.is_empty() && segments == &["core", "ptr", "null_mut"] => break,
+                OpKind::Call { args, .. } if is_recast_narrow(&op.kind) => {
+                    null_source = args[0].clone();
+                }
+                _ => {
+                    return Err(format!(
+                        "{name}: block {c} nullable-pointer test has no null_mut source"
+                    ));
+                }
+            }
+        }
         let (bool_idx, bool_var) = graph.blocks[c]
             .operations
             .iter()
             .enumerate()
             .find_map(|(i, op)| match (&op.kind, op.result.as_ref()) {
                 (OpKind::UnaryOp { op, operand, .. }, Some(result))
-                    if op == "bool" && *operand == ne_var =>
+                    if op == "bool" && *operand == disc_var =>
                 {
                     Some((i, result.clone()))
                 }
@@ -682,15 +746,17 @@ fn rewire_one_next_site(
                 ));
             }
         }
+        pure_indices.extend(null_indices);
+        pure_indices.push(bool_idx);
         assert_block_pure_besides(
             graph,
             c,
-            &[null_idx, ne_idx, bool_idx],
+            &pure_indices,
             "nullable-pointer discriminant",
             &name,
         )?;
         let (none_link, some_link) = split_niche_bool_exits(&graph.blocks[c].exits, &name)?;
-        let branch_value_vars = vec![ne_var, bool_var.clone()];
+        branch_value_vars.push(bool_var.clone());
         (none_link, some_link, false, branch_value_vars)
     };
     let some_target = some_link.target;

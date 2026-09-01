@@ -8328,6 +8328,64 @@ mod tests {
         assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 0);
     }
 
+    /// `registered_struct_layout` resolves a spelling that is not a key by
+    /// asking the StructId registry — the arm every synthetic fixture in this
+    /// file skips by publishing the exact ctor spelling. It may only answer
+    /// when every key sharing the id carries the same rows, so a registry that
+    /// maps two spellings with different layouts onto one id declines instead
+    /// of returning whichever the iteration reached first.
+    #[test]
+    fn registered_struct_layout_resolves_and_declines_across_owner_spellings() {
+        use crate::test_support::register_struct_ids_serialized;
+
+        let full = "model_registered_layout_test::Owner";
+        let relative = "registered_layout_test::Owner";
+        let alias = "model_registered_layout_test::OwnerAlias";
+        let other = "model_registered_layout_test::Other";
+        let owner_id = majit_ir::descr::StructId::from_canonical(full);
+        let other_id = majit_ir::descr::StructId::from_canonical(other);
+        // One registration for the whole test: the guard is not reentrant, and
+        // the differing-rows case varies the `attrs` argument, not the table.
+        let _registry = register_struct_ids_serialized(std::collections::HashMap::from([
+            (full.to_string(), Some(owner_id)),
+            (relative.to_string(), Some(owner_id)),
+            (alias.to_string(), Some(owner_id)),
+            (other.to_string(), Some(other_id)),
+        ]));
+
+        let rows = || {
+            vec![
+                ("ob_header".to_string(), ValueType::Ref(None)),
+                ("intval".to_string(), ValueType::Int),
+            ]
+        };
+
+        // Only the crate-relative spelling is a key; the full one reaches the
+        // same rows through the id.
+        let attrs = std::collections::HashMap::from([(relative.to_string(), rows())]);
+        assert_eq!(registered_struct_layout(full, &attrs), Some(&rows()));
+        assert_eq!(registered_struct_layout(relative, &attrs), Some(&rows()));
+
+        // An owner the registry knows, but whose id no key shares.
+        assert_eq!(registered_struct_layout(other, &attrs), None);
+
+        // An owner no registry entry names at all.
+        assert_eq!(
+            registered_struct_layout("unregistered::Owner", &attrs),
+            None
+        );
+
+        // Two keys, one id, disagreeing rows: the answer is not a coin flip.
+        let ambiguous = std::collections::HashMap::from([
+            (relative.to_string(), rows()),
+            (
+                alias.to_string(),
+                vec![("ob_header".to_string(), ValueType::Ref(None))],
+            ),
+        ]);
+        assert_eq!(registered_struct_layout(full, &ambiguous), None);
+    }
+
     /// The four numeric boxing structs' complete field layouts. Synthetic
     /// fixtures have no StructId registry, so they publish the exact owner
     /// spelling carried by their constructor; production qualified aliases

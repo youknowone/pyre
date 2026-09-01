@@ -103,6 +103,8 @@ mod parse;
 )]
 pub mod pipeline;
 mod runtime_names;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod unsimplify;
 pub mod virtualizable_decl;
 // `translator/` is the RPython-orthodox port home — see
