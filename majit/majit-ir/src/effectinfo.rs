@@ -13,6 +13,7 @@
 use crate::descr::DescrRef;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 /// effectinfo.py `class UnsupportedFieldExc(Exception)`.
@@ -371,8 +372,14 @@ pub fn intern_effect_info(effect_info: EffectInfo) -> Arc<EffectInfoCell> {
         return Arc::new(EffectInfoCell::new(effect_info));
     }
 
-    static CACHE: LazyLock<Mutex<Vec<Arc<EffectInfoCell>>>> =
-        LazyLock::new(|| Mutex::new(Vec::new()));
+    // `effectinfo.py:14` spells the interner `_cache = {}` and `:147` probes
+    // it with `key in cls._cache`, so one lookup costs one hash of the key
+    // whatever the cache already holds. A sequence answered the same question
+    // by running `EffectInfo`'s `==` — which compares six descr sets
+    // element-wise — against every cell already interned, so the cost of
+    // interning the n-th distinct EffectInfo grew with n.
+    static CACHE: LazyLock<Mutex<HashMap<EffectInfo, Arc<EffectInfoCell>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
     // `effectinfo.py:143-146` destructures `tgt_func, tgt_saveerr` but appends
     // the fresh-object breaker only `if tgt_func`, so `tgt_saveerr` never
     // enters the key, and upstream's only null-target value is
@@ -386,11 +393,15 @@ pub fn intern_effect_info(effect_info: EffectInfo) -> Arc<EffectInfoCell> {
     effect_info.call_release_gil_target = EffectInfo::_NO_CALL_RELEASE_GIL_TARGET;
 
     let mut cache = CACHE.lock();
-    if let Some(existing) = cache.iter().find(|existing| existing.get() == &effect_info) {
+    // The key is a copy rather than the cell's own EffectInfo because the cell
+    // is interior-mutable. Only `set_bitstrings` writes it, and the fields it
+    // writes are outside the `Eq`/`Hash` pair below, so the copy and the cell
+    // answer every probe identically.
+    if let Some(existing) = cache.get(&effect_info) {
         return existing.clone();
     }
-    let canonical = Arc::new(EffectInfoCell::new(effect_info));
-    cache.push(canonical.clone());
+    let canonical = Arc::new(EffectInfoCell::new(effect_info.clone()));
+    cache.insert(effect_info, canonical.clone());
     canonical
 }
 
