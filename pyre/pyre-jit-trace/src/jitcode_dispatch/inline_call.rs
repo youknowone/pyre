@@ -7433,6 +7433,14 @@ fn type_call_decline(reason: &str) -> Result<Option<(DispatchOutcome, usize)>, D
 /// The payoff is not the removed dispatch alone: an instance built by
 /// `new_with_vtable` is a virtual, so a constructor whose result never escapes
 /// the loop optimizes away entirely, as it does upstream.
+///
+/// This applies at every inline depth.  `MetaInterp.perform_call` gives each
+/// Python call its own `MIFrame`, and `capture_resumedata` preserves the whole
+/// framestack; being reached from another inlined Python frame is therefore not
+/// a reason to leave `type.__call__` residual.  Pyre's matching shape is the
+/// callee-owned frame plus the `descr_call` parent level installed by
+/// `ctor_continuation_parent_frame`, which keeps the instance (rather than
+/// `__init__`'s return) live across a guard resume.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -7444,8 +7452,8 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk || dst_bank != 'r' {
-        // These three reject far more calls than the instantiations this emit is
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        // These two reject far more calls than the instantiations this emit is
         // about, so name the reason only for a call that does resolve to a
         // class, and only while the reasons are being collected — the extra
         // resolution below is diagnostic cost, not tracing cost.
@@ -7457,8 +7465,6 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         {
             return type_call_decline(if !ctx.is_authoritative_executor {
                 "not the authoritative executor"
-            } else if ctx.fbw_mode.inline_subwalk {
-                "inline sub-walk"
             } else {
                 "destination is not a ref register"
             });
