@@ -51,7 +51,11 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
     let main_module = pyre_object::w_module_new_aliasing_dict("__main__", canonical);
     importing::set_sys_module("__main__", main_module);
 
-    eval_with_jit(&mut frame, None).map_err(|e| format!("execution error: {}", e.message))?;
+    // An `AssertionError` a program raises is object-backed, so its `message`
+    // field is empty and only `message_text` derives the text from
+    // `exc_object`.
+    eval_with_jit(&mut frame, None)
+        .map_err(|e| format!("execution error: {}", e.message_text()))?;
     Ok(())
 }
 
