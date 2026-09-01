@@ -78,6 +78,15 @@ fn field_slot_in(fields: &[BhFieldSpec], name: &str, offset: usize) -> Option<us
     at_offset.next().is_none().then_some(idx)
 }
 
+/// One integer operand in assembler.py's bytecode namespace. `Register`
+/// also covers an int constants-pool slot (`argcode == 'i'`), while
+/// `ShortConst` is the inline signed byte selected by `USE_C_FORM`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JitCodeIntOperand {
+    Register(u16),
+    ShortConst(i8),
+}
+
 #[derive(Default)]
 pub struct JitCodeBuilder {
     /// RPython `jitcode.py` `self.name = name`. Propagated to the
@@ -2439,6 +2448,57 @@ impl JitCodeBuilder {
         self.push_u8(lhs as u8);
         self.push_u8(rhs as u8);
         self.push_u8(dst as u8);
+    }
+
+    /// Emit a dynamically-numbered `USE_C_FORM` integer operation. PyPy's
+    /// assembler allocates the `(opname, argcodes)` byte only when that shape
+    /// appears; the runtime assembler supplies that byte here.
+    pub fn record_binop_i_operands(
+        &mut self,
+        dst: u16,
+        opcode_byte: u8,
+        lhs: JitCodeIntOperand,
+        rhs: JitCodeIntOperand,
+    ) {
+        self.touch_reg(dst);
+        for operand in [lhs, rhs] {
+            if let JitCodeIntOperand::Register(reg) = operand {
+                self.touch_int_reg_or_pool_slot(reg);
+            }
+        }
+        self.start_instr(opcode_byte);
+        self.pending_resulttype = Some('i');
+        for operand in [lhs, rhs] {
+            match operand {
+                JitCodeIntOperand::Register(reg) => self.push_reg_u8(reg, "integer operand"),
+                JitCodeIntOperand::ShortConst(value) => self.push_u8(value as u8),
+            }
+        }
+        self.push_reg_u8(dst, "integer result");
+    }
+
+    /// Fused integer comparison branch with independently short-constant
+    /// operands (`goto_if_not_int_*/{ci,ic,cc}L`).
+    pub fn goto_if_not_int_operands(
+        &mut self,
+        opcode_byte: u8,
+        lhs: JitCodeIntOperand,
+        rhs: JitCodeIntOperand,
+        label: u16,
+    ) {
+        for operand in [lhs, rhs] {
+            if let JitCodeIntOperand::Register(reg) = operand {
+                self.touch_int_reg_or_pool_slot(reg);
+            }
+        }
+        self.start_instr(opcode_byte);
+        for operand in [lhs, rhs] {
+            match operand {
+                JitCodeIntOperand::Register(reg) => self.push_reg_u8(reg, "integer branch operand"),
+                JitCodeIntOperand::ShortConst(value) => self.push_u8(value as u8),
+            }
+        }
+        self.push_label_ref(label);
     }
 
     /// `blackhole.py:478-497` `bhimpl_int_{add,sub,mul}_jump_if_ovf(label,
