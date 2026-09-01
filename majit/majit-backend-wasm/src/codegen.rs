@@ -471,7 +471,12 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
     }
 
     fn i32_wrap_i64(&mut self) -> &mut Self {
-        if let Some(PendingInstruction::I64Const(value)) = self.pending.pop() {
+        // Inspect the tail before removing it, the way every other fold here
+        // does: `pending` is a lookbehind buffer, not an operand stack, so a
+        // tail this fold does not consume still owes its instruction to
+        // `flush`.
+        if let Some(PendingInstruction::I64Const(value)) = self.pending.last().copied() {
+            self.pending.pop();
             self.pending
                 .push(PendingInstruction::I32Const(value as u64 as u32 as i32));
         } else {
@@ -1988,15 +1993,6 @@ fn emit_reload_ca_input_refs_from_homes(
     }
 }
 
-/// llsupport/gc.py GcLLDescr_framework
-///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-/// Looks up the materialized table populated by the runner from the
-/// active gc_ll_descr. RPython resolves the same value via
-/// `cpu.gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr`.
-fn lookup_typeid_from_classptr(table: &HashMap<i64, u32>, classptr: usize) -> Option<u32> {
-    table.get(&(classptr as i64)).copied()
-}
-
 /// Information about a guard exit collected during pre-scan.
 /// The live-position mask a guard's bridge inputargs were filtered by.
 ///
@@ -2048,6 +2044,34 @@ pub fn live_fail_arg_extent(meta_descr: Option<&majit_ir::DescrRef>, n: usize) -
         .iter()
         .rposition(|&live| live)
         .map_or(0, |i| i + 1)
+}
+
+/// Whether a guard's live fail-arg positions ARE the positional exit slots a
+/// frame bridge entry reads.
+///
+/// `emit_guard_fail_args_spill` writes fail argument `i` into slot `i`, holes
+/// included, because the deadframe readers index that same logical layout.
+/// `initialize_state_from_guard_failure` instead drops the holes, so bridge
+/// input `k` names the k-th LIVE position — the two orders coincide only while
+/// every hole trails the last live position. `rebuild_faillocs_from_descr` is
+/// where a location per live position is recovered; the frame entry in
+/// `build_function` has no such table and can only read slot `k`, so a caller
+/// that cannot honour this must decline the bridge.
+///
+/// A descr whose `rd_locs` was never sized to its fail-arg list declares every
+/// position live — the reading `live_fail_arg_mask` takes — and its positions
+/// are then the slots by construction.
+pub fn frame_entry_reads_live_positions(
+    fail_descr: &dyn majit_ir::FailDescr,
+    bridge_inputs: usize,
+) -> bool {
+    let n = fail_descr.fail_arg_types().len();
+    let locs = fail_descr.rd_locs();
+    if locs.len() != n {
+        return bridge_inputs == n;
+    }
+    let live = locs.iter().filter(|&&pos| pos != 0xFFFF).count();
+    bridge_inputs == live && locs[..live].iter().all(|&pos| pos != 0xFFFF)
 }
 
 pub struct GuardExit {
@@ -2291,6 +2315,15 @@ fn residual_call_typed_sig(
         // parameter puts it outside `residual_call_void_true_arity`'s uniform
         // word family.  `all_float` below is false for it, so it reaches the
         // allow-list check like every other mixed shape.
+        //
+        // Only a descr that records `()` names such a callee.  A void-recorded
+        // descr carrying `result_size == 8` (the `make_call_descr_void_word_abi`
+        // shape) names one that really returns a machine word, and an empty
+        // result list is a different type from the one the callee has.  The i64
+        // family `residual_call_void_word_arity` selects is where that ABI is
+        // spelled; where that family declines -- a float parameter it cannot
+        // carry -- the reflecting trampoline is the arm that stays correct.
+        Type::Void if cd.result_size() != 0 => return None,
         Type::Void => None,
     };
     let arg_types = cd.arg_types();
@@ -4935,39 +4968,44 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                     sink.i64_ne();
                 } else {
-                    // gcremovetypeptr fallback (assembler.py:1893-1901):
-                    //   on x86_64 the typeid is a 32-bit value at offset 0.
-                    let class_arg = op.arg(1).to_opref();
-                    // history.py — inline-Const carries its class pointer directly.
-                    let classptr = class_arg.const_int_value().expect(
-                        "_cmp_guard_class: gcremovetypeptr requires \
-                             loc_classptr to be a ConstInt immediate \
-                             (aarch64/regalloc.py:829 op.getarg(1).getint())",
-                    );
-                    let expected_typeid =
-                        lookup_typeid_from_classptr(classptr_to_typeid, classptr as usize).expect(
-                            "GuardClass: vtable_offset is None but the wasm \
-                                 backend has no gc_ll_descr.\
-                                 get_typeid_from_classptr_if_gcremovetypeptr",
-                        );
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i32_const(expected_typeid as i32);
-                    sink.i32_ne();
+                    // x86/assembler.py `_cmp_guard_class` hands the
+                    // gcremovetypeptr case to `_cmp_guard_gc_type`, whose
+                    // layout keeps the type id in the object's first word.
+                    // majit keeps it in the GC header word placed immediately
+                    // before the payload — the lower `TYPE_ID_BITS` of
+                    // `majit_gc::header::GcHeader`'s `tid_and_flags`, the
+                    // address the `GuardGcType`, `GuardIsObject` and
+                    // `GuardSubclass` arms read. Under that layout `obj[0]` is
+                    // a payload field, so comparing it against a type id
+                    // answers a different question.
+                    //
+                    // Reading the header instead is not enough on its own
+                    // here: this arm evaluates the class compare
+                    // unconditionally and ORs the null test in afterwards, so
+                    // for a NULL receiver `obj - GcHeader::SIZE` addresses
+                    // below linear memory and traps instead of failing the
+                    // guard — `genop_guard_guard_nonnull_class` avoids that
+                    // with a forward jump this arm does not have. Decline: a
+                    // frontend that emits GUARD_CLASS configures the vtable
+                    // offset (pyre passes `OB_TYPE_OFFSET`), so no trace pays
+                    // for the decline.
+                    return Err(BackendError::Unsupported(format!(
+                        "wasm backend: {:?} with cpu.vtable_offset = None \
+                         (gcremovetypeptr) is unsupported; the type id lives \
+                         in the GC header and this arm has no null-safe \
+                         header compare",
+                        op.opcode
+                    )));
                 }
                 if op.opcode == OpCode::GuardNonnullClass {
                     // x86/assembler.py genop_guard_guard_nonnull_class wraps
                     // `_cmp_guard_class` in `CMP(ptr, 1)` plus a forward `B`
                     // jump, so a NULL receiver reaches the guard already
                     // failing and never has its class read. Here the class
-                    // compare above has already run — harmlessly, since it
-                    // reads offset 0 or the vtable offset, both inside the
-                    // first page — so the guard's answer is the disjunction.
+                    // compare above has already run — harmlessly, since the
+                    // only shape this arm lowers reads the vtable offset, and
+                    // a NULL receiver puts that read inside the first page —
+                    // so the guard's answer is the disjunction.
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i64_eqz();
                     sink.i32_or();
@@ -5648,11 +5686,13 @@ fn build_function(
             }
 
             // ── GC memory ops ──
-            // The indexed forms are also wired as real frontend blackhole ops
-            // (blackhole.rs `gc_load_indexed_{i,f}` / `gc_store_indexed_{i,f}`),
-            // so an llop/buffer trace can carry them into the backend. This
-            // backend has no descr-driven lowering for them, so decline
-            // (interpreter fallback) rather than aborting the whole compile.
+            // The indexed forms have the same sole producer as the bare ones
+            // below — `GcRewriterImpl`, which this backend does not run — and
+            // no opimpl records them, so nothing carries them here. The
+            // blackhole wiring for `gc_load_indexed_{i,f}` /
+            // `gc_store_indexed_{i,f}` executes them, it does not trace them.
+            // Decline (interpreter fallback) rather than aborting the whole
+            // compile.
             OpCode::GcLoadIndexedI
             | OpCode::GcLoadIndexedR
             | OpCode::GcLoadIndexedF
@@ -6145,30 +6185,23 @@ fn build_function(
                 );
                 guard_idx += 1;
             }
+            // `reached_loop_header` mints this op only to donate its
+            // `rd_resume_position` to the guards `jump_to_existing_trace` and
+            // `inline_short_preamble` stamp; both `optimize_GUARD_FUTURE_CONDITION`
+            // arms then consume it into `patchguardop` and emit nothing, which is
+            // why nothing under `rpython/jit/backend` lowers it. Reaching a
+            // backend means the optimizer did not consume it, and there is
+            // nothing correct to lower it to: it is nullary, so there is no
+            // condition to test, and an exit publishing neither `frame[0]` nor
+            // the fail args leaves the resume reading whatever the frame last
+            // held.
             OpCode::GuardFutureCondition => {
-                // This arm writes neither the fail args nor `frame[0]`, so it
-                // keeps branching to the shared epilogue — giving it the
-                // ordinary guard spill would change what the exit reports, not
-                // just how it gets there. The epilogue takes a cell address
-                // when bridge dispatch is on; otherwise retain the unused index
-                // write unchanged.
-                if !guard_dispatch.param_type_indices.is_empty() {
-                    emit_guard_param_tail_call(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        guard_idx,
-                        op,
-                        guard_dispatch,
-                    );
-                } else if guard_dispatch.enabled {
-                    emit_guard_bridge_dispatch(&mut sink, guard_idx, guard_dispatch);
-                } else {
-                    sink.i32_const(guard_idx as i32);
-                    sink.local_set(bridge_slot_local);
-                }
-                sink.br(block_exit_depth);
-                guard_idx += 1;
+                return Err(BackendError::Unsupported(
+                    "wasm backend: GuardFutureCondition is unsupported (the optimizer \
+                     consumes it into patchguardop and no backend lowers it); \
+                     declining the trace"
+                        .to_string(),
+                ));
             }
 
             // ── Quasi-immutable / record / assert ──

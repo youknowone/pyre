@@ -87,8 +87,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// edge. 40-43 split a rejected inline trial into value-layout,
 /// Ref-home-layout, missing-local-label, and other backend errors. 44 = a
 /// bridge compiled with a parameter entry; 45 = parameter entry declined
-/// because the source module has frame-only dispatch; 46 = parameter entry
-/// declined because the source guard and bridge input arities disagree; 47 =
+/// because the source module has frame-only dispatch; 46 = the bridge entry
+/// cannot name the source guard's fail arguments — a parameter entry whose
+/// arity disagrees with the guard's live count, or a frame entry whose
+/// positional slots are not where that guard spilled them (the two arms are
+/// mutually exclusive: `bridge_params_enabled` selects one for the whole
+/// process); 47 =
 /// LABEL publication suppressed because the bridge entry has nonzero parameters.
 /// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
 /// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
@@ -4212,6 +4216,24 @@ impl majit_backend::Backend for WasmBackend {
             }
             Some(inputargs.len())
         } else {
+            // A frame entry reads bridge input `k` out of the positional exit
+            // slot `k`, while `emit_guard_fail_args_spill` writes each fail
+            // argument into the slot named by its own resume position, holes
+            // included. `initialize_state_from_guard_failure` drops those
+            // holes, so input `k` is the k-th LIVE position and the two orders
+            // coincide only while every hole trails the last live one.
+            // `rebuild_faillocs_from_descr` is where a live position's own
+            // location is recovered instead; this entry has no table to do it
+            // with, so decline the shape rather than hand the bridge a
+            // neighbouring fail argument's slot.
+            if !codegen::frame_entry_reads_live_positions(fail_descr, inputargs.len()) {
+                diag_bump(46);
+                return Err(BackendError::Unsupported(
+                    "wasm backend: frame-entry bridge cannot address the source guard's \
+                     live fail-arg slots"
+                        .into(),
+                ));
+            }
             None
         };
         let allow_ca = ca_candidate;
