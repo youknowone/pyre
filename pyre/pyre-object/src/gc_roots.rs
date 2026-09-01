@@ -717,6 +717,31 @@ pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
     with_shadow_stack(|stack| normalize_published_slot(stack, index))
 }
 
+/// Reload the current top shadow-stack entry after a call that may have moved
+/// it. `root` names the value the top slot was published with; the runtime read
+/// ignores that copy and answers the slot, which a collection forwards in
+/// place.
+///
+/// The call stays a real residual, bound in `jit_trace_fnaddrs()`: aliasing it
+/// to its argument would leave a trace carrying the pre-move word, and nothing
+/// else forwards a value the trace holds.
+#[inline]
+#[must_use = "a top root may have moved; use the reloaded live word"]
+#[majit_macros::dont_look_inside]
+pub fn reload_top_root(root: PyObjectRef) -> PyObjectRef {
+    let _ = root;
+    majit_gc::shadow_stack::top_ref().0 as PyObjectRef
+}
+
+/// One-word residual-call ABI for [`reload_top_root`].
+///
+/// A residual with a `Ref` result lowers to a direct `call_indirect` typed
+/// `(i64) -> i64`; `PyObjectRef` is `i32` on wasm32, where the call
+/// type-checks its callee.
+pub extern "C" fn reload_top_root_jit_abi(root: i64) -> i64 {
+    reload_top_root(root as PyObjectRef) as i64
+}
+
 /// Publish a complete translated livevar set before performing any
 /// forwarding query.  RPython's `push_roots(hop)` writes every live GCREF to
 /// the root stack as one pre-allocation phase; calling [`pin_root`] repeatedly

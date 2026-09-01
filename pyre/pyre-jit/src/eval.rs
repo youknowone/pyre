@@ -18,6 +18,7 @@ use pyre_interpreter::{
     decode_instruction_forward_pc, execute_opcode_step,
 };
 use pyre_interpreter::{locals_w, locals_w_mut};
+use pyre_object::gc_roots;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -273,8 +274,8 @@ struct FrameView;
 
 impl FrameView {
     #[inline]
-    fn top_frame() -> *mut PyFrame {
-        majit_gc::shadow_stack::top_ref().0 as *mut PyFrame
+    fn reload(frame: *mut PyFrame) -> *mut PyFrame {
+        gc_roots::reload_top_root(frame as pyre_object::PyObjectRef) as *mut PyFrame
     }
 }
 
@@ -6218,10 +6219,9 @@ impl PyPyJitDriver {
         frame: &mut PyFrame,
         ec: *const PyExecutionContext,
     ) -> bool {
-        // The translated marker signature must retain the red `frame` name,
-        // although the untranslated warm-state path reloads it through the
-        // shadow-stack root below after possible collection points.
-        let _ = frame;
+        // The translated marker signature retains the red `frame` name; the
+        // untranslated warm-state path reloads it through the shadow-stack
+        // root below after possible collection points.
         let env = PyreEnv;
         let (driver, info) = driver_pair();
         let loop_pycode = pycode as *const ();
@@ -6234,12 +6234,19 @@ impl PyPyJitDriver {
                 >= portal_metatrace_skip()
             && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            drive_portal_metatrace(driver, green_key_hash, next_instr);
+            drive_portal_metatrace(
+                driver,
+                info,
+                &env,
+                green_key_hash,
+                next_instr,
+                frame as *mut PyFrame,
+            );
         }
         // The Stage-0 drive records IR and executes residuals concretely, so it
         // is a collection point; reload the same shadow-stack root before the
         // compile path reads the frame.
-        let f: *mut PyFrame = FrameView::top_frame();
+        let f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
         let Some(loop_result) = maybe_compile_and_run(
             unsafe { &mut *f },
             green_key,
@@ -7175,8 +7182,11 @@ impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
 /// num_recorded_ops=…` alongside this summary.
 fn drive_portal_metatrace(
     driver: &mut JitDriver<PyreJitState>,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    env: &PyreEnv,
     green_key: u64,
     loop_header_pc: usize,
+    frame: *mut PyFrame,
 ) {
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
 
@@ -7249,7 +7259,7 @@ fn drive_portal_metatrace(
         // root only after those calls, immediately before the concrete portal
         // inputs are captured; never trust a raw frame pointer supplied by the
         // caller across a collection point.
-        let live_frame = FrameView::top_frame();
+        let live_frame = FrameView::reload(frame);
         let next_instr = loop_header_pc as i64;
         let is_being_profiled = i64::from(unsafe { &*live_frame }.get_is_being_profiled());
         let pycode = unsafe { &*live_frame }.pycode as pyre_object::PyObjectRef;
@@ -7263,24 +7273,26 @@ fn drive_portal_metatrace(
             live_frame as usize, ec as usize,
         );
 
-        let live_values = [
-            majit_ir::Value::Ref(majit_ir::GcRef(live_frame as usize)),
-            majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)),
-        ];
-        let action = meta.force_start_tracing(
-            green_key,
-            (pycode as usize, loop_header_pc),
-            None,
-            &live_values,
+        // Start the trace through `JitDriver::force_start_tracing`, the entry
+        // the production function-entry path uses: it publishes the
+        // virtualizable heap pointer (`set_vable_ptr`) and the expanded live
+        // values through the jit state, so `initialize_virtualizable` binds
+        // the frame's `VirtualizableInfo` to the trace.  Starting on the
+        // `MetaInterp` alone leaves the trace without that info and the
+        // first `setfield_vable` aborts the walk.
+        let mut jit_state = build_jit_state(unsafe { &*live_frame }, info);
+        driver.force_start_tracing(green_key, loop_header_pc, &mut jit_state, env);
+        let meta = driver.meta_interp_mut();
+        let started = meta.is_tracing();
+        eprintln!(
+            "[jd0-mt] force_start_tracing -> {}",
+            if started {
+                "StartedTracing"
+            } else {
+                "NotTracing"
+            }
         );
-        let action_name = match &action {
-            majit_metainterp::BackEdgeAction::Interpret => "Interpret",
-            majit_metainterp::BackEdgeAction::StartedTracing => "StartedTracing",
-            majit_metainterp::BackEdgeAction::AlreadyTracing => "AlreadyTracing",
-            majit_metainterp::BackEdgeAction::RunCompiled => "RunCompiled",
-        };
-        eprintln!("[jd0-mt] force_start_tracing -> {action_name}");
-        if !matches!(action, majit_metainterp::BackEdgeAction::StartedTracing) {
+        if !started {
             return;
         }
 
@@ -7470,9 +7482,7 @@ fn drive_portal_metatrace(
             },
         );
 
-        if meta.is_tracing() {
-            meta.abort_trace(false);
-        }
+        driver.abort_current_trace(false);
 
         match walked {
             Some((action, before, after, depth, stop_jitcode, stop_cursor, stop_pc)) => {
@@ -7495,10 +7505,7 @@ fn drive_portal_metatrace(
     }));
 
     if let Err(payload) = result {
-        let meta = driver.meta_interp_mut();
-        if meta.is_tracing() {
-            meta.abort_trace(false);
-        }
+        driver.abort_current_trace(false);
         let message = if let Some(message) = payload.downcast_ref::<&str>() {
             (*message).to_owned()
         } else if let Some(message) = payload.downcast_ref::<String>() {
@@ -9997,10 +10004,10 @@ fn cached_function_entry_trace_is_jit_safe(code: &pyre_interpreter::CodeObject) 
 /// JIT hooks are thin inline checks; all heavy logic is in #[cold] helpers.
 fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // The caller's root is the top of the shadow stack and names this frame;
-    // every reload below goes through that root (`FrameView::top_frame`).
+    // every reload below goes through that root (`FrameView::reload`).
     debug_assert!(
         std::ptr::eq(
-            FrameView::top_frame() as *const PyFrame,
+            FrameView::reload(frame as *mut PyFrame) as *const PyFrame,
             frame as *const PyFrame,
         ),
         "eval_loop_jit entered without its frame as the top shadow-stack root"
@@ -10045,6 +10052,16 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
+    // The one frame binding the whole dispatch loop reads through. Seeded from
+    // the parameter here — the parameter itself is not read inside the loop —
+    // and re-seeded through `FrameView::reload(f)` after every collection
+    // point. At the jit_merge_point split only greens and reds may stay live
+    // (`split_before_jit_merge_point` links exactly those), and `f` is the
+    // marker's red, so chaining every reload through `f` keeps the split
+    // legal; a fresh `frame as *mut PyFrame` cast inside the loop would be
+    // value-numbered into one definition that crosses the split as neither.
+    let mut f: *mut PyFrame = FrameView::reload(frame as *mut PyFrame);
+
     loop {
         // PyPy's ActionFlag is one process breaker.  Keep pyre's free-threaded
         // finalization and STW extensions on the same already-established
@@ -10081,7 +10098,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // after every collection-point call in this loop (bytecode_trace,
         // perform_actions, execute_opcode_step, handle_exception, can_enter_jit /
         // maybe_compile_and_run).
-        let f: *mut PyFrame = FrameView::top_frame();
+        f = FrameView::reload(f);
 
         // The plain evaluator's twin: a bounded major collection that reached
         // `max_heap_size` owes a `MemoryError`, and the safepoint above — which
@@ -10113,7 +10130,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 &mut next_instr,
             ) {
                 // handle_exception allocates → re-seed before the write.
-                let f: *mut PyFrame = FrameView::top_frame();
+                f = FrameView::reload(f);
                 unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                 continue;
             }
@@ -10136,7 +10153,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             unsafe { &mut *f },
             marker_ec,
         );
-        // `f` is the marker's red `frame` and stays valid across it; the marker does not collect.
+        // `f` is the marker's red `frame` — the one frame value declared
+        // live across the split, as PyFrame.dispatch's `self` is upstream.
+        // The marker does not collect.
 
         // `interp_jit.py` `PyFrame.dispatch`: `co_code = pycode.co_code`,
         // read from the green the marker just declared and nowhere else. One
@@ -10168,7 +10187,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // field is a valid repr(u8) `Instruction` discriminant.
         let instruction =
             unsafe { std::mem::transmute::<u8, pyre_interpreter::Instruction>(opcode) };
-        let op_arg = pyre_interpreter::OpArg::new((packed_instruction >> 8) as u32);
+        let op_arg = pyre_interpreter::oparg_from_u32((packed_instruction >> 8) as u32);
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
         unsafe { &mut *f }.last_instr = pc as isize;
@@ -10219,7 +10238,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             if unsafe { &mut *f }.take_failed_attr_before_opcode() {
                 unsafe { (*ec_ptr).run_failed_attr_finalizers() };
             }
-            let f: *mut PyFrame = FrameView::top_frame();
+            f = FrameView::reload(f);
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             // A compiled back-edge deopts when the process breaker is armed.
             // On resume, run the live frame's ordinary bytecode_trace so its
@@ -10239,14 +10258,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     // bytecode_trace at this opcode.  In particular, an
                     // asynchronously injected exception must be catchable by
                     // the target frame's surrounding try/except.
-                    let f: *mut PyFrame = FrameView::top_frame();
+                    f = FrameView::reload(f);
                     let mut next_instr = unsafe { &*f }.next_instr();
                     if pyre_interpreter::eval::handle_exception(
                         unsafe { &mut *f },
                         &mut err,
                         &mut next_instr,
                     ) {
-                        let f: *mut PyFrame = FrameView::top_frame();
+                        f = FrameView::reload(f);
                         unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                         continue;
                     }
@@ -10254,7 +10273,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 }
                 // bytecode_trace may allocate (tracer callback) → the frame may
                 // have moved; re-seed before reading it again.
-                let f: *mut PyFrame = FrameView::top_frame();
+                f = FrameView::reload(f);
                 // A trace callback may perform a debugger line-jump by
                 // setting `frame.f_lineno` (`fset_f_lineno` → `last_instr
                 // = best_addr`).  The opcode for this iteration was
@@ -10295,7 +10314,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                         // the current opcode so the frame's try/except can catch
                         // it. `frame.last_instr` was set to `pc` above, so
                         // `handle_exception` finds the covering handler.
-                        let f: *mut PyFrame = FrameView::top_frame();
+                        f = FrameView::reload(f);
                         let mut next_instr = unsafe { &*f }.next_instr();
                         if pyre_interpreter::eval::handle_exception(
                             unsafe { &mut *f },
@@ -10304,7 +10323,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                         ) {
                             // handle_exception may allocate; re-seed before the
                             // final frame write.
-                            let f: *mut PyFrame = FrameView::top_frame();
+                            f = FrameView::reload(f);
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
@@ -10316,7 +10335,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // The ec block above may have run bytecode_trace / perform_actions
         // (collection points) on a fall-through path; re-seed before the
         // opcode dispatch.
-        let f: *mut PyFrame = FrameView::top_frame();
+        f = FrameView::reload(f);
         let mut next_instr = unsafe { &*f }.next_instr();
         let step_result =
             execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, next_instr);
@@ -10342,7 +10361,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 }
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer for the compile path.
-                let f: *mut PyFrame = FrameView::top_frame();
+                f = FrameView::reload(f);
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
                 let marker_ec = pyre_interpreter::call::getexecutioncontext();
@@ -10363,7 +10382,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 ) {
                     // maybe_compile_and_run compiles and may allocate → re-seed
                     // before handle_exception reads the frame.
-                    let f: *mut PyFrame = FrameView::top_frame();
+                    f = FrameView::reload(f);
                     let loop_result = take_pending_loop_exit(marker_ec);
                     // warmspot.py handle_jitexception: an
                     // `ExitFrameWithExceptionRef` from a direct compiled-code
@@ -10385,7 +10404,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                             &mut next_instr,
                         ) {
                             // handle_exception may allocate → re-seed.
-                            let f: *mut PyFrame = FrameView::top_frame();
+                            f = FrameView::reload(f);
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                             continue;
                         }
@@ -10399,14 +10418,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             Err(mut err) => {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer.
-                let f: *mut PyFrame = FrameView::top_frame();
+                f = FrameView::reload(f);
                 if pyre_interpreter::eval::handle_exception(
                     unsafe { &mut *f },
                     &mut err,
                     &mut next_instr,
                 ) {
                     // handle_exception may allocate → re-seed before the write.
-                    let f: *mut PyFrame = FrameView::top_frame();
+                    f = FrameView::reload(f);
                     unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
                     continue;
                 }

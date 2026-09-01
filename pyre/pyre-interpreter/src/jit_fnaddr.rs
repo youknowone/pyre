@@ -1154,6 +1154,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::pin_root",
         pyre_object::gc_roots::pin_root,
     );
+    // `reload_top_root` re-reads the top entry of the `majit_gc` shadow stack
+    // (a different structure from `pin_root`'s root stack) after a call that
+    // may have moved what was published there.  A trace that kept the pre-move
+    // word instead has no other forwarding for it, so the call stays a
+    // residual — and a `Ref` result makes it a direct `call_indirect`, hence
+    // the word-ABI bridge rather than the raw `fn` its neighbours bind.
+    cpa1(
+        &mut entries,
+        "pyre_object::gc_roots::reload_top_root",
+        "pyre_object::reload_top_root",
+        pyre_object::gc_roots::reload_top_root_jit_abi,
+    );
     // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
     // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through
     // state the tracer cannot model (the `pin_root` / `try_gc_write_barrier`
@@ -2804,6 +2816,89 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::disarm_async_eval_breaker",
         crate::executioncontext::disarm_async_eval_breaker,
     );
+
+    // Eval-breaker poll residuals: the dispatch-loop poll reads the breaker
+    // word, drains a pending memory-error bit, and services stop-the-world /
+    // finalization requests through these cross-crate helpers.
+    //
+    // The value-returning ones ride a word-ABI bridge.  A residual whose
+    // result is Int/Ref lowers to a direct `call_indirect` typed
+    // `(i64 x n) -> i64` (`ResidualCallAbi::Word`, the default), and a Rust
+    // `-> usize` / `-> bool` / `&T` argument is narrower than a word on
+    // wasm32, where the call type-checks its callee.  The two `-> ()` polls
+    // keep their plain rows because they take no arguments: `() -> ()` is the
+    // type the void residual family declares on every target.  A void residual
+    // that DOES take arguments needs a bridge like any other, which is why
+    // `frame_anchor_release` has one.
+    cp0(
+        &mut entries,
+        "majit_ir::eval_breaker_word::load",
+        majit_ir::eval_breaker_word::load_jit_abi,
+    );
+    cp0(
+        &mut entries,
+        "majit_ir::eval_breaker_word::take_memory_error",
+        majit_ir::eval_breaker_word::take_memory_error_jit_abi,
+    );
+    let gc_safepoint_poll: fn() = majit_gc::gc_sync::safepoint_poll;
+    p0(
+        &mut entries,
+        "majit_gc::gc_sync::safepoint_poll",
+        gc_safepoint_poll,
+    );
+    let thread_park_if_finalizing: fn() = crate::module::thread::park_if_finalizing;
+    p0(
+        &mut entries,
+        "pyre_interpreter::module::thread::park_if_finalizing",
+        thread_park_if_finalizing,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::module::thread::all_thread_hooks_current",
+        crate::module::thread::all_thread_hooks_current_jit_abi,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::executioncontext::space_decrement_ticker",
+        crate::executioncontext::space_decrement_ticker_jit_abi,
+    );
+    // The `anchor` handler graph residualizes `FrameAnchor::new` itself
+    // (its aggregate return keeps it out of inlining), and `push_anchored`
+    // reads back through `FrameAnchor::live`; bind both under the exact
+    // path spellings the codewriter hashes for method targets.  They carry
+    // their own bridges rather than sharing the free slot ops': one address
+    // must name one function here.  `new` is `from_raw` handed back without a
+    // `Drop`, and `front::mir` aliases an `Rvalue::Ref` over a bare local to
+    // that local's own Variable without emitting an address-of, so `live`'s
+    // `&self` arrives as the one-word anchor's value — the depth — rather
+    // than a pointer to it.
+    cpa1(
+        &mut entries,
+        "eval::FrameAnchor::new",
+        "pyre_interpreter::eval::FrameAnchor::new",
+        crate::eval::frame_anchor_new_jit_abi,
+    );
+    cpa1(
+        &mut entries,
+        "eval::FrameAnchor::live",
+        "pyre_interpreter::eval::FrameAnchor::live",
+        crate::eval::frame_anchor_live_method_jit_abi,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::eval::frame_anchor_push",
+        crate::eval::frame_anchor_push_jit_abi,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::eval::frame_anchor_live",
+        crate::eval::frame_anchor_live_jit_abi,
+    );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::eval::frame_anchor_release",
+        crate::eval::frame_anchor_release_jit_abi,
+    );
     pa1(
         &mut entries,
         "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
@@ -4203,6 +4298,43 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
         (
             "typeobject::COMPARES_BY_IDENTITY_NO",
             pyre_object::typeobject::COMPARES_BY_IDENTITY_NO as i64,
+        ),
+        // Eval-breaker word bit masks read by the dispatch-loop poll in
+        // `executioncontext.rs`. Cross-crate `pub const usize` reads reach
+        // the front-end as opaque `Foreign` globals, so bake the build-time
+        // bit values.
+        (
+            "eval_breaker_word::EB_ASYNC",
+            majit_ir::eval_breaker_word::EB_ASYNC as i64,
+        ),
+        (
+            "eval_breaker_word::EB_STW",
+            majit_ir::eval_breaker_word::EB_STW as i64,
+        ),
+        (
+            "eval_breaker_word::EB_FINALIZING",
+            majit_ir::eval_breaker_word::EB_FINALIZING as i64,
+        ),
+        (
+            "eval_breaker_word::EB_GC_INTERP",
+            majit_ir::eval_breaker_word::EB_GC_INTERP as i64,
+        ),
+        (
+            "eval_breaker_word::EB_GC",
+            majit_ir::eval_breaker_word::EB_GC as i64,
+        ),
+        (
+            "eval_breaker_word::EB_MEMORY_ERROR",
+            majit_ir::eval_breaker_word::EB_MEMORY_ERROR as i64,
+        ),
+        (
+            "eval_breaker_word::JIT_BREAKER_MASK",
+            majit_ir::eval_breaker_word::JIT_BREAKER_MASK as i64,
+        ),
+        // Tick-counter decrement step read on the same poll path.
+        (
+            "executioncontext::TICK_COUNTER_STEP",
+            crate::executioncontext::TICK_COUNTER_STEP as i64,
         ),
     ]
 }

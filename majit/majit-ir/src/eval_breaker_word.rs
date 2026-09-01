@@ -95,6 +95,15 @@ pub fn load() -> usize {
     EVAL_BREAKER_WORD.load(Ordering::Relaxed)
 }
 
+/// One-word residual-call ABI for [`load`].
+///
+/// A value-returning residual lowers to a direct `call_indirect` typed
+/// `() -> i64`, and `usize` is narrower than a word on wasm32, where the
+/// call type-checks its callee.
+pub extern "C" fn load_jit_abi() -> i64 {
+    load() as i64
+}
+
 // --- async (bit0): armed by the OS signal handler / action dispatcher ---
 // `fetch_or` is a single lock-free atomic RMW → async-signal-safe.
 pub fn set_async() {
@@ -297,6 +306,11 @@ pub fn take_memory_error() -> bool {
         release_one_owed();
         true
     })
+}
+
+/// One-word residual-call ABI for [`take_memory_error`].
+pub extern "C" fn take_memory_error_jit_abi() -> i64 {
+    take_memory_error() as i64
 }
 
 /// Depth of the operation chain between the poll's load and its guard.

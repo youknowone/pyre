@@ -3514,7 +3514,10 @@ fn legacy_const_define_hlvalue(
         OpKind::Call {
             target:
                 crate::model::CallTarget::SyntheticTransparentCtor {
-                    name, owner_path, ..
+                    name,
+                    owner_path,
+                    variant_tag,
+                    ..
                 },
             args,
             ..
@@ -3555,6 +3558,7 @@ fn legacy_const_define_hlvalue(
             let instance =
                 crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
                     &qualname,
+                    *variant_tag,
                 );
             let Some(instance) = instance else {
                 return Ok(None);

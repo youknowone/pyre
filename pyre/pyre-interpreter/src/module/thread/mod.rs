@@ -356,10 +356,26 @@ pub(crate) fn set_profile_all_execution_contexts(
 /// `_settraceallthreads` / `_setprofileallthreads` generations, but when
 /// neither changed it need not enter the updater (and its mutex-bearing slow
 /// arms) at every opcode.
+/// `dont_look_inside`: the generation counters are process-global statics the
+/// tracer cannot model as fields; the caller residualizes the gate and the
+/// slow hook-application path stays behind it.
 #[inline(always)]
+#[majit_macros::dont_look_inside]
 pub(crate) fn all_thread_hooks_current(ec: &crate::PyExecutionContext) -> bool {
     ec.trace_all_generation == TRACE_ALL_GENERATION.load(Ordering::Acquire)
         && ec.profile_all_generation == PROFILE_ALL_GENERATION.load(Ordering::Acquire)
+}
+
+/// One-word residual-call ABI for [`all_thread_hooks_current`].
+///
+/// A value-returning residual is lowered as `(i64) -> i64`; the Rust
+/// signature's reference argument and `bool` result are narrower than a word
+/// on wasm32, where `call_indirect` type-checks its callee.
+pub extern "C" fn all_thread_hooks_current_jit_abi(ec: i64) -> i64 {
+    // SAFETY: the residual's slot is the execution context the walked graph
+    // read it from; it outlives the call.
+    let ec = unsafe { &*(ec as *const crate::PyExecutionContext) };
+    all_thread_hooks_current(ec) as i64
 }
 
 /// `dont_look_inside`: the per-thread trace/profile safepoint reads the

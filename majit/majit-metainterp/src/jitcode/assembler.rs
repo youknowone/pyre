@@ -5794,8 +5794,10 @@ impl JitCodeBuilder {
             constants_r: self.constants_r.into_iter().map(Into::into).collect(),
             constants_f: self.constants_f,
             // This builder constructs bytecode directly and never emits
-            // prebuilt-string ref constants, so the descriptor bank is empty.
+            // prebuilt-string or unit-variant ref constants, so both
+            // descriptor banks are empty.
             str_consts: Vec::new(),
+            unit_variant_consts: Vec::new(),
             c_num_regs_i: self.num_regs_i,
             c_num_regs_r: self.num_regs_r,
             c_num_regs_f: self.num_regs_f,

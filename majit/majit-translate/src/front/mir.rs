@@ -5721,41 +5721,52 @@ impl<'a> Lowering<'a> {
                 // use `variant_idx = null`, enum variants index into the
                 // `TypeDeclKind::Enum` variant list.
                 let resolved = self.resolve_aggregate_adt(&kind);
-                let (owner_path, ctor_name, field_rows, aggregate_owner_id, adt_is_struct) =
-                    match resolved {
-                        Some((owner_path, ctor_name, field_rows, owner_id, is_struct)) => {
-                            (owner_path, ctor_name, field_rows, Some(owner_id), is_struct)
-                        }
-                        None => {
-                            // Synthetic placeholders for non-Adt aggregates
-                            // (`Tuple`, `Array`, `Closure`) — they have no
-                            // user-defined class to resolve into.  A non-empty
-                            // tuple or array carries its per-shape `<…>` suffix
-                            // so its `__pos_N` attrs do not collide with other
-                            // shapes on one global class; the suffix matches
-                            // `positional_aggregate_owner` (Site-A reads) and
-                            // `tyref_positional_aggregate_suffix` (Site-B reads).
-                            // The per-shape `<…>` suffix is rendered from the
-                            // destination place type, not the `AggregateKind` head:
-                            // Charon's `AggregateKind::Adt(Tuple, …)` carries no
-                            // element `types`, so keying off it would spell a bare
-                            // `Tuple` on the write while the `.N` projection reads
-                            // (which do see `place.ty`'s element types) spell the
-                            // suffixed owner — a write/read owner split.  `dest_ty`
-                            // is that same `place.ty`, so both sides agree.
-                            let leaf = format!(
-                                "{}{}",
-                                aggregate_ctor_name(&kind),
-                                tyref_positional_aggregate_suffix(dest_ty, self.llbc)
-                            );
-                            let positional = (0..arg_vars.len())
-                                .map(|i| (format!("__pos_{i}"), String::new(), None))
-                                .collect();
-                            // Not an Adt at all, so there is no struct decl to
-                            // stand behind an allocation rewrite.
-                            (Vec::new(), leaf, positional, None, false)
-                        }
-                    };
+                let (
+                    owner_path,
+                    ctor_name,
+                    field_rows,
+                    aggregate_owner_id,
+                    adt_is_struct,
+                    enum_variant_tag,
+                ) = match resolved {
+                    Some((owner_path, ctor_name, field_rows, owner_id, is_struct, tag)) => (
+                        owner_path,
+                        ctor_name,
+                        field_rows,
+                        Some(owner_id),
+                        is_struct,
+                        tag,
+                    ),
+                    None => {
+                        // Synthetic placeholders for non-Adt aggregates
+                        // (`Tuple`, `Array`, `Closure`) — they have no
+                        // user-defined class to resolve into.  A non-empty
+                        // tuple or array carries its per-shape `<…>` suffix
+                        // so its `__pos_N` attrs do not collide with other
+                        // shapes on one global class; the suffix matches
+                        // `positional_aggregate_owner` (Site-A reads) and
+                        // `tyref_positional_aggregate_suffix` (Site-B reads).
+                        // The per-shape `<…>` suffix is rendered from the
+                        // destination place type, not the `AggregateKind` head:
+                        // Charon's `AggregateKind::Adt(Tuple, …)` carries no
+                        // element `types`, so keying off it would spell a bare
+                        // `Tuple` on the write while the `.N` projection reads
+                        // (which do see `place.ty`'s element types) spell the
+                        // suffixed owner — a write/read owner split.  `dest_ty`
+                        // is that same `place.ty`, so both sides agree.
+                        let leaf = format!(
+                            "{}{}",
+                            aggregate_ctor_name(&kind),
+                            tyref_positional_aggregate_suffix(dest_ty, self.llbc)
+                        );
+                        let positional = (0..arg_vars.len())
+                            .map(|i| (format!("__pos_{i}"), String::new(), None))
+                            .collect();
+                        // Not an Adt at all, so there is no struct decl to
+                        // stand behind an allocation rewrite.
+                        (Vec::new(), leaf, positional, None, false, None)
+                    }
+                };
                 let result_ty_owner = if owner_path.is_empty() {
                     ctor_name.clone()
                 } else {
@@ -5782,6 +5793,15 @@ impl<'a> Lowering<'a> {
                     CallTarget::synthetic_transparent_struct_ctor(
                         owner_path.clone(),
                         ctor_name.clone(),
+                    )
+                } else if let Some(tag) = enum_variant_tag {
+                    // A resolved enum variant records its declaration
+                    // index so a payload-less variant folded to a
+                    // prebuilt singleton keeps its discriminant.
+                    CallTarget::synthetic_transparent_enum_variant_ctor(
+                        owner_path.clone(),
+                        ctor_name.clone(),
+                        tag,
                     )
                 } else {
                     CallTarget::synthetic_transparent_ctor_with_owner(
@@ -7138,6 +7158,7 @@ impl<'a> Lowering<'a> {
         Vec<(String, String, Option<TyRef>)>,
         majit_ir::descr::StructId,
         bool,
+        Option<i64>,
     )> {
         let adt = kind.as_object()?.get("Adt")?.as_array()?;
         // `AggregateKind::Adt` head: either a bare `type_id` u64 or a
@@ -7183,6 +7204,7 @@ impl<'a> Lowering<'a> {
                     field_rows,
                     concrete_adt_struct_id(template, head_adt, self.llbc),
                     true,
+                    None,
                 ))
             }
             (TypeDeclKind::Enum(variants), Some(idx)) => {
@@ -7226,6 +7248,7 @@ impl<'a> Lowering<'a> {
                     field_rows,
                     concrete_adt_struct_id(template, head_adt, self.llbc),
                     false,
+                    Some(idx as i64),
                 ))
             }
             _ => None,
@@ -18447,12 +18470,15 @@ fn gc_root_pin_path(name: &str) -> bool {
 /// W_Root instance, re-creating on the read side exactly the StringRepr-meets-
 /// InstanceRepr union the write-side stamp exists to remove.  `get` is the
 /// only such leaf in `gc_roots`, so the match stays unambiguous.
+///
+/// `reload_top_root` answers the same kind of slot for the top entry, so it
+/// carries the stamp for the same reason.
 fn gc_root_gcref_result_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.iter().any(|s| *s == "gc_roots")
         && matches!(
             segments.last(),
-            Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get")
+            Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get") | Some(&"reload_top_root")
         )
 }
 

@@ -262,7 +262,7 @@ impl FrameAnchor {
     /// null slot, so anchoring one costs a push and answers null from
     /// [`Self::live`].
     pub unsafe fn from_raw(frame: *mut PyFrame) -> Self {
-        let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(frame as usize));
+        let depth = frame_anchor_push(frame);
         Self {
             depth,
             _not_send: std::marker::PhantomData,
@@ -270,14 +270,91 @@ impl FrameAnchor {
     }
 
     pub fn live(&self) -> *mut PyFrame {
-        majit_gc::shadow_stack::get(self.depth).0 as *mut PyFrame
+        frame_anchor_live(self.depth)
     }
 }
 
 impl Drop for FrameAnchor {
     fn drop(&mut self) {
-        majit_gc::shadow_stack::try_pop_to(self.depth);
+        frame_anchor_release(self.depth);
     }
+}
+
+/// Shadow-stack slot publication behind [`FrameAnchor`].  The slot ops live
+/// in `majit_gc`, which has no jitcode graphs, so a walked handler graph
+/// reaching them found only a symbolic path hash.  First-party
+/// `dont_look_inside` wrappers with word-sized signatures keep each op a
+/// bound residual the tracer can execute (`jit_trace_fnaddrs()` rows).
+#[majit_macros::dont_look_inside]
+pub fn frame_anchor_push(frame: *mut PyFrame) -> usize {
+    majit_gc::shadow_stack::push(majit_ir::GcRef(frame as usize))
+}
+
+/// Read the anchored frame back from its shadow-stack slot; a collection
+/// between push and read leaves the forwarded address here.
+#[majit_macros::dont_look_inside]
+pub fn frame_anchor_live(depth: usize) -> *mut PyFrame {
+    majit_gc::shadow_stack::get(depth).0 as *mut PyFrame
+}
+
+/// Release the anchor's slot (and any deeper ones) on drop.
+#[majit_macros::dont_look_inside]
+pub fn frame_anchor_release(depth: usize) {
+    majit_gc::shadow_stack::try_pop_to(depth);
+}
+
+/// One-word residual-call ABI for the three slot ops, and — as separate
+/// functions below — for the two [`FrameAnchor`] methods a walked handler
+/// graph reaches.
+///
+/// A value-returning residual is lowered as `(i64 x n) -> i64`; a raw
+/// `*mut PyFrame` / `usize` signature is narrower than a word on wasm32,
+/// where `call_indirect` type-checks its callee.
+///
+/// Each spelling gets its own bridge because `jit_trace_fnaddrs()` reads one
+/// address back as one function: two unrelated paths sharing an address is
+/// what `registered_paths_sharing_an_address_are_alias_spellings` refuses.
+pub extern "C" fn frame_anchor_push_jit_abi(frame: i64) -> i64 {
+    frame_anchor_push(frame as *mut PyFrame) as i64
+}
+
+/// One-word residual-call ABI for [`frame_anchor_live`].
+pub extern "C" fn frame_anchor_live_jit_abi(depth: i64) -> i64 {
+    frame_anchor_live(depth as usize) as i64
+}
+
+/// One-word residual-call ABI for [`frame_anchor_release`].
+pub extern "C" fn frame_anchor_release_jit_abi(depth: i64) {
+    frame_anchor_release(depth as usize);
+}
+
+/// One-word residual-call ABI for [`FrameAnchor::new`], which the `anchor`
+/// handler graph residualizes rather than inlining.
+///
+/// The anchor is one word, and the trace keeps that word: the construction is
+/// handed back without running `Drop`, exactly as the aggregate return did
+/// when the method itself was the registered target.
+pub extern "C" fn frame_anchor_new_jit_abi(frame: i64) -> i64 {
+    // SAFETY: the residual's slot holds the frame the walked graph read it
+    // from, or null, which `from_raw` anticipates.
+    let anchor = unsafe { FrameAnchor::from_raw(frame as *mut PyFrame) };
+    let depth = anchor.depth;
+    std::mem::forget(anchor);
+    depth as i64
+}
+
+/// One-word residual-call ABI for [`FrameAnchor::live`].
+///
+/// `front::mir` aliases an `Rvalue::Ref` over a bare local to that local's own
+/// Variable without emitting an address-of, so the method's `&self` reaches
+/// the residual as the one-word anchor's value — the depth — rather than a
+/// pointer to it.
+pub extern "C" fn frame_anchor_live_method_jit_abi(anchor: i64) -> i64 {
+    let anchor = std::mem::ManuallyDrop::new(FrameAnchor {
+        depth: anchor as usize,
+        _not_send: std::marker::PhantomData,
+    });
+    anchor.live() as i64
 }
 
 /// rpython/memory/gctransform/framework.py `root_walker.walk_roots` parity:
@@ -2673,9 +2750,18 @@ impl LocalOpcodeHandler for PyFrame {
         Ok(locals_w!(self)[idx])
     }
 
-    fn load_local_checked_value(&mut self, idx: usize, name: &str) -> Result<Self::Value, PyError> {
+    fn load_local_checked_value(&mut self, idx: usize) -> Result<Self::Value, PyError> {
         let value = locals_w!(self)[idx];
         if value.is_null() {
+            // Name resolution stays on the failure path only
+            // (pyopcode.py LOAD_FAST -> _load_fast_failed), keeping the
+            // varnames read out of the non-raising path.
+            let code = unsafe { &*crate::pyframe_get_pycode(self) };
+            let name = if idx < code.varnames.len() {
+                code.varnames[idx].as_str()
+            } else {
+                "<cell>"
+            };
             return Err(PyError::unbound_local_error(format!(
                 "cannot access local variable '{name}' where it is not associated with a value"
             )));
