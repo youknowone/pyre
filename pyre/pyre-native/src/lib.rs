@@ -16,4 +16,3 @@ pub mod lzma;
 pub mod ssl;
 #[cfg(feature = "wasm_vfs")]
 pub mod vfs;
-pub mod zlib;

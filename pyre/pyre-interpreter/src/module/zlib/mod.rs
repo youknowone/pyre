@@ -2,15 +2,15 @@
 //!
 //! CRC-32 / Adler-32 checksums plus the DEFLATE compress/decompress surface.
 //! The DEFLATE machinery is shared with RustPython through
-//! `rustpython_common::compression::zlib`.  `pyre_native::zlib` keeps an opaque
-//! adapter outside LLBC extraction; this module is the W_Root object glue.
+//! `rustpython_common::compression::zlib`, which Charon never enters because it
+//! is a git dependency; this module is the W_Root object glue.
 //!
 //! `Compress` / `Decompress` / `_ZlibDecompressor` own their native stream
 //! directly, matching `interp_zlib.py`'s `self.stream`.  Each stream also owns
 //! its PyPy-style per-object lock; there is no process-global side table.
 
-use pyre_native::zlib as backend;
 use pyre_object::*;
+use rustpython_common::compression::zlib as backend;
 
 use parking_lot::Mutex;
 
