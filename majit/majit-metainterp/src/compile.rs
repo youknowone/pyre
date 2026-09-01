@@ -4549,8 +4549,26 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_adr_jump_offset(&self, offset: usize) {
         unsafe { *self.adr_jump_offset.get() = offset };
     }
+    /// `store_info_on_descr` writes `guardtok.faildescr.rd_locs`
+    /// (`llsupport/assembler.py:279`), so a backend that emits machine code for
+    /// this guard leaves its own physical positions here.  The frontend's
+    /// identity-with-holes layout is resume data instead, and
+    /// `_copy_resume_data_from` never runs `store_final_boxes_in_guard` on a
+    /// copied descr, so it is written only on the donor.  Read through to the
+    /// donor when no backend has written one, the same way `fail_arg_types`,
+    /// `rd_numb` and `rd_consts` chase `get_resumestorage(): return prev`
+    /// (`compile.py:847-850`).  Without it the hole mask is empty on every
+    /// backend that keeps failargs in their logical slots, and both consumers
+    /// silently take their unmasked branch.
     fn rd_locs(&self) -> &[u16] {
-        unsafe { &*self.rd_locs.get() }
+        let own = unsafe { &*self.rd_locs.get() };
+        if !own.is_empty() {
+            return own;
+        }
+        self.prev()
+            .as_fail_descr()
+            .map(|fd| fd.rd_locs())
+            .unwrap_or(&[])
     }
     fn set_rd_locs(&self, locs: Vec<u16>) {
         unsafe { *self.rd_locs.get() = locs };
