@@ -5368,8 +5368,6 @@ mod tests {
     use majit_gc::trace::TypeInfo;
     use majit_ir::forwarding::bound_operand_from_opref as rb;
 
-    static WASM_COMPILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn typed_blackhole_allocation_never_falls_back_to_raw_memory() {
         // No active wasm GC is installed on this test thread.  A typed descr
@@ -5404,7 +5402,7 @@ mod tests {
 
     #[test]
     fn straightline_trace_defers_host_module_until_execution() {
-        let _compile_guard = WASM_COMPILE_TEST_LOCK.lock().unwrap();
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let mut backend = WasmBackend::new();
         let token = JitCellToken::new(1);
         let finish = Op::new(majit_ir::OpCode::Finish, &[]);
@@ -5433,7 +5431,7 @@ mod tests {
 
     #[test]
     fn identical_call_assembler_publication_reuses_the_runtime_snapshot() {
-        let _compile_guard = WASM_COMPILE_TEST_LOCK.lock().unwrap();
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let token_number = 9_900_000;
         ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
         ca_dispatch_publish(token_number, 11, 22, 33, 44, 55);
@@ -5450,7 +5448,7 @@ mod tests {
 
     #[test]
     fn redirect_call_assembler_grows_tmp_callback_frame_info() {
-        let _compile_guard = WASM_COMPILE_TEST_LOCK.lock().unwrap();
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         fn compile_with_depth(backend: &mut WasmBackend, token: &JitCellToken, value_count: u32) {
             let inputargs = vec![InputArg::new_int(0)];
             let mut previous = majit_ir::OpRef::input_arg_int(0);

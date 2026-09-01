@@ -254,6 +254,7 @@ mod tests {
         // The emitted CALL_ASSEMBLER check compares against a baked reserved
         // index, so a trace whose own exits started below the reserved block
         // would collide with it.
+        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
         let base = fail_descr_base();
         assert!(base >= super::FINISH_EXIT_INDEX_COUNT);
         for (index, types) in [
@@ -659,6 +660,13 @@ pub fn remove_call_assembler_targets_for_compiled_ptr(compiled_ptr: u32) {
     }
     ca_dispatch_remove_compiled_ptr(compiled_ptr);
 }
+
+/// Serializes tests that claim a [`fail_descr_base`] and later
+/// [`register_fail_descrs`]. The wasm host never interleaves those two
+/// calls; cargo's parallel unit-test runner does. Held by this module's
+/// reserved-exit test and by every `compile_loop` unit test in `lib.rs`.
+#[cfg(test)]
+pub static FAIL_DESCR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Global `frame[0]` fail-index space.
 ///
