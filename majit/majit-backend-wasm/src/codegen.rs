@@ -721,6 +721,22 @@ fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
         .unwrap_or_else(|| missing_layout_descr("array descr (item size/sign)", op))
 }
 
+/// `raw_load` / `raw_store` address `arg(0) + arg(1)` and nothing else: a raw
+/// buffer has no GC array header, so the descr's base size is not part of the
+/// address the way it is for the `GETARRAYITEM` family.
+fn emit_raw_addr(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    op: &Op,
+) {
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+    sink.i32_wrap_i64();
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+    sink.i32_wrap_i64();
+    sink.i32_add();
+}
+
 fn array_item_is_float_from_descr(op: &Op) -> bool {
     op.with_array_descr(|ad| ad.item_type() == Type::Float)
         .unwrap_or_else(|| missing_layout_descr("array descr (item is_float)", op))
@@ -5228,6 +5244,40 @@ fn build_function(
                     s.i64_xor();
                 },
             ),
+            // resoperation.py `int_between(a, b, c)` is the three-operand
+            // range test `a <= b < c`, signed on all three. jtransform lowers
+            // the name directly (`jtransform_opname.rs`), and the bigint
+            // compare path mints it as `int_between(-1, i2 >> 48, 1)`, so a
+            // trace can carry it.
+            OpCode::IntBetween => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                    sink.i64_le_s();
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
+                    sink.i64_lt_s();
+                    sink.i32_and();
+                    sink.i64_extend_i32_u();
+                    sink.local_set(value_types.local(vi));
+                }
+            }
+
+            // `float_mod` is C `fmod`: the interpreter evaluates it as Rust's
+            // `a % b`, which truncates toward zero. Wasm has no float
+            // remainder instruction, and `a - (a/b).floor() * b` answers
+            // Python's floored `%` instead — a different result for mixed
+            // signs, and inexact for a large quotient either way. Decline
+            // until there is a host helper to call.
+            OpCode::FloatMod => {
+                return Err(BackendError::Unsupported(
+                    "wasm backend: FloatMod is unsupported (fmod has no wasm \
+                     instruction); declining the trace"
+                        .to_string(),
+                ));
+            }
+
             // ── Extended integer ops ──
             OpCode::IntSignext => {
                 // int_signext(val, num_bytes): sign-extend from num_bytes width
@@ -5630,25 +5680,24 @@ fn build_function(
             }
 
             // ── Raw memory access ──
-            OpCode::RawLoadI => {
+            OpCode::RawLoadI | OpCode::RawLoadF => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // ptr
-                    sink.i32_wrap_i64();
-                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref()); // offset
-                    sink.i32_wrap_i64();
-                    sink.i32_add();
-                    let (item_size, signed) = array_item_size_sign_from_descr(op);
-                    emit_sized_int_load(&mut sink, 0, item_size, signed);
+                    emit_raw_addr(&mut sink, constants, value_types, op);
+                    if op.opcode == OpCode::RawLoadF {
+                        sink.f64_load(mem64(0));
+                    } else {
+                        let (item_size, signed) = array_item_size_sign_from_descr(op);
+                        emit_sized_int_load(&mut sink, 0, item_size, signed);
+                    }
                     sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::RawStore => {
-                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                sink.i32_wrap_i64();
-                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
-                sink.i32_wrap_i64();
-                sink.i32_add();
+                emit_raw_addr(&mut sink, constants, value_types, op);
+                // `emit_resolve` hands back a Float operand as the `i64` its
+                // bits spell, so the width-sized integer store writes the same
+                // eight bytes an `f64.store` would.
                 emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
                 let (item_size, _signed) = array_item_size_sign_from_descr(op);
                 emit_sized_int_store(&mut sink, 0, item_size);
@@ -6137,7 +6186,9 @@ fn build_function(
             // — there is no `Newstr` / `Strsetitem` / `Copystrcontent`
             // producer outside majit's ported RPython infrastructure, so
             // string work stays in residual interpreter calls and none of
-            // these reach a wasm trace today.
+            // these reach a wasm trace today. The setitem pair is named here
+            // rather than left to the catch-all so the whole family declines
+            // from one place.
             //
             // They are declined rather than left as silent no-ops. The old
             // arms emitted nothing for the copies and, for the allocations, a
@@ -6150,7 +6201,9 @@ fn build_function(
             OpCode::Newstr
             | OpCode::Newunicode
             | OpCode::Copystrcontent
-            | OpCode::Copyunicodecontent => {
+            | OpCode::Copyunicodecontent
+            | OpCode::Strsetitem
+            | OpCode::Unicodesetitem => {
                 return Err(BackendError::Unsupported(format!(
                     "wasm backend: {:?} is unsupported (no rstr lowering); \
                      declining the trace",
@@ -7499,12 +7552,19 @@ fn build_function(
             | OpCode::Keepalive => {}
 
             _ => {
-                // An opcode with no codegen arm. If it produces a value (a
-                // result local that later ops read), silently skipping it
-                // leaves a stale slot and yields wrong results, so decline the
-                // whole trace and let the metainterp fall back to the
-                // interpreter (correct, unaccelerated). Side-effect-free
-                // metadata opcodes that produce no value are enumerated above.
+                // An opcode with no codegen arm declines the whole trace and
+                // lets the metainterp fall back to the interpreter (correct,
+                // unaccelerated). That covers a void opcode too: its `pos` is
+                // `OpRef::NONE`, whose raw is `u32::MAX`, and
+                // `raw_is_constant` rejects the sentinel range. So the only op
+                // that reaches here and emits nothing is one the optimizer
+                // folded into the constant namespace, which by then is pure and
+                // has no side effect left to drop.
+                //
+                // An opcode that must emit nothing belongs in one of the no-op
+                // arms above, where the reason it owes no code is written down;
+                // a side-effecting op put there is dropped in silence, which is
+                // what `CondCallN` was.
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     return Err(BackendError::Unsupported(format!(

@@ -5961,6 +5961,68 @@ fn call_release_gil_takes_its_callee_from_arg_one() {
     );
 }
 
+/// `raw_load_f` is a translated operation (`insns.rs` BC_RAW_LOAD_F), and the
+/// int form was lowered while the float form declined the trace.
+#[test]
+fn raw_load_f_loads_a_double() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let descr = Arc::new(SimpleArrayDescr::new(1, 0, 8, 55, Type::Float));
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let load = make_op(
+        OpCode::RawLoadF,
+        &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+        OpRef::float_op(2),
+    );
+    load.setdescr(descr);
+    let ops = vec![load, Op::new(OpCode::Finish, &[rb(OpRef::float_op(2))])];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let mut f64_loads = 0;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::F64Load { .. }) {
+            f64_loads += 1;
+        }
+    });
+    assert_eq!(f64_loads, 1, "the float raw load is an f64.load");
+}
+
+/// resoperation.py `int_between(a, b, c)` is `a <= b < c`, signed.
+#[test]
+fn int_between_is_two_signed_comparisons() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Int, 2),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::IntBetween,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::input_arg_int(1),
+                OpRef::input_arg_int(2),
+            ],
+            OpRef::int_op(3),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let (mut le_s, mut lt_s, mut ands) = (0, 0, 0);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64LeS => le_s += 1,
+        wasmparser::Operator::I64LtS => lt_s += 1,
+        wasmparser::Operator::I32And => ands += 1,
+        _ => {}
+    });
+    assert_eq!((le_s, lt_s, ands), (1, 1, 1), "a <= b, b < c, and");
+}
+
 /// `genop_discard_cond_call`: CondCallN is a real conditional call, not a no-op.
 #[test]
 fn cond_call_n_emits_predicate_and_trampoline() {
