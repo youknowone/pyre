@@ -11021,9 +11021,21 @@ impl<'a> Lowering<'a> {
         // chain against named int constants (`pypy/interpreter/pyopcode.py`
         // `dispatch_bytecode`, folded by `merge_if_blocks`), never as a
         // method on the tag.  Twin of the `<str as PartialEq>::eq` fold.
+        //
+        // `!=` resolves to `PartialEq::ne`, which `derive` does not generate:
+        // it is the trait's PROVIDED method, whose body lives in `core` and so
+        // outside every extracted closure.  It therefore arrives fully
+        // qualified as `<module>::<Enum>::ne` rather than as a method on the
+        // receiver, and both spellings fold to the same discriminant `BinOp`.
         let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
-            && let CallTarget::Method { name, .. } = target
+            && let Some(name) = match target {
+                CallTarget::Method { name, .. } => Some(name.as_str()),
+                CallTarget::FunctionPath { segments } => {
+                    segments.last().map(std::string::String::as_str)
+                }
+                _ => None,
+            }
             && let Some(binop) = fieldless_enum_cmp_binop(name)
             && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
                 .iter()
@@ -33892,6 +33904,43 @@ mod tests {
                 .count(),
             1,
             "the discriminant comparison lowers to one int `BinOp(eq)`"
+        );
+    }
+
+    /// The `ne` half of the same fold, on the real lowered IR of
+    /// `getattr_str_impl` — `err.kind != PyErrorKind::AttributeError` over the
+    /// fieldless `PyErrorKind`.  `derive` generates only `eq`, so `!=` resolves
+    /// to `PartialEq`'s provided `ne` and reaches the lowering fully qualified
+    /// as a `FunctionPath` rather than as a `Method` on the receiver.  Left
+    /// residual it is an unregistered callee and the whole graph declines.
+    /// Ignored by default (loads the real LLBC).
+    #[test]
+    #[ignore]
+    fn fieldless_enum_ne_fold_real_getattr_str_impl() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "pyre_interpreter::baseobjspace::getattr_str_impl")
+                .expect("lower getattr_str_impl");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } => super::fmt_path_ends_with(segments, &["PyErrorKind", "ne"]),
+                    _ => false,
+                })
+                .count(),
+            0,
+            "no residual `PyErrorKind::ne` call survives the fold"
+        );
+        assert!(
+            ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")),
+            "the discriminant comparison lowers to an int `BinOp(ne)`"
         );
     }
 
