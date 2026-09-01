@@ -5394,10 +5394,17 @@ impl TraceCtx {
         if crate::vable_read_probe_enabled() {
             eprintln!(
                 "[vable-read-probe] enter pc={pc} nonstandard={nonstandard} \
-                 index_value={index_runtime_value} vable_concrete={} boxes={:?} lengths={:?}",
+                 index_value={index_runtime_value} vable_concrete={} boxes={:?} lengths={:?} \
+                 vable_opref={vable_opref:?} standard_box={:?} hc_nonstandard={} \
+                 heap_ptr=0x{:x} shadow_concrete={:?}",
                 concrete.is_some(),
                 self.virtualizable_boxes.as_ref().map(Vec::len),
                 self.virtualizable_array_lengths.as_deref(),
+                self.standard_virtualizable_box(),
+                self.heap_cache
+                    .is_known_nonstandard_virtualizable(vable_opref),
+                self.diag_virtualizable_heap_ptr(),
+                self.standard_virtualizable_concrete(),
             );
         }
         if nonstandard {

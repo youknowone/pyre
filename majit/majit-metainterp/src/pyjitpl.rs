@@ -4462,6 +4462,18 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:3330: virtualizable_boxes.append(virtualizable_box)
         // is folded inside init_virtualizable_boxes (it pushes vable_ref
         // at the end of the list).
+        if crate::vable_read_probe_enabled() {
+            eprintln!(
+                "[vable-read-probe] init virtualizable_box={virtualizable_box:?} \
+                 virtualizable_value={virtualizable_value:?} num_greens={num_green_args} \
+                 num_reds={num_reds} index_of_virtualizable={index_of_virtualizable} \
+                 identity_ref_bank_index={:?} identity_index={identity_index:?} \
+                 box_ref_index={box_ref_index} num_static={num_static} \
+                 array_lengths={array_lengths:?} has_expanded_tail={has_expanded_tail} \
+                 live_values={:?}",
+                info.identity_ref_bank_index, live_values,
+            );
+        }
         ctx.init_virtualizable_boxes(
             info,
             virtualizable_box,
