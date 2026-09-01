@@ -4944,6 +4944,18 @@ fn build_function(
                     sink.i32_const(expected_typeid as i32);
                     sink.i32_ne();
                 }
+                if op.opcode == OpCode::GuardNonnullClass {
+                    // x86/assembler.py genop_guard_guard_nonnull_class wraps
+                    // `_cmp_guard_class` in `CMP(ptr, 1)` plus a forward `B`
+                    // jump, so a NULL receiver reaches the guard already
+                    // failing and never has its class read. Here the class
+                    // compare above has already run — harmlessly, since it
+                    // reads offset 0 or the vtable offset, both inside the
+                    // first page — so the guard's answer is the disjunction.
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i64_eqz();
+                    sink.i32_or();
+                }
                 emit_guard_if_exit(
                     &mut sink,
                     constants,
@@ -5750,6 +5762,82 @@ fn build_function(
                     );
                 }
             }
+            OpCode::CondCallValueI | OpCode::CondCallValueR => {
+                // x86/regalloc.py `consider_cond_call`, COND_CALL_VALUE arm:
+                // "Calls the function when args[0] is equal to 0 or NULL.
+                // Returns the result from the function call if done, or args[0]
+                // if it was not 0/NULL." Upstream forces the result into
+                // args[0]'s register and lets the call overwrite it; the result
+                // local plays that register's part here.
+                //
+                // The operand roles are COND_CALL's: predicate, callee, then the
+                // call's own arguments. Sharing the generic CALL arm read args[0]
+                // as the callee and args[1] as the first argument, and called
+                // unconditionally.
+                //
+                // `do_conditional_call` asserts the callee forces no virtual or
+                // virtualizable, so unlike the CALL arm this needs no force
+                // bracket.
+                let jit_call =
+                    jit_call_idx.expect("COND_CALL_VALUE op present but jit_call not imported");
+                let vi = op.pos.get().raw();
+                let has_result = !OpRef::raw_is_constant(vi);
+                let cond = op.arg(0).to_opref();
+                let func = op.arg(1).to_opref();
+                let call_args = &op.getarglist()[2..];
+
+                if has_result {
+                    emit_resolve(&mut sink, constants, value_types, cond);
+                    sink.local_set(value_types.local(vi));
+                }
+                // The predicate is a full word: `i32.wrap_i64` would read a
+                // value whose only set bits are above 32 as NULL and call on a
+                // live one, so the test has to be `i64.eqz`.
+                emit_resolve(&mut sink, constants, value_types, cond);
+                sink.i64_eqz();
+                sink.if_(BlockType::Empty);
+                emit_call_area_addr(&mut sink);
+                emit_resolve(&mut sink, constants, value_types, func);
+                sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+                emit_call_area_addr(&mut sink);
+                sink.i64_const(call_args.len() as i64);
+                sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+                for (i, arg) in call_args.iter().enumerate() {
+                    emit_call_area_addr(&mut sink);
+                    emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
+                }
+                emit_jit_call(&mut sink, jit_call);
+                if has_result {
+                    // Int and Ref are the only result types
+                    // `do_conditional_call` mints this opcode for, so the
+                    // trampoline's word needs no float reinterpretation.
+                    emit_call_area_addr(&mut sink);
+                    sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
+                    sink.local_set(value_types.local(vi));
+                }
+                sink.end();
+                // The call arm can collect, so reload after the `if`; on the
+                // arm that did not call, the slots the reload re-reads are the
+                // ones the stores kept current.
+                if call_can_collect(op) {
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        has_result.then_some(vi),
+                        frame,
+                    );
+                }
+            }
 
             // x86/assembler.py genop_guard_guard_gc_type:
             // GUARD_GC_TYPE: args[0] = object ref, args[1] = expected
@@ -6443,8 +6531,6 @@ fn build_function(
             | OpCode::CallAssemblerN
             | OpCode::CallReleaseGilI
             | OpCode::CallReleaseGilN
-            | OpCode::CondCallValueI
-            | OpCode::CondCallValueR
             | OpCode::CallLoopinvariantI
             | OpCode::CallLoopinvariantR
             | OpCode::CallLoopinvariantN
@@ -6466,6 +6552,16 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 let can_collect = call_can_collect(op);
 
+                // pyjitpl.py `direct_call_release_gil` records CALL_RELEASE_GIL_*
+                // as `[savebox, funcbox] + argboxes[1:]`, so its callee is arg 1
+                // and its own arguments start at 2. Every other CALL keeps the
+                // callee at arg 0.
+                let func_ofs = usize::from(matches!(
+                    op.opcode,
+                    OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN
+                ));
+                let func_ptr_ref = op.arg(func_ofs).to_opref();
+
                 // Direct in-module residual call: skip the `jit_call` host hop and
                 // `call_indirect` the callee's table slot with a static
                 // `(i64×n)->i64` type. The residual ABI is uniformly i64 for
@@ -6476,12 +6572,12 @@ fn build_function(
                 if let (Some(base), Some(nargs)) =
                     (residual_type_base, residual_call_i64_arity(op, constants))
                 {
-                    let call_args = &op.getarglist()[1..];
+                    let call_args = &op.getarglist()[func_ofs + 1..];
                     for arg in call_args {
                         emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     }
                     // func_ptr (arg 0) is the table slot — wrap to i32 index.
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     // call_indirect(table_index, type_index): table 0, type for arity n.
                     sink.call_indirect(0, base + nargs as u32);
@@ -6516,11 +6612,11 @@ fn build_function(
                     // Direct in-module word-ABI void residual call: the callee
                     // really is `(i64×n)->i64` (descr result_size == 8), so use
                     // the i64 family and drop the dummy result.
-                    let call_args = &op.getarglist()[1..];
+                    let call_args = &op.getarglist()[func_ofs + 1..];
                     for arg in call_args {
                         emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     }
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
                     sink.drop();
@@ -6551,7 +6647,7 @@ fn build_function(
                     // Direct in-module typed residual call with the
                     // descr-derived mixed `(i64/f64...) -> i64/f64` signature.
                     let (params, _) = &sig;
-                    let call_args = &op.getarglist()[1..];
+                    let call_args = &op.getarglist()[func_ofs + 1..];
                     debug_assert_eq!(call_args.len(), params.len());
                     for (arg, ty) in call_args.iter().zip(params) {
                         if *ty == ValType::F64 {
@@ -6561,7 +6657,7 @@ fn build_function(
                         }
                     }
                     // func_ptr (arg 0) is the table slot — wrap to i32 index.
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, type_idx);
                     // A void callee leaves nothing on the stack, so there is
@@ -6599,11 +6695,11 @@ fn build_function(
                     // Direct in-module true-void residual call: the callee is
                     // `(i64×n)->()` (descr result_size == 0), so the call has no
                     // result to drop.
-                    let call_args = &op.getarglist()[1..];
+                    let call_args = &op.getarglist()[func_ofs + 1..];
                     for arg in call_args {
                         emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     }
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
                     if can_collect {
@@ -6626,9 +6722,7 @@ fn build_function(
                 } else {
                     let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
 
-                    // args[0] = func_ptr, args[1..] = call arguments
-                    let func_ptr_ref = op.arg(0).to_opref();
-                    let call_args = &op.getarglist()[1..];
+                    let call_args = &op.getarglist()[func_ofs + 1..];
 
                     // Store func_ptr to call area
                     emit_call_area_addr(&mut sink);

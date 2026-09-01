@@ -5828,6 +5828,139 @@ fn interior_field_ops_compile() {
     assert_eq!(shl, 1, "item_size 8 on the RAW store is get_scale 3");
 }
 
+/// Count the operators a test cares about in the one code section entry.
+fn count_operators(bytes: &[u8], mut f: impl FnMut(&wasmparser::Operator<'_>)) {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                f(&operators.read().unwrap());
+            }
+        }
+    }
+}
+
+/// x86/regalloc.py `consider_cond_call`, COND_CALL_VALUE arm: the call happens
+/// when args[0] is 0/NULL, args[1] is the callee, and the result is args[0]
+/// otherwise. Sharing the generic CALL arm called unconditionally through
+/// args[0].
+#[test]
+fn cond_call_value_tests_its_value_and_calls_arg_one() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::CondCallValueI,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::const_int(0x100),
+                OpRef::input_arg_int(1),
+            ],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let (mut eqz, mut ifs) = (0, 0);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Eqz => eqz += 1,
+        wasmparser::Operator::If { .. } => ifs += 1,
+        _ => {}
+    });
+    assert!(eqz >= 1, "COND_CALL_VALUE tests its value with i64.eqz");
+    assert_eq!(ifs, 1, "the call sits under exactly one predicate");
+    assert!(
+        import_func_type(&bytes, "jit_call_compact").is_some(),
+        "COND_CALL_VALUE uses the residual trampoline"
+    );
+}
+
+/// x86/assembler.py `genop_guard_guard_nonnull_class` guards the class compare
+/// with `CMP(ptr, 1)`; sharing the GUARD_CLASS arm let a NULL receiver be
+/// decided by a read of linear-memory address 0, which on wasm does not trap.
+#[test]
+fn guard_nonnull_class_also_tests_for_null() {
+    let build = |opcode: OpCode| {
+        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+        let ops = vec![
+            make_guard(
+                opcode,
+                &[OpRef::input_arg_ref(0), OpRef::const_int(0x55)],
+                &[OpRef::input_arg_ref(0)],
+            ),
+            Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]),
+        ];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        let (mut eqz, mut ors) = (0, 0);
+        count_operators(&bytes, |op| match op {
+            wasmparser::Operator::I64Eqz => eqz += 1,
+            wasmparser::Operator::I32Or => ors += 1,
+            _ => {}
+        });
+        (eqz, ors)
+    };
+    assert_eq!(
+        build(OpCode::GuardClass),
+        (0, 0),
+        "GUARD_CLASS is the class compare alone"
+    );
+    assert_eq!(
+        build(OpCode::GuardNonnullClass),
+        (1, 1),
+        "GUARD_NONNULL_CLASS ors in a null test"
+    );
+}
+
+/// pyjitpl.py `direct_call_release_gil` records `[savebox, funcbox] + args`, so
+/// the callee is arg 1. The shared CALL arm read arg 0 — the `save_err`
+/// immediate — as the callee and passed the real function as the first
+/// argument.
+#[test]
+fn call_release_gil_takes_its_callee_from_arg_one() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let call = make_op(
+        OpCode::CallReleaseGilI,
+        &[
+            OpRef::const_int(0x11),  // save_err
+            OpRef::const_int(0x22),  // the real callee
+            OpRef::input_arg_int(0), // its one argument
+        ],
+        OpRef::int_op(1),
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0x5100_0000,
+        vec![Type::Int],
+        Type::Int,
+        true,
+        8,
+        EffectInfo::default(),
+    )));
+    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let mut nargs_consts = Vec::new();
+    count_operators(&bytes, |op| {
+        if let wasmparser::Operator::I64Const { value } = op {
+            nargs_consts.push(*value);
+        }
+    });
+    assert!(
+        nargs_consts.contains(&0x22),
+        "the callee stored to the call area is arg 1"
+    );
+    assert!(
+        nargs_consts.contains(&1),
+        "one call argument, not two: {nargs_consts:?}"
+    );
+}
+
 /// `genop_discard_cond_call`: CondCallN is a real conditional call, not a no-op.
 #[test]
 fn cond_call_n_emits_predicate_and_trampoline() {
@@ -5849,20 +5982,12 @@ fn cond_call_n_emits_predicate_and_trampoline() {
     ];
     let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
     validate_wasm(&bytes);
-    let mut eqz = 0;
-    let mut ifs = 0;
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
-        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
-            let mut operators = body.get_operators_reader().unwrap();
-            while !operators.eof() {
-                match operators.read().unwrap() {
-                    wasmparser::Operator::I64Eqz => eqz += 1,
-                    wasmparser::Operator::If { .. } => ifs += 1,
-                    _ => {}
-                }
-            }
-        }
-    }
+    let (mut eqz, mut ifs) = (0, 0);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Eqz => eqz += 1,
+        wasmparser::Operator::If { .. } => ifs += 1,
+        _ => {}
+    });
     assert!(eqz >= 1, "CondCallN tests the predicate with i64.eqz");
     assert!(ifs >= 1, "CondCallN wraps the call in an if");
     assert!(
