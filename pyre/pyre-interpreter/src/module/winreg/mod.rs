@@ -85,7 +85,8 @@ mod imp {
     use majit_rlib::rbigint::RBigInt as BigInt;
     use pyre_object::*;
     use rustpython_host_env::winreg::{self as host_reg, HKEY};
-    use widestring::WideCString;
+    use rustpython_wtf8::{Wtf8, Wtf8Buf};
+    use widestring::{WideCStr, WideCString};
 
     /// A raw handle/pointer value → a Python int (`PyLong_FromVoidPtr`).  The
     /// predefined roots sign-extend past `i64::MAX` on 64-bit, so route those
@@ -352,29 +353,48 @@ mod imp {
         obj: PyObjectRef,
         func: &str,
         label: &str,
-    ) -> Result<Option<String>, crate::PyError> {
+    ) -> Result<Option<&'static Wtf8>, crate::PyError> {
         if unsafe { is_none(obj) } {
             return Ok(None);
         }
         if unsafe { is_str(obj) } {
-            return Ok(Some(unsafe { w_str_get_value(obj) }.to_string()));
+            return Ok(Some(unsafe { w_str_get_wtf8(obj) }));
         }
         Err(text_arg_error(func, label, true, obj))
     }
 
     /// `Py_UNICODE` — the same argument where `None` is not one of the
     /// answers.
-    fn req_text(obj: PyObjectRef, func: &str, label: &str) -> Result<String, crate::PyError> {
+    fn req_text(
+        obj: PyObjectRef,
+        func: &str,
+        label: &str,
+    ) -> Result<&'static Wtf8, crate::PyError> {
         if unsafe { is_str(obj) } {
-            return Ok(unsafe { w_str_get_value(obj) }.to_string());
+            return Ok(unsafe { w_str_get_wtf8(obj) });
         }
         Err(text_arg_error(func, label, false, obj))
     }
 
+    /// `PyUnicode_AsWideCharString` — a text argument as the terminated
+    /// UTF-16 a Win32 `W` call reads.
+    ///
+    /// The registry is UTF-16 native, so an unpaired surrogate is a code unit
+    /// like any other in a key or value name: the text is read as WTF-8, and
+    /// `encode_wide` hands every code point straight to its own units, which
+    /// is what carries such a surrogate across unchanged.  A NUL is the one
+    /// unit that cannot travel, because the terminator is what marks the end;
+    /// the size-less `PyUnicode_AsWideCharString` the clinic's `Py_UNICODE`
+    /// converter calls refuses it rather than truncating there.
+    fn wide(text: &Wtf8) -> Result<WideCString, crate::PyError> {
+        WideCString::from_vec(text.encode_wide().collect::<Vec<u16>>())
+            .map_err(|_| crate::PyError::value_error("embedded null character"))
+    }
+
     /// The name a sub-key argument spells; absent and `None` both mean the key
     /// itself, which the Win32 calls take as the empty name.
-    fn wide_or_empty(text: Option<String>) -> WideCString {
-        WideCString::from_str_truncate(text.as_deref().unwrap_or(""))
+    fn wide_or_empty(text: Option<&Wtf8>) -> Result<WideCString, crate::PyError> {
+        wide(text.unwrap_or_default())
     }
 
     // The four wordings `longobject.c` gives a value outside an unsigned
@@ -491,7 +511,7 @@ mod imp {
             host_reg::REG_SZ | host_reg::REG_EXPAND_SZ => {
                 let units = utf16_units(data);
                 let end = units.iter().position(|&c| c == 0).unwrap_or(units.len());
-                w_str_new(&String::from_utf16_lossy(&units[..end]))
+                w_str_from_wtf8(Wtf8Buf::from_wide(&units[..end]))
             }
             host_reg::REG_MULTI_SZ => {
                 // `countStrings`/`fixupMultiSZ` — one trailing terminator ends
@@ -511,7 +531,7 @@ mod imp {
                     while stop < end && units[stop] != 0 {
                         stop += 1;
                     }
-                    items.push(w_str_new(&String::from_utf16_lossy(&units[start..stop])));
+                    items.push(w_str_from_wtf8(Wtf8Buf::from_wide(&units[start..stop])));
                     start = stop + 1;
                 }
                 w_list_new(items)
@@ -526,8 +546,8 @@ mod imp {
         }
     }
 
-    fn encode_utf16z(s: &str) -> Vec<u8> {
-        let mut units: Vec<u16> = s.encode_utf16().collect();
+    fn encode_utf16z(text: &Wtf8) -> Vec<u8> {
+        let mut units: Vec<u16> = text.encode_wide().collect();
         units.push(0);
         units.iter().flat_map(|u| u.to_le_bytes()).collect()
     }
@@ -583,7 +603,7 @@ mod imp {
                 if unsafe { !is_str(value) } {
                     return Err(Py2RegError::Unconvertible);
                 }
-                Ok(encode_utf16z(unsafe { w_str_get_value(value) }))
+                Ok(encode_utf16z(unsafe { w_str_get_wtf8(value) }))
             }
             host_reg::REG_MULTI_SZ => {
                 let len = if unsafe { is_none(value) } {
@@ -600,7 +620,7 @@ mod imp {
                     if unsafe { !is_str(item) } {
                         return Err(Py2RegError::Unconvertible);
                     }
-                    let units: Vec<u16> = unsafe { w_str_get_value(item) }.encode_utf16().collect();
+                    let units: Vec<u16> = unsafe { w_str_get_wtf8(item) }.encode_wide().collect();
                     out.extend(units.iter().flat_map(|u| u.to_le_bytes()));
                     out.extend_from_slice(&[0, 0]);
                 }
@@ -631,18 +651,18 @@ mod imp {
     fn open_key_named(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
         let bound = bind_key_args(args, name, ["key", "sub_key", "reserved", "access"])?;
         let key = as_hkey(bound[0].expect("key is required"), false)?;
-        let wide = wide_or_empty(opt_text(
+        let wide_sub = wide_or_empty(opt_text(
             bound[1].expect("sub_key is required"),
             name,
             "'sub_key'",
-        )?);
+        )?)?;
         let reserved = bound[2].map(int_arg).transpose()?.unwrap_or(0) as u32;
         let access = bound[3]
             .map(dword_arg)
             .transpose()?
             .unwrap_or(host_reg::KEY_READ);
         let mut out: HKEY = core::ptr::null_mut();
-        let rc = unsafe { host_reg::open_key_ex(key, &wide, reserved, access, &mut out) };
+        let rc = unsafe { host_reg::open_key_ex(key, &wide_sub, reserved, access, &mut out) };
         if rc != 0 {
             return Err(win_err(rc));
         }
@@ -666,11 +686,11 @@ mod imp {
             ["key", "sub_key", "reserved", "access"],
         )?;
         let key = as_hkey(bound[0].expect("key is required"), false)?;
-        let wide = wide_or_empty(opt_text(
+        let wide_sub = wide_or_empty(opt_text(
             bound[1].expect("sub_key is required"),
             "CreateKeyEx",
             "'sub_key'",
-        )?);
+        )?)?;
         let reserved = bound[2].map(int_arg).transpose()?.unwrap_or(0) as u32;
         let access = bound[3]
             .map(dword_arg)
@@ -680,7 +700,7 @@ mod imp {
         let rc = unsafe {
             host_reg::create_key_ex(
                 key,
-                &wide,
+                &wide_sub,
                 reserved,
                 core::ptr::null_mut(),
                 host_reg::REG_OPTION_NON_VOLATILE,
@@ -715,8 +735,7 @@ mod imp {
             .transpose()?
             .unwrap_or(host_reg::KEY_WOW64_64KEY);
         let reserved = bound[3].map(int_arg).transpose()?.unwrap_or(0) as u32;
-        let wide = WideCString::from_str_truncate(&sub_key);
-        check(unsafe { host_reg::delete_key_ex(key, &wide, access, reserved) })
+        check(unsafe { host_reg::delete_key_ex(key, &wide(sub_key)?, access, reserved) })
     }
 
     fn load_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -727,17 +746,14 @@ mod imp {
         let key = as_hkey(pos[0], false)?;
         let sub_key = req_text(pos[1], "LoadKey", "2")?;
         let file_name = req_text(pos[2], "LoadKey", "3")?;
-        let wide_sub = WideCString::from_str_truncate(&sub_key);
-        let wide_file = WideCString::from_str_truncate(&file_name);
-        check(unsafe { host_reg::load_key(key, &wide_sub, &wide_file) })
+        check(unsafe { host_reg::load_key(key, &wide(sub_key)?, &wide(file_name)?) })
     }
 
     fn save_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let pos = exact_args(args, "SaveKey", 2)?;
         let key = as_hkey(pos[0], false)?;
         let file_name = req_text(pos[1], "SaveKey", "2")?;
-        let wide = WideCString::from_str_truncate(&file_name);
-        check(unsafe { host_reg::save_key(key, &wide) })
+        check(unsafe { host_reg::save_key(key, &wide(file_name)?) })
     }
 
     fn close_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -755,26 +771,86 @@ mod imp {
         Ok(w_none())
     }
 
+    /// `winreg_QueryValue_impl` — the key's unnamed value, read as text.
+    ///
+    /// `host_reg::query_default_value` answers a `String`, so a `REG_SZ` whose
+    /// units hold an unpaired surrogate has no spelling it can give back; the
+    /// units are read here instead and carried across as themselves
+    /// (`PyUnicode_FromWideChar`).
+    fn query_default_value(key: HKEY, sub_key: &WideCStr) -> Result<Wtf8Buf, crate::PyError> {
+        use windows_sys::Win32::Foundation::{
+            ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_MORE_DATA,
+        };
+        // The performance data root answers no default value, and the refusal
+        // is spelled here rather than left to the registry.
+        if key == host_reg::HKEY_PERFORMANCE_DATA {
+            return Err(win_err(ERROR_INVALID_HANDLE));
+        }
+        // An absent or empty sub-key names the key itself; anything else is
+        // opened for the read and closed again after it.
+        let child_key = if sub_key.is_empty() {
+            None
+        } else {
+            let mut out: HKEY = core::ptr::null_mut();
+            let rc = unsafe {
+                host_reg::open_key_ex(key, sub_key, 0, host_reg::KEY_QUERY_VALUE, &mut out)
+            };
+            if rc != 0 {
+                return Err(win_err(rc));
+            }
+            Some(out)
+        };
+        let target = child_key.unwrap_or(key);
+        // `WCHAR buf[256]`, whose byte size is what the first call is given.
+        let mut buffer = vec![0u8; 256 * size_of::<u16>()];
+        let mut typ = 0u32;
+        let result = loop {
+            let mut size = buffer.len() as u32;
+            let rc = unsafe {
+                host_reg::query_value_ex(target, None, &mut typ, buffer.as_mut_ptr(), &mut size)
+            };
+            if rc == ERROR_MORE_DATA {
+                // The failed call reports the size it wanted, so the retry
+                // asks for exactly that.
+                buffer.resize(size as usize, 0);
+                continue;
+            }
+            // A key with no unnamed value reads back as the empty string
+            // rather than as the error the call reports for it.
+            if rc == ERROR_FILE_NOT_FOUND {
+                break Ok(Wtf8Buf::new());
+            }
+            if rc != 0 {
+                break Err(win_err(rc));
+            }
+            if typ != host_reg::REG_SZ {
+                break Err(win_err(ERROR_INVALID_DATA));
+            }
+            let units = utf16_units(&buffer[..size as usize]);
+            let end = units
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(units.len());
+            break Ok(Wtf8Buf::from_wide(&units[..end]));
+        };
+        if let Some(child) = child_key {
+            host_reg::close_key(child);
+        }
+        result
+    }
+
     fn query_value(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        use rustpython_host_env::winreg::QueryStringError;
         let pos = exact_args(args, "QueryValue", 2)?;
         let key = as_hkey(pos[0], false)?;
-        let sub_key = opt_text(pos[1], "QueryValue", "2")?;
-        let wide_sub = sub_key.as_deref().map(WideCString::from_str_truncate);
-        match host_reg::query_default_value(key, wide_sub.as_deref()) {
-            Ok(value) => Ok(w_str_new(&value)),
-            Err(QueryStringError::Code(code)) => Err(win_err(code)),
-            Err(QueryStringError::Utf16(_)) => Err(crate::PyError::value_error(
-                "registry value is not valid UTF-16",
-            )),
-        }
+        let wide_sub = wide_or_empty(opt_text(pos[1], "QueryValue", "2")?)?;
+        Ok(w_str_from_wtf8(query_default_value(key, &wide_sub)?))
     }
 
     fn query_value_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let pos = exact_args(args, "QueryValueEx", 2)?;
         let key = as_hkey(pos[0], false)?;
-        let name = opt_text(pos[1], "QueryValueEx", "2")?.unwrap_or_default();
-        match host_reg::query_value_bytes(key, &WideCString::from_str_truncate(&name)) {
+        let name = wide_or_empty(opt_text(pos[1], "QueryValueEx", "2")?)?;
+        match host_reg::query_value_bytes(key, &name) {
             Ok((data, typ)) => Ok(w_tuple_new(vec![reg2py(&data, typ), w_int_new(typ as i64)])),
             Err(code) => Err(win_err(code)),
         }
@@ -791,9 +867,7 @@ mod imp {
         if rc != 0 {
             return Err(win_err(rc));
         }
-        Ok(w_str_new(&String::from_utf16_lossy(
-            &buffer[..len as usize],
-        )))
+        Ok(w_str_from_wtf8(Wtf8Buf::from_wide(&buffer[..len as usize])))
     }
 
     fn enum_value(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -856,9 +930,8 @@ mod imp {
                 .iter()
                 .position(|&unit| unit == 0)
                 .unwrap_or(name.len());
-            let name_s = String::from_utf16_lossy(&name[..end]);
             return Ok(w_tuple_new(vec![
-                w_str_new(&name_s),
+                w_str_from_wtf8(Wtf8Buf::from_wide(&name[..end])),
                 reg2py(&data[..data_len as usize], typ),
                 w_int_new(typ as i64),
             ]));
@@ -887,9 +960,9 @@ mod imp {
     fn create_key(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let pos = exact_args(args, "CreateKey", 2)?;
         let key = as_hkey(pos[0], false)?;
-        let wide = wide_or_empty(opt_text(pos[1], "CreateKey", "2")?);
+        let wide_sub = wide_or_empty(opt_text(pos[1], "CreateKey", "2")?)?;
         let mut out: HKEY = core::ptr::null_mut();
-        let rc = unsafe { host_reg::create_key(key, &wide, &mut out) };
+        let rc = unsafe { host_reg::create_key(key, &wide_sub, &mut out) };
         if rc != 0 {
             return Err(win_err(rc));
         }
@@ -899,20 +972,32 @@ mod imp {
     fn set_value(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // SetValue only writes REG_SZ, and the type is read before it is
         // judged, so a non-integer is an integer's complaint rather than the
-        // wrong-type one.
+        // wrong-type one.  Every argument is spelled before any of them is
+        // judged, though, so a `value` that is no string is that argument's
+        // complaint even when the type is wrong too.
         let pos = exact_args(args, "SetValue", 4)?;
         let key = as_hkey(pos[0], false)?;
-        let sub_key = opt_text(pos[1], "SetValue", "2")?.unwrap_or_default();
+        let sub_key = wide_or_empty(opt_text(pos[1], "SetValue", "2")?)?;
         let typ = dword_arg(pos[2])?;
+        let value = req_text(pos[3], "SetValue", "4")?;
         if typ != host_reg::REG_SZ {
             return Err(crate::PyError::type_error("type must be winreg.REG_SZ"));
         }
-        let value = req_text(pos[3], "SetValue", "4")?;
+        // `(length + 1) * sizeof(WCHAR)` — the stored `REG_SZ` carries its
+        // terminator, and the byte count has to fit a `DWORD`.
+        let units: Vec<u16> = value.encode_wide().chain(std::iter::once(0)).collect();
+        if u32::try_from(units.len() * size_of::<u16>()).is_err() {
+            return Err(crate::PyError::overflow_error("value is too long"));
+        }
+        if key == host_reg::HKEY_PERFORMANCE_DATA {
+            use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+            return Err(win_err(ERROR_INVALID_HANDLE));
+        }
         check(host_reg::set_default_value(
             key,
-            &WideCString::from_str_truncate(&sub_key),
+            &sub_key,
             typ,
-            &widestring::WideString::from_str(&value),
+            &widestring::WideString::from_vec(units),
         ))
     }
 
@@ -929,7 +1014,7 @@ mod imp {
                 crate::PyError::value_error("Could not convert the data to the specified type.")
             }
         })?;
-        let wide_name = name.as_deref().map(WideCString::from_str_truncate);
+        let wide_name = name.map(wide).transpose()?;
         let rc = unsafe {
             host_reg::set_value_ex(
                 key,
@@ -949,15 +1034,14 @@ mod imp {
         let pos = exact_args(args, "DeleteKey", 2)?;
         let key = as_hkey(pos[0], false)?;
         let sub_key = req_text(pos[1], "DeleteKey", "2")?;
-        let wide = WideCString::from_str_truncate(&sub_key);
-        check(unsafe { host_reg::delete_key(key, &wide) })
+        check(unsafe { host_reg::delete_key(key, &wide(sub_key)?) })
     }
 
     fn delete_value(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let pos = exact_args(args, "DeleteValue", 2)?;
         let key = as_hkey(pos[0], false)?;
         let name = opt_text(pos[1], "DeleteValue", "2")?;
-        let wide_name = name.as_deref().map(WideCString::from_str_truncate);
+        let wide_name = name.map(wide).transpose()?;
         check(unsafe { host_reg::delete_value(key, wide_name.as_deref()) })
     }
 
@@ -965,17 +1049,39 @@ mod imp {
         let pos = exact_args(args, "ConnectRegistry", 2)?;
         let computer = opt_text(pos[0], "ConnectRegistry", "1")?;
         let key = as_hkey(pos[1], false)?;
-        let wide = computer.as_deref().map(WideCString::from_str_truncate);
+        let wide_computer = computer.map(wide).transpose()?;
         let mut out: HKEY = core::ptr::null_mut();
-        let rc = unsafe { host_reg::connect_registry(wide.as_deref(), key, &mut out) };
+        let rc = unsafe { host_reg::connect_registry(wide_computer.as_deref(), key, &mut out) };
         if rc != 0 {
             return Err(win_err(rc));
         }
         Ok(make_pyhkey(out))
     }
 
+    /// `ExpandEnvironmentStringsW`, twice: the first call reports the size the
+    /// second one writes into.  `None` is the call having failed, which the
+    /// caller spells with the code the system left behind.
+    ///
+    /// `host_reg::expand_environment_strings` answers a `String`, so an
+    /// expansion holding an unpaired surrogate has no spelling it can give
+    /// back; the units are read here instead and carried across as themselves
+    /// (`PyUnicode_FromWideChar`).
+    fn expand_environment_strings_wide(input: &WideCStr) -> Option<Wtf8Buf> {
+        use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
+        let size = unsafe { ExpandEnvironmentStringsW(input.as_ptr(), core::ptr::null_mut(), 0) };
+        if size == 0 {
+            return None;
+        }
+        let mut out = vec![0u16; size as usize];
+        let written = unsafe { ExpandEnvironmentStringsW(input.as_ptr(), out.as_mut_ptr(), size) };
+        if written == 0 {
+            return None;
+        }
+        let end = out.iter().position(|&unit| unit == 0).unwrap_or(out.len());
+        Some(Wtf8Buf::from_wide(&out[..end]))
+    }
+
     fn expand_environment_strings(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        use rustpython_host_env::winreg::ExpandEnvironmentStringsError;
         // The only boundary whose refusal names neither a parameter nor a
         // position, because it has just the one argument.
         let input = req_text(
@@ -983,13 +1089,10 @@ mod imp {
             "ExpandEnvironmentStrings",
             "",
         )?;
-        match host_reg::expand_environment_strings(&WideCString::from_str_truncate(&input)) {
-            Ok(value) => Ok(w_str_new(&value)),
-            Err(ExpandEnvironmentStringsError::Os) => Err(win_err(
+        match expand_environment_strings_wide(&wide(input)?) {
+            Some(value) => Ok(w_str_from_wtf8(value)),
+            None => Err(win_err(
                 std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32,
-            )),
-            Err(ExpandEnvironmentStringsError::Utf16(_)) => Err(crate::PyError::value_error(
-                "expanded value is not valid UTF-16",
             )),
         }
     }
