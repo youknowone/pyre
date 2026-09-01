@@ -99,7 +99,7 @@ pub struct PipelineConfig {
     pub register_trait_families: Vec<String>,
     /// Graphs seeded into the `find_all_graphs` BFS beside the portals.
     ///
-    /// `call.py:59-64` seeds `support.inline_calls_to`: helper graphs the
+    /// `call.py` seeds `support.inline_calls_to`: helper graphs the
     /// portal never calls in source because the codewriter lowers an
     /// operation straight to a residual call of that helper.  A host that
     /// lowers an opcode to a residual the same way names the residual's

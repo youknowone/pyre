@@ -9424,7 +9424,7 @@ where
                     self.replace_box(ctx, opref, const_ref, Type::Float);
                 }
             }
-            // pyjitpl.py:1518-1524 opimpl_guard_class:
+            // pyjitpl.py opimpl_guard_class:
             //     clsbox = self.cls_of_box(box)
             //     if not self.metainterp.heapcache.is_class_known(box):
             //         self.metainterp.generate_guard(rop.GUARD_CLASS, box, clsbox,

@@ -607,9 +607,9 @@ pub const BC_ASSERT_NOT_NONE: u8 = 200;
 // `blackhole.py @arguments("r", "i")`.
 pub const BC_RECORD_EXACT_CLASS: u8 = 201;
 
-// `guard_class/r>i` and `guard_class/r>r` — RPython `blackhole.py:1558-1560`
+// `guard_class/r>i` and `guard_class/r>r` — RPython `blackhole.py`
 // `bhimpl_guard_class(cpu, struct): return cpu.bh_classof(struct)`, emitted
-// by `jtransform.py:1004-1010 handle_getfield_typeptr` for every read of the
+// by `jtransform.py handle_getfield_typeptr` for every read of the
 // object header's class word.  Upstream's result is `Ptr(OBJECT_VTABLE)`;
 // pyre's `PyObject.ob_type` is read as a raw word in some graphs and as a
 // GC ref in others, and the guard keeps the bank of the read it replaced.
@@ -1089,7 +1089,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // constant int class pointer as a ConstPtr before recording.
     m.insert("assert_not_none/r", BC_ASSERT_NOT_NONE);
     m.insert("record_exact_class/ri", BC_RECORD_EXACT_CLASS);
-    // `guard_class` — `blackhole.py:1558-1560`; see `BC_GUARD_CLASS`.
+    // `guard_class` — `blackhole.py bhimpl_guard_class`; see `BC_GUARD_CLASS`.
     m.insert("guard_class/r>i", BC_GUARD_CLASS);
     m.insert("guard_class/r>r", BC_GUARD_CLASS_R);
 

@@ -523,7 +523,7 @@ enum RewriteResult {
     Keep,
 }
 
-/// `jtransform.py:952-954 is_typeptr_getset`: the access names the class
+/// `jtransform.py is_typeptr_getset`: the access names the class
 /// word of the object header.  Upstream keys on the field name `typeptr`
 /// and the struct's `typeptr` hint; pyre's header is `PyObject { ob_type,
 /// w_class }`, and only the `ob_type` word is the class the tracer guards on
@@ -3041,8 +3041,8 @@ impl<'a> Transformer<'a> {
             // `rtype_bool` per repr for the un-rtyped `bool` hop that
             // `FunctionGraph::set_branch` puts before every exitswitch:
             // `BoolRepr` is the identity, `IntegerRepr.rtype_bool` is
-            // `int_is_true` (`rint.py:200-205`), a nullable `PtrRepr` is
-            // `ptr_nonzero` (`rmodel.py:251-260`).  Naming the op here, ahead
+            // `int_is_true` (`rint.py`), a nullable `PtrRepr` is
+            // `ptr_nonzero` (`rmodel.py`).  Naming the op here, ahead
             // of `optimize_goto_if_not`, is what lets the fusion see it: that
             // gate matches opnames, and `bool` is not one of them.  The
             // identity arm is what fuses an `is_null` test -- its `ptr_iszero`
@@ -3842,7 +3842,7 @@ impl<'a> Transformer<'a> {
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        // `jtransform.py:833-834 if self.is_typeptr_getset(op): return
+        // jtransform.py `if self.is_typeptr_getset(op): return
         // self.handle_getfield_typeptr(op)` — checked before anything else,
         // as upstream does.  Upstream also folds a Constant receiver to its
         // class constant; pyre's receivers here are SSA variables (a prebuilt
@@ -3855,7 +3855,7 @@ impl<'a> Transformer<'a> {
                 function: graph_name.to_string(),
                 detail: format!("rewrite: getfield({}) → guard_class", field.name),
             });
-            // `jtransform.py:1008-1010`: `-live-` first, the guard is a
+            // `jtransform.py handle_getfield_typeptr`: `-live-` first, the guard is a
             // resume point.
             return RewriteResult::Replace(vec![
                 SpaceOperation {

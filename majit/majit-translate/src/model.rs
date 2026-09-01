@@ -1106,7 +1106,7 @@ pub enum OpKind {
         /// `codewriter/jtransform.py:611`.
         kind_char: char,
     },
-    /// `jtransform.py:1004-1010 handle_getfield_typeptr` — a read of the
+    /// `jtransform.py handle_getfield_typeptr` — a read of the
     /// object header's class word is not a load but a `guard_class`: the
     /// tracer pins the receiver's class and the op's result is that class
     /// as a constant, which is what lets every `isinstance`-shaped test

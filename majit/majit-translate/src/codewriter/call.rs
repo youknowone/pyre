@@ -1218,7 +1218,7 @@ pub struct CallControl {
     /// RPython: `CallControl.candidate_graphs`.
     candidate_graphs: HashSet<CallPath>,
     /// `PipelineConfig::helper_graphs` — host-declared BFS seeds beside the
-    /// portals (`call.py:59-64 inline_calls_to`).
+    /// portals (`call.py inline_calls_to`).
     helper_seed_graphs: Vec<CallPath>,
 
     /// RPython: `JitDriverStaticData` — metadata for each jitdriver.
@@ -3129,7 +3129,7 @@ impl CallControl {
     /// `fnaddr_for_target()` no longer fall back to symbolic hashes.
     /// Seed `path` into the `find_all_graphs` BFS beside the portals.
     ///
-    /// `call.py:59-64` seeds the `inline_calls_to` helper graphs because the
+    /// `call.py` seeds the `inline_calls_to` helper graphs because the
     /// codewriter lowers an operation straight to a residual call of the
     /// helper, so no graph calls it in source.  A host lowering an opcode to
     /// a residual the same way names the residual's body here; the seed is a
