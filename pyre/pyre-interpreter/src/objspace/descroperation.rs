@@ -5679,6 +5679,50 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     }
 }
 
+/// The `CompareOp` a jitcode integer operand names.
+///
+/// A fieldless enum argument is lowered as its discriminant, so the decode
+/// has to read the discriminant rather than a hand-written table that happens
+/// to agree with today's declaration order — a variant inserted in the middle
+/// would renumber every later one and the table would keep answering the old
+/// meaning. Searching [`CompareOp::ALL`] by `op as i64` asks the compiler for
+/// the number it actually assigned, so the two sides cannot drift.
+fn compare_op_from_discriminant(value: i64) -> Option<CompareOp> {
+    CompareOp::ALL
+        .iter()
+        .copied()
+        .find(|op| *op as i64 == value)
+}
+
+/// One-word residual-call ABI for [`compare_slot`].
+///
+/// `compare_slot` itself is `(PyObjectRef, PyObjectRef, CompareOp) -> PyResult`,
+/// and neither end of that signature fits the residual-call ABI: `PyError` is
+/// far wider than a register so `Result<PyObjectRef, PyError>` returns through
+/// an sret pointer, and `CompareOp` is not a `ResidualSlot`. Publishing the
+/// raw address would pass one register where the callee reads a hidden return
+/// slot. `jit_fnaddr.rs`'s publication helpers reject both by their bounds.
+///
+/// The trace calls this as `(r, r, i) -> r`:
+/// `declared_result_type_for_target` projects a callee's `Result<T, PyError>`
+/// through the transparent `Ok` unwrap and the error travels out of band, the
+/// same shape `runtime_ops::call_callable_with_args` publishes. An operand
+/// outside the enum's discriminants cannot come from a correct lowering; it
+/// takes the same route `call_jit.rs` takes for an unknown compare tag — a
+/// published `TypeError` and the null sentinel, so a `GUARD_NO_EXCEPTION`
+/// fires instead of a silently wrong comparison.
+pub extern "C" fn compare_slot_jit_abi(a: i64, b: i64, op: i64) -> i64 {
+    let Some(op) = compare_op_from_discriminant(op) else {
+        return crate::runtime_ops::jit_publish_residual_error(PyError::type_error(format!(
+            "unknown compare op discriminant {op}"
+        )));
+    };
+    match compare_slot(a as PyObjectRef, b as PyObjectRef, op) {
+        Ok(result) => result as i64,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
+}
+
 /// Comparison operator enum (mirrors RustPython's ComparisonOperator).
 #[derive(Debug, Clone, Copy)]
 pub enum CompareOp {
@@ -5691,6 +5735,20 @@ pub enum CompareOp {
 }
 
 impl CompareOp {
+    /// Every variant, in declaration order.
+    ///
+    /// `compare_op_from_discriminant` searches this rather than indexing it,
+    /// so the array is a set of variants to consider and not a position table:
+    /// reordering it cannot change which integer decodes to which operator.
+    pub const ALL: [CompareOp; 6] = [
+        CompareOp::Lt,
+        CompareOp::Le,
+        CompareOp::Gt,
+        CompareOp::Ge,
+        CompareOp::Eq,
+        CompareOp::Ne,
+    ];
+
     /// The Python operator symbol (`<`, `<=`, `>`, `>=`, `==`, `!=`) used in
     /// the "not supported between instances of" TypeError message.
     pub fn symbol(self) -> &'static str {

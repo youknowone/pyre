@@ -289,6 +289,15 @@ fn upa3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
 }
 
 #[inline]
+fn cp3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: extern "C" fn(A1, A2, A3) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
 fn cpa3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
     entries: &mut Vec<(&'static str, i64)>,
     module_path: &'static str,
@@ -2244,6 +2253,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::pycode::w_code_const",
         crate::pycode::w_code_const,
+    );
+    // `compare` residualizes its `compare_slot` tail: the slot body reads two
+    // `&[u8]` through `core::slice::cmp`, which has no LLBC, so the source lift
+    // fails and the whole callee becomes a residual. What was missing is only
+    // the address — the callee keeps its graph, and with it a real EffectInfo,
+    // so it must NOT be given `dont_look_inside` (a graphless callee gets an
+    // empty rather than a top EffectInfo, and the heap optimizer would then
+    // keep cached fields across a comparison that can run user `__eq__`).
+    // The published address is the word-ABI bridge, not `compare_slot` itself;
+    // see `compare_slot_jit_abi` for why the raw signature cannot be a row.
+    cp3(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::compare_slot",
+        crate::objspace::descroperation::compare_slot_jit_abi,
     );
     // Truncated `_divrem` projections used by Rust operator shims.
     cp2(
