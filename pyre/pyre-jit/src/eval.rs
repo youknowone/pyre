@@ -4773,23 +4773,22 @@ fn build_gc() -> Box<MiniMarkGC> {
     deque_lock_descr.gc_type_id.set(deque_lock_tid);
 
     // ── GC-root registration completeness oracle ─────────────────────────
-    // Every `#[pyre_class]` type appends its descriptor to the whole-program
-    // `PYRE_CLASS_DESCRIPTORS` slice. A type with inline managed children must
+    // Every `#[pyre_class]` type registers its descriptor into the
+    // whole-program registry. A type with inline managed children must
     // be reachable by either its marker layout or the immortal-root offset
     // registry. Run the oracle only after the absolute-tail registrations so
     // hidden non-vtable GcStructs such as WeakrefLifeline are included too.
-    #[cfg(not(target_arch = "wasm32"))]
     {
         let mut unregistered: Vec<&'static str> = Vec::new();
-        for descr in pyre_object::lltype::PYRE_CLASS_DESCRIPTORS {
+        pyre_object::lltype::for_each_class_descriptor(|descr| {
             if descr.ptr_offsets.is_empty() {
-                continue;
+                return;
             }
             let in_offset_registry =
                 unsafe { pyre_object::gc_hook::offsets_for_pytype(descr.pytype_ptr) }
                     .is_some_and(|o| !o.is_empty());
             if in_offset_registry {
-                continue;
+                return;
             }
             let tid = descr.gc_type_id.get();
             let marker_traced = tid != pyre_object::lltype::TypeIdCell::UNASSIGNED
@@ -4805,7 +4804,7 @@ fn build_gc() -> Box<MiniMarkGC> {
             if !marker_traced {
                 unregistered.push(descr.pyname);
             }
-        }
+        });
         assert!(
             unregistered.is_empty(),
             "GC-root registration gap: #[pyre_class] type(s) with managed \

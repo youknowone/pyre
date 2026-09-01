@@ -142,3 +142,10 @@ cc = "1.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# `type_object()` accessors publish their residual-call address through a
+# `linkme` link section off wasm32.  wasm32 rejects that section — a custom
+# `link_section` static there must be a plain byte list, and a descriptor
+# holds two pointers — so the accessors register from a constructor instead.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ctor = { workspace = true }

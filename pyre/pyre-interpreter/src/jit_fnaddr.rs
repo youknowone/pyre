@@ -801,24 +801,25 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         push_abi_unsound_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
     }
 
-    // `#[pyre_methods]` `type_object()` accessors are `dont_look_inside`
-    // (`majit-translate` `front::llbc_hints` stamps them: the JIT residualizes
-    // the `OnceLock` body rather than lifting its unliftable `CELL` read), so
-    // each residual call needs the accessor's runtime address.  The macro
-    // registers every `(path, fn)` into this link-time slice; iterate it
-    // instead of hand-listing ~46 module-qualified paths (which mis-resolve
-    // inline-mod spellings and miss per-module `cfg` gates).  Register the
-    // crate-stripped alias too, so either spelling of the residual
-    // `FunctionPath` resolves.  The descriptor carries the accessor as a
-    // `fn() -> PyObjectRef` rather than an address, so `p0` checks it the same
-    // way it checks a hand-written publication.
-    #[cfg(not(target_arch = "wasm32"))]
-    for desc in pyre_object::lltype::PYRE_TYPE_OBJECT_FNADDRS {
-        p0(&mut entries, desc.path, desc.func);
-        if let Some((_crate_seg, rest)) = desc.path.split_once("::") {
-            p0(&mut entries, rest, desc.func);
+    // `type_object()` accessors are `dont_look_inside` (`majit-translate`
+    // `front::llbc_hints` stamps them: the JIT residualizes the `OnceLock` body
+    // rather than lifting its unliftable `CELL` read), so each residual call
+    // needs the accessor's runtime address.  Every accessor registers its
+    // `(path, fn)` through `register_type_object_fnaddr!`; iterate that
+    // registry instead of hand-listing ~46 module-qualified paths (which
+    // mis-resolve inline-mod spellings and miss per-module `cfg` gates).  The
+    // registry covers every target, because the stamp does: an accessor the
+    // front residualizes but this loop never publishes leaves the residual
+    // holding a symbolic fnaddr.  Register the crate-stripped alias too, so
+    // either spelling of the residual `FunctionPath` resolves.  The descriptor
+    // carries the accessor as a `fn() -> PyObjectRef` rather than an address,
+    // so `p0` checks it the same way it checks a hand-written publication.
+    pyre_object::lltype::for_each_type_object_fnaddr(|path, func| {
+        p0(&mut entries, path, func);
+        if let Some((_crate_seg, rest)) = path.split_once("::") {
+            p0(&mut entries, rest, func);
         }
-    }
+    });
 
     cpa2(
         &mut entries,
@@ -4355,26 +4356,17 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
 /// fully-qualified Rust path the flowgraph names the global read with
 /// (`PyreClassDescriptor::pytype_path`).
 ///
-/// Empty on `wasm32`, where the `PYRE_CLASS_DESCRIPTORS` registry does not
-/// exist (`linkme::distributed_slice` rejects the target).  That makes the
-/// binding set target-dependent, so `pyre-jit-trace`'s build script drops
-/// these rows when it is generating jitcodes *for* wasm: a name bound at
-/// build time but missing from the runtime pool keeps the build-process
-/// address baked in the constant pool, because
+/// Populated on every target.  The set has to be target-independent: a name
+/// bound at build time but missing from the runtime pool keeps the
+/// build-process address baked in the constant pool, because
 /// `runtime_fnaddr_patch::patch_static_addr_constants` only re-pairs names
 /// present in both.
 pub fn pyre_class_pytype_addrs() -> Vec<(&'static str, i64)> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        pyre_object::lltype::PYRE_CLASS_DESCRIPTORS
-            .iter()
-            .map(|d| (d.pytype_path, d.pytype_ptr as usize as i64))
-            .collect()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        Vec::new()
-    }
+    let mut rows = Vec::new();
+    pyre_object::lltype::for_each_class_descriptor(|d| {
+        rows.push((d.pytype_path, d.pytype_ptr as usize as i64));
+    });
+    rows
 }
 
 /// Build-time addresses of the prebuilt dict-strategy singletons pyre
@@ -4854,12 +4846,10 @@ mod tests {
         assert_eq!(bindings["module::_random::Random::genrand32"], expected);
     }
 
-    /// `PYRE_TYPE_OBJECT_FNADDRS` is a native-only `distributed_slice`, so the
-    /// `#[pyre_methods]` `type_object()` residual addresses are published only
-    /// off wasm32.  Both the crate-qualified path (the residual `FunctionPath`)
+    /// Every `#[pyre_methods]` `type_object()` accessor publishes its residual
+    /// address.  Both the crate-qualified path (the residual `FunctionPath`)
     /// and the crate-stripped alias resolve to the accessor.
     #[test]
-    #[cfg(not(target_arch = "wasm32"))]
     fn jit_trace_fnaddrs_covers_deque_iter_type_object_residual() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         let expected =
@@ -4882,7 +4872,6 @@ mod tests {
     /// a symbolic fnaddr and inline JIT descent aborts.  Guards the invariant
     /// that every `type_object` generator (macro or hand-written) registers.
     #[test]
-    #[cfg(not(target_arch = "wasm32"))]
     fn jit_trace_fnaddrs_covers_hand_written_csv_dialect_type_object() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         assert!(

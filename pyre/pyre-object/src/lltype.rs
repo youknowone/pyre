@@ -183,22 +183,65 @@ unsafe impl Sync for PyreClassDescriptor {}
 /// class descriptors — the Rust stand-in for RPython's translation-time
 /// walk over every `GcStruct` in the low-level type graph
 /// (`rpython/memory/gctransform/framework.py`), which pyre cannot do
-/// because Rust has no such pass.  Consumed only as a completeness
-/// *oracle*: the JIT driver's `build_gc` asserts, right before
-/// `freeze_types()`, that every descriptor with managed children was
-/// actually wired into the GC.  It is deliberately NOT used to *drive*
-/// registration — population is a link-section array whose completeness
-/// is not guaranteed on every backend (notably wasm), and an oracle
-/// degrades gracefully under under-population (it can only under-check,
-/// never false-alarm) whereas a driver could not.
+/// because Rust has no such pass.  Two consumers read it: the JIT
+/// driver's `build_gc` completeness *oracle*, which asserts right before
+/// `freeze_types()` that every descriptor with managed children was
+/// actually wired into the GC, and `pyre_class_pytype_addrs`, which binds
+/// each `PyType` static's address for the translation boundary.  The
+/// oracle degrades gracefully under under-population (it can only
+/// under-check, never false-alarm); the address binder does not, because
+/// a name bound at build time and missing at runtime keeps the
+/// build-process address.  Both populations below therefore have to hold
+/// the same set.
 ///
-/// Compiled native-only: `linkme::distributed_slice` rejects `wasm32`
-/// ("distributed_slice is not implemented for this platform"), and the
-/// sole consumer — `build_gc`'s oracle — is itself `wasm32`-gated, so the
-/// registry is dead weight there anyway.
+/// `distributed_slice` rejects `wasm32` ("distributed_slice is not
+/// implemented for this platform"), which carries the same set in
+/// [`WASM_CLASS_DESCRIPTORS`] instead; read both through
+/// [`for_each_class_descriptor`].
 #[cfg(not(target_arch = "wasm32"))]
 #[::linkme::distributed_slice]
 pub static PYRE_CLASS_DESCRIPTORS: [&'static PyreClassDescriptor] = [..];
+
+/// The same registry on wasm32, populated at constructor time.
+///
+/// `linkme` has no wasm32 arm, and the reason is the target rather than
+/// the crate: a static with a custom `link_section` must be a plain list
+/// of bytes there, with no relocation for a pointer field.  A constructor
+/// runs before any exported function of the module, so the set is
+/// complete by the time the JIT binds its address table, and it is
+/// emitted beside the type — so it inherits that module's `cfg` gates
+/// exactly as the link-section element does.
+#[cfg(target_arch = "wasm32")]
+pub static WASM_CLASS_DESCRIPTORS: std::sync::Mutex<Vec<&'static PyreClassDescriptor>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Append one type's descriptor to [`WASM_CLASS_DESCRIPTORS`].
+///
+/// Called only from the constructor `#[pyre_class]` emits.
+#[cfg(target_arch = "wasm32")]
+pub fn register_class_descriptor(descr: &'static PyreClassDescriptor) {
+    WASM_CLASS_DESCRIPTORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(descr);
+}
+
+/// Visit every registered `#[pyre_class]` descriptor, whichever population
+/// the target carries.
+pub fn for_each_class_descriptor(mut visit: impl FnMut(&'static PyreClassDescriptor)) {
+    #[cfg(not(target_arch = "wasm32"))]
+    for descr in PYRE_CLASS_DESCRIPTORS {
+        visit(descr);
+    }
+    #[cfg(target_arch = "wasm32")]
+    for descr in WASM_CLASS_DESCRIPTORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+    {
+        visit(descr);
+    }
+}
 
 /// Link-time descriptor for a `#[pyre_methods]`-generated `type_object()`
 /// accessor.  The accessor's body is the `OnceLock<usize>` type-object cache;
@@ -220,14 +263,96 @@ pub struct TypeObjectFnDescriptor {
 // process-global code; sharing across threads is sound.
 unsafe impl Sync for TypeObjectFnDescriptor {}
 
-/// Link-time registry of every `#[pyre_methods]` `type_object()` accessor,
-/// populated by the macro so `jit_trace_fnaddrs` publishes each residual-call
-/// address without a hand-maintained list (which would mis-resolve inline-mod
-/// paths and miss per-module `cfg` gates).  Native only, matching
-/// [`PYRE_CLASS_DESCRIPTORS`]: `distributed_slice` rejects `wasm32`.
+/// Link-time registry of every `type_object()` accessor, populated by
+/// [`register_type_object_fnaddr!`] so `jit_trace_fnaddrs` publishes each
+/// residual-call address without a hand-maintained list (which would
+/// mis-resolve inline-mod paths and miss per-module `cfg` gates).
+/// `distributed_slice` rejects `wasm32`, which carries the same set in
+/// [`WASM_TYPE_OBJECT_FNADDRS`] instead; read both through
+/// [`for_each_type_object_fnaddr`].
 #[cfg(not(target_arch = "wasm32"))]
 #[::linkme::distributed_slice]
 pub static PYRE_TYPE_OBJECT_FNADDRS: [TypeObjectFnDescriptor] = [..];
+
+/// The same registry on wasm32, populated at constructor time.
+///
+/// `linkme` has no wasm32 arm, and the reason is the target rather than the
+/// crate: a static with a custom `link_section` must be a plain list of bytes
+/// there, with no relocation for a pointer field, and a descriptor holds two.
+/// A constructor runs before any exported function of the module, so an entry
+/// is present by the time the JIT binds its address table, and it is emitted
+/// beside the accessor — so it inherits the module's `cfg` gates exactly as
+/// the link-section element does.
+#[cfg(target_arch = "wasm32")]
+pub static WASM_TYPE_OBJECT_FNADDRS: std::sync::Mutex<Vec<TypeObjectFnDescriptor>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Append one accessor to [`WASM_TYPE_OBJECT_FNADDRS`].
+///
+/// Called only from the constructor [`register_type_object_fnaddr!`] emits.
+/// An entry appended after `jit_trace_fnaddrs` has been read is not published,
+/// and the residual call keeps the address its build-time snapshot carried.
+#[cfg(target_arch = "wasm32")]
+pub fn register_type_object_fnaddr(path: &'static str, func: fn() -> crate::PyObjectRef) {
+    WASM_TYPE_OBJECT_FNADDRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(TypeObjectFnDescriptor { path, func });
+}
+
+/// Visit every registered `type_object()` accessor, whichever population the
+/// target carries.
+///
+/// The JIT stamps the accessor `dont_look_inside` on every target, so a target
+/// that visited none would leave those residual calls bound to the addresses
+/// the build-script process recorded, which name nothing in the runtime one.
+pub fn for_each_type_object_fnaddr(
+    mut visit: impl FnMut(&'static str, fn() -> crate::PyObjectRef),
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    for desc in PYRE_TYPE_OBJECT_FNADDRS {
+        visit(desc.path, desc.func);
+    }
+    #[cfg(target_arch = "wasm32")]
+    for desc in WASM_TYPE_OBJECT_FNADDRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+    {
+        visit(desc.path, desc.func);
+    }
+}
+
+/// Publish the enclosing module's `type_object()` accessor for the JIT's
+/// residual call.
+///
+/// Expanded beside every accessor — `#[pyre_methods]`, `py_class!`,
+/// `py_class_typed!`, and the hand-written `_csv::dialect_class` one — so each
+/// registration carries whatever `cfg` gates its module already carries.  A
+/// central list could not: the accessors sit behind nested gates, and one that
+/// fell behind would silently drop an address rather than fail to build.
+#[macro_export]
+macro_rules! register_type_object_fnaddr {
+    () => {
+        #[cfg(not(target_arch = "wasm32"))]
+        #[::linkme::distributed_slice($crate::lltype::PYRE_TYPE_OBJECT_FNADDRS)]
+        #[allow(non_upper_case_globals)]
+        static __PYRE_TYPE_OBJECT_FNADDR: $crate::lltype::TypeObjectFnDescriptor =
+            $crate::lltype::TypeObjectFnDescriptor {
+                path: ::core::concat!(::core::module_path!(), "::type_object"),
+                func: type_object,
+            };
+
+        #[cfg(target_arch = "wasm32")]
+        #[::ctor::ctor(unsafe)]
+        fn __pyre_register_type_object_fnaddr() {
+            $crate::lltype::register_type_object_fnaddr(
+                ::core::concat!(::core::module_path!(), "::type_object"),
+                type_object,
+            );
+        }
+    };
+}
 
 /// Compile-time bridge between a `#[pyre_class]` struct and its
 /// per-type static `PyType` / `PyreClassDescriptor`.  Implemented
