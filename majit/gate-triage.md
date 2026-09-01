@@ -353,6 +353,13 @@ cover the condition they diagnose.
 - What it does: `MAJIT_NO_BRIDGE`: suppress bridge recording so every guard failure resumes through the blackhole.  Public because a frontend that owns its own guard-failure entry point has to honour it there too — gating only the jitdriver-internal paths leaves the variable set but inert, which reads as "bridges are off" while they keep recording.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_NO_GUARD_RESUME_BRIDGE`
+
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
+- Accessor: `no_guard_resume_bridge_enabled()`
+- What it does: `MAJIT_NO_GUARD_RESUME_BRIDGE`: decline every bridge entry taken directly from a guard failure, so each one resumes through the blackhole and the bridge is grown from the next merge point instead.  Narrower than `MAJIT_NO_BRIDGE`, which suppresses bridge recording outright: this leaves the merge-point-grown bridges in place, so a wrong answer that survives `MAJIT_NO_BRIDGE` and disappears here is attributable to what the walk rebuilds from resume data rather than to bridges as such.  Costly — the blackhole arm reaches the merge point by interpreting — so it is a bisection tool, not a policy.  Off by default.
+- Retirement condition: Remove when a bridge entered from a guard failure records the same answer as the blackhole arm reaching the same merge point, so the two arms have nothing left to separate.
+
 ### `MAJIT_OPREF_VARIANT_AUDIT`
 
 - Read sites: 1 — `majit/majit-ir/src/opref_audit.rs`

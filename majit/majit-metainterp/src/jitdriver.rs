@@ -570,6 +570,19 @@ pub fn bridge_fuel_take() -> bool {
     }
     true
 }
+/// `MAJIT_NO_GUARD_RESUME_BRIDGE`: decline every bridge entry taken directly
+/// from a guard failure, so each one resumes through the blackhole and the
+/// bridge is grown from the next merge point instead.  Narrower than
+/// `MAJIT_NO_BRIDGE`, which suppresses bridge recording outright: this leaves
+/// the merge-point-grown bridges in place, so a wrong answer that survives
+/// `MAJIT_NO_BRIDGE` and disappears here is attributable to what the walk
+/// rebuilds from resume data rather than to bridges as such.  Costly — the
+/// blackhole arm reaches the merge point by interpreting — so it is a bisection
+/// tool, not a policy.  Off by default.
+fn no_guard_resume_bridge_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_GUARD_RESUME_BRIDGE").is_some())
+}
 fn guardlog_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
@@ -5417,6 +5430,9 @@ impl<S: JitState> JitDriver<S> {
         // for the applying one, which stores the deferred writes on its way
         // in, and the blackhole arm this decline hands the guard to then
         // stores them a second time.
+        if no_guard_resume_bridge_enabled() {
+            return None;
+        }
         if self.guard_carries_pending_fields(descr_arc) {
             let why = GuardResumeDecline::ReplayIncomplete;
             crate::mc_diag_bump(why.diag_slot());
