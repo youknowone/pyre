@@ -4,6 +4,7 @@
 import _json
 import array
 import codecs
+import errno
 import functools
 import io
 import json
@@ -12,6 +13,7 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import types
 from ctypes import (
     CFUNCTYPE,
@@ -359,12 +361,19 @@ if sys.platform in ("linux", "darwin"):
     assert refusal(lambda: compile("a\0b", "<s>", "exec"), SyntaxError) == (
         "source code string cannot contain null bytes"
     )
-    try:
-        os.symlink("/tmp", "/tmp")
-    except OSError as exc:
-        assert (exc.filename, exc.filename2) == ("/tmp", "/tmp")
-    else:
-        raise AssertionError("symlink over an existing path succeeded")
+    # A symlink whose destination already exists reports EEXIST and carries
+    # both operands: `filename` is the source, `filename2` the destination.
+    with tempfile.TemporaryDirectory() as symlink_dir:
+        occupied = os.path.join(symlink_dir, "occupied")
+        with open(occupied, "w"):
+            pass
+        try:
+            os.symlink(occupied, occupied)
+        except OSError as exc:
+            assert exc.errno == errno.EEXIST
+            assert (exc.filename, exc.filename2) == (occupied, occupied)
+        else:
+            raise AssertionError("symlink over an existing path succeeded")
 
 
 # Untrusted UTF-8 is checked before it becomes the runtime's string storage.
