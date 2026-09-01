@@ -9009,18 +9009,40 @@ fn dict_view_all_contained_in(
     view: pyre_object::PyObjectRef,
     other: pyre_object::PyObjectRef,
 ) -> Result<bool, crate::PyError> {
-    let snapshot = crate::type_methods::dict_view_snapshot(view);
-    // `contains` runs a user `__contains__`/`__eq__`, so `other` and every
-    // item still waiting in this native Vec move under the loop.  Pin them and
-    // read each one back at its use.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let other_slot = pyre_object::gc_roots::shadow_stack_len();
-    let other = pyre_object::gc_roots::pin_root(other);
-    let item_base = pyre_object::gc_roots::pin_roots(&snapshot);
-    for i in 0..snapshot.len() {
-        let other = pyre_object::gc_roots::shadow_stack_get(other_slot);
-        let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-        if !crate::baseobjspace::contains(other, item)? {
+    // `_all_contained_in` walks a live `space.iter(w_dictview)`, so a
+    // `contains_w` that mutates the dict behind the view is caught by the
+    // iterator's own size check on the next step.  A snapshot taken up front
+    // answers from the pre-mutation copy and never reaches that check.
+    //
+    // `iter`, `next` and `contains` each run user Python, and a dict view is
+    // `try_gc_alloc_nursery_raw` and so moves, so both operands are read back
+    // from their slots at each use.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.publish(&[view, other]);
+    roots.normalize(base, 2);
+    let iterator = crate::baseobjspace::iter(roots.get(base))?;
+    let iterator_slot = roots.publish(&[iterator]);
+    roots.normalize(iterator_slot, 1);
+    // A dict-view iterator is an off-GC carrier whose registered raw-field
+    // walker covers frame reachability only, so the source dict is retained
+    // for the native loop the way `collect_iterator` retains it.
+    if unsafe { pyre_object::dictmultiobject::is_dict_view_iterator(roots.get(iterator_slot)) } {
+        let w_dict = unsafe {
+            pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(roots.get(iterator_slot))
+        };
+        let _ = roots.pin_root(w_dict);
+    }
+    // The yielded item is dead once its `contains` answers, so one slot is
+    // rewritten per turn rather than a fresh root pinned for every item.
+    let item_slot = roots.publish(&[pyre_object::w_none()]);
+    loop {
+        let item = match crate::baseobjspace::next(roots.get(iterator_slot)) {
+            Ok(item) => item,
+            Err(e) if e.matches_stop_iteration() => break,
+            Err(e) => return Err(e),
+        };
+        roots.set(item_slot, item);
+        if !crate::baseobjspace::contains(roots.get(base + 1), roots.get(item_slot))? {
             return Ok(false);
         }
     }
@@ -9028,7 +9050,7 @@ fn dict_view_all_contained_in(
 }
 
 #[derive(Clone, Copy)]
-enum DictViewCmp {
+pub(crate) enum DictViewCmp {
     Eq,
     Ne,
     Lt,
@@ -9037,7 +9059,7 @@ enum DictViewCmp {
     Ge,
 }
 
-fn dict_view_compare(
+pub(crate) fn dict_view_compare(
     self_view: pyre_object::PyObjectRef,
     other: pyre_object::PyObjectRef,
     op: DictViewCmp,
@@ -9070,6 +9092,11 @@ fn dict_view_compare(
 /// reject as soon as any item is in self.  Pyre's snapshot-based
 /// `contains` over the view materialises the (k, v) tuple wrapping
 /// for items views, matching the PyPy semantics.
+///
+/// The operand is stepped one item at a time rather than materialised: the
+/// walk stops at the first common element, so an iterable that yields one and
+/// then raises answers `False` instead of propagating, and a generator is left
+/// holding the items the walk never needed.
 fn dict_view_isdisjoint(
     self_view: pyre_object::PyObjectRef,
     other: pyre_object::PyObjectRef,
@@ -9080,22 +9107,50 @@ fn dict_view_isdisjoint(
             unsafe { pyre_object::w_int_get_value(n) } == 0,
         ));
     }
-    // `collect_iterable` runs a user `__iter__` and `__next__`, and the
-    // receiver it is not handed is a native copy no root walker updates -- a
-    // dict view is `try_gc_alloc_nursery_raw` and so moves -- which is why the
-    // receiver is published before that call rather than after it.  Its own
-    // scope has popped by the time it returns, so the items sit in an untraced
-    // native Vec while each `contains` runs a user `__eq__`; those are pinned
-    // as well, the shape `dict_view_all_contained_in` above uses.
+    // `iter`, `next` and `contains` each run user Python, and a dict view is
+    // `try_gc_alloc_nursery_raw` and so moves, so both operands live in
+    // shadow-stack slots that are read back at each use rather than in the
+    // native copies handed to this function.
     let roots = pyre_object::gc_roots::push_roots();
-    let view_slot = roots.publish(&[self_view]);
-    roots.normalize(view_slot, 1);
-    let other_items = crate::builtins::collect_iterable(other)?;
-    let item_base = pyre_object::gc_roots::pin_roots(&other_items);
-    for index in 0..other_items.len() {
-        let self_view = roots.get(view_slot);
-        let item = pyre_object::gc_roots::shadow_stack_get(item_base + index);
-        if crate::baseobjspace::contains(self_view, item)? {
+    let base = roots.publish(&[self_view, other]);
+    roots.normalize(base, 2);
+    // `descr_isdisjoint` iterates the shorter operand when both are set-like,
+    // so which slot is walked and which is asked `contains` is decided here
+    // instead of being fixed by the argument order.
+    let (mut container, mut iterated) = (base, base + 1);
+    if dict_view_is_set_like(roots.get(base + 1)) {
+        let self_n =
+            unsafe { pyre_object::w_int_get_value(crate::baseobjspace::len(roots.get(base))?) };
+        let other_n =
+            unsafe { pyre_object::w_int_get_value(crate::baseobjspace::len(roots.get(base + 1))?) };
+        if other_n > self_n {
+            (container, iterated) = (base + 1, base);
+        }
+    }
+    let iterator = crate::baseobjspace::iter(roots.get(iterated))?;
+    let iterator_slot = roots.publish(&[iterator]);
+    roots.normalize(iterator_slot, 1);
+    // A dict-view iterator is an off-GC carrier whose registered raw-field
+    // walker covers frame reachability only, so the source dict is retained
+    // for the native loop the way `collect_iterator` retains it.
+    if unsafe { pyre_object::dictmultiobject::is_dict_view_iterator(roots.get(iterator_slot)) } {
+        let w_dict = unsafe {
+            pyre_object::dictmultiobject::w_dict_view_iterator_get_dict(roots.get(iterator_slot))
+        };
+        let _ = roots.pin_root(w_dict);
+    }
+    // The yielded item is dead once its `contains` answers, and the walk has
+    // no bound, so one slot is rewritten per turn rather than a fresh root
+    // pinned for every item the iterator produces.
+    let item_slot = roots.publish(&[pyre_object::w_none()]);
+    loop {
+        let item = match crate::baseobjspace::next(roots.get(iterator_slot)) {
+            Ok(item) => item,
+            Err(e) if e.matches_stop_iteration() => break,
+            Err(e) => return Err(e),
+        };
+        roots.set(item_slot, item);
+        if crate::baseobjspace::contains(roots.get(container), roots.get(item_slot))? {
             return Ok(pyre_object::w_bool_from(false));
         }
     }
