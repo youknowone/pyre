@@ -152,6 +152,45 @@ pub struct BhJitDriverSd {
     /// `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
     /// function returned by `get_portal_runner` for `bh_call_*`.
     pub mainjitcode_calldescr: BhCallDescr,
+    /// `warmspot.py:921` `jd.mainjitcode` — the portal function's jitcode.
+    ///
+    /// `blackhole.py` `_handle_jitexception_in_portal` picks the driver whose
+    /// `mainjitcode is self.jitcode`, so a recursive `ContinueRunningNormally`
+    /// re-enters the portal that raised it and not some other driver's.
+    /// [`portal_runner_for`] runs that same search.
+    pub mainjitcode: Option<std::sync::Arc<JitCode>>,
+}
+
+/// How [`BlackholeInterpreter::run`]'s dispatch loop stopped.
+///
+/// `blackhole.py`'s `dispatch_loop` is `while True:` over `ord(code[position])`
+/// and never returns — it only raises, and `run` converts `LeaveFrame` into a
+/// normal return while letting everything else through.  So upstream has three
+/// exits, and each one leaves different state behind for `_resume_mainloop` to
+/// read.  Naming them keeps the caller from having to infer which happened.
+///
+/// The fourth, [`Self::EndOfCode`], has no upstream counterpart: reading past
+/// the last byte is an `IndexError` there.  It exists here because pyre's unit
+/// builders emit jitcodes that simply end, and it is a distinct variant rather
+/// than a synonym for [`Self::LeaveFrame`] because the two differ in exactly
+/// the state a caller goes on to publish — `return_type` and `tmpreg_*` are
+/// written by a `*_return` handler and cleared by neither `cleanup_registers`
+/// (upstream has no such slot to clear) nor `release_interp`, so a frame that
+/// merely ran out of bytes carries the previous occupant of its pooled
+/// interpreter to the caller's result register.
+#[derive(Debug)]
+pub enum BhRunOutcome {
+    /// A `*_return` handler raised `LeaveFrame`: `return_type` and the matching
+    /// `tmpreg_*` hold this frame's result.
+    LeaveFrame,
+    /// An exception no `catch_exception` in this frame handled;
+    /// `got_exception` and `exception_last_value` carry it.
+    Exception,
+    /// `blackhole.py:1068` `raise ContinueRunningNormally(*args)`.
+    ContinueRunningNormally(Box<MergePointArgs>),
+    /// The dispatch loop ran out of bytecode without returning.  No upstream
+    /// counterpart — see the type's own docs.
+    EndOfCode,
 }
 
 /// Signal raised by handlers and propagated up through `dispatch_step` to `run`.
@@ -1097,8 +1136,23 @@ impl BlackholeInterpreter {
         // blackhole.py `_resume_mainloop` does not catch
         // ContinueRunningNormally; it propagates out to `_run_forever`
         // and then to `handle_jitexception` (warmspot.py).
-        if let Some(args) = self.run() {
-            return Err(JitException::ContinueRunningNormally(args));
+        match self.run() {
+            BhRunOutcome::ContinueRunningNormally(args) => {
+                return Err(JitException::ContinueRunningNormally(args));
+            }
+            // `blackhole.py:1633` reads `self._return_type` next, and it only
+            // gets there because `dispatch_loop` raised `LeaveFrame` from a
+            // `*_return` handler that had just written it.  Nothing writes it
+            // on the way out of a frame that merely ran out of bytecode, and
+            // nothing clears it either, so the read below would publish the
+            // result of whatever ran on this pooled interpreter last.
+            BhRunOutcome::EndOfCode => panic!(
+                "resume_mainloop: jitcode {:?} index {:?} ended without a return \
+                 opcode, so there is no result to pass to the caller",
+                self.jitcode.name,
+                self.jitcode.try_index(),
+            ),
+            BhRunOutcome::LeaveFrame | BhRunOutcome::Exception => {}
         }
 
         // Check for exception during execution
@@ -1628,7 +1682,7 @@ impl BlackholeInterpreter {
     /// catches exceptions and calls `handle_exception_in_frame`.
     /// Returns `Some(args)` for `ContinueRunningNormally` (RPython: raise
     /// jitexc.ContinueRunningNormally propagates through run→_run_forever).
-    pub fn run(&mut self) -> Option<Box<MergePointArgs>> {
+    pub fn run(&mut self) -> BhRunOutcome {
         let _bh_phase = majit_gc::BhProbePhase::enter("blackhole");
         // Root this frame's register bank AND every pending caller frame
         // reachable through `nextblackholeinterp`.  RPython keeps the whole
@@ -1703,7 +1757,7 @@ impl BlackholeInterpreter {
         result
     }
 
-    fn run_inner(&mut self) -> Option<Box<MergePointArgs>> {
+    fn run_inner(&mut self) -> BhRunOutcome {
         let trace = crate::majit_log_enabled() || crate::bh_debug_enabled();
         // blackhole.py:86-91:
         //
@@ -1749,7 +1803,7 @@ impl BlackholeInterpreter {
                         self.registers_i.first().copied().unwrap_or(-1)
                     );
                 }
-                return None;
+                return BhRunOutcome::EndOfCode;
             }
             let pos_before = self.position;
             self.last_opcode_position = pos_before;
@@ -1782,7 +1836,7 @@ impl BlackholeInterpreter {
                             pos_before, self.return_type,
                         );
                     }
-                    return None;
+                    return BhRunOutcome::LeaveFrame;
                 }
                 Err(DispatchError::ContinueRunningNormally(args)) => {
                     // blackhole.py:1068: raise ContinueRunningNormally(*args)
@@ -1793,7 +1847,7 @@ impl BlackholeInterpreter {
                             &format!("ContinueRunningNormally at pos={pos_before}"),
                         );
                     }
-                    return Some(args);
+                    return BhRunOutcome::ContinueRunningNormally(args);
                 }
                 Err(DispatchError::RaiseException { exc, .. }) => {
                     // blackhole.py: except Exception → handle_exception_in_frame
@@ -1810,7 +1864,7 @@ impl BlackholeInterpreter {
                     // No handler: propagate exception via got_exception flag
                     self.got_exception = true;
                     self.exception_last_value = exc;
-                    return None;
+                    return BhRunOutcome::Exception;
                 }
             }
         }
@@ -2741,6 +2795,22 @@ impl BlackholeInterpBuilder {
         // `scalar_slot`/`array_elem_slot` range checks are `debug_assert!`, so
         // a release build reads whatever slot the arithmetic lands on.
         interp.state_field_layout = StateFieldLayout::default();
+        // Two more pyre-only fields on the same footing as the ones above:
+        // they describe the run that just ended, and `acquire_interp` refreshes
+        // only the six builder-shared slots.
+        //
+        // `called_residual` is "this frame left the interpreter", set by every
+        // `bh_call_*` helper and cleared by `reset_for_inline_reuse` alone.  A
+        // pooled interp that kept it hands its next user the previous run's
+        // answer, which `jitdriver.rs` reads on the back-edge to decide whether
+        // the walk may treat the frame as never having escaped.
+        //
+        // `record_caught_exception` is a callback the resume path installs on
+        // every frame of a chain (`call_jit.rs`), and the chain goes back into
+        // the same pool.  Handing the next user a hook it never asked for makes
+        // it report exceptions to whoever owned the frame before it.
+        interp.called_residual.set(false);
+        interp.record_caught_exception = None;
         interp.back = self.blackholeinterps.take();
         self.blackholeinterps = Some(interp);
     }
@@ -2771,17 +2841,39 @@ fn handle_jitexception_dispatch(
     portal_runner: Option<
         &dyn Fn(&JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>,
     >,
+    result_kind: Option<BhReturnType>,
 ) -> Result<(BhReturnType, i64), PortalRunnerFailure> {
+    // `warmspot.py:984-996` guards each `DoneWithThisFrame*` arm with `if
+    // result_kind == '<kind>':`, so a portal only ever absorbs the flavour it
+    // returns; a mismatch falls off the end of the `while True` into
+    // `:1007 raise AssertionError("all cases should have been handled")`.  The
+    // kinds carry the value in different banks — `DoneWithThisFrameInt` at a
+    // ref portal would install an integer through `setup_return_value_i` and
+    // the caller would read it as a pointer — so the wrong arm is a wrong
+    // answer, not a mislabelled one.  `None` is a jitcode no driver claims
+    // (the unit-test builders build `BhJitDriverSd` without `mainjitcode`);
+    // there is no `result_kind` to test against, so the variant alone decides
+    // as it did before the driver was consulted.
+    let kind_matches = |kind: BhReturnType| result_kind.is_none_or(|want| want == kind);
+    let done_arm = |kind: BhReturnType, value: i64| {
+        assert!(
+            kind_matches(kind),
+            "portal result_kind {:?} cannot absorb DoneWithThisFrame{:?}",
+            result_kind,
+            kind,
+        );
+        Ok((kind, value))
+    };
     match exc {
-        // warmspot.py:986-987
-        JitException::DoneWithThisFrameVoid => Ok((BhReturnType::Void, 0)),
+        // warmspot.py:985-987
+        JitException::DoneWithThisFrameVoid => done_arm(BhReturnType::Void, 0),
         // warmspot.py:988-990
-        JitException::DoneWithThisFrameInt(result) => Ok((BhReturnType::Int, result)),
+        JitException::DoneWithThisFrameInt(result) => done_arm(BhReturnType::Int, result),
         // warmspot.py:991-993
-        JitException::DoneWithThisFrameRef(result) => Ok((BhReturnType::Ref, result.0 as i64)),
+        JitException::DoneWithThisFrameRef(result) => done_arm(BhReturnType::Ref, result.0 as i64),
         // warmspot.py:994-996
         JitException::DoneWithThisFrameFloat(result) => {
-            Ok((BhReturnType::Float, result.to_bits() as i64))
+            done_arm(BhReturnType::Float, result.to_bits() as i64)
         }
         // warmspot.py:998-1005
         JitException::ExitFrameWithExceptionRef(_) => Err(PortalRunnerFailure::jit(exc)),
@@ -2822,12 +2914,13 @@ fn handle_jitexception_in_portal(
     portal_runner: Option<
         &dyn Fn(&JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>,
     >,
+    result_kind: Option<BhReturnType>,
 ) -> Result<(), PortalRunnerFailure> {
     // warmspot.py handle_jitexception: while True loop.
     // ContinueRunningNormally → portal_runner → may raise JitException → loop.
     let mut current_exc = exc;
     loop {
-        match handle_jitexception_dispatch(current_exc, portal_runner) {
+        match handle_jitexception_dispatch(current_exc, portal_runner, result_kind) {
             Ok((ret_type, result)) => {
                 // warmspot.py:1041-1050
                 match ret_type {
@@ -2865,8 +2958,14 @@ fn handle_jitexception_in_portal(
                 exception: next_exc,
                 terminal,
             }) => {
-                // warmspot.py:967-968, 979-980: JitException from portal_runner
-                // or EnterJitAssembler → loop back in handle_jitexception
+                // warmspot.py:979-980: a JitException out of `portal_runner`
+                // loops back in `handle_jitexception`.  Upstream reaches the
+                // same `continue` from `:967-968` as well, where
+                // `EnterJitAssembler.execute()` raised; pyre has no such
+                // exception because `warmstate.py maybe_compile_and_run`'s
+                // counterpart in `eval.rs` enters the assembler directly, so
+                // that producer has no port and this arm serves the portal
+                // re-entry alone.
                 assert!(
                     terminal.is_none(),
                     "only BailToInterpreter may carry a terminal blackhole image"
@@ -3015,8 +3114,20 @@ fn handle_jitexception(
     // DoneWithThisFrame{Int,Ref,Float,Void} and returns it.
     //
     // In Rust we can do this directly since JitException carries the result.
+    //
+    // `bh` is upstream's `self` — the portal frame that raised — so its own
+    // driver owns the runner.  Only a frame no driver claims falls back to the
+    // runner this call was handed.
+    let own_runner = portal_runner_for(&bh);
+    let own_runner = own_runner.as_ref().map(|hook| {
+        hook as &dyn Fn(
+            &crate::jitexc::JitException,
+        ) -> Result<(BhReturnType, i64), PortalRunnerFailure>
+    });
+    let result_kind = portal_result_kind_for(&bh);
     let caller = bh.nextblackholeinterp.as_mut().unwrap();
-    let portal_outcome = handle_jitexception_in_portal(caller, exc, portal_runner);
+    let portal_outcome =
+        handle_jitexception_in_portal(caller, exc, own_runner.or(portal_runner), result_kind);
     let current_exc = match portal_outcome {
         Ok(()) => 0,
         Err(PortalRunnerFailure {
@@ -3254,7 +3365,12 @@ pub fn convert_and_run_from_pyjitpl(
     // recursive portal level can re-enter the portal function.  Without it
     // `handle_jitexception_dispatch` has nothing to call and
     // `ContinueRunningNormally` reaches its `expect`.
-    let hook = PORTAL_RUNNER_HOOK.get().copied();
+    //
+    // This is only the fallback for a frame no driver claims: the recursive
+    // level resolves its own runner from the raising portal frame
+    // (`portal_runner_for`), because the driver that owns that jitcode is the
+    // one whose portal has to be re-entered.
+    let hook = portal_runner_for(&first_bh);
     let portal_runner = hook.as_ref().map(|hook| {
         hook as &dyn Fn(
             &crate::jitexc::JitException,
@@ -7080,6 +7196,78 @@ fn bhimpl_jit_leave_portal_frame() {}
 /// blackhole.py `bhimpl_hint_force_virtualizable(r): pass`.
 fn bhimpl_hint_force_virtualizable(_r: i64) {}
 
+/// The interpreter's `portal_runner`, re-entering the portal function when
+/// `ContinueRunningNormally` is raised at a recursive portal level
+/// (`warmspot.py handle_jitexception_from_blackhole`).
+///
+/// `warmspot.py:1010-1013` `jd.handle_jitexc_from_bh`, one per jitdriver.
+pub type PortalRunnerHook =
+    fn(&crate::jitexc::JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>;
+
+/// The registered runners, indexed by `metainterp_sd.jitdrivers_sd` position.
+///
+/// Upstream hangs this callback off the driver itself, so
+/// `_handle_jitexception_in_portal` can pick the one whose `mainjitcode is
+/// self.jitcode`.  Keeping the table beside `BhJitDriverSd` rather than in it
+/// only avoids an initialisation order between the driver table (built once,
+/// lazily) and the consumer's registration; [`portal_runner_for`] joins the two
+/// at the point of use, by the same identity test upstream uses.
+static PORTAL_RUNNER_HOOKS: std::sync::RwLock<Vec<Option<PortalRunnerHook>>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Install the [`PortalRunnerHook`] owned by `jitdrivers_sd[jd_index]`.
+///
+/// First registration for an index wins, so a consumer may call it from every
+/// install path for that driver.
+pub fn register_portal_runner_hook(jd_index: usize, hook: PortalRunnerHook) {
+    let mut hooks = PORTAL_RUNNER_HOOKS
+        .write()
+        .expect("portal runner table poisoned");
+    if hooks.len() <= jd_index {
+        hooks.resize(jd_index + 1, None);
+    }
+    hooks[jd_index].get_or_insert(hook);
+}
+
+/// `blackhole.py` `_handle_jitexception_in_portal`:
+///
+/// ```python
+/// for jd in self.builder.metainterp_sd.jitdrivers_sd:
+///     if jd.mainjitcode is self.jitcode:
+///         break
+/// else:
+///     assert 0, "portal jitcode not found??"
+/// jd.handle_jitexc_from_bh(self.nextblackholeinterp, e)
+/// ```
+///
+/// `bh` is the portal frame that raised, i.e. upstream's `self`.  Upstream
+/// asserts when no driver owns that jitcode; here a miss returns `None` and
+/// each caller keeps the behaviour it had before the driver was consulted,
+/// because a `BhJitDriverSd` table assembled without `mainjitcode` (the
+/// unit-test builders) would otherwise abort paths that used to work.
+fn portal_jd_for(bh: &BlackholeInterpreter) -> Option<usize> {
+    bh.jitdrivers_sd.iter().position(|jd| {
+        jd.mainjitcode
+            .as_ref()
+            .is_some_and(|code| std::sync::Arc::ptr_eq(code, &bh.jitcode))
+    })
+}
+
+/// The `jd.handle_jitexc_from_bh` of the driver [`portal_jd_for`] picked.
+fn portal_runner_for(bh: &BlackholeInterpreter) -> Option<PortalRunnerHook> {
+    let jd_index = portal_jd_for(bh)?;
+    *PORTAL_RUNNER_HOOKS
+        .read()
+        .expect("portal runner table poisoned")
+        .get(jd_index)?
+}
+
+/// The `result_kind` `warmspot.py:984-996` tests each `DoneWithThisFrame*`
+/// against, taken from the same driver [`portal_jd_for`] picked.
+fn portal_result_kind_for(bh: &BlackholeInterpreter) -> Option<BhReturnType> {
+    Some(bh.jitdrivers_sd[portal_jd_for(bh)?].result_type)
+}
+
 /// Called at every `-live-` marker, i.e. once per source-level instruction the
 /// blackhole replays. Arguments are the interpreter and the marker's own
 /// bytecode position.
@@ -7100,25 +7288,6 @@ fn bhimpl_hint_force_virtualizable(_r: i64) {}
 /// colouring reusing that register almost immediately
 /// (`rpython/tool/algo/regalloc.py:28-75`); a codewriter whose colours are
 /// not reused that densely needs the same clear at marker granularity.
-/// The interpreter's `portal_runner`, re-entering the portal function when
-/// `ContinueRunningNormally` is raised at a recursive portal level
-/// (`warmspot.py handle_jitexception_from_blackhole`).
-///
-/// Registered as a module hook rather than held on `JitDriver`, because the two
-/// production entries into `convert_and_run_from_pyjitpl` reach it with
-/// `MetaInterpStaticData` only — neither can name the driver that owns the
-/// callback.  Same shape as [`LiveMarkerHook`] beside it.
-pub type PortalRunnerHook =
-    fn(&crate::jitexc::JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>;
-
-static PORTAL_RUNNER_HOOK: std::sync::OnceLock<PortalRunnerHook> = std::sync::OnceLock::new();
-
-/// Install the [`PortalRunnerHook`]. First registration wins; later calls are
-/// ignored, so a consumer may call it from every driver install path.
-pub fn register_portal_runner_hook(hook: PortalRunnerHook) {
-    let _ = PORTAL_RUNNER_HOOK.set(hook);
-}
-
 pub type LiveMarkerHook = fn(&mut BlackholeInterpreter, usize);
 
 static LIVE_MARKER_HOOK: std::sync::OnceLock<LiveMarkerHook> = std::sync::OnceLock::new();
@@ -12914,9 +13083,21 @@ fn handler_inline_call_nested_ext(
     // Every exit below leaves through the single `break 'callee`, so the
     // frame always reaches the scratch slot on its way out.
     let outcome = 'callee: {
-        if let Some(args) = callee.run() {
-            bh.position = p;
-            break 'callee Err(DispatchError::ContinueRunningNormally(args));
+        match callee.run() {
+            BhRunOutcome::ContinueRunningNormally(args) => {
+                bh.position = p;
+                break 'callee Err(DispatchError::ContinueRunningNormally(args));
+            }
+            // Same reason as `resume_mainloop`: the caller copies the callee's
+            // `return_type` / `tmpreg_*` into its own result register below,
+            // and a callee that ran out of bytecode never wrote either.
+            BhRunOutcome::EndOfCode => panic!(
+                "inline_call: callee jitcode {:?} index {:?} ended without a \
+                 return opcode, so there is no result for the caller",
+                callee.jitcode.name,
+                callee.jitcode.try_index(),
+            ),
+            BhRunOutcome::LeaveFrame | BhRunOutcome::Exception => {}
         }
 
         // RPython `blackhole.py` invariant: after the handler has
