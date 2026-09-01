@@ -84,6 +84,20 @@ pub const BC_RECURSIVE_CALL_REF: u8 = 224;
 pub const BC_RECURSIVE_CALL_FLOAT: u8 = 225;
 pub const BC_RECURSIVE_CALL_VOID: u8 = 226;
 
+/// "This cached control opcode is absent" sentinel for the
+/// `blackhole.py:72-74` fields (`op_live`, `op_catch_exception`,
+/// `op_rvmprof_code`).
+///
+/// Upstream spells the fallback `insns.get('live/', -1)` and then tests
+/// `opcode == self.op_live` against `ord(code[position])`.  `-1` lies
+/// outside that `0..=255` range, so an absent entry can never match a real
+/// instruction.  A `u8` has no value outside the range, so the same
+/// guarantee is bought by reserving the byte instead: no opname may be
+/// assigned `BC_ABSENT`, and [`is_reserved_opcode_byte`] keeps both dynamic
+/// allocators (`Assembler::next_dynamic_opnum` here and pyre's runtime
+/// `record_insn_key`) off it.
+pub const BC_ABSENT: u8 = u8::MAX;
+
 pub const BC_LOOP_HEADER: u8 = 12;
 pub const BC_ABORT: u8 = 13;
 pub const BC_ABORT_PERMANENT: u8 = 14;
@@ -690,6 +704,9 @@ pub fn is_reserved_opcode_byte(byte: u8) -> bool {
         for (_, value) in extension_insns() {
             reserved[value as usize] = true;
         }
+        // Keep the absent-control-opcode sentinel out of every allocator's
+        // pool so `opcode == op_live` cannot match a real instruction.
+        reserved[BC_ABSENT as usize] = true;
         reserved
     });
     reserved[byte as usize]
@@ -1402,5 +1419,29 @@ mod recursive_call_byte_tests {
                 "recursive_call byte {b} collides with an already-registered insn"
             );
         }
+    }
+
+    /// `blackhole.py:72-74` reads the cached control opcodes as
+    /// `insns.get(key, -1)` and compares them against `ord(code[position])`,
+    /// so an absent key can never match a real instruction.  `BC_ABSENT`
+    /// carries that guarantee into `u8` by staying out of every allocator's
+    /// pool; if some opname ever claimed it, `handle_exception_in_frame`
+    /// would read that instruction as `live/` or `catch_exception/L`.
+    #[test]
+    fn absent_control_opcode_sentinel_is_never_a_real_instruction() {
+        assert!(
+            is_reserved_opcode_byte(BC_ABSENT),
+            "BC_ABSENT must be reserved so no dynamic allocator hands it out"
+        );
+
+        let registered: Vec<u8> = wellknown_bh_insns()
+            .values()
+            .chain(extension_insns().values())
+            .copied()
+            .collect();
+        assert!(
+            !registered.contains(&BC_ABSENT),
+            "BC_ABSENT must not name an instruction"
+        );
     }
 }

@@ -229,10 +229,13 @@ pub struct BlackholeInterpreter {
     /// lifetime shape as the sibling `cpu: Option<&'static dyn Backend>`.
     pub descrs: &'static dyn DescrTable,
     /// RPython `blackhole.py` `self.op_catch_exception = builder.op_catch_exception`.
+    /// `BC_ABSENT` when the key is missing — see [`BlackholeInterpBuilder::op_live`].
     pub op_catch_exception: u8,
     /// RPython `blackhole.py:290` `self.op_rvmprof_code = builder.op_rvmprof_code`.
+    /// `BC_ABSENT` when the key is missing — see [`BlackholeInterpBuilder::op_live`].
     pub op_rvmprof_code: u8,
     /// RPython `blackhole.py:289` `self.op_live = builder.op_live`.
+    /// `BC_ABSENT` when the key is missing — see [`BlackholeInterpBuilder::op_live`].
     pub op_live: u8,
     /// Integer register bank.
     /// Indices 0..num_regs_i are working registers.
@@ -501,10 +504,11 @@ impl Default for BlackholeInterpreter {
             // blackhole.py `EMPTY_LIST_I = [] # shared`.
             descrs: EMPTY_DESCR_TABLE,
             // RPython blackhole.py — copied from builder in `acquire_interp`.
-            // Sentinel `u8::MAX` matches RPython's `insns.get('…', -1)` fallback.
-            op_catch_exception: u8::MAX,
-            op_rvmprof_code: u8::MAX,
-            op_live: u8::MAX,
+            // `BC_ABSENT` stands in for `insns.get('…', -1)`: a reserved byte
+            // no opname is ever assigned, so it cannot match `code[position]`.
+            op_catch_exception: majit_translate::insns::BC_ABSENT,
+            op_rvmprof_code: majit_translate::insns::BC_ABSENT,
+            op_live: majit_translate::insns::BC_ABSENT,
             registers_i: Vec::new(),
             registers_r: Vec::new(),
             registers_f: Vec::new(),
@@ -2281,10 +2285,18 @@ pub struct BlackholeInterpBuilder {
     /// Populated by `setup_insns`; empty until called.
     pub _insns: Vec<String>,
     /// RPython `blackhole.py` `self.op_live = insns.get('live/', -1)`.
+    ///
+    /// A missing key stores [`majit_translate::insns::BC_ABSENT`] rather than
+    /// upstream's `-1`.  The two carry the same guarantee for the
+    /// `opcode == self.op_live` tests: `-1` cannot equal `ord(code[position])`
+    /// because it is outside `0..=255`, and `BC_ABSENT` cannot because it is a
+    /// reserved byte that no opname is ever assigned.
     pub op_live: u8,
     /// RPython `blackhole.py:73` `self.op_catch_exception`.
+    /// `BC_ABSENT` when the key is missing — see [`Self::op_live`].
     pub op_catch_exception: u8,
     /// RPython `blackhole.py:74` `self.op_rvmprof_code`.
+    /// `BC_ABSENT` when the key is missing — see [`Self::op_live`].
     pub op_rvmprof_code: u8,
     /// RPython `blackhole.py:103` `self.descrs`.
     /// Populated by `setup_descrs()` from the assembler's descriptor table.
@@ -2339,9 +2351,9 @@ impl BlackholeInterpBuilder {
             blackholeinterps: None,
             cpu: None,
             _insns: Vec::new(),
-            op_live: u8::MAX,
-            op_catch_exception: u8::MAX,
-            op_rvmprof_code: u8::MAX,
+            op_live: majit_translate::insns::BC_ABSENT,
+            op_catch_exception: majit_translate::insns::BC_ABSENT,
+            op_rvmprof_code: majit_translate::insns::BC_ABSENT,
             // blackhole.py `EMPTY_LIST_I = [] # shared`.
             descrs: EMPTY_DESCR_TABLE,
             dispatch_table: std::sync::Arc::new(Vec::new()),
@@ -2374,7 +2386,7 @@ impl BlackholeInterpBuilder {
     ) {
         let to_u8 = |opcode: i32| -> u8 {
             if opcode < 0 {
-                u8::MAX
+                majit_translate::insns::BC_ABSENT
             } else {
                 u8::try_from(opcode).expect("cached blackhole opcode does not fit in u8")
             }
