@@ -10272,7 +10272,7 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
         crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
     let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[actual, expected])?;
-    // `implement_guard_value`'s second half (`pyjitpl.py:1915-1928`): the guard
+    // `pyjitpl.py` `MIFrame.implement_guard_value`'s second half: the guard
     // has proved the read equals the constant, so the heapcache serves the
     // constant to every later reader of the same box.
     ctx.trace_ctx.heap_cache_mut().replace_box(actual, expected);
