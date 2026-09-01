@@ -1263,7 +1263,7 @@ fn typeids_z_bytes() -> Result<Vec<u8>, crate::PyError> {
     let text = majit_gc::get_typeids_text()
         .ok_or_else(|| crate::PyError::not_implemented("operation not implemented by this GC"))?;
     pyre_native::zlib::compress(&text, 9, pyre_native::zlib::MAX_WBITS)
-        .map_err(crate::PyError::os_error)
+        .map_err(|error| crate::PyError::os_error(error.into_message()))
 }
 
 /// The spelling each typeid sidecar wants. `app_referents.py:34` opens

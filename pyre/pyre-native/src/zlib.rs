@@ -15,14 +15,38 @@ pub const Z_SYNC_FLUSH: i32 = common::Z_SYNC_FLUSH;
 pub const Z_FULL_FLUSH: i32 = common::Z_FULL_FLUSH;
 pub const Z_FINISH: i32 = common::Z_FINISH;
 
-#[inline(never)]
-pub fn compress(data: &[u8], level: i32, wbits: i32) -> Result<Vec<u8>, String> {
-    common::compress(data, level, wbits)
+#[derive(Debug)]
+pub enum InitError {
+    InvalidOption,
+    Zlib(String),
+}
+
+impl InitError {
+    pub fn into_message(self) -> String {
+        match self {
+            Self::InvalidOption => "Invalid initialization option".to_owned(),
+            Self::Zlib(message) => message,
+        }
+    }
+}
+
+impl From<common::InitError> for InitError {
+    fn from(error: common::InitError) -> Self {
+        match error {
+            common::InitError::InvalidOption => Self::InvalidOption,
+            common::InitError::Zlib(message) => Self::Zlib(message),
+        }
+    }
 }
 
 #[inline(never)]
-pub fn decompress(data: &[u8], wbits: i32, bufsize: usize) -> Result<Vec<u8>, String> {
-    common::decompress(data, wbits, bufsize)
+pub fn compress(data: &[u8], level: i32, wbits: i32) -> Result<Vec<u8>, InitError> {
+    common::compress(data, level, wbits).map_err(Into::into)
+}
+
+#[inline(never)]
+pub fn decompress(data: &[u8], wbits: i32, bufsize: usize) -> Result<Vec<u8>, InitError> {
+    common::decompress(data, wbits, bufsize).map_err(Into::into)
 }
 
 pub struct Compressor(common::Compressor);
@@ -36,8 +60,10 @@ impl Compressor {
         mem_level: i32,
         strategy: i32,
         zdict: Option<&[u8]>,
-    ) -> Result<Self, String> {
-        common::Compressor::new(level, method, wbits, mem_level, strategy, zdict).map(Self)
+    ) -> Result<Self, InitError> {
+        common::Compressor::new(level, method, wbits, mem_level, strategy, zdict)
+            .map(Self)
+            .map_err(Into::into)
     }
 
     #[inline(never)]
@@ -65,8 +91,10 @@ pub struct Decompressor(common::Decompressor);
 
 impl Decompressor {
     #[inline(never)]
-    pub fn new(wbits: i32, zdict: Option<Vec<u8>>) -> Result<Self, String> {
-        common::Decompressor::new(wbits, zdict).map(Self)
+    pub fn new(wbits: i32, zdict: Option<Vec<u8>>) -> Result<Self, InitError> {
+        common::Decompressor::new(wbits, zdict)
+            .map(Self)
+            .map_err(Into::into)
     }
 
     #[inline(never)]
@@ -119,8 +147,10 @@ pub struct ZlibDecompressor(common::ZlibDecompressor);
 
 impl ZlibDecompressor {
     #[inline(never)]
-    pub fn new(wbits: i32, zdict: Option<Vec<u8>>) -> Result<Self, String> {
-        common::ZlibDecompressor::new(wbits, zdict).map(Self)
+    pub fn new(wbits: i32, zdict: Option<Vec<u8>>) -> Result<Self, InitError> {
+        common::ZlibDecompressor::new(wbits, zdict)
+            .map(Self)
+            .map_err(Into::into)
     }
 
     #[inline(never)]

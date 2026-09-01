@@ -79,19 +79,19 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # names `MarshalError::DataTooShort` / `EofObject` and `CFormatType::Bytes`,
 # which arrived with it.
 #
-# Moved to the head of RustPython #8631 for the feature-gated, VM-independent
-# zlib stream engine shared by rustpython-stdlib and pyre-native.
+# Pinned to the merge of RustPython #8631 for the feature-gated,
+# VM-independent zlib stream engine shared by rustpython-stdlib and pyre-native.
 #
-rustpython-common = { git = "https://github.com/youknowone/RustPython.git", rev = "c3dff8fb171779fe58d13c893c530b2ba46fe109", features = ["binascii", "cjk-codecs", "inet", "json", "zlib"] }
-rustpython-literal = { git = "https://github.com/youknowone/RustPython.git", rev = "c3dff8fb171779fe58d13c893c530b2ba46fe109" }
-rustpython-compiler = { git = "https://github.com/youknowone/RustPython.git", rev = "c3dff8fb171779fe58d13c893c530b2ba46fe109" }
-rustpython-compiler-core = { git = "https://github.com/youknowone/RustPython.git", rev = "c3dff8fb171779fe58d13c893c530b2ba46fe109" }
+rustpython-common = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326", features = ["binascii", "cjk-codecs", "inet", "json", "zlib"] }
+rustpython-literal = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
+rustpython-compiler = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
+rustpython-compiler-core = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
 ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/youknowone/RustPython.git", rev = "c3dff8fb171779fe58d13c893c530b2ba46fe109" }
-rustpython-wtf8 = { git = "https://github.com/youknowone/RustPython.git", rev = "c3dff8fb171779fe58d13c893c530b2ba46fe109" }
-rustpython-unicode = { git = "https://github.com/youknowone/RustPython.git", rev = "c3dff8fb171779fe58d13c893c530b2ba46fe109" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/youknowone/RustPython.git", rev = "c3dff8fb171779fe58d13c893c530b2ba46fe109" }
+rustpython-host_env = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
+rustpython-wtf8 = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
+rustpython-unicode = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
