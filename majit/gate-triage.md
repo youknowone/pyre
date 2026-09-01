@@ -255,6 +255,13 @@ cover the condition they diagnose.
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_GUARD_RESUME_REFUSE_PENDING_FIELDS`
+
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
+- Accessor: `guard_resume_refuse_pending_fields()`
+- What it does: Restores `guard_carries_pending_fields`, the refusal to build a guard-resume bridge for a guard whose deferred writes span more than one virtual. Off by default: upstream has no such refusal, and the double-application it once guarded against is answered by siting the decision ahead of `start_bridge_tracing` rather than by declining. Kept so the two answers stay comparable inside one binary, which a second build cannot do.
+- Retirement condition: Remove once no consumer needs the refusal restored to attribute a result.
+
 ### `MAJIT_HEAPDBG`
 
 - Read sites: 1 — `majit/majit-metainterp/src/lib.rs`

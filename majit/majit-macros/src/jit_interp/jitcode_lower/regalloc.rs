@@ -422,11 +422,7 @@ mod tests {
             quote! { __builder.load_const_i_value(1u16, 41i64); },
         );
         lowerer.emit_op(
-            OpMeta::linear(
-                OpKind::Call,
-                vec![Register::int(1)],
-                vec![Register::int(2)],
-            ),
+            OpMeta::linear(OpKind::Call, vec![Register::int(1)], vec![Register::int(2)]),
             quote! {
                 let __typed_args = &[majit_metainterp::JitCallArg::int(1u16)];
                 __builder.residual_call_int_canonical_via_target(__fn_idx, __typed_args, 2u16);

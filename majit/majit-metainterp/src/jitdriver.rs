@@ -605,6 +605,18 @@ fn no_guard_resume_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_GUARD_RESUME_BRIDGE").is_some())
 }
+/// Restores the refusal of a guard-resume bridge for a guard whose deferred
+/// writes span more than one virtual.
+///
+/// Off by default, because upstream has no such refusal —
+/// `compile.py ResumeGuardDescr.handle_fail` bridges whenever `must_compile`
+/// fires. The cut decides a large share of every bridge opportunity, so the
+/// two answers have to stay comparable inside ONE binary; a second build is
+/// not a control for that question.
+fn guard_resume_refuse_pending_fields() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_GUARD_RESUME_REFUSE_PENDING_FIELDS").is_some())
+}
 fn guardlog_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
@@ -5388,18 +5400,22 @@ impl<S: JitState> JitDriver<S> {
         // position to re-enter at; every other JitState resumes through its
         // own frontend.
         let dispatch = self.dispatch_jitcode().cloned()?;
-        // The cut below is a MASK, not a boundary: it refuses a guard whose
-        // deferred writes span more than one virtual. The wrong answers that
-        // motivated it were never this entry's to begin with — they are made
-        // at the CLOSE, by a loop whose single LABEL its own closing JUMP
-        // specialized, and `compile_loop` now declines to compile that shape
-        // rather than publishing a label nothing can enter soundly (see
-        // `MetaInterp::closing_jump_fixes_label_slots`).
+        // The cut below is OFF by default and upstream has no equivalent:
+        // `compile.py ResumeGuardDescr.handle_fail` bridges whenever
+        // `must_compile` fires, whatever the guard's deferred writes look
+        // like. What the guard's pendingfields once threatened was a double
+        // application — the entry's applying reader storing them on its way
+        // in and the blackhole arm this decline hands the guard to storing
+        // them again — and that is answered by SITING the decision ahead of
+        // `start_bridge_tracing`, which is where it now is, not by refusing.
+        // A guard admitted here reaches exactly one of the two readers.
         //
-        // What is left here is policy. Rebuilding a bridge entry from resume
-        // data is sound on its own; this only narrows which guards are given
-        // one. Nothing below depends on the cut for correctness, and removing
-        // it cannot reintroduce the close-side defect.
+        // The wrong answers that later narrowed the cut to `nv > 1` were
+        // never this entry's either: they are made at the CLOSE, by a loop
+        // whose single LABEL its own closing JUMP specialized, and
+        // `compile_loop` now declines to compile that shape rather than
+        // publishing a label nothing can enter soundly (see
+        // `MetaInterp::closing_jump_fixes_label_slots`).
         //
         // Sited here rather than in the ladder below because
         // `compile.py ResumeGuardDescr.handle_fail` runs ONE of resume.py's
@@ -5410,7 +5426,7 @@ impl<S: JitState> JitDriver<S> {
         if no_guard_resume_bridge_enabled() {
             return None;
         }
-        if self.guard_carries_pending_fields(descr_arc) {
+        if guard_resume_refuse_pending_fields() && self.guard_carries_pending_fields(descr_arc) {
             let why = GuardResumeDecline::ReplayIncomplete;
             crate::mc_diag_bump(why.diag_slot());
             if crate::majit_log_enabled() {
@@ -6665,9 +6681,19 @@ impl<S: JitState> JitDriver<S> {
                         bh_sf.float_scalar_base,
                         bh_sf.num_float_scalars,
                     );
-                    let sf_before_i = bh.registers_i[sf_i.clone()].to_vec();
-                    let sf_before_r = bh.registers_r[sf_r.clone()].to_vec();
-                    let sf_before_f = bh.registers_f[sf_f.clone()].to_vec();
+                    // Three register-bank copies, and their only purpose is
+                    // `guard_may_bridge` below, whose only reader takes them
+                    // under `should_bridge`. A guard the counter has not
+                    // fired for pays them on every failure and asks nothing
+                    // of them, and that is the common case by orders of
+                    // magnitude.
+                    let sf_before = should_bridge.then(|| {
+                        (
+                            bh.registers_i[sf_i.clone()].to_vec(),
+                            bh.registers_r[sf_r.clone()].to_vec(),
+                            bh.registers_f[sf_f.clone()].to_vec(),
+                        )
+                    });
                     let outcome = loop {
                         match bh.resume_mainloop(cur_exc) {
                             Ok(next_exc) => match bh.nextblackholeinterp.take() {
@@ -6724,11 +6750,17 @@ impl<S: JitState> JitDriver<S> {
                     //
                     // A walk that crossed a frame boundary is not judged by one
                     // frame's registers, so it does not qualify.
-                    let tail_wrote_state = bh.registers_i[sf_i] != sf_before_i[..]
-                        || bh.registers_r[sf_r] != sf_before_r[..]
-                        || bh.registers_f[sf_f] != sf_before_f[..];
-                    let guard_may_bridge =
-                        bh_frames_popped == 0 && !bh.called_residual.get() && !tail_wrote_state;
+                    let guard_may_bridge = match &sf_before {
+                        Some((before_i, before_r, before_f)) => {
+                            let tail_wrote_state = bh.registers_i[sf_i] != before_i[..]
+                                || bh.registers_r[sf_r] != before_r[..]
+                                || bh.registers_f[sf_f] != before_f[..];
+                            bh_frames_popped == 0 && !bh.called_residual.get() && !tail_wrote_state
+                        }
+                        // Only reachable with `should_bridge` false, where the
+                        // reader below short-circuits before asking.
+                        None => false,
+                    };
                     let mut portal_crn_handled = false;
                     let resume_pc = match outcome {
                         // Next merge point reached (loop back-edge): flush the
