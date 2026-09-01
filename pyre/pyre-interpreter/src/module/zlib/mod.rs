@@ -1,9 +1,9 @@
 //! zlib module — PyPy: `pypy/module/zlib/`.
 //!
 //! CRC-32 / Adler-32 checksums plus the DEFLATE compress/decompress surface.
-//! The DEFLATE machinery is a deliberate duplication of RustPython's zlib
-//! implementation, ported into `pyre_native::zlib` (flate2 / zlib-rs) and kept
-//! outside the LLBC extraction; this module is the W_Root object glue.
+//! The DEFLATE machinery is shared with RustPython through
+//! `rustpython_common::compression::zlib`.  `pyre_native::zlib` keeps an opaque
+//! adapter outside LLBC extraction; this module is the W_Root object glue.
 //!
 //! `Compress` / `Decompress` / `_ZlibDecompressor` own their native stream
 //! directly, matching `interp_zlib.py`'s `self.stream`.  Each stream also owns
@@ -123,6 +123,15 @@ fn zlib_error(msg: impl Into<String>) -> crate::PyError {
         }
     }
     err
+}
+
+fn init_error(error: backend::InitError) -> crate::PyError {
+    match error {
+        backend::InitError::InvalidOption => {
+            crate::PyError::value_error("Invalid initialization option")
+        }
+        backend::InitError::Zlib(message) => zlib_error(message),
+    }
 }
 
 fn eof_error(msg: &str) -> crate::PyError {
@@ -373,7 +382,7 @@ fn make_compress_for(
         return Err(crate::PyError::value_error("Invalid initialization option"));
     }
     let c = backend::Compressor::new(level, method, wbits, mem_level, strategy, zdict.as_deref())
-        .map_err(zlib_error)?;
+        .map_err(init_error)?;
     allocate_compress(cls, c)
 }
 
@@ -624,7 +633,7 @@ fn make_decompress_for(
         // conversion for inflateInit2.
         return Err(crate::PyError::value_error("Invalid initialization option"));
     }
-    let d = backend::Decompressor::new(wbits, zdict).map_err(zlib_error)?;
+    let d = backend::Decompressor::new(wbits, zdict).map_err(init_error)?;
     allocate_decompress(cls, d)
 }
 
@@ -719,7 +728,7 @@ fn zdecompress_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         backend::MAX_WBITS as i64,
     )?);
     let zdict = zdict_or_none(args.get(2).copied().unwrap_or(PY_NULL))?;
-    let d = backend::ZlibDecompressor::new(wbits, zdict).map_err(zlib_error)?;
+    let d = backend::ZlibDecompressor::new(wbits, zdict).map_err(init_error)?;
     let cls = args.first().copied().unwrap_or_else(zdecompress_type);
     allocate_zdecompress(cls, d)
 }
@@ -892,7 +901,7 @@ crate::py_module! {
         ) -> Result<PyObjectRef, crate::PyError> {
             let level = int_or_default(level, -1)? as i32;
             let wbits = to_wbits(int_or_default(wbits, backend::MAX_WBITS as i64)?);
-            let out = backend::compress(&data, level, wbits).map_err(zlib_error)?;
+            let out = backend::compress(&data, level, wbits).map_err(init_error)?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
         // interp_zlib.py `decompress(string, __posonly__=None, wbits, bufsize)`.
@@ -909,7 +918,7 @@ crate::py_module! {
             if bufsize < 0 {
                 return Err(crate::PyError::value_error("bufsize must be non-negative"));
             }
-            let out = backend::decompress(&data, wbits, bufsize as usize).map_err(zlib_error)?;
+            let out = backend::decompress(&data, wbits, bufsize as usize).map_err(init_error)?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
         // interp_zlib.py `Compress___new__(level, method, wbits, memLevel,
