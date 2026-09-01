@@ -5516,7 +5516,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // warmspot.py handle_jitexception_from_blackhole parity:
     // portal_runner is called when ContinueRunningNormally is raised
     // at a recursive portal level during blackhole execution.
-    majit_metainterp::blackhole::register_portal_runner_hook(pyre_portal_runner);
+    // Index 0 is pyre's own `PyPyJitDriver` portal (`interp_jit.py`), the only
+    // driver this process installs a Rust-side runner for; a second driver
+    // registers its own under its own index.
+    majit_metainterp::blackhole::register_portal_runner_hook(0, pyre_portal_runner);
     // pypy/module/pypyjit/interp_jit.py PyPyJitDriver(..., is_recursive=True).
     // Drives MetaInterp.is_main_jitcode() / is_portal_jitcode dispatch
     // — without this flag the recursive-portal bookkeeping stays
@@ -9616,11 +9619,19 @@ pub(crate) fn pyre_portal_runner(
     let pycode = all_r.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
     let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
     let ec = all_r.get(2).copied().unwrap_or(0) as *const pyre_interpreter::PyExecutionContext;
-    if frame_ptr.is_null() {
-        return Err(PortalRunnerFailure::jit(
-            JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(0)),
-        ));
-    }
+    // `warmspot.py:976` calls `portal_ptr(*args)` unconditionally: the reds a
+    // `ContinueRunningNormally` carries are the portal's own arguments, so the
+    // frame red is always present.  A null one means the CRN was built with the
+    // wrong red layout, and there is no exception to report — an
+    // `ExitFrameWithExceptionRef(GcRef(0))` would reach `resume_mainloop` as
+    // "no exception pending" and let the failure pass silently.
+    assert!(
+        !frame_ptr.is_null(),
+        "portal runner: ContinueRunningNormally carried no frame red \
+         (red_ref[1]); greens={} reds={}",
+        green_ref.len(),
+        red_ref.len(),
+    );
     let frame = unsafe { &mut *frame_ptr };
     // warmspot.py:976 forwards the CRN values to `portal_ptr`; it does not
     // rewrite the red frame's identity. Retain the activation's own pycode

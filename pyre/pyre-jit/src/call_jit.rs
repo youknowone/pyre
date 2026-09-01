@@ -2833,6 +2833,13 @@ pub fn blackhole_resume_via_rd_numb(
                 d.result_type = 'r';
                 d
             },
+            // `get_portal_runner` reaches this table by INDEX
+            // (`jitdrivers_sd[jdindex]`), so the driver never has to be found
+            // by its portal jitcode here.  Leaving it unset keeps
+            // `portal_jd_for` from claiming a frame for a synthetic driver
+            // assembled around whichever jitcode happened to be innermost when
+            // the chain was built.
+            mainjitcode: None,
         }]);
     {
         let vinfo = bh.virtualizable_info;
@@ -3060,8 +3067,27 @@ pub fn blackhole_resume_via_rd_numb(
         // continuation and the call result is deliberately garbage on raise.
         // Running even one opcode first consumes that garbage as a successful
         // return and replaces the real exception with a secondary TypeError.
-        if !bh.got_exception
-            && let Some(args) = bh.run()
+        let run_outcome = (!bh.got_exception).then(|| bh.run());
+        // A frame that ran out of bytecode never reached a `*_return` handler,
+        // so `return_type` and `tmpreg_*` still hold whatever the previous
+        // occupant of this pooled interpreter left there — and the tail of this
+        // loop publishes exactly those two to the caller.  `blackhole.py`'s
+        // `dispatch_loop` cannot reach that state at all: it is `while True:`
+        // over `ord(code[position])`, so reading past the end raises.
+        if matches!(
+            run_outcome,
+            Some(majit_metainterp::blackhole::BhRunOutcome::EndOfCode)
+        ) {
+            let name = bh.jitcode.name().to_string();
+            let index = bh.jitcode.try_index();
+            release_bh_rd(bh);
+            panic!(
+                "blackhole_resume_via_rd_numb: jitcode {name:?} index {index:?} ended \
+                 without a return opcode, so there is no result to pass to the caller"
+            );
+        }
+        if let Some(majit_metainterp::blackhole::BhRunOutcome::ContinueRunningNormally(args)) =
+            run_outcome
         {
             // blackhole.py:1068: raise ContinueRunningNormally(*args)
             //
