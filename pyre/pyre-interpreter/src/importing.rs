@@ -3139,10 +3139,20 @@ pub(crate) fn sys_modules_registry_get(name: &str) -> Option<PyObjectRef> {
 /// report it — `None` is not a module it can hand back, so it falls through
 /// to the search — hence the separate lookup.
 fn sys_modules_blocks(name: &str) -> bool {
-    // Build the key before reading the dict, the order `check_sys_modules`
+    sys_modules_blocks_key(pyre_object::w_str_new(name))
+}
+
+/// [`sys_modules_blocks`] for a name with no `&str` spelling.  A module name
+/// is WTF-8 and may carry a lone surrogate, and `sys.modules` is free to hold
+/// such a name as a key, so the block is asked for as an object.
+fn sys_modules_blocks_wtf8(name: &Wtf8) -> bool {
+    sys_modules_blocks_key(pyre_object::w_str_from_wtf8(name.to_owned()))
+}
+
+fn sys_modules_blocks_key(key: PyObjectRef) -> bool {
+    // The key is built before the dict is read, the order `check_sys_modules`
     // uses: reading the thread-local last keeps the borrow off the stack
     // across the allocation.
-    let key = pyre_object::w_str_new(name);
     let dict = sys_modules_dict();
     if dict.is_null() {
         return false;
@@ -5414,46 +5424,68 @@ pub fn dunder_import(
         if let Some(w_mod) = gcd_import_fast(name)? {
             let mod_slot = shadow_stack_len();
             let _ = pin_root(w_mod);
-            // `interp_import.py interp___import__` — the list is tested only
-            // once the cache hit is in hand.  Testing it before `_gcd_import` would
-            // call a stateful `__bool__` on the give-up path too, and the
-            // importer this falls through to makes the one test `__import__`
-            // owes it.
-            let have_fromlist =
-                !fromlist_missing && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?;
-            if !have_fromlist {
-                let dotindex = rpython_str_find_char(name, '.', 0);
-                if dotindex < 0 {
-                    return Ok(shadow_stack_get(mod_slot));
-                }
-                // `import a.b` answers `a`; give up when the top-level
-                // ancestor is not initialised yet.
-                if let Some(w_top) = gcd_import_fast(rpython_str_slice_prefix(name, dotindex))? {
-                    return Ok(w_top);
-                }
-            } else if crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__path__")?
-                .is_none()
-            {
-                return Ok(shadow_stack_get(mod_slot));
-            } else if let Some(w_handled) =
-                handle_fromlist_fast(shadow_stack_get(mod_slot), shadow_stack_get(fromlist_slot))?
-            {
-                return Ok(w_handled);
+            // `import a.b` answers `a`.  The head is resolved BEFORE the list
+            // is tested, so a name whose head is not in `sys.modules` gives up
+            // without testing at all: the give-up re-enters `__import__`
+            // through the slow path, and that importer makes the one test a
+            // stateful `__bool__` is owed.  Resolving the head is a
+            // `sys.modules` lookup, so running it ahead of the test runs no
+            // Python code and reorders nothing observable.  A missing head
+            // gives up from the non-empty arm too, which
+            // `interp_import.py interp___import__` reaches without the head;
+            // the slow path answers that arm identically.
+            let dotindex = rpython_str_find_char(name, '.', 0);
+            let w_head = if dotindex < 0 {
+                Some(shadow_stack_get(mod_slot))
             } else {
-                // `interp_import.py interp___import__` returns from both arms
-                // of the package test; the `_handle_fromlist` it calls is
-                // always installed upstream.  While it is not, the native one stands
-                // in here.  Falling through to the slow path instead would
-                // resolve the same cached module a second time and test the
-                // list a second time, and `__import__` owes a stateful
-                // `__bool__` exactly one test.
-                handle_fromlist(
+                gcd_import_fast(rpython_str_slice_prefix(name, dotindex))?
+            };
+            // Give up before the test when the top-level ancestor is not
+            // initialised yet; the slow path both resolves it and tests once.
+            if let Some(w_head) = w_head {
+                let head_slot = shadow_stack_len();
+                let _ = pin_root(w_head);
+                // `interp_import.py interp___import__` — the list is tested
+                // only once the cache hit is in hand.
+                let have_fromlist = !fromlist_missing
+                    && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?;
+                if !have_fromlist {
+                    return Ok(shadow_stack_get(head_slot));
+                } else if crate::baseobjspace::findattr_result(
+                    shadow_stack_get(mod_slot),
+                    "__path__",
+                )?
+                .is_none()
+                {
+                    return Ok(shadow_stack_get(mod_slot));
+                } else if let Some(w_handled) = handle_fromlist_fast(
                     shadow_stack_get(mod_slot),
                     shadow_stack_get(fromlist_slot),
-                    false,
-                    execution_context,
-                )?;
-                return Ok(shadow_stack_get(mod_slot));
+                )? {
+                    return Ok(w_handled);
+                } else if get_sys_module("importlib._bootstrap").is_none() {
+                    // `interp_import.py interp___import__` returns from both
+                    // arms of the package test; the `_handle_fromlist` it
+                    // calls is always installed upstream.  While the bootstrap
+                    // is not installed at all, the native one stands in here.
+                    // Falling through to the slow path instead would resolve
+                    // the same cached module a second time and test the list a
+                    // second time, and `__import__` owes a stateful `__bool__`
+                    // exactly one test.
+                    handle_fromlist(
+                        shadow_stack_get(mod_slot),
+                        shadow_stack_get(fromlist_slot),
+                        false,
+                        execution_context,
+                    )?;
+                    return Ok(shadow_stack_get(mod_slot));
+                }
+                // An installed bootstrap that cannot serve `_handle_fromlist`
+                // is a broken bootstrap, not an absent one.  `_bootstrap.
+                // __import__` reaches the handler as a module global and
+                // raises when it is gone, so fall through to the slow path and
+                // let that error be the one `__import__` reports rather than
+                // answering from the native handler.
             }
         }
     }
@@ -6017,10 +6049,22 @@ fn handle_fromlist(
             Wtf8::new(""),
         )?);
         // The native importer names modules by `&str` throughout, so a child
-        // whose name has no UTF-8 spelling can be neither found, cached nor
-        // blocked here.  That is the outcome `_handle_fromlist` already
-        // swallows: the import raises `ModuleNotFoundError` for exactly this
-        // name and no `sys.modules` entry contradicts it.
+        // whose name has no UTF-8 spelling can be neither found nor cached
+        // here.  That is the outcome `_handle_fromlist` already swallows: the
+        // import raises `ModuleNotFoundError` for exactly this name.  The one
+        // entry that contradicts the swallow is an explicit `None` block, and
+        // `sys.modules.get(from_name, _NEEDS_LOADING) is not None` reads it
+        // whatever the name spells — so ask for it as an object before
+        // swallowing, and re-raise the error the import would have raised.
+        if from_name.as_str().is_err() && sys_modules_blocks_wtf8(&from_name) {
+            let mut message: Wtf8Buf = "No module named '".into();
+            message.push_wtf8(&from_name);
+            message.push_str("'");
+            return Err(crate::PyError::module_not_found_with_name_obj(
+                message,
+                pyre_object::w_str_from_wtf8(from_name),
+            ));
+        }
         let Ok(child) = from_name.as_str() else {
             continue;
         };
