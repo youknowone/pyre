@@ -93,6 +93,22 @@ pub(crate) fn is_checked_arith_target(target: &CallTarget) -> bool {
         && checked_arith_ovf_opname(leaf).is_some()
 }
 
+/// `true` for the signed width atoms (`{"Literal": {"Int": _}}`) whose
+/// overflow bound is the one `add_ovf` / `sub_ovf` / `mul_ovf` test.
+///
+/// Charon spells every inherent integer impl as `<Impl>`, so
+/// [`is_checked_arith_target`] cannot tell `i8::checked_add` from
+/// `i64::checked_add` by path, and `tyref_to_value_type` colors every signed
+/// width `Int`.  Fusing a narrower width answers a different question than
+/// the source asked: `127i8.checked_add(1)` overflows `i8` but not the
+/// machine word, so the rewrite would take the success continuation carrying
+/// `128` where the residual call returns `None`.  `Isize` is the machine word
+/// by definition and shares the equivalence `get_type_flag` already makes for
+/// it; `I128` is wider than the int bank.
+pub(crate) fn is_ovf_width_int_atom(atom: &str) -> bool {
+    matches!(atom, "I64" | "Isize")
+}
+
 /// The `Option::ok_or_else` continuation paired with a signed checked-arith
 /// result.  The MIR collector resolves the type-owned names while the Rust
 /// types are still in hand; the post-pass validates that the call immediately
@@ -685,6 +701,18 @@ mod tests {
     }
 
     #[test]
+    /// The rewrite emits a machine-word `*_ovf`, so only the atoms whose
+    /// overflow bound IS that word may reach it.
+    #[test]
+    fn only_machine_word_signed_atoms_reach_the_ovf_rewrite() {
+        for atom in ["I64", "Isize"] {
+            assert!(is_ovf_width_int_atom(atom), "{atom} should fuse");
+        }
+        for atom in ["I8", "I16", "I32", "I128", "U64", "Usize"] {
+            assert!(!is_ovf_width_int_atom(atom), "{atom} should decline");
+        }
+    }
+
     fn rewrite_lifts_checked_add_to_add_ovf_with_overflow_edge() {
         let mut g = FunctionGraph::new("test_checked_add");
         let a = g.startblock;
