@@ -4154,27 +4154,27 @@ static MEMORY_ERROR_PROVIDER: std::sync::OnceLock<fn() -> i64> = std::sync::Once
 /// is stored there, with zero replaced by 29872897 so a computed value is
 /// distinguishable from the sentinel.
 ///
-/// PyPy relies on process serialization here.  Pyre's CPython-3.14t contract
-/// permits concurrent readers, so the same one-word owner is accessed
-/// atomically rather than duplicated in a side table.
+/// The word is read and written the same way the compiled path reaches it.
+/// `build_ll_strhash_internal_helper_graph` implements `_ll_strhash` as an
+/// ordinary `getfield`/`setfield` pair on this field, and both backends lower
+/// those to plain loads and stores, so this must not be the one accessor that
+/// makes it atomic: a location reached atomically by one writer and plainly by
+/// another is a data race whichever way the race resolves.
+///
+/// The store stays benign for the same reason it is in `LLHelpers`: every racing
+/// writer computes the identical value from immutable characters, so a losing
+/// writer overwrites the word with what is already there.
 fn blackhole_cached_hash(string_ptr: i64, compute: impl FnOnce() -> i64) -> i64 {
     assert_ne!(string_ptr, 0, "blackhole string hash: null string");
-    let cache = unsafe { &*(string_ptr as usize as *const std::sync::atomic::AtomicIsize) };
-    let cached = cache.load(std::sync::atomic::Ordering::Acquire);
+    let cache = string_ptr as usize as *mut isize;
+    let cached = unsafe { std::ptr::read(cache) };
     if cached != 0 {
         return cached as i64;
     }
     let computed = compute() as isize;
     let computed = if computed == 0 { 29_872_897 } else { computed };
-    match cache.compare_exchange(
-        0,
-        computed,
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-    ) {
-        Ok(_) => computed as i64,
-        Err(winner) => winner as i64,
-    }
+    unsafe { std::ptr::write(cache, computed) };
+    computed as i64
 }
 
 /// Install the `memory_error` singleton provider.  Called once from
