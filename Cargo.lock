@@ -2866,7 +2866,6 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "rustls-webpki",
- "rustpython-common",
  "rustpython-host_env",
  "scrypt 0.11.0",
  "sha1",

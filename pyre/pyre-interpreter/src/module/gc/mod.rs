@@ -1267,10 +1267,17 @@ fn dump_rpy_heap_fd(fd: i32) -> Result<(), crate::PyError> {
 }
 
 fn typeids_z_bytes() -> Result<Vec<u8>, crate::PyError> {
+    use rustpython_common::compression::zlib;
+
     let text = majit_gc::get_typeids_text()
         .ok_or_else(|| crate::PyError::not_implemented("operation not implemented by this GC"))?;
-    pyre_native::zlib::compress(&text, 9, pyre_native::zlib::MAX_WBITS)
-        .map_err(|error| crate::PyError::os_error(error.into_message()))
+    zlib::compress(&text, 9, zlib::MAX_WBITS).map_err(|error| {
+        let message = match error {
+            zlib::InitError::InvalidOption => "Invalid initialization option".to_owned(),
+            zlib::InitError::Zlib(message) => message,
+        };
+        crate::PyError::os_error(message)
+    })
 }
 
 /// The spelling each typeid sidecar wants. `app_referents.py:34` opens
