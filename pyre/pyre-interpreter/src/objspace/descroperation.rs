@@ -3036,12 +3036,75 @@ unsafe fn dunder_overridden(obj: PyObjectRef, dunder: &str, tp: PyObjectRef) -> 
     }
 }
 
+/// Special-method pair passed to the residual override gates below.  A
+/// residual call gives every argument one machine word, so a `&str` — a fat
+/// pointer — cannot be published through `jit_fnaddr`, and a traced caller
+/// is left holding an unbound symbolic residual where a bound call belongs.
+/// A fieldless enum is one word, so the gate stays bindable; the names are
+/// recovered inside the residual, where the lookups they feed already live.
+#[derive(Clone, Copy)]
+pub(crate) enum BinopDunder {
+    Add,
+    Sub,
+    Mul,
+    FloorDiv,
+    Mod,
+    TrueDiv,
+    Pow,
+    DivMod,
+    LShift,
+    RShift,
+    And,
+    Or,
+    Xor,
+}
+
+impl BinopDunder {
+    /// The forward name and its reflected counterpart, in that order.
+    fn names(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Add => ("__add__", "__radd__"),
+            Self::Sub => ("__sub__", "__rsub__"),
+            Self::Mul => ("__mul__", "__rmul__"),
+            Self::FloorDiv => ("__floordiv__", "__rfloordiv__"),
+            Self::Mod => ("__mod__", "__rmod__"),
+            Self::TrueDiv => ("__truediv__", "__rtruediv__"),
+            Self::Pow => ("__pow__", "__rpow__"),
+            Self::DivMod => ("__divmod__", "__rdivmod__"),
+            Self::LShift => ("__lshift__", "__rlshift__"),
+            Self::RShift => ("__rshift__", "__rrshift__"),
+            Self::And => ("__and__", "__rand__"),
+            Self::Or => ("__or__", "__ror__"),
+            Self::Xor => ("__xor__", "__rxor__"),
+        }
+    }
+}
+
+/// Unary special-method name, carried as a word for the same reason as
+/// [`BinopDunder`].
+#[derive(Clone, Copy)]
+pub(crate) enum UnaryDunder {
+    Pos,
+    Neg,
+    Invert,
+}
+
+impl UnaryDunder {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pos => "__pos__",
+            Self::Neg => "__neg__",
+            Self::Invert => "__invert__",
+        }
+    }
+}
+
 /// Builtin sequence base selected by [`needs_seq_binop_dispatch`].  The
 /// caller passes this discriminant instead of a `&STR_TYPE`/… static so
 /// the type-static load stays inside the residual helper, off the traced
 /// `add` graph.
 #[derive(Clone, Copy)]
-enum SeqBase {
+pub(crate) enum SeqBase {
     Str,
     List,
     Tuple,
@@ -3059,13 +3122,13 @@ enum SeqBase {
 /// traced caller emits a residual call instead of carrying an
 /// unresolvable `LoadStatic` into its JitCode.
 #[majit_macros::dont_look_inside]
-unsafe fn needs_seq_binop_dispatch(
+pub(crate) unsafe fn needs_seq_binop_dispatch(
     a: PyObjectRef,
     b: PyObjectRef,
     base: SeqBase,
-    fwd: &str,
-    rev: &str,
+    op: BinopDunder,
 ) -> bool {
+    let (fwd, rev) = op.names();
     let tp: *const pyre_object::PyType = match base {
         SeqBase::Str => &pyre_object::STR_TYPE,
         SeqBase::List => &pyre_object::LIST_TYPE,
@@ -3087,7 +3150,12 @@ unsafe fn needs_seq_binop_dispatch(
 /// keeps the base type-static loads in the residual call, off the traced
 /// `add` graph.
 #[majit_macros::dont_look_inside]
-unsafe fn needs_bytes_binop_dispatch(a: PyObjectRef, b: PyObjectRef, fwd: &str, rev: &str) -> bool {
+pub(crate) unsafe fn needs_bytes_binop_dispatch(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: BinopDunder,
+) -> bool {
+    let (fwd, rev) = op.names();
     bytes_operand_overrides(a, fwd, rev) || bytes_operand_overrides(b, fwd, rev)
 }
 
@@ -3267,12 +3335,12 @@ unsafe fn numeric_operand_overrides(obj: PyObjectRef, dunder: &str, rdunder: &st
 /// this residual helper, off the traced numeric graph; the hot int path is
 /// specialized separately via `guard_class` in the JIT.
 #[majit_macros::dont_look_inside]
-unsafe fn needs_numeric_binop_dispatch(
+pub(crate) unsafe fn needs_numeric_binop_dispatch(
     a: PyObjectRef,
     b: PyObjectRef,
-    fwd: &str,
-    rev: &str,
+    op: BinopDunder,
 ) -> bool {
+    let (fwd, rev) = op.names();
     numeric_operand_overrides(a, fwd, rev) || numeric_operand_overrides(b, fwd, rev)
 }
 
@@ -3285,7 +3353,7 @@ unsafe fn needs_numeric_binop_dispatch(
 /// `FROZENSET_TYPE` statics here, so keep that load in this residual helper
 /// off the traced graph — mirrors `needs_seq`/`needs_bytes`/`needs_numeric`.
 #[majit_macros::dont_look_inside]
-unsafe fn needs_set_binop_dispatch(a: PyObjectRef, b: PyObjectRef) -> bool {
+pub(crate) unsafe fn needs_set_binop_dispatch(a: PyObjectRef, b: PyObjectRef) -> bool {
     let is_exact_setlike = |obj| {
         pyre_object::is_exact_type(obj, &pyre_object::setobject::SET_TYPE)
             || pyre_object::is_exact_type(obj, &pyre_object::setobject::FROZENSET_TYPE)
@@ -3295,29 +3363,29 @@ unsafe fn needs_set_binop_dispatch(a: PyObjectRef, b: PyObjectRef) -> bool {
 }
 
 /// Unary analog: true when numeric operand `a` overrides the unary
-/// special `dunder` relative to its builtin base.
+/// special named by `op` relative to its builtin base.
 #[majit_macros::dont_look_inside]
-unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, dunder: &str) -> bool {
+pub(crate) unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, op: UnaryDunder) -> bool {
     let Some(t) = numeric_base_type_of_overriding_subclass(a) else {
         return false;
     };
-    dunder_overridden(a, dunder, t.as_ptr())
+    dunder_overridden(a, op.name(), t.as_ptr())
 }
 
 /// Call the overriding unary special on a numeric subclass operand before
 /// the Rust fast path.  Returns `None` when `a` is an exact builtin
-/// numeric or does not override `dunder`, so the caller falls through.
+/// numeric or does not override `op`, so the caller falls through.
 unsafe fn try_numeric_unaryop_override(
     a: PyObjectRef,
-    dunder: &str,
+    op: UnaryDunder,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    if !needs_numeric_unaryop_dispatch(a, dunder) {
+    if !needs_numeric_unaryop_dispatch(a, op) {
         return Ok(None);
     }
     let Some(t) = crate::typedef::r#type(a) else {
         return Ok(None);
     };
-    let Some(method) = lookup_in_type_where(t.as_ptr(), dunder) else {
+    let Some(method) = lookup_in_type_where(t.as_ptr(), op.name()) else {
         return Ok(None);
     };
     Ok(Some(crate::call::call_function_impl_result(method, &[a])?))
@@ -3397,7 +3465,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `+` and `+=` — one body, see [`binop_type_error`].
 pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__add__", "__radd__");
+        let numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::Add);
         // A sequence left operand has no `nb_add` to offer, so the numeric
         // override runs the right operand's alone; the concat branches below
         // are `PyNumber_Add`'s `sq_concat` fall-through and already reach
@@ -3427,7 +3495,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             // descroperation.py:664 "unicode + string subclass" — a str
             // subclass overriding `__add__`/`__radd__` must reach the
             // reflected dispatch; otherwise concat directly.
-            if needs_seq_binop_dispatch(a, b, SeqBase::Str, "__add__", "__radd__")
+            if needs_seq_binop_dispatch(a, b, SeqBase::Str, BinopDunder::Add)
                 && let Some(result) =
                     try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
             {
@@ -3451,7 +3519,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             }
         }
         if is_list(a) && is_list(b) {
-            if needs_seq_binop_dispatch(a, b, SeqBase::List, "__add__", "__radd__")
+            if needs_seq_binop_dispatch(a, b, SeqBase::List, BinopDunder::Add)
                 && let Some(result) =
                     try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
             {
@@ -3480,7 +3548,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             }
         }
         if is_tuple(a) && is_tuple(b) {
-            if needs_seq_binop_dispatch(a, b, SeqBase::Tuple, "__add__", "__radd__")
+            if needs_seq_binop_dispatch(a, b, SeqBase::Tuple, BinopDunder::Add)
                 && let Some(result) =
                     try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
             {
@@ -3508,7 +3576,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
                 // Only a real bytes-like rhs can carry a subclass `__radd__`;
                 // a memoryview cannot, so dispatch only when both are bytes-like.
                 if pyre_object::bytesobject::is_bytes_like(b)
-                    && needs_bytes_binop_dispatch(a, b, "__add__", "__radd__")
+                    && needs_bytes_binop_dispatch(a, b, BinopDunder::Add)
                     && let Some(result) =
                         try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
                 {
@@ -3571,7 +3639,7 @@ pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         {
             return Ok(result);
         }
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__sub__", "__rsub__");
+        let numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::Sub);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__sub__", "__rsub__")?
@@ -3618,7 +3686,7 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `*` and `*=` — one body, see [`binop_type_error`].
 pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__mul__", "__rmul__");
+        let numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::Mul);
         // As in [`binop_add_impl`]: a sequence operand carries no
         // `nb_multiply`, so only the other operand's runs here.
         if numeric_override
@@ -3755,7 +3823,7 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `//` and `//=` — one body, see [`binop_type_error`].
 pub(crate) fn floordiv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__floordiv__", "__rfloordiv__");
+        let numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::FloorDiv);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__floordiv__", "__rfloordiv__")?
@@ -3811,7 +3879,7 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `%` and `%=` — one body, see [`binop_type_error`].
 pub(crate) fn mod_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__mod__", "__rmod__");
+        let numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::Mod);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__mod__", "__rmod__")?
@@ -3893,7 +3961,7 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `/` and `/=` — one body, see [`binop_type_error`].
 pub(crate) fn truediv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__truediv__", "__rtruediv__");
+        let numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::TrueDiv);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__truediv__", "__rtruediv__")?
@@ -3951,7 +4019,7 @@ pub(crate) fn truediv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str)
 /// fast paths nor `__pow__` / `__rpow__` produce a result.
 fn pow_binary(a: &mut PyObjectRef, b: &mut PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch(*a, *b, "__pow__", "__rpow__");
+        let numeric_override = needs_numeric_binop_dispatch(*a, *b, BinopDunder::Pow);
         if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
                 return Ok(Some(result));
@@ -4722,7 +4790,7 @@ pub fn pow3(mut base: PyObjectRef, mut exp: PyObjectRef, mut modulus: PyObjectRe
 pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     let numeric_override;
     unsafe {
-        numeric_override = needs_numeric_binop_dispatch(a, b, "__divmod__", "__rdivmod__");
+        numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::DivMod);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__divmod__", "__rdivmod__")?
@@ -4910,7 +4978,7 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `<<` and `<<=` — one body, see [`binop_type_error`].
 pub(crate) fn lshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__lshift__", "__rlshift__");
+        let numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::LShift);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__lshift__", "__rlshift__")?
@@ -4944,7 +5012,7 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `>>` and `>>=` — one body, see [`binop_type_error`].
 pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__rshift__", "__rrshift__");
+        let numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::RShift);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__rshift__", "__rrshift__")?
@@ -4985,7 +5053,7 @@ pub(crate) fn and_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         {
             return Ok(result);
         }
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__and__", "__rand__");
+        let numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::And);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__and__", "__rand__")?
@@ -5069,7 +5137,7 @@ pub(crate) fn or_impl(a: PyObjectRef, b: PyObjectRef, symbol: &str) -> PyResult 
     };
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
-        let numeric = needs_numeric_binop_dispatch(a, b, "__or__", "__ror__");
+        let numeric = needs_numeric_binop_dispatch(a, b, BinopDunder::Or);
         if set_override
             && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__or__", "__ror__")?
         {
@@ -5163,7 +5231,7 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         {
             return Ok(result);
         }
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__xor__", "__rxor__");
+        let numeric_override = needs_numeric_binop_dispatch(a, b, BinopDunder::Xor);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__xor__", "__rxor__")?
@@ -5767,7 +5835,7 @@ impl CompareOp {
 
 pub fn pos(a: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_numeric_unaryop_override(a, "__pos__")? {
+        if let Some(result) = try_numeric_unaryop_override(a, UnaryDunder::Pos)? {
             return Ok(result);
         }
         pos_inner(a)
@@ -5858,7 +5926,7 @@ fn bad_operand_type(descr: &str, a: PyObjectRef) -> PyError {
 
 pub fn neg(a: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_numeric_unaryop_override(a, "__neg__")? {
+        if let Some(result) = try_numeric_unaryop_override(a, UnaryDunder::Neg)? {
             return Ok(result);
         }
         neg_inner(a)
@@ -5938,7 +6006,7 @@ pub(crate) fn bool_invert_deprecation_text() -> PyObjectRef {
 
 pub fn invert(a: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_numeric_unaryop_override(a, "__invert__")? {
+        if let Some(result) = try_numeric_unaryop_override(a, UnaryDunder::Invert)? {
             return Ok(result);
         }
         if is_bool(a) {

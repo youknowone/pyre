@@ -55,6 +55,15 @@ impl<T: rustpython_compiler_core::bytecode::OpArgType> ResidualSlot
 {
 }
 
+/// The dunder-pair and builtin-base discriminants the override gates in
+/// `descroperation` take.  Each is a fieldless enum, which the front models
+/// as its discriminant integer (`tyref_is_fieldless_enum_free`), so it fills
+/// exactly one argument slot — the reason those gates carry a discriminant
+/// rather than the `&str` names themselves.
+impl ResidualSlot for crate::objspace::descroperation::BinopDunder {}
+impl ResidualSlot for crate::objspace::descroperation::UnaryDunder {}
+impl ResidualSlot for crate::objspace::descroperation::SeqBase {}
+
 impl<T> ResidualSlot for &T {}
 impl<T> ResidualSlot for &mut T {}
 impl<T> ResidualSlot for *const T {}
@@ -289,6 +298,15 @@ fn upa3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
 }
 
 #[inline]
+fn up3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: unsafe fn(A1, A2, A3) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
 fn cp3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
     entries: &mut Vec<(&'static str, i64)>,
     full_path: &'static str,
@@ -328,6 +346,15 @@ fn upa4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, 
 ) {
     push_raw_fnaddr(entries, module_path, f as *const ());
     push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
+fn up4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: unsafe fn(A1, A2, A3, A4) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
 }
 
 #[inline]
@@ -2267,6 +2294,35 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::objspace::descroperation::compare_slot",
         crate::objspace::descroperation::compare_slot_jit_abi,
+    );
+    // `binop_impl`'s builtin-fast-path override gates.  Each is
+    // `dont_look_inside` so the type-static and typeobject-registry loads stay
+    // out of the traced arithmetic graph, which makes every one of them a
+    // residual call the walk has to bind.
+    up3(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::needs_numeric_binop_dispatch",
+        crate::objspace::descroperation::needs_numeric_binop_dispatch,
+    );
+    up3(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::needs_bytes_binop_dispatch",
+        crate::objspace::descroperation::needs_bytes_binop_dispatch,
+    );
+    up4(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::needs_seq_binop_dispatch",
+        crate::objspace::descroperation::needs_seq_binop_dispatch,
+    );
+    up2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::needs_set_binop_dispatch",
+        crate::objspace::descroperation::needs_set_binop_dispatch,
+    );
+    up2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::needs_numeric_unaryop_dispatch",
+        crate::objspace::descroperation::needs_numeric_unaryop_dispatch,
     );
     // Truncated `_divrem` projections used by Rust operator shims.
     cp2(
