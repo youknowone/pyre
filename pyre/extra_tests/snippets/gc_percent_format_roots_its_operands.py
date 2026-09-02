@@ -5,8 +5,8 @@ Two separate holes, both reached through the same operand column:
 
 * `BINARY_OP %` pops the format string and the operand off the value stack
   before dispatching, so on `b"%a" % (Collects(),)` nothing refers to the
-  operand tuple while `__repr__` runs.  A tuple never moves, but an
-  unreachable one is still collected.
+  operand tuple while `__repr__` runs, and a tuple is nursery-allocated, so
+  it is both moved and collected out from under an unrooted local.
 * Every conversion runs Python, and the operands are drained into a plain
   native column first.  A list or dict still waiting its turn moves under a
   collection triggered by an earlier conversion, so it would be formatted at

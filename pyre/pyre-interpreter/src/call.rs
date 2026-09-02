@@ -4899,11 +4899,10 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     // Neither tuple has a referrer besides this frame's Rust locals until
     // `w_type_new` stores the resolved one into `W_TypeObject.bases`, and
     // `__mro_entries__`, `__prepare__`, the class body and the metaclass call
-    // all run in between.  A tuple is allocated stable, so it never moves and
-    // the raw copies stay valid addresses — but an unmarked stable block is
-    // still swept, and a class body long enough to span a whole major cycle
-    // frees it under the local.  Both slots therefore stay pinned until
-    // `build_class_inner`, the one consumer, returns.
+    // all run in between.  A tuple is nursery-allocated, so a raw copy goes
+    // stale as soon as one of those collects, and an unreferenced one is
+    // swept besides; every use below therefore reads its slot back, and both
+    // slots stay pinned until `build_class_inner`, the one consumer, returns.
     let bases_roots = pyre_object::gc_roots::push_roots();
     let orig_bases_slot = bases_roots.base();
     let _ = bases_roots.pin_root(pyre_object::w_tuple_new(base_args.to_vec()));

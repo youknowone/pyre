@@ -120,9 +120,10 @@ pub struct ScanStats {
 /// the caller's copy and the query, leaving the caller's local pointing at a
 /// forwarding stub.  Reading the returned word is the fix; `let _ =` opts out
 /// and thereby asserts the kind never moves, which is what
-/// [`Self::movable`] checks.  `getitem_tuple` states the assertion in prose --
-/// "a tuple never moves, so the root is for liveness alone and the address in
-/// hand stays correct".
+/// [`Self::movable`] checks.  The assertion is worth checking because it has
+/// been written down and been wrong: `getitem_tuple` and `getitem_str` each
+/// stated in prose that their receiver never moves, and both receivers are
+/// nursery-allocated.
 pub struct StalePinRead {
     pub func_name: String,
     pub file: String,

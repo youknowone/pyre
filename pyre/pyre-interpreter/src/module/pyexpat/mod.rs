@@ -560,8 +560,9 @@ impl<'a> MiniXmlParser<'a> {
         // The content model is a fresh `tuple` that nothing but this local
         // refers to while the position update writes three parser slots and the
         // handler runs Python; a collection completing there would reclaim it.
-        // One liveness pin at the mint — a tuple does not move, so the local
-        // stays current.
+        // One pin at the mint, and the local is the word the pin handed back:
+        // a tuple is nursery-allocated, so the address it was handed in on is
+        // the one a collection would leave behind.
         let roots = pyre_object::gc_roots::push_roots();
         let model = w_tuple_new(vec![
             w_int_new(2),

@@ -97,8 +97,8 @@ pub fn w_method_new(
         // Remember the shell before publishing nursery members: running the
         // barrier after the stores would leave a movable `w_self` (notably a
         // list) named by a slot no collection traces until it does. This is
-        // the same pre-store shape as tupleobject's stable shell plus young
-        // items block. A nursery shell answers the barrier in its `is_in_nursery`
+        // the same pre-store shape as tupleobject's shell plus its young items
+        // block. A nursery shell answers the barrier in its `is_in_nursery`
         // arm, so the call stands for the spill case alone.
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         // The four slots are not one contiguous run — `shell_slot` was read
