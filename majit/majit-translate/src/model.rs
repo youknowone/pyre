@@ -3556,14 +3556,27 @@ pub fn lower_struct_ptr_writes(
 /// RPython's orthodox form is alloc-then-init (`p = malloc(S); p.f = v`); the
 /// rtyper lowers `malloc` to the GC allocation op.  pyre's rtyper is an
 /// ephemeral type oracle that never rewrites the surviving model graph, so the
-/// lowering is produced here instead: rewrite the cluster to
-/// `NewWithVtable { owner, vtable } -> %ret` + a single payload
-/// `FieldWrite(%ret, …)`, dropping the `ob_header` (PyObject base) subtree.
-/// The type pointer the dropped `ob_header.ob_type` store carries is captured
-/// into `NewWithVtable.vtable` (the runtime stamps the new object's `ob_type` /
-/// `w_class` from it — `type_id` resolves struct size only), matching the
-/// runtime tracer oracle (`box_trace.rs trace_box_float`: one `NewWithVtable`
-/// carrying a real type pointer + one `SetfieldGc` for the payload).
+/// lowering is produced here instead: rewrite the cluster to an allocation
+/// `-> %ret` + one payload `FieldWrite(%ret, …)` per field the allocation does
+/// not carry, dropping the `ob_header` (PyObject base) subtree.
+///
+/// Which allocation is `rewrite_op_malloc`'s fork, and it turns on what the
+/// STRUCT carries rather than on what the cluster stores.  A constant type
+/// pointer is captured into `NewWithVtable.vtable` (the runtime stamps the new
+/// object's `ob_type` / `w_class` from it — `type_id` resolves struct size
+/// only), matching the runtime tracer oracle (`box_trace.rs trace_box_float`:
+/// one `NewWithVtable` carrying a real type pointer + one `SetfieldGc` for the
+/// payload).  A cluster with no type word at all takes the plain `New` upstream
+/// emits for a struct it has no vtable to take.
+///
+/// There is deliberately no third arm for a type word that is present but not
+/// constant.  Upstream cannot reach that shape — its typeptr is a property of
+/// the STRUCT, not of the instance — and pyre cannot lower it: the type word
+/// travels only on the allocation, since `optimize_setfield_gc` removes a
+/// `setfield_gc` whose descr `is_typeptr()` and keeps only a constant value,
+/// as `known_class` (`heaptracker.py:66-67`, which drops `typeptr` from every
+/// field list).  Lowering it anyway ships an object whose type word is never
+/// written.
 ///
 /// The payload store is inserted *after* the `NewWithVtable` (which reuses the
 /// malloc result Variable `%ret`), since the original aggregate field stores
@@ -3632,18 +3645,41 @@ pub fn fuse_boxing_alloc(
     }
 
     // `owner`'s registered field layout, in struct-declaration order.
-    let is_gc_malloc = |target: &CallTarget| -> bool {
-        matches!(target, CallTarget::FunctionPath { segments }
-            if segments.len() >= 2
-                && matches!(
-                    segments[segments.len() - 1].as_str(),
-                    "malloc"
-                        | "malloc_typed"
-                        | "malloc_typed_managed"
-                        | "malloc_typed_stable"
-                )
-                && segments[segments.len() - 2] == "lltype")
-    };
+    // The allocator spelling decides more than whether this is a boxing
+    // cluster.  `rewrite_op_malloc` forks on the malloc's flavor before it
+    // forks on the struct, and refuses outright the flavors its allocation op
+    // cannot express: `raw` diverts to `_rewrite_raw_malloc`, and a
+    // `nonmovable` hint raises `UnsupportedMallocFlags`, because the op it
+    // would emit IS a nursery bump and nothing in the op can say otherwise.
+    fn gc_malloc_flavor(target: &CallTarget) -> Option<&str> {
+        let CallTarget::FunctionPath { segments } = target else {
+            return None;
+        };
+        if segments.len() < 2 || segments[segments.len() - 2] != "lltype" {
+            return None;
+        }
+        match segments[segments.len() - 1].as_str() {
+            flavor @ ("malloc"
+            | "malloc_typed"
+            | "malloc_typed_managed"
+            | "malloc_typed_stable") => Some(flavor),
+            _ => None,
+        }
+    }
+    // Whether the cluster's allocator hands back an object the collector may
+    // move.  `malloc_typed_stable` is `try_gc_alloc_stable_raw`, whose contract
+    // is an old-gen pointer stable across every collection, and `malloc_typed`
+    // (`alloc_with_gc_header`) leaks outside the collector entirely; both are
+    // the structural twin of the `nonmovable` hint `rewrite_op_malloc` refuses.
+    //
+    // The refusal applies only to the arm this fork newly reaches.  A cluster
+    // whose type word is a constant has lowered to `NewWithVtable` since long
+    // before the `New` arm existed, and its structs carry the flavor on their
+    // published `SizeDescr` instead; re-deciding that here would regress
+    // clusters this fork is not about.
+    fn allocates_movable(flavor: &str) -> bool {
+        matches!(flavor, "malloc" | "malloc_typed_managed")
+    }
 
     // Resolve the type-pointer the dropped `ob_header.ob_type` store carries:
     // `%agg.ob_header = %h; %h.ob_type = __cast_instance_intrinsic(ConstRefAddr(t))`.
@@ -3659,6 +3695,17 @@ pub fn fuse_boxing_alloc(
     fn store_value(graph: &FunctionGraph, base: &Variable, field_name: &str) -> Option<Variable> {
         let (_, value, _) = unique_store(graph, base, field_name)?;
         value.as_variable().cloned()
+    }
+    /// Whether the graph writes `base.field_name` at all, however many times.
+    /// [`unique_store`] collapses "never written" and "written inconsistently"
+    /// into one `None`; the malloc fork needs them apart, because a struct that
+    /// never writes a type word is upstream's plain `new`, while one that
+    /// writes several is a cluster this pass cannot read an answer out of.
+    fn any_store(graph: &FunctionGraph, base: &Variable, field_name: &str) -> bool {
+        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(&op.kind, OpKind::FieldWrite { base: b, field, .. }
+                if b == base && field.name.as_str() == field_name)
+        })
     }
     /// The unique graph-wide store to `base.field_name`, or `None` if absent
     /// or conflicting. Without reaching-definition analysis, choosing among
@@ -3892,7 +3939,9 @@ pub fn fuse_boxing_alloc(
     /// carrying only the sizedescr, and each remaining field arrives as its own
     /// `setfield`.
     struct HeaderPlan {
-        vtable: i64,
+        /// `Some` lowers to `NewWithVtable` carrying the type word; `None` is
+        /// upstream's plain `new` — a struct with no type word to stamp.
+        vtable: Option<i64>,
         w_class: Option<Payload>,
     }
     let resolve_header_plan = |graph: &FunctionGraph, agg: &Variable| -> Option<HeaderPlan> {
@@ -3915,26 +3964,71 @@ pub fn fuse_boxing_alloc(
             );
             return None;
         }
-        let mut resolved: Option<i64> = None;
+        // `None` until the first root is read; the inner `Option` is the
+        // vtable when that root's type word is a constant and `None` when the
+        // root writes no type word at all, so roots disagreeing about *which
+        // allocation this is* are caught by the same equality that catches
+        // roots naming different types.
+        let mut resolved: Option<Option<i64>> = None;
         // `None` until the first root is read; `Some(None)` once a root's class
         // folds into the vtable, `Some(Some(_))` once one does not.
         let mut w_class: Option<Option<(FieldDescriptor, LinkArg, ValueType)>> = None;
         for root in &roots {
-            let Some(vtable) = store_value(graph, root, "ob_type")
-                .and_then(|obtype| const_ref_addr(graph, &obtype, 8))
-            else {
-                // The commonest reason in a test fixture: the `PyType`
-                // singleton addresses were not supplied, so the `&T` read
-                // stayed a residual call rather than a `ConstRefAddr`. It is
-                // indistinguishable here from a graph that genuinely stores no
-                // type pointer, which is why the count names the resolution
-                // step rather than guessing the cause.
-                crate::decline::record(
-                    VTABLE_GATE,
-                    "ob_type-not-a-constant-address",
-                    format_args!("{}", graph.name),
-                );
-                return None;
+            // `rewrite_op_malloc` reads the vtable off the STRUCT, statically
+            // (`heaptracker.get_vtable_for_gcstruct`), and forks on whether the
+            // struct has one at all: `new_with_vtable` when it does, plain
+            // `new` when it does not.  Neither arm ever writes the type word as
+            // a field — `heaptracker.py:66` drops `typeptr` from every field
+            // list ("dealt otherwise"), so no setfield for it is ever built.
+            //
+            // pyre recovers that same static answer by data flow, its rtyper
+            // carrying no `_hints`: a root that writes no type word at all is
+            // the `new` case, one that writes a constant is `new_with_vtable`.
+            let root_vtable = match unique_store(graph, root, "ob_type") {
+                Some((_, value, _)) => {
+                    let Some(vtable) = value
+                        .as_variable()
+                        .and_then(|v| const_ref_addr(graph, v, 8))
+                    else {
+                        // A type word this pass cannot fold is NOT the `new`
+                        // case, and re-emitting it as its own store is not an
+                        // option: `optimize_setfield_gc` removes a `setfield_gc`
+                        // whose descr `is_typeptr()`, keeping only a CONSTANT
+                        // value and only as `known_class` — the same
+                        // `heaptracker.py:66-67` rule that keeps the type word
+                        // out of the field lists.  A plain `new` here would
+                        // therefore ship an object whose type word is never
+                        // written at all.  RPython cannot reach this shape,
+                        // its typeptr being a property of the STRUCT rather
+                        // than of the instance, so there is no arm to port for
+                        // it: refuse, as upstream refuses the flavors its op
+                        // cannot express.
+                        //
+                        // In a test fixture the commonest cause is simply that
+                        // the `PyType` singleton addresses were not supplied,
+                        // so the `&T` read stayed a residual call rather than a
+                        // `ConstRefAddr`.
+                        crate::decline::record(
+                            VTABLE_GATE,
+                            "ob_type-not-a-constant-address",
+                            format_args!("{}", graph.name),
+                        );
+                        return None;
+                    };
+                    Some(vtable)
+                }
+                // `unique_store` answers `None` both for a root that never
+                // writes the word and for one that writes it inconsistently.
+                // Only the first is upstream's `new`.
+                None if any_store(graph, root, "ob_type") => {
+                    crate::decline::record(
+                        VTABLE_GATE,
+                        "ob_type-stores-conflict",
+                        format_args!("{}", graph.name),
+                    );
+                    return None;
+                }
+                None => None,
             };
             let declares_no_class_word =
                 header_declares_no_class_word(graph, root, struct_field_attrs);
@@ -3951,10 +4045,14 @@ pub fn fuse_boxing_alloc(
                     return None;
                 }
                 Some((field, value, ty)) => {
-                    let folds = value
-                        .as_variable()
-                        .and_then(|value| get_instantiate_arg_addr(graph, value, 8))
-                        == Some(vtable);
+                    // With no vtable on the allocation there is nothing the
+                    // class store could fold into, so it is always kept.
+                    let folds = root_vtable.is_some_and(|root_vtable| {
+                        value
+                            .as_variable()
+                            .and_then(|value| get_instantiate_arg_addr(graph, value, 8))
+                            == Some(root_vtable)
+                    });
                     (!folds).then(|| (field.clone(), value.clone(), ty.clone()))
                 }
                 // RPython's root OBJECT declares only `typeptr`. With no
@@ -4001,10 +4099,13 @@ pub fn fuse_boxing_alloc(
                 }
             }
             match resolved {
-                None => resolved = Some(vtable),
-                Some(seen) if seen == vtable => {}
+                None => resolved = Some(root_vtable),
+                Some(seen) if seen == root_vtable => {}
                 // Predecessors building headers for different types merge into
                 // one malloc: no single vtable stands for the whole cluster.
+                // A root that carries a type word meeting one that does not
+                // lands here too: the allocation cannot both stamp the word and
+                // have none to stamp.
                 Some(_) => {
                     crate::decline::record(
                         VTABLE_GATE,
@@ -4033,7 +4134,9 @@ pub fn fuse_boxing_alloc(
         aggregate: crate::flowspace::model::Variable,
         result: crate::flowspace::model::Variable,
         owner: String,
-        vtable: i64,
+        /// `Some` lowers to `NewWithVtable` carrying the type word; `None`
+        /// lowers to the plain `New` upstream emits for a struct with none.
+        vtable: Option<i64>,
         /// The header's `w_class` store when the vtable does not stand for it,
         /// re-emitted ahead of the payload stores so the whole rewrite lands in
         /// struct order (`ob_header` is field zero of every boxing struct).
@@ -4054,9 +4157,9 @@ pub fn fuse_boxing_alloc(
             let OpKind::Call { target, args, .. } = &op.kind else {
                 continue;
             };
-            if !is_gc_malloc(target) || args.len() != 1 {
+            let Some(flavor) = gc_malloc_flavor(target).filter(|_| args.len() == 1) else {
                 continue;
-            }
+            };
             let Some(result) = &op.result else {
                 crate::decline::record(
                     FUSE_GATE,
@@ -4191,6 +4294,23 @@ pub fn fuse_boxing_alloc(
                 );
                 continue;
             };
+            // `rewrite_op_malloc` refuses a malloc its allocation op cannot
+            // express rather than lowering it approximately: a `nonmovable`
+            // hint raises `UnsupportedMallocFlags`.  The `New` arm carries no
+            // type word to stamp and no long-published `SizeDescr` flavor
+            // behind it, so lowering a non-movable cluster into one would
+            // silently re-flavor the object into a collected nursery block.
+            // `descr.rs`'s instance group states what follows: a minor
+            // collection inside a residual moves the fresh object, and the
+            // caller finishes writing into the dead pre-move copy.
+            if header.vtable.is_none() && !allocates_movable(flavor) {
+                crate::decline::record(
+                    FUSE_GATE,
+                    "unsupported-malloc-flags-nonmovable",
+                    format_args!("{owner} in {}", graph.name),
+                );
+                continue;
+            }
             sites.push(Site {
                 block: bi,
                 op: oi,
@@ -4212,16 +4332,22 @@ pub fn fuse_boxing_alloc(
         let block = &mut graph.blocks[site.block];
         block.operations[site.op] = SpaceOperation {
             result: Some(site.result.clone()),
-            kind: OpKind::NewWithVtable {
-                owner: site.owner,
-                vtable: site.vtable,
+            // `rewrite_op_malloc` picks the opcode from what the struct
+            // carries: with a static vtable it is `new_with_vtable`, without
+            // one it is `new`.  Both take the size descriptor and nothing else.
+            kind: match site.vtable {
+                Some(vtable) => OpKind::NewWithVtable {
+                    owner: site.owner,
+                    vtable,
+                },
+                None => OpKind::New { owner: site.owner },
             },
         };
-        // The kept stores follow the `NewWithVtable`, in struct order: the
-        // header's `w_class` where the vtable does not stand for it, then the
-        // payloads.  Each is a plain `FieldWrite` the assembler lowers to its
-        // own `setfield_gc`, which is the shape `jtransform.py:1044` leaves
-        // every field the allocation itself does not carry.
+        // The kept stores follow the allocation, in struct order: the header's
+        // `w_class` where the vtable does not stand for it, then the payloads.
+        // Each is a plain `FieldWrite` the assembler lowers to its own
+        // `setfield_gc`, which is the shape `jtransform.py:1044` leaves every
+        // field the allocation itself does not carry.
         for (k, payload) in site.w_class.into_iter().chain(site.payloads).enumerate() {
             block.operations.insert(
                 site.op + 1 + k,
@@ -10350,6 +10476,246 @@ mod tests {
                             if owner == "W_IntObject" && *vtable == CLASS_ADDR
                     )),
                     "{label}: the fused allocation must carry the resolved ob_type address"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_forks_new_and_new_with_vtable_on_the_type_word() {
+        // `jtransform.py rewrite_op_malloc`'s fork, and its two refusals.
+        //
+        // The opcode is decided by what the STRUCT carries, never by what the
+        // cluster happens to store: a constant type word is taken onto the
+        // allocation as `new_with_vtable`, a struct with no type word at all
+        // gets the plain `new`, and the flavors the allocation op cannot
+        // express are refused instead of approximated.
+        //
+        // The last row is the one that must never lower.  A type word that is
+        // present but not constant cannot travel on the allocation, and it
+        // cannot follow as its own store either: `optimize_setfield_gc` removes
+        // a `setfield_gc` whose descr `is_typeptr()` and keeps only a constant
+        // value, as `known_class` (`heaptracker.py:66-67`).  Emitting `new` for
+        // it ships an object whose type word is never written.
+        type Var = crate::flowspace::model::Variable;
+        const CLASS_ADDR: i64 = 4357049520;
+
+        /// What the cluster's header stores into `ob_type`.
+        enum ObType {
+            /// No store at all — upstream's struct with no vtable to take.
+            Unstored,
+            /// A constant type pointer.
+            Constant,
+            /// A class read back off the shadow stack: present, but no
+            /// constant this pass can fold onto the allocation.
+            ShadowStack,
+        }
+
+        fn cluster(ob_type: &ObType, flavor: &str) -> FunctionGraph {
+            let field = |base: &Var, name: &str, owner: &str, value: &Var| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            };
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let payload = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+            let header = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor("TypeOnlyHeader"),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some("TypeOnlyHeader".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            let stored = match ob_type {
+                ObType::Unstored => None,
+                ObType::Constant => Some(
+                    graph
+                        .push_op_var(entry, OpKind::ConstRefAddr(CLASS_ADDR), true)
+                        .unwrap(),
+                ),
+                ObType::ShadowStack => {
+                    let base = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+                    Some(
+                        graph
+                            .push_op_var(
+                                entry,
+                                OpKind::Call {
+                                    target: CallTarget::FunctionPath {
+                                        segments: [
+                                            crate::runtime_names::crates::OBJECT,
+                                            "gc_roots",
+                                            "shadow_stack_get",
+                                        ]
+                                        .iter()
+                                        .map(|s| (*s).to_string())
+                                        .collect(),
+                                    },
+                                    args: vec![base],
+                                    result_ty: ValueType::Ref(Some("object".into())),
+                                },
+                                true,
+                            )
+                            .unwrap(),
+                    )
+                }
+            };
+            if let Some(value) = stored {
+                graph.push_op_var(
+                    entry,
+                    field(&header, "ob_type", "TypeOnlyHeader", &value),
+                    false,
+                );
+            }
+            let agg = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor("W_IntObject"),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some("W_IntObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_op_var(
+                entry,
+                field(&agg, "ob_header", "W_IntObject", &header),
+                false,
+            );
+            graph.push_op_var(entry, field(&agg, "intval", "W_IntObject", &payload), false);
+            let ret = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: [crate::runtime_names::crates::OBJECT, "lltype", flavor]
+                                .iter()
+                                .map(|s| (*s).to_string())
+                                .collect(),
+                        },
+                        args: vec![agg],
+                        result_ty: ValueType::Ref(Some("W_IntObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(entry, Some(ret));
+            graph
+        }
+
+        /// `Some(None)` expects a plain `New`; `Some(Some(addr))` expects a
+        /// `NewWithVtable` carrying that address; `None` expects no fusion.
+        type Expected = Option<Option<i64>>;
+        let rows: [(&str, ObType, &str, Expected); 6] = [
+            (
+                "a constant type word rides on the allocation",
+                ObType::Constant,
+                "malloc_typed",
+                Some(Some(CLASS_ADDR)),
+            ),
+            (
+                "a struct with no type word takes the plain new",
+                ObType::Unstored,
+                "malloc",
+                Some(None),
+            ),
+            (
+                "the managed movable allocator takes it too",
+                ObType::Unstored,
+                "malloc_typed_managed",
+                Some(None),
+            ),
+            (
+                "a non-moving allocator is refused, not re-flavored",
+                ObType::Unstored,
+                "malloc_typed_stable",
+                None,
+            ),
+            (
+                "a collector-external allocator is refused as well",
+                ObType::Unstored,
+                "malloc_typed",
+                None,
+            ),
+            (
+                "a type word that is present but not constant never lowers",
+                ObType::ShadowStack,
+                "malloc",
+                None,
+            ),
+        ];
+
+        for (label, ob_type, flavor, expected) in rows {
+            let mut graph = cluster(&ob_type, flavor);
+            let entry = graph.startblock;
+            let attrs = std::collections::HashMap::from([
+                (
+                    "W_IntObject".to_string(),
+                    vec![
+                        ("ob_header".to_string(), ValueType::Ref(None)),
+                        ("intval".to_string(), ValueType::Int),
+                    ],
+                ),
+                (
+                    "TypeOnlyHeader".to_string(),
+                    vec![("ob_type".to_string(), ValueType::Ref(None))],
+                ),
+            ]);
+            assert_eq!(
+                fuse_boxing_alloc(&mut graph, &attrs),
+                usize::from(expected.is_some()),
+                "{label}: wrong number of fused clusters"
+            );
+            let ops = &graph.block(entry).operations;
+            let residual = ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some(flavor)
+                )
+            });
+            assert_eq!(
+                residual,
+                expected.is_none(),
+                "{label}: the residual malloc must survive exactly when the cluster declines"
+            );
+            let allocation = ops.iter().find(|op| match &op.kind {
+                OpKind::NewWithVtable { owner, .. } | OpKind::New { owner } => {
+                    owner == "W_IntObject"
+                }
+                _ => false,
+            });
+            let emitted = allocation.map(|op| match &op.kind {
+                OpKind::NewWithVtable { vtable, .. } => Some(*vtable),
+                _ => None,
+            });
+            assert_eq!(emitted, expected, "{label}: wrong allocation opcode");
+            // Whichever arm ran, the type word is never re-emitted as a store
+            // onto the allocation: `heaptracker.py:66` keeps `typeptr` out of
+            // every field list, and a `setfield_gc` for it would be removed
+            // downstream anyway.  (The dropped `ob_header` subtree keeps its
+            // own store until the later remnant sweep, so this asks about the
+            // allocation's result specifically.)
+            if let Some(result) = allocation.and_then(|op| op.result.as_ref()) {
+                assert!(
+                    !ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { base, field, .. }
+                            if base == result && field.name.as_str() == "ob_type"
+                    )),
+                    "{label}: the fused allocation must not carry an ob_type store"
                 );
             }
         }
