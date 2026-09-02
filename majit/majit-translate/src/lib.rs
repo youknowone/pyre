@@ -1633,6 +1633,20 @@ fn analyze_pipeline_from_module_paths(
                 // concrete override at the same classdef/MRO decision point
                 // as the exception-handler pair above.
                 "load_super_attr_with",
+                // `ControlFlowOpcodeHandler::close_loop`'s default asks
+                // `close_loop_args`, whose own default answers `None`, and
+                // reports `StepResult::Continue`.  `PyFrame` overrides it to
+                // report `CloseLoop` unconditionally — that report is the
+                // back edge, and the portal turns it into the `loop_header`
+                // op `jtransform.py` rewrites `can_enter_jit` into.  Left on
+                // the default, a walk of the portal reads `Continue` at every
+                // back edge, never reaches `loop_header`, and so leaves
+                // `seen_loop_header_for_jdindex` at -1 for the whole walk:
+                // every `jit_merge_point` is a no-op and no trace can close.
+                // The override is three statements over a `Vec` and a struct
+                // literal, so it carries none of the objspace surface the
+                // staging above is about.
+                "close_loop",
             ];
             let devirt: Option<(&str, &front::semantic::SemanticFunction)> =
                 if is_default && DEFAULT_SHADOW_DEVIRT_SCOPE.contains(&method.name.as_str()) {
