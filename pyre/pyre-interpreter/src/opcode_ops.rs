@@ -42,7 +42,12 @@ fn inplace_dunder_name(op: BinaryOperator) -> Option<&'static str> {
 fn skips_inplace_special(a: PyObjectRef, b: PyObjectRef, op: BinaryOperator) -> bool {
     matches!(op, BinaryOperator::InplaceMultiply)
         && unsafe { crate::objspace::descroperation::is_repeat_sequence(a) }
-        && !unsafe { crate::objspace::descroperation::seq_repeat_override(a, &["__imul__"]) }
+        && !unsafe {
+            crate::objspace::descroperation::seq_repeat_override(
+                a,
+                crate::objspace::descroperation::RepeatDunder::IMul,
+            )
+        }
         && unsafe { crate::baseobjspace::lookup(b, "__index__").is_none() }
 }
 

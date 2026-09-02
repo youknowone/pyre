@@ -3099,6 +3099,26 @@ impl UnaryDunder {
     }
 }
 
+/// The set of special-method names a repeat gate tests, carried as a word for
+/// the same reason as [`BinopDunder`] — a `&[&str]` is a slice, so it fills two
+/// argument slots and leaves the gate unpublishable.
+#[derive(Clone, Copy)]
+pub(crate) enum RepeatDunder {
+    /// `__mul__` and its reflected counterpart, the pair a binary repeat tests.
+    MulPair,
+    /// `__imul__` alone; an in-place repeat has no reflected form.
+    IMul,
+}
+
+impl RepeatDunder {
+    fn names(self) -> &'static [&'static str] {
+        match self {
+            Self::MulPair => &["__mul__", "__rmul__"],
+            Self::IMul => &["__imul__"],
+        }
+    }
+}
+
 /// Builtin sequence base selected by [`needs_seq_binop_dispatch`].  The
 /// caller passes this discriminant instead of a `&STR_TYPE`/… static so
 /// the type-static load stays inside the residual helper, off the traced
@@ -3192,7 +3212,7 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: &str, rev: &str) -> boo
 /// base type statics are loaded here, and a traced caller would otherwise
 /// carry an unresolvable `LoadStatic`.
 #[majit_macros::dont_look_inside]
-unsafe fn sequence_numeric_slot_is_null(obj: PyObjectRef, dunder: &str) -> bool {
+pub(crate) unsafe fn sequence_numeric_slot_is_null(obj: PyObjectRef, op: BinopDunder) -> bool {
     let tp: *const pyre_object::PyType = if is_str(obj) {
         &pyre_object::STR_TYPE
     } else if is_list(obj) {
@@ -3209,7 +3229,7 @@ unsafe fn sequence_numeric_slot_is_null(obj: PyObjectRef, dunder: &str) -> bool 
     let Some(t) = crate::typedef::gettypefor(tp) else {
         return false;
     };
-    !dunder_overridden(obj, dunder, t.as_ptr())
+    !dunder_overridden(obj, op.names().0, t.as_ptr())
 }
 
 /// `needs_seq_binop_dispatch` for the `sq_repeat` branches of [`mul`], where
@@ -3227,7 +3247,7 @@ unsafe fn sequence_numeric_slot_is_null(obj: PyObjectRef, dunder: &str) -> bool 
 /// traced caller emits a residual call rather than an unresolvable
 /// `LoadStatic`.
 #[majit_macros::dont_look_inside]
-pub(crate) unsafe fn seq_repeat_override(obj: PyObjectRef, dunders: &[&str]) -> bool {
+pub(crate) unsafe fn seq_repeat_override(obj: PyObjectRef, dunders: RepeatDunder) -> bool {
     if pyre_object::is_exact_builtin_instance(obj) {
         return false;
     }
@@ -3262,6 +3282,7 @@ pub(crate) unsafe fn seq_repeat_override(obj: PyObjectRef, dunders: &[&str]) -> 
         return false;
     };
     dunders
+        .names()
         .iter()
         .any(|dunder| dunder_overridden(obj, dunder, t))
 }
@@ -3471,7 +3492,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // are `PyNumber_Add`'s `sq_concat` fall-through and already reach
         // `__radd__` before refusing.
         if numeric_override
-            && !sequence_numeric_slot_is_null(a, "__add__")
+            && !sequence_numeric_slot_is_null(a, BinopDunder::Add)
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
         {
@@ -3690,7 +3711,7 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // As in [`binop_add_impl`]: a sequence operand carries no
         // `nb_multiply`, so only the other operand's runs here.
         if numeric_override
-            && !sequence_numeric_slot_is_null(a, "__mul__")
+            && !sequence_numeric_slot_is_null(a, BinopDunder::Mul)
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
         {
@@ -3714,8 +3735,8 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // sequences.  A sequence subclass that overrides `__mul__`/`__rmul__`
         // must reach its override first — `LM([1]) * 2` is `LM.__mul__`, not a
         // list repetition — the same gate the concat branches of `add` apply.
-        if (seq_repeat_override(a, &["__mul__", "__rmul__"])
-            || seq_repeat_override(b, &["__mul__", "__rmul__"]))
+        if (seq_repeat_override(a, RepeatDunder::MulPair)
+            || seq_repeat_override(b, RepeatDunder::MulPair))
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
         {
@@ -3727,8 +3748,8 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // is the only operand offered and answers first.  The repeat runs at
         // the tail of this function when it declines.
         let count_answers_first = numeric_override
-            && (sequence_numeric_slot_is_null(a, "__mul__")
-                || sequence_numeric_slot_is_null(b, "__mul__"));
+            && (sequence_numeric_slot_is_null(a, BinopDunder::Mul)
+                || sequence_numeric_slot_is_null(b, BinopDunder::Mul));
         if !count_answers_first {
             if is_str(a) && is_int_or_long(b) {
                 return str_repeat(a, b);

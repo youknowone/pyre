@@ -11,11 +11,15 @@
 //!
 //! The publication side is already checked by the compiler: `jit_fnaddr`'s
 //! helpers take the function itself, so `ResidualSlot` rejects a fat pointer
-//! before an address can be taken.  What nothing checks is the signature the
-//! front actually lowers, which is what this file covers.  `ValueType::Str`
-//! is the exact shape that cannot be published, so it — not the argument
-//! count — is what these assert on: swapping two `&str`s for one enum also
-//! changes the count, but restoring a single `&str` would not.
+//! before an address can be taken.  That bound is the ONLY check: the front
+//! collapses `ValueType::Str` to `Type::Ref` and `type_to_argclass` gives a
+//! `Ref` one slot, so a `&str` argument is described as one word and its
+//! length half is never passed.  Restoring a `&str` here therefore produces
+//! no front-side error — the gate simply loses its row and every traced
+//! caller is left holding an unbound symbolic residual.  `ValueType::Str` is
+//! that exact shape, so it — not the argument count — is what these assert
+//! on: swapping two `&str`s for one enum also changes the count, but
+//! restoring a single `&str` would not.
 
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::lower_function_with_static_addrs;
@@ -70,6 +74,8 @@ fn no_override_gate_takes_a_fat_pointer() {
         "needs_bytes_binop_dispatch",
         "needs_numeric_unaryop_dispatch",
         "needs_set_binop_dispatch",
+        "sequence_numeric_slot_is_null",
+        "seq_repeat_override",
     ] {
         let banks = parameter_banks(&format!(
             "pyre_interpreter::objspace::descroperation::{gate}"
@@ -95,15 +101,18 @@ fn no_override_gate_takes_a_fat_pointer() {
 
 #[test]
 fn the_dunder_discriminant_is_banked_as_an_integer() {
-    // The names live behind `BinopDunder` / `UnaryDunder`, which the front
-    // models as the discriminant integer (`tyref_is_fieldless_enum_free`).
-    // `SeqBase`'s `base` is the same shape and predates them.
+    // The names live behind `BinopDunder` / `UnaryDunder` / `RepeatDunder`,
+    // which the front models as the discriminant integer
+    // (`tyref_is_fieldless_enum_free`).  `SeqBase`'s `base` is the same shape
+    // and predates them.
     for (gate, param) in [
         ("needs_numeric_binop_dispatch", "op"),
         ("needs_seq_binop_dispatch", "op"),
         ("needs_seq_binop_dispatch", "base"),
         ("needs_bytes_binop_dispatch", "op"),
         ("needs_numeric_unaryop_dispatch", "op"),
+        ("sequence_numeric_slot_is_null", "op"),
+        ("seq_repeat_override", "dunders"),
     ] {
         let banks = parameter_banks(&format!(
             "pyre_interpreter::objspace::descroperation::{gate}"

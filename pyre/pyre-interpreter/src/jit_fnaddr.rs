@@ -63,6 +63,7 @@ impl<T: rustpython_compiler_core::bytecode::OpArgType> ResidualSlot
 impl ResidualSlot for crate::objspace::descroperation::BinopDunder {}
 impl ResidualSlot for crate::objspace::descroperation::UnaryDunder {}
 impl ResidualSlot for crate::objspace::descroperation::SeqBase {}
+impl ResidualSlot for crate::objspace::descroperation::RepeatDunder {}
 
 impl<T> ResidualSlot for &T {}
 impl<T> ResidualSlot for &mut T {}
@@ -2323,6 +2324,19 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::objspace::descroperation::needs_numeric_unaryop_dispatch",
         crate::objspace::descroperation::needs_numeric_unaryop_dispatch,
+    );
+    // The two gates `binop_impl`'s sequence branches reach past the ones
+    // above.  Each also carried its dunder names as text and so had no row
+    // until it took a discriminant.
+    up2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::sequence_numeric_slot_is_null",
+        crate::objspace::descroperation::sequence_numeric_slot_is_null,
+    );
+    up2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::seq_repeat_override",
+        crate::objspace::descroperation::seq_repeat_override,
     );
     // Truncated `_divrem` projections used by Rust operator shims.
     cp2(
