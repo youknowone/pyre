@@ -5424,69 +5424,71 @@ pub fn dunder_import(
         if let Some(w_mod) = gcd_import_fast(name)? {
             let mod_slot = shadow_stack_len();
             let _ = pin_root(w_mod);
-            // `import a.b` answers `a`.  The head is resolved BEFORE the list
-            // is tested, so a name whose head is not in `sys.modules` gives up
-            // without testing at all: the give-up re-enters `__import__`
-            // through the slow path, and that importer makes the one test a
-            // stateful `__bool__` is owed.  Resolving the head is a
-            // `sys.modules` lookup, so running it ahead of the test runs no
-            // Python code and reorders nothing observable.  A missing head
-            // gives up from the non-empty arm too, which
-            // `interp_import.py interp___import__` reaches without the head;
-            // the slow path answers that arm identically.
-            let dotindex = rpython_str_find_char(name, '.', 0);
-            let w_head = if dotindex < 0 {
-                Some(shadow_stack_get(mod_slot))
-            } else {
-                gcd_import_fast(rpython_str_slice_prefix(name, dotindex))?
-            };
-            // Give up before the test when the top-level ancestor is not
-            // initialised yet; the slow path both resolves it and tests once.
-            if let Some(w_head) = w_head {
-                let head_slot = shadow_stack_len();
-                let _ = pin_root(w_head);
-                // `interp_import.py interp___import__` — the list is tested
-                // only once the cache hit is in hand.
-                let have_fromlist = !fromlist_missing
-                    && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?;
-                if !have_fromlist {
-                    return Ok(shadow_stack_get(head_slot));
-                } else if crate::baseobjspace::findattr_result(
-                    shadow_stack_get(mod_slot),
-                    "__path__",
-                )?
-                .is_none()
-                {
-                    return Ok(shadow_stack_get(mod_slot));
-                } else if let Some(w_handled) = handle_fromlist_fast(
-                    shadow_stack_get(mod_slot),
-                    shadow_stack_get(fromlist_slot),
-                )? {
-                    return Ok(w_handled);
-                } else if get_sys_module("importlib._bootstrap").is_none() {
-                    // `interp_import.py interp___import__` returns from both
-                    // arms of the package test; the `_handle_fromlist` it
-                    // calls is always installed upstream.  While the bootstrap
-                    // is not installed at all, the native one stands in here.
-                    // Falling through to the slow path instead would resolve
-                    // the same cached module a second time and test the list a
-                    // second time, and `__import__` owes a stateful `__bool__`
-                    // exactly one test.
-                    handle_fromlist(
-                        shadow_stack_get(mod_slot),
-                        shadow_stack_get(fromlist_slot),
-                        false,
-                        execution_context,
-                    )?;
+            // `interp_import.py interp___import__` — the list is tested once
+            // the cache hit is in hand, and a dotted name's head is resolved
+            // only inside the empty-list arm.  Resolving it ahead of the test
+            // would run `gcd_import_fast` on the head, whose `__spec__` and
+            // `_initializing` reads can run a module's own Python; neither
+            // importer runs that for a non-empty list.
+            let have_fromlist =
+                !fromlist_missing && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?;
+            if !have_fromlist {
+                // `import a.b` answers `a`.
+                let dotindex = rpython_str_find_char(name, '.', 0);
+                if dotindex < 0 {
                     return Ok(shadow_stack_get(mod_slot));
                 }
-                // An installed bootstrap that cannot serve `_handle_fromlist`
-                // is a broken bootstrap, not an absent one.  `_bootstrap.
-                // __import__` reaches the handler as a module global and
-                // raises when it is gone, so fall through to the slow path and
-                // let that error be the one `__import__` reports rather than
-                // answering from the native handler.
+                let head = rpython_str_slice_prefix(name, dotindex);
+                if let Some(w_head) = gcd_import_fast(head)? {
+                    return Ok(w_head);
+                }
+                // An uncached head is what `_bootstrap.__import__`'s own
+                // `if not fromlist:` arm imports — `return _gcd_import(
+                // name.partition('.')[0])`.  Re-entering under the head name
+                // with no list reaches that same import while leaving the
+                // caller's list alone: the one truth test `__import__` owes a
+                // stateful `__bool__` has already been made here.
+                return dunder_import(
+                    head,
+                    shadow_stack_get(globals_slot),
+                    shadow_stack_get(locals_slot),
+                    pyre_object::w_none(),
+                    0,
+                    execution_context,
+                );
             }
+            // `assert have_fromlist` — the package test and its two return
+            // arms.
+            if crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__path__")?
+                .is_none()
+            {
+                return Ok(shadow_stack_get(mod_slot));
+            } else if let Some(w_handled) =
+                handle_fromlist_fast(shadow_stack_get(mod_slot), shadow_stack_get(fromlist_slot))?
+            {
+                return Ok(w_handled);
+            } else if get_sys_module("importlib._bootstrap").is_none() {
+                // `interp_import.py interp___import__` returns from both arms
+                // of the package test; the `_handle_fromlist` it calls is
+                // always installed upstream.  While the bootstrap is not
+                // installed at all, the native one stands in here.  Falling
+                // through to the slow path instead would resolve the same
+                // cached module a second time and test the list a second time,
+                // and `__import__` owes a stateful `__bool__` exactly one test.
+                handle_fromlist(
+                    shadow_stack_get(mod_slot),
+                    shadow_stack_get(fromlist_slot),
+                    false,
+                    execution_context,
+                )?;
+                return Ok(shadow_stack_get(mod_slot));
+            }
+            // An installed bootstrap that cannot serve `_handle_fromlist` is a
+            // broken bootstrap, not an absent one.  `_bootstrap.__import__`
+            // reaches the handler as a module global and raises when it is
+            // gone, so fall through to the slow path and let that error be the
+            // one `__import__` reports rather than answering from the native
+            // handler.
         }
     }
 
