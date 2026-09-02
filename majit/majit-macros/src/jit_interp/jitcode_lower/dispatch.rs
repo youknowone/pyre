@@ -4029,24 +4029,31 @@ pub(crate) fn lower_dispatch_body(
     // the single-pass merge hook, which returns it directly and therefore does
     // not execute this suffix a second time in native Rust.
     //
-    // The epilogue fails open.  A prefix statement the lowering refuses -- an
-    // I/O loop, a green write -- rolls back to the loop exit and leaves the
+    // The epilogue fails open.  A statement the lowering refuses -- an I/O
+    // loop, a green write -- rolls back to the loop exit and leaves the
     // binding unset, so the walk terminates in `void_return` and `Finish`
     // hands the whole suffix to native execution exactly once.  Propagating
     // the refusal instead would take the entire dispatch JitCode down with it,
     // and every trace of that interpreter becomes `AbortPermanent`.
+    //
+    // Prefix and tail roll back TOGETHER.  A tail the lowering refuses after a
+    // committed prefix would leave the prefix in the JitCode and still
+    // terminate in `void_return`, so the native suffix -- the prefix included
+    // -- would run a second time once the `Finish` breaks the dispatch loop.
     let prefix_len = post_loop
         .len()
         .saturating_sub(usize::from(return_expr.is_some()));
-    let prefix_lowered = lowerer.transactional(|inner| {
-        for stmt in &post_loop[..prefix_len] {
-            inner.lower_stmt(stmt)?;
-        }
-        Some(())
-    });
-    let binding = prefix_lowered
-        .and(return_expr)
-        .and_then(|e| lowerer.lower_value_expr(e));
+    let binding = lowerer
+        .transactional(|inner| {
+            for stmt in &post_loop[..prefix_len] {
+                inner.lower_stmt(stmt)?;
+            }
+            match return_expr {
+                Some(expr) => inner.lower_value_expr(expr).map(Some),
+                None => Some(None),
+            }
+        })
+        .flatten();
     let (reads, emitter) = typed_return_terminator(binding);
     lowerer.emit_op(OpMeta::terminal(reads), emitter);
 
