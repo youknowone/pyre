@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 from testutils import assert_raises
 
 a = slice(10)
@@ -196,10 +197,13 @@ def test_all_slices():
                     )
                 count += 1
 
+    assert count == len(slices_res), (count, len(slices_res))
     if failures:
-        for f in failures:
-            print(f)
-        print(len(failures), "slices failed")
+        raise AssertionError(
+            "{} of {} slices differ from CPython:\n{}".format(
+                len(failures), count, "\n".join(failures)
+            )
+        )
 
 
 test_all_slices()

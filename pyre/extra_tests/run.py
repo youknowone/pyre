@@ -58,6 +58,7 @@ GATE_PREFIX = "# pyre-check: gate="
 # scaffolding imported by other snippets).  Skip them from the run.
 NON_TEST_FILES = {
     "testutils.py",
+    "cpython_generated_slices.py",
 }
 
 
