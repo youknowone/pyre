@@ -3010,9 +3010,8 @@ pub(crate) fn walker_apparent_super_class(
     start_type: pyre_object::PyObjectRef,
     obj: pyre_object::PyObjectRef,
 ) -> Option<ApparentSuperClass> {
-    let (receiver_type, receiver_version_tag, receiver_map, objtype) = unsafe {
-        pyre_interpreter::baseobjspace::super_check_apparent_fast_path(start_type, obj)
-    }?;
+    let (receiver_type, receiver_version_tag, receiver_map, objtype) =
+        unsafe { pyre_interpreter::baseobjspace::super_check_apparent_fast_path(start_type, obj) }?;
     Some(ApparentSuperClass {
         objtype,
         receiver_type,
@@ -5065,6 +5064,18 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
     if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
         return Ok(None);
     }
+    // Tried before the hand-written fold below, and returning here takes the
+    // site away from it rather than adding one.  That ordering is only
+    // harmless while the descent declines, which it does today at
+    // `w_method_new`.  Lifting that wall was measured: the descent then
+    // compiled `bench/synth/zero_arg_super_attr.py` 128x slower than the fold
+    // (7.71s against 0.06s at N=2,000,000, one binary A/B'd with
+    // `PYRE_FBW_NO_SPECIALIZE`, identical output, both arms
+    // `loops_compiled=2 loops_aborted=0`), and on
+    // `extra_tests/snippets/class_super_zero_arg_inlined_callee.py` it took 2
+    // of the fold's 5 sites while `loops_aborted` went 0 -> 6.  Publishing
+    // `w_method_new` therefore needs that deficit explained and this
+    // preference reconsidered, not just the wall removed.
     if spec_gate(SpecFold::LoadSuperAttrDescent, || {
         try_walker_orthodox_load_super_attr(
             ctx,

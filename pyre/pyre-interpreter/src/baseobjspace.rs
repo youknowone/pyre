@@ -10471,7 +10471,11 @@ pub(crate) unsafe fn w_type_getdictvalue(
     // process-global `STRING_INTERN_TABLE` mutex once per lookup, which is the
     // cost `lookup_in_type_where_wtf8` documents paying for the same ABI.
     let w_value = _pure_getdictvalue_no_unwrapping(w_type, w_name, version_tag);
-    if w_value.is_null() { None } else { Some(w_value) }
+    if w_value.is_null() {
+        None
+    } else {
+        Some(w_value)
+    }
 }
 
 /// `lookup` value projection of [`lookup_where_with_method_cache`]
