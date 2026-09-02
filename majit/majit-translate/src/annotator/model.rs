@@ -2267,13 +2267,23 @@ impl SomeValueTag {
             // Type chain: SomeTypeOf < SomeType < SomeObject (model.py).
             T::TypeOf => &[T::TypeOf, T::Type, T::Object],
             T::Type => &[T::Type, T::Object],
-            // String family shares a SomeStringOrUnicode base upstream; dispatch
-            // is flat — each tag resolves to itself then Object.
+            // String family: `SomeString`, `SomeUnicodeString` and
+            // `SomeByteArray` share a `SomeStringOrUnicode` base
+            // (model.py:288, 296, 304) that carries no pairtype
+            // registration, so naming it here would resolve nothing — those
+            // three resolve to themselves then Object. The two element tags
+            // do inherit from a registered class: `SomeChar(SomeString)`
+            // (model.py:309) and `SomeUnicodeCodePoint(SomeUnicodeString)`
+            // (model.py:318). That edge is load-bearing — `pairtype(SomeChar,
+            // SomeChar)` (binaryop.py:374) defines only `union`, so `chr + chr`
+            // reaches `pairtype(SomeString, SomeString).add` (binaryop.py:338)
+            // through it, and a char operand serves every other `SomeString`
+            // pair the same way.
             T::String => &[T::String, T::Object],
             T::UnicodeString => &[T::UnicodeString, T::Object],
             T::ByteArray => &[T::ByteArray, T::Object],
-            T::Char => &[T::Char, T::Object],
-            T::UnicodeCodePoint => &[T::UnicodeCodePoint, T::Object],
+            T::Char => &[T::Char, T::String, T::Object],
+            T::UnicodeCodePoint => &[T::UnicodeCodePoint, T::UnicodeString, T::Object],
             T::List => &[T::List, T::Object],
             T::Tuple => &[T::Tuple, T::Object],
             T::Dict => &[T::Dict, T::Object],

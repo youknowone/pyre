@@ -655,6 +655,33 @@ fn dispatch_rtype_op(
         | (AbstractStringRepr, AbstractStringRepr, "inplace_add") => {
             committed(super::rstr::pair_abstract_string_rtype_add(r1, r2, hop))
         }
+        // `rtype_add` is defined at exactly one place, `pairtype(
+        // AbstractStringRepr, AbstractStringRepr)` (rstr.py:651-659); no
+        // char pairtype defines one. A char operand reaches that body
+        // through `CharRepr(AbstractCharRepr, StringRepr)` and
+        // `UniCharRepr(AbstractUniCharRepr, UnicodeRepr)`
+        // (lltypesystem/rstr.py:291, 294), which is also where
+        // `char_repr.repr` comes from: `StringRepr.repr = string_repr`
+        // and `UniCharRepr.repr = unicode_repr` (lltypesystem/rstr.py:
+        // 1262-1264), so `rtype_add` coerces both operands to the
+        // string surface and calls the same `ll_strconcat`. The two
+        // functions below already coerce that way, and
+        // `pair_convert_from_to` already carries the Char→Str /
+        // UniChar→Unicode `ll_chr2str` edge, so the mixed and char-only
+        // pairs need dispatch entries and no lowering of their own.
+        // Pyre's CharRepr pair_mro is [CharRepr, Repr] (explicit-arm
+        // design, as for the comparisons below), so they are spelled
+        // out rather than inherited.
+        (StringRepr, CharRepr, "add" | "inplace_add")
+        | (CharRepr, StringRepr, "add" | "inplace_add")
+        | (CharRepr, CharRepr, "add" | "inplace_add") => {
+            committed(super::rstr::pair_string_string_rtype_add(hop))
+        }
+        (UnicodeRepr, UniCharRepr, "add" | "inplace_add")
+        | (UniCharRepr, UnicodeRepr, "add" | "inplace_add")
+        | (UniCharRepr, UniCharRepr, "add" | "inplace_add") => {
+            committed(super::rstr::pair_unicode_unicode_rtype_add(hop))
+        }
         // rtuple.py — `pairtype(TupleRepr, TupleRepr).rtype_add`
         // (and its `rtype_inplace_add` alias) concatenates two tuples
         // by per-position getfield + newtuple_cached.
