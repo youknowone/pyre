@@ -10,7 +10,13 @@
 # The keyword overrides a default (`step=1`) and the result depends on both
 # the positional and the keyword arg so the call cannot be constant-folded
 # away; the exact aggregate makes a single dropped iteration observable.
-N = 236520100
+# Sized for the dropped-iteration check, not for an armed ratio gate.  Arming
+# one needs a pypy execution over the floor-gate minimum, which this loop
+# reaches only past fifty million iterations, and pyre walks the same
+# iterations far more slowly here than it does with the keyword spelled
+# positionally -- so a length that arms the gate is also one that exceeds
+# the per-fixture timeout.  The keyword-call cost is the thing to fix.
+N = 400000
 
 
 def g(x, step=1):

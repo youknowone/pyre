@@ -5384,7 +5384,18 @@ def main():
         # put dynasm between 0.50x and 1.4x, so it moves between the bounds
         # the way cranelift already does: floor 0.34x under the 0.50x
         # reading, 2.05x over the 1.4x windows reading.
-        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       2.05,    2,       2.5)
+        # Both pypy ceilings then move again, for a reason that is not a
+        # measurement: a pyre backend now subtracts pypy's startup rather than
+        # its own, so the startup a pyre process spends above pypy stays inside
+        # every pyre reading here.  That is a fixed 0.05s-0.11s per host against
+        # a fib whose pypy execution is a third of a second, and it lands on
+        # each leg in proportion to how short that leg's baseline is: the widest
+        # dynasm reading becomes 2.36x on windows and the widest cranelift one
+        # 2.74x on ubuntu.  Both ceilings are fitted to those with a quarter's
+        # headroom, and both derived floors -- 0.483x and 0.567x -- stay under
+        # the narrowest readings of 1.25x and 1.83x, which the same subtraction
+        # moved up rather than down.
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       2.9,     2,       3.4)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
         # Run 33363045302 measured spectral_norm at 0.4-1.4x on the healthy
@@ -5401,7 +5412,14 @@ def main():
         # regression of the two in both rows. Those two spawns were three
         # quarters of every cpython second this file spends outside the
         # synthetic suite.
-        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       None,    2.3,     None,    2.3)
+        # Both ceilings then move for the startup-subtraction reason recorded on
+        # fib_recursive above.  spectral_norm carries it worse than fib does
+        # because its pypy execution is barely over a tenth of a second, so a
+        # 0.05s-0.11s startup deficit is most of a whole multiple: the readings
+        # become 1.60x-2.83x, widest on windows dynasm, and a 3.5 ceiling covers
+        # that with a quarter's headroom while its 0.583x floor stays under the
+        # 1.60x narrowest.
+        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       None,    3.5,     None,    3.5)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       None,    5,       None,    5,    wasm_float_tol=True)
         # fannkuch is almost nothing but cross-loop JUMP, which the two
         # backends pay differently: cranelift's closing_jump carries a LABEL's
