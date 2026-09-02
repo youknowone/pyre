@@ -5712,17 +5712,14 @@ impl TraceCtx {
     /// `mp.green_key == key` test here — the `same_greenkey` semantics
     /// survive the collapse.
     ///
-    /// **Known parity gap (intentional for now)**: upstream
+    /// `live_args_len` is the shape upstream's
     /// `pyjitpl.py assert len(original_boxes) == len(live_arg_boxes)`
-    /// must fire on every visited merge point because all merge points
-    /// in `current_merge_points` come from the same jitdriver (fixed
-    /// red-bank shape).  Pyre's `current_merge_points` currently mixes
-    /// shapes across its inline-frame model (observed: 4 vs 14 on
-    /// `nested_loop`), so enforcing the assert prematurely panics
-    /// healthy traces.  The assert lands once jitdriver isolation
-    /// across `add_merge_point` callers is tightened — a separate
-    /// follow-up.  `live_args_len` is plumbed through so that
-    /// follow-up doesn't need to re-touch the call sites.
+    /// compares against.  Pyre carried a filter there instead, because the
+    /// mixed shapes its inline-frame model produced (observed: 4 vs 14 on
+    /// `nested_loop`) would have panicked healthy traces.  That mismatch no
+    /// longer reproduces — slot 54, which counted exactly it, reads 0 over the
+    /// whole fixture corpus — so the body asserts and no longer filters.  See
+    /// there for what the assert does and does not cover.
     pub fn has_merge_point_with_shape_assert(&self, key: u64, live_args_len: usize) -> bool {
         // pyjitpl.py:2994-2997 reverse scan:
         //   for j in range(len(self.current_merge_points) - 1, -1, -1):
@@ -5741,20 +5738,44 @@ impl TraceCtx {
         // by shape length instead of asserting — a shape mismatch means
         // the merge point was seeded under a different frame layout and
         // should not match.
-        // Same reverse scan, same short-circuit; the loop form exists only so
-        // the SHAPE REJECTION can be tallied. `pyjitpl.py:3020 assert
+        // Same reverse scan, same short-circuit. `pyjitpl.py assert
         // len(original_boxes) == len(live_arg_boxes)` asserts here — upstream
-        // never filters. Slot 54 counts every same-green-key merge point this
-        // rule discards, so a corpus reading 0 can promote the filter to a
-        // `debug_assert!`.
+        // never filters — and slot 54 existed to earn that assert by counting
+        // every same-green-key merge point the filter discarded.
+        //
+        // Measured 0 over 537 fixtures (`pyre/bench/synth` 527 +
+        // `pyre/bench` 10, which is where the `nested_loop` the older note
+        // named actually lives), against a live denominator: this is the
+        // loop-close decision, so every compiled loop in that corpus took the
+        // matching return below.  So the filter is gone and a same-green-key
+        // entry closes the loop the way upstream's does.
+        //
+        // The counter STAYS, next to the assert rather than replaced by it.
+        // `debug_assert!` is compiled out of release, and the corpus that
+        // produced the zero is a release binary; keeping the bump means a
+        // mismatch that only a release build reaches is still counted rather
+        // than silently matching.
+        //
+        // The assert is narrower than upstream's, deliberately: upstream
+        // asserts on EVERY visited merge point, before the green-key test,
+        // because its `current_merge_points` all come from one jitdriver.
+        // Pyre's can mix jitdrivers across `add_merge_point` callers, and
+        // nothing here measured the shapes of the entries whose green key does
+        // NOT match, so those are left unasserted.
         for mp in self.current_merge_points.iter().rev() {
             if mp.green_key != key {
                 continue;
             }
-            if mp.green_boxes.len() == live_args_len {
-                return true;
+            if mp.green_boxes.len() != live_args_len {
+                crate::mc_diag_bump(54);
+                debug_assert_eq!(
+                    mp.green_boxes.len(),
+                    live_args_len,
+                    "same-green-key merge point with a different red-bank shape: \
+                     seeded under a different frame layout",
+                );
             }
-            crate::mc_diag_bump(54);
+            return true;
         }
         false
     }

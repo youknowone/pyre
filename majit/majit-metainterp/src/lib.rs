@@ -1571,13 +1571,16 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// no compiled target, 52 = abort after a declined bridge attempt, 53 =
 /// `compile_trace` called `compile_bridge` and it returned false.
 ///
-/// 54-56 are the merge-point path's three silent recovery rules, each counted
+/// 54-56 are the merge-point path's silent recovery rules, each counted
 /// where it FIRES rather than where it is called, so a slot reading 0 over the
 /// corpus is the evidence needed to replace the rule with a `debug_assert!`:
-/// 54 = `has_merge_point_with_shape_assert` rejected a SAME-green-key merge
-/// point because its `green_boxes` length differed from `live_args_len`, where
-/// `pyjitpl.py assert len(original_boxes) == len(live_arg_boxes)` asserts
-/// instead of filtering; 55 = `register_retrace_merge_point` declined to
+/// 54 = a SAME-green-key merge point in `has_merge_point_with_shape_assert`
+/// whose `green_boxes` length differs from `live_args_len`, where
+/// `pyjitpl.py assert len(original_boxes) == len(live_arg_boxes)` asserts.
+/// 54 has since spent that evidence — 0 over the whole fixture corpus — and
+/// the filter it justified is gone; the slot is kept beside the
+/// `debug_assert_eq!` that replaced it, because that assert is compiled out of
+/// the release builds the corpus reading came from; 55 = `register_retrace_merge_point` declined to
 /// register because some jump arg carried no intrinsic type, where
 /// `pyjitpl.py:3059-3060 self.current_merge_points.append((live_arg_boxes,
 /// start))` appends unconditionally; 56 = `close_header_pc` fell back to
