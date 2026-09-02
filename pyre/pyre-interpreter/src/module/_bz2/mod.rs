@@ -3,12 +3,13 @@
 //! name `_bz2`).
 //!
 //! `interp_bz2.py` keeps the libbz2 stream and its per-object lock on the
-//! wrapper object; here the stream lives in `pyre_native::bz2`
-//! (bzip2 / libbz2-rs-sys) outside the LLBC extraction, exactly as `zlib`
-//! keeps its DEFLATE codec, and this module is the W_Root object glue.
+//! wrapper object.  The stream machinery is shared with RustPython through
+//! `rustpython_common::compression::bz2`, which Charon never enters because it
+//! is a git dependency; this module is the W_Root object glue and keeps the
+//! per-object lock.
 
-use pyre_native::bz2 as backend;
 use pyre_object::*;
+use rustpython_common::compression::bz2 as backend;
 
 use parking_lot::Mutex;
 

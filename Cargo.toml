@@ -80,19 +80,20 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # names `MarshalError::DataTooShort` / `EofObject` and `CFormatType::Bytes`,
 # which arrived with it.
 #
-# Pinned to the merge of RustPython #8631 for the feature-gated,
-# VM-independent zlib stream engine shared by rustpython-stdlib and pyre-native.
+# Pinned to the merge of RustPython #8638, which puts the feature-gated,
+# VM-independent bzip2 stream engine next to the zlib one from #8631.  Both are
+# shared with rustpython-stdlib, so neither codec needs a pyre-local copy.
 #
-rustpython-common = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326", features = ["binascii", "cjk-codecs", "inet", "json", "zlib"] }
-rustpython-literal = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
-rustpython-compiler = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
-rustpython-compiler-core = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "zlib"] }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
 ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
-rustpython-wtf8 = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
-rustpython-unicode = { git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/youknowone/RustPython.git", rev = "294ba6ba8f6205f6857eea74712ec8e943f95326" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
@@ -185,10 +186,6 @@ sha3 = "0.10"
 blake2b_simd = { version = "1.0.4" }
 blake2s_simd = { version = "1.0.4" }
 scrypt = { version = "0.11", default-features = false }
-# bzip2 backend (pyre-native only): the crate's default feature selects
-# libbz2-rs-sys, the pure-Rust libbz2 port from the same source as zlib-rs,
-# whose output is byte-identical to the reference C libbz2.
-bzip2 = "0.6.1"
 # liblzma backend (pyre-native only): xz-core is the pure-Rust port of
 # liblzma, with the same entry points `Modules/_lzmamodule.c` calls, so
 # `_lzma` needs no C toolchain and builds for wasm32 like the others.
