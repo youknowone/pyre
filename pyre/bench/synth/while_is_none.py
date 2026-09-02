@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=18
+# pyre-check: max-pypy-ratio=3.9
 # The walk loop's hot body reads `head.val` (an int) and `head.next` (the next
 # node).  The full-body-walker LOAD_ATTR fold folds the object-typed `head.next`
 # read to `guard_class` + `guard_value(map)` + `getfield(storage)` +
@@ -10,7 +10,7 @@
 #
 # N/ITERS are sized to leave every backend well inside the synthetic timeout
 # while still driving the compiled walk loop thousands of times.
-N = 600
+N = 62400
 ITERS = 500
 
 

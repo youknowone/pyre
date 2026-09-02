@@ -1,9 +1,9 @@
-# pyre-check: max-pypy-ratio=20
+# pyre-check: max-pypy-ratio=3.3
 # A FOR_ITER caller should inline a method-form callee whose body performs a
 # nested method-form call.  The nested `LOAD_METHOD` path emits a
 # `load_method_self` residual after the attribute lookup; deferring it lets the
 # record-time fold remove it before the replay backstop.
-N = 240000
+N = 113280000
 
 
 class Cursor:

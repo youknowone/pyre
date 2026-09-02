@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=3.6
 # pyre-check: spec-folds=kwonly_defaults_inline
 # A hot call into a keyword-only callee that supplies nothing for it, so the
 # inline has to fill `step` from `__kwdefaults__` itself.
@@ -14,7 +14,7 @@
 # default, and the aggregate is exact, so a seeding that fills the slot with
 # the wrong value or the wrong local changes the printed sum rather than the
 # timing.
-N = 400000
+N = 90000000
 
 
 def g(x, *, step=1):

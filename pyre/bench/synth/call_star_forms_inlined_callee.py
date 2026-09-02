@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=18
+# pyre-check: max-pypy-ratio=4
 # CALL_KW and CALL_FUNCTION_EX inside a callee that is inlined into the hot
 # loop.  The residual port compiles both opcodes rather than emitting
 # abort_permanent and declining the callee's jitcode.  Guards output
@@ -6,7 +6,7 @@
 #
 # `call_kw_hot_loop.py` is the contrasting shape: a CALL_KW directly in the
 # hot loop body rather than nested inside an inlined callee.
-N = 600000
+N = 36000000
 
 
 def add(a, b, c):

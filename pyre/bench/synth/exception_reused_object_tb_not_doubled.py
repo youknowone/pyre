@@ -7,12 +7,6 @@
 # exception hides this: the discarded walk's object is unreachable, so only a
 # reused one accumulates both deliveries.
 #
-# N is bounded rather than sized for throughput. The doubling reproduces from
-# roughly the 1200th iteration on both native backends, while cranelift takes a
-# GC BUG (`minor_varsize_item_target`) on this shape somewhere between 4000 and
-# 8000 — a pre-existing crash this workload happens to reach, not something the
-# traceback chain is party to.
-#
 # No `max-pypy-ratio`: this is a traceback-shape oracle, and its pypy arm runs
 # well under a tenth of a second — below the point where a wall-clock ratio
 # measures the workload rather than process startup.

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=11
+# pyre-check: max-pypy-ratio=2
 # GC heap-array ops on the blackhole guard-failure resume path. The loop
 # body reads and writes a list (getarrayitem_gc_i / setarrayitem_gc_i) and
 # the function returns a tuple (new_array_clear + setarrayitem_gc_r +
@@ -8,7 +8,7 @@
 # through a tuple/list build or an array element access panicked with an
 # unwired opcode. A traced loop that never deopts through these ops would
 # not cover them.
-N = 80000
+N = 34160000
 
 
 def work(n):

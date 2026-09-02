@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=14
+# pyre-check: max-pypy-ratio=2.2
 # A list subscript, assignment, and deletion coerce a non-int key through
 # `__index__` (`getindex_w`); an index too large for a machine word raises
 # IndexError naming the key's real type ("cannot fit '<type>' ..."), and an
@@ -53,7 +53,7 @@ def delv(i):
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(79215000))
     m("read_idx", lambda: read(Idx(1)))
     m("read_neg", lambda: read(Idx(-1)))
     m("read_oob", lambda: read(Idx(9)))

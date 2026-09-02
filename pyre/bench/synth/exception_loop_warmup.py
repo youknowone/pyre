@@ -1,11 +1,11 @@
-# pyre-check: max-pypy-ratio=38
+# pyre-check: max-pypy-ratio=4.1
 # Warm-up-then-raise exception handling: the loop runs cleanly long enough to
 # compile, then a nested try/(try-finally)/except starts raising only after the
 # warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,
 # so the guard failure resumes in the blackhole and the exception must hop
 # floordiv -> inner finally -> reraise -> outer except entirely under blackhole
 # control. Benches that raise from iteration 1 do not exercise this path.
-N = 80000
+N = 7840000
 
 
 def nested(n):

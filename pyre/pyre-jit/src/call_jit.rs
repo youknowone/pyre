@@ -6594,7 +6594,8 @@ fn load_special_method_name(method_kind: i64) -> &'static str {
 /// `_PyObject_LookupSpecial` looks the method up on the type only, bypassing
 /// the instance dict and any `__getattribute__` override, so a traced
 /// `with`/`async with` calls the same method the interpreter would.  Returns
-/// the bound method; [`bh_load_special_self_fn`] therefore reports a NULL self.
+/// the bound method, so LOAD_SPECIAL's `null_or_self` half is the constant NULL
+/// the codewriter pushes without a call.
 pub extern "C" fn bh_load_special_fn(obj: i64, method_kind: i64) -> i64 {
     let name = load_special_method_name(method_kind);
     match pyre_interpreter::baseobjspace::load_special_resolve(
@@ -6607,13 +6608,6 @@ pub extern "C" fn bh_load_special_fn(obj: i64, method_kind: i64) -> i64 {
             0
         }
     }
-}
-
-/// The LOAD_SPECIAL `null_or_self` value.  [`bh_load_special_fn`] returns the
-/// method already bound through the descriptor's `__get__`, so — as in the
-/// interpreter's `load_special` — the pushed pair carries a NULL self.
-pub extern "C" fn bh_load_special_self_fn(_obj: i64, _attr: i64, _method_kind: i64) -> i64 {
-    pyre_object::PY_NULL as i64
 }
 
 /// WITH_EXCEPT_START residual.  The generated JitCode carries the five
@@ -7569,8 +7563,9 @@ pub extern "C" fn bh_unary_not_fn(value: i64) -> i64 {
 /// as `value` (possibly `PY_NULL` for an unbound local).  Returns `value`
 /// unchanged when bound; on an unbound local raises `UnboundLocalError`,
 /// resolving the variable name from the resume frame's code object via the
-/// `co_varnames` index baked in by the codewriter.  Reads no heap and runs no
-/// user code (`CallFlavor::Plain`); the exception is published through
+/// `co_varnames` index baked in by the codewriter.  Reads only that immutable
+/// `co_varnames`, writes nothing and runs no user code
+/// (`CallFlavor::CanRaise`); the exception is published through
 /// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call returns
 /// 0.
 pub extern "C" fn bh_load_fast_check_fn(value: i64, w_code_ptr: i64, name_idx: i64) -> i64 {

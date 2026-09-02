@@ -2731,24 +2731,6 @@ fn emit_frontend_load_special(
     )
 }
 
-fn emit_frontend_load_special_self(
-    graph: &mut super::flow::FunctionGraph,
-    block: &super::flow::BlockRef,
-    obj: super::flow::FlowValue,
-    attr: super::flow::FlowValue,
-    method_kind_const: super::flow::FlowValue,
-    offset: i64,
-) -> super::flow::Variable {
-    emit_graph_op_with_result(
-        graph,
-        block,
-        "load_special_self",
-        vec![obj.into(), attr.into(), method_kind_const.into()],
-        Kind::Ref,
-        offset,
-    )
-}
-
 fn emit_frontend_load_name(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3543,7 +3525,6 @@ struct FnPtrIndices {
     load_attr_fn: HelperHandle,
     load_method_self_fn: HelperHandle,
     load_special_fn: HelperHandle,
-    load_special_self_fn: HelperHandle,
     with_except_start_fn: HelperHandle,
     store_attr_fn: HelperHandle,
     build_map_from_array_fn: HelperHandle,
@@ -3631,7 +3612,13 @@ struct FnPtrIndices {
 ///   (`effectinfo.py:23`) → `MayForce`.
 /// * `load_global_fn` / `build_slice_fn`: namespace dict lookup +
 ///   slice allocation; can raise (`NameError` / `MemoryError`) but do
-///   not force virtuals — `EF_CAN_RAISE` → `Plain`.
+///   not force virtuals.  They sit on `Plain` rather than `CanRaise`
+///   because `Plain` is the "nothing was classified" row
+///   (`EF_RANDOM_EFFECTS`), and `CanRaise` asserts empty read AND write
+///   sets — a helper that touches any field the trace can cache has not
+///   earned it, and `heap.py force_from_effectinfo` would then skip
+///   both the pending-set flush the callee's read needs and the cache
+///   invalidation its write needs.
 /// * `box_int_fn`: kept on `Plain` until the upstream
 ///   `@jit.elidable_promote` decorator is wired (`rpython/rlib/jit.py`).
 /// * `load_const_fn`: reads the shared `co_consts_w` slot, but pyre lazily
@@ -3818,11 +3805,6 @@ fn register_helper_fn_pointers(
         cpu.load_special_fn as *const (),
         CallFlavor::MayForce,
     );
-    let load_special_self_fn = bind(
-        assembler,
-        cpu.load_special_self_fn as *const (),
-        CallFlavor::Plain,
-    );
     let with_except_start_fn = bind(
         assembler,
         cpu.with_except_start_fn as *const (),
@@ -3996,13 +3978,16 @@ fn register_helper_fn_pointers(
         cpu.unary_not_fn as *const (),
         CallFlavor::MayForce,
     );
-    // `bh_load_fast_check_fn` only null-checks the local and raises
-    // UnboundLocalError; it reads no heap and runs no user code → `Plain`.
-    // Appended last to preserve fn_ptr indices.
+    // `bh_load_fast_check_fn` null-checks the local it is handed and, when
+    // unbound, reads the code object's immutable `co_varnames` to name the
+    // variable in an `UnboundLocalError`.  It reads no mutable field, writes
+    // none, and runs no user code, so it earns the empty read/write sets of
+    // `EF_CAN_RAISE` — `CanRaise`, not the `EF_RANDOM_EFFECTS` an unclassified
+    // callee gets.  Appended last to preserve fn_ptr indices.
     let load_fast_check_fn = bind(
         assembler,
         cpu.load_fast_check_fn as *const (),
-        CallFlavor::Plain,
+        CallFlavor::CanRaise,
     );
     // `bh_unary_negative_fn` computes `-value`; a user `__neg__` may run
     // Python → `MayForce`.  Appended last to preserve fn_ptr indices.
@@ -4390,7 +4375,6 @@ fn register_helper_fn_pointers(
         load_attr_fn,
         load_method_self_fn,
         load_special_fn,
-        load_special_self_fn,
         with_except_start_fn,
         store_attr_fn,
         build_map_from_array_fn,
@@ -6300,11 +6284,6 @@ impl CodeWriter {
                     idx: load_special_fn_idx,
                     flavor: _load_special_fn_flavor,
                 },
-            load_special_self_fn:
-                HelperHandle {
-                    idx: load_special_self_fn_idx,
-                    flavor: _load_special_self_fn_flavor,
-                },
             with_except_start_fn:
                 HelperHandle {
                     idx: with_except_start_fn_idx,
@@ -6708,7 +6687,6 @@ impl CodeWriter {
             load_attr_fn_idx,
             load_method_self_fn_idx,
             load_special_fn_idx,
-            load_special_self_fn_idx,
             store_attr_fn_idx,
             build_map_from_array_fn_idx,
             binary_slice_fn_idx,
@@ -12910,8 +12888,8 @@ impl CodeWriter {
                                 let result_value = emit_frontend_load_special(
                                     &mut graph,
                                     &current_block.block(),
-                                    obj_value.clone(),
-                                    method_kind_const.clone(),
+                                    obj_value,
+                                    method_kind_const,
                                     py_pc as i64,
                                 );
                                 current_state.stack.push(result_value.into());
@@ -12921,19 +12899,15 @@ impl CodeWriter {
                                     result_value.into(),
                                     py_pc
                                 );
-                                let bound_value = emit_frontend_load_special_self(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    obj_value,
-                                    result_value.into(),
-                                    method_kind_const,
-                                    py_pc as i64,
-                                );
-                                current_state.stack.push(bound_value.into());
-                                emit_pushvalue_ref!(
+                                // `load_special` resolves the method through the
+                                // descriptor's `__get__`, so the pair's second half
+                                // is the NULL the interpreter's `load_special`
+                                // pushes, not a receiver — a compile-time constant,
+                                // the same one `PushNull` emits.
+                                current_state.stack.push(null_stack_sentinel());
+                                emit_pushvalue_ref_const!(
                                     current_depth,
-                                    stack_base + current_depth,
-                                    bound_value.into(),
+                                    pyre_object::PY_NULL as i64,
                                     py_pc
                                 );
                             }
@@ -13049,7 +13023,9 @@ impl CodeWriter {
                         // load_fast_check_fn, ListR[value, code],
                         // ListI[name_idx])` returns the value when bound or
                         // raises the unbound UnboundLocalError (`bh_load_fast_check_fn`,
-                        // CallFlavor::Plain — reads no heap, runs no user code).
+                        // CallFlavor::CanRaise — reads only the code object's
+                        // immutable `co_varnames`, writes nothing, runs no
+                        // user code).
                         // `name_idx` is the `co_varnames` index the residual
                         // resolves the variable name with.
                         Instruction::LoadFastCheck { var_num } => {

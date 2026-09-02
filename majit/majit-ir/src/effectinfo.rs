@@ -1198,6 +1198,26 @@ pub enum RuntimeHelperKind {
     /// also keeps the executed-effect odometer off it because the slot has no
     /// value reader and a non-committing walk has nothing to undo.
     ClearInFlightException,
+    /// `load_special_fn(obj, method_kind)` — the LOAD_SPECIAL Enter/Exit
+    /// residual (`lower_load_special_hlop_to_insn`).  The Ref operand is the
+    /// context-manager object and the Int operand is the `SpecialMethod`
+    /// discriminant naming `__enter__` / `__exit__`.  The full-body walker
+    /// recognises this tag to fold the lookup the way PyPy's `BEFORE_WITH`
+    /// gets it for free: `space.lookup` is ordinary RPython there, so under a
+    /// promoted type it is constant and the bound method it builds virtualizes
+    /// into the following CALL.  Falls through to the residual for every shape
+    /// [`pyre_interpreter::baseobjspace::load_special_fast_path`] declines.
+    LoadSpecial,
+    /// `load_fast_check_fn(value, code, name_idx)` — the LOAD_FAST_CHECK
+    /// residual (`lower_load_fast_check_hlop_to_insn`).  The Ref operands are
+    /// the local's value and the jitcode's own PyCode; the Int operand is the
+    /// `co_varnames` index the `UnboundLocalError` names.  The helper is the
+    /// identity on a bound local, so the full-body walker recognises this tag
+    /// to fold it to `guard_nonnull(value)` plus the operand itself — the
+    /// nullity test upstream spells with a guard rather than a call
+    /// (`pyjitpl.py _establish_nullity`).  A guard failure resumes at the
+    /// opcode, where the interpreter re-runs it and raises.
+    LoadFastCheck,
 }
 
 impl EffectInfo {
