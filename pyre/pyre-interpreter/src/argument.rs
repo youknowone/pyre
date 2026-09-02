@@ -1522,10 +1522,11 @@ impl Arguments {
         // point.  The dictionary moves under one, and the names and values sit
         // in native vectors no root walker updates, so the whole set is
         // published before the first turn and read back on the turn that uses
-        // it.  A tuple is allocated stable, so `w_args` only needs the one pin
-        // that keeps it alive across the same run.
+        // it.  `w_args` is nursery-allocated too, so it is read back at the
+        // return rather than carried across the loop in a local.
         let _roots = pyre_object::gc_roots::push_roots();
-        let w_args = pyre_object::gc_roots::pin_root(w_args);
+        let args_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_args);
         let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new());
         if let (Some(names), Some(values)) =
@@ -1548,7 +1549,10 @@ impl Arguments {
                 )?;
             }
         }
-        Ok((w_args, pyre_object::gc_roots::shadow_stack_get(kwds_slot)))
+        Ok((
+            pyre_object::gc_roots::shadow_stack_get(args_slot),
+            pyre_object::gc_roots::shadow_stack_get(kwds_slot),
+        ))
     }
 }
 

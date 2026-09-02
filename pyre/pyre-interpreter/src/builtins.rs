@@ -6674,8 +6674,8 @@ fn type_descr_new_with_metaclass(
         // with no other referrer, and it has to survive `calculate_metaclass`,
         // the namespace copy, `validate_c3_mro`, `create_all_slots`,
         // `__set_name__` and `__init_subclass__` before anything else refers to
-        // it.  A tuple never moves, so the plain uses below stay valid
-        // addresses; the pin is what keeps a major cycle from sweeping it.
+        // it.  A tuple is nursery-allocated and every one of those collects,
+        // so each use below reads the slot back instead of carrying the word.
         let _effective_bases_roots = pyre_object::gc_roots::push_roots();
         let w_effective_bases =
             if bases.is_null() || !unsafe { is_tuple(bases) } || unsafe { w_tuple_len(bases) } == 0
@@ -6689,7 +6689,8 @@ fn type_descr_new_with_metaclass(
             } else {
                 bases
             };
-        let w_effective_bases = pyre_object::gc_roots::pin_root(w_effective_bases);
+        let effective_bases_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_effective_bases);
         // calculate_metaclass — delegate to winner if different
         let default_meta = if w_metaclass.is_null() {
             crate::typedef::w_type()
@@ -6745,7 +6746,12 @@ fn type_descr_new_with_metaclass(
 
         // This is type.__new__'s own construction path. A different winning
         // metaclass above received the original bases without a C3 pre-check.
-        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, false)? };
+        unsafe {
+            crate::baseobjspace::validate_c3_mro(
+                pyre_object::gc_roots::shadow_stack_get(effective_bases_slot),
+                false,
+            )?
+        };
 
         let _dict_root = pyre_object::gc_roots::push_roots();
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
@@ -6757,7 +6763,11 @@ fn type_descr_new_with_metaclass(
         // raised, since the store cannot propagate one).
         let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
         let dict_obj = pyre_object::gc_roots::pin_root(dict_obj);
-        let w_type = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
+        let w_type = pyre_object::w_type_new(
+            name,
+            pyre_object::gc_roots::shadow_stack_get(effective_bases_slot),
+            dict_obj as *mut u8,
+        );
         // Nothing refers to a class this young — the classcell is optional and
         // `weak_subclasses` is weak — while the passes below allocate, so a
         // major cycle sweeps it out from under `create_all_slots` and the
@@ -6770,7 +6780,12 @@ fn type_descr_new_with_metaclass(
         // pass receives the forwarded address rather than the word above.
         type_new_take_qualname(w_type, pyre_object::gc_roots::shadow_stack_get(dict_root))?;
         // typeobject.py create_all_slots parity.
-        unsafe { crate::call::create_all_slots(w_type, w_effective_bases)? };
+        unsafe {
+            crate::call::create_all_slots(
+                w_type,
+                pyre_object::gc_roots::shadow_stack_get(effective_bases_slot),
+            )?
+        };
         // `type_ready_fill_dict` defaults the doc entry once the slot and
         // instance descriptors own their names.
         type_dict_set_doc(w_type);
@@ -6869,7 +6884,11 @@ fn type_descr_new_with_metaclass(
             },
             None => Vec::new(),
         };
-        crate::call::call_init_subclass_on_bases(w_type, w_effective_bases, &init_subclass_kwargs)?;
+        crate::call::call_init_subclass_on_bases(
+            w_type,
+            pyre_object::gc_roots::shadow_stack_get(effective_bases_slot),
+            &init_subclass_kwargs,
+        )?;
 
         return Ok(w_type);
     }
