@@ -82,9 +82,9 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 #
 # Pinned to RustPython/RustPython main (ssl keylog #8655). CJK tables in
 # rustpython-common are unchanged from #8631; the bump is the rest of the
-# workspace crates that share this rev.
+# workspace crates that share this rev. `bz2` is the #8638 stream engine.
 #
-rustpython-common = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad", features = ["binascii", "cjk-codecs", "inet", "json", "zlib"] }
+rustpython-common = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "zlib"] }
 rustpython-literal = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
 rustpython-compiler = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
 rustpython-compiler-core = { git = "https://github.com/youknowone/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
@@ -186,10 +186,6 @@ sha3 = "0.10"
 blake2b_simd = { version = "1.0.4" }
 blake2s_simd = { version = "1.0.4" }
 scrypt = { version = "0.11", default-features = false }
-# bzip2 backend (pyre-native only): the crate's default feature selects
-# libbz2-rs-sys, the pure-Rust libbz2 port from the same source as zlib-rs,
-# whose output is byte-identical to the reference C libbz2.
-bzip2 = "0.6.1"
 # liblzma backend (pyre-native only): xz-core is the pure-Rust port of
 # liblzma, with the same entry points `Modules/_lzmamodule.c` calls, so
 # `_lzma` needs no C toolchain and builds for wasm32 like the others.

@@ -2853,7 +2853,6 @@ version = "0.0.2"
 dependencies = [
  "blake2b_simd",
  "blake2s_simd",
- "bzip2",
  "cc",
  "der",
  "libc",
@@ -3324,6 +3323,7 @@ dependencies = [
  "ascii",
  "base64 0.23.1",
  "bitflags 2.13.0",
+ "bzip2",
  "crc32fast",
  "getrandom 0.4.3",
  "itertools 0.15.0",
