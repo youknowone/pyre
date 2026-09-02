@@ -18715,13 +18715,15 @@ pub enum InlineDecision {
     Inline,
     /// Emit a CALL_ASSEMBLER: callee has compiled code.
     CallAssembler,
-    /// Callee not compiled and no on-demand token machinery.  pyjitpl.py:1417
-    /// (`inlining` true) would build the token via `compile_tmp_callback`
-    /// (warmstate.py:714-722) and still emit CALL_ASSEMBLER; lacking that here,
-    /// this variant means "no token yet" and the dispatcher aborts/retries
-    /// until the callee compiles.  It is not pyjitpl.py's `inlining`-false
-    /// residual call.  See `should_inline_core` for the same
-    /// `compile_tmp_callback` gap.
+    /// No callee token was PROVEN when the decision was taken.  Not
+    /// pyjitpl.py's `inlining`-false residual call: with `inlining` true
+    /// `_opimpl_recursive_call` still takes `assembler_call = True` here and
+    /// builds the token on demand via `compile_tmp_callback` (warmstate.py).
+    /// This variant exists because `decide_recursive_inline` is pure in its
+    /// five scalars and so cannot reach a synthesiser; the emitter it feeds
+    /// asks the seam that can (`Runtime::recursive_call_assembler_target`) and
+    /// treats this exactly as [`Self::CallAssembler`], aborting only if that
+    /// seam also comes back empty.
     ResidualCall,
 }
 
@@ -18760,9 +18762,11 @@ pub(crate) fn decide_recursive_inline(
     // this predicate: it is pure in the five scalars, and token synthesis
     // belongs to the emitter.  So the not-compiled case is labelled
     // `ResidualCall` — a stand-in meaning "no token proven yet, do not commit
-    // to CALL_ASSEMBLER from here" — which the dispatcher turns into
-    // abort/retry when its own seam (`Runtime::recursive_call_assembler_target`)
-    // also comes back empty.  It is NOT pyjitpl.py's `inlining`-false residual
+    // to CALL_ASSEMBLER from here".  The emitter reads it as the same
+    // `assembler_call = True` upstream takes: it asks
+    // `Runtime::recursive_call_assembler_target`, whose production resolver
+    // does synthesise, and aborts only when that seam also comes back empty.
+    // It is NOT pyjitpl.py's `inlining`-false residual
     // (`assembler_call = False`) path.
     let non_inline = if callee_compiled {
         InlineDecision::CallAssembler

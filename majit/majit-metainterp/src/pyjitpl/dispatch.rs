@@ -3311,7 +3311,7 @@ where
             inline_depth,
             recursive_depth,
         );
-        if decision == crate::pyjitpl::InlineDecision::CallAssembler {
+        if decision != crate::pyjitpl::InlineDecision::Inline {
             // pyjitpl.py `_opimpl_recursive_call` →
             // `do_recursive_call(assembler_call=True)`: instead of inlining
             // the portal frame, force the caller vable to heap, record a
@@ -3319,6 +3319,35 @@ where
             // by green key), and reload on return.  Mirrors the
             // `BC_CALL_ASSEMBLER_INT` arm verbatim except for token
             // resolution (green key, not the jitcode fn_ptr_idx slot).
+            //
+            // `CallAssembler` and `ResidualCall` both arrive here, because
+            // upstream draws no line between them at this point: with
+            // `warmrunnerstate.inlining` true (always, here —
+            // `WarmEnterState::inlining` in `warmstate.rs` defaults to `true`)
+            // every path that does not `perform_call` sets
+            // `assembler_call = True` and falls into `do_recursive_call`.  The
+            // callee-not-compiled case is not a residual call there; the token
+            // is built on demand further down, by `direct_assembler_call` →
+            // `get_assembler_token` → `compile_tmp_callback`
+            // (warmstate.py).  The two variants differ only in whether a token
+            // was already PROVEN when the decision was taken, and
+            // `decide_recursive_inline` cannot prove one: it is pure in five
+            // scalars with no synthesiser in reach.  The synthesiser sits
+            // behind the seam this arm consults —
+            // `Runtime::recursive_call_assembler_target`, which the production
+            // resolver backs with `get_assembler_token` / `compile_tmp_callback`
+            // — so asking it is what turns "no token proven yet" into
+            // upstream's on-demand token rather than a lost trace.
+            //
+            // A seam that still comes back empty aborts inside
+            // `exec_recursive_call_assembler`, which is the retry-until-the-
+            // callee-compiles behaviour this arm used to take unconditionally,
+            // now reached only when no token can be built at all.
+            //
+            // pyjitpl.py's true residual path
+            // (`assembler_call = False`, `do_residual_call`) is reachable only
+            // when `inlining` is false, which is never the case here, so it is
+            // intentionally unmodelled.
             return self.exec_recursive_call_assembler(
                 ctx,
                 sym,
@@ -3329,29 +3358,6 @@ where
                 &green_values,
                 &arg_triples,
             );
-        }
-        if decision != crate::pyjitpl::InlineDecision::Inline {
-            // `ResidualCall` here labels pyjitpl.py:1376's callee-not-compiled
-            // case.  Under `warmrunnerstate.inlining` (pyjitpl.py, always
-            // true here — `WarmEnterState::inlining` in `warmstate.rs`
-            // defaults to `true`) that case takes
-            // `assembler_call = True` (pyjitpl.py) →
-            // `direct_assembler_call` → `get_assembler_token`, which
-            // synthesises the callee token on demand via `compile_tmp_callback`
-            // (warmstate.py:714-722); it is NOT a residual call.
-            // `compile_tmp_callback` is ported (`compile.rs`), but reaching it
-            // here needs a `Runtime::recursive_call_assembler_target` that
-            // synthesises rather than reporting the tokens it already holds, and
-            // the decision itself arrives from a predicate with no synthesiser
-            // in reach (`decide_recursive_inline`).  So the on-demand token
-            // cannot be built at this point: abort and retry until the callee
-            // compiles on its own, after which a later attempt takes the wired
-            // `CallAssembler` leg (`exec_recursive_call_assembler`).
-            // pyjitpl.py's true residual
-            // path (`assembler_call = False`, do_residual_call) is reachable
-            // only when `inlining` is false, which is never the case here, so
-            // it is intentionally unmodelled.
-            return TraceAction::Abort;
         }
         // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
         // `portal_jitcode`; enter their portal at `green_pc` as before.
@@ -12274,6 +12280,133 @@ mod tests {
             finish_args[0],
             call_op.pos.get(),
             "the recursive CALL_ASSEMBLER result must be wired into the caller's return register",
+        );
+    }
+
+    /// A runtime that reports `ResidualCall` — no callee token PROVEN when the
+    /// decision was taken — while its `recursive_call_assembler_target` seam
+    /// still resolves one.  This is the production shape on the first recursive
+    /// edge: `decide_recursive_inline` is pure in five scalars and cannot reach
+    /// a synthesiser, but the seam is backed by `get_assembler_token` /
+    /// `compile_tmp_callback`.  `token: None` models the seam that cannot build
+    /// one either.
+    struct RecursiveResidualDecisionRuntime {
+        token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
+    }
+
+    impl JitCodeRuntime for RecursiveResidualDecisionRuntime {
+        fn label_at(&self, _pc: usize) -> usize {
+            0
+        }
+
+        fn recursive_inline_decision(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+            _inline_depth: usize,
+            _recursive_depth: usize,
+        ) -> crate::pyjitpl::InlineDecision {
+            crate::pyjitpl::InlineDecision::ResidualCall
+        }
+
+        fn recursive_call_assembler_target(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+        ) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)> {
+            self.token.clone().map(|token| (token, 0))
+        }
+
+        fn execute_recursive_assembler_int(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            reds: &[Value],
+        ) -> Option<i64> {
+            let arg = match reds.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return None,
+            };
+            RECURSIVE_CALLEE_ARG.with(|c| c.set(arg));
+            Some(arg + 100)
+        }
+    }
+
+    /// `_opimpl_recursive_call` sets `assembler_call = True` for every
+    /// non-inlined recursive call once `warmrunnerstate.inlining` holds, and
+    /// builds the callee token on demand below that point
+    /// (`direct_assembler_call` → `get_assembler_token` →
+    /// `compile_tmp_callback`).  It has no callee-not-compiled case here, so
+    /// `ResidualCall` — which only records that no token was proven when the
+    /// pure decision predicate ran — must reach the same emitter as
+    /// `CallAssembler` and let the seam answer.
+    ///
+    /// Declining from the decision instead loses the whole trace on the first
+    /// recursive edge and does not recover until the callee happens to compile
+    /// on its own.
+    #[test]
+    fn a_residual_decision_still_reaches_call_assembler_through_the_token_seam() {
+        RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.recursive_call_int(0, 0, &[], &[]);
+        caller_builder.int_return(0);
+        let caller = caller_builder.finish();
+
+        let runtime = RecursiveResidualDecisionRuntime {
+            token: Some(std::sync::Arc::new(majit_backend::JitCellToken::new(7))),
+        };
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = RecursiveFreshSym;
+        let action =
+            trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
+
+        assert!(
+            matches!(
+                action,
+                TraceAction::Finish {
+                    exit_with_exception: false,
+                    ..
+                }
+            ),
+            "a ResidualCall decision whose seam resolves a token must record the \
+             call and finish, not abort: got {action:?}",
+        );
+        // The concrete leg ran with the FRESH reds, same as the CallAssembler
+        // decision — the two differ only in what the decision had proven.
+        assert_eq!(RECURSIVE_CALLEE_ARG.with(|c| c.get()), 0);
+
+        let recorder = ctx.into_recorder();
+        let call_ops = recorder
+            .ops()
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallAssemblerI)
+            .count();
+        assert_eq!(
+            call_ops, 1,
+            "exactly one CallAssemblerI, resolved through the token seam",
+        );
+    }
+
+    /// The abort is kept for the case that actually has no token: a seam that
+    /// cannot synthesise one either. That is the retry-until-the-callee-compiles
+    /// behaviour, now reached only when no token can be built at all rather
+    /// than whenever the decision predicate could not prove one.
+    #[test]
+    fn a_residual_decision_aborts_when_the_token_seam_is_also_empty() {
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.recursive_call_int(0, 0, &[], &[]);
+        caller_builder.int_return(0);
+        let caller = caller_builder.finish();
+
+        let runtime = RecursiveResidualDecisionRuntime { token: None };
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = RecursiveFreshSym;
+        let action =
+            trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
+
+        assert!(
+            matches!(action, TraceAction::Abort),
+            "no token anywhere must still abort: got {action:?}",
         );
     }
 
