@@ -6268,6 +6268,10 @@ impl PyPyJitDriver {
         let green_key = driver.resolve_cell_key(green_key_hash, || {
             pyre_jit_trace::driver::make_green_key_typed(loop_pycode, next_instr, is_being_profiled)
         });
+        // Safe to tally here and nowhere upstream of it: `jtransform` rewrites
+        // the `can_enter_jit` call into the `loop_header` operation, so this
+        // body is never part of a traced graph.  See `PORTAL_DIAG_LABELS`.
+        portal_diag_bump(0);
         if portal_metatrace_enabled()
             && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 >= portal_metatrace_skip()
@@ -6297,6 +6301,7 @@ impl PyPyJitDriver {
             return false;
         };
         set_pending_loop_exit(ec, loop_result);
+        portal_diag_bump(1);
         true
     }
 }
@@ -7152,6 +7157,68 @@ fn jd1_experiment_enabled() -> bool {
         }
         std::env::var("PYRE_JD1").as_deref() == Ok("1")
     })
+}
+
+/// Legend for [`PORTAL_DIAG`], positionally.
+///
+/// The portal's own decisions are otherwise unobservable on wasm32: every
+/// existing portal knob (`PYRE_PORTAL_METATRACE`, `MAJIT_PCSEQ`) is a
+/// `std::env::var` read, and the guest has no environment, so those probes are
+/// dead code there rather than silent evidence.  A counter the host reads back
+/// through an export is the shape that carries out of the guest — the same
+/// channel `majit_backend_wasm::BRIDGE_DIAG` and the full-body-walk census
+/// already use.
+///
+/// Every tally is bumped from code the portal graph does **not** contain.
+/// That constraint is not stylistic: `pyre-jit` is one of the four LLBC crates,
+/// so a counter placed in `eval_loop_jit`'s `CloseLoop` arm is lowered into the
+/// portal jitcode, and `AtomicU64::fetch_add` is outside the LLBC set — it
+/// would become a symbolic residual sitting between the arm and its
+/// `loop_header`, which no `pyre-jit` path can ever bind (every production
+/// fnaddr comes from `pyre_interpreter::jit_trace_fnaddrs`, and that table
+/// cannot name a crate above it). It would block the portal walk *and* regress
+/// any production trace that inlines a nested activation. `can_enter_jit`'s
+/// body is safe for the opposite reason: `jtransform` rewrites the call into
+/// the `loop_header` operation, so the body is never traced.
+///
+/// That rules out the sites the arm's own decisions would need. The two
+/// filters sit in the arm itself, and `portal_activation_bracketed` is reached
+/// from `funccall_valuestack` with no `dont_look_inside` or may-force boundary
+/// in between, so none of them is provably outside a traced graph. This line
+/// counts what it can count safely rather than what would read most directly.
+pub const PORTAL_DIAG_LABELS: &[&str] = &[
+    // `can_enter_jit` was reached (warmspot.py:446).  Only `eval_loop_jit`'s
+    // `StepResult::CloseLoop` arm calls it, and only after both of that arm's
+    // filters passed, so a run with back edges and `can_enter_jit=0` says the
+    // arm never completed — which is what a clobbered `StepResult` discriminant
+    // looks like from outside the trace.
+    "can_enter_jit",
+    // …and it answered true: the driver took the trace or ran compiled code.
+    "can_enter_jit_taken",
+];
+
+/// Portal decision tallies, indexed by [`PORTAL_DIAG_LABELS`].
+///
+/// `Relaxed` throughout: these are diagnostics, no other state is ordered
+/// against them, and the back edge they sit on is hot.
+pub static PORTAL_DIAG: [std::sync::atomic::AtomicU64; PORTAL_DIAG_LABELS.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; PORTAL_DIAG_LABELS.len()];
+
+#[inline]
+fn portal_diag_bump(slot: usize) {
+    if let Some(cell) = PORTAL_DIAG.get(slot) {
+        cell.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One portal tally, by [`PORTAL_DIAG_LABELS`] index; out of range reads 0.
+///
+/// The wasm export and the native `[jit-stats]` line share this reader so the
+/// two backends report the same numbers from the same place.
+pub fn portal_diag(slot: usize) -> u64 {
+    PORTAL_DIAG
+        .get(slot)
+        .map_or(0, |cell| cell.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn portal_metatrace_enabled() -> bool {

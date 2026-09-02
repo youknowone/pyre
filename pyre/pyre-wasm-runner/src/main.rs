@@ -911,6 +911,27 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             }
             eprintln!("[jit-stats] bridge_diag {}", parts.join(" "));
         }
+        // The portal's own decision tallies. POSITIONAL MIRROR of
+        // `pyre_jit::eval::PORTAL_DIAG_LABELS`, but unlike `bridge_diag` above
+        // the guest also exports the slot count, so a slot added there without
+        // a label here is reported as `slot<N>` rather than silently dropped.
+        if let Ok(diag) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_portal_diag") {
+            let labels = ["can_enter_jit", "can_enter_jit_taken"];
+            let guest_len = instance
+                .get_typed_func::<(), u32>(&mut store, "pyre_jit_portal_diag_len")
+                .ok()
+                .and_then(|f| f.call(&mut store, ()).ok())
+                .unwrap_or(labels.len() as u32) as usize;
+            let mut parts = Vec::new();
+            for i in 0..guest_len.max(labels.len()) {
+                let n = diag.call(&mut store, i as u32).unwrap_or(0);
+                match labels.get(i) {
+                    Some(lbl) => parts.push(format!("{lbl}={n}")),
+                    None => parts.push(format!("slot{i}={n}")),
+                }
+            }
+            eprintln!("[jit-stats] portal_diag {}", parts.join(" "));
+        }
         if let Ok(geometry) =
             instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_inline_geometry_diag")
         {
