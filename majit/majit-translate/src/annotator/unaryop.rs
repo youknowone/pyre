@@ -594,10 +594,15 @@ pub fn simple_call_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> Optio
     // through to `consider_op`, which binds Impossible without blocking.
     match s_func.call(&argspec) {
         Ok(cell) => cell,
-        // Match upstream's substring so the dual-gate `is_known_unported`
-        // Skip classification matches RPython's `compute_at_fixpoint`
-        // failures (`bookkeeper.py:108-118` propagates uncaught).
-        Err(e) => panic!("compute_at_fixpoint failed: {e}"),
+        // `compute_at_fixpoint` (bookkeeper.py) propagates uncaught, so the
+        // error leaves the annotator as itself. Carrying the
+        // `AnnotatorError` rather than a rendering of it keeps the failing
+        // stage in the payload's type, which is how `flowin`
+        // (annrpython.py) knows to attach `source` and how `gottypererror`
+        // (rtyper.py) stays a separate handler; `in_stage`
+        // names the entry point inside the message the way upstream
+        // composes it at the raise site.
+        Err(e) => std::panic::panic_any(e.in_stage("compute_at_fixpoint")),
     }
 }
 
@@ -615,7 +620,7 @@ pub fn call_args(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<SomeValue> 
     let callspec = super::argument::complex_args(&shape, args_s);
     match s_func.call(&callspec) {
         Ok(cell) => cell,
-        Err(e) => panic!("compute_at_fixpoint failed: {e}"),
+        Err(e) => std::panic::panic_any(e.in_stage("compute_at_fixpoint")),
     }
 }
 

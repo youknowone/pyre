@@ -2267,13 +2267,23 @@ impl SomeValueTag {
             // Type chain: SomeTypeOf < SomeType < SomeObject (model.py).
             T::TypeOf => &[T::TypeOf, T::Type, T::Object],
             T::Type => &[T::Type, T::Object],
-            // String family shares a SomeStringOrUnicode base upstream; dispatch
-            // is flat — each tag resolves to itself then Object.
+            // String family: `SomeString`, `SomeUnicodeString` and
+            // `SomeByteArray` share a `SomeStringOrUnicode` base
+            // (model.py) that carries no pairtype
+            // registration, so naming it here would resolve nothing — those
+            // three resolve to themselves then Object. The two element tags
+            // do inherit from a registered class: `SomeChar(SomeString)`
+            // and `SomeUnicodeCodePoint(SomeUnicodeString)` (model.py). That
+            // edge is load-bearing — `pairtype(SomeChar, SomeChar)`
+            // (binaryop.py) defines only `union`, so `chr + chr` reaches
+            // `pairtype(SomeString, SomeString).add` (binaryop.py)
+            // through it, and a char operand serves every other `SomeString`
+            // pair the same way.
             T::String => &[T::String, T::Object],
             T::UnicodeString => &[T::UnicodeString, T::Object],
             T::ByteArray => &[T::ByteArray, T::Object],
-            T::Char => &[T::Char, T::Object],
-            T::UnicodeCodePoint => &[T::UnicodeCodePoint, T::Object],
+            T::Char => &[T::Char, T::String, T::Object],
+            T::UnicodeCodePoint => &[T::UnicodeCodePoint, T::UnicodeString, T::Object],
             T::List => &[T::List, T::Object],
             T::Tuple => &[T::Tuple, T::Object],
             T::Dict => &[T::Dict, T::Object],
@@ -3023,6 +3033,58 @@ impl fmt::Display for AnnotatorError {
 }
 
 impl std::error::Error for AnnotatorError {}
+
+/// Read a caught panic payload as text.
+///
+/// Upstream's handlers catch a typed exception and read its fields —
+/// `flowin` (annrpython.py) catches `AnnotatorError` to attach `source`,
+/// `gottypererror` (rtyper.py) catches `TyperError` to attach `where` — and
+/// the message text is produced once, at the terminal report (`complete`,
+/// `'\n-----'.join(str(e) for e in self.errors)`). A pyre unwind carries
+/// either the error object or an already-formatted string, so the object is
+/// read first and the string is the fallback.
+///
+/// Every consumer of an annotator unwind must go through this one reader.
+/// A site that hand-rolls `downcast_ref::<String>` reads an object payload
+/// as "unrecognised", and the dual gate then treats a routine unported
+/// subject as a real bug because [`crate::translator::rtyper::cutover::is_known_unported`]
+/// never sees the message.
+///
+/// `None` is reserved for a payload that is neither — each caller keeps its
+/// own wording for that case.
+pub fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    if let Some(err) = payload.downcast_ref::<AnnotatorError>() {
+        return Some(err.to_string());
+    }
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return Some(text.clone());
+    }
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        return Some((*text).to_string());
+    }
+    None
+}
+
+impl AnnotatorError {
+    /// Name the annotator entry point that was driving when this error
+    /// surfaced, without changing the error's class.
+    ///
+    /// Upstream raises `AnnotatorError` from inside `compute_at_fixpoint`
+    /// and `complete_pending_blocks` and lets it propagate as itself; the
+    /// class is what tells a handler which half of the translator failed,
+    /// and `gottypererror` (rtyper.py) keeps `TyperError` separate for the
+    /// other half.
+    /// A caller that reformats one into the other erases that distinction,
+    /// after which the stage is recoverable only by matching substrings of
+    /// the rendered text.
+    pub fn in_stage(mut self, stage: &str) -> Self {
+        self.msg = Some(match self.msg.take() {
+            Some(msg) => format!("{stage} failed: {msg}"),
+            None => format!("{stage} failed"),
+        });
+        self
+    }
+}
 
 // ---------------------------------------------------------------------------
 // union() dispatch (A4.6) — model.py + binaryop.py pair().union().

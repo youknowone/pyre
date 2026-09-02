@@ -3946,6 +3946,63 @@ pub(super) fn pair_function_repr_functions_pbc_convert_from_to(
     Ok(Some(Hlvalue::Constant(result)))
 }
 
+/// RPython `pairtype(MultipleFrozenPBCRepr, FunctionRepr)
+///                  .convert_from_to((r_frozen1, r_fn2), v, llops)`
+/// (rpbc.py):
+///
+/// ```python
+/// def convert_from_to((r_frozen1, r_fn2), v, llops):
+///     if r_fn2.lowleveltype is Void:
+///         value = r_fn2.s_pbc.const
+///         return Constant(value, Void)
+///     return NotImplemented
+/// ```
+///
+/// The target is a constant function, so its repr carries no runtime
+/// value and the source pointer is dropped: the conversion materialises
+/// the target's own constant at `Void`. Unlike the
+/// `pairtype(FunctionsPBCRepr, FunctionRepr)` sibling — which yields
+/// `inputconst(Void, None)` — upstream puts `s_pbc.const` in the
+/// `Constant` here, and builds it directly rather than through
+/// `FunctionRepr.convert_const`, whose answer is always `None`.
+pub(super) fn pair_multiple_frozen_pbc_function_repr_convert_from_to(
+    r_to: &dyn Repr,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let r_fn2 = (r_to as &dyn std::any::Any)
+        .downcast_ref::<FunctionRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_multiple_frozen_pbc_function_repr_convert_from_to: r_to is not \
+                 FunctionRepr",
+            )
+        })?;
+    // upstream: `if r_fn2.lowleveltype is Void:` … `return NotImplemented`.
+    // `FunctionRepr.lowleveltype` is the class attribute `Void`
+    // (rpbc.py), so the guard normally holds; a repr that answers
+    // otherwise falls through to the next pair_mro entry.
+    if !matches!(r_fn2.lowleveltype(), LowLevelType::Void) {
+        return Ok(None);
+    }
+    // upstream: `value = r_fn2.s_pbc.const`. FunctionRepr is the repr for
+    // a constant function, so the SomePBC carries a const_box.
+    let value = r_fn2
+        .base
+        .s_pbc
+        .base
+        .const_box
+        .as_ref()
+        .map(|c| c.value.clone())
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_multiple_frozen_pbc_function_repr_convert_from_to: FunctionRepr \
+                 s_pbc has no const — the constant-function invariant is violated",
+            )
+        })?;
+    // upstream: `return Constant(value, Void)`.
+    let c = crate::translator::rtyper::rmodel::inputconst_from_lltype(&LowLevelType::Void, &value)?;
+    Ok(Some(Hlvalue::Constant(c)))
+}
+
 pub(super) fn pair_small_function_set_functions_pbc_convert_from_to(
     r_from: &dyn Repr,
     r_to: &dyn Repr,

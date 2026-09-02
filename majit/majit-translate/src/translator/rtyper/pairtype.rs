@@ -384,6 +384,23 @@ fn dispatch_convert_from_to(
         (FunctionRepr, FunctionsPBCRepr) => {
             super::rpbc::pair_function_repr_functions_pbc_convert_from_to(r_from, r_to, v, llops)
         }
+        // rpbc.py — pairtype(MultipleFrozenPBCRepr,
+        // FunctionRepr).convert_from_to: a frozen-PBC pointer feeding a
+        // constant-function repr drops its runtime value and materialises
+        // the target's own `s_pbc.const` at Void.
+        //
+        // The other five frozen-PBC pairs upstream registers
+        // (`MultipleFrozenPBCRepr` × `MultipleUnrelatedFrozenPBCRepr` /
+        // `MultipleFrozenPBCRepr`, `SingleFrozenPBCRepr` ×
+        // `MultipleFrozenPBCRepr`, `MultipleFrozenPBCReprBase` ×
+        // `SingleFrozenPBCRepr`, `FunctionRepr` ×
+        // `MultipleFrozenPBCRepr`) are still unported. The
+        // `MultipleFrozenPBCReprBase` one additionally needs that base in
+        // `pair_mro`, which currently sends both `Multiple*` reprs
+        // straight to `Repr`.
+        (MultipleFrozenPBCRepr, FunctionRepr) => {
+            super::rpbc::pair_multiple_frozen_pbc_function_repr_convert_from_to(r_to)
+        }
         // rpbc.py — pairtype(FunctionsPBCRepr,
         // FunctionsPBCRepr).convert_from_to: upstream identity if
         // `r_fpbc1.lowleveltype == r_fpbc2.lowleveltype`, else
@@ -637,6 +654,33 @@ fn dispatch_rtype_op(
         (AbstractStringRepr, AbstractStringRepr, "add")
         | (AbstractStringRepr, AbstractStringRepr, "inplace_add") => {
             committed(super::rstr::pair_abstract_string_rtype_add(r1, r2, hop))
+        }
+        // `rtype_add` is defined at exactly one place, `pairtype(
+        // AbstractStringRepr, AbstractStringRepr)` (rstr.py); no
+        // char pairtype defines one. A char operand reaches that body
+        // through `CharRepr(AbstractCharRepr, StringRepr)` and
+        // `UniCharRepr(AbstractUniCharRepr, UnicodeRepr)`
+        // (lltypesystem/rstr.py), which is also where `char_repr.repr`
+        // comes from: `StringRepr.repr = string_repr` and
+        // `UniCharRepr.repr = unicode_repr` (lltypesystem/rstr.py), so
+        // `rtype_add` coerces both operands to the
+        // string surface and calls the same `ll_strconcat`. The two
+        // functions below already coerce that way, and
+        // `pair_convert_from_to` already carries the Char→Str /
+        // UniChar→Unicode `ll_chr2str` edge, so the mixed and char-only
+        // pairs need dispatch entries and no lowering of their own.
+        // Pyre's CharRepr pair_mro is [CharRepr, Repr] (explicit-arm
+        // design, as for the comparisons below), so they are spelled
+        // out rather than inherited.
+        (StringRepr, CharRepr, "add" | "inplace_add")
+        | (CharRepr, StringRepr, "add" | "inplace_add")
+        | (CharRepr, CharRepr, "add" | "inplace_add") => {
+            committed(super::rstr::pair_string_string_rtype_add(hop))
+        }
+        (UnicodeRepr, UniCharRepr, "add" | "inplace_add")
+        | (UniCharRepr, UnicodeRepr, "add" | "inplace_add")
+        | (UniCharRepr, UniCharRepr, "add" | "inplace_add") => {
+            committed(super::rstr::pair_unicode_unicode_rtype_add(hop))
         }
         // rtuple.py — `pairtype(TupleRepr, TupleRepr).rtype_add`
         // (and its `rtype_inplace_add` alias) concatenates two tuples

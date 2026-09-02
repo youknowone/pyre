@@ -264,3 +264,168 @@ opname lives in `insns.bin` (build OUT_DIR `target/debug/build/pyre-jit-trace-<h
 `strings insns.bin | rg newlist`), not stderr. The cluster's hot graphs (`setitem_list`,
 `getitem_list`, `w_list_setitem`, `setitem_bytearray`) only lift once ALL their stacked walls close —
 expect most of the census movement on the LAST slice.
+
+## Superseding census — 2026-09-02
+
+The Slice A/B/C item lists above are historical. They were derived from a
+268/276-record census, and the two-phase prepass has since grown its subject
+set by an order of magnitude, so their named subjects no longer exist in the
+census. In particular `int_pow`, `pow` and `opcode_get_iter` (Slice A's
+deferral note) name no record now; re-derive a population from a fresh census
+before working any item list in this document.
+
+**Provenance.** Branch `rtyper2` with the batch below applied: release
+profile, default features, `build/llbc` re-extracted for `majit-rlib
+pyre-object pyre-interpreter pyre-jit` at each tree, `PYRE_RTYPER_VERBOSE=1
+cargo build --release -p pyre-jit-trace`, graded by the build's own exit status
+and by the stderr file's mtime against the build start, never by `ls -t` alone.
+
+The baseline and the probe of each pair below were taken on one tree, and the
+branch has been rebased past that tree since, so those commits are no longer
+reachable by hash. What survives a rebase is the pair — a movement measured
+against its own baseline — not the absolute, which the section after next
+re-measures on a later base and finds different.
+
+A census is comparable only to another census taken on the same tree with the
+same artefacts. Both halves matter: a rebase that touches any of the four
+extracted crates restales `build/llbc`, and the chain order is therefore
+extract → test → census, never test → census on artefacts from an older tree.
+
+**Phase A = 1883 records, one record per subject.** Reading a record: split on
+`(?=\[PREPASS )`; a trailing `thread '<unnamed>' … panicked` block belongs to
+the NEXT record; the subject is the record head, and the nested chain inside
+one record is a free victim map. The text is JSON-escaped and quotes
+identifiers in backticks, so a needle must be copied out of the file, never
+retyped.
+
+| family | records | share |
+|---|---|---|
+| unregistered CallRegistry path | 1203 | 63.9% |
+| Blocked block | 202 | 10.7% |
+| classdef-less `getattr` | 171 | 9.1% |
+| UnionError | 147 | 7.8% |
+| no analyser registered | 44 | 2.3% |
+| undefined operand | 27 | 1.4% |
+| other | 89 | 4.7% |
+
+### The frontier is flat, and the census total is not the metric
+
+`MAJIT_RTYPER_FRONTIER=1` resumes past every unresolvable call instead of
+stopping at the first, so each subject reports its whole call-wall set rather
+than the wall it happened to reach first. On this tree 629 subjects carry wall
+rows; 397 of them have a single distinct wall, and **the largest single wall
+serves 25 subjects** (`undefined operand`), the next 8, then 7, 7, 6, 6. No
+registry closure on this frontier buys more than ~1.3% of phase A.
+
+That flatness is why a wall's record count going to zero says nothing on its
+own. The `IndirectCall` wall (253 records, then the single largest leaf) was
+closed at `9bfbafe3f80`: the wall went 253 → 0 and **not one graph lifted** —
+all 253 subjects relocated, to Blocked block (60), `iter::sources::once::once`
+(52), `Chain::next` (22), UnionError (15) and eleven smaller heads. Grade a
+wall by the per-subject victim map — for each subject that named X in the
+baseline, what is its head cause in the probe — not by the total.
+
+Two co-blocking stacks are already measured and should be assumed, not
+rediscovered:
+
+- `getattr_str_impl` (baseobjspace.rs:5791) holds `w_method_new` at :5928 and,
+  through `object_getattr_miss` at :6345 → `getdictvalue` → `has_mapdict_layout`,
+  `W_INT_USER_GC_TYPE_ID` at mapdict.rs:644. Source order decides which is
+  reported. The signature is visible in the census as a near-even split inside
+  one class family (`_io::buffered_random` 9/9, `_io::buffered` 8/9,
+  `_io::textio` 13/7).
+- Foreign `core::iter` adapters chain among themselves: registering
+  `iter::sources::once::once` moves its victims to `Chain::chain`, then to
+  `Chain::next`, which is an adapter state machine with no RPython counterpart.
+  The cure for that family is source-side (do not write the adapter chain), not
+  a registry row.
+
+### What the first graded batch moved, and where the frontier went
+
+Three changes measured together against the 1883-record baseline:
+`Constant(None, Void)` for a Void operand, the `SomeChar`/`SomeString` MRO
+edge, and dropping the `chain(once(..))` adapter out of `w_method_new`.
+Phase A 1883 → 1848; 48 subjects left the fail list, 13 entered it, no graph
+that previously cleared phase A stopped clearing it.
+
+The 13 entrants are not regressions. Each appears nowhere in the baseline
+census — not as a failure and not as a skip — because its caller blocked
+before it could be reached. They fail at a merge (`Method ∪ W_FloatObject` and
+kin), which is the wall behind `w_method_new`, one level deeper than the wall
+that was closed.
+
+The frontier also moved from phase A to phase B for the first time on this
+family. Phase B had **zero** failures in the baseline; it now has 25, and all
+25 carry one message: `pair(rtype_add) not implemented for (StringRepr,
+CharRepr)`. That is the rtyper-side twin of the annotator MRO edge, closed in
+the same commit; it is recorded here because the shape recurs. A rule ported
+at the annotator alone will surface its rtyper half as a phase-B wall, and
+phase-B counts are not in the phase-A histogram — read both.
+
+### Refuted: lowering `Box::new_uninit` to a zero-arg synthetic ctor
+
+A no-arg `boxed::Box::new_uninit()` (32 records / 14 graphs) looks like it
+should lower to `CallTarget::synthetic_transparent_ctor("Box")` with no args,
+the spelling `Rvalue::ShallowInitBox` already uses. It should not, as written:
+
+- A zero-arg `SyntheticTransparentCtor` is first read as a unit-variant
+  singleton (`flowspace_adapter.rs`, the `args.is_empty()` arm). `"Box"` is not
+  on `is_synthetic_unit_variant_path`, so it falls through.
+- The general arm then interns by qualname only for the fixed placeholder tags
+  `Tuple | Array | Closure`. `synthetic_transparent_ctor` leaves `owner_path`
+  empty, so `"Box"` takes the `HostObject::new_class` branch and mints a fresh
+  `ClassDesc` **per site** — the exact split the same arm's comment warns about,
+  whose symptom is a UnionError at a join with no common base.
+
+Either add `Box` to the interned placeholder set (it is likewise one universal
+tag with no enum ambiguity, so the stated justification for the other three
+covers it) or give the ctor an owner path. Both change the existing
+`ShallowInitBox` lowering, so neither ships without its own census.
+
+### What a base move does to these numbers
+
+Re-taken with the same batch applied on a base 238 files further on, and
+`build/llbc` re-extracted for all four crates, phase A reads 1889 and phase B
+reads 5. Neither is comparable to the 1848 and 25 above — that is the rule at
+the top of this section, applied to itself. What carries over is the
+composition.
+
+Phase B's two shapes at that base:
+
+- `pyre_object::interp_exceptions::is_exception` — `don't know how to convert
+  from <InstanceRepr Ptr GcStruct pyobject::PyType> to <RootClassRepr Ptr
+  Struct object_vtable>`. There is no such conversion upstream to port:
+  `convert_from_to` between instance reprs is `pairtype(InstanceRepr,
+  InstanceRepr)`, the only pairtype naming a class repr is
+  `pairtype(ClassesPBCRepr, ClassRepr)`, and an instance's vtable is reached
+  by an *operation* — `InstanceRepr.rtype_type`, which reads the `typeptr`
+  field or calls `ll_inst_type`. So the site to change is the one asking the
+  rtyper to convert, not the pairtype table.
+- Four graphs — `topframe_for_locals` and three
+  `__majit_wrap_descr_typecheck_*` getters — all failing on the same op,
+  `simple_call(jit_force_virtualizable, frame)`, whose result variable carries
+  `SomeNone` and no concretetype, which is what the rtyper's `the annotator
+  doesn't agree that 'simple_call' has no return value` reports. The same
+  graphs were `MAJIT_RTYPER skip` rows on the earlier base; the base moved the
+  force gateways, and the graphs now reach phase B to fail there.
+
+### The one slice the census names: a dead vtable read
+
+Every `Blocked block` record is a `getattr` (189 of them at that base), and 68
+name a vtable slot on a receiver whose `SomeInstance` classdef is the empty
+`{vtable}` class: `__cast_instance_intrinsic(recv, "{vtable}")`, then
+`getattr(.., "method_strategy_kind")`. 58 of the 68 were `IndirectCall`
+records before that wall was closed, so this is where most of that wall's
+relocated victims went — the victim map the grading rule above asks for, one
+slice later.
+
+The cause is on the `OpKind::IndirectCall` arm. It drops the `funcptr`
+*operand*, because the `getattr` re-derives it from the receiver — but the ops
+that *defined* that operand, the vtable cast and the slot read, are already in
+the graph, and the annotator still annotates them, against a class with no
+fields. The front end cannot simply stop emitting them: the residual path
+still calls through that pointer for real (`codewriter/call.rs`'s
+`IndirectCall { graphs: None, funcptr, .. }`, and its `inline.rs` and
+`result_exc.rs` peers). So the repair is a dead-op sweep over the flowspace
+graph in the prepass, which is a design rather than a registration, and it
+needs its own census.

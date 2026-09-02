@@ -1239,11 +1239,13 @@ impl RPythonAnnotator {
         // upstream "the annotator stops" semantics.
         self.bookkeeper
             .compute_at_fixpoint()
-            .unwrap_or_else(|err| panic!("compute_at_fixpoint failed: {err}"));
+            .unwrap_or_else(|err| std::panic::panic_any(err.in_stage("compute_at_fixpoint")));
         // upstream: `if block_subset is None: perform_normalizations(self)`
         if block_subset.is_none() {
             super::super::translator::rtyper::normalizecalls::perform_normalizations(self)
-                .unwrap_or_else(|err| panic!("perform_normalizations failed: {err}"));
+                .unwrap_or_else(|err| {
+                    std::panic::panic_any(err.in_stage("perform_normalizations"))
+                });
         }
     }
 

@@ -336,13 +336,8 @@ pub(crate) fn dual_gate_check_with_registry(
         }
         Err(payload) => {
             unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources);
-            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                (*s).to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "<unrecognised panic payload>".to_string()
-            };
+            let msg = crate::annotator::model::panic_payload_text(&*payload)
+                .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
             if is_known_unported(&msg) {
                 return Ok(DualGateOutcome::Skip(msg));
             }
@@ -355,13 +350,8 @@ pub(crate) fn dual_gate_check_with_registry(
         super::legacy_resolve::resolve_types(legacy_graph);
     }));
     if let Err(payload) = baseline {
-        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "<unrecognised panic payload>".to_string()
-        };
+        let msg = crate::annotator::model::panic_payload_text(&*payload)
+            .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
         return Err(format!(
             "dual-gate baseline panicked (legacy walker crashed before \
              comparison could run — comparison cannot validate the real \
@@ -3871,10 +3861,7 @@ fn run_phase_b_rtype_isolated(
             if let Err(payload) = result {
                 cutoff_panics += 1;
                 if let Some(trace) = trace {
-                    let payload = payload
-                        .downcast_ref::<&str>()
-                        .map(|message| (*message).to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                    let payload = crate::annotator::model::panic_payload_text(&*payload)
                         .unwrap_or_else(|| "<non-string panic payload>".to_string());
                     eprintln!("[DTRACE-CUTPANIC] {trace} payload={payload:?}");
                 }
@@ -4371,13 +4358,8 @@ pub(crate) fn dual_gate_outcome_from_cache(
         super::legacy_resolve::resolve_types(legacy);
     }));
     if let Err(payload) = baseline {
-        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "<unrecognised panic payload>".to_string()
-        };
+        let msg = crate::annotator::model::panic_payload_text(&*payload)
+            .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
         return Err(format!(
             "two-phase baseline panicked (legacy walker crashed before comparison): {msg}"
         ));
@@ -4678,6 +4660,43 @@ mod tests {
         let msg = "unexpected rtyper invariant failure";
         assert_eq!(unported_category(msg), None);
         assert!(!is_known_unported(msg));
+    }
+
+    /// An annotator half that fails leaves the unwind carrying its
+    /// `AnnotatorError`, not a rendering of it — the payload's type is what
+    /// names the failing stage, the way the exception class does upstream.
+    /// Every consumer therefore has to read it through
+    /// `panic_payload_text`; a site that still hand-rolls
+    /// `downcast_ref::<String>` sees "unrecognised" and turns a routine
+    /// unported subject into a hard dual-gate failure.
+    #[test]
+    fn annotator_error_payload_routes_through_the_shared_reader() {
+        use crate::annotator::model::{AnnotatorError, panic_payload_text};
+
+        let payload = std::panic::catch_unwind(|| {
+            std::panic::panic_any(
+                AnnotatorError::new("calltable row not found in CallFamily for simple_call")
+                    .in_stage("compute_at_fixpoint"),
+            )
+        })
+        .expect_err("panic_any always unwinds");
+
+        assert!(
+            payload.downcast_ref::<String>().is_none(),
+            "the payload is the error object, so the string downcast must miss"
+        );
+
+        let text = panic_payload_text(&*payload).expect("the object arm reads it");
+        assert!(
+            text.contains("compute_at_fixpoint failed"),
+            "the entry point stays in the message: {text:?}"
+        );
+        assert_eq!(
+            unported_category(&text),
+            Some("annotator-fixpoint-failed"),
+            "an annotator-stage failure keeps its Skip route: {text:?}"
+        );
+        assert!(is_known_unported(&text));
     }
 
     #[test]

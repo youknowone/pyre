@@ -4954,6 +4954,84 @@ mod tests {
         );
     }
 
+    /// A Char operand concatenated with a String reaches the same
+    /// `pair(AbstractStringRepr, AbstractStringRepr).rtype_add` body
+    /// (rstr.py), because `CharRepr(AbstractCharRepr,
+    /// StringRepr)` (lltypesystem/rstr.py) inherits
+    /// `StringRepr.repr = string_repr` — so `str1_repr` is the
+    /// string surface on both sides and the char coerces through
+    /// `ll_chr2str` before the one `ll_strconcat`. No char pairtype
+    /// defines an `rtype_add` of its own.
+    #[test]
+    fn pair_rtype_add_string_char_coerces_through_ll_chr2str_then_ll_strconcat() {
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_s = Variable::new();
+        v_s.set_concretetype(Some(STRPTR.clone()));
+        let v_c = Variable::new();
+        v_c.set_concretetype(Some(LowLevelType::Char));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(STRPTR.clone()));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "add".to_string(),
+                vec![Hlvalue::Variable(v_s), Hlvalue::Variable(v_c)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            crate::annotator::model::SomeValue::String(crate::annotator::model::SomeString::new(
+                false, false,
+            )),
+            crate::annotator::model::SomeValue::Char(crate::annotator::model::SomeChar::new(false)),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(string_repr() as Arc<dyn Repr>),
+            Some(char_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result = crate::translator::rtyper::pairtype::pair_rtype_add(
+            string_repr().as_ref(),
+            char_repr().as_ref(),
+            &hop,
+        )
+        .unwrap_or_else(|err| panic!("pair add(str, char): {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        let called: Vec<String> = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .map(|op| format!("{:?}", op.args[0]))
+            .collect();
+        assert_eq!(
+            called.len(),
+            2,
+            "one chr2str coercion, one concat: {called:?}"
+        );
+        assert!(
+            called[0].contains("ll_chr2str"),
+            "the char operand coerces first: {called:?}"
+        );
+        assert!(
+            called[1].contains("ll_strconcat"),
+            "then the shared string body runs: {called:?}"
+        );
+    }
+
     /// rstr.py (UnicodeRepr inherited) — UNICODE pair surface
     /// uses distinct helper-cache identity `ll_unicode_concat`.
     #[test]

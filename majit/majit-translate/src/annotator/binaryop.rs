@@ -1396,24 +1396,40 @@ fn init_string_pairtype(
 }
 
 fn string_string_add(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
-    let s1 = match ann.annotation(&hl.args[0]) {
-        Some(SomeValue::String(s)) => s,
-        _ => panic!("string_string_add: arg 0 is not SomeString"),
-    };
-    let s2 = match ann.annotation(&hl.args[1]) {
-        Some(SomeValue::String(s)) => s,
-        _ => panic!("string_string_add: arg 1 is not SomeString"),
-    };
-    let mut result = SomeString::new(false, s1.inner.no_nul && s2.inner.no_nul);
+    // `SomeChar` is a `SomeString` subclass (model.py), and
+    // `pairtype(SomeChar, SomeChar)` (binaryop.py) registers only
+    // `union`, so a char operand on either side resolves to this arm
+    // through the MRO and the result is a `SomeString` either way.
+    fn extract(sv: &SomeValue, side: &str) -> (bool, Option<Vec<u8>>) {
+        let (inner, is_immutable_constant) = match sv {
+            SomeValue::String(s) => (&s.inner, s.is_immutable_constant()),
+            SomeValue::Char(c) => (&c.inner, c.is_immutable_constant()),
+            other => panic!("string_string_add: {side} is not SomeString/SomeChar: {other:?}"),
+        };
+        // upstream reads `str.const` only under `is_immutable_constant()`,
+        // so a non-constant operand contributes no const half.
+        let bytes = is_immutable_constant
+            .then(|| match inner.base.const_box.as_ref().map(|c| &c.value) {
+                Some(ConstValue::ByteStr(b)) => Some(b.clone()),
+                _ => None,
+            })
+            .flatten();
+        (inner.no_nul, bytes)
+    }
+    let a = ann
+        .annotation(&hl.args[0])
+        .expect("string_string_add: lhs unbound");
+    let b = ann
+        .annotation(&hl.args[1])
+        .expect("string_string_add: rhs unbound");
+    let (no_nul1, c1) = extract(&a, "arg 0");
+    let (no_nul2, c2) = extract(&b, "arg 1");
+    let mut result = SomeString::new(false, no_nul1 && no_nul2);
     // upstream: `if str1.is_immutable_constant() and str2.is_immutable_constant():
     //              result.const = str1.const + str2.const`
-    if s1.is_immutable_constant()
-        && s2.is_immutable_constant()
-        && let (Some(c1), Some(c2)) = (&s1.inner.base.const_box, &s2.inner.base.const_box)
-        && let (ConstValue::ByteStr(a), ConstValue::ByteStr(b)) = (&c1.value, &c2.value)
-    {
-        let mut combined = a.clone();
-        combined.extend_from_slice(b);
+    if let (Some(a), Some(b)) = (c1, c2) {
+        let mut combined = a;
+        combined.extend_from_slice(&b);
         result.inner.base.const_box = Some(Constant::new(ConstValue::ByteStr(combined)));
     }
     SomeValue::String(result)
