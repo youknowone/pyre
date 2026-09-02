@@ -2516,7 +2516,7 @@ pub(crate) fn resolve_kwargs(
         let takes_str = if ndefaults > 0 {
             format!(
                 "from {} to {} positional arguments",
-                n_pos_params - ndefaults,
+                n_pos_params as isize - ndefaults as isize,
                 n_pos_params
             )
         } else {
@@ -2569,14 +2569,22 @@ pub(crate) fn resolve_kwargs(
     }
 
     // Fill positional defaults (PyPy: _match_signature defs_w)
-    // Defaults cover the LAST N of the positional params (arg_count).
+    // Defaults cover the LAST N of the positional params (arg_count), which
+    // `argument.py:278` spells as a *signed* `def_first = co_argcount -
+    // len(defaults_w)`: a `__defaults__` longer than the positional parameters
+    // drives it negative, and `defnum = i - def_first` (`argument.py:309`) then
+    // names the tuple's tail.  Clamping `def_first` at zero instead would bind
+    // the head, silently passing the wrong value.
     let defaults = unsafe { crate::function_get_defaults(target_func) };
     if !defaults.is_null() && unsafe { pyre_object::is_tuple(defaults) } {
         let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
-        let first_default = n_pos_params.saturating_sub(ndefaults);
-        for pi in first_default..n_pos_params {
+        let def_first = n_pos_params as isize - ndefaults as isize;
+        for pi in 0..n_pos_params {
             if result[pi].is_null() {
-                let di = pi - first_default;
+                let di = pi as isize - def_first;
+                if di < 0 {
+                    continue;
+                }
                 if let Some(v) = unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) } {
                     result[pi] = v;
                 }
@@ -3416,7 +3424,7 @@ fn call_with_kwargs_in_ctx_impl(
                 let takes_str = if ndefaults > 0 {
                     format!(
                         "from {} to {} positional arguments",
-                        n_pos_params - ndefaults,
+                        n_pos_params as isize - ndefaults as isize,
                         n_pos_params
                     )
                 } else {
@@ -3437,14 +3445,21 @@ fn call_with_kwargs_in_ctx_impl(
                 return Err(crate::PyError::type_error(msg));
             }
 
-            // Fill positional defaults from __defaults__ tuple.
+            // Fill positional defaults from __defaults__ tuple, on the signed
+            // `def_first = co_argcount - len(defaults_w)` of `argument.py:278`
+            // so that a `__defaults__` longer than the positional parameters
+            // binds the tuple's tail (`defnum = i - def_first`,
+            // `argument.py:309`) rather than its head.
             let defaults = unsafe { crate::function_get_defaults(current_callable()) };
             if !defaults.is_null() && unsafe { pyre_object::is_tuple(defaults) } {
                 let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
-                let first_default = n_pos_params.saturating_sub(ndefaults);
-                for pi in first_default..n_pos_params {
+                let def_first = n_pos_params as isize - ndefaults as isize;
+                for pi in 0..n_pos_params {
                     if result[pi].is_null() {
-                        let di = pi - first_default;
+                        let di = pi as isize - def_first;
+                        if di < 0 {
+                            continue;
+                        }
                         if let Some(v) =
                             unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) }
                         {
