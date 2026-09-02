@@ -10120,6 +10120,15 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
 
+        // Dumped before the call, not after: `Optimizer::propagate_from_pass_range`
+        // resolves each argument in place on the op it is handed
+        // (`optimizer.py:650-652 _emit_operation`), so once the call returns
+        // these ops carry resolved arguments rather than the recorded ones.
+        // `compile_simple_loop` dumps at the same point for the same reason.
+        if crate::majit_log_enabled() {
+            eprintln!("--- finish trace (before opt) ---");
+            eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
+        }
         // InvalidLoop during optimization should abort the trace, not crash
         // the process. Matches compile_loop.
         let optimize_start = Instant::now();
@@ -10195,8 +10204,6 @@ impl<M: Clone> MetaInterp<M> {
                 "[jit] finish_and_compile: key={}, ops_before={}, ops_after={}",
                 green_key, num_ops_before, num_ops_after
             );
-            eprintln!("--- finish trace (before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
             eprintln!("--- finish trace (after opt, before unbox) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }

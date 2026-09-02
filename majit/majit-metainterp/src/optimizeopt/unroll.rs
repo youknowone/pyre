@@ -911,16 +911,16 @@ impl UnrollOptimizer {
                 .iter()
                 .map(|op| op.ty().expect("inputarg OpRef must carry box.type"))
                 .collect();
-            // Wrap input ops as `Vec<OpRc>` so TraceIterator's `&[OpRc]`
-            // surface receives shared identity (history.py:528). The
-            // deep-clone here corresponds to PyPy's `cls()` per-op fresh
-            // allocation inside `TraceIterator.next` (opencoder.py).
-            let ops_oprc: Vec<majit_ir::OpRc> =
-                ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
+            // `TraceIterator` walks any `Borrow<Op>` slice, and `next` already
+            // performs PyPy's `cls()` per-op fresh allocation (opencoder.py),
+            // so the recorder ops feed it directly — a pre-wrap into
+            // `Vec<OpRc>` would allocate a second copy of every op that
+            // nothing reads (the iterator caches the op it mints, not its
+            // source).
             let mut p1_iter = crate::opencoder::TraceIterator::new(
-                &ops_oprc,
+                ops,
                 0,
-                ops_oprc.len(),
+                ops.len(),
                 None,
                 &p1_inputarg_types,
                 0, // start_fresh = 0 — inputargs at [0..num_inputs)
@@ -1298,13 +1298,12 @@ impl UnrollOptimizer {
             .iter()
             .map(|op| op.ty().expect("inputarg OpRef must carry box.type"))
             .collect();
-        // Wrap into `Vec<OpRc>` for TraceIterator's `&[OpRc]` surface.
-        let ops_oprc: Vec<majit_ir::OpRc> =
-            ops.iter().map(|op| std::rc::Rc::new(op.clone())).collect();
+        // Fed straight to `TraceIterator` (a `Borrow<Op>` slice); `next` mints
+        // the fresh per-op copy, so a pre-wrap would only duplicate it.
         let mut iter = crate::opencoder::TraceIterator::new(
-            &ops_oprc,
+            ops,
             0,
-            ops_oprc.len(),
+            ops.len(),
             None,
             &p2_inputarg_types,
             phase2_inputarg_base, // fresh inputargs at [phase2_inputarg_base..)

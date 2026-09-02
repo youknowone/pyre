@@ -2397,6 +2397,13 @@ impl Optimizer {
     /// `input_ops` be seeded from them directly (`input_ops_from_ops =
     /// true`), so `find_producer_op`'s lowest-priority store is populated
     /// without any snapshot read.
+    ///
+    /// The caller transfers its argument slots: emission resolves each
+    /// argument in place through its forwarding chain
+    /// (`optimizer.py:650-652 _emit_operation`), so on return an op's
+    /// `getarglist` reads the resolved operands, not the recorded ones. A
+    /// caller that still needs the recorded arguments must read them before
+    /// the call.
     pub fn optimize_with_constants_and_inputs_oprc(
         &mut self,
         ops: &[majit_ir::OpRc],
@@ -4755,10 +4762,6 @@ impl Optimizer {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        // The canonical `OpRc` is threaded in so callers can resolve the
-        // producer directly when they need a bound operand. For this pass the
-        // body reads through this `&Op` view (Deref), behaviour-identical.
-        let op: &Op = op_rc;
         // Box.type lives intrinsically on `OpRef.ty()` (variant
         // tag, history.py:220 + resoperation.py:1693 parity) and on
         // `Op.type_` once the op lands in `new_operations`, so an external
@@ -4776,15 +4779,30 @@ impl Optimizer {
         // would be a pyre-only layer that could substitute Const refs
         // post-`make_equal_to(_, const_target)` and de-sync from the
         // numbering snapshot.
-        let mut resolved_op = op.clone();
         // optimizer.py force_box loop parity: resolve each arg
         // through its forwarding chain. Store the CANONICAL terminal box
         // (carrying the live _forwarded chain), not a fresh from_opref box,
         // so passes can read PtrInfo / IntBound / known-class directly off
         // op.arg(i) — matching RPython where get_box_replacement returns the
         // Box object itself. A from_opref box is unbound and drops the chain.
-        for i in 0..resolved_op.num_args() {
-            let arg = resolved_op.arg(i);
+        //
+        // `optimizer.py:650-652 _emit_operation` writes the resolution back
+        // with `op.setarg(i, arg)` — into the operation's own slot, because
+        // upstream's operation IS the box the passes forward. Written back
+        // onto `op_rc` here for the same reason. Two things make that sound:
+        //
+        //  - No pass reads `op_rc`'s arguments. A pass reaches `op_rc` only as
+        //    `Operand::from_bound_op(op_rc)`, the `make_equal_to` forwarding
+        //    host, so what the second parameter carries is identity, which
+        //    resolving in place does not change; the argument view every pass
+        //    reads is `current_op` below.
+        //  - The caller has handed its argument slots over. The unroll and
+        //    bridge entries walk `TraceIterator`, whose `next` mints a fresh
+        //    operation per step, so those ops are the pass's own outright;
+        //    `optimize_with_constants_and_inputs_oprc` threads the recorder's
+        //    own ops and documents the transfer on its own signature.
+        for i in 0..op_rc.num_args() {
+            let arg = op_rc.arg(i);
             // Resolve each operand to its canonical bound terminal. When no
             // producer is registered yet — a short-preamble / bridge operand
             // dispatched mid-pass through `send_extra_operation`, whose
@@ -4807,10 +4825,12 @@ impl Optimizer {
                     }
                 }
             };
-            resolved_op.setarg(i, resolved);
+            op_rc.setarg(i, resolved);
         }
 
-        let mut current_op = resolved_op;
+        // Borrowed until a pass replaces the operation; `Replace` and
+        // `Restart` mint their own, and only those need an owned copy.
+        let mut current_op: std::borrow::Cow<'_, Op> = std::borrow::Cow::Borrowed(op_rc);
 
         // optimizer.py: optimize_SAME_AS_I/R/F → make_equal_to(op, arg0)
         // SameAs ops are absorbed into forwarding, never emitted.
@@ -4885,7 +4905,7 @@ impl Optimizer {
                     // construction (1) and a typed `op.pos` so
                     // downstream `op_at` lookups resolve it directly
                     // without a side-table refresh.
-                    current_op = op;
+                    current_op = std::borrow::Cow::Owned(op);
                     replaced = true;
                 }
                 OptimizationResult::Restart(op) => {
@@ -4962,7 +4982,7 @@ impl Optimizer {
         // If no pass handled it, emit as-is. An unreplaced pass-through is the
         // recorder input op verbatim (args re-resolved), so emit may reuse that
         // input op as the producer instead of cloning.
-        self.emit_operation(current_op.clone(), ctx, !replaced)?;
+        self.emit_operation((*current_op).clone(), ctx, !replaced)?;
         // Postprocess in reverse order after emission.
         for &pp_idx in postprocess_passes.iter().rev() {
             self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
@@ -5154,10 +5174,17 @@ impl Optimizer {
                 op.getarglist()
             );
         }
+        // `optimizer.py:626 _newoperations.append(op)` appends the operation
+        // itself. Captured up front so the emit can move `op` in rather than
+        // hand it a copy; everything the post-emit block reads off `op` is
+        // this opcode and the result type it implies (asserted equal by
+        // `debug_assert_box_type_invariant`).
+        let op_opcode = op.opcode;
+        let op_result_type = op.result_type();
         let emitted = if reuse {
-            ctx.emit_reusing(op.clone())
+            ctx.emit_reusing(op)
         } else {
-            ctx.emit(op.clone())
+            ctx.emit(op)
         };
         // optimizer.py `self._emittedoperations[op] = None` — record
         // the freshly emitted op so `as_operation` can later confirm it
@@ -5175,7 +5202,7 @@ impl Optimizer {
         // optimizer.py: returns_bool_result → getintbound(op).make_bool().
         // Run here (post-emit) so the now-bound op box carries the IntBound
         // write; returns_bool ops are Int-typed (asserted above).
-        if op.opcode.returns_bool() {
+        if op_opcode.returns_bool() {
             let bound_box = ctx
                 .get_box_replacement_operand_opt(emitted)
                 .expect("just-emitted op resolves to a bound operand");
@@ -5187,7 +5214,7 @@ impl Optimizer {
         //       opinfo = op.get_forwarded()  # IntBound
         //       if opinfo is not None and opinfo.is_constant():
         //           op.set_forwarded(ConstInt(opinfo.get_constant_int()))
-        if op.result_type() == majit_ir::Type::Int {
+        if op_result_type == majit_ir::Type::Int {
             let replaced = ctx.get_replacement_opref(emitted);
             // operand shim — peek_intbound_box takes an operand per optimizer.py:99-113.
             let bound = ctx
@@ -5204,7 +5231,7 @@ impl Optimizer {
         }
         if crate::majit_log_enabled()
             && matches!(
-                op.opcode,
+                op_opcode,
                 OpCode::CallMayForceI
                     | OpCode::CallMayForceR
                     | OpCode::CallMayForceF
@@ -5215,7 +5242,7 @@ impl Optimizer {
         {
             eprintln!(
                 "[opt] emit {:?} pos={:?} len={}",
-                op.opcode,
+                op_opcode,
                 emitted,
                 ctx.new_operations.len()
             );
