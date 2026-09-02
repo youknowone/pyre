@@ -252,26 +252,17 @@ type DepthBumpFn = fn() -> Option<Box<dyn std::any::Any>>;
 static DEPTH_BUMP_OVERRIDE: OnceLock<DepthBumpFn> = OnceLock::new();
 
 thread_local! {
-    /// Python recursion depth — the number of user Python frames currently
-    /// executing bytecode on this thread.  Bumped once at every `eval_loop` /
-    /// `eval_loop_jit` entry and dropped when that activation returns, so the
-    /// module-level frame, an `exec`ed body and a resumed generator each cost
-    /// one unit exactly like a called function does.  `stack_check()` compares
-    /// it against `sys.getrecursionlimit()`.
-    static PY_RECURSION_DEPTH: Cell<u32> = const { Cell::new(0) };
-
-    /// The innermost frame whose activation has already spent its
-    /// [`PY_RECURSION_DEPTH`] unit.  A frame is executed through nested entry
-    /// points — the JIT wrapper may run it as compiled code, hand it to the
-    /// JIT eval loop, or decline and re-enter the plain evaluator for the very
-    /// same frame — and only the outermost of those pays.  Any frame reached
-    /// from here is a different, simultaneously-live frame, so its address
-    /// cannot collide with the one recorded.
-    static ACCOUNTED_ACTIVATION: Cell<usize> = const { Cell::new(0) };
+    /// This thread's activation accounting — see [`RecursionState`].
+    static RECURSION_STATE: RecursionState = const {
+        RecursionState {
+            depth: Cell::new(0),
+            accounted: Cell::new(0),
+        }
+    };
 
     /// Monotonic count of Python frame eval-loop entries — bumped once per
     /// `eval_loop` / `eval_loop_jit` entry (every user-level bytecode frame
-    /// that begins running), NEVER decremented.  Unlike [`PY_RECURSION_DEPTH`] (net
+    /// that begins running), NEVER decremented.  Unlike the depth (net
     /// zero after a balanced call returns), this is a cumulative odometer, so
     /// a snapshot taken before a residual call and re-read after it reveals
     /// whether ANY user Python frame ran during the call regardless of how
@@ -284,6 +275,34 @@ thread_local! {
     static FRAME_ENTRY_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
+/// The pair every activation entry and exit touches together.
+///
+/// One thread-local rather than two because both are read and written by the
+/// same handful of operations, and a `thread_local!` access is not free on
+/// every platform: darwin resolves each key through a `_tlv_get_addr` call
+/// into the dynamic loader, so the cost is per KEY per access, not per byte.
+/// Sharing one key lets `enter_recursive_frame` and the activation seam pay
+/// for a single lookup and then touch both fields through it.
+struct RecursionState {
+    /// Number of user Python frames currently executing bytecode on this
+    /// thread.  Bumped once at every `eval_loop` / `eval_loop_jit` entry and
+    /// dropped when that activation returns, so the module-level frame, an
+    /// `exec`ed body and a resumed generator each cost one unit exactly like a
+    /// called function does.  `stack_check()` compares it against
+    /// `sys.getrecursionlimit()`.
+    depth: Cell<u32>,
+    /// The innermost frame whose activation has already spent its [`depth`]
+    /// unit.  A frame is executed through nested entry points — the JIT
+    /// wrapper may run it as compiled code, hand it to the JIT eval loop, or
+    /// decline and re-enter the plain evaluator for the very same frame — and
+    /// only the outermost of those pays.  Any frame reached from here is a
+    /// different, simultaneously-live frame, so its address cannot collide
+    /// with the one recorded.
+    ///
+    /// [`depth`]: RecursionState::depth
+    accounted: Cell<usize>,
+}
+
 /// Number of user Python frames currently executing bytecode on this thread.
 /// Used by pyre-jit for JIT_CALL_DEPTH parity.
 ///
@@ -293,7 +312,7 @@ thread_local! {
 /// annotator.
 #[majit_macros::dont_look_inside]
 pub fn py_recursion_depth() -> u32 {
-    PY_RECURSION_DEPTH.with(|d| d.get())
+    RECURSION_STATE.with(|s| s.depth.get())
 }
 
 /// Snapshot of the monotonic Python frame eval-loop entry odometer
@@ -327,20 +346,22 @@ pub fn bump_frame_entry_count() {
 #[inline]
 pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
     let key = frame as usize;
-    let saved_depth = PY_RECURSION_DEPTH.with(|d| d.get());
-    if ACCOUNTED_ACTIVATION.with(|c| c.get()) == key {
-        return RecursionDepthGuard {
-            prev: key,
-            spent: false,
+    RECURSION_STATE.with(|s| {
+        let saved_depth = s.depth.get();
+        if s.accounted.get() == key {
+            return RecursionDepthGuard {
+                prev: key,
+                spent: false,
+                saved_depth,
+            };
+        }
+        s.depth.set(saved_depth + 1);
+        RecursionDepthGuard {
+            prev: s.accounted.replace(key),
+            spent: true,
             saved_depth,
-        };
-    }
-    PY_RECURSION_DEPTH.with(|d| d.set(saved_depth + 1));
-    RecursionDepthGuard {
-        prev: ACCOUNTED_ACTIVATION.with(|c| c.replace(key)),
-        spent: true,
-        saved_depth,
-    }
+        }
+    })
 }
 
 /// Spend one unit of the recursion budget on a dispatch level that pushes no
@@ -349,20 +370,22 @@ pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
 /// The self-referential `A.__call__ = A()` chain recurses through
 /// `user_call_slot` natively and never reaches a frame activation, so there is
 /// no activation to key on: the unit is spent unconditionally and
-/// `ACCOUNTED_ACTIVATION` is carried through unchanged, leaving the next real
-/// activation to account for itself.
+/// [`RecursionState::accounted`] is carried through unchanged, leaving the
+/// next real activation to account for itself.
 #[inline]
 pub fn enter_native_dispatch() -> RecursionDepthGuard {
-    let saved_depth = PY_RECURSION_DEPTH.with(|d| d.get());
-    PY_RECURSION_DEPTH.with(|d| d.set(saved_depth + 1));
-    RecursionDepthGuard {
-        prev: ACCOUNTED_ACTIVATION.with(|c| c.get()),
-        spent: true,
-        saved_depth,
-    }
+    RECURSION_STATE.with(|s| {
+        let saved_depth = s.depth.get();
+        s.depth.set(saved_depth + 1);
+        RecursionDepthGuard {
+            prev: s.accounted.get(),
+            spent: true,
+            saved_depth,
+        }
+    })
 }
 
-/// RAII guard that releases the [`PY_RECURSION_DEPTH`] unit on drop.
+/// RAII guard that releases the [`RecursionState::depth`] unit on drop.
 ///
 /// It restores the depth this activation was entered with rather than
 /// subtracting its own unit.  Compiled code charges and releases the units of
@@ -381,10 +404,12 @@ pub struct RecursionDepthGuard {
 impl Drop for RecursionDepthGuard {
     #[inline]
     fn drop(&mut self) {
-        PY_RECURSION_DEPTH.with(|d| d.set(self.saved_depth));
-        if self.spent {
-            ACCOUNTED_ACTIVATION.with(|c| c.set(self.prev));
-        }
+        RECURSION_STATE.with(|s| {
+            s.depth.set(self.saved_depth);
+            if self.spent {
+                s.accounted.set(self.prev);
+            }
+        });
     }
 }
 
@@ -394,9 +419,9 @@ impl Drop for RecursionDepthGuard {
 /// This is [`enter_recursive_frame`]'s body for a caller that cannot hold an
 /// RAII value: a compiled trace, which records the charge as an operation and
 /// records the matching [`jit_release_recursion_unit`] where it records
-/// `executioncontext.leave`.  Claiming `ACCOUNTED_ACTIVATION` here is what
-/// keeps a frame that later reaches a portal door — a guard failure resuming
-/// this same activation — from paying a second time.
+/// `executioncontext.leave`.  Claiming [`RecursionState::accounted`] here is
+/// what keeps a frame that later reaches a portal door — a guard failure
+/// resuming this same activation — from paying a second time.
 ///
 /// `units` is more than one where the trace mints more than one activation
 /// before it reaches this call: a fragment inlines a run of callee levels and
@@ -408,23 +433,30 @@ impl Drop for RecursionDepthGuard {
 /// every call, so the drift is a spurious `RecursionError` rather than a stale
 /// frame link.
 ///
-/// Returns the claim it displaced, which is the value its release takes back.
+/// Returns the claim it displaced — the value its release takes back — and the
+/// depth the charge produced, so the caller's limit test costs no second
+/// lookup of the thread-local this already holds open.
 /// The trace threads that word from the one to the other, so the pair is held
 /// together by a dataflow edge rather than by two separate spellings of the
 /// caller, and no reader has to recover a frame from `f_backref`, which holds
 /// the caller's *vref* and not the caller.
 #[majit_macros::dont_look_inside]
-pub fn jit_charge_recursion_unit(frame: *const PyFrame, units: u32) -> usize {
-    PY_RECURSION_DEPTH.with(|d| d.set(d.get() + units));
-    ACCOUNTED_ACTIVATION.with(|c| c.replace(frame as usize))
+pub fn jit_charge_recursion_unit(frame: *const PyFrame, units: u32) -> (usize, u32) {
+    RECURSION_STATE.with(|s| {
+        let depth = s.depth.get() + units;
+        s.depth.set(depth);
+        (s.accounted.replace(frame as usize), depth)
+    })
 }
 
 /// Give back the units [`jit_charge_recursion_unit`] spent, restoring the claim
 /// it returned.
 #[majit_macros::dont_look_inside]
 pub fn jit_release_recursion_unit(displaced_activation: usize, units: u32) {
-    PY_RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(units)));
-    ACCOUNTED_ACTIVATION.with(|c| c.set(displaced_activation));
+    RECURSION_STATE.with(|s| {
+        s.depth.set(s.depth.get().saturating_sub(units));
+        s.accounted.set(displaced_activation);
+    });
 }
 
 /// Register the JIT-aware eval function. Called by pyre-jit at startup.

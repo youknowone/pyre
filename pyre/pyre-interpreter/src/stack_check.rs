@@ -763,7 +763,7 @@ pub fn stack_check() -> Result<(), PyError> {
     // CPython 3.14 checks `py_recursion_remaining`, i.e. Python interpreter
     // depth, independently of native stack protection.  pyre's matching
     // counter is bumped around every user-function call.
-    recursion_depth_check()?;
+    recursion_depth_check(crate::call::py_recursion_depth())?;
     let current = current_sp();
     let end = PYRE_STACKTOOBIG.stack_end.load(Ordering::Relaxed);
     let length = PYRE_STACKTOOBIG.stack_length.load(Ordering::Relaxed);
@@ -797,8 +797,8 @@ pub extern "C" fn stack_check_jit_abi() -> i64 {
 /// boundary would only pay for it twice.  The logical half has no such home,
 /// so it is the half a synthesized activation has to carry.
 #[inline]
-fn recursion_depth_check() -> Result<(), PyError> {
-    if crate::call::py_recursion_depth() >= get_recursion_limit() as u32 {
+fn recursion_depth_check(depth: u32) -> Result<(), PyError> {
+    if depth >= get_recursion_limit() as u32 {
         return Err(PyError::recursion_error("maximum recursion depth exceeded"));
     }
     Ok(())
@@ -829,9 +829,10 @@ fn recursion_depth_check() -> Result<(), PyError> {
 ///
 /// `units` counts the activations the fragment reaching this call has minted,
 /// so the check runs against the depth they all add up to rather than against
-/// the one this call names.  The charge goes first for that reason, and is
-/// given back when the check refuses: an activation that never begins owes no
-/// unit.
+/// the one this call names.  The charge goes first for that reason — it also
+/// hands back the depth it produced, which is what keeps this whole call to a
+/// single thread-local lookup — and is given back when the check refuses: an
+/// activation that never begins owes no unit.
 ///
 /// Returns the word [`jit_activation_leave_abi`] takes back, which the trace
 /// threads from the one call to the other.  The error travels on the published
@@ -839,9 +840,9 @@ fn recursion_depth_check() -> Result<(), PyError> {
 /// result is free to carry the pairing.
 pub extern "C" fn jit_activation_enter_abi(callee_frame: i64, units: i64) -> i64 {
     let units = units as u32;
-    let displaced =
+    let (displaced, depth) =
         crate::call::jit_charge_recursion_unit(callee_frame as *const crate::PyFrame, units);
-    if let Err(error) = recursion_depth_check() {
+    if let Err(error) = recursion_depth_check(depth) {
         crate::call::jit_release_recursion_unit(displaced, units);
         return crate::runtime_ops::jit_publish_residual_error(error);
     }
