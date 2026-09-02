@@ -4956,9 +4956,9 @@ mod tests {
 
     /// A Char operand concatenated with a String reaches the same
     /// `pair(AbstractStringRepr, AbstractStringRepr).rtype_add` body
-    /// (rstr.py:651-659), because `CharRepr(AbstractCharRepr,
-    /// StringRepr)` (lltypesystem/rstr.py:291) inherits
-    /// `StringRepr.repr = string_repr` (:1262) — so `str1_repr` is the
+    /// (rstr.py), because `CharRepr(AbstractCharRepr,
+    /// StringRepr)` (lltypesystem/rstr.py) inherits
+    /// `StringRepr.repr = string_repr` — so `str1_repr` is the
     /// string surface on both sides and the char coerces through
     /// `ll_chr2str` before the one `ll_strconcat`. No char pairtype
     /// defines an `rtype_add` of its own.

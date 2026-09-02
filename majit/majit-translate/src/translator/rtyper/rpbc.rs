@@ -3948,7 +3948,7 @@ pub(super) fn pair_function_repr_functions_pbc_convert_from_to(
 
 /// RPython `pairtype(MultipleFrozenPBCRepr, FunctionRepr)
 ///                  .convert_from_to((r_frozen1, r_fn2), v, llops)`
-/// (rpbc.py:836-840):
+/// (rpbc.py):
 ///
 /// ```python
 /// def convert_from_to((r_frozen1, r_fn2), v, llops):
@@ -3978,7 +3978,7 @@ pub(super) fn pair_multiple_frozen_pbc_function_repr_convert_from_to(
         })?;
     // upstream: `if r_fn2.lowleveltype is Void:` … `return NotImplemented`.
     // `FunctionRepr.lowleveltype` is the class attribute `Void`
-    // (rpbc.py:318), so the guard normally holds; a repr that answers
+    // (rpbc.py), so the guard normally holds; a repr that answers
     // otherwise falls through to the next pair_mro entry.
     if !matches!(r_fn2.lowleveltype(), LowLevelType::Void) {
         return Ok(None);

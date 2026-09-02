@@ -401,9 +401,10 @@ fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
 }
 
 /// A Void-typed operand is spelled as a Void `Constant`, never as a
-/// `Variable`: `jtransform.py:83-85` renames every Void var to
+/// `Variable`: `do_rename` inside `Transformer.optimize_block`
+/// (jtransform.py) renames every Void var to
 /// `Constant(None, lltype.Void)` before it can be read, and
-/// `rmodel.py:361-363` `pairtype(Repr, VoidRepr).convert_from_to`
+/// `pairtype(Repr, VoidRepr).convert_from_to` (rmodel.py)
 /// converts into Void as `inputconst(lltype.Void, None)`.
 ///
 /// The front end relies on that: `front::mir` mints a Void operand with
@@ -1309,7 +1310,7 @@ fn translate_op_or_frontier(
 /// `CallTarget::Indirect` arm of [`translate_op`], which is one of the two
 /// callers. The other is that arm's pyre-internal twin, `OpKind::IndirectCall`
 /// carrying a `family_key`: an `indirect_call` op has no pre-rtyper spelling
-/// upstream — `rpbc.py:193-194` mints it inside `rtype_simple_call`, so
+/// upstream — `rpbc.py` mints it inside `rtype_simple_call`, so
 /// everything the annotator sees is still a `simple_call` — and the adapter is
 /// the entry into annotation, so both spellings must arrive here as one.
 fn dyn_trait_dispatch_ops(
@@ -3132,17 +3133,20 @@ pub fn translate_op(
 
         // ─── Pyre-internal: IndirectCall ───
         // An `indirect_call` op has no pre-rtyper spelling. Upstream mints it
-        // inside the rtyper — `rpbc.py:193-194` `rtype_simple_call(self, hop):
-        // return self.call(hop)`, which reaches the emit at `rpbc.py:215-217`:
+        // inside the rtyper — `rpbc.py` `rtype_simple_call(self, hop):
+        // return self.call(hop)`, which reaches the emit in
+        // `FunctionReprBase.call`:
         // ```python
         // vlist.append(hop.inputconst(Void, row_of_graphs.values()))
         // v = hop.genop('indirect_call', vlist, resulttype=rresult)
         // ```
         // Everything the annotator sees is still a `simple_call`
-        // (`flowspace/operation.py:663-664`, `annotator/unaryop.py:114-118`),
+        // (`SimpleCall` in `flowspace/operation.py`,
+        // `simple_call_SomeObject` in `annotator/unaryop.py`),
         // and this adapter is the entry into annotation. So the op cannot be
         // lowered to a flowspace `indirect_call` before arriving here: the
-        // trailing `c_graphs` Constant that `graphanalyze.py:117-119` reads out
+        // trailing `c_graphs` Constant that `GraphAnalyzer.analyze`
+        // (graphanalyze.py) reads out
         // of `op.args[-1]` is a product of rtyping, which has not run yet.
         //
         // `family_key` carries the pre-rtyper identity of the vtable slot, so a
@@ -6507,7 +6511,8 @@ mod tests {
         // pointer: it names no trait receiver and no method, so there is
         // nothing for a `getattr` to spell, and a function pointer has no
         // pre-rtyper shape at all — upstream only ever mints `indirect_call`
-        // inside `rpbc.py:193-217`, after rtyping. Fail-loud is the
+        // inside `rtype_simple_call` and `FunctionReprBase.call` (rpbc.py),
+        // after rtyping. Fail-loud is the
         // parity-correct behaviour for that arm.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
@@ -6537,7 +6542,7 @@ mod tests {
     /// An IndirectCall that does carry a `family_key` names a dyn-trait vtable
     /// slot, and lowers to the same pre-rtyper shape as its `CallTarget::
     /// Indirect` twin: `getattr(receiver, method)` then `simple_call`. The
-    /// annotator never sees an `indirect_call` — `rpbc.py:193-194` mints that
+    /// annotator never sees an `indirect_call` — `rpbc.py` mints that
     /// inside `rtype_simple_call`, downstream of here.
     #[test]
     fn translate_op_indirect_call_with_family_key_lowers_to_getattr_simple_call() {

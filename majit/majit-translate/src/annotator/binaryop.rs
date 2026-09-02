@@ -1396,8 +1396,8 @@ fn init_string_pairtype(
 }
 
 fn string_string_add(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
-    // `SomeChar` is a `SomeString` subclass (model.py:309), and
-    // `pairtype(SomeChar, SomeChar)` (binaryop.py:374) registers only
+    // `SomeChar` is a `SomeString` subclass (model.py), and
+    // `pairtype(SomeChar, SomeChar)` (binaryop.py) registers only
     // `union`, so a char operand on either side resolves to this arm
     // through the MRO and the result is a `SomeString` either way.
     fn extract(sv: &SomeValue, side: &str) -> (bool, Option<Vec<u8>>) {

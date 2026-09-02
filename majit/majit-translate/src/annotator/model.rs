@@ -2269,14 +2269,14 @@ impl SomeValueTag {
             T::Type => &[T::Type, T::Object],
             // String family: `SomeString`, `SomeUnicodeString` and
             // `SomeByteArray` share a `SomeStringOrUnicode` base
-            // (model.py:288, 296, 304) that carries no pairtype
+            // (model.py) that carries no pairtype
             // registration, so naming it here would resolve nothing — those
             // three resolve to themselves then Object. The two element tags
             // do inherit from a registered class: `SomeChar(SomeString)`
-            // (model.py:309) and `SomeUnicodeCodePoint(SomeUnicodeString)`
-            // (model.py:318). That edge is load-bearing — `pairtype(SomeChar,
-            // SomeChar)` (binaryop.py:374) defines only `union`, so `chr + chr`
-            // reaches `pairtype(SomeString, SomeString).add` (binaryop.py:338)
+            // and `SomeUnicodeCodePoint(SomeUnicodeString)` (model.py). That
+            // edge is load-bearing — `pairtype(SomeChar, SomeChar)`
+            // (binaryop.py) defines only `union`, so `chr + chr` reaches
+            // `pairtype(SomeString, SomeString).add` (binaryop.py)
             // through it, and a char operand serves every other `SomeString`
             // pair the same way.
             T::String => &[T::String, T::Object],
@@ -3037,9 +3037,9 @@ impl std::error::Error for AnnotatorError {}
 /// Read a caught panic payload as text.
 ///
 /// Upstream's handlers catch a typed exception and read its fields —
-/// `annrpython.py:530` catches `AnnotatorError` to attach `source`,
-/// `rtyper.py:493` catches `TyperError` to attach `where` — and the message
-/// text is produced once, at the terminal report (`annrpython.py:244`,
+/// `flowin` (annrpython.py) catches `AnnotatorError` to attach `source`,
+/// `gottypererror` (rtyper.py) catches `TyperError` to attach `where` — and
+/// the message text is produced once, at the terminal report (`complete`,
 /// `'\n-----'.join(str(e) for e in self.errors)`). A pyre unwind carries
 /// either the error object or an already-formatted string, so the object is
 /// read first and the string is the fallback.
@@ -3072,7 +3072,8 @@ impl AnnotatorError {
     /// Upstream raises `AnnotatorError` from inside `compute_at_fixpoint`
     /// and `complete_pending_blocks` and lets it propagate as itself; the
     /// class is what tells a handler which half of the translator failed,
-    /// and `rtyper.py:493` keeps `TyperError` separate for the other half.
+    /// and `gottypererror` (rtyper.py) keeps `TyperError` separate for the
+    /// other half.
     /// A caller that reformats one into the other erases that distinction,
     /// after which the stage is recoverable only by matching substrings of
     /// the rendered text.

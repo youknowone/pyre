@@ -656,14 +656,14 @@ fn dispatch_rtype_op(
             committed(super::rstr::pair_abstract_string_rtype_add(r1, r2, hop))
         }
         // `rtype_add` is defined at exactly one place, `pairtype(
-        // AbstractStringRepr, AbstractStringRepr)` (rstr.py:651-659); no
+        // AbstractStringRepr, AbstractStringRepr)` (rstr.py); no
         // char pairtype defines one. A char operand reaches that body
         // through `CharRepr(AbstractCharRepr, StringRepr)` and
         // `UniCharRepr(AbstractUniCharRepr, UnicodeRepr)`
-        // (lltypesystem/rstr.py:291, 294), which is also where
-        // `char_repr.repr` comes from: `StringRepr.repr = string_repr`
-        // and `UniCharRepr.repr = unicode_repr` (lltypesystem/rstr.py:
-        // 1262-1264), so `rtype_add` coerces both operands to the
+        // (lltypesystem/rstr.py), which is also where `char_repr.repr`
+        // comes from: `StringRepr.repr = string_repr` and
+        // `UniCharRepr.repr = unicode_repr` (lltypesystem/rstr.py), so
+        // `rtype_add` coerces both operands to the
         // string surface and calls the same `ll_strconcat`. The two
         // functions below already coerce that way, and
         // `pair_convert_from_to` already carries the Char→Str /
