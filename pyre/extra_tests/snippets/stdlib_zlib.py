@@ -62,3 +62,8 @@ for text in compressed_lorem_list:
 
 assert_raises(zlib.error, lambda: zlib.compress(b"123", -40))
 assert_raises(zlib.error, lambda: zlib.compress(b"123", 10))
+# An invalid wbits reaches the same deflateInit / inflateInit rejection as an
+# invalid level, and both one-shot helpers report it as zlib.error rather than
+# letting the initialization ValueError through.
+assert_raises(zlib.error, lambda: zlib.compress(b"123", 6, 99))
+assert_raises(zlib.error, lambda: zlib.decompress(b"123", -40))
