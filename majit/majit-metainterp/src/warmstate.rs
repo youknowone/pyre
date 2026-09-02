@@ -7123,6 +7123,65 @@ mod tests {
         );
     }
 
+    /// The one-walk resolve answers an ambiguous bucket with no greens exactly
+    /// as the two readers it replaced did.
+    ///
+    /// [`WarmEnterState::resolved_cell`] folds
+    /// [`WarmEnterState::cell_keys_at`] and [`WarmEnterState::cell_by_key`]
+    /// into a single traversal, and its `(count > 1, make_key: None)` arm is
+    /// the one that cannot be checked against a caller's greens: it reports the
+    /// raw hash and whatever cell that hash names. That arm reaches the cell
+    /// through `by_key`, a candidate noted DURING the walk, where the readers
+    /// it replaced reached it by walking back from the key — so the two can
+    /// only be shown to agree on a bucket that actually holds more than one
+    /// candidate, which is the fixture below.
+    #[test]
+    fn an_ambiguous_bucket_resolved_without_greens_names_the_cell_its_key_names() {
+        let mut ws = WarmEnterState::new(100);
+        let first = GreenKey::new(vec![4100, 4200]);
+        let second = GreenKey::new(vec![4300, colliding_last_green(&first, 4300)]);
+        let bucket = first.get_uhash();
+
+        // A procedure token keeps the first cell non-removable so the second
+        // install chains it rather than pruning it — the same shape
+        // `a_chained_bucket_reached_without_greens_answers_the_first_occupant`
+        // builds, because a single-candidate bucket takes the `(1, _)` arm and
+        // never reaches the branch under test.
+        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        attach_alive_for_key(&mut ws, &first, token);
+        let first_key = ws
+            .cell_key_for(&first)
+            .expect("the first key owns the cell it just installed");
+        let _second_key = ws.ensure_cell_key(&second);
+
+        let (count, first_found) = ws.cell_keys_at(bucket);
+        assert!(
+            count > 1,
+            "fixture: the bucket must own two candidates, or the resolve takes              its single-candidate arm and the branch under test never runs",
+        );
+        assert_eq!(
+            first_found,
+            Some(first_key),
+            "fixture: and the first of them is the occupant that kept the raw              hash",
+        );
+
+        let (cell_key, cell) = ws.resolved_cell(bucket, None);
+        assert_eq!(
+            cell_key, bucket,
+            "with no greens to settle the bucket, the resolve reports the raw              hash, exactly as `sole_cell_key` declines and `resolve_cell_key`              falls back",
+        );
+
+        let by_key = ws
+            .cell_by_key(bucket)
+            .expect("the raw hash names the bucket's original occupant");
+        let cell = cell.expect("and the resolve hands that same cell back");
+        assert!(
+            std::ptr::eq(cell, by_key),
+            "the cell noted during the walk must BE the one a walk back from              the key finds, not merely one with equal fields",
+        );
+        assert_eq!(cell.cell_key, Some(first_key));
+    }
+
     /// The number of cells linked at `hash`'s table slot, counting the
     /// neighbours the index truncation put there as well as `hash`'s own.
     fn chain_len(ws: &WarmEnterState, hash: u64) -> usize {
