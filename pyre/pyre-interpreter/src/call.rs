@@ -327,16 +327,19 @@ pub fn bump_frame_entry_count() {
 #[inline]
 pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
     let key = frame as usize;
+    let saved_depth = PY_RECURSION_DEPTH.with(|d| d.get());
     if ACCOUNTED_ACTIVATION.with(|c| c.get()) == key {
         return RecursionDepthGuard {
             prev: key,
             spent: false,
+            saved_depth,
         };
     }
-    PY_RECURSION_DEPTH.with(|d| d.set(d.get() + 1));
+    PY_RECURSION_DEPTH.with(|d| d.set(saved_depth + 1));
     RecursionDepthGuard {
         prev: ACCOUNTED_ACTIVATION.with(|c| c.replace(key)),
         spent: true,
+        saved_depth,
     }
 }
 
@@ -350,27 +353,78 @@ pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
 /// activation to account for itself.
 #[inline]
 pub fn enter_native_dispatch() -> RecursionDepthGuard {
-    PY_RECURSION_DEPTH.with(|d| d.set(d.get() + 1));
+    let saved_depth = PY_RECURSION_DEPTH.with(|d| d.get());
+    PY_RECURSION_DEPTH.with(|d| d.set(saved_depth + 1));
     RecursionDepthGuard {
         prev: ACCOUNTED_ACTIVATION.with(|c| c.get()),
         spent: true,
+        saved_depth,
     }
 }
 
 /// RAII guard that releases the [`PY_RECURSION_DEPTH`] unit on drop.
+///
+/// It restores the depth this activation was entered with rather than
+/// subtracting its own unit.  Compiled code charges and releases the units of
+/// the activations it mints itself ([`jit_charge_recursion_unit`]), and an exit
+/// that leaves compiled code between one of those pairs — a guard failure, a
+/// raise — skips the release the same way it skips the `ec.topframeref`
+/// restore.  Restoring the entry value closes both halves at the activation
+/// boundary, which is where `pyre-jit`'s `TopFrameRefGuard` already balances
+/// the frame chain for the same exits.
 pub struct RecursionDepthGuard {
     prev: usize,
     spent: bool,
+    saved_depth: u32,
 }
 
 impl Drop for RecursionDepthGuard {
     #[inline]
     fn drop(&mut self) {
+        PY_RECURSION_DEPTH.with(|d| d.set(self.saved_depth));
         if self.spent {
-            PY_RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
             ACCOUNTED_ACTIVATION.with(|c| c.set(self.prev));
         }
     }
+}
+
+/// Spend one recursion unit on the activation `frame` names, without a guard
+/// to give it back.
+///
+/// This is [`enter_recursive_frame`]'s body for a caller that cannot hold an
+/// RAII value: a compiled trace, which records the charge as an operation and
+/// records the matching [`jit_release_recursion_unit`] where it records
+/// `executioncontext.leave`.  Claiming `ACCOUNTED_ACTIVATION` here is what
+/// keeps a frame that later reaches a portal door — a guard failure resuming
+/// this same activation — from paying a second time.
+///
+/// `units` is more than one where the trace mints more than one activation
+/// before it reaches this call: a fragment inlines a run of callee levels and
+/// only then hands the rest to `CALL_ASSEMBLER`, so the seam that survives to
+/// run time pays for the whole run at once.  Charging per inlined level
+/// instead would be exact at the moment of the call and wrong afterwards —
+/// a guard leaving the callee skips the recorded release the same way it skips
+/// the `ec.topframeref` restore, and unlike that slot the depth is read by
+/// every call, so the drift is a spurious `RecursionError` rather than a stale
+/// frame link.
+///
+/// Returns the claim it displaced, which is the value its release takes back.
+/// The trace threads that word from the one to the other, so the pair is held
+/// together by a dataflow edge rather than by two separate spellings of the
+/// caller, and no reader has to recover a frame from `f_backref`, which holds
+/// the caller's *vref* and not the caller.
+#[majit_macros::dont_look_inside]
+pub fn jit_charge_recursion_unit(frame: *const PyFrame, units: u32) -> usize {
+    PY_RECURSION_DEPTH.with(|d| d.set(d.get() + units));
+    ACCOUNTED_ACTIVATION.with(|c| c.replace(frame as usize))
+}
+
+/// Give back the units [`jit_charge_recursion_unit`] spent, restoring the claim
+/// it returned.
+#[majit_macros::dont_look_inside]
+pub fn jit_release_recursion_unit(displaced_activation: usize, units: u32) {
+    PY_RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(units)));
+    ACCOUNTED_ACTIVATION.with(|c| c.set(displaced_activation));
 }
 
 /// Register the JIT-aware eval function. Called by pyre-jit at startup.
