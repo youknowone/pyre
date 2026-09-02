@@ -544,6 +544,21 @@ fn main() {
         started.elapsed().as_secs_f64()
     );
 
+    // The bridge row, on stderr so it never enters the tables above. `BRIDGES`
+    // is what the guards earned; `BRIDGE_OPS` is how much trace each carried,
+    // and the quotient is the unit a per-bridge cost divides by.
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bridges = shortcircuit::BRIDGES.load(Relaxed);
+        if bridges != 0 {
+            eprintln!(
+                "bridges {bridges}, ops {}, {:.1} ops/bridge",
+                shortcircuit::BRIDGE_OPS.load(Relaxed),
+                shortcircuit::BRIDGE_OPS.load(Relaxed) as f64 / bridges as f64,
+            );
+        }
+    }
+
     if bad != 0 {
         std::process::exit(1);
     }

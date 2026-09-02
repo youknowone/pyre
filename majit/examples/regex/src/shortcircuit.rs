@@ -524,6 +524,10 @@ pub static COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// the loop counter cannot see them, because a guard that declines to bridge
 /// still deopts through the blackhole and leaves the loop count at 1.
 pub static BRIDGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Operations in every bridge this run compiled, summed. `BRIDGES` counts how
+/// many the guards earned; this counts how much trace each one carried, so a
+/// per-bridge cost can be divided by the work the bridge actually holds.
+pub static BRIDGE_OPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Traces abandoned. `COMPILES > 0` does not rule this out: a bridge can abort
 /// while the loop stands.
 pub static ABORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -651,8 +655,9 @@ impl Matcher {
             COMPILES.fetch_add(1, Relaxed);
             *LAST_BODY.lock().unwrap() = opcodes.to_vec();
         });
-        driver.set_on_compile_bridge(|_gk, _fail_index, _num_ops| {
+        driver.set_on_compile_bridge(|_gk, _fail_index, num_ops| {
             BRIDGES.fetch_add(1, Relaxed);
+            BRIDGE_OPS.fetch_add(num_ops, Relaxed);
         });
         driver.set_on_trace_abort(|_gk, _permanent| {
             ABORTS.fetch_add(1, Relaxed);

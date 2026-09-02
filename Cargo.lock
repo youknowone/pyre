@@ -3150,6 +3150,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "mimalloc",
 ]
 
 [[package]]
