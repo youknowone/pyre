@@ -834,6 +834,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::ConstInt(_)
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
+        | OpKind::ConstSingleFloat(_)
         | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }

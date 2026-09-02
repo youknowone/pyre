@@ -461,6 +461,7 @@ pub(crate) fn remap_op_kind(
         },
         OpKind::ConstUInt(v) => OpKind::ConstUInt(*v),
         OpKind::ConstInt128(v) => OpKind::ConstInt128(*v),
+        OpKind::ConstSingleFloat(v) => OpKind::ConstSingleFloat(*v),
         OpKind::ConstUInt128(v) => OpKind::ConstUInt128(*v),
         OpKind::ConstBool(v) => OpKind::ConstBool(*v),
         OpKind::ConstSymbolic { tag, ty } => OpKind::ConstSymbolic {
@@ -954,6 +955,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::ConstInt(_)
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
+        | OpKind::ConstSingleFloat(_)
         | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
@@ -1232,6 +1234,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::ConstInt(_)
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
+        | OpKind::ConstSingleFloat(_)
         | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
         // `_we_are_jitted` symbolic const — a pure `Constant`, removable

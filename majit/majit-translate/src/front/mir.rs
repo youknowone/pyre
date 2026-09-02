@@ -6373,6 +6373,7 @@ impl<'a> Lowering<'a> {
             DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
             DecodedConst::Bool(b) => OpKind::ConstBool(b),
             DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
+            DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
             // String / char / byte-string constants — no
             // ConstStr opkind exists; synthesise a 0-arg `Call` whose
             // path encodes the literal text so the IR stays stable.
@@ -24550,6 +24551,10 @@ enum DecodedConst {
     UInt128(u128),
     Bool(bool),
     Float(u64),
+    /// An `f32` literal, as its f32 bit pattern.  Charon records the
+    /// width on the constant (`{"Float": {"value": "...", "ty": "F32"}}`),
+    /// and parsing both widths into an f64 bit pattern is what erased it.
+    SingleFloat(u32),
     /// String / char / byte-string literals. The IR has no dedicated
     /// string constant opkind; the codewriter treats these as opaque
     /// pointer-typed values. We carry the textual representation as a
@@ -24566,6 +24571,8 @@ enum DecodedConst {
 #[derive(Clone, Copy)]
 enum ConstLit {
     Int(i64),
+    /// See [`DecodedConst::SingleFloat`].
+    SingleFloat(u32),
     /// Unsigned integer bits.  Keeping this distinct is required while
     /// evaluating const initializers: `(1_u64 << 63) - 1` cannot be
     /// evaluated correctly after prematurely reinterpreting the first
@@ -24725,13 +24732,21 @@ fn decode_const_lit(value: &serde_json::Value) -> Option<ConstLit> {
     if let Some(value) = literal.get("Bool").and_then(serde_json::Value::as_bool) {
         return Some(ConstLit::Bool(value));
     }
-    if let Some(value) = literal
-        .get("Float")
-        .and_then(|float| float.get("value"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(|text| text.parse::<f64>().ok())
+    if let Some(float) = literal.get("Float")
+        && let Some(value) = float
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.parse::<f64>().ok())
     {
-        return Some(ConstLit::Float(value.to_bits()));
+        // See [`decode_literal_constant`]: the width rides beside the
+        // value, and an `f32` keeps its own carrier.
+        return Some(
+            if float.get("ty").and_then(serde_json::Value::as_str) == Some("F32") {
+                ConstLit::SingleFloat((value as f32).to_bits())
+            } else {
+                ConstLit::Float(value.to_bits())
+            },
+        );
     }
     None
 }
@@ -24807,6 +24822,7 @@ fn const_lit_to_op(value: ConstLit) -> Option<OpKind> {
         ConstLit::UInt(n) => Some(OpKind::ConstUInt(n)),
         ConstLit::Bool(b) => Some(OpKind::ConstBool(b)),
         ConstLit::Float(bits) => Some(OpKind::ConstFloat(bits)),
+        ConstLit::SingleFloat(bits) => Some(OpKind::ConstSingleFloat(bits)),
         ConstLit::Checked(..) | ConstLit::CheckedUInt(..) => None,
     }
 }
@@ -25232,13 +25248,19 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
         return Ok(DecodedConst::Bool(b));
     }
     if let Some(f) = lit_obj.get("Float") {
-        if let Some(s) = f
-            .as_object()
-            .and_then(|m| m.get("value"))
-            .and_then(Value::as_str)
+        if let Some(obj) = f.as_object()
+            && let Some(s) = obj.get("value").and_then(Value::as_str)
             && let Ok(v) = s.parse::<f64>()
         {
-            return Ok(DecodedConst::Float(v.to_bits()));
+            // The width is carried beside the value, and an `f32` keeps
+            // its own carrier: narrowing to `f32` here is the conversion
+            // rustc already applied to the literal, and the f64 bit
+            // pattern of the same number is a different value.
+            return Ok(if obj.get("ty").and_then(Value::as_str) == Some("F32") {
+                DecodedConst::SingleFloat((v as f32).to_bits())
+            } else {
+                DecodedConst::Float(v.to_bits())
+            });
         }
         return Err(LowerError::Schema(format!("Float shape: {f}")));
     }

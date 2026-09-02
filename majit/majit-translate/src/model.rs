@@ -787,6 +787,19 @@ pub enum OpKind {
     /// existing `constants_f` pool with a `float_copy` op, mirroring
     /// the `ConstInt` → `int_copy` lowering.
     ConstFloat(u64),
+    /// RPython `flowmodel.py:Constant(value)` whose `concretetype` is
+    /// `lltype.SingleFloat` — a Rust `f32` literal.  Stored as the f32
+    /// bit pattern, which is what distinguishes it from [`OpKind::ConstFloat`]:
+    /// a Charon float constant records its width (`{"Float": {"value":
+    /// "...", "ty": "F32"}}`), and parsing both widths into an f64 bit
+    /// pattern is what erased it.
+    ///
+    /// It carries no [`ValueType`] field, for the same reason
+    /// [`OpKind::ConstInt128`] carries none: the width is in the variant
+    /// name.  The codewriter policy reaches it the way `policy.py:96-98`
+    /// reaches upstream's `Constant(value, SingleFloat)` through
+    /// `op.args`, and refuses the graph.
+    ConstSingleFloat(u32),
     /// RPython `flowmodel.py:Constant(str_value)` after
     /// `StringRepr.convert_const` resolves the host string to a
     /// prebuilt `Ptr(STR)`. The pre-jtransform string-constant fold

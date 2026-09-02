@@ -9004,6 +9004,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
+        | OpKind::ConstSingleFloat(_)
         | OpKind::ConstStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull

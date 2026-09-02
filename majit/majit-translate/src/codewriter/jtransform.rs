@@ -8059,6 +8059,7 @@ fn remap_op(
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)
+        | OpKind::ConstSingleFloat(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)

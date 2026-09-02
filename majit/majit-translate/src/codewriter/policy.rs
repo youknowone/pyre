@@ -496,6 +496,7 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
     // `&'static` from a `const`.  Name the two shapes once instead.
     static INT128: ValueType = ValueType::Int128;
     static UINT128: ValueType = ValueType::UInt128;
+    static SINGLEFLOAT: ValueType = ValueType::SingleFloat;
 
     match kind {
         // The type of the value the op reads or writes.
@@ -531,6 +532,11 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         // over a `Constant` of the 16-byte primitive.
         OpKind::ConstInt128(_) => out.push(&INT128),
         OpKind::ConstUInt128(_) => out.push(&UINT128),
+        // Likewise `Constant(value, SingleFloat)`.  This is the only way
+        // the walk sees an `f32` literal: the variant declares no
+        // `ValueType` field, and the literal's own type channel is not
+        // one this walk reads.
+        OpKind::ConstSingleFloat(_) => out.push(&SINGLEFLOAT),
 
         // No value type declared.  The remaining constant variants carry
         // a Rust literal whose kind is fixed by the variant name, and the
@@ -781,6 +787,19 @@ mod tests {
         );
         assert!(contains_unsupported_variable_type(&g, true, true, false));
         assert!(!contains_unsupported_variable_type(&g, true, true, true));
+    }
+
+    /// The `f32` literal is the carrier with no `ValueType` field
+    /// anywhere on its path — it declares none, and nothing else in a
+    /// literal-only graph declares one either. `policy.py:96-98` reaches
+    /// upstream's `Constant(value, SingleFloat)` through `op.args`, and
+    /// this is how the walk reaches its op form.
+    #[test]
+    fn a_singlefloat_constant_is_unsupported() {
+        let mut g = FunctionGraph::new("narrow_float_const");
+        let entry = g.startblock;
+        g.push_op_var(entry, OpKind::ConstSingleFloat(1.0f32.to_bits()), true);
+        assert!(contains_unsupported_variable_type(&g, true, true, false));
     }
 
     /// Word-sized and float values keep their kinds, so an ordinary
