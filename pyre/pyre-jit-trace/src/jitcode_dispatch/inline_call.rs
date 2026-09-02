@@ -5063,7 +5063,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // The keyed route bypasses the legacy caller-replay classification, but it
     // does not inherit that route's DeferredCall admission.
     let mut foriter_deferred_admit = false;
-    let mut foriter_dirty_bound = false;
     let mut foriter_dirty_seeded_resume_admit = false;
     // The pcs handed to this callee's sub-walk, set by whichever admission
     // below admitted a body the scan could not prove clean everywhere.
@@ -5200,7 +5199,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     && inline_depth < 2
                     && (try_multiframe || strict_seed);
                 foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
-                foriter_dirty_bound = entry_is_call_boundary
+                let foriter_dirty_bound = entry_is_call_boundary
                     && (bound_method.is_some() || seeded_callee_resume)
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !pyre_interpreter::code_is_self_recursive(callee_code);
@@ -5413,6 +5412,21 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // choice as `pyjitpl.py do_residual_or_indirect_call` when a callee
         // cannot be followed: every call that *is* inlined keeps its own red
         // frame.
+        //
+        // Three populations reach this one decline and they are not the same
+        // work to serve, so name which one in the `[fbw-census]` tally: a body
+        // neither predicate accepts declined here before this gate existed,
+        // while the cellvar and depth cases are the ones the seeded-only
+        // admission newly residualizes.
+        if fbw_debug_abort_enabled() {
+            crate::jitcode_dispatch::census_record(if !strict_inlinable {
+                "SeededInline::NeitherStrictNorMultiframe"
+            } else if !callee_code.cellvars.is_empty() {
+                "SeededInline::CalleeOwnsCellvars"
+            } else {
+                "SeededInline::OverMultiframeDepth"
+            });
+        }
         return resolved_inline_decline(op.pc, line!());
     }
     // `seeded_inline` is the admission: everything else returned above, so the
@@ -5420,7 +5434,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // reaches the seed with a real parent.
     let precomputed_parent_frame =
         match compute_inline_caller_frame(ctx, op.pc, !callee_code.freevars.is_empty()) {
-            Ok(parent) => Some(parent),
+            Ok(parent) => parent,
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => {
                 return resolved_inline_decline(op.pc, line!());
             }
@@ -6084,70 +6098,69 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     //
     // All of these sit before the first recorded op (the `GETFIELD_GC_R`
     // below), so returning costs nothing but the inline.
-    if seeded_inline {
-        {
-            // Branch-A frame shape only (mirror REC_CA): existing freevar
-            // cells are admissible, while fresh cellvar allocation is not.
-            // `strict_seed` already excludes such a callee, so only the
-            // multiframe path reaches this.
-            if !callee_code.cellvars.is_empty() {
-                return resolved_inline_decline(op.pc, line!());
-            }
-            // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to a bare
-            // `ptr_eq`/`ptr_ne` against the None singleton whose `Kind::Int`
-            // result feeds the exitswitch -- no residual call and no boxed
-            // bool.  What the shape does need is the tested value popped as a
-            // Ref (`pop_ref_or_fresh`, the codewriter PopJumpIfNone arm).  When
-            // the multiframe inline int-specializes the tested local, the
-            // mid-body guard resume cannot source that operand's Ref form from
-            // the callee register banks (`collect_callee_active_boxes` would
-            // read a stale/mismatched box), so the encoded liveness stream
-            // disagrees with the decoder (`resume.rs decode_ref: unexpected
-            // tag`) and the caller frame is corrupted.  Decline to the ordinary
-            // residual call until the multi-frame resume reboxes
-            // int-specialized identity operands.
-            // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
-            // int bank, so no Ref rebox is needed.  A strict straight-line callee
-            // has no branch at all, so this scan never fires for it.
-            // Stored bound methods carry their explicit receiver and callee frame,
-            // so their Ref operands remain available to the resume path.
-            //
-            // This precondition used to abort the enclosing trace rather than
-            // decline the inline, because residualizing it let loops compile that
-            // then printed traceback tuples missing their OUTERMOST frame.  That
-            // node is now recorded — the two bridge handler-entry arms attach the
-            // catching frame's own node — so the decline joins every other
-            // precondition here and returns `Ok(None)`.
-            //
-            // The abort was expensive out of all proportion to the inline it was
-            // protecting: a callee that walks a traceback (`while tb is not None`)
-            // lowers to exactly this instruction, so any handler calling such a
-            // helper aborted every retrace of the enclosing loop.  The guard whose
-            // bridge the retrace was building therefore never got one and deopted
-            // on every delivery.
-            if bound_method.is_none() {
-                let liveness = crate::liveness::liveness_for(raw_callee_code);
-                let has_is_none_branch = (0..callee_code.instructions.len()).any(|pc| {
-                    matches!(
-                        pyre_interpreter::decode_instruction_at(callee_code, pc),
-                        Some((
-                            pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
-                                | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
-                            _
-                        ))
-                    ) && (
-                        // Hazard 1 — kept operands. A branch that leaves slots
-                        // on the value stack needs its guard resume to restore
-                        // them, and the inline sub-walk's mirror does not model
-                        // them, so the kept Ref reads NULL and
-                        // `walker_branch_guard` raises
-                        // BranchGuardUnrestorableKeptStackPermanent — a
-                        // permanent abort that discards the enclosing loop
-                        // trace.  `stack_depth_at` is the depth BEFORE the
-                        // instruction and the branch pops the tested value, so
-                        // `depth > 1` is exactly "a kept slot survives".  An
-                        // unreachable pc has no depth and cannot fire a guard.
-                        liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
+    {
+        // Branch-A frame shape only (mirror REC_CA): existing freevar
+        // cells are admissible, while fresh cellvar allocation is not.
+        // `strict_seed` already excludes such a callee, so only the
+        // multiframe path reaches this.
+        if !callee_code.cellvars.is_empty() {
+            return resolved_inline_decline(op.pc, line!());
+        }
+        // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to a bare
+        // `ptr_eq`/`ptr_ne` against the None singleton whose `Kind::Int`
+        // result feeds the exitswitch -- no residual call and no boxed
+        // bool.  What the shape does need is the tested value popped as a
+        // Ref (`pop_ref_or_fresh`, the codewriter PopJumpIfNone arm).  When
+        // the multiframe inline int-specializes the tested local, the
+        // mid-body guard resume cannot source that operand's Ref form from
+        // the callee register banks (`collect_callee_active_boxes` would
+        // read a stale/mismatched box), so the encoded liveness stream
+        // disagrees with the decoder (`resume.rs decode_ref: unexpected
+        // tag`) and the caller frame is corrupted.  Decline to the ordinary
+        // residual call until the multi-frame resume reboxes
+        // int-specialized identity operands.
+        // POP_JUMP_IF_TRUE/FALSE stay inlinable: their `bool` truth folds in the
+        // int bank, so no Ref rebox is needed.  A strict straight-line callee
+        // has no branch at all, so this scan never fires for it.
+        // Stored bound methods carry their explicit receiver and callee frame,
+        // so their Ref operands remain available to the resume path.
+        //
+        // This precondition used to abort the enclosing trace rather than
+        // decline the inline, because residualizing it let loops compile that
+        // then printed traceback tuples missing their OUTERMOST frame.  That
+        // node is now recorded — the two bridge handler-entry arms attach the
+        // catching frame's own node — so the decline joins every other
+        // precondition here and returns `Ok(None)`.
+        //
+        // The abort was expensive out of all proportion to the inline it was
+        // protecting: a callee that walks a traceback (`while tb is not None`)
+        // lowers to exactly this instruction, so any handler calling such a
+        // helper aborted every retrace of the enclosing loop.  The guard whose
+        // bridge the retrace was building therefore never got one and deopted
+        // on every delivery.
+        if bound_method.is_none() {
+            let liveness = crate::liveness::liveness_for(raw_callee_code);
+            let has_is_none_branch = (0..callee_code.instructions.len()).any(|pc| {
+                matches!(
+                    pyre_interpreter::decode_instruction_at(callee_code, pc),
+                    Some((
+                        pyre_interpreter::bytecode::Instruction::PopJumpIfNone { .. }
+                            | pyre_interpreter::bytecode::Instruction::PopJumpIfNotNone { .. },
+                        _
+                    ))
+                ) && (
+                    // Hazard 1 — kept operands. A branch that leaves slots
+                    // on the value stack needs its guard resume to restore
+                    // them, and the inline sub-walk's mirror does not model
+                    // them, so the kept Ref reads NULL and
+                    // `walker_branch_guard` raises
+                    // BranchGuardUnrestorableKeptStackPermanent — a
+                    // permanent abort that discards the enclosing loop
+                    // trace.  `stack_depth_at` is the depth BEFORE the
+                    // instruction and the branch pops the tested value, so
+                    // `depth > 1` is exactly "a kept slot survives".  An
+                    // unreachable pc has no depth and cannot fire a guard.
+                    liveness.stack_depth_at(pc).is_some_and(|depth| depth > 1)
                             // Hazard 2 — the tested operand itself.  When the
                             // multiframe inline int-specializes the tested
                             // local, the mid-body guard resume cannot source
@@ -6175,126 +6188,125 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 // the whole-signature answer.
                                 _ => callee_binds_an_unboxed_local,
                             }
-                    )
-                });
-                if has_is_none_branch {
-                    return resolved_inline_decline(op.pc, line!());
-                }
-            }
-            let nlocals = callee_code.varnames.len();
-            let ncells = pyre_interpreter::ncells(callee_code);
-            let frame_array_size = nlocals + ncells + callee_code.max_stackdepth as usize;
-
-            let Some(callee_jitcode_index) =
-                crate::state::ensure_jitcode_index(callee_code_key as *const ())
-            else {
-                return resolved_inline_decline(op.pc, line!());
-            };
-            let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(callee_jitcode_index as i32);
-            if frame_reg == u16::MAX
-                || ec_reg == u16::MAX
-                || frame_reg as usize >= callee_regs_r.len()
-                || ec_reg as usize >= callee_regs_r.len()
-            {
+                )
+            });
+            if has_is_none_branch {
                 return resolved_inline_decline(op.pc, line!());
             }
-
-            // ec red: `perform_call` threads the caller's second portal red
-            // down unchanged, just as PyPy shares `ec` between MIFrames.
-            let sym_ptr = ctx.fbw_mode.snapshot_sym;
-            if sym_ptr.is_null() {
-                return resolved_inline_decline(op.pc, line!());
-            }
-            let sym = unsafe { &*sym_ptr };
-            let callee_ec = sym.execution_context();
-            if callee_ec.is_none() {
-                return resolved_inline_decline(op.pc, line!());
-            }
-
-            let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
-            let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
-            let param_boxes: Vec<OpRef> = (0..seeded_locals).map(|i| callee_args[i]).collect();
-            // Same pairing as the Branch A site: the `frame_stores_global`
-            // decline earlier in this walk is what lets a `debugdata`-less
-            // frame answer for `inline_consts.w_globals`.
-            let Some(callee_frame) = crate::helpers::emit_new_pyframe_inline_with_params(
-                ctx.trace_ctx,
-                &param_boxes,
-                &freevar_cell_ops,
-                nlocals,
-                frame_array_size,
-                nlocals + ncells,
-                pycode_const,
-                w_globals_obj_const,
-            ) else {
-                return resolved_inline_decline(op.pc, line!());
-            };
-
-            callee_regs_r[frame_reg as usize] = callee_frame;
-            // `perform_call` creates one concrete frame per MIFrame before
-            // `setup_call` installs the argument boxes (pyjitpl.py,
-            // 1862-1874).  Mirror that recording-time object.  `setup_call`
-            // installs the whole box list, so seed every local the symbolic
-            // frame above got from `param_boxes` — a `*args` callee's packed
-            // vararg tuple is one of them, and a frame short of it publishes
-            // that name as unbound to any residual the sub-walk runs.  Root
-            // each freshly boxed argument immediately: `ConcreteValue::to_pyobj`
-            // can allocate, and a later argument must not collect an earlier
-            // one before the frame constructor takes ownership of the slice.
-            let arg_roots = pyre_object::gc_roots::push_roots();
-            let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
-            for concrete in callee_arg_concretes.iter().take(seeded_locals).copied() {
-                let _ = pyre_object::gc_roots::pin_root(concrete.to_pyobj());
-            }
-            let concrete_args: Vec<pyre_object::PyObjectRef> = (0..seeded_locals)
-                .map(|i| pyre_object::gc_roots::shadow_stack_get(arg_root_base + i))
-                .collect();
-            let concrete_ec = sym.concrete_execution_context();
-            // Use a GC-managed frame, not `new_boxed`: the concrete pointer is
-            // stamped onto the active trace's frontend op below, and
-            // `MetaInterp::walk_active_trace_refs` is then its RPython-style
-            // GC root through optimization.  A scope-owned tracer snapshot
-            // would be freed when this function returns while the Box value
-            // still exists, leaving a dangling recording-time pointer.
-            let mut frame = pyre_interpreter::pyframe::FrameBox::new(
-                pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
-                    w_code,
-                    &concrete_args,
-                    inline_consts.w_globals as pyre_object::PyObjectRef,
-                    concrete_ec,
-                    concrete_closure,
-                    pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
-                ),
-            );
-            drop(arg_roots);
-            let concrete_frame_ptr = frame.as_mut_ptr();
-            concrete_callee_frame = concrete_frame_ptr;
-            callee_concrete_r[frame_reg as usize] =
-                ConcreteValue::Ref(concrete_frame_ptr as pyre_object::PyObjectRef);
-            ctx.trace_ctx.set_opref_concrete(
-                callee_frame,
-                majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
-            );
-            // GC-managed FrameBox::drop intentionally relinquishes only the
-            // host handle; the frontend op above keeps the frame reachable.
-            drop(frame);
-            callee_regs_r[ec_reg as usize] = callee_ec;
-            // `perform_call` threads the same concrete ExecutionContext into
-            // every MIFrame.  The symbolic second red above and its concrete
-            // shadow are one value; leaving only the shadow unknown makes
-            // `build_single_frame_miframe` reject an otherwise complete
-            // callee image during an escape, after which the legacy caller
-            // replay resumes past CALL without its result.
-            callee_concrete_r[ec_reg as usize] =
-                ConcreteValue::Ref(concrete_ec as pyre_object::PyObjectRef);
-
-            // Retain for a possible `SubLoopCalleeCallAssembler` emit.
-            ca_callee_frame = callee_frame;
-            ca_callee_ec = callee_ec;
-            ca_nlocals = nlocals + ncells;
-            ca_concrete_frame = concrete_frame_ptr;
-            callee_frame_seeded = true;
         }
+        let nlocals = callee_code.varnames.len();
+        let ncells = pyre_interpreter::ncells(callee_code);
+        let frame_array_size = nlocals + ncells + callee_code.max_stackdepth as usize;
+
+        let Some(callee_jitcode_index) =
+            crate::state::ensure_jitcode_index(callee_code_key as *const ())
+        else {
+            return resolved_inline_decline(op.pc, line!());
+        };
+        let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(callee_jitcode_index as i32);
+        if frame_reg == u16::MAX
+            || ec_reg == u16::MAX
+            || frame_reg as usize >= callee_regs_r.len()
+            || ec_reg as usize >= callee_regs_r.len()
+        {
+            return resolved_inline_decline(op.pc, line!());
+        }
+
+        // ec red: `perform_call` threads the caller's second portal red
+        // down unchanged, just as PyPy shares `ec` between MIFrames.
+        let sym_ptr = ctx.fbw_mode.snapshot_sym;
+        if sym_ptr.is_null() {
+            return resolved_inline_decline(op.pc, line!());
+        }
+        let sym = unsafe { &*sym_ptr };
+        let callee_ec = sym.execution_context();
+        if callee_ec.is_none() {
+            return resolved_inline_decline(op.pc, line!());
+        }
+
+        let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
+        let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
+        let param_boxes: Vec<OpRef> = (0..seeded_locals).map(|i| callee_args[i]).collect();
+        // Same pairing as the Branch A site: the `frame_stores_global`
+        // decline earlier in this walk is what lets a `debugdata`-less
+        // frame answer for `inline_consts.w_globals`.
+        let Some(callee_frame) = crate::helpers::emit_new_pyframe_inline_with_params(
+            ctx.trace_ctx,
+            &param_boxes,
+            &freevar_cell_ops,
+            nlocals,
+            frame_array_size,
+            nlocals + ncells,
+            pycode_const,
+            w_globals_obj_const,
+        ) else {
+            return resolved_inline_decline(op.pc, line!());
+        };
+
+        callee_regs_r[frame_reg as usize] = callee_frame;
+        // `perform_call` creates one concrete frame per MIFrame before
+        // `setup_call` installs the argument boxes (pyjitpl.py,
+        // 1862-1874).  Mirror that recording-time object.  `setup_call`
+        // installs the whole box list, so seed every local the symbolic
+        // frame above got from `param_boxes` — a `*args` callee's packed
+        // vararg tuple is one of them, and a frame short of it publishes
+        // that name as unbound to any residual the sub-walk runs.  Root
+        // each freshly boxed argument immediately: `ConcreteValue::to_pyobj`
+        // can allocate, and a later argument must not collect an earlier
+        // one before the frame constructor takes ownership of the slice.
+        let arg_roots = pyre_object::gc_roots::push_roots();
+        let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
+        for concrete in callee_arg_concretes.iter().take(seeded_locals).copied() {
+            let _ = pyre_object::gc_roots::pin_root(concrete.to_pyobj());
+        }
+        let concrete_args: Vec<pyre_object::PyObjectRef> = (0..seeded_locals)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(arg_root_base + i))
+            .collect();
+        let concrete_ec = sym.concrete_execution_context();
+        // Use a GC-managed frame, not `new_boxed`: the concrete pointer is
+        // stamped onto the active trace's frontend op below, and
+        // `MetaInterp::walk_active_trace_refs` is then its RPython-style
+        // GC root through optimization.  A scope-owned tracer snapshot
+        // would be freed when this function returns while the Box value
+        // still exists, leaving a dangling recording-time pointer.
+        let mut frame = pyre_interpreter::pyframe::FrameBox::new(
+            pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
+                w_code,
+                &concrete_args,
+                inline_consts.w_globals as pyre_object::PyObjectRef,
+                concrete_ec,
+                concrete_closure,
+                pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            ),
+        );
+        drop(arg_roots);
+        let concrete_frame_ptr = frame.as_mut_ptr();
+        concrete_callee_frame = concrete_frame_ptr;
+        callee_concrete_r[frame_reg as usize] =
+            ConcreteValue::Ref(concrete_frame_ptr as pyre_object::PyObjectRef);
+        ctx.trace_ctx.set_opref_concrete(
+            callee_frame,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
+        );
+        // GC-managed FrameBox::drop intentionally relinquishes only the
+        // host handle; the frontend op above keeps the frame reachable.
+        drop(frame);
+        callee_regs_r[ec_reg as usize] = callee_ec;
+        // `perform_call` threads the same concrete ExecutionContext into
+        // every MIFrame.  The symbolic second red above and its concrete
+        // shadow are one value; leaving only the shadow unknown makes
+        // `build_single_frame_miframe` reject an otherwise complete
+        // callee image during an escape, after which the legacy caller
+        // replay resumes past CALL without its result.
+        callee_concrete_r[ec_reg as usize] =
+            ConcreteValue::Ref(concrete_ec as pyre_object::PyObjectRef);
+
+        // Retain for a possible `SubLoopCalleeCallAssembler` emit.
+        ca_callee_frame = callee_frame;
+        ca_callee_ec = callee_ec;
+        ca_nlocals = nlocals + ncells;
+        ca_concrete_frame = concrete_frame_ptr;
+        callee_frame_seeded = true;
     }
     // gh#467 forward-flush inputs are captured AT the CALL, after this
     // iteration's pre-CALL effects and before any callee sub-walk.  Hoisting
@@ -6330,7 +6342,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // a paused caller image.  `compute_inline_caller_frame` failures were
     // residualized before the seed, so there is no caller-boundary collapse.
     let parent_frame = precomputed_parent_frame;
-    let callee_frame_materialized_has_resume = callee_frame_seeded && parent_frame.is_some();
+    let callee_frame_materialized_has_resume = callee_frame_seeded;
 
     // CODEX1 parity: snapshot the heap-effect state before the callee
     // sub-walk.  If the prologue (callee pc 0 → its loop header) mutates the
@@ -6560,7 +6572,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `MIFrame` between them.  Recording it on this level is what puts it
         // at its own depth for every guard below, including one inside a
         // callee `__init__` itself inlines.
-        let mut parents: Vec<InlineParentFrame> = parent_frame.into_iter().collect();
+        let mut parents: Vec<InlineParentFrame> = vec![parent_frame];
         if let Some((instance, _)) = constructor_result
             && callee_frame_materialized_has_resume
         {
@@ -6641,8 +6653,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // those stores also emits the promote guard in
                 // `vable_getfield_*` (`pyjitpl.py:1916,2582`), whose resume
                 // image must include the paused caller frame
-                // (`opencoder.py:819`). If this sub-walk has no caller image,
-                // keep folding: publishing only the callee frame is unsound.
+                // (`opencoder.py:819`). Every admitted inline now carries one,
+                // so the remaining question is only whether the callee's own
+                // frame reds were seeded; an unseeded callee keeps folding.
                 shadow.frame_materialized = callee_frame_materialized_has_resume;
             }
             for i in 0..seeded_locals {
