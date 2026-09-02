@@ -3409,6 +3409,11 @@ struct Lowering<'a> {
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
     block_live_in: Vec<bit_set::BitSet>,
+    /// MIR locals this body moves out of.  A root-bracket guard among them is
+    /// dropped under an initialisation flag the artefact does not carry, so
+    /// its bracket is left open rather than closed on a path that may not own
+    /// it (see [`moved_out_locals`]).
+    root_scope_moved_locals: bit_set::BitSet,
     block_entry_local_var: Vec<PackedLocalRow>,
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     block_positional_seen: Vec<bit_set::BitSet>,
@@ -3855,9 +3860,22 @@ impl<'a> Lowering<'a> {
         for _ in 1..body.body.len() {
             block_id.push(graph.create_block());
         }
-        let index_write_extra_live = compute_index_write_extra_live(body, llbc);
+        let mut extra_live = compute_index_write_extra_live(body, llbc);
         let glue_call_drops = glue_call_drop_blocks(body, llbc);
-        let block_live_in = compute_mir_liveness(body, &index_write_extra_live, &glue_call_drops);
+        // A root-bracket guard's `Drop` lowers to a call that takes the guard
+        // by reference, so the dropping block reads it.  Every other drop is
+        // pure control flow as far as liveness is concerned; without this the
+        // guard reaches no drop block's inputargs and the close has no place
+        // to name.  `glue_call_drops` is the same fact for the `drop_in_place`
+        // spelling #1689 already keeps live.
+        let root_scope_moved_locals = moved_out_locals(body);
+        if extra_live.len() < body.body.len() {
+            extra_live.resize(body.body.len(), Vec::new());
+        }
+        for (bb_idx, local) in root_scope_drop_sites(body, llbc, &root_scope_moved_locals) {
+            extra_live[bb_idx].push(local);
+        }
+        let block_live_in = compute_mir_liveness(body, &extra_live, &glue_call_drops);
         let mut block_entry_local_var = vec![
             PackedLocalRow {
                 len: n_locals,
@@ -3939,6 +3957,7 @@ impl<'a> Lowering<'a> {
             is_none_sites: Vec::new(),
             closure_select_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),
+            root_scope_moved_locals,
         })
     }
 
@@ -7471,6 +7490,66 @@ impl<'a> Lowering<'a> {
         )
     }
 
+    /// Close a root bracket at the guard's `Drop`, by calling the same rewind
+    /// the destructor body calls. A non-guard drop is a no-op.
+    ///
+    /// The call takes the guard by reference rather than the two words the
+    /// rewind needs, so this arm reads no field of it. A crate that only
+    /// imports the guard sees an opaque stub with no fields, and a
+    /// field-keyed close would silently confine itself to the crate that
+    /// defines one.
+    fn emit_root_scope_close(&mut self, mir_bb: usize, place: &Place) {
+        let Some(class_root) = self.tyref_adt_class_root(&place.ty) else {
+            return;
+        };
+        if !gc_root_scope_type_path(&class_root) {
+            return;
+        }
+        // Charon stamps a drop `Conditional` when the destructor runs only if
+        // the place still holds a value.  The flag that decides it is not in
+        // the artefact, so a guard the body moves out of keeps its bracket
+        // open: closing one the moved-to owner still holds would rewind a
+        // shadow stack that owner is using.
+        if let PlaceKind::Local(local) = place.kind
+            && self.root_scope_moved_locals.contains(local as usize)
+        {
+            self.decline_root_scope_close("guard-moved");
+            return;
+        }
+        // A drop can still name a local no block lowered so far has assigned.
+        // Leaving that bracket open is what every drop did before this arm
+        // existed, so the graph stays lowerable and the gap is counted rather
+        // than turned into a refused function.
+        let Ok(base) = self.resolve_place(mir_bb, clone_place(place)) else {
+            self.decline_root_scope_close("guard-place-unresolved");
+            return;
+        };
+        // The helper is a sibling of the guard's own type, so its path is the
+        // guard's with the leaf replaced. Nothing here names an owning crate.
+        let mut segments: Vec<String> = class_root.split("::").map(str::to_string).collect();
+        segments.pop();
+        segments.push(ROOT_SCOPE_CLOSE.to_string());
+        let bb_id = self.block_id[mir_bb];
+        let void = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(void),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args: vec![base],
+                result_ty: ValueType::Void,
+            },
+        });
+    }
+
+    /// Count a bracket this pass left open, against the graph that holds it.
+    /// The rewind is what the guard's destructor does, so a skipped one is a
+    /// retention the census has to be able to name.
+    fn decline_root_scope_close(&self, reason: &'static str) {
+        crate::decline::record_named("root_bracket_close", reason, &self.graph.name);
+    }
+
     /// For a struct the owner_root is the LLBC TypeDecl's leaf name
     /// (`PyFrame` from `pyre_interpreter::pyframe::PyFrame`) so the
     /// downstream `struct_fields` registry resolves with the same leaf
@@ -8287,7 +8366,11 @@ impl<'a> Lowering<'a> {
                 on_unwind,
             } => self.lower_call(mir_bb, call, target as usize, on_unwind as usize),
             // RootScope drop closes the shadow-stack bracket opened by
-            // `push_roots`; erasing it made traced loops retain every pin.
+            // `push_roots`.  #1689 spells that as the Charon `drop_in_place`
+            // glue call; this branch spells the same rewind as the named
+            // `root_scope_close` residual so a crate that only imports the
+            // opaque guard can still name it.  Emit the named residual, not
+            // both — a second close would truncate an already-rewound stack.
             // Other drops keep the legacy goto until their glue bodies and
             // residual callees are available to the translator.
             TermKind::Drop {
@@ -8296,14 +8379,9 @@ impl<'a> Lowering<'a> {
                 target,
                 on_unwind,
             } => {
+                let _ = on_unwind;
                 if drop_lowers_as_glue_call(&place, &fn_ptr, self.llbc) {
-                    return self.lower_drop_as_glue_call(
-                        mir_bb,
-                        place,
-                        fn_ptr,
-                        target as usize,
-                        on_unwind as usize,
-                    );
+                    self.emit_root_scope_close(mir_bb, &place);
                 }
                 let target_bb = self.block_id[target as usize];
                 let args = self.edge_args(mir_bb, target as usize)?;
@@ -19138,6 +19216,21 @@ fn gc_root_pin_path(name: &str) -> bool {
     segments.last() == Some(&"pin_root") && segments.iter().any(|s| *s == "gc_roots")
 }
 
+/// The root-bracket guard type and the call that closes one.
+/// Every spelling here is a leaf or module segment: the owning crate comes
+/// from the dropped value's own resolved path, so nothing below names one.
+const ROOT_SCOPE_MODULE: &str = "gc_roots";
+const ROOT_SCOPE_TYPE: &str = "RootScope";
+/// The shadow-stack rewind the guard's destructor performs, spelled as a call
+/// that takes the guard by reference.
+pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
+
+/// True for the root-bracket guard's own type path.
+fn gc_root_scope_type_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
+}
+
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
 fn gc_root_scope_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
@@ -19155,6 +19248,10 @@ fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) ->
 }
 
 /// Match the lowered RootScope close used by result/exception rewrites.
+///
+/// #1689 hoists Charon's `drop_in_place` glue; this branch emits the named
+/// `root_scope_close` residual.  Both rewind the same stack, so a rewrite
+/// that walks a close has to see either spelling.
 pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments },
@@ -19163,9 +19260,10 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
     else {
         return false;
     };
-    segments.last().map(String::as_str) == Some("drop_in_place")
-        && segments.iter().any(|s| s == "gc_roots")
-        && segments.iter().any(|s| s == "RootScope")
+    let leaf = segments.last().map(String::as_str);
+    let in_gc_roots = segments.iter().any(|s| s == "gc_roots");
+    (leaf == Some("drop_in_place") && in_gc_roots && segments.iter().any(|s| s == "RootScope"))
+        || (leaf == Some(ROOT_SCOPE_CLOSE) && in_gc_roots)
 }
 
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
@@ -19194,7 +19292,6 @@ fn unit_tyref() -> TyRef {
         }
     }))
 }
-
 /// Root-stack operations whose PyObjectRef return is the physical spelling
 /// of `llmemory.GCREF`, not a W_Root instance.  Upstream's GC transformer
 /// gives such a helper call a GCREF result and casts it back to the concrete
@@ -19635,6 +19732,84 @@ fn deref_write_base_local(place: &Place) -> Option<usize> {
         PlaceKind::Local(i) => Some(i as usize),
         _ => None,
     }
+}
+
+/// The MIR locals this body moves out of.
+///
+/// Charon stamps almost every `Drop` `Conditional`: the destructor runs only
+/// if the place still holds a value, and the initialisation flag that decides
+/// it is not in the artefact.  For a local nothing moves, that flag is always
+/// set and the drop is unconditional in fact; for a local something moves, it
+/// is not, and a bracket close emitted there would rewind a shadow stack the
+/// moved-to owner is still using.
+///
+/// A guard is never partially moved — it owns no droppable field and its own
+/// fields are private — so a direct `Local` operand is the whole move set.
+fn moved_out_locals(body: &Unstructured) -> bit_set::BitSet {
+    fn scan(v: &serde_json::Value, out: &mut bit_set::BitSet) {
+        match v {
+            serde_json::Value::Object(map) => {
+                if let Some(local) = map
+                    .get("Move")
+                    .and_then(|place| place.get("kind"))
+                    .and_then(|kind| kind.get("Local"))
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    out.insert(local as usize);
+                }
+                for nested in map.values() {
+                    scan(nested, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for nested in items {
+                    scan(nested, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = bit_set::BitSet::new();
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            scan(&stmt.kind, &mut out);
+        }
+        scan(&bb.terminator.kind, &mut out);
+    }
+    out
+}
+
+/// `(block, local)` for every drop of a root-bracket guard whose close this
+/// pass can emit — the guard's local, in the block that drops it.
+///
+/// A guard the body moves out of is left out: see [`moved_out_locals`].
+fn root_scope_drop_sites(
+    body: &Unstructured,
+    llbc: &Llbc,
+    moved: &bit_set::BitSet,
+) -> Vec<(usize, usize)> {
+    let mut sites = Vec::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        let Ok(TermKind::Drop { place, .. }) = bb.term() else {
+            continue;
+        };
+        let PlaceKind::Local(local) = place.kind else {
+            continue;
+        };
+        if moved.contains(local as usize) {
+            continue;
+        }
+        let Some(def_id) = output_adt_def_id_free(&place.ty, llbc) else {
+            continue;
+        };
+        let Some(decl) = llbc.type_by_id(def_id) else {
+            continue;
+        };
+        if gc_root_scope_type_path(&decl.item_meta.name_path()) {
+            sites.push((bb_idx, local as usize));
+        }
+    }
+    sites
 }
 
 /// Per-block extra-live MIR locals for the deferred array-write base /
