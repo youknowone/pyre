@@ -260,7 +260,7 @@ cover the condition they diagnose.
 
 - Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
 - Accessor: `guard_resume_refuse_pending_fields()`
-- What it does: Restores `guard_carries_pending_fields`, the refusal to build a guard-resume bridge for a guard whose deferred writes span more than one virtual. Off by default: upstream has no such refusal, and the double-application it once guarded against is answered by siting the decision ahead of `start_bridge_tracing` rather than by declining. Kept so the two answers stay comparable inside one binary, which a second build cannot do.
+- What it does: Restores `guard_carries_pending_fields`, the refusal to build a guard-resume bridge for a guard whose deferred writes span more than one virtual. Off by default: upstream has no such refusal, and the double-application it once guarded against is answered by placing the decision ahead of `start_bridge_tracing` rather than by declining. Kept so the two answers stay comparable inside one binary, which a second build cannot do.
 - Retirement condition: Remove once no consumer needs the refusal restored to attribute a result.
 
 ### `MAJIT_HEAPDBG`
@@ -414,8 +414,8 @@ cover the condition they diagnose.
 ### `MAJIT_SKIP_BRIDGES`
 
 - Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
-- Accessor: `bridge_fuel_skipped()`
-- What it does: `MAJIT_SKIP_BRIDGES=a,b,...`: decline exactly the listed `MAJIT_MAX_BRIDGES` sequence numbers and take every other one, so a bisect can ask whether one numbered bridge corrupts on its own or whether the corruption is cumulative. The fuel limit cannot answer that, because declining number N also declines everything after it.
+- Accessor: `bridge_fuel_skip_set()`, read by `bridge_fuel_skipped()` and by `bridge_fuel_take()`
+- What it does: `MAJIT_SKIP_BRIDGES=a,b,...`: decline exactly the listed bridge sequence numbers and take every other one, so a bisect can ask whether one numbered bridge corrupts on its own or whether the corruption is cumulative. `MAJIT_MAX_BRIDGES` cannot answer that, because declining number N also declines everything after it. The two share one sequence — the n-th bridge `should_bridge` otherwise reaches — and either one alone starts the count, so this gate needs no fuel limit beside it.
 - Retirement condition: Remove with `MAJIT_MAX_BRIDGES`, once a compiled bridge cannot produce a value the same guard's blackhole resume would not.
 
 ### `MAJIT_SMALLIR`

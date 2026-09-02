@@ -546,14 +546,17 @@ pub fn no_bridge_enabled() -> bool {
 /// limit cannot draw, because declining N also declines everything after it.
 /// Off by default; an unparsable entry is ignored rather than reported, since
 /// the variable exists only for a bisect the operator is reading anyway.
-fn bridge_fuel_skipped(n: u64) -> bool {
+fn bridge_fuel_skip_set() -> &'static [u64] {
     static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         std::env::var("MAJIT_SKIP_BRIDGES")
             .map(|v| v.split(',').filter_map(|p| p.trim().parse().ok()).collect())
             .unwrap_or_default()
     })
-    .contains(&n)
+}
+
+fn bridge_fuel_skipped(n: u64) -> bool {
+    bridge_fuel_skip_set().contains(&n)
 }
 /// `MAJIT_MAX_BRIDGES=N` (diagnostic): allow the first N bridge compilations
 /// and behave as `MAJIT_NO_BRIDGE` from then on.  Bisecting N names the bridge
@@ -562,6 +565,10 @@ fn bridge_fuel_skipped(n: u64) -> bool {
 /// already held, so the count is bridges actually taken — place it last in the
 /// `&&` chain.  `MAJIT_BRIDGE_FUEL_LOG` reports each one taken.
 ///
+/// `MAJIT_SKIP_BRIDGES` names positions in this same sequence, so either gate
+/// alone starts the count: numbering only when a limit is set would leave the
+/// skip list naming positions nothing ever allocates.
+///
 /// Public for the same reason `no_bridge_enabled` is: a frontend with its own
 /// guard-failure entry point spends fuel there too, and a counter that only
 /// half the bridges draw from makes `MAJIT_MAX_BRIDGES=0` disagree with
@@ -569,16 +576,21 @@ fn bridge_fuel_skipped(n: u64) -> bool {
 /// every bridge that entry point reaches.
 pub fn bridge_fuel_take() -> bool {
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let Some(limit) = *LIMIT.get_or_init(|| {
+    let limit = *LIMIT.get_or_init(|| {
         std::env::var("MAJIT_MAX_BRIDGES")
             .ok()
             .and_then(|v| v.parse().ok())
-    }) else {
+    });
+    // The sequence number belongs to the pair, not to the limit: the skip list
+    // names positions in this same count, so a run that configures only the
+    // skip list still has to number the bridges it takes. Numbering only when a
+    // limit is set would leave the skip list naming positions nothing allocates.
+    if limit.is_none() && bridge_fuel_skip_set().is_empty() {
         return true;
-    };
+    }
     static USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = USED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n >= limit {
+    if limit.is_some_and(|limit| n >= limit) {
         return false;
     }
     if bridge_fuel_skipped(n) {
@@ -6749,13 +6761,19 @@ impl<S: JitState> JitDriver<S> {
                     // actually happened records it.
                     //
                     // A walk that crossed a frame boundary is not judged by one
-                    // frame's registers, so it does not qualify.
+                    // frame's registers, so it does not qualify — and cannot be:
+                    // each pop above rebinds `bh` to its caller, while the spans
+                    // were measured against the bank of the frame the guard
+                    // failed in. The frame-count test therefore has to come
+                    // first, so the comparison is reached only while the spans
+                    // still describe the bank they are indexing.
                     let guard_may_bridge = match &sf_before {
                         Some((before_i, before_r, before_f)) => {
-                            let tail_wrote_state = bh.registers_i[sf_i] != before_i[..]
-                                || bh.registers_r[sf_r] != before_r[..]
-                                || bh.registers_f[sf_f] != before_f[..];
-                            bh_frames_popped == 0 && !bh.called_residual.get() && !tail_wrote_state
+                            bh_frames_popped == 0
+                                && !bh.called_residual.get()
+                                && bh.registers_i[sf_i] == before_i[..]
+                                && bh.registers_r[sf_r] == before_r[..]
+                                && bh.registers_f[sf_f] == before_f[..]
                         }
                         // Only reachable with `should_bridge` false, where the
                         // reader below short-circuits before asking.
