@@ -11836,8 +11836,20 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
+        // A plain loop back-edge carries neither a guard nor a resume point.
+        // `warmstate.py execute_assembler` never builds a description for one:
+        // the JUMP has already re-entered the loop's own LABEL, and what comes
+        // back out is the loop-carried state, not a failure to recover from.
+        let is_jump_exit = Self::is_jump_exit(is_finish, fail_index);
         // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
-        let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
+        // Only the layout fallback and the `must_compile` identity read it, and
+        // a JUMP exit reaches neither, so the weakref upgrade the resolution
+        // costs is not paid on the back edge.
+        let rd_loop_token = if is_jump_exit {
+            None
+        } else {
+            majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key())
+        };
         Self::finish_compiled_run_io();
 
         // RPython: guard failure counter tick and bridge compilation happen
@@ -11848,46 +11860,59 @@ impl<M: Clone> MetaInterp<M> {
             self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
-        // Fresh lookup, and fallible: the run can re-enter the driver through
-        // a residual call and drop this green key (`jitdriver.rs`'s
-        // `remove_compiled_loop` on the unrecoverable-resume path), in which
-        // case the exit falls through to the `rd_loop_token` lookup and then
-        // to the synthesized default layout below.
-        let compiled = self.compiled_loops.get(&green_key);
-        // Only a guard exit reaches here — a final descr returned through the
-        // fast path above — so the layout comes from the failing guard's own
-        // trace, and falls back to a synthesized one per `run_compiled_detailed`
-        // when the green key no longer holds it.
-        let mut exit_layout = compiled
-            .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
-            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
-            .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
-            .and_then(|(owning_key, resolved_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
-            })
-            .unwrap_or_else(|| CompiledExitLayout {
-                rd_loop_token: green_key,
-                trace_id,
-                fail_index,
-                source_op_index: None,
-                exit_types: ExitTypes::from_slice(exit_types),
-                is_finish,
-                is_exception_exit: is_exit_frame_with_exception,
-                recovery_layout: None,
-                resume_layout: None,
-                // The green-key index no longer holds this trace, but the
-                // failing descr still carries the resume payload it was
-                // compiled with (`compile.py get_resumestorage`), so a
-                // blackhole resume off this layout stays possible.
-                storage: crate::resume::ResumeStorage::from_fail_descr(descr)
-                    .map(std::sync::Arc::new),
-            });
-        // RPython: deadframe has ALL jitframe slots accessible.
-        // If the backend's descr covers more slots than the trace layout,
-        // extend exit_layout.exit_types to match (conservative Int for extras).
-        if exit_types.len() > exit_layout.exit_types.len() {
-            exit_layout.exit_types.resize(exit_types.len(), Type::Int);
-        }
+        // Built for a guard exit only. Every reader of this field opens it past
+        // its own JUMP arm — the two driver run loops restore the exit values
+        // and return, and the drain loop breaks — so a layout built for a back
+        // edge is a type-vector copy, three refcount pairs and a heap box that
+        // nothing reads.
+        let exit_layout = (!is_jump_exit).then(|| {
+            // Fresh lookup, and fallible: the run can re-enter the driver
+            // through a residual call and drop this green key (`jitdriver.rs`'s
+            // `remove_compiled_loop` on the unrecoverable-resume path), in
+            // which case the exit falls through to the `rd_loop_token` lookup
+            // and then to the synthesized default layout below.
+            let compiled = self.compiled_loops.get(&green_key);
+            // The layout comes from the failing guard's own trace, and falls
+            // back to a synthesized one per `run_compiled_detailed` when the
+            // green key no longer holds it.
+            let mut exit_layout = compiled
+                .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
+                .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+                .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
+                .and_then(|(owning_key, resolved_id, trace)| {
+                    Self::compiled_exit_layout_from_trace(
+                        trace,
+                        owning_key,
+                        resolved_id,
+                        fail_index,
+                    )
+                })
+                .unwrap_or_else(|| CompiledExitLayout {
+                    rd_loop_token: green_key,
+                    trace_id,
+                    fail_index,
+                    source_op_index: None,
+                    exit_types: ExitTypes::from_slice(exit_types),
+                    is_finish,
+                    is_exception_exit: is_exit_frame_with_exception,
+                    recovery_layout: None,
+                    resume_layout: None,
+                    // The green-key index no longer holds this trace, but the
+                    // failing descr still carries the resume payload it was
+                    // compiled with (`compile.py get_resumestorage`), so a
+                    // blackhole resume off this layout stays possible.
+                    storage: crate::resume::ResumeStorage::from_fail_descr(descr)
+                        .map(std::sync::Arc::new),
+                });
+            // RPython: deadframe has ALL jitframe slots accessible.
+            // If the backend's descr covers more slots than the trace layout,
+            // extend exit_layout.exit_types to match (conservative Int for
+            // extras).
+            if exit_types.len() > exit_layout.exit_types.len() {
+                exit_layout.exit_types.resize(exit_types.len(), Type::Int);
+            }
+            Box::new(exit_layout)
+        });
         let savedata = self.backend.get_savedata_ref(&frame);
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
         let exc_value_ref = self.backend.grab_exc_value(&frame);
@@ -11911,7 +11936,7 @@ impl<M: Clone> MetaInterp<M> {
             descr_arc: Some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
-            exit_layout: Some(Box::new(exit_layout)),
+            exit_layout,
             savedata,
             exception,
             status,
