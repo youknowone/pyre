@@ -9727,6 +9727,18 @@ pub(crate) fn pyre_portal_runner(
         );
     }
     frame.set_last_instr_from_next_instr(next_instr);
+    // Same correction every other blackhole resume leg applies: the frame still
+    // carries the FAILING GUARD's recorded operand depth, and this handoff
+    // resumes at the CRN's merge-point pc instead, so that depth over-counts
+    // and the header's pushes overflow the frame at its peak stack use.
+    // Re-derive it from the pc actually resumed at.
+    //
+    // Spelled here rather than through `apply_blackhole_crn_handoff`, which
+    // pairs the same two calls: that helper takes its pc from `green_int` alone
+    // and does nothing when it is empty, while this leg reads the MERGED
+    // `all_i`.  Routing through it would change which value becomes the resume
+    // pc, which is a separate question from the depth this fixes.
+    correct_resume_vsd(frame, next_instr);
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
