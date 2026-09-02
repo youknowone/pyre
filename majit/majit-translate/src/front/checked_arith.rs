@@ -700,7 +700,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// The rewrite emits a machine-word `*_ovf`, so only the atoms whose
     /// overflow bound IS that word may reach it.
     #[test]
@@ -713,6 +712,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn rewrite_lifts_checked_add_to_add_ovf_with_overflow_edge() {
         let mut g = FunctionGraph::new("test_checked_add");
         let a = g.startblock;
