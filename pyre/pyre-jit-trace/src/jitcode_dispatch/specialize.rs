@@ -16154,6 +16154,9 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
                 eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
             }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
+            // The cut retires every OpRef recorded after `pre_fold_pos`, so the
+            // pin table's answers, which are OpRefs, have to go with them.
+            ctx.session.borrow_mut().root_pins.clear();
             ctx.trace_ctx.heap_cache_mut().reset();
             if promoted_empty {
                 fbw_append_promote_journal_rollback_last(inner_self);
@@ -16921,6 +16924,9 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
                 eprintln!("[decline-why] LIST-POP-SUBWALK pc={pc}");
             }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
+            // The cut retires every OpRef recorded after `pre_fold_pos`, so the
+            // pin table's answers, which are OpRefs, have to go with them.
+            ctx.session.borrow_mut().root_pins.clear();
             ctx.trace_ctx.heap_cache_mut().reset();
             Ok(None)
         }
@@ -17177,6 +17183,9 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
                 eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
             }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
+            // The cut retires every OpRef recorded after `pre_fold_pos`, so the
+            // pin table's answers, which are OpRefs, have to go with them.
+            ctx.session.borrow_mut().root_pins.clear();
             ctx.trace_ctx.heap_cache_mut().reset();
             if promoted_empty {
                 fbw_append_promote_journal_rollback_last(list);

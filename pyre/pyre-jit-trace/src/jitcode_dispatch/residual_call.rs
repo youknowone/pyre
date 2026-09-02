@@ -6333,6 +6333,102 @@ fn walker_foldable_runtime_helper<Sym: WalkSym>(
     }
 }
 
+/// Keep [`WalkSession::root_pins`] answering for the source root bracket this
+/// residual belongs to.
+///
+/// Called before the residual runs, from both shapes a bracket helper reaches:
+/// a pin claims the slot at the current top, so the length read here IS the
+/// index it is about to write, and any helper that can change what a slot
+/// already holds retires the whole table rather than leaving a stale answer
+/// for a later read-back.
+fn walker_note_root_bracket_residual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    funcptr: OpRef,
+    pinned: Option<(OpRef, OpRef)>,
+) {
+    if !ctx.is_authoritative_executor {
+        return;
+    }
+    let Some(addr) = funcptr_concrete_int(ctx, funcptr) else {
+        return;
+    };
+    let addr = addr as usize;
+    if pyre_interpreter::is_shadow_stack_slot_overwrite(addr) {
+        ctx.session.borrow_mut().root_pins.clear();
+        return;
+    }
+    if let Some((scope, value)) = pinned
+        && pyre_interpreter::is_root_scope_pin(addr)
+    {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        ctx.session
+            .borrow_mut()
+            .root_pins
+            .insert((scope, slot), value);
+    }
+}
+
+/// `RootScope::get(scope, slot)` -> the box the matching `RootScope::pin_root`
+/// wrote into `slot`, with no operation recorded.
+///
+/// The read-back exists because a livevar copied to a native stack slot can go
+/// stale across a collecting call, so the bracket republishes it through the
+/// shadow stack.  A trace has no such stale copy: a reference it holds lives in
+/// the JitFrame gcmap, which the collector rewrites in place when the object
+/// moves, so the read-back returns the pinned box itself.  That is the erasure
+/// `try_gc_current_object_address` already gets at translation, reached here
+/// instead because the slot index is only a constant once the walk has unrolled
+/// the loop that computes it.
+///
+/// Declining costs a residual call, which is the behaviour without the fold, so
+/// every question below is asked in the safe direction: the slot must be live,
+/// the walk must have pinned it, and the pin must still be what the slot holds.
+fn try_walker_fold_root_scope_get<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    funcptr: OpRef,
+    scope: OpRef,
+    index: OpRef,
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    let Some(addr) = funcptr_concrete_int(ctx, funcptr) else {
+        return Ok(None);
+    };
+    if !pyre_interpreter::is_root_scope_get(addr as usize) {
+        return Ok(None);
+    }
+    // An index that is already a trace constant does not shift with the
+    // bracket, so it names an absolute slot that a later entry at another
+    // shadow-stack depth would not agree with.
+    if matches!(index, OpRef::ConstInt(_)) {
+        return Ok(None);
+    }
+    let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index) else {
+        return Ok(None);
+    };
+    let Ok(slot) = usize::try_from(slot) else {
+        return Ok(None);
+    };
+    // Keying on the receiver as well as the slot is what makes the pairing
+    // survive replay: both halves read `save_point` out of the same scope, so
+    // an index equal at record time is the same offset from the same base.
+    let Some(pinned) = ctx.session.borrow().root_pins.get(&(scope, slot)).copied() else {
+        return Ok(None);
+    };
+    if slot >= pyre_object::gc_roots::shadow_stack_len() {
+        return Ok(None);
+    }
+    let Some(majit_ir::Value::Ref(recorded)) = ctx.trace_ctx.concrete_of_opref(pinned) else {
+        return Ok(None);
+    };
+    let live = pyre_object::gc_roots::shadow_stack_get(slot);
+    if recorded.0 as usize != live as usize {
+        return Ok(None);
+    }
+    write_ref_reg(ctx, op.pc, dst, pinned, ConcreteValue::Ref(live))?;
+    Ok(Some(()))
+}
+
 /// `residual_call` shape `iRd>X` dispatcher. Reads `funcptr (i)`,
 /// R-list args, and `descr`, runs `_build_allboxes` to produce the
 /// callee's ABI-ordered arglist, classifies the call by `EffectInfo`
@@ -6529,6 +6625,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     ctx.clear_last_exc_value();
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (mut r_args, arg_width) = read_ref_var_list(code, op, 1, ctx)?;
+    // `RootScope::pin_root(scope, value)` is the two-Ref shape; the value is
+    // the second argument.  This only records, so the call proceeds normally.
+    walker_note_root_bracket_residual(
+        ctx,
+        funcptr,
+        r_args.first().copied().zip(r_args.get(1).copied()),
+    );
     // #62: env-gated recognition probe (no-op unless PYRE_DIAG_INLINE_RECOG
     // set; full-body-walk authoritative path only).  First slice of the
     // call-inlining feature — confirms callable->JitCode recognition before
@@ -8177,6 +8280,24 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     } else {
         code[op.pc + 1 + descr_offset + 2] as usize
     };
+
+    // A slot writer reaches the walker in this shape (`shadow_stack_set` takes
+    // an index and a value); it never pins, so it can only retire the table.
+    walker_note_root_bracket_residual(ctx, funcptr, None);
+
+    // The bracket's read-back half.  Offered before `_build_allboxes` because
+    // a fold that records nothing has no arglist to build.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && i_args.len() == 1
+        && r_args.len() == 1
+        && spec_gate(SpecFold::GcRootScopeGet, || {
+            try_walker_fold_root_scope_get(ctx, op, funcptr, r_args[0], i_args[0], dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
 
     // Flat argboxes = i_args ++ r_args (`boxes2` argcode order).
     // Parallel argbox_types stamps each entry with its source bank so

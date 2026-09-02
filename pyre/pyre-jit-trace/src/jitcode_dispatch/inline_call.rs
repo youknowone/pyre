@@ -909,6 +909,7 @@ fn collect_descent_effect_aware_blockers(
             here.push((blocker, effect));
             false
         },
+        &pyre_interpreter::is_rewindable_root_bracket_residual_i64,
     );
     for (blocker, effect) in here {
         record_reachable_blocker(out, blocker, entry_effect || effect);
@@ -1045,6 +1046,10 @@ struct DescentPoint {
 /// and add the direct heap writes, which the odometer reaches only through a
 /// journal.  Both directions are conservative: the scan may call a body
 /// effectful where the walk would not, never the reverse.
+///
+/// The one residual the caller spares is the one whose funcbox resolves to a
+/// root-bracket helper: a rewind may re-run those, so calling them effectful
+/// here would refuse a descent for an effect that never happens.
 fn descent_op_applies_effect(opname: &str) -> bool {
     opname.starts_with("residual_call")
         || opname.starts_with("setfield_gc")
@@ -1054,6 +1059,29 @@ fn descent_op_applies_effect(opname: &str) -> bool {
         || opname.starts_with("setinteriorfield_gc")
         || opname.starts_with("strsetitem")
         || opname.starts_with("unicodesetitem")
+}
+
+/// Byte offset of an op's first `d` (descr) operand, past the opcode byte.
+/// The descr twin of [`label_operand_offset`], with the same width table.
+fn descr_operand_offset(argcodes: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut chars = argcodes.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            'd' => return Some(offset),
+            'i' | 'c' | 'r' | 'f' => offset += 1,
+            'j' => offset += 2,
+            // A varlist's width is in the code bytes this shape question does
+            // not read, so an op that puts one first is not answered here.
+            'I' | 'R' | 'F' | 'P' => return None,
+            '>' => {
+                chars.next()?;
+                offset += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Byte offset of an op's first `L` operand, counted from the byte after the
@@ -1145,6 +1173,7 @@ pub(crate) fn summarize_body_blockers(
         constants_i,
         |descr_index, _caller_effect| callee_summary(descr_index),
         &mut |_blocker, _effect| true,
+        &pyre_interpreter::is_rewindable_root_bracket_residual_i64,
     )
 }
 
@@ -1167,6 +1196,7 @@ fn summarize_body_blockers_with(
     constants_i: &[i64],
     mut callee_summary: impl FnMut(usize, bool) -> Option<DescentBlockerSummary>,
     on_blocker: &mut dyn FnMut(i64, bool) -> bool,
+    is_rewindable_residual: &dyn Fn(i64) -> bool,
 ) -> DescentBlockerSummary {
     let mut summary = DescentBlockerSummary::default();
 
@@ -1265,10 +1295,18 @@ fn summarize_body_blockers_with(
         let mut effect = point.effect;
         let mut known_i = point.known_i;
 
+        // Set by a `residual_call` whose funcbox resolves to a helper a rewind
+        // may re-run, so the effect classification below can spare it.
+        let mut rewindable_residual = false;
         if d.opname.starts_with("residual_call") {
             // Every `residual_call_*` argcode string opens with the `i` funcbox
             // operand, so it is the byte right after the opcode.
             let funcbox = code.get(d.pc + 1).copied().unwrap_or(0) as usize;
+            if let Some(Some(fnaddr)) = known_i.get(funcbox)
+                && !majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
+            {
+                rewindable_residual = is_rewindable_residual(*fnaddr);
+            }
             if let Some(Some(fnaddr)) = known_i.get(funcbox)
                 && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
             {
@@ -1319,7 +1357,40 @@ fn summarize_body_blockers_with(
                 effect = true;
             }
         }
-        if descent_op_applies_effect(d.opname) {
+        // Every blocker a body reports reads as `after_effect` once one early
+        // op arms the flag, so the reachable set alone does not say what to
+        // repair.  Name each op that arms it — with the funcbox a residual
+        // resolves to, and the field a store writes — so the first one on the
+        // entry path is readable.
+        if !effect && descent_op_applies_effect(d.opname) && fbw_inline_diag_enabled() {
+            let funcbox = d
+                .opname
+                .starts_with("residual_call")
+                .then(|| code.get(d.pc + 1).copied())
+                .flatten()
+                .and_then(|slot| known_i.get(slot as usize).copied())
+                .flatten();
+            let field = descr_operand_offset(d.argcodes)
+                .and_then(|off| {
+                    let lo = *code.get(d.pc + 1 + off)? as usize;
+                    let hi = *code.get(d.pc + 2 + off)? as usize;
+                    Some(lo | (hi << 8))
+                })
+                .and_then(|index| {
+                    crate::jitcode_runtime::descr_ref_table()
+                        .at(index)
+                        .and_then(|descr| descr.as_field_descr().map(|f| f.field_name().to_string()))
+                });
+            eprintln!(
+                "[descent-effect-origin] pc={} op={} rewindable={rewindable_residual} \
+                 funcbox={} field={}",
+                d.pc,
+                d.opname,
+                funcbox.map_or_else(|| "-".to_string(), |addr| format!("{addr:#x}")),
+                field.as_deref().unwrap_or("-")
+            );
+        }
+        if descent_op_applies_effect(d.opname) && !rewindable_residual {
             effect = true;
         }
         if effect {
@@ -3003,6 +3074,9 @@ fn cut_declined_subwalk<Sym: WalkSym>(
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
 ) {
     ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+    // The cut retires every OpRef recorded after `pre_fold_pos`, so the pin
+    // table's answers, which are OpRefs, have to go with them.
+    ctx.session.borrow_mut().root_pins.clear();
     ctx.trace_ctx.heap_cache_mut().reset();
 }
 
