@@ -790,6 +790,38 @@ pub fn emit_super_inline(
     new_op
 }
 
+/// Emit inline `Cell` creation for one cellvar of a frame the inline-call path
+/// builds — the `NewWithVtable` plus the `SetfieldGc` set `w_cell_new`
+/// performs (`nestedscope.py Cell.__init__`).
+///
+/// `family` is the address `(pycode, slot)` names
+/// (`pycode.py PyCode._initialize` builds the table once with the code
+/// object, so it is a trace-time constant); `header_w_class` is
+/// `get_instantiate(&CELL_TYPE)`.  `contents` is not stored: the constructor
+/// this mirrors passes `PY_NULL` for a fresh cell, and a virtual reads an
+/// unwritten reference field as null.
+///
+/// Keeping the allocation as `New` + `SetField` rather than a residual lets
+/// the optimizer virtualize the cell away for the common shape where the
+/// callee both creates and consumes it within one trace.
+pub fn emit_new_cell_inline(ctx: &mut TraceCtx, family: OpRef, header_w_class: OpRef) -> OpRef {
+    let new_op = ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_cell_size_descr(),
+    );
+    ctx.heap_cache_mut().new_object(new_op);
+    for (descr, value) in [
+        (crate::descr::cell_family_descr(), family),
+        (crate::descr::cell_header_w_class_descr(), header_w_class),
+    ] {
+        let index = descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], descr);
+        ctx.heapcache_setfield_cached(new_op, index, value);
+    }
+    new_op
+}
+
 /// Emit inline `Function` creation for `MAKE_FUNCTION` — `NewWithVtable` plus
 /// the `SetfieldGc` set `function.py Function.__init__` performs — instead
 /// of the opaque `jit_make_function_from_globals` residual.
@@ -1532,9 +1564,10 @@ pub fn emit_box_float_inline(
 /// already-boxed positional argument refs.  Same field-complete frame shape as
 /// [`emit_new_pyframe_inline_self_recursive`] but seeds `locals[0..nparams]`
 /// from `param_boxes` (Ref boxes at the Python call boundary) instead of
-/// boxing a single raw int. Existing closure cells are placed at
-/// `freevar_start..`, matching `PyFrame::finish_for_call_with_globals_obj`;
-/// callers that need fresh cellvars remain on the residual path. The frame is
+/// boxing a single raw int. The cell band is placed at `cell_start..`,
+/// matching `PyFrame::finish_for_call_with_globals_obj`: the caller composes it
+/// as one freshly emitted cell per pure cellvar ([`emit_new_cell_inline`])
+/// followed by the closure's existing cell objects. The frame is
 /// the callee MIFrame's `frame` red —
 /// `_opimpl_inline_call*` / `perform_call`+`setup_call` push a fresh MIFrame
 /// per inlined call (`pyjitpl.py:2445-2476,1862-1874`) — the app-level frame
@@ -1559,8 +1592,8 @@ pub fn emit_box_float_inline(
 pub fn emit_new_pyframe_inline_with_params(
     ctx: &mut TraceCtx,
     param_boxes: &[OpRef],
-    freevar_cells: &[OpRef],
-    freevar_start: usize,
+    cell_slots: &[OpRef],
+    cell_start: usize,
     array_size: usize,
     valuestackdepth: usize,
     pycode: OpRef,
@@ -1615,11 +1648,12 @@ pub fn emit_new_pyframe_inline_with_params(
         );
         ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, p);
     }
-    // PyFrame.finish_for_call_with_globals_obj: a closure contributes the
-    // existing cell objects themselves after locals + pure cellvars. LOAD_DEREF
-    // must therefore read the live cell, not a snapshot of its contents.
-    for (i, &cell) in freevar_cells.iter().enumerate() {
-        let idx = ctx.const_int((freevar_start + i) as i64);
+    // PyFrame.finish_for_call_with_globals_obj: the pure cellvars take a fresh
+    // cell each and a closure then contributes its existing cell objects
+    // themselves, in that order. LOAD_DEREF must read the live cell, not a
+    // snapshot of its contents, so the slot holds the cell.
+    for (i, &cell) in cell_slots.iter().enumerate() {
+        let idx = ctx.const_int((cell_start + i) as i64);
         ctx.record_op_with_descr(
             OpCode::SetarrayitemGc,
             &[locals_array, idx, cell],
