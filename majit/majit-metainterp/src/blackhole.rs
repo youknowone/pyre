@@ -7255,11 +7255,20 @@ fn portal_jd_for(bh: &BlackholeInterpreter) -> Option<usize> {
 
 /// The `jd.handle_jitexc_from_bh` of the driver [`portal_jd_for`] picked.
 fn portal_runner_for(bh: &BlackholeInterpreter) -> Option<PortalRunnerHook> {
-    let jd_index = portal_jd_for(bh)?;
-    *PORTAL_RUNNER_HOOKS
+    let hooks = PORTAL_RUNNER_HOOKS
         .read()
-        .expect("portal runner table poisoned")
-        .get(jd_index)?
+        .expect("portal runner table poisoned");
+    let own = portal_jd_for(bh).and_then(|jd_index| *hooks.get(jd_index)?);
+    // The search may find nothing, and then this must still hand back the
+    // runner it would have handed back before the search existed.  Upstream can
+    // assert instead (`blackhole.py:1704` "portal jitcode not found??") because
+    // every level it reaches came through `_run_forever`, so the frame that
+    // stopped the walk really is a portal frame.  pyre's production guard-failure
+    // loop in `call_jit.rs` does not go through `_run_forever`, so the chain can
+    // stop at a frame whose jitcode is not any driver's `mainjitcode`; returning
+    // `None` there does not report a missing driver, it silently withdraws the
+    // portal re-entry from a path that had it.
+    own.or_else(|| hooks.iter().find_map(|slot| *slot))
 }
 
 /// The `result_kind` `warmspot.py:984-996` tests each `DoneWithThisFrame*`
