@@ -2988,16 +2988,16 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
     Some((self_op, cell_op, layout.self_is_cell))
 }
 
-/// The third arm of PyPy's `descriptor.py:_super_check`, when its
-/// `space.getattr(obj, '__class__')` is the ordinary class-attribute read the
-/// mapdict tracer already knows how to fold.
+/// The walker's holder for
+/// [`pyre_interpreter::baseobjspace::super_check_apparent_fast_path`] -- the
+/// third arm of `descriptor.py:_super_check`, admitted for the receivers whose
+/// `space.getattr(obj, '__class__')` is the ordinary class-attribute read.
 ///
-/// `class_attr_fast_path` is deliberately the whole admission predicate: a
-/// property, custom `__getattribute__`, heap-type descriptor, devolved map or
-/// instance shadow stays on the traceable/residual Python path.  For an
-/// admitted read these four values are exactly the guards an ordinary
-/// `LOAD_ATTR __class__` emits, so super construction can consume the same
-/// answer without inventing a stronger receiver-class equality.
+/// The predicate is the interpreter's so that both engines answer the same
+/// receivers; what stays here is the three pins it reports, which are exactly
+/// the guards an ordinary `LOAD_ATTR __class__` emits.  Super construction can
+/// therefore consume the answer without inventing a stronger receiver-class
+/// equality.
 #[derive(Clone, Copy)]
 pub(crate) struct ApparentSuperClass {
     pub(crate) objtype: pyre_object::PyObjectRef,
@@ -3010,21 +3010,9 @@ pub(crate) fn walker_apparent_super_class(
     start_type: pyre_object::PyObjectRef,
     obj: pyre_object::PyObjectRef,
 ) -> Option<ApparentSuperClass> {
-    if start_type.is_null()
-        || obj.is_null()
-        || !unsafe { pyre_object::is_type(start_type) }
-        || unsafe { pyre_object::is_none(obj) }
-    {
-        return None;
-    }
     let (receiver_type, receiver_version_tag, receiver_map, objtype) = unsafe {
-        pyre_interpreter::objspace::std::mapdict::class_attr_fast_path(obj, "__class__")
+        pyre_interpreter::baseobjspace::super_check_apparent_fast_path(start_type, obj)
     }?;
-    if !unsafe { pyre_object::is_type(objtype) }
-        || !unsafe { pyre_interpreter::baseobjspace::jit_issubtype_w(objtype, start_type) }
-    {
-        return None;
-    }
     Some(ApparentSuperClass {
         objtype,
         receiver_type,

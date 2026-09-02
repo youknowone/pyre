@@ -11115,6 +11115,57 @@ pub unsafe fn bound_method_attr_fast_path(
     Some((w_type, version_tag, w_descr, owes_shadow_guard))
 }
 
+/// `_super_check`'s third arm for a receiver whose `__class__` read settles
+/// without running Python (descriptor.py:139-146).
+///
+/// [`crate::builtins::super_check_python_free`] answers the first two arms,
+/// which consult installed MROs alone.  The third asks the receiver itself for
+/// `__class__`, and a property answers that with arbitrary code, which is why
+/// that function stops before it.  A mapdict instance whose type installs the
+/// default `__getattribute__` and whose map does not shadow the name is the
+/// case where the read is instead a plain class-attribute fetch:
+/// `class_attr_fast_path` both proves that and reports the three pins holding
+/// the proof -- the receiver's type, that type's version tag, and its map.
+///
+/// The tracer consults this rather than recomputing the arm, for the reason
+/// [`super_attr_fast_path`] gives: the interpreter and the tracer must agree on
+/// which receivers take the reduced shape, or the recorded and the concrete
+/// stacks desync.
+///
+/// Returns `class_attr_fast_path`'s own tuple,
+/// `(receiver_type, receiver_version_tag, receiver_map, objtype)`, with
+/// `objtype` the apparent class the arm yields.
+///
+/// # Safety
+/// `start_type` and `obj` must be valid object pointers (null tolerated).
+pub unsafe fn super_check_apparent_fast_path(
+    start_type: PyObjectRef,
+    obj: PyObjectRef,
+) -> Option<(
+    PyObjectRef,
+    u64,
+    crate::objspace::std::mapdict::MapRef,
+    PyObjectRef,
+)> {
+    if start_type.is_null() || obj.is_null() || !is_type(start_type) {
+        return None;
+    }
+    // `None` is a singleton with no mapdict, and the two arms above have
+    // already answered for it; keep the map read off it entirely.
+    if pyre_object::is_none(obj) {
+        return None;
+    }
+    let (receiver_type, receiver_version_tag, receiver_map, objtype) =
+        crate::objspace::std::mapdict::class_attr_fast_path(obj, "__class__")?;
+    // descriptor.py:145 `if space.issubtype_w(w_type, w_starttype)`.  The arm
+    // yields the apparent class only when that holds; otherwise `_super_check`
+    // raises, which is not an answer this predicate offers.
+    if !is_type(objtype) || !issubtype_w(objtype, start_type) {
+        return None;
+    }
+    Some((receiver_type, receiver_version_tag, receiver_map, objtype))
+}
+
 /// The Python-free prefix of `super(C, self).name`: validate the pair and find
 /// the first descriptor in the MRO suffix after `C`.
 ///
