@@ -241,11 +241,39 @@ impl<'c> Lowerer<'c> {
                 if let Expr::Return(ret) = expr {
                     return self.lower_return_stmt(ret, is_arm_tail);
                 }
-                if matches!(expr, Expr::Continue(_)) {
-                    if let Some(label) = self.dispatch_loop_label.clone() {
-                        self.emit_jump(&label);
+                if let Expr::Continue(cont) = expr {
+                    // The only `continue` this lowering can honour is the one
+                    // that means the dispatch back-edge, because the jump it
+                    // emits targets `dispatch_loop_label` and there is no other
+                    // label in scope here.  Two spellings reach this arm naming
+                    // a different loop, and both used to be answered with that
+                    // same jump -- or, with no dispatch label at all, with a
+                    // bare `Some(())` that emitted nothing and dropped the
+                    // transfer:
+                    //
+                    //   * a `continue` inside a loop written in the arm body.
+                    //     Its direct and `if`-branch spellings are taken by
+                    //     `lower_loop_stmt` / `lower_loop_if` with that loop's
+                    //     own labels, so what arrives here came through a
+                    //     `match` arm or a nested block.  `lower_loop_body_block`
+                    //     clears the dispatch label for exactly this reason, so
+                    //     the `None` below is what such a `continue` sees.
+                    //   * a labelled `continue 'l`, which crosses nested loops
+                    //     and names a loop this lowering has no label for.
+                    //
+                    // Both are refused instead of mistargeted.  The refusal
+                    // declines the whole body, so the arm keeps running in the
+                    // interpreter rather than jumping to the wrong head or
+                    // falling through with the transfer gone.
+                    if cont.label.is_none() {
+                        if let Some(label) = self.dispatch_loop_label.clone() {
+                            self.emit_jump(&label);
+                            return Some(());
+                        }
                     }
-                    return Some(());
+                    // `stmt_contains_loop_control` fires on a bare `continue`,
+                    // so the fallback refuses and records the reason.
+                    return self.lower_stmt_fallback(stmt, "expr");
                 }
                 if let Some(()) = self.lower_expr_stmt(expr) {
                     return Some(());
@@ -2562,4 +2590,76 @@ fn stmt_contains_loop_control(stmt: &Stmt) -> bool {
     };
     probe.visit_stmt(stmt);
     probe.hit
+}
+
+#[cfg(test)]
+mod continue_target_tests {
+    use super::*;
+
+    const DISPATCH_LABEL: &str = "__l_dispatch";
+
+    fn dispatch_lowerer() -> Lowerer<'static> {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.dispatch_loop_label = Some(syn::Ident::new(
+            DISPATCH_LABEL,
+            proc_macro2::Span::call_site(),
+        ));
+        lowerer
+    }
+
+    fn emitted(lowerer: &Lowerer<'_>) -> String {
+        lowerer
+            .statements
+            .iter()
+            .map(|tokens| tokens.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The spelling this lowering exists for: a `continue` in a dispatch arm
+    /// body is the interpreter's back-edge and lowers to a jump to the loop
+    /// head the dispatch JitCode marked.
+    #[test]
+    fn an_arm_body_continue_lowers_to_the_dispatch_back_edge() {
+        let mut lowerer = dispatch_lowerer();
+        let stmt: Stmt = syn::parse_quote! { continue; };
+
+        assert!(lowerer.lower_stmt(&stmt).is_some());
+        let body = emitted(&lowerer);
+        assert!(
+            body.contains(DISPATCH_LABEL),
+            "an arm-body `continue` must jump to the dispatch head:\n{body}"
+        );
+    }
+
+    /// With no dispatch label there is no loop head to jump to, so the old
+    /// `Some(())` emitted nothing and reported success — the transfer was
+    /// silently deleted and the caller ran on to the next statement.
+    #[test]
+    fn a_continue_with_no_dispatch_label_refuses_instead_of_vanishing() {
+        let mut lowerer = Lowerer::new(None);
+        let stmt: Stmt = syn::parse_quote! { continue; };
+
+        assert!(
+            lowerer.lower_stmt(&stmt).is_none(),
+            "a `continue` with no loop head to name must refuse"
+        );
+        assert!(lowerer.statements.is_empty());
+        assert!(lowerer.op_metadata.is_empty());
+    }
+
+    /// A labelled `continue` crosses nested loops to a loop this lowering
+    /// holds no label for; the dispatch head is not it.
+    #[test]
+    fn a_labelled_continue_refuses() {
+        let mut lowerer = dispatch_lowerer();
+        let stmt: Stmt = syn::parse_quote! { continue 'outer; };
+
+        assert!(
+            lowerer.lower_stmt(&stmt).is_none(),
+            "`continue 'outer` names a loop the dispatch label is not"
+        );
+        assert!(lowerer.statements.is_empty());
+        assert!(lowerer.op_metadata.is_empty());
+    }
 }

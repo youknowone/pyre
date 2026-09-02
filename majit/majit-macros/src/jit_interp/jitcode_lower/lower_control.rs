@@ -498,7 +498,16 @@ impl<'c> Lowerer<'c> {
             nested_failure_reasons: Vec::new(),
             opcode_var_name: self.opcode_var_name.clone(),
             in_dispatch_arm_body: self.in_dispatch_arm_body,
-            dispatch_loop_label: self.dispatch_loop_label.clone(),
+            // Never inherited: inside a loop body an unlabelled `continue`
+            // binds to that loop, not to the dispatch back-edge.  The
+            // spellings this block lowers itself -- a bare `continue` and one
+            // in an `if` branch -- are taken by `lower_loop_stmt` /
+            // `lower_loop_if` with `continue_label`; any other spelling falls
+            // back to `lower_stmt`, whose `Expr::Continue` arm emits a jump to
+            // `dispatch_loop_label`.  Carrying the dispatch label in would aim
+            // that jump at the dispatch head instead of this loop.  Cleared, it
+            // refuses there.
+            dispatch_loop_label: None,
             pc_pinned: self.pc_pinned,
             // Never inherited: a loop body statement is not the arm body's
             // tail, so a `return` inside it must be rejected, not lowered.
@@ -1090,6 +1099,53 @@ mod unroll_binding_tests {
         assert!(
             !emitted.contains("goto_if_not_int_is_true"),
             "the negation must replace the branch, not add one:\n{emitted}"
+        );
+    }
+
+    /// A `continue` inside a `match` in a loop body binds to that loop, not
+    /// to the dispatch back-edge.  `lower_loop_stmt` / `lower_loop_if` take
+    /// the direct and `if`-branch spellings with the loop's own labels; a
+    /// `match` arm falls back to `lower_stmt`, whose `Expr::Continue` arm
+    /// answered it with a jump to `dispatch_loop_label`.  On the pre-fix
+    /// lowerer this `while` lowers and its stream names the dispatch head —
+    /// one loop out from the loop the source wrote.
+    #[test]
+    fn a_continue_in_a_match_inside_a_loop_never_targets_the_dispatch_head() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.dispatch_loop_label = Some(syn::Ident::new(
+            "__l_dispatch",
+            proc_macro2::Span::call_site(),
+        ));
+        let stmt: Stmt = syn::parse_quote! { let flag = 1; };
+        let Stmt::Local(local) = stmt else {
+            unreachable!("parse_quote produced the requested let statement")
+        };
+        assert!(lowerer.lower_local(&local).is_some());
+
+        let expr: syn::ExprWhile = syn::parse_quote! {
+            while flag {
+                match flag {
+                    1 => continue,
+                    _ => {},
+                }
+            }
+        };
+        let lowered = lowerer.lower_while_loop(&expr);
+
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(|tokens| tokens.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !emitted.contains("__l_dispatch"),
+            "the inner loop's `continue` must not jump to the dispatch head:\n{emitted}"
+        );
+        assert!(
+            lowered.is_none(),
+            "a `continue` this loop cannot spell must refuse the loop, not \
+             retarget it:\n{emitted}"
         );
     }
 
