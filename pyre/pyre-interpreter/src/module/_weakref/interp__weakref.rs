@@ -1621,13 +1621,17 @@ proxy_binary!(proxy_floordiv, crate::baseobjspace::floordiv);
 proxy_binary_reflected!(proxy_rfloordiv, crate::baseobjspace::floordiv);
 proxy_binary!(proxy_mod, crate::baseobjspace::mod_);
 proxy_binary_reflected!(proxy_rmod, crate::baseobjspace::mod_);
-// pow / rpow — interp__weakref.py:363 generates a 3-arg wrapper because
-// `('pow', '**', 3, ['__pow__', '__rpow__'])` has arity=3 but
-// `forcing_count = len(special_methods) = 2`, so the optional modulo
-// operand passes through unforced. The two-arg form hands off to
-// `space.pow`, whose forward/reverse dance lets `__rpow__` answer; the
-// three-arg form hands off to `space.pow3`, which consults only the
-// forward `__pow__` (descroperation.py:450) and never the reflected slot.
+// pow / rpow — the `ObjSpace.MethodTable` loop in interp__weakref.py
+// generates a 3-arg wrapper from
+// `('pow', '**', 3, ['__pow__', '__rpow__'])`, whose
+// `forcing_count = len(special_methods) = 2` leaves the optional modulo
+// operand unforced. `WRAP_TERNARY` dereferences it whenever it is present,
+// so a proxy modulus reaches the slot as its referent and a dead one raises
+// `ReferenceError`; that is what `proxy_pow_modulus` below restores. The
+// two-arg form hands off to `space.pow`, whose forward/reverse dance lets
+// `__rpow__` answer; the three-arg form hands off to `space.pow3`, which
+// consults only the forward `__pow__` (`DescrOperation.pow`) and never the
+// reflected slot.
 /// `wrap_ternaryfunc`'s count check, written here rather than declared at the
 /// registration: the modulo operand is optional, so the slice is two or three
 /// long and there is no single arity for the gateway to enforce.  Without it
@@ -1642,14 +1646,24 @@ fn proxy_pow_arity(args: &[PyObjectRef]) -> Result<(), PyError> {
     Ok(())
 }
 
+/// `WRAP_TERNARY`'s `if (w != NULL) { UNWRAP(w); }`.  The dereference comes
+/// before the `None` test, so a dead proxy modulus raises `ReferenceError`
+/// rather than being read as "no modulus".
+fn proxy_pow_modulus(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    if args.len() < 3 || args[2].is_null() {
+        return Ok(PY_NULL);
+    }
+    force(args[2])
+}
+
 pub fn proxy_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     proxy_pow_arity(args)?;
     let w_obj0 = force(args[0])?;
     let w_obj1 = force(args[1])?;
-    let has_modulo =
-        args.len() >= 3 && !args[2].is_null() && !unsafe { pyre_object::is_none(args[2]) };
+    let w_obj2 = proxy_pow_modulus(args)?;
+    let has_modulo = !w_obj2.is_null() && !unsafe { pyre_object::is_none(w_obj2) };
     if has_modulo {
-        crate::baseobjspace::pow3(w_obj0, w_obj1, args[2])
+        crate::baseobjspace::pow3(w_obj0, w_obj1, w_obj2)
     } else {
         crate::baseobjspace::pow(w_obj0, w_obj1)
     }
@@ -1661,10 +1675,10 @@ pub fn proxy_rpow(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // two operands; the modulo argument keeps its slot.
     let w_obj0 = force(args[0])?;
     let w_obj1 = force(args[1])?;
-    let has_modulo =
-        args.len() >= 3 && !args[2].is_null() && !unsafe { pyre_object::is_none(args[2]) };
+    let w_obj2 = proxy_pow_modulus(args)?;
+    let has_modulo = !w_obj2.is_null() && !unsafe { pyre_object::is_none(w_obj2) };
     if has_modulo {
-        crate::baseobjspace::pow3(w_obj1, w_obj0, args[2])
+        crate::baseobjspace::pow3(w_obj1, w_obj0, w_obj2)
     } else {
         crate::baseobjspace::pow(w_obj1, w_obj0)
     }
@@ -2639,9 +2653,8 @@ mod tests {
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 20);
     }
 
-    /// `__pow__` is a 3-arg row in MethodTable. The wrapper must force
-    /// the first two operands and pass the optional modulo through
-    /// unchanged — PyPy's `forcing_count = len(special_methods) = 2`.
+    /// `__pow__` is a 3-arg row in MethodTable, but the slice reaching the
+    /// wrapper is two long when no modulus is given.
     #[test]
     fn test_proxy_pow_two_arg_form() {
         let _g = super::lock_proxy_tests();
@@ -2651,6 +2664,45 @@ mod tests {
         // 2-arg form: 2 ** 8 == 256
         let result = proxy_pow(&[proxy, pyre_object::w_int_new(8)]).unwrap();
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 256);
+    }
+
+    /// `WRAP_TERNARY` dereferences the modulo operand, so `pow` sees the
+    /// referent and not the proxy: `pow(2, 8, proxy_to_100) == 56`.
+    #[test]
+    fn test_proxy_pow_forces_modulus() {
+        let _g = super::lock_proxy_tests();
+        crate::typedef::init_typeobjects();
+        let modulus = W_Proxy_new(pyre_object::w_int_new(100), PY_NULL);
+        let proxy = W_Proxy_new(pyre_object::w_int_new(2), PY_NULL);
+        let result = proxy_pow(&[proxy, pyre_object::w_int_new(8), modulus]).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 56);
+        // Reflected wrapper swaps only the first two operands.
+        let modulus = W_Proxy_new(pyre_object::w_int_new(100), PY_NULL);
+        let proxy = W_Proxy_new(pyre_object::w_int_new(8), PY_NULL);
+        let result = proxy_rpow(&[proxy, pyre_object::w_int_new(2), modulus]).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 56);
+    }
+
+    /// A dead modulo proxy is dereferenced before the `None` test, so it
+    /// raises `ReferenceError` instead of reading as "no modulus".
+    #[test]
+    fn test_proxy_pow_dead_modulus_raises_reference_error() {
+        let _g = super::lock_proxy_tests();
+        crate::typedef::init_typeobjects();
+        let dead = W_Proxy_new(pyre_object::w_none(), PY_NULL);
+        write_attr(dead, ATTR_W_OBJ_WEAK, pyre_object::w_none());
+        for wrapper in [
+            proxy_pow as fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>,
+            proxy_rpow,
+        ] {
+            let proxy = W_Proxy_new(pyre_object::w_int_new(2), PY_NULL);
+            let err = wrapper(&[proxy, pyre_object::w_int_new(8), dead]).unwrap_err();
+            assert_eq!(err.kind, crate::PyErrorKind::ReferenceError);
+            assert_eq!(
+                err.message_text(),
+                "weakly-referenced object no longer exists"
+            );
+        }
     }
 
     /// pypy/interpreter/baseobjspace.py — `__instancecheck__`
