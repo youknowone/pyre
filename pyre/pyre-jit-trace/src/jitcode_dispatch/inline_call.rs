@@ -10315,6 +10315,144 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     Ok(Some(inlined))
 }
 
+/// Route `f"{x:spec}"` through an app-level `__format__`.
+///
+/// FORMAT_WITH_SPEC lowers to `residual_call_r_r(format_with_spec_fn,
+/// [value, spec])`, and `bh_format_with_spec_fn` reaches the receiver dunder
+/// through `runtime_ops::format_value` → `space.format`. When that dunder is
+/// Python, the whole method body sits behind an opaque MayForce residual and
+/// runs interpreted once per iteration. This is the `__format__` sibling of
+/// [`try_walker_inline_user_binop`]: pin the promoted receiver class, then
+/// enter the ordinary resolved-callee plumbing with the value as `self` and
+/// the spec as the second parameter.
+///
+/// Unlike a binary operator there is no `NotImplemented` escape hatch to hand
+/// back to a wider protocol — `__format__` either returns a string or raises —
+/// so this route needs none of binop's rewind machinery, and a body that
+/// commits an effect is admitted like any other inlined callee.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 2 {
+        return Ok(None);
+    }
+
+    // Name every bail, as the binop route does: a FORMAT_WITH_SPEC that stays
+    // residual costs a full interpreted `__format__` per execution, and
+    // without a reason line the only observable is the runtime.
+    macro_rules! decline {
+        ($why:expr) => {{
+            if fbw_inline_diag_enabled() {
+                eprintln!("[format-inline-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
+
+    let value = r_args[0];
+    let spec = r_args[1];
+    let Some(concrete_value) = walker_concrete_ref_object(ctx, value) else {
+        decline!("value has no concrete ref");
+    };
+    let Some(concrete_spec) = walker_concrete_ref_object(ctx, spec) else {
+        decline!("spec has no concrete ref");
+    };
+
+    // A tagged immediate is an exact builtin `int` with C-level slots: no heap
+    // `w_class` to pin, and its `__format__` is not inlinable Python code.
+    // Decline before the deref below, which would fault on the immediate.
+    // Inert behind `CAN_BE_TAGGED` (default false).
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && pyre_object::tagged_int::is_tagged_int(concrete_value)
+    {
+        decline!("tagged immediate receiver");
+    }
+
+    let w_class = unsafe { (*concrete_value).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        decline!("receiver w_class is not a type");
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        decline!(format_args!(
+            "receiver class {} has no version tag",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
+    }
+
+    let Some(method) =
+        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__format__") })
+    else {
+        decline!(format_args!("{} has no __format__", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_class)
+        }));
+    };
+    // `object.__format__` and the builtin type overrides are C slots, so this
+    // is also what refuses a receiver that has no app-level `__format__` at
+    // all — no separate comparison against the default is needed.
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        decline!(format_args!(
+            "{}.__format__ is not inlinable Python code",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
+    };
+    if nparams != 2 {
+        decline!(format_args!(
+            "{}.__format__ takes {nparams} params",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
+    }
+
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_value),
+        ConcreteValue::Ref(concrete_spec),
+    ];
+    try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        method_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![value, spec],
+        vec![
+            ConcreteValue::Ref(concrete_value),
+            ConcreteValue::Ref(concrete_spec),
+        ],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((value, concrete_value, w_class, version_tag)),
+        None,
+        // The abort rewind names this entry, as it does for the property and
+        // exception-override routes that enter through the same plumbing.
+        true,
+        // `__format__` returning a non-string is a TypeError the interpreter
+        // raises; the plumbing guards the inlined result is a string so that
+        // check keeps its meaning on the compiled path.
+        true,
+        None,
+    )
+}
+
 /// Allocate the callee's three symbolic register banks for a sub-walk
 /// entered through any `inline_call_*` arm.
 ///

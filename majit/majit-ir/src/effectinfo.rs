@@ -960,6 +960,22 @@ pub enum RuntimeHelperKind {
     /// `guard_class INT` (`~x` always fits an int, so no overflow guard); a
     /// bool / subclass / non-int operand falls through to the generic residual.
     UnaryInvert,
+    /// `bh_format_simple_fn(value)` — the FORMAT_SIMPLE helper
+    /// (`runtime_ops::format_value` with the empty spec).  A user
+    /// `__format__` runs Python here, so the generic residual is opaque for
+    /// the whole method body.  The full-body walker recognises this tag to
+    /// resolve `__format__` on the promoted receiver class and inline the
+    /// resolved body behind a `guard_class` + version-tag guard, the same
+    /// receiver-pinning route [`RuntimeHelperKind::BinaryOp`] takes for a
+    /// user `__add__`.  A builtin `__format__` is not inlinable Python code
+    /// and falls through to the residual unchanged.
+    FormatSimple,
+    /// `bh_format_with_spec_fn(value, spec)` — the FORMAT_WITH_SPEC helper,
+    /// the two-operand sibling of [`RuntimeHelperKind::FormatSimple`] carrying
+    /// the f-string's format spec.  Recognised for the same receiver-pinned
+    /// `__format__` inline; `spec` is threaded to the callee as its second
+    /// parameter.
+    FormatWithSpec,
     /// `bh_unpack_sequence_fn(count, seq)` — the UNPACK_SEQUENCE validator
     /// emitted by the codewriter UNPACK_SEQUENCE arm.  Validates the exact
     /// length and returns the normalized tuple.  The full-body walker

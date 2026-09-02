@@ -6190,7 +6190,7 @@ where
         ctx.format_simple_fn_idx,
         vec![value],
         CallFlavor::MayForce,
-        majit_ir::RuntimeHelperKind::None,
+        majit_ir::RuntimeHelperKind::FormatSimple,
         dst_reg,
     ))
 }
@@ -6824,7 +6824,7 @@ where
         ctx.format_with_spec_fn_idx,
         vec![value, spec],
         CallFlavor::MayForce,
-        majit_ir::RuntimeHelperKind::None,
+        majit_ir::RuntimeHelperKind::FormatWithSpec,
         dst_reg,
     ))
 }
