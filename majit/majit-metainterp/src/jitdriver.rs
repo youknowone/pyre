@@ -3115,6 +3115,12 @@ impl<S: JitState> JitDriver<S> {
         if !portal_rca_enabled() {
             return;
         }
+        if resume_pc == usize::MAX {
+            // The finish sentinel: the interpreted function returned, so there
+            // is no resume coordinate to build a state image against.
+            eprintln!("[portal-rca][parity-crn] resume_pc=<finish>");
+            return;
+        }
         let key = self.meta.single_pass_compiled_key;
         let dispatch_key = key.and_then(|k| self.meta.front_target_dispatch_key(k));
         let meta = S::build_meta(state, resume_pc, env);
@@ -4514,11 +4520,21 @@ impl<S: JitState> JitDriver<S> {
                     // to exit either way; a walk that published its finish
                     // values without a final pc would otherwise leave the hook
                     // with neither a break nor a resume and spin the native
-                    // loop.  Only the resume coordinate is pc-gated.
-                    let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
-                    if let Some(p) = pc {
-                        self.meta.single_pass_outcome = Some((p, Vec::new()));
-                    }
+                    // loop.
+                    //
+                    // The outcome is not conditional on it either, and for the
+                    // same reason: the hook reads `single_pass_finish` only
+                    // from INSIDE the outcome branch, so publishing nothing
+                    // would hide the flag it is supposed to carry.
+                    // `usize::MAX` is the no-position sentinel the wrapper
+                    // itself returns for a finish, so a consumer that ignores
+                    // the flag fails loudly instead of resuming somewhere.
+                    let pc = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.walk_final_pc)
+                        .unwrap_or(usize::MAX);
+                    self.meta.single_pass_outcome = Some((pc, Vec::new()));
                     self.meta.single_pass_finish = true;
                     if let Some(sym) = self.sym.as_ref() {
                         let scalars = S::collect_scalar_state_field_values(sym);
