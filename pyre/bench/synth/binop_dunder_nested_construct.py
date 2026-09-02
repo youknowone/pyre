@@ -24,7 +24,7 @@
 #
 # Deterministic, terminating, prints an int checksum; jit == nojit.
 M = 1000000007
-N = 1600000
+N = 17600000
 
 
 class Pair:

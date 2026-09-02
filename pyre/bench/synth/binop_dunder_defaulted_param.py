@@ -21,7 +21,7 @@
 #
 # Deterministic, terminating, prints an int checksum; jit == nojit.
 M = 1000000007
-N = 3200000
+N = 14400000
 
 
 class Ctx:
