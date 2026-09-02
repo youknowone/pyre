@@ -1184,6 +1184,19 @@ impl<'c> Lowerer<'c> {
         }
         let green_reads: Vec<Register> =
             green_bindings.iter().map(Register::from_binding).collect();
+        // jtransform.py `handle_recursive_call` opens with `promote_greens`:
+        // every green Variable is pinned by a `-live-` + `<kind>_guard_value`
+        // pair before the call is emitted.  The dispatcher picks the callee by
+        // hashing the green key it reads out of these registers, so a green the
+        // trace never guarded lets a recorded loop replay with a different key
+        // and enter the portal at a pc it was not compiled for.  The merge
+        // point promotes its greens for the same reason
+        // (`dispatch::emit_promote_greens`); this is the other `promote_greens`
+        // call site.  Upstream skips Constants and Voids; every green here is a
+        // register a value expression just produced, so none is skipped.
+        for binding in &green_bindings {
+            self.emit_live_and_guard_value(binding.kind, binding.reg);
+        }
         let green_tokens: Vec<proc_macro2::TokenStream> = green_bindings
             .iter()
             .map(|b| {

@@ -3203,32 +3203,10 @@ pub(super) fn emit_promote_greens(lowerer: &mut Lowerer, config: &LowererConfig)
         });
         let reg = binding.reg;
         let kind = binding.kind;
-        // jtransform.py:1707: emit `-live-` before each guard_value so the
-        // codewriter's per-marker liveness analysis records the alive set here.
-        lowerer.emit_op(
-            OpMeta::live_marker(),
-            quote::quote! { __builder.live_placeholder(); },
-        );
-        match kind {
-            BindingKind::Int => {
-                lowerer.emit_op(
-                    OpMeta::linear(OpKind::GuardValue, vec![Register::int(reg)], vec![]),
-                    quote::quote! { __builder.int_guard_value(#reg); },
-                );
-            }
-            BindingKind::Ref => {
-                lowerer.emit_op(
-                    OpMeta::linear(OpKind::GuardValue, vec![Register::ref_(reg)], vec![]),
-                    quote::quote! { __builder.ref_guard_value(#reg); },
-                );
-            }
-            BindingKind::Float => {
-                lowerer.emit_op(
-                    OpMeta::linear(OpKind::GuardValue, vec![Register::float(reg)], vec![]),
-                    quote::quote! { __builder.float_guard_value(#reg); },
-                );
-            }
-        }
+        // The `-live-` before each guard_value is what lets the codewriter's
+        // per-marker liveness analysis record the alive set at the guard; the
+        // pair is shared with `handle_recursive_call`'s promote_greens.
+        lowerer.emit_live_and_guard_value(kind, reg);
     }
 }
 

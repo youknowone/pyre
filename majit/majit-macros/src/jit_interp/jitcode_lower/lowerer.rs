@@ -347,6 +347,39 @@ impl<'c> Lowerer<'c> {
         self.op_metadata.push(meta);
     }
 
+    /// `jtransform.py promote_greens` — the `-live-` + `<kind>_guard_value`
+    /// pair that pins one green to a constant.
+    ///
+    /// Both of upstream's `promote_greens` call sites emit exactly this shape:
+    /// `handle_jit_marker__jit_merge_point` before `jit_merge_point`, and
+    /// `handle_recursive_call` before `recursive_call_<kind>`.  The `-live-`
+    /// comes first so the codewriter's per-marker liveness analysis records the
+    /// alive set at the guard.
+    pub(super) fn emit_live_and_guard_value(&mut self, kind: BindingKind, reg: u16) {
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        let (read, guard) = match kind {
+            BindingKind::Int => (
+                Register::int(reg),
+                quote! { __builder.int_guard_value(#reg); },
+            ),
+            BindingKind::Ref => (
+                Register::ref_(reg),
+                quote! { __builder.ref_guard_value(#reg); },
+            ),
+            BindingKind::Float => (
+                Register::float(reg),
+                quote! { __builder.float_guard_value(#reg); },
+            ),
+        };
+        self.emit_op(
+            OpMeta::linear(OpKind::GuardValue, vec![read], vec![]),
+            guard,
+        );
+    }
+
     pub(super) fn append_lowered_sequence(&mut self, lowered: LoweredSequence) {
         debug_assert_eq!(
             lowered.statements.len(),
