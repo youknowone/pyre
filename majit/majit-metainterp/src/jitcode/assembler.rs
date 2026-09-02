@@ -18,6 +18,37 @@ use super::{
     RuntimeBhDescr,
 };
 
+/// The `EffectInfo` a jitcode-lowered `#[jit_may_force]` helper carries.
+///
+/// `EF_RANDOM_EFFECTS`, for the reason `pyre-jit`'s `CallFlavor::MayForce`
+/// resolves to the same constant: `call.py:288-289 if
+/// virtualizable_analyzer.analyze(op):` reaches
+/// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` only through
+/// `effectinfo_from_writeanalyze(self.readwrite_analyzer.analyze(op))`
+/// (`call.py:319-323`), which names every field and array the callee writes —
+/// `self.stack[*]` for `tl.py Stack.roll`. The helper reached from here is a
+/// Rust `extern "C"` fn with no graph for that analyzer to walk, so an empty
+/// write set asserts something it has not proved, and
+/// `heap.py force_from_effectinfo` believes it.
+///
+/// What makes the difference observable on this leg: a jitcode-lowered
+/// may-force call belongs to a `#[jit_interp(state_fields = ...)]` machine,
+/// which is `VirtualizableInfo::without_vable_token`. Nothing clears a token,
+/// so `vable_after_residual_call` never aborts and the trace runs on past the
+/// call and reads the state back through
+/// `TraceCtx::reload_tokenless_virtualizable_after_residual_call` — a read the
+/// empty write set lets the heap cache fold to the value stored before the
+/// call.
+///
+/// The promotion costs no may-force machinery: `check_forces_virtual_or_
+/// virtualizable()` reads `extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
+/// (`effectinfo.py:249-250`) and RandomEffects is above it, so
+/// `do_residual_call` still selects `CALL_MAY_FORCE_*` with its vable/vref
+/// preparation.
+fn jitcode_may_force_effect_info() -> majit_ir::effectinfo::EffectInfo {
+    crate::call_descr::default_effect_info()
+}
+
 /// Byte width of one scalar of `ty` in memory — a struct field or an array
 /// item.
 ///
@@ -4034,17 +4065,7 @@ impl JitCodeBuilder {
             ),
             fn_ptr_idx,
             arg_regs,
-            // PyPy `call.py:288-289 if virtualizable_analyzer.analyze(op):`
-            // selects `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, fed through
-            // `effectinfo_from_writeanalyze` with the analyzer-empty
-            // (`graphanalyze.py bottom_result()`) default. The
-            // resulting EI is the dedicated FVOV slot — distinct from
-            // `MOST_GENERAL`/RandomEffects (only the
-            // `randomeffects_analyzer` branch at `call.py:282-283`).
-            // Routing to `MOST_GENERAL` over-invalidates the heap cache
-            // via `has_random_effects() → clean_caches` PyPy reserves
-            // for genuinely-random callees.
-            crate::call_descr::forces_virtual_or_virtualizable_effect_info(),
+            jitcode_may_force_effect_info(),
             "call_may_force_void_canonical_via_target",
         );
     }
@@ -4541,17 +4562,7 @@ impl JitCodeBuilder {
             fn_ptr_idx,
             arg_regs,
             dst,
-            // PyPy `call.py:288-289 if virtualizable_analyzer.analyze(op):`
-            // selects `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, fed through
-            // `effectinfo_from_writeanalyze` with the analyzer-empty
-            // (`graphanalyze.py bottom_result()`) default. The
-            // resulting EI is the dedicated FVOV slot — distinct from
-            // `MOST_GENERAL`/RandomEffects which is only the
-            // `randomeffects_analyzer` branch (`call.py:282-283`).
-            // Routing to `MOST_GENERAL` over-invalidates the heap cache
-            // via `has_random_effects() → clean_caches` PyPy reserves
-            // for genuinely-random callees.
-            crate::call_descr::forces_virtual_or_virtualizable_effect_info(),
+            jitcode_may_force_effect_info(),
         );
     }
 
@@ -4625,17 +4636,7 @@ impl JitCodeBuilder {
             fn_ptr_idx,
             arg_regs,
             dst,
-            // PyPy `call.py:288-289 if virtualizable_analyzer.analyze(op):`
-            // selects `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, fed through
-            // `effectinfo_from_writeanalyze` with the analyzer-empty
-            // (`graphanalyze.py bottom_result()`) default. The
-            // resulting EI is the dedicated FVOV slot — distinct from
-            // `MOST_GENERAL`/RandomEffects which is only the
-            // `randomeffects_analyzer` branch (`call.py:282-283`).
-            // Routing to `MOST_GENERAL` over-invalidates the heap cache
-            // via `has_random_effects() → clean_caches` PyPy reserves
-            // for genuinely-random callees.
-            crate::call_descr::forces_virtual_or_virtualizable_effect_info(),
+            jitcode_may_force_effect_info(),
         );
     }
 
@@ -4674,17 +4675,7 @@ impl JitCodeBuilder {
             fn_ptr_idx,
             arg_regs,
             dst,
-            // PyPy `call.py:288-289 if virtualizable_analyzer.analyze(op):`
-            // selects `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`, fed through
-            // `effectinfo_from_writeanalyze` with the analyzer-empty
-            // (`graphanalyze.py bottom_result()`) default. The
-            // resulting EI is the dedicated FVOV slot — distinct from
-            // `MOST_GENERAL`/RandomEffects which is only the
-            // `randomeffects_analyzer` branch (`call.py:282-283`).
-            // Routing to `MOST_GENERAL` over-invalidates the heap cache
-            // via `has_random_effects() → clean_caches` PyPy reserves
-            // for genuinely-random callees.
-            crate::call_descr::forces_virtual_or_virtualizable_effect_info(),
+            jitcode_may_force_effect_info(),
         );
     }
 

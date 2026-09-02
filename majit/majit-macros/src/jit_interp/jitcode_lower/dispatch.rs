@@ -1966,47 +1966,6 @@ pub(super) fn typed_return_terminator(
     }
 }
 
-/// Whether `expr` contains a store — a plain `a = b` or a compound `a += b`.
-///
-/// Used to keep a *storing* function-final expression out of the walk; see the
-/// call site in `lower_dispatch_body` for why a store there is applied twice.
-fn expr_stores(expr: &Expr) -> bool {
-    use syn::visit::Visit;
-    struct FindStore {
-        hit: bool,
-    }
-    impl<'ast> Visit<'ast> for FindStore {
-        fn visit_expr(&mut self, e: &'ast Expr) {
-            match e {
-                Expr::Assign(_) => self.hit = true,
-                Expr::Binary(b) if is_assign_op(&b.op) => self.hit = true,
-                _ => {}
-            }
-            syn::visit::visit_expr(self, e);
-        }
-    }
-    let mut finder = FindStore { hit: false };
-    finder.visit_expr(expr);
-    finder.hit
-}
-
-/// Whether `op` is a compound-assignment operator (`+=`, `-=`, ...).
-fn is_assign_op(op: &syn::BinOp) -> bool {
-    matches!(
-        op,
-        syn::BinOp::AddAssign(_)
-            | syn::BinOp::SubAssign(_)
-            | syn::BinOp::MulAssign(_)
-            | syn::BinOp::DivAssign(_)
-            | syn::BinOp::RemAssign(_)
-            | syn::BinOp::BitXorAssign(_)
-            | syn::BinOp::BitAndAssign(_)
-            | syn::BinOp::BitOrAssign(_)
-            | syn::BinOp::ShlAssign(_)
-            | syn::BinOp::ShrAssign(_)
-    )
-}
-
 /// `Some(N)` if `body` is a pure forward-advancing dispatch arm: straight-line
 /// work followed by a single trailing `pc += N` (N > 0), with no back-edge
 /// (`can_enter_jit!` / `jit_merge_point!`), no early `return` / `continue` /
@@ -2141,6 +2100,13 @@ mod arm_is_pure_pc_advance_tests {
     fn plain_forward_advance_is_pure() {
         assert_eq!(arm_is_pure_pc_advance(&body("{ pc += 3; }")), Some(3));
         assert_eq!(arm_is_pure_pc_advance(&body("{ pc = pc + 2; }")), Some(2));
+        assert_eq!(
+            arm_is_pure_pc_advance(&body(
+                "{ let r = program[pc] as i8 as i64; storage_roll(&mut state, r); pc += 1; }"
+            )),
+            Some(1),
+            "a residual helper does not own the caller's green-pc return channel",
+        );
     }
 
     /// A `return` arm must NEVER be routed to the split sub-JitCode path: the
@@ -2275,14 +2241,10 @@ impl<'c> Lowerer<'c> {
         None
     }
 
-    /// `true` if `body` contains a call whose policy resolves to
-    /// `CallPolicySpec::Infer` — an auto-discovered helper whose effect /
-    /// raisability (and, for `&[u8]`-arg helpers like `interpret_at`, whether
-    /// a marshalable C-ABI call target exists at all) is decided at runtime.
-    /// Such an arm keeps the sub-JitCode path: its build-time IIFE degrades
-    /// to an abort stub when the runtime policy is unsupported, which the
-    /// inline stream cannot do cleanly.  Explicit-policy and helper-free arms
-    /// are inlineable.
+    /// Whether an arm contains an auto-discovered residual helper. These calls
+    /// stay in a sub-JitCode so their guard-resume liveness is scoped to the
+    /// callee frame; a trailing green-pc advance is returned explicitly to the
+    /// caller by the split path below.
     pub(super) fn arm_body_has_infer_call(&self, body: &Expr) -> bool {
         use syn::visit::Visit;
         struct InferCallProbe<'a, 'c> {
@@ -2754,41 +2716,32 @@ pub(super) fn lower_dispatch_chain(
         // reach the dispatch loop's reg0.  A BC_INLINE_CALL into a sub-JitCode
         // copies args caller→callee only, so a sub-JitCode pc-write never
         // reaches reg0 (the merge-point pc) — the inline path is what makes
-        // the green pc advance.  Arms whose body contains an inferred-policy
-        // call (`interpret_at`'s &[u8] unsupported residual, `storage_roll`)
-        // keep the sub-JitCode path: its build-time IIFE degrades to an abort
-        // stub when the runtime policy is unsupported, which the inline stream
-        // cannot do without a partial-ops-then-abort hazard.  Red-pc
-        // dispatches keep the sub-JitCode path unconditionally.
+        // the green pc advance. `try_inline_dispatch_arm` is transactional, so
+        // an inferred-policy call whose arguments cannot lower rolls back the
+        // whole attempt and falls through to the diagnostic sub-JitCode abort
+        // stub; a supported residual call keeps the caller's pc in this live
+        // frame. Red-pc dispatches keep the sub-JitCode path unconditionally.
         //
-        // No infer-call arm writes a *propagating* pc today, so keeping them on
-        // the sub-JitCode path loses no pc advance.  The only infer-call arms in
-        // the corpus are the `ROLL` arms of tl and tlc (bare-path `auto_calls`
-        // helpers `storage_roll` / `tlc_roll`).  tlc declares no green pc, so it
-        // never inlines any arm (every arm is red-pc sub-JitCode); the hazard is
-        // structurally absent there.  tl's green-pc `ROLL` body contains only
-        // `pc += 1`, which on the non-pinned sub-JitCode path is recognized as
-        // inert and dropped (the dispatch loop owns the pc register), so the
-        // sub-JitCode emits no pc op at all.  The hazard reappears only for a
-        // *non-droppable* pc write — a branch `pc = target` in an arm that also
-        // makes a bare-path inferred-policy call — at which point the remedy is
-        // either to lower that arm inline behind an abort guard, or to add an
-        // explicit pc-writeback from the sub-JitCode into the caller's reg0.
         // `split_dispatch` opt-in: a pure forward-advancing green-pc arm is
         // routed to the per-arm sub-JitCode path (below) with a pc-returning
         // `inline_call_<types>_i` instead of being force-inlined here — this is
         // what keeps the dispatch JitCode's register/const footprint small.
         // `Some(N)` carries the arm's `pc += N` advance to the body generator.
-        // When `split_dispatch` is off this short-circuits to `None` before
-        // `arm_is_pure_pc_advance` runs, so the gate stays byte-identical.
-        let pc_return_increment = if config.split_dispatch
+        // This return channel is independent of whether the work contains an
+        // inferred-policy residual call: if that work cannot lower, the
+        // transactional sub-lowerer returns an abort stub; if it can, dropping
+        // the green return would resume at the old opcode. RPython keeps `pc`
+        // in the caller frame across either call shape.
+        // Inferred residual calls also use this split even without the size
+        // opt-in: their resume guards belong to the callee frame, while the
+        // caller still owns green `pc`.
+        let has_infer_call = lowerer.arm_body_has_infer_call(&arm.original_body);
+        let pc_return_increment = if (config.split_dispatch || has_infer_call)
             && pc_is_green(config)
             && matches!(
                 arm.pattern,
                 crate::jit_interp::classify::ArmPattern::Lowerable
-            )
-            && !lowerer.arm_body_has_infer_call(&arm.original_body)
-        {
+            ) {
             arm_is_pure_pc_advance(&arm.original_body)
         } else {
             None
@@ -2799,7 +2752,7 @@ pub(super) fn lower_dispatch_chain(
                 arm.pattern,
                 crate::jit_interp::classify::ArmPattern::Lowerable
             )
-            && !lowerer.arm_body_has_infer_call(&arm.original_body)
+            && !has_infer_call
         {
             lowerer.try_inline_dispatch_arm(&arm.original_body)
         } else {
@@ -4043,30 +3996,64 @@ pub(crate) fn lower_dispatch_body(
     // at the typed-return emission (interp_jit.py:95-100 return boundary).
     lowerer.emit_label_def(&default_label);
 
-    // Lower the function-final return expression (the stmt after the while loop).
-    // dispatch_minimal returns `state.a` (i64) → BC_INT_RETURN.
-    let return_expr = func_block.stmts.iter().rev().find_map(|s| match s {
-        syn::Stmt::Expr(e, None) => Some(e),
+    // Locate the source dispatch loop and its post-loop epilogue.  A terminal
+    // opcode (`break`) transfers control to this whole suffix, not merely to
+    // its final expression.  Until the suffix is represented as JitCode, a
+    // state-mutating statement there must fail closed: compiling just the
+    // final read would skip the mutation on the machine-code path (TL's
+    // `stackpos -= 1; stack[stackpos]` returned the pre-pop slot).
+    let dispatch_match = find_dispatch_match(func_block)?;
+    let dispatch_loop_index = func_block.stmts.iter().position(|stmt| {
+        let Stmt::Expr(expr, _) = stmt else {
+            return false;
+        };
+        match expr {
+            Expr::While(w) => block_contains_match(&w.body, dispatch_match),
+            Expr::Loop(l) => block_contains_match(&l.body, dispatch_match),
+            _ => false,
+        }
+    })?;
+    let post_loop = &func_block.stmts[dispatch_loop_index + 1..];
+    // Positionally, not by searching backwards for the first expression-shaped
+    // statement: a `while` / `if` / `match` / `loop` written in statement
+    // position is also `Stmt::Expr(_, None)`, so a search would name one of
+    // those as the tail, and `prefix_len` would then both re-lower it as
+    // prefix and leave the real last statement unlowered.
+    let return_expr = match post_loop.last() {
+        Some(syn::Stmt::Expr(e, None)) => Some(e),
         _ => None,
-    });
-    // A trailing expression that STORES must not be lowered here. `jitdriver.rs`'s
-    // `TraceAction::Finish` arm hands the post-loop work to native execution and
-    // writes the walk-final state back for it to read, so a store lowered into the
-    // walk is applied twice: once on the walk's symbolic state (which the
-    // write-back then pushes into native `state`) and once by native code. A pure
-    // trailing expression is idempotent under that division and keeps its typed
-    // return, so this narrows only the storing case, which falls through to
-    // `void_return` and ends the walk at the loop exit.
+    };
+    // The terminal opcode's `break` reaches every statement after the source
+    // loop before evaluating the tail expression.  Lower that epilogue in
+    // source order.  `TraceAction::Finish` publishes its concrete result to
+    // the single-pass merge hook, which returns it directly and therefore does
+    // not execute this suffix a second time in native Rust.
     //
-    // The check is syntactic. A store hidden inside a callee is not caught, but
-    // such an expression does not lower to a binding anyway and so already
-    // reaches `void_return`.
+    // The epilogue fails open.  A statement the lowering refuses -- an I/O
+    // loop, a green write -- rolls back to the loop exit and leaves the
+    // binding unset, so the walk terminates in `void_return` and `Finish`
+    // hands the whole suffix to native execution exactly once.  Propagating
+    // the refusal instead would take the entire dispatch JitCode down with it,
+    // and every trace of that interpreter becomes `AbortPermanent`.
     //
-    // A `None` binding here (no trailing expression, one that stores, or one
-    // that did not lower) falls through to `void_return`.
-    let binding = return_expr
-        .filter(|e| !expr_stores(e))
-        .and_then(|e| lowerer.lower_value_expr(e));
+    // Prefix and tail roll back TOGETHER.  A tail the lowering refuses after a
+    // committed prefix would leave the prefix in the JitCode and still
+    // terminate in `void_return`, so the native suffix -- the prefix included
+    // -- would run a second time once the `Finish` breaks the dispatch loop.
+    let prefix_len = post_loop
+        .len()
+        .saturating_sub(usize::from(return_expr.is_some()));
+    let binding = lowerer
+        .transactional(|inner| {
+            for stmt in &post_loop[..prefix_len] {
+                inner.lower_stmt(stmt)?;
+            }
+            match return_expr {
+                Some(expr) => inner.lower_value_expr(expr).map(Some),
+                None => Some(None),
+            }
+        })
+        .flatten();
     let (reads, emitter) = typed_return_terminator(binding);
     lowerer.emit_op(OpMeta::terminal(reads), emitter);
 

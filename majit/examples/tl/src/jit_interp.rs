@@ -7,6 +7,7 @@
 /// Greens: [pc, code]
 /// Reds:   [inputarg, stackpos, stack]  (inputarg is a function parameter — red by nature)
 use majit_metainterp::jit::promote;
+use majit_metainterp::virt_array::VirtArray;
 
 /// Hot loops majit compiled. The only positive evidence the JIT tier is alive:
 /// a green suite, agreement with `interp::interpret` and an exact absolute trip
@@ -48,15 +49,16 @@ pub static LAST_ALWAYS_FAILS: core::sync::atomic::AtomicBool =
 #[cfg(test)]
 pub static ROLL_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Rotates the live stack through a residual call. The state-machine
-/// virtualizable has no force token, so lowering this raw-pointer mutation as
-/// an ordinary call would leave symbolic array cells stale; the dispatch arm
-/// must remain degraded until array effects can be synchronized.
+/// Rotates the live stack through a residual call.
+///
+/// As in `tl.py::Stack.roll`, the helper receives the virtualizable object,
+/// not a raw pointer to one redirected field. The may-force call therefore
+/// synchronizes the virtualizable before the helper mutates its live array.
 #[majit_macros::jit_may_force]
-extern "C" fn storage_roll(stack_ptr: usize, stackpos: i64, r: i64) {
+extern "C" fn storage_roll(state: &mut TlState, r: i64) {
     #[cfg(test)]
     ROLL_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let stack = unsafe { std::slice::from_raw_parts_mut(stack_ptr as *mut i64, stackpos as usize) };
+    let stack = &mut state.stack[..state.stackpos as usize];
     let len = stack.len();
     if r < -1 {
         // tl.py:45-55
@@ -106,7 +108,7 @@ impl BytecodeExt for [u8] {
 /// (`interp_eval`) passes `len(code)`. See tl.py:120.
 struct TlState {
     stackpos: i64,
-    stack: Vec<i64>,
+    stack: VirtArray<i64>,
 }
 
 // ── Opcodes ──
@@ -166,7 +168,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     let stacksize: i32 = 0;
     let mut state = TlState {
         stackpos: 0,
-        stack: vec![0i64; program.len()],
+        stack: VirtArray::filled(0i64, program.len()),
     };
 
     // RPython warmspot.py:281-289 canonical-liveness install hook.
@@ -178,32 +180,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     }
 
     while pc < program.len() {
-        // Still the legacy bare form, which discards the walk outcome and
-        // re-runs the circuit the walk already executed.
-        //
-        // `jit_merge_point!(driver, program, pc; state)` carries the tests whose
-        // loops hold no `ROLL` — `sum_bytecode` compiles a loop and resumes at
-        // its header — but not `roll_loop_bytecode`. `ROLL`'s arm lowers to an
-        // abort stub, because `storage_roll` is handed
-        // `state.stack.as_mut_ptr()` and the macro has no spelling for the base
-        // pointer of a `[int; virt]` state-field array. The abort then lands
-        // after the shared `pc += 1` below and before the arm's own operand
-        // advance at `pc += 1` inside `ROLL`, so the resume position names
-        // `ROLL`'s operand byte rather than an opcode boundary:
-        // `MAJIT_PORTAL_RCA=1` reports `resume_pc=10 compiled_key=None` where
-        // `ROLL, 2` occupies pc 9–10, against `resume_pc=3` with a real
-        // `compiled_key` on the `ROLL`-free control.
-        //
-        // Two gaps have to close, not one. The arm has to lower (the macro
-        // spelling above), AND the abort path needs a source-opcode boundary to
-        // resume at: both of its exits report the same mid-opcode pc today.
-        // `run_pending_abort_blackhole` takes it from the merge point the
-        // blackhole chain reaches, and declining before the chain runs falls
-        // back to `walk_final_pc`, which the `TraceAction::Abort` arm sets from
-        // i0 — advanced by dispatch before the arm ran. No per-source-opcode
-        // entry pc is retained during the walk, so neither exit can name the
-        // boundary.
-        jit_merge_point!();
+        jit_merge_point!(driver, program, pc; state);
         // tl.py:88  stack.stackpos = promote(stack.stackpos)
         state.stackpos = promote(state.stackpos);
 
@@ -233,8 +210,8 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
             // tl.py  Stack.roll() is @dont_look_inside
             ROLL => {
                 let r = program[pc] as i8 as i64;
+                storage_roll(&mut state, r);
                 pc += 1;
-                storage_roll(state.stack.as_mut_ptr() as usize, state.stackpos, r);
             }
             // tl.py  Stack.pick(i): duplicate stack[stackpos - i - 1]
             PICK => {
@@ -525,7 +502,7 @@ mod tests {
         degraded.sort_unstable();
         assert_eq!(
             degraded,
-            ["PUSHARG", "ROLL"],
+            ["PUSHARG"],
             "the degraded-arm set moved. A NEW name means an arm silently \
              stopped lowering and every trace reaching it now aborts; a MISSING \
              name means that arm lowers again, so a loop that could not trace \
@@ -539,10 +516,7 @@ mod tests {
         causes.sort_unstable();
         assert_eq!(
             causes,
-            [
-                ("PUSHARG", RefusalKind::UnlowerableStmt),
-                ("ROLL", RefusalKind::GreenWriteback)
-            ],
+            [("PUSHARG", RefusalKind::UnlowerableStmt)],
             "a degraded arm's CAUSE moved while its name did not. That is the \
              signal the set above structurally cannot carry: the arm still \
              degrades, so part 3 is unchanged, but a different mechanism is \
@@ -561,13 +535,6 @@ mod tests {
                 .expect("part 3 already pinned this arm as present")
                 .reason
         };
-        assert!(
-            reason_of("ROLL").contains("pc += 1"),
-            "ROLL's refusal no longer names `pc += 1` as the offending \
-             statement — the green-writeback guard is now stopping somewhere \
-             else in the arm: {}",
-            reason_of("ROLL")
-        );
         assert!(
             reason_of("PUSHARG").contains("state.stack"),
             "PUSHARG's refusal no longer names the `state.stack` write as the \
@@ -675,6 +642,21 @@ mod tests {
                  double-execution would inflate this count"
             );
         }
+    }
+
+    /// The first residual ROLL's result is consumed before the inverse ROLL.
+    /// This prevents a pair that merely cancels in the heap from hiding a
+    /// missing post-call virtualizable reload in the trace.
+    #[test]
+    fn jit_residual_result_is_visible_to_following_ops() {
+        let bc = vec![
+            PUSH, 1, PUSHARG, PICK, 0, BR_COND, 2, POP, RETURN, ROLL, 2, PICK, 0, ADD, ROLL, 254,
+            PUSH, 1, SUB, PUSH, 1, BR_COND, 236,
+        ];
+        let n = 8;
+        let expected = interp::interpret(&bc, n);
+        assert_eq!(expected, 1 << n, "fixture computes 2**n");
+        assert_eq!(run_jit(&bc, n), expected);
     }
 
     fn trip_count_bytecode() -> Vec<u8> {
@@ -882,7 +864,7 @@ mod tests {
         let program = sum_bytecode();
         let caller = TlState {
             stackpos: 7,
-            stack: vec![1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0],
+            stack: VirtArray::from_slice(&[1, 2, 3, 4, 5, 6, 7, 0, 0, 0, 0, 0]),
         };
         let meta = caller.build_meta(0, program.as_slice());
         let mut sym = <TlState as majit_metainterp::JitState>::create_sym(&meta, 0);
@@ -921,7 +903,7 @@ mod tests {
         let program = sum_bytecode();
         let caller = TlState {
             stackpos: 3,
-            stack: vec![9, 8, 7, 0, 0, 0, 0, 0],
+            stack: VirtArray::from_slice(&[9, 8, 7, 0, 0, 0, 0, 0]),
         };
         let meta = caller.build_meta(0, program.as_slice());
         let mut sym = <TlState as majit_metainterp::JitState>::create_sym(&meta, 0);

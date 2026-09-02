@@ -1676,6 +1676,11 @@ pub struct MetaInterp<M: Clone> {
     /// `break` instead of resuming at the pc). `take`n by the `__merge` wrapper's
     /// caller.
     pub(crate) single_pass_finish: bool,
+    /// Concrete FINISH payload produced by the single-pass tracing walk.
+    /// The macro drains this to return from the portal directly after it has
+    /// written the walk-final state back, so a lowered post-loop epilogue is
+    /// not executed a second time by native Rust.
+    pub(crate) single_pass_finish_values: Option<ExitValues>,
     /// The FINISH arguments of a compiled run entered from a back edge, when
     /// that run ended in FINISH rather than a back-edge JUMP or a guard
     /// failure. `compile.py` `_DoneWithThisFrameDescr` sets
@@ -3487,6 +3492,7 @@ impl<M: Clone> MetaInterp<M> {
             tracing: None,
             single_pass_outcome: None,
             single_pass_finish: false,
+            single_pass_finish_values: None,
             back_edge_finish: None,
             single_pass_scalar_values: None,
             single_pass_ref_scalar_values: None,
@@ -5480,8 +5486,8 @@ impl<M: Clone> MetaInterp<M> {
     ///    fallback (borrows `compiled_loops` + `warm_state`);
     /// 3. `recursive_target` — recursive-call green-key → `(Arc<JitCellToken>,
     ///    green_key)` resolver for a recursive CALL_ASSEMBLER (mirrors
-    ///    `get_loop_token_arc`; only already-compiled callees, the
-    ///    pending-token window returns `None` → the dispatcher aborts);
+    ///    `WarmEnterState.get_assembler_token`, including creation of a
+    ///    temporary callback token for an uncompiled callee);
     /// 4. `recursive_decision` — the recursive-portal inline decision,
     ///    sharing `decide_recursive_inline` with `should_inline_core`;
     /// 5. `recursive_exec` — runs a recursive callee's compiled loop via
@@ -5501,13 +5507,17 @@ impl<M: Clone> MetaInterp<M> {
             &dyn Fn(&JitCellToken, &[Value]) -> Option<()>,
         ) -> R,
     ) -> Option<R> {
-        let tracing = self.tracing.as_mut()?;
+        // Move the trace out while the runtime closures run.  RPython's
+        // MetaInterp owns both history and warmrunnerstate and can mutate the
+        // latter from `do_recursive_call`; keeping `self.tracing` borrowed in
+        // place would artificially prohibit the same disjoint-field access in
+        // Rust.  It is restored before returning.
+        let mut tracing = self.tracing.take()?;
         let compiled_loops = &self.compiled_loops;
-        let warm_state = &self.warm_state;
-        let backend = &self.backend;
         let staticdata = &self.staticdata;
         let pending_green_key = self.pending_token.as_ref().map(|(k, _)| *k);
         let max_unroll = self.max_unroll_recursion;
+        let runtime_state = std::cell::RefCell::new((&mut self.warm_state, &mut self.backend));
         let resolver = |n: u64| -> Option<Arc<JitCellToken>> {
             for compiled in compiled_loops.values() {
                 if let Some(tok) = compiled.token.upgrade()
@@ -5523,29 +5533,68 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 }
             }
-            warm_state.find_token_by_number(n)
+            runtime_state.borrow().0.find_token_by_number(n)
         };
-        // recursive-call green-key → token resolver (pyjitpl.py:3593-3599
-        // `get_assembler_token`).  Resolves only already-compiled callees
-        // through `warm_state.get_compiled`; the pending-token convergence
-        // window returns `None` so the dispatcher aborts and retries (a
-        // later slice wires the `compile_tmp_callback` stand-in).
-        let recursive_target =
-            |jd_index: usize, green_values: &[i64]| -> Option<(Arc<JitCellToken>, u64)> {
-                let jd = staticdata.jitdrivers_sd.get(jd_index)?;
-                let spec = jd.green_args_spec();
-                // Resolve to the callee's CELL key before consulting either
-                // index: the token comes off the celltable and the key travels
-                // on to the `CALL_ASSEMBLER` descr, so both must name the cell
-                // the callee's greens own rather than whatever heads its bucket.
-                let green_key = warm_state
-                    .resolve_cell_key(crate::green_key_hash_typed(green_values, &spec), || {
-                        majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone())
-                    });
-                warm_state
-                    .get_compiled(green_key)
-                    .map(|arc| (arc, green_key))
-            };
+        // recursive-call green-key → token resolver (pyjitpl.py
+        // `do_recursive_call` → `direct_assembler_call` →
+        // `warmrunnerstate.get_assembler_token`).  An absent compiled token is
+        // not an abort: upstream installs `compile_tmp_callback` immediately,
+        // so the recursive edge remains a CALL_ASSEMBLER while the real callee
+        // loop is still pending.
+        let recursive_target = |jd_index: usize,
+                                green_values: &[i64]|
+         -> Option<(Arc<JitCellToken>, u64)> {
+            let jd = staticdata.jitdrivers_sd.get(jd_index)?.clone();
+            let spec = jd.green_args_spec();
+            // Resolve to the callee's CELL key before consulting either
+            // index: the token comes off the celltable and the key travels
+            // on to the `CALL_ASSEMBLER` descr, so both must name the cell
+            // the callee's greens own rather than whatever heads its bucket.
+            let green_key = runtime_state
+                .borrow()
+                .0
+                .resolve_cell_key(crate::green_key_hash_typed(green_values, &spec), || {
+                    majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone())
+                });
+            if let Some(token) = runtime_state.borrow().0.get_compiled(green_key) {
+                return Some((token, green_key));
+            }
+            let greenboxes: Vec<Value> = green_values
+                .iter()
+                .zip(spec.iter())
+                .map(|(&value, kind)| match majit_ir::green_type_to_ir(*kind) {
+                    Type::Int => Value::Int(value),
+                    Type::Ref => Value::Ref(GcRef(value as usize)),
+                    Type::Float => Value::Float(f64::from_bits(value as u64)),
+                    Type::Void => Value::Void,
+                })
+                .collect();
+            let red_arg_types = jd.red_arg_types_as_ir_types();
+            let mut state = runtime_state.borrow_mut();
+            let (warm_state, backend) = &mut *state;
+            let token_number = warm_state.alloc_token_number();
+            match warm_state.get_assembler_token(green_key, |memmgr| {
+                compile::compile_tmp_callback(
+                    *backend,
+                    &jd,
+                    token_number,
+                    green_key,
+                    &greenboxes,
+                    &red_arg_types,
+                    Some(memmgr),
+                )
+            }) {
+                Ok(token) => Some((token, green_key)),
+                Err(err) => {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit][recursive-ca] compile_tmp_callback failed for key={green_key}: {err:?}"
+                        );
+                    }
+                    None
+                }
+            }
+        };
         // recursive-call recursive-portal inline decision, sharing
         // `decide_recursive_inline` with `should_inline_core` so the
         // dispatch-side and metainterp-side decisions cannot drift.  The
@@ -5567,7 +5616,9 @@ impl<M: Clone> MetaInterp<M> {
             // one: `decide_recursive_inline` exists to keep this decision and
             // that resolver from drifting, which they would if one asked the
             // celltable about a cell the other never looked at.
-            let green_key = warm_state
+            let green_key = runtime_state
+                .borrow()
+                .0
                 .resolve_cell_key(crate::green_key_hash_typed(green_values, &spec), || {
                     majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone())
                 });
@@ -5580,8 +5631,8 @@ impl<M: Clone> MetaInterp<M> {
             // one, the exact drift `decide_recursive_inline` is meant to prevent.
             let callee_compiled = compiled_loops.contains_key(&green_key)
                 || pending_green_key == Some(green_key)
-                || warm_state.get_compiled(green_key).is_some();
-            let can_inline = warm_state.can_inline_callable(green_key);
+                || runtime_state.borrow().0.get_compiled(green_key).is_some();
+            let can_inline = runtime_state.borrow().0.can_inline_callable(green_key);
             let (decision, _should_disable) = decide_recursive_inline(
                 callee_compiled,
                 can_inline,
@@ -5595,7 +5646,7 @@ impl<M: Clone> MetaInterp<M> {
         // through the JITFRAME-ABI `execute_token_raw` and decode the int
         // FINISH output (mirrors `run_compiled_raw_detailed_with_values`).
         let recursive_exec = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
-            let result = backend.execute_token_raw(token, reds);
+            let result = runtime_state.borrow().1.execute_token_raw(token, reds);
             if result.is_finish {
                 result.outputs.first().copied()
             } else {
@@ -5607,7 +5658,7 @@ impl<M: Clone> MetaInterp<M> {
         // float as `f64::to_bits()`, both into `outputs`), so the int decode
         // shape carries through unchanged.
         let recursive_exec_ref = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
-            let result = backend.execute_token_raw(token, reds);
+            let result = runtime_state.borrow().1.execute_token_raw(token, reds);
             if result.is_finish {
                 result.outputs.first().copied()
             } else {
@@ -5615,7 +5666,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         let recursive_exec_float = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
-            let result = backend.execute_token_raw(token, reds);
+            let result = runtime_state.borrow().1.execute_token_raw(token, reds);
             if result.is_finish {
                 result.outputs.first().copied()
             } else {
@@ -5625,11 +5676,11 @@ impl<M: Clone> MetaInterp<M> {
         // Void runs the callee for its side effects; a finished loop yields
         // `Some(())`, an unfinished one `None`.
         let recursive_exec_void = |token: &JitCellToken, reds: &[Value]| -> Option<()> {
-            let result = backend.execute_token_raw(token, reds);
+            let result = runtime_state.borrow().1.execute_token_raw(token, reds);
             result.is_finish.then_some(())
         };
-        Some(f(
-            tracing,
+        let result = f(
+            &mut tracing,
             &resolver,
             &recursive_target,
             &recursive_decision,
@@ -5637,7 +5688,9 @@ impl<M: Clone> MetaInterp<M> {
             &recursive_exec_ref,
             &recursive_exec_float,
             &recursive_exec_void,
-        ))
+        );
+        self.tracing = Some(tracing);
+        Some(result)
     }
 
     pub fn force_finish_trace_enabled(&self) -> bool {

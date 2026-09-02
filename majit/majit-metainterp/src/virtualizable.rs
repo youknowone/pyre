@@ -954,6 +954,7 @@ impl VirtualizableInfo {
                 None => Some(0),
                 Some(_) => self.identity_live_index,
             },
+            has_vable_token: self.has_vable_token(),
         }
     }
 

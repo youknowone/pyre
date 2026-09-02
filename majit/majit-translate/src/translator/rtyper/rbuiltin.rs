@@ -1511,6 +1511,35 @@ pub(super) fn rtype_we_are_jitted(
     Ok(Some(Hlvalue::Constant(c)))
 }
 
+/// Rust source marker for RPython
+/// `VirtualizableInstanceRepr.hook_access_field`.
+///
+/// Upstream does not call a force helper here: the rtyper emits
+/// `jit_force_virtualizable(vinst, cname, flags)` directly.  Pyre's source
+/// marker carries only the live frame because the redirected field and flags
+/// are already fixed by the gateway.  Preserve that argument and emit the
+/// same Void LLOp; `jtransform.rewrite_op_jit_force_virtualizable` removes it
+/// from looked-inside JIT graphs, while the runtime source body remains the
+/// untranslated execution path.
+pub(super) fn rtype_jit_force_virtualizable(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_frame = hop
+        .args_r
+        .borrow()
+        .first()
+        .and_then(Clone::clone)
+        .ok_or_else(|| {
+            TyperError::message("rtype_jit_force_virtualizable: frame repr missing".to_string())
+        })?;
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_frame.as_ref())])?;
+    hop.exception_cannot_occur()?;
+    Ok(hop.genop("jit_force_virtualizable", vlist, GenopResult::Void))
+}
+
 /// `BigInt::from(i64) -> BigInt` residual lowering, reached through
 /// `BuiltinFunctionRepr.findbltintyper` →
 /// `extregistry.lookup(BigInt.from).specialize_call`
@@ -4694,6 +4723,56 @@ mod tests {
         // nb_args = 0 → should err.
         let err = rtype_builtin_bool(&hop, &HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("rtype_builtin_bool"));
+    }
+
+    /// `rvirtualizable.py:49 VirtualizableInstanceRepr.hook_access_field`
+    /// emits the force for every redirected field.  Pyre spells that hook as a
+    /// callable marker, so this typer is what each frame gateway's force
+    /// resolves to, and its emitted shape is what `jtransform.py:2164-2172
+    /// rewrite_op_jit_force_virtualizable` matches on when it deletes the op
+    /// from a looked-inside graph.  A wrong arity, a lost repr conversion or a
+    /// missing exception declaration would break every gateway silently.
+    #[test]
+    fn rtype_jit_force_virtualizable_emits_a_one_argument_void_llop() {
+        use crate::annotator::model::SomeInteger;
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rint::IntegerRepr;
+
+        let hop = dummy_hop();
+        let frame = Variable::named("v_frame");
+        frame.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(frame));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        let frame_repr: Arc<dyn Repr> =
+            Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int")));
+        hop.args_r.borrow_mut().push(Some(frame_repr));
+
+        // Void genop yields no result variable to the caller.
+        let result = rtype_jit_force_virtualizable(&hop, &HashMap::new()).unwrap();
+        assert!(result.is_none());
+
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the force llop is emitted");
+        assert_eq!(last.opname, "jit_force_virtualizable");
+        assert_eq!(
+            last.args.len(),
+            1,
+            "the marker carries the live frame and nothing else",
+        );
+        match &last.args[0] {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("the frame argument must stay a Variable, got {other:?}"),
+        }
+        match &last.result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Void)),
+            other => panic!("the force result must be a Void Variable, got {other:?}"),
+        }
+        assert!(
+            llops._called_exception_is_here_or_cannot_occur,
+            "the typer must declare that the force cannot raise",
+        );
     }
 
     #[test]

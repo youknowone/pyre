@@ -868,6 +868,25 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         } else {
             quote! {}
         };
+    let fresh_entry_vable_capacity_pushes: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let len_value_name = quote::format_ident!("{}_len_value", f.name);
+            quote! { __capacities.push(self.#len_value_name); }
+        })
+        .collect();
+    let recursive_fresh_entry_vable_capacities_override: TokenStream =
+        if num_ref_scalars == 0 && num_float_scalars == 0 && opaque_fields.is_empty() {
+            quote! {
+                fn recursive_fresh_entry_vable_capacities(&self) -> Option<Vec<i64>> {
+                    let mut __capacities = Vec::new();
+                    #(#fresh_entry_vable_capacity_pushes)*
+                    Some(__capacities)
+                }
+            }
+        } else {
+            quote! {}
+        };
 
     // Recursive CALL_ASSEMBLER portal entry for host allocation and release
     // The compiled caller loop cannot `New` a host `#state_type` through the
@@ -2807,6 +2826,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
 
             #recursive_fresh_entry_reds_override
+            #recursive_fresh_entry_vable_capacities_override
 
             #recursive_fresh_alloc_free_targets_override
         }

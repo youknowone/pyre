@@ -82,7 +82,32 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// `#[inline(never)]` keeps the callee name on the Call so the rewrite can
 /// see it.
 ///
-/// # Reach, and why the readers do not carry it
+/// # Reach: gateways, not redirected-array readers
+///
+/// Manual frame getset gateways publish their bodies through
+/// `gateway::BUILTIN_WRAPPER_DESCRIPTORS`, the Rust counterpart of
+/// `BuiltinCode.func`'s SomePBC family.  The untranslated interpreter retains
+/// the force, while `jtransform` deletes it from every gateway graph admitted
+/// by the codewriter — the same two populations `hook_access_field` creates
+/// upstream.
+///
+/// Which gateways carry it starts from `hook_access_field`'s own condition,
+/// `if self.my_redirected_fields.get(cname.value)` — and the redirected set is
+/// the one `pyre-jit-trace` `virtualizable_gen.rs` declares, not
+/// `interp_jit.py`'s string list: `last_instr`, `pycode`, `valuestackdepth`,
+/// `debugdata` and the `locals_cells_stack_w` array (`w_globals` is skipped;
+/// no `PyFrame` field answers to it).  `pyframe.rs`
+/// `__majit_wrap_descr_typecheck_fget_f_back` and `..._fget_f_builtins` read
+/// `f_backref` and `w_builtin`, so they carry none.
+///
+/// A hand-placed marker owes one question upstream's injection never has to
+/// ask, because it fires at every access in every graph rather than once per
+/// gateway: can the trace's shadow and the live frame disagree about the field
+/// this body reads?  For `pycode` they cannot — it is written only at frame
+/// construction — so `__majit_wrap_descr_typecheck_fget_f_code` carries no
+/// marker either.
+/// Each of the three says so at its own definition, with what the marker
+/// measured.
 ///
 /// Upstream reaches the rewrite because `hook_access_field` puts the marker
 /// at every redirected FIELD access, which lands it inside graphs the
@@ -110,9 +135,9 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// `__majit_wrap_descr_typecheck_fget_getdictscope` gateway, so a marker at the readers
 /// is redundant where it would matter and new only where it costs.
 ///
-/// So the readers carry no force.
+/// So the redirected-array readers carry no force.
 ///
-/// The other force sites call [`force_frame`] or
+/// Non-gateway force sites call [`force_frame`] or
 /// [`force_frame_before_locals_read`] directly, and only two of them sit in
 /// a graph that has a jitcode — `pyframe.rs`
 /// `FrameLocalsProxy::force_locals` and `builtins.rs`

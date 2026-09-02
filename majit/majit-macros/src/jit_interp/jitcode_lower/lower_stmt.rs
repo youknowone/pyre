@@ -1416,6 +1416,12 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_record_known_result(expr) {
             return Some(());
         }
+        // Loop-carried local updates have to write their existing physical
+        // register; rebinding would leave an already-emitted loop header
+        // reading the pre-update register.
+        if let Some(()) = self.lower_local_update(expr) {
+            return Some(());
+        }
         // Local variable reassignment: `pc = expr` or `stackok = expr`.
         // Rebinds an already-known local to a freshly-lowered RHS value.
         if let Some(()) = self.lower_local_reassign(expr) {
@@ -2411,7 +2417,7 @@ impl<'c> Lowerer<'c> {
 /// plain-ident green names a caller local that a statement can assign to, so a
 /// field or index spelling is skipped rather than flattened to a bare name that
 /// would collide with an unrelated local of that name.
-fn green_idents(config: &LowererConfig) -> Vec<String> {
+pub(super) fn green_idents(config: &LowererConfig) -> Vec<String> {
     config
         .greens
         .iter()

@@ -103,7 +103,7 @@ impl OldGen {
             rawmalloced_pages_freed: 0,
             rawmalloced_total_size: 0,
             rawmalloced_peak_size: 0,
-            poison_on_alloc: std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some(),
+            poison_on_alloc: crate::gc_nursery_poison_enabled(),
         }
     }
 

@@ -148,6 +148,13 @@ impl<'c> Lowerer<'c> {
         if let Some(binding) = self.lower_vable_array_len(expr) {
             return Some(binding);
         }
+        // RPython call.py passes the virtualizable object itself to residual
+        // helpers. Rust spells that object argument `&mut state`; preserve the
+        // existing ref register instead of trying to manufacture a raw array
+        // pointer from a redirected virtualizable field.
+        if let Some(binding) = self.lower_vable_reference(expr) {
+            return Some(binding);
+        }
         // RPython jtransform.py:655 — suppress hint_access_directly(frame) /
         // hint_fresh_virtualizable(frame) function calls as identity.
         // These return the frame unchanged, so lower the argument instead.
@@ -169,6 +176,26 @@ impl<'c> Lowerer<'c> {
                 ..
             }) => {
                 let value = int_lit.base10_parse::<i64>().ok()?;
+                let reg = self.alloc_reg();
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(reg)]),
+                    quote! { __builder.load_const_i_value(#reg, #value); },
+                );
+                Some(Binding {
+                    reg,
+                    kind: BindingKind::Int,
+                    depends_on_stack: false,
+                    struct_type: None,
+                })
+            }
+            // RPython's bytecode loops compare `ord(code[p])` with integer
+            // character constants. Rust spells the same one-byte constant as
+            // `b'['`; it belongs on the int channel with its `u8` value.
+            Expr::Lit(ExprLit {
+                lit: Lit::Byte(byte_lit),
+                ..
+            }) => {
+                let value = i64::from(byte_lit.value());
                 let reg = self.alloc_reg();
                 self.emit_op(
                     OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(reg)]),
@@ -760,6 +787,64 @@ impl<'c> Lowerer<'c> {
         }
         let binding = self.lower_value_expr(&assign.right)?;
         self.bindings.insert(lhs_ident, binding);
+        Some(())
+    }
+
+    /// Lower a compound update of an existing local into that local's
+    /// physical register: `need -= 1`, `target += offset`, and so on.
+    ///
+    /// This must not allocate and rebind an SSA-like result. A local carried
+    /// around a translated `while` back-edge is read from the register that
+    /// existed when the loop header was emitted; changing the binding after
+    /// the body has been lowered would leave the header reading the stale
+    /// value. RPython's `BrainInterpreter.interp_char` bracket scans depend on
+    /// these loop-carried updates.
+    pub(super) fn lower_local_update(&mut self, expr: &Expr) -> Option<()> {
+        let Expr::Binary(binary) = expr else {
+            return None;
+        };
+        let Expr::Path(lhs_path) = &*binary.left else {
+            return None;
+        };
+        let lhs_ident = lhs_path.path.get_ident()?.to_string();
+        // `lower_expr_stmt` reaches this before `lower_stmt_fallback`, so the
+        // green-write refusal there never sees the statement.  A green is a
+        // caller local threaded through the merge point: writing it into this
+        // body's own register drops the advance instead of carrying it back,
+        // and the arm then records, compiles and answers with a stale green.
+        // The sub-JitCode paths that legitimately advance a green take it
+        // through `pc_return_increment`, which removes the statement before
+        // lowering, so refusing here cannot reach them.
+        if let Some(config) = self.config
+            && super::lower_stmt::green_idents(config).contains(&lhs_ident)
+        {
+            return None;
+        }
+        let lhs = self.bindings.get(&lhs_ident)?.clone();
+        let (op_kind, opcode) = match lhs.kind {
+            BindingKind::Int => (OpKind::BinopI, opcode_for_assign_binop(&binary.op)?),
+            BindingKind::Float => (OpKind::BinopF, opcode_for_assign_binop_f(&binary.op)?),
+            BindingKind::Ref => return None,
+        };
+        let rhs = self.lower_value_expr(&binary.right)?;
+        if lhs.kind != rhs.kind {
+            return None;
+        }
+
+        let tokens = match lhs.kind {
+            BindingKind::Int => binop_i_emit_tokens(lhs.reg, &opcode, lhs.reg, rhs.reg),
+            BindingKind::Float => binop_f_emit_tokens(lhs.reg, &opcode, lhs.reg, rhs.reg),
+            BindingKind::Ref => return None,
+        };
+        let register = Register::new(lhs.kind, lhs.reg);
+        self.emit_op(
+            OpMeta::linear(
+                op_kind,
+                vec![register, Register::from_binding(&rhs)],
+                vec![register],
+            ),
+            tokens,
+        );
         Some(())
     }
 
@@ -2416,6 +2501,49 @@ mod tests {
             depends_on_stack: false,
             struct_type: None,
         }
+    }
+
+    #[test]
+    fn loop_carried_local_update_writes_the_existing_register() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("need".to_string(), binding(3, BindingKind::Int));
+        let expr: Expr = syn::parse_str("need -= 1").expect("parse local update");
+
+        assert_eq!(lowerer.lower_local_update(&expr), Some(()));
+
+        assert_eq!(lowerer.op_metadata[0].kind, OpKind::LoadConstI);
+        let op = &lowerer.op_metadata[1];
+        assert_eq!(op.kind, OpKind::BinopI);
+        assert_eq!(op.reads[0], Register::int(3));
+        assert_eq!(op.writes, vec![Register::int(3)]);
+        assert_eq!(lowerer.bindings["need"].reg, 3);
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("IntSub"));
+    }
+
+    #[test]
+    fn byte_literal_uses_the_integer_constant_channel() {
+        let mut lowerer = Lowerer::new(None);
+        let expr: Expr = syn::parse_str("b']'").expect("parse byte literal");
+
+        let binding = lowerer
+            .lower_value_expr(&expr)
+            .expect("byte literal lowers");
+
+        assert_eq!(binding.kind, BindingKind::Int);
+        assert_eq!(lowerer.op_metadata[0].kind, OpKind::LoadConstI);
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(emitted.contains("93i64"));
     }
 
     #[test]

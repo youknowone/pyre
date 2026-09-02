@@ -1345,6 +1345,49 @@ fn analyze_pipeline_from_module_paths(
     // `front::mir::collect_unsafe_fn_stubs_from_llbc`, populated on the
     // SemanticProgram in `build_semantic_program_via_active_frontend`.
     call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();
+    // `rpython.rtyper.extregistry.register_external` parity for the three
+    // shadow-stack operations `eval::FrameAnchor` reaches.  `majit_gc` is not
+    // one of the crates lowered by `scripts/extract-llbc.py` (see the
+    // canmallocgc census below), so these safe free functions have neither a
+    // graph nor an unsafe-declaration stub.  Leaving them undeclared poisons
+    // `FrameAnchor::from_raw`'s CallRegistry entry, which in turn rejects
+    // every frame getset gateway before the codewriter can remove its
+    // `jit_force_virtualizable` marker.
+    //
+    // These entries use the existing annotator-only stub carrier: it supplies
+    // the declared signature/result shell but never adds a codewriter graph.
+    // The matching runtime addresses are published by
+    // `pyre_interpreter::jit_trace_fnaddrs`, exactly like an RPython
+    // `register_external` declaration is paired with its linker symbol.
+    use crate::flowspace::argument::Signature;
+    call_control.unsafe_fn_stubs.extend([
+        (
+            vec!["majit_gc".into(), "shadow_stack".into(), "push".into()],
+            Signature::new(vec!["gcref".into()], None, None),
+            // `shadow_stack::push` returns the native-word stack index
+            // (`usize`).  Stub results use the front end's canonical semantic
+            // tokens (`dont_look_inside_return_token` maps `Unsigned` to
+            // `u64`), not literal Rust type spellings.  RPython's
+            // shadow-stack top/depth is likewise a non-negative machine word;
+            // using the signed `i64` token makes `FrameAnchor.depth` merge
+            // `SomeInteger` with `r_uint` at its readers.
+            Some("u64".into()),
+        ),
+        (
+            vec!["majit_gc".into(), "shadow_stack".into(), "get".into()],
+            Signature::new(vec!["depth".into()], None, None),
+            Some("gcref".into()),
+        ),
+        (
+            vec![
+                "majit_gc".into(),
+                "shadow_stack".into(),
+                "try_pop_to".into(),
+            ],
+            Signature::new(vec!["depth".into()], None, None),
+            None,
+        ),
+    ]);
     // Parallel carrier for foreign opaque-ADT method externals
     // (`<BigInt as Add>::add`, …) — `populate_call_registry_from_call_graphs`
     // registers each as an opaque external so the residual `FunctionPath`

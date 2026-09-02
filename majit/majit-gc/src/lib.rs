@@ -220,14 +220,16 @@ pub fn gc_freelist_diag_enabled() -> bool {
     *ENABLED
 }
 
-/// `MAJIT_GC_NURSERY_POISON` — the poison-word audit the resume-root
-/// registration runs over the slice it is handed.
+/// `MAJIT_GC_NURSERY_POISON` — fill recycled nursery and old-gen memory with a
+/// poison word, and audit the slice the resume-root registration is handed.
 ///
 /// Read once, for the reason [`gc_lifetime_log_enabled`] gives, and with a
 /// sharper case: the gate sits in `shadow_stack::push_resume_ref_roots`, which
 /// every blackhole resume calls once per rebuilt frame and once per virtuals
 /// cache, and `std::env::var_os` takes the environment lock and scans it
-/// linearly whether or not the variable is set.
+/// linearly whether or not the variable is set.  The arena and old-gen
+/// constructors ask once each and could read the environment directly; routing
+/// them through the same accessor keeps all three readers on one answer.
 pub fn gc_nursery_poison_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some());

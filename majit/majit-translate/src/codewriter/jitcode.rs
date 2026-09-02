@@ -311,10 +311,9 @@ pub struct JitCode {
     /// Memoized verdicts derived from `body`, not assembled into it, so they
     /// are recomputed rather than serialized. Each is a static property of the
     /// body, so the memo travels with the body it describes instead of sitting
-    /// in a map keyed beside it. It is not shared across threads: the runtime
-    /// jitcode table is itself per-thread (`jitcode_runtime.rs JITCODE_CELLS`,
-    /// which cites the GIL for that shape), so a thread that decodes its own
-    /// `JitCode` computes its own answer.
+    /// in a map keyed beside it. The runtime publishes each frozen JitCode once
+    /// process-wide, matching `MetaInterpStaticData.jitcodes`, so all execution
+    /// contexts share the memoized answer.
     #[serde(skip)]
     derived: DerivedBodyFacts,
 }

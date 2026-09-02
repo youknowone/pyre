@@ -19,13 +19,19 @@
 #     sub-walk and the single-frame arm would take it;
 #   - the CALLER's depth, `_gf(1)`.  `try_walker_specialize_sys_getframe` takes
 #     only depth 0 at the top walk level, where getframe's answer IS the portal
-#     virtualizable and no force is needed -- so a zero-argument call, which is
-#     what this fixture used to carry, now escapes nothing at all and the
-#     baselines went to `fbw_blackhole_adopted_multi_frame=0`.  Depth 1 names a
-#     frame the specialization refuses, so the call stays residual and forces;
-#   - nothing read off the returned frame: the read accessors force nothing
-#     either -- `fast2locals` is `@jit.unroll_safe` -- so a read would add
-#     opcodes without adding an escape.
+#     virtualizable, so a zero-argument call names a frame the walk already
+#     holds and the baselines went to `fbw_blackhole_adopted_multi_frame=0`.
+#     Depth 1 names a frame the specialization refuses, so the call stays
+#     residual and hands the traced virtualizable to the interpreter;
+#   - a read of `f_lasti` off the frame it returns.  `getframe` takes no
+#     virtualizable force of its own; `rvirtualizable.py hook_access_field`
+#     places one at each REDIRECTED field access, and `virtualizable_gen.rs`
+#     declares that set as `last_instr`, `pycode`, `valuestackdepth`,
+#     `debugdata` and `locals_cells_stack_w`.  `f_lasti` reads `last_instr`, so
+#     its gateway forces.  A bare call forces nothing, and neither does a read
+#     of `f_code` or `f_back`: `pyframe.rs`
+#     `__majit_wrap_descr_typecheck_fget_f_code` and `..._fget_f_back` each say
+#     at their own definition why they carry no marker.
 # Changing any of the three can silently stop exercising the path.
 #
 # The printed total counts one callee entry per iteration, so a resume that
@@ -37,7 +43,7 @@ _gf = sys._getframe
 
 
 def leaf(x):
-    _gf(1)
+    _ = _gf(1).f_lasti
     return x + 1
 
 

@@ -12491,7 +12491,7 @@ mod tests {
     use pyre_object::floatobject::w_float_get_value;
     use pyre_object::listobject::w_list_getitem;
     use pyre_object::pyobject::{INT_TYPE, PyType, is_list};
-    use std::cell::{Cell, UnsafeCell};
+    use std::cell::UnsafeCell;
 
     #[test]
     fn reconstructed_ref_slot_does_not_invent_color_in_mapped_frame() {
@@ -12502,8 +12502,8 @@ mod tests {
         assert_eq!(reconstructed_ref_slot_color(&[], 1), Some(1));
     }
 
+    static TEST_CALLBACKS_INIT: std::sync::Once = std::sync::Once::new();
     thread_local! {
-        static TEST_CALLBACKS_INIT: Cell<bool> = const { Cell::new(false) };
         static TEST_JIT_DRIVER: UnsafeCell<crate::driver::JitDriverPair> = UnsafeCell::new({
             let info = crate::frame_layout::build_pyframe_virtualizable_info();
             let mut driver = majit_metainterp::JitDriver::new(1);
@@ -12890,11 +12890,7 @@ mod tests {
     }
 
     fn ensure_test_callbacks() {
-        TEST_CALLBACKS_INIT.with(|init| {
-            if init.get() {
-                return;
-            }
-            init.set(true);
+        TEST_CALLBACKS_INIT.call_once(|| {
             let cb = Box::leak(Box::new(crate::callbacks::CallJitCallbacks {
                 callee_frame_helper: |_| None,
                 recursive_force_cache_safe: |_| false,
@@ -12916,6 +12912,17 @@ mod tests {
             }));
             crate::callbacks::init(cb);
         });
+    }
+
+    #[test]
+    fn callback_table_is_visible_to_new_threads() {
+        ensure_test_callbacks();
+        assert!(
+            std::thread::spawn(|| crate::callbacks::try_get().is_some())
+                .join()
+                .unwrap(),
+            "process-global MetaInterpStaticData callbacks disappeared on a new thread"
+        );
     }
 
     /// Install the real `hash_w` and `hash_str` on this test thread so

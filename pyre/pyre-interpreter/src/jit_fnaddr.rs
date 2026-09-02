@@ -62,6 +62,25 @@ impl<T> ResidualSlot for *mut T {}
 impl<T> ResidualRet for *const T {}
 impl<T> ResidualRet for *mut T {}
 
+/// Word-ABI bridges for the three shadow-stack operations `eval::FrameAnchor`
+/// reaches.  `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so
+/// each of the raw functions is `(usize) -> usize`, `(usize) -> usize` and
+/// `(usize) -> ()` — and `usize` is 32-bit on wasm32.  A residual call whose
+/// descr types are all words lowers to an in-module `(i64xn) -> i64` (or
+/// `(i64xn) -> ()`) `call_indirect`, which type-checks its callee on every
+/// call, so the raw functions are a different table type there.
+extern "C" fn shadow_stack_push_word(gcref: i64) -> i64 {
+    majit_gc::shadow_stack::push(majit_ir::GcRef(gcref as usize)) as i64
+}
+
+extern "C" fn shadow_stack_get_word(index: i64) -> i64 {
+    majit_gc::shadow_stack::get(index as usize).as_usize() as i64
+}
+
+extern "C" fn shadow_stack_try_pop_to_word(depth: i64) {
+    majit_gc::shadow_stack::try_pop_to(depth as usize);
+}
+
 /// Word-ABI bridge for the scalar bytecode read used by translated residual
 /// calls.  The backends call integer helpers uniformly as `(i64, ..) -> i64`;
 /// the raw Rust function is `(pointer, usize) -> u16`, which is a different
@@ -835,6 +854,28 @@ pub fn is_abi_unsound_argument_residual(addr: usize) -> bool {
 fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     let mut entries = Vec::new();
     let mut abi_unsound_arguments = Vec::new();
+
+    // `eval::FrameAnchor` is interpreter runtime rooting, outside the LLBC
+    // module set.  `majit-translate` declares these three functions through
+    // its annotator-only `register_external` carrier; publish an address for
+    // each declared path here so a residual call never falls back to a
+    // symbolic hash.  The addresses are the word-ABI bridges above, not the
+    // raw functions, for the reason their doc gives.
+    cp1(
+        &mut entries,
+        "majit_gc::shadow_stack::push",
+        shadow_stack_push_word,
+    );
+    cp1(
+        &mut entries,
+        "majit_gc::shadow_stack::get",
+        shadow_stack_get_word,
+    );
+    cp1(
+        &mut entries,
+        "majit_gc::shadow_stack::try_pop_to",
+        shadow_stack_try_pop_to_word,
+    );
 
     pa1(
         &mut entries,
@@ -4680,7 +4721,8 @@ mod tests {
     use super::{
         is_abi_unsound_argument_residual, is_list_write_barrier, is_pyframe_operand_stack_accessor,
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
-        jit_trace_fnaddrs,
+        jit_trace_fnaddrs, shadow_stack_get_word, shadow_stack_push_word,
+        shadow_stack_try_pop_to_word,
     };
     use std::collections::HashMap;
 
@@ -4757,6 +4799,55 @@ mod tests {
             list_append
         );
         assert_eq!(bindings["pyre_object::jit_list_append"], list_append);
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_frame_anchor_shadow_stack_externals() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for (path, expected) in [
+            (
+                "majit_gc::shadow_stack::push",
+                shadow_stack_push_word as *const () as usize as i64,
+            ),
+            (
+                "majit_gc::shadow_stack::get",
+                shadow_stack_get_word as *const () as usize as i64,
+            ),
+            (
+                "majit_gc::shadow_stack::try_pop_to",
+                shadow_stack_try_pop_to_word as *const () as usize as i64,
+            ),
+        ] {
+            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+        }
+    }
+
+    /// The three published addresses answer through the word ABI a residual
+    /// call reaches them with, and the round trip preserves the reference.
+    ///
+    /// Calling each through its registry address, transmuted to the signature
+    /// the lowering emits, is what an in-module `call_indirect` does; a raw
+    /// `(usize) -> usize` published here would be a different wasm32 table
+    /// type and trap there while still passing an address comparison.
+    #[test]
+    fn the_shadow_stack_externals_answer_through_the_word_abi() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let addr = |path: &str| *bindings.get(path).expect("registered") as usize;
+        let push: extern "C" fn(i64) -> i64 =
+            unsafe { std::mem::transmute(addr("majit_gc::shadow_stack::push")) };
+        let get: extern "C" fn(i64) -> i64 =
+            unsafe { std::mem::transmute(addr("majit_gc::shadow_stack::get")) };
+        let try_pop_to: extern "C" fn(i64) =
+            unsafe { std::mem::transmute(addr("majit_gc::shadow_stack::try_pop_to")) };
+
+        // A word that is not a live object: these three only move it between
+        // the stack and the caller.
+        let marker = 0x2468_i64;
+        let depth = push(marker);
+        assert_eq!(get(depth), marker);
+        try_pop_to(depth);
+        assert_eq!(push(marker), depth, "try_pop_to left the depth unrestored");
+        try_pop_to(depth);
     }
 
     /// Two registered functions must never share an address.

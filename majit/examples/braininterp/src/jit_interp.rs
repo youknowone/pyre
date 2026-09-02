@@ -150,7 +150,21 @@ fn mainloop(program: &Bytecode, threshold: u32) -> String {
                 }
             }
             b']' if state.tape[state.pointer as usize] != 0 => {
-                let target = find_matching_open(program, pc);
+                // RPython `BrainInterpreter.interp_char` keeps this scan in
+                // the opcode body, so the translator sees the loop and its
+                // loop-carried locals instead of an opaque slice helper.
+                let mut need: i32 = 1;
+                let mut target = pc - 1;
+                while need > 0 {
+                    if program[target] == b']' {
+                        need += 1;
+                    } else if program[target] == b'[' {
+                        need -= 1;
+                    }
+                    if need > 0 {
+                        target -= 1;
+                    }
+                }
                 if target < pc {
                     can_enter_jit!(driver, target, &mut state, program, || {});
                 }
@@ -290,8 +304,6 @@ mod tests {
     use super::*;
 
     use crate::interp;
-    use majit_metainterp::{RefusalKind, refusal_kind};
-
     static PROBE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// Run `prog` and return only its output.
@@ -344,11 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn jit_tier_aborts_in_the_loop_arm_stub() {
+    fn jit_tier_closes_the_brainfuck_loop() {
         const A: u8 = 7;
         const B: u8 = 3;
         let prog = multiply_gate_bf(A, B);
-        let (got, compiles, ops_before, ops_after, _shape) = compile_probe(&prog);
+        let (got, compiles, ops_before, ops_after, shape) = compile_probe(&prog);
 
         // The interpreter must still answer correctly whatever the tier does.
         assert_eq!(
@@ -370,77 +382,23 @@ mod tests {
             .filter(|a| a.interp == "BfState")
             .collect();
         let degraded: Vec<&str> = bf_arms.iter().map(|a| a.arm).collect();
-        assert_eq!(
-            degraded,
-            vec!["b'['", "b']'"],
-            "degraded dispatch arms moved — every trace reaching one aborts"
-        );
-
-        // The CAUSE, which the name set above cannot see: an arm can keep
-        // degrading for an entirely different reason. See tl's `jit_tier_is_alive`
-        // for the measurement that motivated this — three A/B arms whose name
-        // sets and pass counts were identical while the mechanism changed.
-        let causes: Vec<(&str, RefusalKind)> = bf_arms
-            .iter()
-            .map(|a| (a.arm, refusal_kind(a.reason)))
-            .collect();
-        assert_eq!(
-            causes,
-            [
-                ("b'['", RefusalKind::GreenWriteback),
-                ("b']'", RefusalKind::UnlowerableStmt)
-            ],
-            "an arm still degrades, but a different mechanism is refusing it now"
-        );
-        let bracket = bf_arms
-            .iter()
-            .find(|a| a.arm == "b'['")
-            .expect("b'[' is in the set asserted immediately above");
-        let close = bf_arms
-            .iter()
-            .find(|a| a.arm == "b']'")
-            .expect("b']' is in the set asserted immediately above");
         assert!(
-            close.reason.contains("find_matching_open(program, pc)"),
-            "b']' refusal no longer names the unsupported matching-bracket call: {}",
-            close.reason
+            degraded.is_empty(),
+            "a braininterp opcode body still installs an abort stub: {bf_arms:?}"
         );
         assert!(
-            close.reason.contains("pc = target"),
-            "b']' refusal no longer preserves the trailing green writeback: {}",
-            close.reason
+            compiles > 0,
+            "the bracket arms lower, but the hot Brainfuck loop compiled nothing"
         );
         assert!(
-            bracket.reason.contains("while need > 0"),
-            "b'[' refusal no longer names the unsupported scan loop: {}",
-            bracket.reason
+            shape.closes_a_loop(),
+            "the compiled body does not close a loop: {}",
+            shape.why_not().unwrap_or("closes a loop")
         );
 
-        // THE ASSERTION THAT DISCRIMINATES, and the one to replace rather than
-        // re-record. `b']'` is the loop arm, so every trace that reaches the
-        // loop aborts in its stub and nothing is ever compiled.
-        //
-        // IF THIS FAILS, the loop arm lowers and the tier has come alive. Do
-        // NOT re-record it: replace this whole gate with a liveness gate
-        // asserting `shape.closes_a_loop()`, which is the property a segmented
-        // or aborted trace can never satisfy.
-        assert_eq!(
-            compiles, 0,
-            "multiply({A}*{B}) compiled {compiles} loops. This crate's loop arm \
-             `b']'` is an abort stub, so no trace should survive to be compiled. \
-             A non-zero count means either the arm lowers now — replace this gate \
-             with `assert!(shape.closes_a_loop())` — or another test entered the \
-             JIT inside this probe's window without taking PROBE_LOCK"
-        );
-
-        // No assertion on `ops_after` or on the fold ratio, deliberately. With
-        // nothing compiled they are both 0, and an assertion over a value that
-        // is structurally 0 is the same species of oracle-that-cannot-fail this
-        // gate was rebuilt to stop making. `ops_before` is reported, not pinned,
-        // for the same reason.
         println!(
-            "[tier-aborting] multiply({A}*{B}) = {cell} from the interpreter \
-             alone, {compiles} loops compiled, {ops_before} ops recorded, \
+            "[tier-live] multiply({A}*{B}) = {cell}, {compiles} loops compiled, \
+             {ops_before} ops recorded, \
              {ops_after} after opt, degraded {degraded:?}"
         );
     }

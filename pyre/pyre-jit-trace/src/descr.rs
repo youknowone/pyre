@@ -2337,6 +2337,20 @@ static W_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 true,
                 false,
             ),
+            // The cell a frame constructor allocates is emitted inline
+            // ([`crate::helpers::emit_new_cell_inline`]) and can escape a guard
+            // and be materialized, so the header class `w_cell_new` stamps has
+            // to be a proper virtual field of this group -- the same reason
+            // `W_Super` carries one.
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "Cell",
         "nestedscope::Cell",
@@ -3891,6 +3905,28 @@ pub fn object_mutable_cell_value_descr() -> DescrRef {
 /// residual `bh_call_fn(locals)` whose frame force loses the enclosing loop.
 pub fn cell_contents_descr() -> DescrRef {
     field_descr_from_group(&W_CELL_DESCR_GROUP, 0)
+}
+
+/// `nestedscope.py Cell.family` — the [`pyre_object::nestedscope::CellFamily`]
+/// every cell of one cellvar shares.  Immutable per
+/// `_immutable_fields_ = ['family']`, and a leaked (untraced) address rather
+/// than a managed reference, so the descriptor spells it `Type::Int`.
+pub fn cell_family_descr() -> DescrRef {
+    field_descr_from_group(&W_CELL_DESCR_GROUP, 1)
+}
+
+/// Inherited `PyObject.w_class` on a `Cell` — kept in this group for the same
+/// reason [`super_header_w_class_descr`] is kept in the `W_Super` one.
+pub fn cell_header_w_class_descr() -> DescrRef {
+    field_descr_from_group(&W_CELL_DESCR_GROUP, 2)
+}
+
+/// Size descriptor for `nestedscope.py Cell` allocation via `NewWithVtable`
+/// (vtable = `&CELL_TYPE`); `family` and the inherited header `w_class` are
+/// `SetfieldGc`'d after, while `contents` keeps the null a virtual reads for
+/// an unwritten reference field.
+pub fn w_cell_size_descr() -> DescrRef {
+    W_CELL_DESCR_GROUP.size_descr.clone()
 }
 
 /// `descriptor.py W_Super.w_starttype` — the class `super()` was given, whose
@@ -5973,6 +6009,44 @@ mod tests {
                      born holding recycled nursery bytes",
                 );
             }
+        }
+    }
+
+    /// The same recycled-nursery-bytes rule, for the cell the inline frame
+    /// builder allocates per pure cellvar: `family` is a `Type::Int` slot
+    /// `clear_gc_fields` does not reach, and a cell born with a recycled word
+    /// there hands `try_walker_specialize_load_deref` a `CellFamily` address
+    /// to dereference that no `CellFamily` ever occupied.
+    #[test]
+    fn inline_cell_emitter_stores_every_scalar_cell_field() {
+        let mut ctx = majit_metainterp::TraceCtx::for_test(0);
+        let family = ctx.const_int(0);
+        let header_w_class = ctx.const_ref(0);
+        crate::helpers::emit_new_cell_inline(&mut ctx, family, header_w_class);
+        let stored: std::collections::BTreeSet<usize> = ctx
+            .into_recorder()
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == majit_ir::OpCode::SetfieldGc)
+            .filter_map(|op| {
+                let descr = op.descr.borrow();
+                descr.as_ref()?.as_field_descr().map(FieldDescr::offset)
+            })
+            .collect();
+        let scalars: Vec<(&str, usize)> = W_CELL_DESCR_GROUP
+            .field_descrs
+            .iter()
+            .filter(|d| d.field_type() != Type::Ref)
+            .map(|d| (d.field_name(), d.offset()))
+            .collect();
+        // `family`: a census that found none is reading the wrong group.
+        assert!(!scalars.is_empty(), "scalar field census is vacuous");
+        for (name, offset) in &scalars {
+            assert!(
+                stored.contains(offset),
+                "emit_new_cell_inline stores no {name} (offset {offset}), so the field \
+                 is born holding recycled nursery bytes",
+            );
         }
     }
 

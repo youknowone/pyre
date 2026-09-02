@@ -13,14 +13,17 @@
 # `kept.f_back` below does. A run that prints the right names proves nothing
 # unless the fixture actually reaches the path, so keep the `while` drive.
 #
-# The escape is the SECOND getframe call, at the CALLER's depth.  The captured
-# `kept = _gf()` cannot be it: `try_walker_specialize_sys_getframe` takes depth
-# 0 at the top walk level, where getframe's answer IS the portal virtualizable
-# and no force is needed, so that call escapes nothing -- and the depth-0
-# capture is what makes `kept.f_back` name `main`, so it has to stay.  `_gf(1)`
-# names a frame the specialization refuses, keeping one forcing residual per
-# iteration.  Delete it and the adopt goes back to zero while the printed line
-# stays right.
+# The escape is the `f_lasti` read on the SECOND getframe call, at the CALLER's
+# depth.  The captured `kept = _gf()` cannot be it:
+# `try_walker_specialize_sys_getframe` takes depth 0 at the top walk level,
+# where getframe's answer IS the portal virtualizable, so that call escapes
+# nothing -- and the depth-0 capture is what makes `kept.f_back` name `main`, so
+# it has to stay.  `_gf(1)` names a frame the specialization refuses, keeping
+# one residual per iteration, and the read is what forces it: `getframe` takes
+# no virtualizable force of its own, `rvirtualizable.py hook_access_field`
+# places one at each REDIRECTED field access, and `f_lasti` reads `last_instr`.
+# Drop either half and the adopt goes back to zero while the printed line stays
+# right.
 import sys
 
 _gf = sys._getframe
@@ -31,7 +34,7 @@ kept = None
 def leaf(x):
     global kept
     kept = _gf()
-    _gf(1)
+    _ = _gf(1).f_lasti
     return x + 1
 
 

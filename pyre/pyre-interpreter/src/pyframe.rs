@@ -3074,7 +3074,10 @@ pub fn code_flags_make_generator(flags: crate::CodeFlags) -> bool {
 /// hand rather than by `#[pyre_methods]`, the wrapper still has to spell it —
 /// otherwise it publishes an address, binds at runtime, joins no family, and
 /// the deletion above never runs on anything, because the codewriter never
-/// looks inside this graph at all.
+/// looks inside this graph at all.  Every frame getset below carries it for
+/// the same reason, and `jit_fnaddr.rs`
+/// `every_builtin_wrapper_descriptor_carries_the_family_prefix` is the census
+/// that keeps them there.
 pub fn __majit_wrap_descr_typecheck_fget_getdictscope(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -3087,39 +3090,94 @@ pub fn __majit_wrap_descr_typecheck_fget_getdictscope(
     unsafe { &mut *anchor.live() }.fget_getdictscope()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
-#[allow(non_upper_case_globals)]
-static __majit_builtin_wrapper_target_fget_getdictscope: crate::gateway::BuiltinWrapperDescriptor =
-    crate::gateway::BuiltinWrapperDescriptor {
-        path: concat!(
-            module_path!(),
-            "::",
-            stringify!(__majit_wrap_descr_typecheck_fget_getdictscope)
-        ),
-        func: __majit_wrap_descr_typecheck_fget_getdictscope,
+/// Publish a hand-written frame getset wrapper in the same immutable function
+/// family `#[pyre_methods]` generates for interp2app wrappers.
+///
+/// PyPy's `BuiltinCode.func` is a PBC: every wrapper body is a candidate graph
+/// of the indirect call, including the `jit_force_virtualizable` that rtyping
+/// injected immediately before a redirected field access.  Rust erases the
+/// function identity to `BuiltinCodeFn`; omitting one wrapper here therefore
+/// makes that descriptor opaque to the codewriter and leaves the runtime force
+/// inside a `CALL_MAY_FORCE`.  Keep every manual frame descriptor in one list
+/// so `f_locals` cannot be the only orthodox member by accident.
+macro_rules! register_frame_builtin_wrapper {
+    ($static_name:ident, $func:ident) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        #[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+        #[allow(non_upper_case_globals)]
+        static $static_name: crate::gateway::BuiltinWrapperDescriptor =
+            crate::gateway::BuiltinWrapperDescriptor {
+                path: concat!(module_path!(), "::", stringify!($func)),
+                func: $func,
+            };
     };
+}
+
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fget_getdictscope,
+    __majit_wrap_descr_typecheck_fget_getdictscope
+);
 
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_code`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_code`.
-pub fn descr_typecheck_fget_f_code(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+///
+/// No force marker, although `pycode` IS one of the redirected fields
+/// `virtualizable_gen.rs` declares — the one exception the sibling gateways'
+/// rule needs, and it turns on what the marker is FOR rather than on the field
+/// list.  Upstream `rvirtualizable.py hook_access_field` injects at every
+/// redirected access in every graph, so it never has to ask; pyre places the
+/// marker by hand at the gateway, so each placement owes the question "can the
+/// trace's shadow and the live frame disagree about this field?".
+///
+/// For `pycode` they cannot.  It is written exactly twice, both at frame
+/// construction (`PyFrame::__init__` and the allocator's field
+/// initialisation), and never again; a trace neither writes it back nor
+/// reseeds it.  [`PyFrame::restore_resume_state_from`] states the same thing
+/// from the other side — it restores `last_instr`, `valuestackdepth` and the
+/// locals array, and calls `pycode` frame-invariant.  So the marker cannot
+/// make this read answer differently, and all it does reach is the escape
+/// flush, which `virtualizable.py force_now` turns into
+/// `TOKEN_TRACING_RESCALL` → `TOKEN_NONE` → `pyjitpl` `ABORT_ESCAPE`.
+///
+/// Measured, with identical output on every fixture: carrying it costs
+/// `synth/exception_raise_caught_same_frame_tb` `guard_failures` 605 -> 803,
+/// `synth/exception_reentry_guard_finally_residual`
+/// 5/1027/0/6 -> 8/1903/2/5 (bridges/guard_failures/aborted/compiled),
+/// `synth/c_call_reports_the_callee_frame_not_the_inliners` its `root:inner`
+/// compile, and `synth/frame_chain_survives_a_recursive_call_assembler`
+/// `loop:hot` and `root:rec` — each of them a `tb_frame.f_code` or
+/// `frame.f_code` read from interpreted code nested inside a residual call,
+/// which is where the marker forces the caller's live virtualizable.
+pub fn __majit_wrap_descr_typecheck_fget_f_code(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
     }
-    Ok(unsafe { &*f }.fget_f_code())
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+    Ok(unsafe { &*anchor.live() }.fget_f_code())
 }
+
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fget_f_code,
+    __majit_wrap_descr_typecheck_fget_f_code
+);
 
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::get_w_globals`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_globals`.
-pub fn descr_typecheck_get_w_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_descr_typecheck_get_w_globals(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
     }
-    let w = unsafe { &*f }.get_w_globals();
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+    crate::executioncontext::jit_force_virtualizable(anchor.live());
+    let w = unsafe { &*anchor.live() }.get_w_globals();
     Ok(if w.is_null() {
         pyre_object::w_none()
     } else {
@@ -3127,15 +3185,37 @@ pub fn descr_typecheck_get_w_globals(args: &[PyObjectRef]) -> Result<PyObjectRef
     })
 }
 
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_get_w_globals,
+    __majit_wrap_descr_typecheck_get_w_globals
+);
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_back`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_back`.
-pub fn descr_typecheck_fget_f_back(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+///
+/// No force marker.  `rvirtualizable.py hook_access_field` emits
+/// `jit_force_virtualizable` only under
+/// `if self.my_redirected_fields.get(cname.value)`, and the field this reads —
+/// `f_backref` — is not one: `interp_jit.py` declares `_virtualizable_` as
+/// `last_instr`, `pycode`, `valuestackdepth`, `locals_cells_stack_w[*]`,
+/// `debugdata`, `w_globals`.  [`PyFrame::fget_f_back`] states what a marker
+/// here costs instead — `f_backref` holds a `jit.virtual_ref`, so reading it
+/// IS the force, and it is the foldable one.
+///
+/// Measured on `synth/getframe_inlined_callee_own_frame`: with the marker,
+/// `frame.f_back` raised `VableEscapedDuringResidualCall` 35 times and the
+/// fixture compiled no loop; `frame.f_code`, whose field IS redirected, raised
+/// none because the walker folds that read instead of residualizing it.
+pub fn __majit_wrap_descr_typecheck_fget_f_back(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
     }
-    let back = unsafe { &*f }.fget_f_back();
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+    let back = unsafe { &*anchor.live() }.fget_f_back();
     Ok(if back.is_null() {
         pyre_object::w_none()
     } else {
@@ -3146,10 +3226,17 @@ pub fn descr_typecheck_fget_f_back(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     })
 }
 
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fget_f_back,
+    __majit_wrap_descr_typecheck_fget_f_back
+);
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::get_generator`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_generator`.
-pub fn descr_typecheck_get_generator(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_descr_typecheck_get_generator(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
@@ -3161,6 +3248,11 @@ pub fn descr_typecheck_get_generator(args: &[PyObjectRef]) -> Result<PyObjectRef
         owner
     })
 }
+
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_get_generator,
+    __majit_wrap_descr_typecheck_get_generator
+);
 
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_lasti`.
 ///
@@ -3210,12 +3302,16 @@ pub fn descr_typecheck_get_generator(args: &[PyObjectRef]) -> Result<PyObjectRef
 ///
 /// `-1` is left for a code object with no `RESUME` too, where that index
 /// runs past the end and the frame starts no line either.
-pub fn descr_typecheck_fget_f_lasti(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_descr_typecheck_fget_f_lasti(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
     }
-    let frame = unsafe { &*f };
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+    crate::executioncontext::jit_force_virtualizable(anchor.live());
+    let frame = unsafe { &*anchor.live() };
     let lasti = frame.fget_f_lasti();
     let lasti = if lasti < 0 {
         let code = frame.code();
@@ -3244,17 +3340,28 @@ pub fn descr_typecheck_fget_f_lasti(args: &[PyObjectRef]) -> Result<PyObjectRef,
     }))
 }
 
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fget_f_lasti,
+    __majit_wrap_descr_typecheck_fget_f_lasti
+);
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_builtins`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_builtins`.
-pub fn descr_typecheck_fget_f_builtins(
+///
+/// No force marker, for the reason
+/// [`__majit_wrap_descr_typecheck_fget_f_back`] gives:
+/// [`PyFrame::fget_f_builtins`] reads `w_builtin` and the module's `w_dict`,
+/// and `_virtualizable_` names neither.
+pub fn __majit_wrap_descr_typecheck_fget_f_builtins(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
     }
-    let w = unsafe { &*f }.fget_f_builtins();
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+    let w = unsafe { &*anchor.live() }.fget_f_builtins();
     Ok(if w.is_null() {
         pyre_object::w_none()
     } else {
@@ -3262,21 +3369,37 @@ pub fn descr_typecheck_fget_f_builtins(
     })
 }
 
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fget_f_builtins,
+    __majit_wrap_descr_typecheck_fget_f_builtins
+);
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_lineno`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_lineno`.
-pub fn descr_typecheck_fget_f_lineno(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_descr_typecheck_fget_f_lineno(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
     }
-    Ok(unsafe { &*f }.fget_f_lineno())
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+    crate::executioncontext::jit_force_virtualizable(anchor.live());
+    Ok(unsafe { &*anchor.live() }.fget_f_lineno())
 }
+
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fget_f_lineno,
+    __majit_wrap_descr_typecheck_fget_f_lineno
+);
 
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fset_f_lineno`.
 ///
 /// `GetSetProperty` binds this as its `fset` for `f_lineno`.
-pub fn descr_typecheck_fset_f_lineno(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_descr_typecheck_fset_f_lineno(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
@@ -3285,19 +3408,29 @@ pub fn descr_typecheck_fset_f_lineno(args: &[PyObjectRef]) -> Result<PyObjectRef
     let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
     let new_lineno = crate::baseobjspace::int_w(args[2])
         .map_err(|_| crate::PyError::value_error("lineno must be an integer"))?;
+    crate::executioncontext::jit_force_virtualizable(anchor.live());
     unsafe { &mut *anchor.live() }.fset_f_lineno(new_lineno as isize)?;
     Ok(pyre_object::w_none())
 }
 
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fset_f_lineno,
+    __majit_wrap_descr_typecheck_fset_f_lineno
+);
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_trace`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_trace`.
-pub fn descr_typecheck_fget_f_trace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_descr_typecheck_fget_f_trace(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
     }
-    let w = unsafe { &*f }.fget_f_trace();
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+    crate::executioncontext::jit_force_virtualizable(anchor.live());
+    let w = unsafe { &*anchor.live() }.fget_f_trace();
     Ok(if w.is_null() {
         pyre_object::w_none()
     } else {
@@ -3305,47 +3438,77 @@ pub fn descr_typecheck_fget_f_trace(args: &[PyObjectRef]) -> Result<PyObjectRef,
     })
 }
 
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fget_f_trace,
+    __majit_wrap_descr_typecheck_fget_f_trace
+);
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fset_f_trace`.
 ///
 /// `GetSetProperty` binds this as its `fset` for `f_trace`.
-pub fn descr_typecheck_fset_f_trace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_descr_typecheck_fset_f_trace(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if !f.is_null() {
-        unsafe { &mut *f }.fset_f_trace(args[2]);
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+        crate::executioncontext::jit_force_virtualizable(anchor.live());
+        unsafe { &mut *anchor.live() }.fset_f_trace(args[2]);
     }
     Ok(pyre_object::w_none())
 }
+
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fset_f_trace,
+    __majit_wrap_descr_typecheck_fset_f_trace
+);
 
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fdel_f_trace`.
 ///
 /// `GetSetProperty` binds this as its `fdel` for `f_trace`.
-pub fn descr_typecheck_fdel_f_trace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn __majit_wrap_descr_typecheck_fdel_f_trace(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if !f.is_null() {
-        unsafe { &mut *f }.fdel_f_trace();
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+        crate::executioncontext::jit_force_virtualizable(anchor.live());
+        unsafe { &mut *anchor.live() }.fdel_f_trace();
     }
     Ok(pyre_object::w_none())
 }
 
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fdel_f_trace,
+    __majit_wrap_descr_typecheck_fdel_f_trace
+);
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_trace_lines`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_trace_lines`.
-pub fn descr_typecheck_fget_f_trace_lines(
+pub fn __majit_wrap_descr_typecheck_fget_f_trace_lines(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
     }
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+    crate::executioncontext::jit_force_virtualizable(anchor.live());
     Ok(pyre_object::w_bool_from(
-        unsafe { &*f }.fget_f_trace_lines(),
+        unsafe { &*anchor.live() }.fget_f_trace_lines(),
     ))
 }
+
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fget_f_trace_lines,
+    __majit_wrap_descr_typecheck_fget_f_trace_lines
+);
 
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fset_f_trace_lines`.
 ///
 /// `GetSetProperty` binds this as its `fset` for `f_trace_lines`.
-pub fn descr_typecheck_fset_f_trace_lines(
+pub fn __majit_wrap_descr_typecheck_fset_f_trace_lines(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
@@ -3353,30 +3516,43 @@ pub fn descr_typecheck_fset_f_trace_lines(
         // `is_true` reaches `__bool__` / `__len__`.
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
         let v = crate::baseobjspace::is_true(args[2])?;
+        crate::executioncontext::jit_force_virtualizable(anchor.live());
         unsafe { &mut *anchor.live() }.fset_f_trace_lines(v);
     }
     Ok(pyre_object::w_none())
 }
 
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fset_f_trace_lines,
+    __majit_wrap_descr_typecheck_fset_f_trace_lines
+);
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_trace_opcodes`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_trace_opcodes`.
-pub fn descr_typecheck_fget_f_trace_opcodes(
+pub fn __majit_wrap_descr_typecheck_fget_f_trace_opcodes(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
     if f.is_null() {
         return Ok(pyre_object::w_none());
     }
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+    crate::executioncontext::jit_force_virtualizable(anchor.live());
     Ok(pyre_object::w_bool_from(
-        unsafe { &*f }.fget_f_trace_opcodes(),
+        unsafe { &*anchor.live() }.fget_f_trace_opcodes(),
     ))
 }
+
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fget_f_trace_opcodes,
+    __majit_wrap_descr_typecheck_fget_f_trace_opcodes
+);
 
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fset_f_trace_opcodes`.
 ///
 /// `GetSetProperty` binds this as its `fset` for `f_trace_opcodes`.
-pub fn descr_typecheck_fset_f_trace_opcodes(
+pub fn __majit_wrap_descr_typecheck_fset_f_trace_opcodes(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
@@ -3384,10 +3560,16 @@ pub fn descr_typecheck_fset_f_trace_opcodes(
         // `is_true` reaches `__bool__` / `__len__`.
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
         let v = crate::baseobjspace::is_true(args[2])?;
+        crate::executioncontext::jit_force_virtualizable(anchor.live());
         unsafe { &mut *anchor.live() }.fset_f_trace_opcodes(v);
     }
     Ok(pyre_object::w_none())
 }
+
+register_frame_builtin_wrapper!(
+    __majit_builtin_wrapper_target_fset_f_trace_opcodes,
+    __majit_wrap_descr_typecheck_fset_f_trace_opcodes
+);
 
 impl PyFrame {
     /// pyframe.py getdebug → self.debugdata

@@ -2649,6 +2649,7 @@ impl SomeValue {
                         crate::translator::rtyper::extregistry::ExtRegistryEntry::EnterLeaveMarker { .. }
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::LoopHeader { .. }
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::ForType { .. }
+                            | crate::translator::rtyper::extregistry::ExtRegistryEntry::JitForceVirtualizable
                     )
                 {
                     return entry.compute_annotation_with_kwds(&bk, &kwds_s).map(Some);

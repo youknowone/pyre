@@ -664,8 +664,39 @@ fn is_raw_pointer_type(ty: &Type) -> bool {
     matches!(ty, Type::Ptr(_))
 }
 
+fn path_type_last_ident(ty: &Type) -> Option<&Ident> {
+    match ty {
+        Type::Path(type_path) if type_path.qself.is_none() => {
+            type_path.path.segments.last().map(|segment| &segment.ident)
+        }
+        _ => None,
+    }
+}
+
+/// The spellings whose pointee is unsized, so a reference to one is two words.
+///
+/// A residual-call argument is a single ABI word, which is what
+/// [`helper_arg_from_i64`] rebuilds the reference from.  An unsized pointee
+/// needs an address *and* a length or vtable, so it cannot survive that round
+/// trip and the helper must fall through to `HelperCallKind::Unsupported`
+/// instead.  Sizedness is a type-level property and this runs on syntax, so the
+/// unsized spellings are named: the two structural ones, and the named types
+/// this workspace actually passes by reference.  A pointee missing from here
+/// fails to compile at its call site with E0606 rather than lowering wrongly.
+fn is_wide_pointee(ty: &Type) -> bool {
+    if matches!(ty, Type::Slice(_) | Type::TraitObject(_)) {
+        return true;
+    }
+    let named = primitive_type_ident(ty).or_else(|| path_type_last_ident(ty));
+    matches!(named, Some(ident) if ident == "str" || ident == "Wtf8")
+}
+
+fn is_reference_type(ty: &Type) -> bool {
+    matches!(ty, Type::Reference(reference) if !is_wide_pointee(&reference.elem))
+}
+
 fn helper_call_kind_for_type(ty: &Type) -> HelperCallKind {
-    if is_gc_ref_type(ty) || is_raw_pointer_type(ty) {
+    if is_gc_ref_type(ty) || is_raw_pointer_type(ty) || is_reference_type(ty) {
         return HelperCallKind::Ref;
     }
     match primitive_type_ident(ty)
@@ -694,6 +725,16 @@ fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::Toke
     }
     if is_raw_pointer_type(ty) {
         return Some(quote! { ((#arg_ident) as usize) as #ty });
+    }
+    if is_reference_type(ty)
+        && let Type::Reference(reference) = ty
+    {
+        let elem = &reference.elem;
+        return if reference.mutability.is_some() {
+            Some(quote! { unsafe { &mut *((#arg_ident) as usize as *mut #elem) } })
+        } else {
+            Some(quote! { unsafe { &*((#arg_ident) as usize as *const #elem) } })
+        };
     }
     let ty_ident = primitive_type_ident(ty)?;
     match ty_ident.to_string().as_str() {
