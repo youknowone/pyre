@@ -59,6 +59,14 @@ pub struct Finding {
 #[derive(Default)]
 pub struct ScanStats {
     pub bodies_scanned: usize,
+    /// Bodies the pin-set read declined solely because two root scopes are
+    /// live at once somewhere in them.  The flag is whole-body, so one nested
+    /// pair anywhere withholds every bracketed call in the function; this
+    /// counts how much of [`Self::withheld_contents_opaque`] that costs.
+    pub bodies_with_nested_scopes: usize,
+    /// Calls counted in [`Self::withheld_contents_opaque`] that came from a
+    /// body in [`Self::bodies_with_nested_scopes`].
+    pub withheld_opaque_from_nested: usize,
     /// Bodies holding a terminator this reader could not classify.  Their
     /// liveness is incomplete, so they are reported rather than counted clean.
     pub unparsed_terminator_bodies: usize,
@@ -177,6 +185,16 @@ pub const MOVABLE_GC_MARKERS: &[&str] = &[
     "require_dict",
     "dict_method_",
     "list_method_",
+    // The families whose headers the interpreter allocates in the nursery, so
+    // a pointer reaching one of these is addressed as an object that relocates.
+    // Spelled at the moving constructor rather than at the family prefix: a
+    // `w_weakref_lifeline_*` is `allocate_stable` and a `w_str_new` is
+    // immortal, so the wider spelling would name a pointer that cannot move.
+    "w_tuple_",
+    "w_method_",
+    "w_gc_weakref_box_",
+    "w_weakref_new",
+    "w_str_from_wtf8_managed",
 ];
 
 /// The callees that say a pointer reaching them is addressed as a movable
@@ -670,6 +688,9 @@ pub fn scan(
         // The pin-set analysis below stores only root locals, not which nested
         // guard owns each one.  Keep nested bodies unread rather than letting
         // an inner Drop falsely retain its pins as outer-scope coverage.
+        if has_nested_scopes {
+            stats.bodies_with_nested_scopes += 1;
+        }
         let mut opaque_contents = unparsed_terms || unparsed_stmts || has_nested_scopes;
         let mut saw_pin_call = false;
         let mut term_pins: Vec<HashSet<u64>> = vec![HashSet::new(); n];
@@ -991,6 +1012,9 @@ pub fn scan(
                 // reading as coverage.
                 if opaque_contents || !reachable.contains(&b) {
                     stats.withheld_contents_opaque += 1;
+                    if has_nested_scopes {
+                        stats.withheld_opaque_from_nested += 1;
+                    }
                     continue;
                 }
                 let held: HashSet<u64> = pinned_in[b].difference(&stmt_kills[b]).copied().collect();
