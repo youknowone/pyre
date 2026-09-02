@@ -89,8 +89,14 @@ pub struct VableArrayInfo {
     /// (`unpack_arraydescr`).  This is the authoritative stride: 64-bit
     /// payloads (e.g. `i64` list-strategy backing arrays) carry an explicit
     /// 8-byte descriptor that `item_size_for_type` would under-size to a
-    /// machine word on 32-bit targets.
+    /// machine word on 32-bit targets.  It is also the authoritative LOAD
+    /// WIDTH: `bh_getarrayitem_gc_i` dispatches on `item_size` × sign
+    /// (`majit-backend` `model.rs`), so a narrower item must not be read as a
+    /// full word.
     pub item_size: usize,
+    /// `arraydescr.is_item_signed()` — the other half of that dispatch.
+    /// Meaningless for `Ref` and `Float` items, which have one representation.
+    pub item_signed: bool,
     /// Byte offset of the array pointer in the heap object.
     pub field_offset: usize,
     /// GC type id of the array object stored in a `DirectPointer` field.
@@ -621,11 +627,13 @@ impl VirtualizableInfo {
     ) {
         let name = name.into();
         let item_size = array_descr_item_size(&array_descr, item_type);
+        let item_signed = array_descr_item_signed(&array_descr);
         let array_type_id = array_field_type_id(&name, &array_descr);
         self.array_fields.push(VableArrayInfo {
             name,
             item_type,
             item_size,
+            item_signed,
             field_offset,
             array_type_id,
             storage: VableArrayStorage::DirectPointer,
@@ -657,11 +665,13 @@ impl VirtualizableInfo {
     ) {
         let name = name.into();
         let item_size = array_descr_item_size(&array_descr, item_type);
+        let item_signed = array_descr_item_signed(&array_descr);
         let array_type_id = array_field_type_id(&name, &array_descr);
         self.array_fields.push(VableArrayInfo {
             name,
             item_type,
             item_size,
+            item_signed,
             field_offset,
             array_type_id,
             storage: VableArrayStorage::EmbeddedArray { ptr_offset },
@@ -688,11 +698,13 @@ impl VirtualizableInfo {
     ) {
         let name = name.into();
         let item_size = array_descr_item_size(&array_descr, item_type);
+        let item_signed = array_descr_item_signed(&array_descr);
         let array_type_id = array_field_type_id(&name, &array_descr);
         self.array_fields.push(VableArrayInfo {
             name,
             item_type,
             item_size,
+            item_signed,
             field_offset,
             array_type_id,
             storage: VableArrayStorage::RustVec {
@@ -1727,6 +1739,20 @@ fn array_descr_item_size(array_descr: &DescrRef, item_type: Type) -> usize {
     majit_ir::descr::unpack_arraydescr(array_descr)
         .map(|(_, item_size, _)| item_size)
         .unwrap_or_else(|| item_size_for_type(item_type))
+}
+
+/// `arraydescr.is_item_signed()`, the sign half of `bh_getarrayitem_gc_i`'s
+/// `(item_size, is_item_signed)` dispatch.
+///
+/// A field with no array descriptor falls back to signed: `item_size_for_type`
+/// gives such a field the machine word, and RPython's word-sized integer array
+/// is `Signed`.  The two answers only differ for a narrower item, which cannot
+/// arise without a descriptor to declare the narrower size.
+fn array_descr_item_signed(array_descr: &DescrRef) -> bool {
+    array_descr
+        .as_array_descr()
+        .map(|ad| ad.is_item_signed())
+        .unwrap_or(true)
 }
 
 pub fn item_size_for_type(ty: Type) -> usize {
@@ -3097,40 +3123,81 @@ pub(crate) unsafe fn bhimpl_arraybase_vable(
 pub(crate) unsafe fn vable_read_array_item(
     vable_ptr: *const u8,
     array: &VableArrayInfo,
-    index: usize,
+    index: i64,
 ) -> i64 {
     unsafe {
         // Stride from the field's array descriptor: a pointer array is
         // `size_of::<usize>()` (4 bytes on wasm32) while an `i64` payload
         // array is a fixed 8, regardless of word width.
         let item_size = array.item_size;
+        // `bhimpl_getarrayitem_vable_*` (`blackhole.py:1374-1387`) takes the
+        // index with argcode `i` and hands it to `bh_getarrayitem_gc_*`
+        // SIGNED.  The operand is an interpreter register, so a stale or
+        // clobbered one arrives here as any `i64`; casting it to `usize` turns
+        // a negative one into a huge offset and `data_ptr.add` then names an
+        // address gigabytes away, which reads as a value of `item_type` — for
+        // a `Ref` array, a pointer the caller dereferences.  Refuse it where
+        // it can still be attributed to this array.
+        assert!(
+            index >= 0,
+            "vable_read_array_item: negative index {index} into virtualizable \
+             array {:?} (item_type {:?})",
+            array.name,
+            array.item_type,
+        );
+        let index = index as usize;
         let data_ptr = bhimpl_arraybase_vable(vable_ptr, array);
-        if data_ptr.is_null() {
-            0
-        } else {
-            // An index past the end reads whatever follows the payload and
-            // hands it back as a value of `item_type` — for a `Ref` array that
-            // is a pointer the caller will dereference, so the fault lands in
-            // whatever consumes the result rather than here.  The operand is
-            // an interpreter register, so a stale or clobbered one is a defect
-            // in the producer; report it against this array instead of letting
-            // the poison value travel.
-            if crate::jit_strict_mode() {
-                let len = bhimpl_arraylen_vable(vable_ptr, array);
-                assert!(
-                    index < len,
-                    "vable_read_array_item: index {index} is past the end of \
-                     virtualizable array {:?} (len {len}, item_type {:?})",
-                    array.name,
-                    array.item_type,
-                );
-            }
-            let src = data_ptr.add(index * item_size);
-            if array.item_type == Type::Ref {
-                *(src as *const usize) as i64
-            } else {
-                std::ptr::read(src as *const i64)
-            }
+        // Upstream reaches the items through `bh_getfield_gc_r` and then
+        // `bh_getarrayitem_gc_*`, and a null array field faults in the second.
+        // Answering `0` instead hands a `Ref` read a null the caller
+        // dereferences somewhere else, and an `Int` read a plausible zero that
+        // never surfaces at all.
+        assert!(
+            !data_ptr.is_null(),
+            "vable_read_array_item: virtualizable array {:?} is null \
+             (item_type {:?}, index {index})",
+            array.name,
+            array.item_type,
+        );
+        // An index past the end reads whatever follows the payload and hands
+        // it back as a value of `item_type`, so the fault lands in whatever
+        // consumes the result rather than here.
+        if crate::jit_strict_mode() {
+            let len = bhimpl_arraylen_vable(vable_ptr, array);
+            assert!(
+                index < len,
+                "vable_read_array_item: index {index} is past the end of \
+                 virtualizable array {:?} (len {len}, item_type {:?})",
+                array.name,
+                array.item_type,
+            );
+        }
+        let src = data_ptr.add(index * item_size);
+        match array.item_type {
+            // `llmodel.py read_ref_at_mem` — one machine word.
+            Type::Ref => *(src as *const usize) as i64,
+            // `llmodel.py read_float_at_mem` — the f64 bit pattern, which the
+            // caller re-reads as one.
+            Type::Float => std::ptr::read(src as *const i64),
+            // `bh_getarrayitem_gc_i` dispatches on `(item_size,
+            // is_item_signed)` (`majit-backend` `model.rs`); reading a
+            // narrower item as a full word takes the bytes that follow it.
+            Type::Int | Type::Void => match (item_size, array.item_signed) {
+                (8, true) => *(src as *const i64),
+                (8, false) => *(src as *const u64) as i64,
+                (4, true) => *(src as *const i32) as i64,
+                (4, false) => *(src as *const u32) as i64,
+                (2, true) => *(src as *const i16) as i64,
+                (2, false) => *(src as *const u16) as i64,
+                (1, true) => *(src as *const i8) as i64,
+                (1, false) => *(src as *const u8) as i64,
+                // `llmodel.py:478 else: raise NotImplementedError`.
+                _ => panic!(
+                    "vable_read_array_item: virtualizable array {:?} has no \
+                     integer load for item_size {item_size} (signed {})",
+                    array.name, array.item_signed,
+                ),
+            },
         }
     }
 }
@@ -3164,12 +3231,46 @@ pub(crate) unsafe fn vable_array_write_base(
 pub(crate) unsafe fn vable_write_array_item(
     vable_ptr: *mut u8,
     array: &VableArrayInfo,
-    index: usize,
+    index: i64,
     value: i64,
 ) {
     unsafe {
+        // `bhimpl_setarrayitem_vable_*` (`blackhole.py:1390-1403`) takes the
+        // index with argcode `i` and hands it to `bh_setarrayitem_gc_*`
+        // SIGNED, exactly as the read path does.  Casting a clobbered
+        // register to `usize` turns a negative index into a huge offset and
+        // the store then lands gigabytes past the array.
+        assert!(
+            index >= 0,
+            "vable_write_array_item: negative index {index} into virtualizable \
+             array {:?} (item_type {:?})",
+            array.name,
+            array.item_type,
+        );
         let (data_ptr, owner_ptr) = vable_array_write_base(vable_ptr, array);
-        vable_write_array_item_at(vable_ptr, array, data_ptr, owner_ptr, index, value);
+        // Upstream reaches the items through `bh_getfield_gc_r` and then
+        // `bh_setarrayitem_gc_*`, and a null array field faults in the second.
+        // Dropping the store instead leaves the item holding whatever it held
+        // before, and the mismatch surfaces at some later read with nothing
+        // naming this array.
+        assert!(
+            !data_ptr.is_null(),
+            "vable_write_array_item: virtualizable array {:?} is null \
+             (item_type {:?}, index {index})",
+            array.name,
+            array.item_type,
+        );
+        if crate::jit_strict_mode() {
+            let len = bhimpl_arraylen_vable(vable_ptr as *const u8, array);
+            assert!(
+                (index as usize) < len,
+                "vable_write_array_item: index {index} is past the end of \
+                 virtualizable array {:?} (len {len}, item_type {:?})",
+                array.name,
+                array.item_type,
+            );
+        }
+        vable_write_array_item_at(vable_ptr, array, data_ptr, owner_ptr, index as usize, value);
     }
 }
 
@@ -3209,8 +3310,26 @@ pub(crate) unsafe fn vable_write_array_item_at(
                         majit_gc::gc_write_barrier(majit_ir::GcRef(vable_ptr as usize));
                     }
                 }
-            } else {
+            } else if array.item_type == Type::Float {
+                // `llmodel.py write_float_at_mem` — the f64 bit pattern, which
+                // the caller handed over as one.
                 std::ptr::write(dest as *mut i64, value);
+            } else {
+                // `bh_setarrayitem_gc_i` stores at the descriptor's width
+                // (`majit-backend` `model.rs`); a fixed 8-byte store into a
+                // narrower item overwrites the items that follow it.
+                match item_size {
+                    8 => std::ptr::write(dest as *mut i64, value),
+                    4 => std::ptr::write(dest as *mut i32, value as i32),
+                    2 => std::ptr::write(dest as *mut i16, value as i16),
+                    1 => std::ptr::write(dest as *mut i8, value as i8),
+                    // `llmodel.py:478 else: raise NotImplementedError`.
+                    _ => panic!(
+                        "vable_write_array_item: virtualizable array {:?} has \
+                         no integer store for item_size {item_size}",
+                        array.name,
+                    ),
+                }
             }
         }
     }

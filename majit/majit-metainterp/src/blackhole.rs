@@ -11643,7 +11643,7 @@ fn handler_getarrayitem_vable_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let index = bh.registers_i[code[p + 1] as usize];
     let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
     let (field_descr, p) = read_descr(bh, code, p + 2);
     let array_idx = field_descr.as_vable_array_index();
@@ -11661,7 +11661,7 @@ fn handler_getarrayitem_vable_r(
 ) -> Result<usize, DispatchError> {
     let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let index = bh.registers_i[code[p + 1] as usize];
     let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
     let (field_descr, p) = read_descr(bh, code, p + 2);
     let array_idx = field_descr.as_vable_array_index();
@@ -11684,7 +11684,7 @@ fn handler_setarrayitem_vable_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_i[code[p + 2] as usize];
     let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
     let (field_descr, p) = read_descr(bh, code, p + 3);
@@ -11703,7 +11703,7 @@ fn handler_setarrayitem_vable_r(
 ) -> Result<usize, DispatchError> {
     let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
     let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
     let (field_descr, p) = read_descr(bh, code, p + 3);
@@ -12324,7 +12324,7 @@ fn handler_getarrayitem_vable_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let index = bh.registers_i[code[p + 1] as usize];
     let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
     let (field_descr, p) = read_descr(bh, code, p + 2);
     let array_idx = field_descr.as_vable_array_index();
@@ -12342,7 +12342,7 @@ fn handler_setarrayitem_vable_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_f[code[p + 2] as usize];
     let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
     let (field_descr, p) = read_descr(bh, code, p + 3);
