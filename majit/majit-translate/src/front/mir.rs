@@ -23042,24 +23042,39 @@ fn trait_assoc_projection_target<'a>(
     let mut cur: &serde_json::Value = value;
     let mut resolved: Option<&'a serde_json::Value> = None;
     for _ in 0..4 {
-        let Some(arr) = cur
-            .as_object()
-            .and_then(|o| o.get("TraitType"))
-            .and_then(serde_json::Value::as_array)
-        else {
+        let Some(arr) = trait_type_projection_args(cur) else {
             break;
         };
-        if arr.len() != 2 {
-            break;
-        }
         let next = resolve_trait_assoc_type_value(&arr[0], &arr[1], llbc)?;
         resolved = Some(next);
         cur = next;
+    }
+    // Hand back only a value that is no longer a projection.  The caller
+    // resolves the answer by recursing into `tyref_to_value_type`, which
+    // enters this walk again with a fresh hop budget, so returning a
+    // still-unresolved projection would make the four-hop cap local rather
+    // than total: an `A::X = B::Y`, `B::Y = A::X` binding would then recurse
+    // without bound.  Declining here caps the whole resolution at four hops
+    // and leaves such a chain typed `Ref`, which is what it was before this
+    // walk existed.
+    if trait_type_projection_args(cur).is_some() {
+        return None;
     }
     // The binding is an ordinary type reference: it may be inline, hash
     // consed or a dedup id, and `TyRef`'s own deserializer is what knows
     // the three shapes apart.
     serde_json::from_value::<TyRef>(resolved?.clone()).ok()
+}
+
+/// The `[traitref, assoc]` pair of an unresolved `Self::Assoc` projection,
+/// or `None` when the value is any other type shape.
+fn trait_type_projection_args(value: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    value
+        .as_object()
+        .and_then(|o| o.get("TraitType"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .filter(|arr| arr.len() == 2)
 }
 
 /// The type value the trait's unique impl binds to `assoc` — the shared

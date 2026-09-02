@@ -105,6 +105,35 @@ fn the_same_projection_resolves_in_a_provided_default_body() {
         }
     }
     assert_eq!(seen, 1, "opcode_unary_not calls truth_value once");
-    // The provided default body lowers at all and keeps its own call.
-    lower("pyre_interpreter::pyopcode::BranchOpcodeHandler::record_branch_guard");
+}
+
+#[test]
+fn a_provided_default_body_banks_its_projection_typed_parameter() {
+    // `record_branch_guard` does not CALL `truth_value` — it receives the
+    // projection as a parameter (`truth: Self::Truth`) and forwards it to
+    // `guard_truth_value`.  So the assertion for this side is on the
+    // parameter's own bank: `truth` is the caller's variable that had no kind
+    // satisfying both callees, and this is the lowering that gave it `Ref`.
+    let graph = lower("pyre_interpreter::pyopcode::BranchOpcodeHandler::record_branch_guard");
+    let mut seen = 0usize;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Input { name, ty, .. } = &op.kind else {
+                continue;
+            };
+            if name != "truth" {
+                continue;
+            }
+            seen += 1;
+            assert_eq!(
+                *ty,
+                ValueType::Bool,
+                "`truth: Self::Truth` is the trait's only impl's `bool`.  Left \
+                 unresolved it banks as a GC reference while \
+                 `concrete_truth_as_bool` wants the int bank, and no kind for \
+                 the caller's variable satisfies both"
+            );
+        }
+    }
+    assert_eq!(seen, 1, "record_branch_guard declares `truth` once");
 }
