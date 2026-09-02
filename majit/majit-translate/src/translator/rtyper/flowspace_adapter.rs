@@ -400,6 +400,34 @@ fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
     Constant::with_concretetype(ConstValue::LLPtr(Box::new(p)), GCREF.clone())
 }
 
+/// A Void-typed operand is spelled as a Void `Constant`, never as a
+/// `Variable`: `jtransform.py:83-85` renames every Void var to
+/// `Constant(None, lltype.Void)` before it can be read, and
+/// `rmodel.py:361-363` `pairtype(Repr, VoidRepr).convert_from_to`
+/// converts into Void as `inputconst(lltype.Void, None)`.
+///
+/// The front end relies on that: `front::mir` mints a Void operand with
+/// no defining operation when a field read lands on a fieldless enum,
+/// and says so — "No defining operation, matching the bare
+/// `Constant(None, lltype.Void)` the argument lists skip". Materialising
+/// that constant here is the other half of the same decision, so a Void
+/// operand resolves instead of tripping the undefined-operand invariant.
+///
+/// Only Void is treated this way. A missing operand of any other kind
+/// still fails loud: it names a value some op was supposed to define.
+fn void_constant_for(v: &Variable) -> Option<Hlvalue> {
+    matches!(
+        v.concretetype.borrow().as_ref(),
+        Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void)
+    )
+    .then(|| {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+        ))
+    })
+}
+
 /// Look up the `Hlvalue` for an operand `Variable`. Surfaces a
 /// fail-loud `TyperError` when the operand is undefined (every
 /// referenced operand `Variable` must have been seeded by
@@ -424,7 +452,11 @@ fn lookup_operand(
     op: &SpaceOperation,
     arg_role: &str,
 ) -> Result<Hlvalue, TyperError> {
-    value_map.get(operand).cloned().ok_or_else(|| {
+    value_map
+        .get(operand)
+        .cloned()
+        .or_else(|| void_constant_for(operand))
+        .ok_or_else(|| {
         let result_label = match op.result.as_ref() {
             Some(var) => format!("Some({var:?})"),
             None => "None".to_string(),
@@ -3669,7 +3701,11 @@ fn link_arg_to_hlvalue(
         // to round-trip through `constant_from_constvalue` and
         // mint a fresh id.
         LinkArg::Const(cv) => Ok(Hlvalue::Constant(cv.clone())),
-        LinkArg::Value(var) => value_map.get(var).cloned().ok_or_else(|| {
+        LinkArg::Value(var) => value_map
+            .get(var)
+            .cloned()
+            .or_else(|| void_constant_for(var))
+            .ok_or_else(|| {
             TyperError::message(format!(
                 "translate_op: undefined operand {var:?} as Link.args[{arg_index}] entry \
                  (source block {source_block_id:?} -> target block {target_block_id:?}) — \
