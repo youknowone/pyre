@@ -274,11 +274,17 @@ census. In particular `int_pow`, `pow` and `opcode_get_iter` (Slice A's
 deferral note) name no record now; re-derive a population from a fresh census
 before working any item list in this document.
 
-**Provenance.** Branch `rtyper2` at `3d7db8a9053`, probes at `9bfbafe3f80`,
-release profile, default features, `build/llbc` re-extracted for `majit-rlib
+**Provenance.** Branch `rtyper2` with the batch below applied: release
+profile, default features, `build/llbc` re-extracted for `majit-rlib
 pyre-object pyre-interpreter pyre-jit` at each tree, `PYRE_RTYPER_VERBOSE=1
 cargo build --release -p pyre-jit-trace`, graded by the build's own exit status
 and by the stderr file's mtime against the build start, never by `ls -t` alone.
+
+The baseline and the probe of each pair below were taken on one tree, and the
+branch has been rebased past that tree since, so those commits are no longer
+reachable by hash. What survives a rebase is the pair — a movement measured
+against its own baseline — not the absolute, which the section after next
+re-measures on a later base and finds different.
 
 A census is comparable only to another census taken on the same tree with the
 same artefacts. Both halves matter: a rebase that touches any of the four
@@ -375,3 +381,51 @@ Either add `Box` to the interned placeholder set (it is likewise one universal
 tag with no enum ambiguity, so the stated justification for the other three
 covers it) or give the ctor an owner path. Both change the existing
 `ShallowInitBox` lowering, so neither ships without its own census.
+
+### What a base move does to these numbers
+
+Re-taken with the same batch applied on a base 238 files further on, and
+`build/llbc` re-extracted for all four crates, phase A reads 1889 and phase B
+reads 5. Neither is comparable to the 1848 and 25 above — that is the rule at
+the top of this section, applied to itself. What carries over is the
+composition.
+
+Phase B's two shapes at that base:
+
+- `pyre_object::interp_exceptions::is_exception` — `don't know how to convert
+  from <InstanceRepr Ptr GcStruct pyobject::PyType> to <RootClassRepr Ptr
+  Struct object_vtable>`. There is no such conversion upstream to port:
+  `convert_from_to` between instance reprs is `pairtype(InstanceRepr,
+  InstanceRepr)`, the only pairtype naming a class repr is
+  `pairtype(ClassesPBCRepr, ClassRepr)`, and an instance's vtable is reached
+  by an *operation* — `InstanceRepr.rtype_type`, which reads the `typeptr`
+  field or calls `ll_inst_type`. So the site to change is the one asking the
+  rtyper to convert, not the pairtype table.
+- Four graphs — `topframe_for_locals` and three
+  `__majit_wrap_descr_typecheck_*` getters — all failing on the same op,
+  `simple_call(jit_force_virtualizable, frame)`, whose result variable carries
+  `SomeNone` and no concretetype, which is what the rtyper's `the annotator
+  doesn't agree that 'simple_call' has no return value` reports. The same
+  graphs were `MAJIT_RTYPER skip` rows on the earlier base; the base moved the
+  force gateways, and the graphs now reach phase B to fail there.
+
+### The one slice the census names: a dead vtable read
+
+Every `Blocked block` record is a `getattr` (189 of them at that base), and 68
+name a vtable slot on a receiver whose `SomeInstance` classdef is the empty
+`{vtable}` class: `__cast_instance_intrinsic(recv, "{vtable}")`, then
+`getattr(.., "method_strategy_kind")`. 58 of the 68 were `IndirectCall`
+records before that wall was closed, so this is where most of that wall's
+relocated victims went — the victim map the grading rule above asks for, one
+slice later.
+
+The cause is on the `OpKind::IndirectCall` arm. It drops the `funcptr`
+*operand*, because the `getattr` re-derives it from the receiver — but the ops
+that *defined* that operand, the vtable cast and the slot read, are already in
+the graph, and the annotator still annotates them, against a class with no
+fields. The front end cannot simply stop emitting them: the residual path
+still calls through that pointer for real (`codewriter/call.rs`'s
+`IndirectCall { graphs: None, funcptr, .. }`, and its `inline.rs` and
+`result_exc.rs` peers). So the repair is a dead-op sweep over the flowspace
+graph in the prepass, which is a design rather than a registration, and it
+needs its own census.
