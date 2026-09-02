@@ -3969,7 +3969,8 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `//` and `//=` — one body, see [`binop_type_error`].
 pub(crate) fn floordiv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::FloorDiv);
+        let numeric_override =
+            needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::FloorDiv);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__floordiv__", "__rfloordiv__")?
@@ -4107,7 +4108,8 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `/` and `/=` — one body, see [`binop_type_error`].
 pub(crate) fn truediv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::TrueDiv);
+        let numeric_override =
+            needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::TrueDiv);
         if numeric_override
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__truediv__", "__rtruediv__")?

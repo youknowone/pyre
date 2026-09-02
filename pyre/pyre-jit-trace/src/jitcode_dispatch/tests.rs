@@ -248,26 +248,33 @@ fn a_known_goto_condition_does_not_scan_the_dead_arm() {
     let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
 
-    // 0: i0 = const false; 3: goto_if_not i0 -> 20
+    // 0: i0 = const <src>; 3: goto_if_not i0 -> 20
     // 7: residual(real); 13: residual(symbolic); 19: return; 20: return
-    let mut code = int_copy_const(0, 0);
-    code.extend(goto_if_not(0, 20));
-    code.extend(residual_call_with_funcbox(2));
-    code.extend(residual_call_with_funcbox(3));
-    code.extend(void_return());
-    code.extend(void_return());
-    assert_eq!(code.len(), 21);
+    //
+    // `int_copy/c>i` carries its source inline as one signed byte, so the
+    // condition is spelled by that byte and there is no `constants_i` slot to
+    // vary: the two bodies differ only in it.
+    let body = |src: u8| {
+        let mut code = int_copy_const(src, 0);
+        code.extend(goto_if_not(0, 20));
+        code.extend(residual_call_with_funcbox(2));
+        code.extend(residual_call_with_funcbox(3));
+        code.extend(void_return());
+        code.extend(void_return());
+        assert_eq!(code.len(), 21);
+        code
+    };
 
     let summary =
-        super::inline_call::summarize_body_blockers(&code, 1, &[0, real, symbolic], |_| None);
+        super::inline_call::summarize_body_blockers(&body(0), 1, &[0, real, symbolic], |_| None);
     assert_eq!(summary.blocker_after_effect, None);
     assert_eq!(summary.blocker_effect_free, None);
     assert!(!summary.may_execute_effect);
 
-    // Flip only the constant.  The same body now executes the fallthrough,
+    // Flip only the condition.  The same body now executes the fallthrough,
     // and the blocker after the real residual call must remain a decline.
     let executed =
-        super::inline_call::summarize_body_blockers(&code, 1, &[1, real, symbolic], |_| None);
+        super::inline_call::summarize_body_blockers(&body(1), 1, &[0, real, symbolic], |_| None);
     assert_eq!(executed.blocker_after_effect, Some(symbolic));
     assert!(executed.may_execute_effect);
 }
