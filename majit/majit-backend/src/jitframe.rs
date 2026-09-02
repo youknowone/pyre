@@ -648,6 +648,26 @@ pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl F
         trace_callback(&mut (*obj_addr).jf_guard_exc);
         trace_callback(&mut (*obj_addr).jf_forward as *mut *mut JitFrame as *mut usize);
 
+        jitframe_trace_gcmap(obj_addr, trace_callback);
+    }
+}
+
+/// The `jf_gcmap`-directed half of [`jitframe_trace`], without the fixed
+/// header fields.
+///
+/// The two halves carry different things: the header slots name the frame's
+/// own bookkeeping objects, while these name whatever the compiled trace held
+/// in its Ref bank.  A host that must ask something further about a traced
+/// value — what kind of object it is, what it points to — can only ask it of
+/// the second set, so the walk is reachable on its own.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn jitframe_trace_gcmap(
+    obj_addr: *mut JitFrame,
+    mut trace_callback: impl FnMut(*mut usize),
+) {
+    unsafe {
         // jitframe.py:111-114
         let max: usize = if IS_32BIT { 32 } else { 64 };
 

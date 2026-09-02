@@ -48,6 +48,25 @@ unsafe fn pyre_libc_jitframe_tracer(obj_addr: usize, update: &mut dyn FnMut(*mut
                 update(slot_ptr as *mut majit_ir::GcRef);
             },
         );
+        // A traced Ref may be a `malloc_typed`-immortal object, whose managed
+        // children the visit above does not reach — the same hole the shadow
+        // stack closes in `pyre_object_root_walker_area`, asked here of the
+        // other channel that roots a live reference.
+        //
+        // Only the gcmap half is walked.  The header slots the full trace also
+        // visits name the frame's own bookkeeping objects, which are not
+        // `PyObjectRef`s, and the walk reads `ob_type` off what it is handed.
+        //
+        // Read each slot AFTER the pass above so a relocated value is the one
+        // followed.
+        majit_backend::jitframe::jitframe_trace_gcmap(
+            obj_addr as *mut majit_backend::jitframe::JitFrame,
+            |slot_ptr| {
+                let value = *(slot_ptr as *const pyre_object::PyObjectRef);
+                let mut child = |c: &mut majit_ir::GcRef| update(c as *mut majit_ir::GcRef);
+                pyre_interpreter::eval::walk_raw_immortal_roots(value, &mut child);
+            },
+        );
     }
 }
 
@@ -5868,7 +5887,17 @@ unsafe fn active_trace_root_walker_area(
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
     if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
-        pair.0.walk_active_trace_refs(visitor);
+        // A recorded ref is rooted here the way a compiled one is rooted through
+        // the jitframe gcmap, so it owes the same forwarding of a
+        // `malloc_typed`-immortal value's managed children — see
+        // `pyre_libc_jitframe_tracer`.  Read the value back after the visitor so
+        // a relocated one is what the walk follows.
+        let mut with_immortal_children = |gcref: &mut majit_ir::GcRef| {
+            visitor(gcref);
+            let value = gcref.0 as pyre_object::PyObjectRef;
+            unsafe { pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor) };
+        };
+        pair.0.walk_active_trace_refs(&mut with_immortal_children);
     }
 }
 
