@@ -703,6 +703,16 @@ static INSNS_BYTE_TO_OPNAME: LazyLock<HashMap<u8, String>> = LazyLock::new(|| {
     map
 });
 
+/// What a runtime-allocated opcode byte decodes to, if anything.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeInsn {
+    /// Every publication of this byte named the same key.
+    Unique(&'static str),
+    /// Two `Assembler`s numbered the same byte differently, so the byte alone
+    /// does not identify an instruction — see [`RUNTIME_INSNS_BYTE_TO_OPNAME`].
+    Ambiguous,
+}
+
 /// Opcode bytes the runtime assembler allocated after `INSNS_BYTE_TO_OPNAME`
 /// was fixed.
 ///
@@ -717,51 +727,63 @@ static INSNS_BYTE_TO_OPNAME: LazyLock<HashMap<u8, String>> = LazyLock::new(|| {
 /// callers read as "assume the worst" (`replay_unscannable`, every frame slot
 /// written).
 ///
+/// **The numbering is per-`Assembler`, not global.** `record_insn_key` picks
+/// the lowest unreserved byte this assembler has not used, so first-appearance
+/// order decides, and two assemblers that met different shapes first disagree.
+/// `codewriter.py:21-23` keeps ONE `Assembler` for the session and pyre's
+/// `CodeWriter` mirrors that with a single `RefCell<Assembler>`, so the
+/// production numbering is in fact global — but this table cannot assume it.
+/// A byte published under two keys becomes [`RuntimeInsn::Ambiguous`] and the
+/// decoder goes back to reporting it as undecodable, which is what it did for
+/// every runtime byte before this table existed.  Guessing one of the two would
+/// hand a caller the wrong instruction, which "assume the worst" never does.
+///
 /// Keys are leaked so the decoder can keep handing out `&'static str` exactly
 /// as it does for the build-time table.  The set is small and bounded by the
 /// unreserved opcode bytes.
-static RUNTIME_INSNS_BYTE_TO_OPNAME: LazyLock<std::sync::RwLock<HashMap<u8, &'static str>>> =
+static RUNTIME_INSNS_BYTE_TO_OPNAME: LazyLock<std::sync::RwLock<HashMap<u8, RuntimeInsn>>> =
     LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
 
 /// Publish one runtime-allocated `(opname/argcodes, byte)` pair to the decoder.
 ///
-/// Idempotent, and asserts the mapping stays one-to-one for a byte the
-/// build-time table does not already own.
+/// Idempotent.  A byte that ends up naming two different keys — including one
+/// the build-time table already owns — is recorded as ambiguous instead.
 pub fn publish_runtime_insn(key: &str, byte: u8) {
-    if INSNS_BYTE_TO_OPNAME.contains_key(&byte) {
-        debug_assert_eq!(
-            INSNS_BYTE_TO_OPNAME.get(&byte).map(String::as_str),
-            Some(key),
-            "publish_runtime_insn: byte {byte} is already the build-time table's"
-        );
+    let build_time = INSNS_BYTE_TO_OPNAME.get(&byte).map(String::as_str);
+    if build_time == Some(key) {
+        // Already resolvable, and to this very key.
         return;
     }
     let mut table = RUNTIME_INSNS_BYTE_TO_OPNAME
         .write()
         .expect("runtime insn table poisoned");
-    match table.get(&byte) {
-        Some(existing) => assert_eq!(
-            *existing, key,
-            "publish_runtime_insn: byte {byte} maps to both {existing:?} and {key:?} \
-             (assembler.py:220 keeps Assembler.insns 1:1)"
-        ),
-        None => {
-            table.insert(byte, Box::leak(key.to_string().into_boxed_str()));
-        }
+    let entry = table.entry(byte).or_insert_with(|| match build_time {
+        // The build-time table claims this byte for something else, so no
+        // single key can answer for it.
+        Some(_) => RuntimeInsn::Ambiguous,
+        None => RuntimeInsn::Unique(Box::leak(key.to_string().into_boxed_str())),
+    });
+    if !matches!(entry, RuntimeInsn::Unique(recorded) if *recorded == key) {
+        *entry = RuntimeInsn::Ambiguous;
     }
 }
 
-/// Resolve an opcode byte to its `opname/argcodes` key, consulting the
-/// build-time table first and then whatever the runtime assembler published.
+/// Resolve an opcode byte to its `opname/argcodes` key.
+///
+/// The runtime table is consulted first because it is the one that knows a byte
+/// is ambiguous; only a byte it has never seen falls through to the build-time
+/// table.
 fn key_for_opcode_byte(byte: u8) -> Option<&'static str> {
-    if let Some(key) = INSNS_BYTE_TO_OPNAME.get(&byte) {
-        return Some(key.as_str());
-    }
-    RUNTIME_INSNS_BYTE_TO_OPNAME
+    let runtime = RUNTIME_INSNS_BYTE_TO_OPNAME
         .read()
         .expect("runtime insn table poisoned")
         .get(&byte)
-        .copied()
+        .copied();
+    match runtime {
+        Some(RuntimeInsn::Unique(key)) => Some(key),
+        Some(RuntimeInsn::Ambiguous) => None,
+        None => INSNS_BYTE_TO_OPNAME.get(&byte).map(String::as_str),
+    }
 }
 
 /// RPython `setup_insns(insns)` — full opname → opcode-byte table.
