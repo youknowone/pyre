@@ -1395,6 +1395,19 @@ fn register_synthetic_positional_metadata(
 /// A fixed 16 would truncate any shell that ever records more than one payload
 /// word.  The floor keeps a tag-only shell at the full `[tag | payload]` width,
 /// matching the `size.max(16)` the codewriter applies to the same shell.
+/// Byte width of a Rust integer spelling, for the enum tag `TypeLayout`
+/// records beside its offset (`discriminant_int_type`).  Anything unspelled
+/// answers a machine word, which is the conservative direction: it widens the
+/// tag's byte range and so decides more enums need the explicit sum shell.
+fn int_type_byte_width(int_ty: &str) -> u64 {
+    match int_ty {
+        "i8" | "u8" => 1,
+        "i16" | "u16" => 2,
+        "i32" | "u32" => 4,
+        _ => 8,
+    }
+}
+
 fn sum_shell_size(field_offsets: &std::collections::HashMap<String, u64>) -> u64 {
     field_offsets
         .values()
@@ -1812,8 +1825,56 @@ fn derive_program_metadata(
                 // base tag stays at offset 0 either way, so the shell only
                 // moves the payload of an Option this front end actually
                 // builds.
-                let explicit_sum_shell =
-                    name == "core::result::Result" || name == "core::option::Option";
+                //
+                // Those two names were the cases this shell was first written
+                // for, but the condition they share is physical rather than
+                // nominal: whenever the host layout seats a variant's payload
+                // field on the tag's own bytes, the constructor's payload store
+                // overwrites the tag it just wrote.  Asking the layout catches
+                // every such enum instead of the two that were noticed.
+                //
+                // `pyre_interpreter::pyopcode::StepResult` — what every opcode
+                // handler returns — is one of them.  Charon gives
+                // `CloseLoop.jump_args` and `Return.__pos_0` offset 0, the tag's
+                // own offset, so `close_loop`'s jitcode stamped discriminant 2
+                // and then overwrote it with `jump_args`; `execute_jump_backward`
+                // read the null back as tag 0 and reported `Continue`, and the
+                // portal took its `Continue` arm on every back edge.  A walk of
+                // the portal could therefore never reach `loop_header`, and no
+                // portal trace could close.
+                // The shell is needed exactly when the base registered a
+                // `__discriminant` row that the variant subclass inherits at
+                // byte 0 (`rclass.py:499-518`): the payload must then start
+                // after it.  `tag_recorded_but_unspellable` registers no base
+                // row at all, so a payload at 0 there aliases nothing.
+                let base_has_discriminant = !fieldless && !tag_recorded_but_unspellable;
+                // An unrecorded tag width reads as a machine word: the wider
+                // guess only moves more enums onto the explicit shell, which
+                // is the representation that cannot alias in the first place.
+                let tag_offset = enum_layout
+                    .as_ref()
+                    .and_then(|l| l.discriminant_offset())
+                    .unwrap_or(0);
+                let tag_size = enum_layout
+                    .as_ref()
+                    .and_then(|l| l.discriminant_int_type())
+                    .map_or(8, int_type_byte_width);
+                let payload_seats_on_tag = match enum_layout.as_ref() {
+                    // Charon recorded no layout for this decl — the case that
+                    // hid this bug.  The variant offsets then fall back to
+                    // default packing from byte 0, which is the inherited
+                    // discriminant's byte, on every payload enum in the set.
+                    None => true,
+                    Some(l) => variants.iter().enumerate().any(|(vidx, v)| {
+                        (0..v.fields.len()).any(|i| {
+                            l.field_offset(vidx, i)
+                                .is_some_and(|off| off >= tag_offset && off < tag_offset + tag_size)
+                        })
+                    }),
+                };
+                let explicit_sum_shell = name == "core::result::Result"
+                    || name == "core::option::Option"
+                    || (base_has_discriminant && payload_seats_on_tag);
                 // Register the enum BASE in `exact_layouts`: a single
                 // `__discriminant` field at the tag's real byte position
                 // (`discriminator.Branch.offset` via `discriminant_offset`).
