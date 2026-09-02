@@ -59,10 +59,10 @@ pub struct Finding {
 #[derive(Default)]
 pub struct ScanStats {
     pub bodies_scanned: usize,
-    /// Bodies the pin-set read declined solely because two root scopes are
-    /// live at once somewhere in them.  The flag is whole-body, so one nested
-    /// pair anywhere withholds every bracketed call in the function; this
-    /// counts how much of [`Self::withheld_contents_opaque`] that costs.
+    /// Bodies holding two live root scopes at once somewhere in them.  The
+    /// pin set carries an owner, so this on its own no longer withholds a
+    /// body; the count stays because a nested body that is unread is unread
+    /// for one of the other reasons and the distinction is worth measuring.
     pub bodies_with_nested_scopes: usize,
     /// Calls counted in [`Self::withheld_contents_opaque`] that came from a
     /// body in [`Self::bodies_with_nested_scopes`].
@@ -578,11 +578,14 @@ pub fn scan(
                             ),
                             _ => false,
                         };
-                        if opens && let Some(scope) = bare_local(&call.dest) {
-                            match normal.binary_search(&scope) {
-                                Ok(_) => {}
-                                Err(i) => normal.insert(i, scope),
-                            }
+                        // Pushed rather than inserted in id order: a pin is
+                        // rewound by the *innermost* live guard, because
+                        // `RootScope::drop` truncates the shadow stack to the
+                        // length it saved, so ownership needs nesting order.
+                        if opens && let Some(scope) = bare_local(&call.dest)
+                            && !normal.contains(&scope)
+                        {
+                            normal.push(scope);
                         }
                         for (succ, next) in [(*target, normal), (*on_unwind, unwind)] {
                             if (succ as usize) < n && active_at[succ as usize].insert(next) {
@@ -593,10 +596,10 @@ pub fn scan(
                     }
                     TermKind::Drop { place, .. } => {
                         if let Some(scope) = place_local(place) {
-                            if let Ok(i) = normal.binary_search(&scope) {
+                            if let Some(i) = normal.iter().position(|&s| s == scope) {
                                 normal.remove(i);
                             }
-                            if let Ok(i) = unwind.binary_search(&scope) {
+                            if let Some(i) = unwind.iter().position(|&s| s == scope) {
                                 unwind.remove(i);
                             }
                         }
@@ -613,17 +616,52 @@ pub fn scan(
         let unbracketed: HashSet<usize> = (0..n)
             .filter(|&b| active_at[b].iter().any(Vec::is_empty))
             .collect();
+        // The scope that owns a pin made at `b`: the innermost guard live
+        // there.  `None` where the block is reached with two different scope
+        // stacks, because then the owner is path-dependent and no single
+        // answer is right.
+        let owner_at: Vec<Option<u64>> = (0..n)
+            .map(|b| {
+                let mut it = active_at[b].iter();
+                let first = it.next()?;
+                let innermost = *first.last()?;
+                for other in it {
+                    if other.last() != Some(&innermost) {
+                        return None;
+                    }
+                }
+                Some(innermost)
+            })
+            .collect();
+        // The one scope stack live at `b`, innermost last.  `None` where the
+        // block is reached with two different stacks.
+        let stack_at: Vec<Option<Vec<u64>>> = (0..n)
+            .map(|b| {
+                let mut it = active_at[b].iter();
+                let first = it.next()?;
+                if it.next().is_some() {
+                    return None;
+                }
+                Some(first.clone())
+            })
+            .collect();
+        // The scope local a scope-closing Drop names, so the dataflow can
+        // retire that guard's pins and leave an enclosing guard's alone.
+        let closed_scope: Vec<Option<u64>> = (0..n)
+            .map(|b| match &terms[b] {
+                Some(TermKind::Drop { place, .. }) => place_local(place)
+                    .filter(|scope| active_at[b].iter().any(|a| a.contains(scope))),
+                _ => None,
+            })
+            .collect();
         let has_nested_scopes = active_at
             .iter()
             .flat_map(HashSet::iter)
             .any(|scopes| scopes.len() > 1);
         let term_closes_root_scope: Vec<bool> = (0..n)
             .map(|b| match &terms[b] {
-                Some(TermKind::Drop { place, .. }) => place_local(place).is_some_and(|scope| {
-                    active_at[b]
-                        .iter()
-                        .any(|active| active.binary_search(&scope).is_ok())
-                }),
+                Some(TermKind::Drop { place, .. }) => place_local(place)
+                    .is_some_and(|scope| active_at[b].iter().any(|a| a.contains(&scope))),
                 _ => false,
             })
             .collect();
@@ -685,13 +723,16 @@ pub fn scan(
 
         // A body whose pinned set cannot be read is not a body with an empty
         // one: grading it would turn "not understood" into "root missing".
-        // The pin-set analysis below stores only root locals, not which nested
-        // guard owns each one.  Keep nested bodies unread rather than letting
-        // an inner Drop falsely retain its pins as outer-scope coverage.
+        // The pin-set analysis below carries the owning guard alongside each
+        // root local, so an inner Drop retires its own pins and leaves an
+        // enclosing guard's alone; nesting on its own no longer withholds a
+        // body.  This counts how many still hold two live scopes, because a
+        // body that also trips one of the opacity tests below is unread for
+        // that reason and the two populations are easy to confuse.
         if has_nested_scopes {
             stats.bodies_with_nested_scopes += 1;
         }
-        let mut opaque_contents = unparsed_terms || unparsed_stmts || has_nested_scopes;
+        let mut opaque_contents = unparsed_terms || unparsed_stmts;
         let mut saw_pin_call = false;
         let mut term_pins: Vec<HashSet<u64>> = vec![HashSet::new(); n];
         // The locals a pin was *handed*, as distinct from the word it hands
@@ -763,6 +804,16 @@ pub fn scan(
             }
             term_pins[b] = pinned;
         }
+        // A scope-closing Drop this reader cannot name retires an unknown set,
+        // and a pin made where two scope stacks meet has a path-dependent
+        // owner.  Either would let one guard's Drop release another's pins.
+        // Blocks that neither pin nor close a scope need no owner.
+        if (0..n).any(|b| {
+            (term_closes_root_scope[b] && (closed_scope[b].is_none() || stack_at[b].is_none()))
+                || (!term_pins[b].is_empty() && owner_at[b].is_none())
+        }) {
+            opaque_contents = true;
+        }
         if !bracket_blocks.is_empty() && !saw_pin_call {
             // A scope is open and nothing in this body names what went into
             // it: the pins run behind a helper that holds the scope itself,
@@ -806,24 +857,52 @@ pub fn scan(
         // every path reaching it pinned that local and nothing has reassigned
         // it since.  Starts at the universe and intersects down, so a block
         // whose predecessors disagree keeps only what they all hold.
-        let universe: HashSet<u64> = gc_locals.keys().copied().collect();
-        let out_of = |b: usize, pin: &[HashSet<u64>]| -> HashSet<u64> {
-            let mut s: HashSet<u64> = pin[b].difference(&stmt_kills[b]).copied().collect();
+        // Each element carries the guard that owns it, so a Drop retires that
+        // guard's pins and leaves an enclosing guard's in place.  The owner is
+        // the innermost scope live where the pin was made.
+        let all_scopes: HashSet<u64> = active_at
+            .iter()
+            .flat_map(HashSet::iter)
+            .flat_map(|a| a.iter().copied())
+            .collect();
+        let universe: HashSet<(u64, u64)> = gc_locals
+            .keys()
+            .flat_map(|l| all_scopes.iter().map(move |s| (*l, *s)))
+            .collect();
+        let out_of = |b: usize, pin: &[HashSet<(u64, u64)>]| -> HashSet<(u64, u64)> {
+            let mut s: HashSet<(u64, u64)> = pin[b]
+                .iter()
+                .filter(|(l, _)| !stmt_kills[b].contains(l))
+                .copied()
+                .collect();
             if term_closes_root_scope[b] {
-                // Nested scopes were marked opaque above.  In the remaining
-                // bodies this Drop closes the one live scope, so every pin it
-                // owned leaves the root stack here.
-                s.clear();
+                // `RootScope::drop` truncates the shadow stack to the length it
+                // saved, so a guard takes its own pins *and* those of every
+                // guard opened after it -- dropping out of order takes more
+                // than one scope's worth.  An enclosing guard keeps its own.
+                match (closed_scope[b], stack_at[b].as_ref()) {
+                    (Some(scope), Some(stack)) => {
+                        let retired: HashSet<u64> = match stack.iter().position(|&x| x == scope) {
+                            Some(i) => stack[i..].iter().copied().collect(),
+                            None => stack.iter().copied().collect(),
+                        };
+                        s.retain(|(_, owner)| !retired.contains(owner));
+                    }
+                    // A Drop this reader cannot place retires an unknown set.
+                    _ => s.clear(),
+                }
             }
             if let Some(TermKind::Call { call, .. }) = &terms[b] {
                 if let Some(d) = bare_local(&call.dest) {
-                    s.remove(&d);
+                    s.retain(|(l, _)| *l != d);
                 }
             }
-            s.extend(term_pins[b].iter().copied());
+            if let Some(owner) = owner_at[b] {
+                s.extend(term_pins[b].iter().map(|l| (*l, owner)));
+            }
             s
         };
-        let mut pinned_in: Vec<HashSet<u64>> = (0..n)
+        let mut pinned_in: Vec<HashSet<(u64, u64)>> = (0..n)
             .map(|b| {
                 if b == 0 || !reachable.contains(&b) {
                     HashSet::new()
@@ -833,9 +912,10 @@ pub fn scan(
             })
             .collect();
         for _round in 0..n + 8 {
-            let outs: Vec<HashSet<u64>> = (0..n).map(|b| out_of(b, &pinned_in)).collect();
+            let outs: Vec<HashSet<(u64, u64)>> =
+                (0..n).map(|b| out_of(b, &pinned_in)).collect();
             let mut changed = false;
-            let mut next: Vec<HashSet<u64>> = Vec::with_capacity(n);
+            let mut next: Vec<HashSet<(u64, u64)>> = Vec::with_capacity(n);
             for b in 0..n {
                 if b == 0 || !reachable.contains(&b) {
                     next.push(HashSet::new());
@@ -1017,7 +1097,13 @@ pub fn scan(
                     }
                     continue;
                 }
-                let held: HashSet<u64> = pinned_in[b].difference(&stmt_kills[b]).copied().collect();
+                // Drop the owner here: coverage asks only whether the local
+                // is pinned by *some* live guard.
+                let held: HashSet<u64> = pinned_in[b]
+                    .iter()
+                    .map(|(l, _)| *l)
+                    .filter(|l| !stmt_kills[b].contains(l))
+                    .collect();
                 let mut missing: Vec<String> = after
                     .iter()
                     .filter(|l| !held.contains(l))

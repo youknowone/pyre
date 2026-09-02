@@ -398,14 +398,14 @@ fn main() {
             stats.withheld_bracket_short,
             stats.withheld_contents_opaque
         );
-        // `has_nested_scopes` is a whole-body flag, so one pair of overlapping
-        // root scopes anywhere withholds every bracketed call in the function.
-        // Behind an env var because the gate parses this output by regex and
-        // every pattern there must match exactly once.
+        // Overlapping root scopes are read rather than withheld, so this is a
+        // measurement of how much of the unread set happens to be nested, not
+        // of what nesting costs.  Behind an env var because the gate parses
+        // this output by regex and every pattern there must match exactly once.
         if std::env::var("GC_NESTED_CENSUS").is_ok() {
             println!(
                 "           nested-scope census: {} of {} bodies hold two live root \
-                 scopes, withholding {} of the {} unread calls",
+                 scopes, and {} of the {} unread calls come from one",
                 stats.bodies_with_nested_scopes,
                 stats.bodies_scanned,
                 stats.withheld_opaque_from_nested,
