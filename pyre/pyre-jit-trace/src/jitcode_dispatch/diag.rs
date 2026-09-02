@@ -455,6 +455,7 @@ spec_folds! {
     LoadAttrOnSuper      => ("load_attr_on_super",       "specialize",    "load_attr"),
     KwonlyDefaultsInline => ("kwonly_defaults_inline",   "inline_call",   "-"),
     LoadSuperAttr        => ("load_super_attr",          "residual_call", "-"),
+    LoadSuperAttrDescent => ("load_super_attr_descent",  "specialize",    "load_super_attr"),
     SuperAttrUnwrap      => ("super_attr_unwrap",        "residual_call", "load_super_attr"),
     LocalsTraceLimitCut  => ("builtin_locals_trace_limit_cut", "specialize", "builtin_locals"),
 }

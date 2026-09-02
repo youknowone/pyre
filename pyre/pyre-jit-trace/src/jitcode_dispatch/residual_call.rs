@@ -3106,14 +3106,44 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // to it -> SIGSEGV.  Decline the whole descent so it aborts gracefully at
     // the first un-lowered helper.  Symbolic hashes carry the
     // `SYMBOLIC_FNADDR_BASE` high-16-bit tag no real funcptr can carry.
-    if ctx.fbw_mode.inline_subwalk
+    //
+    // A published address is the weaker claim that the funcptr is real, not
+    // that its signature fits the residual ABI.  The executor writes one word
+    // per `arg_types()` entry, so a helper taking a fat pointer receives its
+    // second half from whichever register the caller last wrote, and reading
+    // that as a length dereferences an address nothing chose --- a fault
+    // inside the callee, past every check this walk makes.
+    // `is_abi_unsound_argument_residual` names exactly the helpers published
+    // with such a parameter, so the descent declines before running one and
+    // the interpreter makes the call with the argument whole.
+    let unsupported_funcbox = if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
-        && (addr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(addr))
     {
+        if addr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(addr) {
+            // `symbolic` resolves against `symbolic_fnaddr_paths` in the
+            // build's jit metadata, so carry the hash for the report.
+            Some(("symbolic", addr, addr))
+        } else if pyre_interpreter::is_abi_unsound_argument_residual(addr as usize) {
+            // A real funcptr reached here, so there is no hash to carry, and
+            // zero is what this variant spells for that.
+            Some(("abi-unsound-arg", addr, 0))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some((reason, addr, symbolic)) = unsupported_funcbox {
+        // Every caller catches this variant to decline its whole fold, so
+        // without a report here the helper that stopped the descent is
+        // unnameable.
+        if fbw_debug_abort_enabled() {
+            eprintln!("[subwalk-unsupported] pc={op_pc} {reason}={addr:#x}");
+        }
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
             pc: op_pc,
-            symbolic: addr,
+            symbolic,
         });
     }
     // Authoritative-executor gate: fire ONLY when the walk is the sole
@@ -8690,6 +8720,28 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     )
                 })?
                 .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                // A bare `g = o.m` read, which `space.getattr` answers with a
+                // `Method` exactly as the fused method-call shape does.  That
+                // shape is left to the block below, where `load_method_attr`
+                // reaches the same receiver by pushing `[w_descr, w_obj]`
+                // without allocating at all; only a read with no
+                // `load_method_self` after it is answered here.
+                if !next_op_is_load_method_self_for_attr(code, op, ctx, dst)
+                    && spec_gate(SpecFold::LoadBoundMethodAttr, || {
+                        try_walker_specialize_load_bound_method_attr(
+                            ctx,
+                            op.pc,
+                            obj_opref,
+                            w_code_ptr,
+                            namei as usize,
+                            dst,
+                            dst_bank,
+                        )
+                    })?
+                    .is_some()
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }

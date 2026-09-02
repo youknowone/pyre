@@ -1577,7 +1577,20 @@ fn analyze_pipeline_from_module_paths(
             // fail-loud resolution at a time; the motivating members are
             // the exception-handler pair whose empty defaults broke
             // generic-dispatch resolution.
-            const DEFAULT_SHADOW_DEVIRT_SCOPE: &[&str] = &["push_exc_info", "pop_except"];
+            const DEFAULT_SHADOW_DEVIRT_SCOPE: &[&str] = &[
+                "push_exc_info",
+                "pop_except",
+                // `pyopcode::execute_load_super_attr` is generic over the
+                // executor, but the portal's one concrete executor is
+                // `PyFrame`.  Keeping the trait default here generates the
+                // deliberately-raising "not implemented" body and cuts the
+                // real `PyFrame::load_super_attr_with` call graph out of the
+                // JitCode closure.  PyPy traces the ordinary
+                // `W_Super.getattribute` / `_super_check` bodies, so bind the
+                // concrete override at the same classdef/MRO decision point
+                // as the exception-handler pair above.
+                "load_super_attr_with",
+            ];
             let devirt: Option<(&str, &front::semantic::SemanticFunction)> =
                 if is_default && DEFAULT_SHADOW_DEVIRT_SCOPE.contains(&method.name.as_str()) {
                     trait_method_overrides

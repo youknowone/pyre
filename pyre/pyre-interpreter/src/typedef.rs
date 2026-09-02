@@ -2091,7 +2091,10 @@ pub fn w_type() -> PyObjectRef {
 }
 
 pub fn gettypeobject(tp: &PyType) -> PyObjectRef {
-    gettypefor(tp as *const PyType).map_or(PY_NULL, |p| p.as_ptr())
+    match gettypefor(tp as *const PyType) {
+        Some(w_type) => w_type.as_ptr(),
+        None => PY_NULL,
+    }
 }
 
 /// Get the wrapped `object` typeobject.

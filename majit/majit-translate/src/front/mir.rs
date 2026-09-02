@@ -10517,6 +10517,39 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // Rust spells `&str != &str` through
+                // `core::cmp::impls::<Impl>::ne`; RPython's
+                // `AbstractStringRepr.rtype_ne` lowers the same operation to
+                // `ll_streq` followed by `bool_not`.  The flow graph's string
+                // `BinOp("ne")` is that decomposition's canonical spelling.
+                // Gate both operands on the builtin `str` pointee because the
+                // generic core path is shared by non-string reference impls.
+                // This is the comparison in PyPy's `W_Super.getattribute`
+                // (`name != '__class__').
+                if args.len() == 2
+                    && fmt_path_ends_with(&segments, &["cmp", "impls", "<Impl>", "ne"])
+                    && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
+                        .iter()
+                        .all(|ty| ty.is_some_and(|ty| tyref_strips_to_str(ty, self.llbc)))
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "ne".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: args[1].clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `<T as ToString>::to_string(x)` renders `x` to an owned
                 // String — the same `str(x)` (`ll_str`) the format!
                 // expansion emits for a Display placeholder.  Lower it to
@@ -33953,6 +33986,54 @@ mod tests {
         assert!(
             ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")),
             "the discriminant comparison lowers to an int `BinOp(ne)`"
+        );
+    }
+
+    /// Anchor the `&str != &str` fold to the comparison in PyPy's
+    /// `W_Super.getattribute`.  Charon resolves that Rust expression to the
+    /// generic `core::cmp::impls::<Impl>::ne`, but the translated graph must
+    /// contain RPython's string inequality operation rather than a residual
+    /// helper call.  Ignored by default (loads the real interpreter LLBC).
+    #[test]
+    #[ignore]
+    fn str_ne_fold_real_super_getattribute() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::baseobjspace::super_getattribute_str",
+        )
+        .expect("lower super_getattribute_str");
+        let ops = || {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+        };
+        assert_eq!(
+            ops()
+                .filter(|operation| matches!(
+                    &operation.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["cmp", "impls", "<Impl>", "ne"])
+                ))
+                .count(),
+            0,
+            "no residual generic string `ne` helper survives the fold"
+        );
+        assert_eq!(
+            ops()
+                .filter(|operation| matches!(
+                    &operation.kind,
+                    OpKind::BinOp { op, .. } if op == "ne"
+                ))
+                .count(),
+            1,
+            "the `__class__` comparison lowers to one string `BinOp(ne)`"
         );
     }
 

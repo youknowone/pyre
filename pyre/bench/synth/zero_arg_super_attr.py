@@ -1,3 +1,5 @@
+# pyre-check: max-pypy-ratio=3
+# pyre-check: skip-cpython
 # pyre-check: spec-folds=load_deref,load_super_attr,super_attr_unwrap
 # Zero-argument `super().val()` with the loop INSIDE the super-bearing method,
 # in the `for` spelling — the `for` twin of `load_super_attr.py`.
@@ -16,6 +18,29 @@
 # LOAD_DEREF __class__, LOAD_FAST self, LOAD_SUPER_ATTR — three of the four
 # were already admitted.
 #
+# N is sized for pypy, not for cpython.  This file used to run 10,000
+# iterations, at which pypy's execution-only time is a few microseconds --
+# under `EXEC_TIME_FLOOR_S`, so check.py printed the ratio with a `~`, whose
+# legend says "ratio is not a measurement, and no ratio gate is applied to
+# it".  What that column showed was warmup: the same file reads 12.6ns per
+# iteration at 1,000,000 and 0.9ns at 20,000,000.  pypy settles at ~0.6ns per
+# iteration here, so 250,000,000 is what puts its execution time (~0.17s) far
+# enough above `FLOOR_GATE_MIN_BASELINE_S` for the ratio to be a measurement
+# and for the ceiling below to be enforced.  cpython cannot usefully run that
+# many, hence `skip-cpython`; pypy stays the oracle the backends' output is
+# compared against.
+#
+# The ceiling is fitted to what that measurement reads: 1.5x on dynasm and
+# 1.7x on cranelift, carried with room for a slower host.
+# `load_super_attr.py` carries the same 3 for the same family.
+#
+# `load_super_attr_descent` is not among them.  The descent walks the MRO
+# suffix and reaches `wtf8_key_is_utf8`, whose `&Wtf8` argument is two machine
+# words against the residual ABI's one, so the sub-walk declines at that call
+# rather than run it: the fold is consulted once per trace and fires zero
+# times.  Naming it here would gate on a fold that cannot fire until the
+# wtf8-keyed dict family takes a key that is one word wide.
+#
 try:
     import pypyjit
 
@@ -23,7 +48,7 @@ try:
 except ImportError:
     pass
 
-N = 20000
+N = 250000000
 
 
 class Base:

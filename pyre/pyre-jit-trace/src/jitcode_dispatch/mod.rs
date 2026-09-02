@@ -9929,6 +9929,30 @@ fn walker_pin_descriptor_slot<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
+/// Pin whatever the class-MRO value's `space.get` arm depends on beyond the
+/// receiver type's version tag, as [`pyre_interpreter::type_attr_value_fast_path`]
+/// reported it.
+fn walker_pin_type_attr_binding<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    binding: pyre_interpreter::TypeAttrBinding,
+) -> Result<(), DispatchError> {
+    match binding {
+        // Neither arm reads a field of the value, so the version tag that
+        // covers rebinding the name is already the whole precondition.
+        pyre_interpreter::TypeAttrBinding::Unbound
+        | pyre_interpreter::TypeAttrBinding::Function => Ok(()),
+        pyre_interpreter::TypeAttrBinding::StaticMethod { w_wrapper } => {
+            walker_pin_descriptor_slot(
+                ctx,
+                op_pc,
+                w_wrapper,
+                crate::descr::staticmethod_w_function_quasi_descr(),
+            )
+        }
+    }
+}
+
 /// The `function.py:47 _immutable_fields_ = ['code?', 'w_func_globals?',
 /// 'closure?[*]', 'defs_w?[*]']` twin of [`walker_pin_descriptor_slot`]: pin
 /// the callee's code slot when the inline lever cannot re-prove it per
@@ -10248,7 +10272,7 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
         crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
     let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[actual, expected])?;
-    // `implement_guard_value`'s second half (`pyjitpl.py:1915-1928`): the guard
+    // `pyjitpl.py` `MIFrame.implement_guard_value`'s second half: the guard
     // has proved the read equals the constant, so the heapcache serves the
     // constant to every later reader of the same box.
     ctx.trace_ctx.heap_cache_mut().replace_box(actual, expected);
