@@ -7001,8 +7001,11 @@ impl<S: JitState> JitDriver<S> {
             // exception-less interpreter): fall back to crude state recovery and
             // resume the interpreter at the guard pc.
             //
-            // compile.py:710 recovery_layout header_pc parity: the resume pc
-            // comes from the guard's recovery metadata. Resolved at the head of
+            // `AbstractResumeGuardDescr.handle_fail` parity: a guard failure
+            // that does not compile is answered by `resume_in_blackhole`, which
+            // rebuilds the frame chain and `setposition`s it at the pc the
+            // guard's own resume data encodes. The header pc of the guard's
+            // recovery frame is that position here. Resolved at the head of
             // this block for two reasons. It sits inside the block because the
             // block is the only reader — every other exit from the guard arm
             // returns a pc the bridge or the blackhole reported — and it sits
