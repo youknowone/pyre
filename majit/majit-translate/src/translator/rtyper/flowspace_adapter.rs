@@ -457,17 +457,17 @@ fn lookup_operand(
         .cloned()
         .or_else(|| void_constant_for(operand))
         .ok_or_else(|| {
-        let result_label = match op.result.as_ref() {
-            Some(var) => format!("Some({var:?})"),
-            None => "None".to_string(),
-        };
-        TyperError::message(format!(
-            "translate_op: undefined operand {operand:?} as {arg_role} of {opkind} \
+            let result_label = match op.result.as_ref() {
+                Some(var) => format!("Some({var:?})"),
+                None => "None".to_string(),
+            };
+            TyperError::message(format!(
+                "translate_op: undefined operand {operand:?} as {arg_role} of {opkind} \
              (result {result_label}) — adapter invariant broken (every referenced \
              operand must be defined as a block inputarg or op result)",
-            opkind = opkind_variant_name(&op.kind),
-        ))
-    })
+                opkind = opkind_variant_name(&op.kind),
+            ))
+        })
 }
 
 /// Resolve the `Hlvalue` result slot for a legacy op. When the op has
@@ -3117,13 +3117,9 @@ pub fn translate_op(
                 CallTarget::Indirect {
                     method_name,
                     trait_root,
-                } => dyn_trait_dispatch_ops(
-                    arg_hls,
-                    trait_root,
-                    method_name,
-                    result,
-                    call_registry,
-                ),
+                } => {
+                    dyn_trait_dispatch_ops(arg_hls, trait_root, method_name, result, call_registry)
+                }
                 CallTarget::UnsupportedExpr => Err(TyperError::message(format!(
                     "translate_op: Call with CallTarget::UnsupportedExpr at \
                      result={} — frontend coverage gap; the `front::mir` \
@@ -3706,13 +3702,13 @@ fn link_arg_to_hlvalue(
             .cloned()
             .or_else(|| void_constant_for(var))
             .ok_or_else(|| {
-            TyperError::message(format!(
-                "translate_op: undefined operand {var:?} as Link.args[{arg_index}] entry \
+                TyperError::message(format!(
+                    "translate_op: undefined operand {var:?} as Link.args[{arg_index}] entry \
                  (source block {source_block_id:?} -> target block {target_block_id:?}) — \
                  adapter invariant broken (every referenced operand must be \
                  defined as a block inputarg or op result)",
-            ))
-        }),
+                ))
+            }),
     }
 }
 

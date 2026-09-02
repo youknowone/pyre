@@ -4993,9 +4993,9 @@ mod tests {
         );
         hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
         hop.args_s.borrow_mut().extend([
-            crate::annotator::model::SomeValue::String(
-                crate::annotator::model::SomeString::new(false, false),
-            ),
+            crate::annotator::model::SomeValue::String(crate::annotator::model::SomeString::new(
+                false, false,
+            )),
             crate::annotator::model::SomeValue::Char(crate::annotator::model::SomeChar::new(false)),
         ]);
         hop.args_r.borrow_mut().extend([
@@ -5017,7 +5017,11 @@ mod tests {
             .filter(|op| op.opname == "direct_call")
             .map(|op| format!("{:?}", op.args[0]))
             .collect();
-        assert_eq!(called.len(), 2, "one chr2str coercion, one concat: {called:?}");
+        assert_eq!(
+            called.len(),
+            2,
+            "one chr2str coercion, one concat: {called:?}"
+        );
         assert!(
             called[0].contains("ll_chr2str"),
             "the char operand coerces first: {called:?}"
