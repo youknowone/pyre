@@ -7000,22 +7000,31 @@ impl<S: JitState> JitDriver<S> {
             // interpreter has no exception machinery — unreachable for an
             // exception-less interpreter): fall back to crude state recovery and
             // resume the interpreter at the guard pc.
+            //
+            // compile.py:710 recovery_layout header_pc parity: the resume pc
+            // comes from the guard's recovery metadata. Resolved at the head of
+            // this block for two reasons. It sits inside the block because the
+            // block is the only reader — every other exit from the guard arm
+            // returns a pc the bridge or the blackhole reported — and it sits
+            // ahead of the retirement below because the index lookup is keyed on
+            // a compiled loop that `remove_compiled_loop` is about to drop:
+            // asking afterwards finds nothing and silently answers `target_pc`,
+            // which resumes at the loop entry against state the recovery has
+            // already rewound. The failing guard's own layout carries the same
+            // header pc, so reading it first also answers without a lookup.
+            let guard_resume_pc = exit_layout
+                .recovery_layout
+                .as_ref()
+                .and_then(|recovery| recovery.frames.first())
+                .and_then(|frame| frame.header_pc)
+                .or_else(|| self.get_merge_point_pc(owning_key, trace_id, fail_index))
+                .map(|pc| pc as usize)
+                .unwrap_or(target_pc);
             state.recover_after_compiled_run();
             self.meta.invalidate_loop(green_key);
             self.meta.remove_compiled_loop(green_key);
             self.meta.warm_state_mut().abort_tracing(green_key, true);
             self.exit_raw_scratch_out(raw_values);
-            // compile.py:710 recovery_layout header_pc parity:
-            // guard resume_pc comes from the guard's recovery metadata.
-            // Resolved here rather than beside the `must_compile` tick: this
-            // block is the only reader, and every other exit from the guard arm
-            // returns a pc the bridge or the blackhole reported, so the three
-            // index lookups the resolution costs were spent per guard failure
-            // for a value all but this one path discarded.
-            let guard_resume_pc = self
-                .get_merge_point_pc(owning_key, trace_id, fail_index)
-                .map(|pc| pc as usize)
-                .unwrap_or(target_pc);
             return Some(guard_resume_pc);
         }
 
