@@ -4870,11 +4870,16 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         {
             if fbw_inline_diag_enabled() {
                 eprintln!(
-                    "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} disp=rollback",
+                    "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} \
+                     disp=rollback effects={}/{} unjournaled={}/{}",
                     unsafe { pyre_interpreter::function_get_name(callable) },
                     op.pc,
                     pc,
                     symbolic as u64,
+                    effects_before,
+                    fbw_executed_effect_count(),
+                    unjournaled_before,
+                    fbw_has_unjournaled_effect(),
                 );
             }
             cut_declined_subwalk(ctx, pre_fold_pos);
@@ -4884,11 +4889,16 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             if let DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic } = &error {
                 if fbw_inline_diag_enabled() {
                     eprintln!(
-                        "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} disp=propagate",
+                        "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} \
+                         disp=propagate effects={}/{} unjournaled={}/{}",
                         unsafe { pyre_interpreter::function_get_name(callable) },
                         op.pc,
                         pc,
                         *symbolic as u64,
+                        effects_before,
+                        fbw_executed_effect_count(),
+                        unjournaled_before,
+                        fbw_has_unjournaled_effect(),
                     );
                 }
                 // The descent's `pc` is an offset into the callee's own
