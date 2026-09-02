@@ -6394,6 +6394,9 @@ impl<S: JitState> JitDriver<S> {
                 .take()
                 .expect("a guard exit carries its descr");
             let guard_value_operand = result.guard_value_operand;
+            // `compile.py handle_fail` `resumedescr.rd_loop_token`, resolved
+            // once where the run handed the descr back.
+            let descr_owning_key = result.rd_loop_token;
             // blackhole.py `_prepare_resume_from_failure(deadframe)`:
             // the pending exception grabbed at guard failure
             // (cpu.grab_exc_value) must seed the blackhole resume so an
@@ -6442,11 +6445,16 @@ impl<S: JitState> JitDriver<S> {
             } else {
                 green_key
             };
-            let (must_compile, owning_key) = self.meta.must_compile_with_values(
+            // Resolved once for the whole event, where the run handed the descr
+            // back, and carried here: `compile.py handle_fail` reads
+            // `resumedescr.rd_loop_token` once and hands the loop it names to
+            // both the layout it looks up and the `must_compile` call.
+            let owning_key = descr_owning_key.unwrap_or(fallback_green_key);
+            let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
                 &descr_arc,
                 &raw_values,
                 guard_value_operand,
-                fallback_green_key,
+                owning_key,
             );
             // compile.py: must_compile() and not stack_almost_full().
             // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
@@ -8084,6 +8092,8 @@ impl<S: JitState> JitDriver<S> {
         // `result` is dropped just below, so the buffer has no reader left.
         let typed_values = std::mem::take(&mut result.typed_values).into_vec();
         let guard_value_operand = result.guard_value_operand;
+        // See the sibling run loop.
+        let descr_owning_key = result.rd_loop_token;
         // llmodel.py grab_exc_value: the pending exception captured at
         // guard failure travels with the GuardFailure outcome so the
         // blackhole resume can seed it (blackhole.py:1794).
@@ -8121,11 +8131,13 @@ impl<S: JitState> JitDriver<S> {
         } else {
             green_key
         };
-        let (must_compile, owning_key) = self.meta.must_compile_with_values(
+        // Carried off the result — see the sibling run loop.
+        let owning_key = descr_owning_key.unwrap_or(fallback_green_key);
+        let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
             &descr_arc,
             &raw_values,
             guard_value_operand,
-            fallback_green_key,
+            owning_key,
         );
         // compile.py: must_compile() and not stack_almost_full().
         // `no_bridge_enabled()` is the same opt-out the two sibling loops

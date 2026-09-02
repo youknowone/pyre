@@ -11582,6 +11582,7 @@ impl<M: Clone> MetaInterp<M> {
             is_finish,
             is_exit_frame_with_exception,
             exit_layout: exit_layout.map(Box::new),
+            rd_loop_token,
             savedata,
             exception,
             status,
@@ -11814,6 +11815,7 @@ impl<M: Clone> MetaInterp<M> {
                 is_finish,
                 is_exit_frame_with_exception,
                 exit_layout: None,
+                rd_loop_token: None,
                 savedata: None,
                 exception: ExceptionState {
                     exc_class: 0,
@@ -11937,6 +11939,7 @@ impl<M: Clone> MetaInterp<M> {
             is_finish,
             is_exit_frame_with_exception,
             exit_layout,
+            rd_loop_token,
             savedata,
             exception,
             status,
@@ -12913,6 +12916,34 @@ impl<M: Clone> MetaInterp<M> {
     const TY_REF: u64 = 0x04;
     const TY_FLOAT: u64 = 0x06;
 
+    /// Green key of the loop a failing guard belongs to.
+    ///
+    /// `compile.py _trace_and_compile_from_bridge` walks
+    /// `resumedescr.rd_loop_token.loop_token_wref()` for the owning JCT.  When
+    /// the weakref is dead (memmgr eviction — `compile.py compile.giveup()`
+    /// parity), no other identity is recoverable, so the caller's own outer
+    /// entry key stands in.  RPython has no such fallback because its identity
+    /// is descr-pointer-based, never indirected through a numeric `green_key`.
+    ///
+    /// A JitCellToken invalidated by `QuasiImmut.invalidate()` (quasiimmut.py)
+    /// still resolves here, and the `must_compile` tick that follows still
+    /// fires: warmstate.py:191-196 stops returning the dead token as a
+    /// procedure token, so once the counter fires, the walk reaches
+    /// `reached_loop_header` (pyjitpl.py) with no compiled target, falls
+    /// through to `compile_loop` and installs a live replacement for the key.
+    /// Suppressing that tick strands every later activation of the dead trace
+    /// in blackhole resume forever.
+    pub fn owning_key_for_descr(
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+        fallback_green_key: u64,
+    ) -> u64 {
+        descr_arc
+            .as_fail_descr()
+            .and_then(majit_backend::descr_owning_jct)
+            .map(|jct| jct.green_key())
+            .unwrap_or(fallback_green_key)
+    }
+
     /// compile.py: must_compile — read self.status directly from
     /// the failed descriptor (by descr_addr), compute hash, tick jitcounter.
     ///
@@ -12927,10 +12958,8 @@ impl<M: Clone> MetaInterp<M> {
     /// loop_token_wref()`, `trace_id` mirrors `assembler.py:227
     /// self.faildescr.trace_id`, and `fail_index_per_trace` mirrors
     /// `self.faildescr.index = i`.  The `fallback_green_key` only fires
-    /// when `descr_owning_jct` returns `None` (the JCT was evicted by
-    /// memmgr, equivalent to RPython's `compile.py:725-729 compile.
-    /// giveup()` path), so callers pass their own outer entry key as
-    /// the safe default.
+    /// when the owning-JCT walk returns `None`; see
+    /// [`Self::owning_key_for_descr`].
     ///
     /// Returns (should_compile, owning_green_key).
     pub fn must_compile_with_values(
@@ -12940,6 +12969,25 @@ impl<M: Clone> MetaInterp<M> {
         guard_value_operand: Option<i64>,
         fallback_green_key: u64,
     ) -> (bool, u64) {
+        let owning_key = Self::owning_key_for_descr(descr_arc, fallback_green_key);
+        self.must_compile_with_owning_key(descr_arc, fail_values, guard_value_operand, owning_key)
+    }
+
+    /// [`Self::must_compile_with_values`] for a caller that has already
+    /// resolved the owning loop.
+    ///
+    /// `compile.py handle_fail` reads `resumedescr.rd_loop_token` once per
+    /// failure and `must_compile` never re-derives the loop it belongs to; a
+    /// caller that walked the owning JCT to look the guard's layout up holds
+    /// the same answer and hands it in rather than paying the weakref upgrade
+    /// a second time inside one event.
+    pub fn must_compile_with_owning_key(
+        &mut self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+        fail_values: &[i64],
+        guard_value_operand: Option<i64>,
+        owning_key: u64,
+    ) -> (bool, u64) {
         crate::mc_diag_bump(0); // must_compile_with_values entered
         let descr_addr = std::sync::Arc::as_ptr(descr_arc) as *const () as usize;
         let descr_fd = descr_arc
@@ -12947,18 +12995,6 @@ impl<M: Clone> MetaInterp<M> {
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
-        // `must_compile` ticks the counter for every reported guard failure,
-        // including one whose owning JitCellToken has since been invalidated by
-        // `QuasiImmut.invalidate()` (quasiimmut.py).  That tick is the
-        // recovery path, not a leak: warmstate.py:191-196 stops returning the
-        // dead token as a procedure token, so once the counter fires, the walk
-        // reaches `reached_loop_header` (pyjitpl.py) with no compiled
-        // target, falls through to `compile_loop` and installs a live
-        // replacement for the key.  Suppressing the tick strands every later
-        // activation of the dead trace in blackhole resume forever.
-        let owning_key = majit_backend::descr_owning_jct(descr_fd)
-            .map(|jct| jct.green_key())
-            .unwrap_or(fallback_green_key);
         // A guard whose bridge was refused by a terminal-declining backend
         // (`bridge_decline_is_terminal()`, currently wasm) or by a structural
         // full-body-walk decline must not re-fire: re-tracing rebuilds the same
@@ -12969,14 +13005,6 @@ impl<M: Clone> MetaInterp<M> {
             crate::mc_diag_bump(1); // guard-descr terminal-decline short-circuit
             return (false, owning_key);
         }
-        // compile.py `_trace_and_compile_from_bridge` walks
-        // `resumedescr.rd_loop_token.loop_token_wref()` for the owning
-        // JCT.  When the weakref is dead (memmgr eviction —
-        // `compile.py compile.giveup()` parity), no other
-        // identity is recoverable, so we fall back to the caller's
-        // outer entry key.  RPython doesn't have this fallback because
-        // its identity is descr-pointer-based, never indirected through
-        // a numeric `green_key`.
         if descr_addr == 0 {
             crate::mc_diag_bump(2); // descr_addr==0 skip
             crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");

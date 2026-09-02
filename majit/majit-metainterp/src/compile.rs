@@ -305,6 +305,17 @@ pub struct CompileResult<M> {
     /// returns before reaching. A FINISH exit stores one null word here, so the
     /// steady entry path's allocation count is unchanged.
     pub exit_layout: Option<Box<CompiledExitLayout>>,
+    /// `compile.py handle_fail` reads `resumedescr.rd_loop_token` once and
+    /// hands the loop it names to everything downstream. The green key of the
+    /// `JitCellToken` the failing descr belongs to, recovered by walking
+    /// `descr.rd_loop_token_clt() -> clt.upgrade_loop_token()`.
+    ///
+    /// `None` when the walk finds no live owner (memmgr eviction) and on a
+    /// finish or back-edge JUMP exit, neither of which has a guard identity to
+    /// recover: the layout fallback and `must_compile` are the only readers,
+    /// and neither exit reaches either. Readers fall back to the key of the
+    /// entry they came in through.
+    pub rd_loop_token: Option<u64>,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
     /// compile.py: ResumeGuardDescr.status read at guard failure.
