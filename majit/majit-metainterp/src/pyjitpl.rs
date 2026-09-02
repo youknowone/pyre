@@ -12735,21 +12735,24 @@ impl<M: Clone> MetaInterp<M> {
     /// hands on enters that same cell's code. Asking for them separately walks
     /// the chain twice; see [`WarmState::resolved_cell_procedure_token`].
     ///
-    /// The key comes back because the second conjunct of the runnable predicate
-    /// reads `compiled_loops`, which is indexed by that key and is not a cell
-    /// walk, so the caller still needs it.
-    /// `gate` runs on the resolved key before the token is read — see
-    /// [`WarmState::resolved_cell_procedure_token`] for why a caller would
-    /// want that.
+    /// The key comes back because the remaining conjunct of the runnable
+    /// predicate reads `compiled_loops`, which is indexed by that key and is
+    /// not a cell walk, so the caller still needs it. That conjunct stays with
+    /// the caller rather than being taken here as a gate: a door that enters
+    /// wants the metadata's VALUE, so testing its presence separately would
+    /// probe the same map twice for one entry.
+    ///
+    /// `make_green_key` is consulted only on an ambiguous bucket, and a caller
+    /// that holds no structured key passes `None` — see
+    /// [`Self::resolve_cell_key`], whose key this reports.
     pub fn resolved_entry_procedure_token(
         &self,
         green_key_hash: u64,
-        make_green_key: impl FnOnce() -> majit_ir::GreenKey,
-        gate: impl FnOnce(u64) -> bool,
+        make_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
     ) -> (u64, Option<std::sync::Arc<JitCellToken>>) {
-        let (cell_key, token) =
-            self.warm_state
-                .resolved_cell_procedure_token(green_key_hash, make_green_key, gate);
+        let (cell_key, token) = self
+            .warm_state
+            .resolved_cell_procedure_token(green_key_hash, make_green_key);
         (cell_key, token.filter(|token| token.has_compiled_code()))
     }
 

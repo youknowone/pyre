@@ -5898,11 +5898,24 @@ impl<S: JitState> JitDriver<S> {
         // rebuild the caller's `GreenKey` on a chained bucket, and the whole
         // point of the carry is that the key, the token and the run come from
         // one resolution.
-        let green_key = if carried_procedure_token.is_some() {
-            green_key_hash
-        } else {
-            self.meta
-                .resolve_cell_key(green_key_hash, structured_green_key)
+        //
+        // The cell-owned half of the entry decision is taken from that same
+        // resolution rather than from later walks back to the cell it already
+        // found: `resolve_cell_key`, the token read and the `JC_TEMPORARY` test
+        // are three questions about ONE cell, and upstream asks all three off
+        // the single `cell` its chain walk bound
+        // (`WarmEnterState.maybe_compile_and_run` — "these few lines inline
+        // some logic that is also on the JitCell class, to avoid computing the
+        // hash several times"). The `compiled_loops` conjunct is still taken
+        // below, where the metadata's value is wanted anyway.
+        //
+        // Which shape the gate below takes, recorded before the token is moved
+        // into it, so the amplified gate can take the same one.
+        #[cfg(feature = "__back-edge-stage-probe")]
+        let carried_token = carried_procedure_token.is_some();
+        let (green_key, entry_procedure_token) = match carried_procedure_token {
+            Some(token) => (green_key_hash, Some(token)),
+            None => self.resolved_entry_procedure_token(green_key_hash, structured_green_key),
         };
         let single_pass_dispatch_key =
             self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
@@ -5948,11 +5961,11 @@ impl<S: JitState> JitDriver<S> {
         // `warmstate.py maybe_compile_and_run`: a cell whose token was
         // `attached by compile_tmp_callback()` is NOT entered — upstream falls
         // straight to `jitcounter.tick(hash, increment_threshold)` and, on
-        // overflow, `bound_reached`. `runnable_procedure_token` reads the
+        // overflow, `bound_reached`. The resolution above reads the
         // cell-owned `JC_TEMPORARY` flag explicitly: a callback token has a
         // body, and pyre may retain frontend metadata for the loop it
         // displaced, so neither token nor metadata presence identifies it.
-        // Binding the token here rather than testing a predicate and
+        // Binding the token rather than testing a predicate and
         // unwrapping afterwards keeps the decision and execution in step — the
         // fall-through below IS the counter processing upstream continues
         // with. Token presence stays one conjunct: it is the
@@ -5973,7 +5986,8 @@ impl<S: JitState> JitDriver<S> {
         // runner receives it and never asks the cell again. This is the same
         // resolve-once discipline the cell key above already follows, one
         // level in: the token the gate said yes about IS the token executed,
-        // and a warm entry pays for one cell lookup rather than two.
+        // and a warm entry pays for one cell lookup, not one per question it
+        // asks about that cell.
         //
         // A caller that already took its own decision on this cell's token
         // hands that same object in, and it is entered unread — the carry
@@ -5986,12 +6000,7 @@ impl<S: JitState> JitDriver<S> {
         // this load nor the loops it feeds.
         #[cfg(feature = "__back-edge-stage-probe")]
         let stage_repeats = back_edge_stage_repeats();
-        // Which shape the gate below takes, recorded before the token is moved
-        // into it, so the amplified gate can take the same one.
-        #[cfg(feature = "__back-edge-stage-probe")]
-        let carried_token = carried_procedure_token.is_some();
-        if let Some(procedure_token) =
-            carried_procedure_token.or_else(|| self.runnable_procedure_token(green_key))
+        if let Some(procedure_token) = entry_procedure_token
             && let Some(compiled_meta) = self.meta.get_compiled_meta(green_key).cloned()
         {
             // warmstate.py `WarmEnterState.make_entry_point` /
@@ -8258,52 +8267,41 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// See [`MetaInterp::runnable_generation`]: a number that holds while
-    /// [`Self::resolved_runnable_procedure_token`] cannot change its answer
+    /// [`Self::resolved_entry_procedure_token`] cannot change its answer
     /// for any key, and moves when it may.
     #[inline]
     pub fn runnable_generation(&self) -> u64 {
         self.meta.runnable_generation()
     }
 
-    /// [`Self::resolve_cell_key`] and [`Self::runnable_procedure_token`] from
-    /// one walk of the cell chain.
+    /// [`Self::resolve_cell_key`] and the whole CELL-OWNED half of
+    /// [`Self::runnable_procedure_token`] from one walk of the cell chain.
     ///
-    /// The two together are what a door holding a raw bucket hash asks: which
-    /// cell do my greens own, and does that cell have code to enter. Asked
-    /// separately they walk the chain twice for the same cell — see
+    /// The pair is what a door holding a raw bucket hash asks: which cell do my
+    /// greens own, and does that cell have code that may be entered. Asked
+    /// separately they walked the chain three times for the same cell — once to
+    /// resolve, once to read the token, once for `JC_TEMPORARY` — see
     /// [`MetaInterp::resolved_entry_procedure_token`]. The answer is identical
     /// to resolving first and then asking; this only stops paying for the
-    /// second walk.
+    /// repeats.
     ///
-    /// The resolved key travels back with the token because a caller that goes
-    /// on to run needs it, and because the `compiled_loops` half of the
-    /// predicate is keyed by it.
+    /// `JC_TEMPORARY` is part of the answer because retained frontend metadata
+    /// must not make a `compile_tmp_callback` token executable as the loop it
+    /// displaced, matching the flag-first branch of
+    /// `WarmEnterState.maybe_compile_and_run`.
     ///
-    /// The `compiled_loops` half is asked FIRST, as the gate the token read
-    /// sits behind. The resolved cell's `JC_TEMPORARY` flag is then the final
-    /// filter, matching `WarmEnterState.maybe_compile_and_run`; retained
-    /// frontend metadata must not make a callback executable as the displaced
-    /// loop. These are pure reads of the same resolved key. A key with no
-    /// compiled entry — which is every key a door declines on — still stops at
-    /// the cheap map probe before the token's `Weak::upgrade` / `Arc` drop.
+    /// The `compiled_loops` conjunct is NOT part of it, and the resolved key
+    /// travels back so the caller can take it: a door that goes on to run needs
+    /// that map's VALUE, so a presence test here would probe it twice for one
+    /// entry, and a door that declines is answered by the walk alone.
     #[inline]
-    pub fn resolved_runnable_procedure_token(
+    pub fn resolved_entry_procedure_token(
         &self,
         green_key_hash: u64,
-        make_green_key: impl FnOnce() -> GreenKey,
+        make_green_key: Option<&dyn Fn() -> GreenKey>,
     ) -> (u64, Option<std::sync::Arc<majit_backend::JitCellToken>>) {
-        let (cell_key, token) =
-            self.meta
-                .resolved_entry_procedure_token(green_key_hash, make_green_key, |cell_key| {
-                    self.meta.get_compiled_meta(cell_key).is_some()
-                });
-        let token = token.filter(|_| {
-            !self
-                .meta
-                .warm_state_ref()
-                .procedure_token_is_temporary(cell_key)
-        });
-        (cell_key, token)
+        self.meta
+            .resolved_entry_procedure_token(green_key_hash, make_green_key)
     }
 
     /// The token [`Self::has_runnable_compiled_loop`] says yes about, handed

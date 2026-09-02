@@ -220,7 +220,7 @@ pub use majit_backend::CompiledTraceInfo;
 /// The object a door carries from its entry decision into the run.
 ///
 /// Re-exported because [`JitDriver::runnable_procedure_token`] and
-/// [`JitDriver::resolved_runnable_procedure_token`] hand one to callers
+/// [`JitDriver::resolved_entry_procedure_token`] hand one to callers
 /// outside this crate, which have no other way to name its type.
 pub use majit_backend::JitCellToken;
 #[cfg(feature = "__execute-stage-probe")]

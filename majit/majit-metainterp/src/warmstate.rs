@@ -3278,7 +3278,7 @@ impl WarmEnterState {
         }
     }
 
-    /// [`Self::resolve_cell_key`] and [`Self::get_procedure_token`] answered
+    /// [`Self::resolve_cell_key`] and the resolved cell's ENTRY TOKEN answered
     /// from ONE walk of the bucket.
     ///
     /// A door that resolves a hash and then reads the resolved key's token
@@ -3288,29 +3288,51 @@ impl WarmEnterState {
     /// holds exactly this key's cell — has the cell in hand at the moment the
     /// count reaches one, so the token is read there.
     ///
+    /// `JC_TEMPORARY` is read off that same borrow, and a cell carrying it
+    /// reports no token: `warmstate.py maybe_compile_and_run` tests the flag
+    /// before it considers a token executable, and a `compile_tmp_callback`
+    /// token has a body like any other, so nothing about the token itself
+    /// answers that question. Folding it in here is what lets the whole
+    /// cell-owned half of an entry decision cost one walk — asked separately it
+    /// was a third walk of the same chain for the same cell.
+    ///
     /// The other two cases are the second walk, unchanged. On a miss the key a
     /// later install would take is `hash`, but `hash` may itself be a minted
-    /// key filed under a different bucket, so the token read has to go through
-    /// [`Self::get_procedure_token`], which maps it. On an ambiguous bucket the
-    /// greens are what settle it, exactly as [`Self::resolve_cell_key`] says.
-    /// `gate` runs on the resolved key, BEFORE the token is read.
+    /// key filed under a different bucket, so the cell has to be looked up
+    /// through [`Self::cell_by_key`], which maps it. On an ambiguous bucket the
+    /// greens are what settle it, exactly as [`Self::resolve_cell_key`] says —
+    /// and a caller that cannot build them (`make_key` is `None`) gets the raw
+    /// hash back, naming that bucket's original occupant or nothing, which is
+    /// the same answer [`Self::sole_cell_key`] gives such a caller.
     ///
-    /// Reading a token is a `Weak::upgrade` and the `Arc` drop that answers it
-    /// — one atomic each. A caller whose real question is a conjunction of that
-    /// read and something cheaper about the same key wants the cheap half
-    /// first, and cannot have it while the resolve and the read are one step:
-    /// the cheap half needs the resolved key, which only the walk produces.
-    ///
-    /// The resolve is unaffected — the key comes back whatever `gate` answers,
-    /// and a refused gate reports no token, which is what the conjunction was
-    /// going to conclude anyway. A caller with no second conjunct passes a gate
-    /// that always accepts.
+    /// The resolve is unaffected by the token: the key comes back whether or
+    /// not one is found, because every consumer downstream is keyed by it.
     pub fn resolved_cell_procedure_token(
         &self,
         hash: u64,
-        make_key: impl FnOnce() -> GreenKey,
-        gate: impl FnOnce(u64) -> bool,
+        make_key: Option<&dyn Fn() -> GreenKey>,
     ) -> (u64, Option<Arc<JitCellToken>>) {
+        let (cell_key, cell) = self.resolved_cell(hash, make_key);
+        let token = cell.and_then(|cell| {
+            if cell.flags.contains(JcFlags::JC_TEMPORARY) {
+                return None;
+            }
+            cell.get_procedure_token()
+        });
+        (cell_key, token)
+    }
+
+    /// [`Self::resolve_cell_key`]'s answer together with the cell it names,
+    /// from the one walk that produces both.
+    ///
+    /// The key alone is what `resolve_cell_key` reports, and every arm here
+    /// hands back exactly the key that function would; a caller that needs
+    /// anything OFF the cell would otherwise walk back to it.
+    fn resolved_cell(
+        &self,
+        hash: u64,
+        make_key: Option<&dyn Fn() -> GreenKey>,
+    ) -> (u64, Option<&BaseJitCell>) {
         let mut count = 0usize;
         let mut found: Option<(&BaseJitCell, u64)> = None;
         let mut cell = self.lookup_chain(hash);
@@ -3326,23 +3348,15 @@ impl WarmEnterState {
             cell = c.next.as_deref();
         }
         match (count, found) {
-            (1, Some((cell, cell_key))) => (
-                cell_key,
-                gate(cell_key).then(|| cell.get_procedure_token()).flatten(),
-            ),
-            (0, _) => (
-                hash,
-                gate(hash).then(|| self.get_procedure_token(hash)).flatten(),
-            ),
-            _ => {
-                let cell_key = self.cell_key_for(&make_key()).unwrap_or(hash);
-                (
-                    cell_key,
-                    gate(cell_key)
-                        .then(|| self.get_procedure_token(cell_key))
-                        .flatten(),
-                )
-            }
+            (1, Some((cell, cell_key))) => (cell_key, Some(cell)),
+            (0, _) => (hash, self.cell_by_key(hash)),
+            _ => match make_key {
+                Some(make_key) => {
+                    let cell_key = self.cell_key_for(&make_key()).unwrap_or(hash);
+                    (cell_key, self.cell_by_key(cell_key))
+                }
+                None => (hash, self.cell_by_key(hash)),
+            },
         }
     }
 
