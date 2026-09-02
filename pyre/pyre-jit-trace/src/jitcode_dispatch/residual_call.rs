@@ -6755,6 +6755,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // FORMAT_WITH_SPEC over a receiver whose `__format__` is Python: inline
+    // the resolved body in place of the opaque format residual.  Keyed off
+    // the helper tag, so every other `residual_call_r_r` falls straight
+    // through.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::FormatWithSpec {
+        if let Some(inlined) =
+            try_walker_inline_format(ctx, op, code, &r_args, call_descr, dst, dst_bank)?
+        {
+            return Ok(inlined);
+        }
+    }
+
     // #62: a self-recursive call the inline path declined (e.g. the
     // branchy `fib`) gets a direct `CALL_ASSEMBLER` to its own loop token
     // instead of the heavyweight func-entry
