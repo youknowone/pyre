@@ -1278,7 +1278,7 @@ static W_LONG_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         &[(
             "value",
             pyre_object::longobject::LONG_VALUE_OFFSET,
-            8,
+            WORD,
             // The `value` slot is a gc-pointer to the BigInt payload, so it
             // enters `gc_fielddescrs` (the boxing SetfieldGc emits the write
             // barrier). Immutable: a long's payload is set once at creation.
@@ -2378,7 +2378,7 @@ static W_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyObject.w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
-                8,
+                WORD,
                 Type::Ref,
                 false,
                 false,
