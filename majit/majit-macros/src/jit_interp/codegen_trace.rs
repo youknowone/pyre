@@ -88,8 +88,12 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         dispatch_lower_ok,
         dispatch_green_schema,
         dispatch_red_schema,
-    ) = match jitcode_lower::lower_dispatch_body(&dispatch_lowerer_config, &func.block, &classified)
-    {
+    ) = match jitcode_lower::lower_dispatch_body(
+        &dispatch_lowerer_config,
+        &func.block,
+        &classified,
+        &func.sig.output,
+    ) {
         Some(generated) => (
             generated.body,
             generated.liveness_prebuild,
