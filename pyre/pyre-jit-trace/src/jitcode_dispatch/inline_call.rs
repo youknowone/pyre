@@ -2897,12 +2897,13 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
 /// path it walks, and a body that delegates through `+` is statically
 /// indistinguishable from `return self.v + o.v` over ints.
 ///
-/// What this filters is a shape that is admissible and still does not survive
-/// being recorded.  A body making a nested Python call and then returning
-/// inlines into a peeled loop whose Phase 2 can still die on `phase2 snapshot
-/// remap cache miss` (`unroll.rs`), measured on
-/// `synth/inline_freevar_after_mayforce` with a `Fraction.__gt__`-shaped body --
-/// `return a._richcmp(b, operator.gt)`.  Keep that returning shape declined.
+/// What the nested-call refusal covers, and the one nested shape it lets
+/// through.  A body making a nested Python call and then returning inlines
+/// into a peeled loop whose Phase 2 can still die on `phase2 snapshot remap
+/// cache miss` (`unroll.rs`), measured on
+/// `synth/inline_freevar_after_mayforce` with a `Fraction.__gt__`-shaped body
+/// -- `return a._richcmp(b, operator.gt)`.  That returning shape is what the
+/// refusal is for.
 ///
 /// A straight-line, handler-free body that raises is different: its nested
 /// call constructs the exception and `raise/r` finishes the inlined MIFrame;
@@ -2919,8 +2920,72 @@ pub(crate) fn dunder_body_facts_admissible_on_rewind(
         || (facts.contains_raise && facts.exc_override_straight_line && !facts.has_exception_table)
 }
 
+/// The filter this carried unconditionally was that nested-call refusal, whose
+/// stated cost was a trace dying in the Phase 2 unroll on `phase2 snapshot
+/// remap cache miss`.  That no longer reproduces:
+/// `synth/inline_freevar_after_mayforce` passes with the nested body admitted,
+/// and all 537 bench scripts answer identically with and without it.  Since
+/// the filter also refused every value type the pure-Python stdlib is made of
+/// -- `date.__add__` returns `date(...)`, `Decimal.__add__` returns
+/// `_dec_from_triple(...)` -- it is off, and `PYRE_BINOP_NO_NESTED_INLINE`
+/// puts it back so one binary carries both arms.
 fn dunder_body_admissible_on_rewind(w_code: *const ()) -> bool {
-    sub_jitcode_body_facts_for_code(w_code).is_some_and(dunder_body_facts_admissible_on_rewind)
+    let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return false;
+    };
+    !binop_nested_filter_enabled() || dunder_body_facts_admissible_on_rewind(facts)
+}
+
+/// `PYRE_NO_BINOP_DEFAULTED_PARAMS`: go back to refusing a `BINARY_OP` /
+/// `COMPARE_OP` dunder whose signature has more than the two parameters the
+/// operands bind, instead of leaving the tail to the resolved descent's
+/// `__defaults__` seeding.
+///
+/// On by default; the variable only turns it off, so a bisection can name this
+/// change in one command and one binary carries both arms.
+fn binop_defaulted_params_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_NO_BINOP_DEFAULTED_PARAMS").is_none())
+}
+
+/// `PYRE_BINOP_NO_NESTED_INLINE`: refuse a `BINARY_OP` / `COMPARE_OP` dunder
+/// whose body makes a nested Python call, in the shape
+/// [`dunder_body_facts_admissible_on_rewind`] states, as
+/// [`dunder_body_admissible_on_rewind`] did before.
+fn binop_nested_filter_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_BINOP_NO_NESTED_INLINE").is_some())
+}
+
+/// Discard a declined inline sub-walk: the operations it recorded, and the
+/// heap cache they populated.
+///
+/// The seven call sites all spelled this out as the same two statements.
+///
+/// `PYRE_SUBWALK_CUT_SNAPSHOTS` additionally truncates the snapshot side
+/// table, which [`majit_metainterp::history::TraceCtx::cut_trace`] leaves
+/// alone: a guard the speculative walk attached before it declined keeps
+/// naming positions the cut has since handed to other operations, and the
+/// unroll's Phase 2 remap reports such a position as a `phase2 snapshot remap
+/// cache miss`.  The `BINARY_OP` entry cuts that way at its own rewind.  Off
+/// by default here because no trace has been found that needs it, while
+/// `cut_trace`'s own note records that truncating regressed a bench.
+fn cut_declined_subwalk<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+) {
+    if subwalk_cut_snapshots_enabled() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+    } else {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+    }
+    ctx.trace_ctx.heap_cache_mut().reset();
+}
+
+/// `PYRE_SUBWALK_CUT_SNAPSHOTS`: see [`cut_declined_subwalk`].
+fn subwalk_cut_snapshots_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_SUBWALK_CUT_SNAPSHOTS").is_some())
 }
 
 fn callee_body_commits_nothing(w_code: *const ()) -> bool {
@@ -4202,8 +4267,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
                     symbolic as u64,
                 );
             }
-            ctx.trace_ctx.cut_trace(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
+            cut_declined_subwalk(ctx, pre_fold_pos);
             return Ok(None);
         }
         Err(error) => {
@@ -7762,6 +7826,11 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         instance,
         &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
     );
+    // Inside a `BINARY_OP` / `COMPARE_OP` rewind region, the `__init__` below
+    // writes this instance's slots through the store-attr resolver, which
+    // refuses an unjournaled commit unless the receiver is one of the region's
+    // own allocations.
+    fbw_binop_rewind_note_fresh(ctx, instance);
     if fbw_inline_diag_enabled() {
         eprintln!(
             "[type-call-inline] pc={} class={} init={}",
@@ -7828,8 +7897,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
                 unsafe { pyre_object::w_type_get_name(w_type) },
             );
         }
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -8370,8 +8438,7 @@ pub(crate) fn try_walker_inline_super_property_get<Sym: WalkSym>(
         None,
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -8493,8 +8560,7 @@ pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
         None,
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -8610,8 +8676,7 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         None,
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -8989,8 +9054,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         }),
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -9102,8 +9166,7 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         None,
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -10201,7 +10264,14 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
         ));
     };
-    if nparams != 2 {
+    // The two operands bind the first two parameters.  A longer signature is
+    // not itself unbindable: `funccall_valuestack` fills every parameter the
+    // call leaves unbound from `defs_w` (`function.py:188-193`), and the
+    // resolved descent below already seeds that tail from `__defaults__` --
+    // it declines on its own when the defaults do not cover the whole tail.
+    // `_pydecimal`'s dunders are all `(self, other, context=None)`, so a hard
+    // `!= 2` refuses every arithmetic operator that module defines.
+    if nparams < 2 || (nparams != 2 && !binop_defaulted_params_enabled()) {
         decline!(format_args!("{}.{dunder} takes {nparams} params", unsafe {
             pyre_object::typeobject::w_type_get_name(w_class)
         }));
@@ -10464,7 +10534,9 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
         return Ok(None);
     };
-    if nparams != 2 {
+    // Same reading as the binary-op route: the two operands bind the first two
+    // parameters and the resolved descent seeds the rest from `__defaults__`.
+    if nparams < 2 || (nparams != 2 && !binop_defaulted_params_enabled()) {
         return Ok(None);
     }
     // A `NotImplemented` result below has to be handed back to the full binary

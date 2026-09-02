@@ -638,6 +638,21 @@ pub struct WalkSession {
     /// that raised it knows the descent stopped for that reason and may take
     /// the cut.
     pub binop_rewind_refused: bool,
+    /// Allocations the region above minted, in the order they were emitted.
+    ///
+    /// A store into one of these is not a commit the cut has to undo: the cut
+    /// discards the operations that built the object, and the concrete object
+    /// the walker allocated alongside them is unreachable from anything the
+    /// re-execution can name — the same reading
+    /// [`inline_call::try_walker_inline_type_call`] already states for its own
+    /// rewind ("the orphaned instance is unreachable and `__init__` has not
+    /// run").  Every other route out of the region — a store into a
+    /// pre-existing object, an unjournaled residual — is still refused, so an
+    /// entry here cannot escape while the region stands.
+    ///
+    /// Emptied by the outermost [`fbw_state::BinopRewindInlineGuard`], so it
+    /// never carries an entry from a region that has already unwound.
+    pub binop_rewind_fresh: Vec<OpRef>,
 }
 
 impl Default for WalkSession {
@@ -660,6 +675,7 @@ impl Default for WalkSession {
             recording_opcode_position: 0,
             binop_rewind_depth: 0,
             binop_rewind_refused: false,
+            binop_rewind_fresh: Vec::new(),
         }
     }
 }

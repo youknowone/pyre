@@ -2532,7 +2532,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // resuming FORWARD past the inlined frame, which a `BINARY_OP` /
     // `COMPARE_OP` dunder answering `NotImplemented` has no form of.  That
     // region refuses every unjournaled commit instead, this one included.
-    fbw_binop_rewind_refuse_commit(ctx, pc)?;
+    fbw_binop_rewind_refuse_commit(ctx, pc, None)?;
     // RPython `do_residual_call` runs the residual executor at any framestack
     // depth (`pyjitpl.py`). Exempt only the self-recursive
     // `CALL_ASSEMBLER` fold's concrete-stamp executor from this pyre-local
@@ -4291,13 +4291,39 @@ pub(crate) fn fbw_callee_body_has_binary_op_residual(
 pub(crate) fn fbw_binop_rewind_refuse_commit<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
+    receiver: Option<OpRef>,
 ) -> Result<(), DispatchError> {
     let mut session = ctx.session.borrow_mut();
     if session.binop_rewind_depth == 0 {
         return Ok(());
     }
+    // A write into an object the region itself allocated is not a write the
+    // cut has to undo — see [`WalkSession::binop_rewind_fresh`].  The
+    // heap-cache reading is asked as well as the membership: `new_object`
+    // raises `HF_IS_UNESCAPED` on the allocation and `escape_box` lowers it,
+    // so an entry that has since been handed to something outside the region
+    // stops answering here without the list having to track the handoff.
+    if let Some(obj) = receiver
+        && session.binop_rewind_fresh.contains(&obj)
+        && ctx.trace_ctx.heap_cache().is_unescaped(obj)
+    {
+        return Ok(());
+    }
     session.binop_rewind_refused = true;
     Err(DispatchError::callee_inline_unsupported(pc))
+}
+
+/// Record an allocation the standing `BINARY_OP` / `COMPARE_OP` rewind region
+/// minted, so a store into it is exempt from
+/// [`fbw_binop_rewind_refuse_commit`].  A no-op outside a region.
+pub(crate) fn fbw_binop_rewind_note_fresh<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    opref: OpRef,
+) {
+    let mut session = ctx.session.borrow_mut();
+    if session.binop_rewind_depth != 0 {
+        session.binop_rewind_fresh.push(opref);
+    }
 }
 
 /// Raises a [`fbw_binop_rewind_refuse_commit`] region for one descent.
@@ -4317,6 +4343,7 @@ impl<'s> BinopRewindInlineGuard<'s> {
         // this one's refusal.
         if outermost {
             s.binop_rewind_refused = false;
+            s.binop_rewind_fresh.clear();
         }
         s.binop_rewind_depth += 1;
         drop(s);
@@ -4342,6 +4369,10 @@ impl<'s> BinopRewindInlineGuard<'s> {
 
 impl Drop for BinopRewindInlineGuard<'_> {
     fn drop(&mut self) {
-        self.session.borrow_mut().binop_rewind_depth -= 1;
+        let mut s = self.session.borrow_mut();
+        s.binop_rewind_depth -= 1;
+        if s.binop_rewind_depth == 0 {
+            s.binop_rewind_fresh.clear();
+        }
     }
 }
