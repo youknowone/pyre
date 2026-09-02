@@ -13,10 +13,6 @@
 # because the names tuple sits above the arguments (caller_operand_slots).
 # call_kw_residual_kwargs_callee.py is the other half, covering the same
 # opcode on a callee the inline declines.
-#
-# Sized for the dropped-iteration check, not for an armed ratio gate: arming
-# one needs a pypy execution over the floor-gate minimum, which this loop
-# reaches only past fifty million iterations.
 N = 400000
 
 

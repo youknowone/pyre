@@ -1,11 +1,4 @@
 # pyre-check: max-pypy-ratio=2.9
-# The ceiling covers a startup deficit rather than a slower loop: a pyre
-# backend subtracts pypy's startup, not its own, so the 0.05s-0.11s a pyre
-# process spends above pypy to reach the first bytecode stays inside this
-# fixture's numerator, against a pypy execution of about a sixth of a
-# second.  The readings that leaves are 1.36x-2.3x across the hosts; 2.9
-# covers the widest with a quarter's headroom and its 0.483x derived floor
-# stays under the narrowest.
 # GC heap-array ops on the blackhole guard-failure resume path. The loop
 # body reads and writes a list (getarrayitem_gc_i / setarrayitem_gc_i) and
 # the function returns a tuple (new_array_clear + setarrayitem_gc_r +
