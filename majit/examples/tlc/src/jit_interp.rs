@@ -14,7 +14,10 @@
 /// so every trace aborted and `Traces compiled` stayed 0 for the whole suite:
 /// the JIT compiled nothing and the tests were green only because the legacy
 /// merge point discards the walk and lets the native loop answer. Declaring the
-/// greens leaves ROLL and PUSHARG as the only degraded arms.
+/// greens leaves PUSHARG as the only degraded arm; `ROLL` joined it there until
+/// the `VirtArray` spelling gave that arm a base pointer to lower against. The
+/// set is pinned by `degraded_dispatch_arms` in the test below, which is what
+/// this sentence must agree with.
 ///
 /// Only integer-stack opcodes are traced. Object opcodes (NIL, CONS, CAR, CDR,
 /// NEW, GETATTR, SETATTR, SEND) cause guard failure in RPython and are absent
