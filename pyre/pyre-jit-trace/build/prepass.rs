@@ -1111,11 +1111,14 @@ fn real_main() {
     // call site.
     let static_pytype_addrs = pyre_interpreter::jit_static_pytype_addrs();
     // This script is compiled for the host even when the crate it feeds is
-    // built for wasm, so a name bound here is only useful if the runtime
-    // pool carries it too — `runtime_fnaddr_patch::patch_static_addr_constants`
-    // rewrites only names it finds in both, and an unmatched name keeps this
-    // process's address.  The `#[pyre_class]` registry populates on every
-    // target for that reason.
+    // built for another target, so a name bound here is only useful if the
+    // runtime pool carries it too — `runtime_fnaddr_patch::
+    // patch_static_addr_constants` rewrites only names it finds in both, and
+    // an unmatched name keeps this process's address.  The `#[pyre_class]`
+    // registry populates on every target for that reason; where the two pools
+    // can still disagree is the module set, which this process cannot read for
+    // another target, and `reject_unpaired_build_addrs` refuses the load if
+    // one of those names reaches a constant pool.
     let registry_rows = pyre_interpreter::pyre_class_pytype_addrs();
     let registry_keys: std::collections::HashSet<&str> =
         registry_rows.iter().map(|&(key, _)| key).collect();

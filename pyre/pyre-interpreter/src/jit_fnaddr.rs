@@ -4356,11 +4356,15 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
 /// fully-qualified Rust path the flowgraph names the global read with
 /// (`PyreClassDescriptor::pytype_path`).
 ///
-/// Populated on every target.  The set has to be target-independent: a name
-/// bound at build time but missing from the runtime pool keeps the
-/// build-process address baked in the constant pool, because
-/// `runtime_fnaddr_patch::patch_static_addr_constants` only re-pairs names
-/// present in both.
+/// Populated on every target.  Its membership still follows the module set,
+/// which a cross-target build cannot see: the list is read once in the build
+/// script, compiled for the host, and once at run time, compiled for the
+/// target, so a module declared behind `target_arch`, `unix` or `windows`
+/// appears in the first and not the second.  A name bound at build time and
+/// missing at run time keeps the build-process address baked in the constant
+/// pool, because `runtime_fnaddr_patch::patch_static_addr_constants` re-pairs
+/// only names present in both; `reject_unpaired_build_addrs` refuses the load
+/// once such an address actually reaches a constant pool.
 pub fn pyre_class_pytype_addrs() -> Vec<(&'static str, i64)> {
     let mut rows = Vec::new();
     pyre_object::lltype::for_each_class_descriptor(|d| {

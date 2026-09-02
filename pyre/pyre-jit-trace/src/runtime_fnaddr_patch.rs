@@ -190,6 +190,7 @@ fn build_time_ref_bindings() -> Vec<(String, i64)> {
 /// call targets).
 pub fn patch_static_addr_constants(jitcodes: &mut [Arc<JitCode>]) {
     let correspondence = &*STATIC_ADDR_CORRESPONDENCE;
+    disarm_unpaired_build_addrs(jitcodes);
 
     if correspondence.is_empty() {
         return;
@@ -235,9 +236,108 @@ static STATIC_ADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|
     correspondence
 });
 
-/// Take both build -> runtime address snapshots now.
+/// Build addresses whose name the runtime pool cannot re-pair, keyed by the
+/// address, valued by the name it was bound under.
 ///
-/// Both maps are `LazyLock`, so without this they would be built at whatever
+/// Both correspondences above rewrite only names present in the build pool and
+/// the runtime one, so an unmatched name leaves the build process's address
+/// where the codewriter put it.  The two pools come from two compilations of
+/// the same list, and they answer a `cfg` differently whenever the build
+/// script's copy is configured differently from the crate it feeds: the script
+/// is built for the host, so a module behind `target_arch`, `unix` or
+/// `windows` registers its accessors and its `#[pyre_class]` statics there and
+/// not in a cross-target runtime, and it is a build-dependency with its own
+/// feature resolution, so a row behind a feature the binary turns off is
+/// bound here and absent there.
+///
+/// Binding such a name costs nothing while no jitcode carries its address, so
+/// the address in a constant pool is what this names, not the binding.
+///
+/// An address the correspondences do know is excluded: the build binary's
+/// identical-code folding can put a re-pairable name and an unmatched one on
+/// one address, and the constant then belongs to the name that re-pairs.
+static UNPAIRED_BUILD_ADDRS: LazyLock<HashMap<i64, String>> = LazyLock::new(|| {
+    let mut runtime_names: std::collections::HashSet<&'static str> =
+        pyre_interpreter::jit_trace_fnaddrs()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+    runtime_names.extend(
+        pyre_interpreter::jit_static_pytype_addrs()
+            .into_iter()
+            .map(|(name, _)| name),
+    );
+    runtime_names.extend(
+        pyre_interpreter::jit_static_ref_addrs()
+            .into_iter()
+            .map(|(name, _)| name),
+    );
+
+    let mut paired: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut unpaired: HashMap<i64, String> = HashMap::new();
+    for (name, build_addr) in build_time_fnaddr_bindings()
+        .into_iter()
+        .chain(build_time_pytype_bindings())
+        .chain(build_time_ref_bindings())
+    {
+        if runtime_names.contains(name.as_str()) {
+            paired.insert(build_addr);
+        } else {
+            unpaired.insert(build_addr, name);
+        }
+    }
+    unpaired.retain(|addr, _| !paired.contains(addr));
+    unpaired
+});
+
+/// Take out the addresses no runtime name re-pairs, before anything reads them.
+///
+/// Such a value is a pointer into the build-script process, and every use the
+/// pools have for one is wrong with it: as a residual call target it enters
+/// whatever this process holds at that address, as a `PyType` operand it is
+/// dereferenced by a type test, and as a pointer-`eq` operand it answers "not
+/// this type" for every object.  Zero is the substitute because it is the one
+/// value none of those can mistake for a real target — a call through it faults
+/// on the first instruction, a dereference faults at the first field, and a
+/// comparison never matches.
+///
+/// All three pools are cleared, `constants_r` included: that pool already
+/// carries words that are not gcrefs — patched host statics and pre-patch
+/// string sentinels — and the collector's `drag_out_root` / `seed_major_root`
+/// gates reject a non-object word before any deref, so a zero there is read the
+/// same way the address it replaces was.
+fn disarm_unpaired_build_addrs(jitcodes: &mut [Arc<JitCode>]) {
+    let unpaired = &*UNPAIRED_BUILD_ADDRS;
+    if unpaired.is_empty() {
+        return;
+    }
+
+    for arc in jitcodes.iter_mut() {
+        let jc = Arc::get_mut(arc).expect(
+            "disarm_unpaired_build_addrs: Arc<JitCode> already shared before patch — \
+             every caller must run this before publishing the table to consumers",
+        );
+        if unpaired.contains_key(&jc.fnaddr) {
+            jc.fnaddr = 0;
+        }
+        if jc.try_body().is_some() {
+            let body = jc.body_mut();
+            for c in body
+                .constants_i
+                .iter_mut()
+                .chain(body.constants_r.iter_mut().map(|slot| slot.get_mut()))
+            {
+                if unpaired.contains_key(c) {
+                    *c = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Take the build -> runtime address snapshots now.
+///
+/// Each map is a `LazyLock`, so without this it would be built at whatever
 /// moment the first jitcode happens to be decoded.  Once jitcode bodies decode
 /// lazily that moment is mid-trace, long after `init_typeobjects` has retagged
 /// the `PyType` singletons — and the map, frozen there, would then patch every
@@ -252,6 +352,10 @@ static STATIC_ADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|
 pub fn prime_address_correspondences() {
     LazyLock::force(&FNADDR_CORRESPONDENCE);
     LazyLock::force(&STATIC_ADDR_CORRESPONDENCE);
+    // Keyed by name rather than by address, so the instant it is taken does
+    // not change what it holds; forced here so no jitcode load pays to build
+    // it mid-trace.
+    LazyLock::force(&UNPAIRED_BUILD_ADDRS);
 }
 
 /// Resolve one build-process function address to this process's address.
