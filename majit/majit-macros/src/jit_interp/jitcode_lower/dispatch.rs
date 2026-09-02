@@ -3002,11 +3002,17 @@ pub(super) fn lower_dispatch_chain(
                 // none of them records a degraded arm.  Recording them would
                 // make the channel fire on every `_ => break` and
                 // `_ => panic!` in the corpus and stop discriminating.
+                // Both stubs still end in `void_return`: every jitcode the
+                // codewriter builds terminates in a return opcode (an empty
+                // graph keeps its return block), and `dispatch_loop` reads
+                // past the end otherwise — the blackhole treats that as a
+                // frame that never produced a result and panics.
                 crate::jit_interp::classify::ArmPattern::Nop => (
                     quote::quote! {
                         {
                             let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
                             __sub_builder.set_name(#sub_jitcode_name);
+                            __sub_builder.void_return();
                             __sub_builder.finish()
                         }
                     },
@@ -3017,6 +3023,7 @@ pub(super) fn lower_dispatch_chain(
                         {
                             let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
                             __sub_builder.set_name(#sub_jitcode_name);
+                            __sub_builder.void_return();
                             __sub_builder.finish()
                         }
                     },
