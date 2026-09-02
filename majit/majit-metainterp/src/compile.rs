@@ -5712,14 +5712,17 @@ impl TraceCtx {
     /// `mp.green_key == key` test here — the `same_greenkey` semantics
     /// survive the collapse.
     ///
-    /// `live_args_len` is the shape upstream's
+    /// **Known parity gap (intentional for now)**: upstream
     /// `pyjitpl.py assert len(original_boxes) == len(live_arg_boxes)`
-    /// compares against.  Pyre carried a filter there instead, because the
-    /// mixed shapes its inline-frame model produced (observed: 4 vs 14 on
-    /// `nested_loop`) would have panicked healthy traces.  That mismatch no
-    /// longer reproduces — slot 54, which counted exactly it, reads 0 over the
-    /// whole fixture corpus — so the body asserts and no longer filters.  See
-    /// there for what the assert does and does not cover.
+    /// must fire on every visited merge point because all merge points
+    /// in `current_merge_points` come from the same jitdriver (fixed
+    /// red-bank shape).  Pyre's `current_merge_points` currently mixes
+    /// shapes across its inline-frame model (observed: 4 vs 14 on
+    /// `nested_loop`), so enforcing the assert prematurely panics
+    /// healthy traces.  The assert lands once jitdriver isolation
+    /// across `add_merge_point` callers is tightened — a separate
+    /// follow-up.  `live_args_len` is plumbed through so that
+    /// follow-up doesn't need to re-touch the call sites.
     pub fn has_merge_point_with_shape_assert(&self, key: u64, live_args_len: usize) -> bool {
         // pyjitpl.py:2994-2997 reverse scan:
         //   for j in range(len(self.current_merge_points) - 1, -1, -1):
@@ -5738,44 +5741,37 @@ impl TraceCtx {
         // by shape length instead of asserting — a shape mismatch means
         // the merge point was seeded under a different frame layout and
         // should not match.
-        // Same reverse scan, same short-circuit. `pyjitpl.py assert
+        // Same reverse scan, same short-circuit; the loop form exists only so
+        // the SHAPE REJECTION can be tallied. `reached_loop_header`'s `assert
         // len(original_boxes) == len(live_arg_boxes)` asserts here — upstream
-        // never filters — and slot 54 existed to earn that assert by counting
-        // every same-green-key merge point the filter discarded.
+        // never filters.
         //
-        // Measured 0 over 537 fixtures (`pyre/bench/synth` 527 +
-        // `pyre/bench` 10, which is where the `nested_loop` the older note
-        // named actually lives), against a live denominator: this is the
-        // loop-close decision, so every compiled loop in that corpus took the
-        // matching return below.  So the filter is gone and a same-green-key
-        // entry closes the loop the way upstream's does.
-        //
-        // The counter STAYS, next to the assert rather than replaced by it.
-        // `debug_assert!` is compiled out of release, and the corpus that
-        // produced the zero is a release binary; keeping the bump means a
-        // mismatch that only a release build reaches is still counted rather
-        // than silently matching.
-        //
-        // The assert is narrower than upstream's, deliberately: upstream
-        // asserts on EVERY visited merge point, before the green-key test,
-        // because its `current_merge_points` all come from one jitdriver.
-        // Pyre's can mix jitdrivers across `add_merge_point` callers, and
-        // nothing here measured the shapes of the entries whose green key does
-        // NOT match, so those are left unasserted.
+        // Slot 54 read 0 over 537 fixtures (`pyre/bench/synth` 527 +
+        // `pyre/bench` 10, where the `nested_loop` the note above names
+        // actually lives), release, `MAJIT_STATS=1`, against a live
+        // denominator — this is the loop-close decision, so every loop
+        // compiled in that corpus took the matching return. That reading does
+        // NOT license promoting the filter to an assert, because the length
+        // test is not only a shape check: `TraceCtx::new`
+        // (`trace_ctx.rs:1755-1766`) seeds `current_merge_points` at trace
+        // start with an entry carrying the trace's OWN green key and the
+        // recorder's inputargs as its `green_boxes`, and the length test is
+        // what keeps that seed from matching. Dropping it makes the FIRST
+        // arrival at a loop header find the seed and close immediately;
+        // `jit_merge_point_first_visit_continues_then_closes_loop` and
+        // `jit_merge_point_int_form_resolves_jdindex_from_the_int_bank`
+        // (`pyre-jit-trace/src/jitcode_dispatch/tests.rs`) pin the
+        // first-arrival-continues contract and fail on it. The assert lands
+        // once the seed is distinguishable from a registered merge point, not
+        // on a counter reading.
         for mp in self.current_merge_points.iter().rev() {
             if mp.green_key != key {
                 continue;
             }
-            if mp.green_boxes.len() != live_args_len {
-                crate::mc_diag_bump(54);
-                debug_assert_eq!(
-                    mp.green_boxes.len(),
-                    live_args_len,
-                    "same-green-key merge point with a different red-bank shape: \
-                     seeded under a different frame layout",
-                );
+            if mp.green_boxes.len() == live_args_len {
+                return true;
             }
-            return true;
+            crate::mc_diag_bump(54);
         }
         false
     }
