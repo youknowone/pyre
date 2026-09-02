@@ -1268,6 +1268,75 @@ fn translate_op_or_frontier(
     }
 }
 
+/// Lower a `dyn Trait` virtual call to the pre-rtyper shape:
+/// `getattr(receiver, method_name)` then `simple_call(bound_method, args[1..])`,
+/// with the receiver narrowed to the trait family's base `ClassDef` first when
+/// the trait is a registered dispatch family.
+///
+/// `args[0]` is the receiver; the rationale for this shape is on the
+/// `CallTarget::Indirect` arm of [`translate_op`], which is one of the two
+/// callers. The other is that arm's pyre-internal twin, `OpKind::IndirectCall`
+/// carrying a `family_key`: an `indirect_call` op has no pre-rtyper spelling
+/// upstream — `rpbc.py:193-194` mints it inside `rtype_simple_call`, so
+/// everything the annotator sees is still a `simple_call` — and the adapter is
+/// the entry into annotation, so both spellings must arrive here as one.
+fn dyn_trait_dispatch_ops(
+    arg_hls: Vec<Hlvalue>,
+    trait_root: &str,
+    method_name: &str,
+    result: Hlvalue,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    let mut iter = arg_hls.into_iter();
+    let receiver = iter.next().ok_or_else(|| {
+        TyperError::message(
+            "Call::Indirect has empty args: dyn-Trait receiver must be args[0]".to_string(),
+        )
+    })?;
+    let base_root = call_registry
+        .bookkeeper()
+        .registered_trait_family_base_root(trait_root);
+    let mut ops = Vec::with_capacity(3);
+    // Narrow the receiver to the family base classdef when the
+    // trait is a registered dispatch family.
+    let getattr_receiver = if let Some(base_root) = base_root {
+        let callable_host = HOST_ENV
+            .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+            .ok_or_else(|| {
+                TyperError::message(
+                    "__cast_instance_intrinsic missing from HOST_ENV bootstrap".to_string(),
+                )
+            })?;
+        let narrowed = Hlvalue::Variable(Variable::new());
+        ops.push(FlowspaceOp::new(
+            "simple_call",
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
+                receiver,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(&base_root))),
+            ],
+            narrowed.clone(),
+        ));
+        narrowed
+    } else {
+        receiver
+    };
+    let bound_method = Hlvalue::Variable(Variable::new());
+    let mut call_args = Vec::with_capacity(iter.size_hint().0 + 1);
+    call_args.push(bound_method.clone());
+    call_args.extend(iter);
+    ops.push(FlowspaceOp::new(
+        "getattr",
+        vec![
+            getattr_receiver,
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str(method_name))),
+        ],
+        bound_method,
+    ));
+    ops.push(FlowspaceOp::new("simple_call", call_args, result));
+    Ok(ops)
+}
+
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<Variable, Hlvalue>,
@@ -3016,60 +3085,13 @@ pub fn translate_op(
                 CallTarget::Indirect {
                     method_name,
                     trait_root,
-                } => {
-                    let mut iter = arg_hls.into_iter();
-                    let receiver = iter.next().ok_or_else(|| {
-                        TyperError::message(
-                            "Call::Indirect has empty args: dyn-Trait receiver must be args[0]"
-                                .to_string(),
-                        )
-                    })?;
-                    let base_root = call_registry
-                        .bookkeeper()
-                        .registered_trait_family_base_root(trait_root);
-                    let mut ops = Vec::with_capacity(3);
-                    // Narrow the receiver to the family base classdef when the
-                    // trait is a registered dispatch family.
-                    let getattr_receiver = if let Some(base_root) = base_root {
-                        let callable_host = HOST_ENV
-                            .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
-                            .ok_or_else(|| {
-                                TyperError::message(
-                                    "__cast_instance_intrinsic missing from HOST_ENV bootstrap"
-                                        .to_string(),
-                                )
-                            })?;
-                        let narrowed = Hlvalue::Variable(Variable::new());
-                        ops.push(FlowspaceOp::new(
-                            "simple_call",
-                            vec![
-                                Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                                    callable_host,
-                                ))),
-                                receiver,
-                                Hlvalue::Constant(Constant::new(ConstValue::byte_str(&base_root))),
-                            ],
-                            narrowed.clone(),
-                        ));
-                        narrowed
-                    } else {
-                        receiver
-                    };
-                    let bound_method = Hlvalue::Variable(Variable::new());
-                    let mut call_args = Vec::with_capacity(iter.size_hint().0 + 1);
-                    call_args.push(bound_method.clone());
-                    call_args.extend(iter);
-                    ops.push(FlowspaceOp::new(
-                        "getattr",
-                        vec![
-                            getattr_receiver,
-                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(method_name))),
-                        ],
-                        bound_method,
-                    ));
-                    ops.push(FlowspaceOp::new("simple_call", call_args, result));
-                    Ok(ops)
-                }
+                } => dyn_trait_dispatch_ops(
+                    arg_hls,
+                    trait_root,
+                    method_name,
+                    result,
+                    call_registry,
+                ),
                 CallTarget::UnsupportedExpr => Err(TyperError::message(format!(
                     "translate_op: Call with CallTarget::UnsupportedExpr at \
                      result={} — frontend coverage gap; the `front::mir` \
@@ -3081,30 +3103,45 @@ pub fn translate_op(
         }
 
         // ─── Pyre-internal: IndirectCall ───
-        // RPython `rpython/rtyper/rpbc.py:216-217`:
+        // An `indirect_call` op has no pre-rtyper spelling. Upstream mints it
+        // inside the rtyper — `rpbc.py:193-194` `rtype_simple_call(self, hop):
+        // return self.call(hop)`, which reaches the emit at `rpbc.py:215-217`:
         // ```python
         // vlist.append(hop.inputconst(Void, row_of_graphs.values()))
         // v = hop.genop('indirect_call', vlist, resulttype=rresult)
         // ```
-        // The trailing `c_graphs` Constant must carry actual graph
-        // identities — pyre's parity emits `ConstValue::Graphs(Vec<usize>)`
-        // via `GraphKey::of(&g.graph).as_usize()` (see
-        // `translator/rtyper/rpbc.rs`). The flowspace adapter
-        // doesn't have access to the graph registry that resolves
-        // `CallPath` segments to `Rc<RefCell<FunctionGraph>>` references,
-        // so it cannot construct a faithful `ConstValue::Graphs`. A
-        // synthetic `ConstValue::List(byte_str(qualname))` would silently
-        // drop indirect-call analysis (`graphanalyze.rs` falls back
-        // to `top_result()` for any non-Graphs ConstValue), so fail-loud
-        // is the parity-correct behaviour: `IndirectCall` must be lowered
-        // by `rpbc.rs` (the rtyper-equivalent layer that owns the graph
-        // registry) before reaching the flowspace adapter.
+        // Everything the annotator sees is still a `simple_call`
+        // (`flowspace/operation.py:663-664`, `annotator/unaryop.py:114-118`),
+        // and this adapter is the entry into annotation. So the op cannot be
+        // lowered to a flowspace `indirect_call` before arriving here: the
+        // trailing `c_graphs` Constant that `graphanalyze.py:117-119` reads out
+        // of `op.args[-1]` is a product of rtyping, which has not run yet.
+        //
+        // `family_key` carries the pre-rtyper identity of the vtable slot, so a
+        // dyn-trait dispatch lowers to the same `getattr` + `simple_call` shape
+        // as its `CallTarget::Indirect` twin. `funcptr` is dropped: it is the
+        // `Field[Adt(vtable), slot]` projection, which the `getattr` re-derives
+        // from the receiver at the level the annotator works in.
+        OpKind::IndirectCall {
+            args,
+            family_key: Some((trait_root, method_name)),
+            ..
+        } => {
+            let arg_hls = args
+                .iter()
+                .enumerate()
+                .map(|(i, v)| lookup_operand(value_map, v, op, &format!("args[{i}]")))
+                .collect::<Result<Vec<_>, _>>()?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            dyn_trait_dispatch_ops(arg_hls, trait_root, method_name, result, call_registry)
+        }
+        // A stored function pointer — no trait receiver and no method name, so
+        // there is nothing for a `getattr` to name. It keeps failing loud.
         OpKind::IndirectCall { .. } => Err(TyperError::message(format!(
-            "translate_op: IndirectCall at result={} must be lowered to \
-             a flowspace `indirect_call` op with `ConstValue::Graphs(Vec<\
-             usize>)` candidate-graph keys by `rpbc.rs:1481-1490` before \
-             reaching the adapter; synthesising a `ConstValue::List` here \
-             would break `graphanalyze.rs:333` indirect-call analysis",
+            "translate_op: IndirectCall at result={} carries no `family_key`, \
+             so it names no dyn-trait vtable slot the adapter can lower to the \
+             pre-rtyper `getattr` + `simple_call` shape; a raw function-pointer \
+             callee has no such shape before rtyping",
             fmt_op_result(op),
         ))),
 
@@ -6433,15 +6470,13 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_indirect_call_surfaces_rpbc_invariant() {
-        // OpKind::IndirectCall must be lowered by `rpbc.rs`
-        // (the rtyper-equivalent layer that owns the graph registry
-        // and can resolve CallPath → ConstValue::Graphs(Vec<usize>))
-        // before reaching the flowspace adapter. Synthesising
-        // `ConstValue::List(byte_str)` here would break
-        // `graphanalyze.rs` indirect-call analysis (any non-Graphs
-        // ConstValue falls back to `top_result()`); fail-loud is the
-        // parity-correct behaviour.
+    fn translate_op_indirect_call_without_family_key_fails_loud() {
+        // An IndirectCall carrying no `family_key` is a stored function
+        // pointer: it names no trait receiver and no method, so there is
+        // nothing for a `getattr` to spell, and a function pointer has no
+        // pre-rtyper shape at all — upstream only ever mints `indirect_call`
+        // inside `rpbc.py:193-217`, after rtyping. Fail-loud is the
+        // parity-correct behaviour for that arm.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 11); // vars[0..11]
@@ -6459,12 +6494,58 @@ mod tests {
             },
         };
         let err = translate_op(&op, &value_map, &empty_call_registry())
-            .expect_err("IndirectCall must surface rpbc.rs invariant break");
+            .expect_err("a family-key-less IndirectCall must fail loud");
         let msg = format!("{err}");
         assert!(
-            msg.contains("IndirectCall") && msg.contains("rpbc.rs"),
-            "fail-loud must cite IndirectCall + rpbc.rs:1481, got: {msg}"
+            msg.contains("IndirectCall") && msg.contains("family_key"),
+            "fail-loud must name IndirectCall and the missing family_key, got: {msg}"
         );
+    }
+
+    /// An IndirectCall that does carry a `family_key` names a dyn-trait vtable
+    /// slot, and lowers to the same pre-rtyper shape as its `CallTarget::
+    /// Indirect` twin: `getattr(receiver, method)` then `simple_call`. The
+    /// annotator never sees an `indirect_call` — `rpbc.py:193-194` mints that
+    /// inside `rtype_simple_call`, downstream of here.
+    #[test]
+    fn translate_op_indirect_call_with_family_key_lowers_to_getattr_simple_call() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        for v in &vars[1..4] {
+            value_map.insert(v.clone(), Hlvalue::Variable(Variable::new()));
+        }
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::IndirectCall {
+                funcptr: vars[1].clone(),
+                args: vec![vars[2].clone()],
+                graphs: None,
+                family_key: Some(("Handler".to_string(), "run".to_string())),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("a family-keyed IndirectCall lowers to the dyn-dispatch shape");
+        let names: Vec<&str> = translated.iter().map(|o| o.opname.as_str()).collect();
+        assert_eq!(names, vec!["getattr", "simple_call"]);
+        let Hlvalue::Constant(ref name_const) = translated[0].args[1] else {
+            panic!("getattr's second arg must be the method-name Constant");
+        };
+        assert!(matches!(
+            name_const.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"run"
+        ));
+        // The bound method threads from getattr.result into simple_call.args[0],
+        // and args[0] of the op — the receiver — is consumed by the getattr.
+        let Hlvalue::Variable(ref m1) = translated[0].result else {
+            panic!("getattr result must be Variable");
+        };
+        let Hlvalue::Variable(ref m2) = translated[1].args[0] else {
+            panic!("simple_call's first arg must be the bound method Variable");
+        };
+        assert_eq!(m1.id(), m2.id());
+        assert_eq!(translated[1].args.len(), 1, "the receiver is not re-passed");
     }
 
     #[test]

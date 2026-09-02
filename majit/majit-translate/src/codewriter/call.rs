@@ -3883,7 +3883,16 @@ impl CallControl {
                 else {
                     continue;
                 };
-                let Some((trait_root, method_name)) = family_key.take() else {
+                // Read the key without clearing it. The two-phase prepass runs
+                // after this fill on the same shared store, and its flowspace
+                // adapter needs the same `(trait_root, method_name)` to emit
+                // the pre-rtyper `getattr` + `simple_call` shape — an
+                // `indirect_call` op does not exist before rtyping. The later
+                // `rpbc::lower_indirect_calls` re-enters its own `take()` arm
+                // and recomputes `graphs` through `all_impls_for_indirect`,
+                // which is this same lookup over the same map, so the value it
+                // writes is unchanged.
+                let Some((trait_root, method_name)) = family_key.clone() else {
                     continue;
                 };
                 let family = trait_method_impls
@@ -11809,6 +11818,11 @@ mod tests {
     /// `CallControl.find_all_graphs`.  A MIR vtable call starts with the same
     /// identity in `family_key`; graph discovery must materialise it on the
     /// registered graph, not wait for the later jitcode clone.
+    ///
+    /// The key survives that materialisation: the flowspace adapter reads the
+    /// same `(trait_root, method_name)` later, off this same shared store, to
+    /// emit the pre-rtyper `getattr` + `simple_call` shape.  It is consumed
+    /// where it is spent, in `rpbc::lower_indirect_calls`, on the graph clone.
     #[test]
     fn graph_discovery_materializes_deferred_vtable_family() {
         let mut cc = CallControl::new();
@@ -11851,7 +11865,11 @@ mod tests {
         else {
             panic!("caller operation must remain an indirect call");
         };
-        assert!(family_key.is_none(), "the rtyping key must be consumed");
+        assert_eq!(
+            family_key.as_ref().map(|(t, m)| (t.as_str(), m.as_str())),
+            Some(("Handler", "run")),
+            "the vtable-slot identity must outlive graph discovery"
+        );
         assert_eq!(
             graphs.as_ref().map(Vec::len),
             Some(2),
