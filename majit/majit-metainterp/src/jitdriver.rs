@@ -7215,26 +7215,21 @@ impl<S: JitState> JitDriver<S> {
         // the same two checks, and folding three doors into one slot would say
         // nothing about any of them.
         crate::mc_diag_bump(61); // mst_entered
-        // warmstate.py `maybe_compile_and_run` consults the cell before
-        // `bound_reached` builds tracing state. Pyre's abort ceiling is the
-        // equivalent permanent refusal. Resolve it through the same typed-key
-        // helper as `on_back_edge_typed_decision` below; the public
-        // hash-only doors fall back through the same u64 arm as that decision.
-        // Keep slot 81 on the same population as the mirrored refusal in
-        // `maybe_compile_decision_with_meta`.
-        let ceiling_latched = match MetaInterp::<S::Meta>::with_typed_decision_key(
-            green_key,
-            (state.code_ptr(), target_pc),
-            |key| self.meta.warm_state.is_ceiling_latched_for_key(key),
-        ) {
-            Some(latched) => latched,
-            None => self.meta.warm_state.is_ceiling_latched(green_key),
-        };
-        if ceiling_latched {
-            crate::mc_diag_bump(81); // abort_ceiling_refused
-            return false;
-        }
-
+        // The abort ceiling is NOT consulted separately here. It is a refusal
+        // the decision below already owns: `maybe_compile_decision_with_key`
+        // takes it in the position `warmstate.py maybe_compile_and_run` gives
+        // `confirm_enter_jit`, above the counter tick and above the
+        // `decay_all_counters` inside `bound_reached`, so a latched cell
+        // reaches neither — which is the whole reason the ceiling decides
+        // early. Asking first resolved the same cell through the same typed
+        // chain walk a second time, for an answer
+        // `is_ceiling_latched_agrees_with_the_decision_it_mirrors` pins equal
+        // to the one the decision reaches; `maybe_compile_and_run` binds its
+        // cell once ("to avoid computing the hash several times") and answers
+        // every question about it off that binding. Slot 81 counts the same
+        // population either way, because only one of the two refusals can fire
+        // for a given edge: every state in which the mirror answered `false`
+        // returns above the decision's ceiling arm or fails its condition.
         match self
             .meta
             .on_back_edge_typed_decision(green_key, (state.code_ptr(), target_pc))
