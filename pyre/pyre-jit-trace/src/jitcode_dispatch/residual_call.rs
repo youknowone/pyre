@@ -6754,6 +6754,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         {
             return Ok(inlined);
         }
+        // `object.__new__(cls)`, which a Python `__new__` ends in.
+        if let Some(inlined) = try_walker_inline_object_new(ctx, op, &r_args, dst_bank, dst)? {
+            return Ok(inlined);
+        }
     }
 
     // FORMAT_WITH_SPEC over a receiver whose `__format__` is Python: inline
@@ -8420,6 +8424,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         if let Some(inlined) =
             try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
         {
+            return Ok(inlined);
+        }
+        // `object.__new__(cls)`, which a Python `__new__` ends in.
+        if let Some(inlined) = try_walker_inline_object_new(ctx, op, &r_args, dst_bank, dst)? {
             return Ok(inlined);
         }
     }

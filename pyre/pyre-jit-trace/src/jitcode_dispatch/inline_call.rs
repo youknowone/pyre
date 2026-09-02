@@ -7751,6 +7751,13 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     // Only `object.__new__` allocates the plain `[ob_type | w_class | map |
     // storage]` instance this emit builds; any other `__new__` picks its own
     // layout (a builtin subclass) or runs arbitrary code.
+    //
+    // A `__new__` written in Python is not that -- it ends in
+    // `object.__new__(cls)`, which [`try_walker_inline_object_new`] folds --
+    // but walking it from here in place of the allocation, and letting its
+    // return value stand for the whole of `type.__call__`, was measured to
+    // produce a wrong answer (`TypeError: 'NewOv' object is not callable`, an
+    // instance reaching the callable slot) and is not what this does.
     let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__new__") };
     let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
     if tp_new != obj_new {
@@ -7900,6 +7907,131 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
+}
+
+/// Fold `object.__new__(cls)` to the allocation it performs.
+///
+/// For a one-argument call on a concrete class, `object_descr_new` reduces to
+/// `w_instance_new(cls)` behind four record-time tests: `cls` is a type, it is
+/// instantiable, it is not abstract, and it is laid out by `object` itself
+/// (`check_user_subclass`).  Pinning the class is what keeps those answers, so
+/// the emit is the same `NewWithVtable` + header/`map` pair
+/// [`try_walker_inline_type_call`] builds for a class it did not have to run a
+/// `__new__` for.
+///
+/// This is how every Python `__new__` ends -- `self = object.__new__(cls)` --
+/// so without it the descent into an overridden `__new__` stops on a residual
+/// whose body reaches `object_descr_new`'s error paths
+/// (`__getslice_minusone`, `abstract_instantiation_error`,
+/// `type_repr_qualified_name`), which is where the builtin route declines with
+/// `un-lowered helper call in body`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_object_new<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 3 {
+        return Ok(None);
+    }
+    // Same two spellings of "no receiver" the type call reads.
+    if walker_concrete_ref_object(ctx, r_args[1])
+        .is_some_and(|null_or_self| !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL)
+    {
+        return Ok(None);
+    }
+    let Some(callable) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    let w_object = pyre_interpreter::typedef::w_object();
+    if w_object.is_null() {
+        return Ok(None);
+    }
+    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
+    if obj_new != Some(callable) {
+        return Ok(None);
+    }
+    let Some(w_type) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_type(w_type) } {
+        return Ok(None);
+    }
+    // The class pin below is what holds `__del__` and the abstract flag, so it
+    // has to be a class whose dict changes are tracked.
+    if unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) } == 0 {
+        return Ok(None);
+    }
+    if unsafe {
+        pyre_object::w_type_disallows_instantiation(w_type)
+            || pyre_object::w_type_is_abstract(w_type)
+            // `w_instance_new` puts an instance of such a class on the
+            // finalizer queue, which `NewWithVtable` does not do.
+            || pyre_object::typeobject::w_type_get_hasuserdel(w_type)
+    } {
+        return Ok(None);
+    }
+    // `check_user_subclass(object, cls)`: the base allocator only knows how to
+    // fill the parent layout, so a subtype that introduces its own is refused.
+    let typedef_of = |w: pyre_object::PyObjectRef| {
+        let layout = unsafe { pyre_object::typeobject::w_type_get_layout_ptr(w) };
+        if layout.is_null() {
+            std::ptr::null()
+        } else {
+            unsafe { (*layout).typedef }
+        }
+    };
+    if !std::ptr::eq(typedef_of(w_object), typedef_of(w_type)) {
+        return Ok(None);
+    }
+    let terminator =
+        unsafe { pyre_interpreter::objspace::std::mapdict::ensure_type_terminator(w_type) };
+    if terminator.is_null() {
+        return Ok(None);
+    }
+
+    let callable_const = ctx.trace_ctx.const_ref(callable as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op.pc,
+        OpCode::GuardValue,
+        &[r_args[0], callable_const],
+    )?;
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[2], type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(r_args[2], type_const);
+    walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+
+    let concrete_instance = pyre_object::w_instance_new(w_type);
+    let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
+    let instance =
+        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const);
+    ctx.trace_ctx.set_opref_concrete(
+        instance,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),
+    );
+    ctx.trace_ctx.heap_cache_mut().class_now_known(
+        instance,
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
+    );
+    fbw_binop_rewind_note_fresh(ctx, instance);
+    if fbw_inline_diag_enabled() {
+        eprintln!("[object-new-inline] pc={} class={}", op.pc, unsafe {
+            pyre_object::w_type_get_name(w_type)
+        });
+    }
+    write_ref_reg(
+        ctx,
+        op.pc,
+        dst,
+        instance,
+        ConcreteValue::Ref(concrete_instance),
+    )?;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Route `str(exc)` / `repr(exc)` through an app-level exception override.
