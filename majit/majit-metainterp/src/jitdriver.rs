@@ -6460,13 +6460,6 @@ impl<S: JitState> JitDriver<S> {
                 && !no_bridge_enabled()
                 && bridge_fuel_take();
 
-            // compile.py:710 recovery_layout header_pc parity:
-            // guard resume_pc comes from the guard's recovery metadata.
-            let guard_resume_pc = self
-                .get_merge_point_pc(owning_key, trace_id, fail_index)
-                .map(|pc| pc as usize)
-                .unwrap_or(target_pc);
-
             // compile.py handle_fail. `must_compile() and not
             // stack_almost_full()` → `_trace_and_compile_from_bridge`, else
             // `resume_in_blackhole`; the two are mutually exclusive and
@@ -7009,6 +7002,17 @@ impl<S: JitState> JitDriver<S> {
             self.meta.remove_compiled_loop(green_key);
             self.meta.warm_state_mut().abort_tracing(green_key, true);
             self.exit_raw_scratch_out(raw_values);
+            // compile.py:710 recovery_layout header_pc parity:
+            // guard resume_pc comes from the guard's recovery metadata.
+            // Resolved here rather than beside the `must_compile` tick: this
+            // block is the only reader, and every other exit from the guard arm
+            // returns a pc the bridge or the blackhole reported, so the three
+            // index lookups the resolution costs were spent per guard failure
+            // for a value all but this one path discarded.
+            let guard_resume_pc = self
+                .get_merge_point_pc(owning_key, trace_id, fail_index)
+                .map(|pc| pc as usize)
+                .unwrap_or(target_pc);
             return Some(guard_resume_pc);
         }
 
