@@ -1147,6 +1147,20 @@ struct DescentPoint {
     fresh_r: Vec<bool>,
 }
 
+/// True when a funcbox constant names a residual the walk's odometer does not
+/// count.
+///
+/// The union of the two families `do_residual_call`'s
+/// `provably_side_effect_free` already spares by address: the re-runnable
+/// bookkeeping helpers and the root bracket's own.  The scan asks this of a
+/// constant where the walk asks it of an executed call, and the two have to
+/// agree — a body the scan calls effectful and the walk does not is a descent
+/// refused for an effect that never happens.
+fn effect_free_residual_fnaddr(fnaddr: i64) -> bool {
+    pyre_interpreter::is_rewindable_root_bracket_residual_i64(fnaddr)
+        || pyre_interpreter::is_rerunnable_bookkeeping_residual(fnaddr as usize)
+}
+
 /// Whether stepping `opname` applies an effect the walk would have to undo.
 ///
 /// The walk's own odometer (`fbw_bump_executed_effect`) counts an executed
@@ -1157,9 +1171,11 @@ struct DescentPoint {
 /// journal.  Both directions are conservative: the scan may call a body
 /// effectful where the walk would not, never the reverse.
 ///
-/// The one residual the caller spares is the one whose funcbox resolves to a
-/// root-bracket helper: a rewind may re-run those, so calling them effectful
-/// here would refuse a descent for an effect that never happens.
+/// Two of those the caller spares, because the odometer spares them too: a
+/// residual the walk would not count ([`effect_free_residual_fnaddr`], or a
+/// calldescr reporting an elidable / loop-invariant / not-in-trace call) and a
+/// store into an object this same body allocated.  Calling either effectful
+/// here refuses a descent for an effect that never happens.
 fn descent_op_applies_effect(opname: &str) -> bool {
     opname.starts_with("residual_call")
         || opname.starts_with("setfield_gc")
@@ -1170,29 +1186,6 @@ fn descent_op_applies_effect(opname: &str) -> bool {
         || opname.starts_with("raw_store")
         || opname.starts_with("strsetitem")
         || opname.starts_with("unicodesetitem")
-}
-
-/// Byte offset of an op's first `d` (descr) operand, past the opcode byte.
-/// The descr twin of [`label_operand_offset`], with the same width table.
-fn descr_operand_offset(argcodes: &str) -> Option<usize> {
-    let mut offset = 0usize;
-    let mut chars = argcodes.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            'd' => return Some(offset),
-            'i' | 'c' | 'r' | 'f' => offset += 1,
-            'j' => offset += 2,
-            // A varlist's width is in the code bytes this shape question does
-            // not read, so an op that puts one first is not answered here.
-            'I' | 'R' | 'F' | 'P' => return None,
-            '>' => {
-                chars.next()?;
-                offset += 1;
-            }
-            _ => return None,
-        }
-    }
-    None
 }
 
 /// Byte offset of an op's first `L` operand, counted from the byte after the
@@ -1246,14 +1239,20 @@ fn heap_write_into_fresh_object(
 /// register of a `switch/id`.
 fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> Option<usize> {
     let mut cursor = op.pc + 1;
-    for c in op.argcodes.chars() {
+    let mut chars = op.argcodes.chars();
+    while let Some(c) = chars.next() {
         match c {
             'i' | 'c' | 'r' | 'f' => cursor += 1,
+            'j' => cursor += 2,
             'I' | 'R' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
             'd' => {
                 return Some(
                     *code.get(cursor)? as usize | ((*code.get(cursor + 1)? as usize) << 8),
                 );
+            }
+            '>' => {
+                chars.next()?;
+                cursor += 1;
             }
             _ => return None,
         }
@@ -1703,9 +1702,10 @@ pub(crate) fn summarize_body_blockers_with(
         let mut known_array_len_r = point.known_array_len_r;
         let mut fresh_r = point.fresh_r;
 
-        // Set by a `residual_call` whose funcbox resolves to a helper a rewind
-        // may re-run, so the effect classification below can spare it.
-        let mut rewindable_residual = false;
+        // Set by a `residual_call` the walk's odometer would not count: one
+        // whose funcbox names a helper a rewind may re-run, or whose calldescr
+        // reports an effect the trace does not have to undo.
+        let mut effect_free_residual = false;
         if d.opname.starts_with("residual_call") {
             // Every `residual_call_*` argcode string opens with the `i` funcbox
             // operand, so it is the byte right after the opcode.
@@ -1713,8 +1713,7 @@ pub(crate) fn summarize_body_blockers_with(
             if let Some(Some(fnaddr)) = known_i.get(funcbox)
                 && !majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
             {
-                rewindable_residual =
-                    pyre_interpreter::is_rewindable_root_bracket_residual_i64(*fnaddr);
+                effect_free_residual = effect_free_residual_fnaddr(*fnaddr);
             }
             if let Some(Some(fnaddr)) = known_i.get(funcbox)
                 && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
@@ -1768,16 +1767,22 @@ pub(crate) fn summarize_body_blockers_with(
                 summary.first_effect_pc.get_or_insert(d.pc);
             }
         }
-        // Every blocker a body reports reads as `after_effect` once one early
-        // op arms the flag, so the reachable set alone does not say what to
-        // repair.  Name each op that arms it — with the funcbox a residual
-        // resolves to, and the field a store writes — so the first one on the
-        // entry path is readable.
+        // A store into an object this body allocated is not an effect: the
+        // allocation goes with the trace, so a rewind leaves nothing that could
+        // read what the store wrote.  The three `_gc` store families all put
+        // the written object in their first operand.  A residual is spared
+        // when its calldescr reports no undoable effect, or when its funcbox
+        // names a helper the odometer does not count.
         let applies_effect = descent_op_applies_effect(d.opname)
-            && !rewindable_residual
+            && !effect_free_residual
             && !(d.opname.starts_with("residual_call")
                 && descr_operand_index(code, &d).is_some_and(|index| call_effect_free(index)))
             && !heap_write_into_fresh_object(code, &d, &fresh_r);
+        // Every blocker a body reports reads as `after_effect` once one early
+        // op arms the flag, so the reachable set alone does not say what to
+        // repair.  Name each op that arms it — with the helper a residual's
+        // funcbox resolves to, and the field a store writes — so the first one
+        // on the entry path is readable.
         if !effect && applies_effect && fbw_inline_diag_enabled() {
             let funcbox = d
                 .opname
@@ -1791,13 +1796,21 @@ pub(crate) fn summarize_body_blockers_with(
                     .at(index)
                     .and_then(|descr| descr.as_field_descr().map(|f| f.field_name().to_string()))
             });
+            // A bare address names nothing on its own, and the registry that
+            // resolves it is the same one the funcbox constant came from.
+            let helper = funcbox.and_then(|addr| {
+                pyre_interpreter::jit_trace_fnaddrs()
+                    .iter()
+                    .find(|(_, registered)| *registered == addr)
+                    .map(|(path, _)| (*path).to_string())
+            });
             eprintln!(
-                "[descent-effect-origin] pc={} op={} rewindable={rewindable_residual} \
-                 funcbox={} field={}",
+                "[descent-effect-origin] pc={} op={} funcbox={} field={} helper={}",
                 d.pc,
                 d.opname,
                 funcbox.map_or_else(|| "-".to_string(), |addr| format!("{addr:#x}")),
-                field.as_deref().unwrap_or("-")
+                field.as_deref().unwrap_or("-"),
+                helper.as_deref().unwrap_or("-"),
             );
         }
         if applies_effect {
@@ -1829,11 +1842,17 @@ pub(crate) fn summarize_body_blockers_with(
             .is_some_and(|(_, dst)| dst == "r")
             && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
         {
-            // A Ref-bank write is fresh only when a `new*` op produced it; any
-            // other producer -- a field read, a call result, a copy -- may name
+            // A Ref-bank write is fresh when a `new*` op produced it or a
+            // `ref_copy` carried that ownership; any other producer may name
             // live heap.
+            let fresh = d.opname.starts_with("new")
+                || (d.key == "ref_copy/r>r"
+                    && code
+                        .get(d.pc + 1)
+                        .and_then(|&src| fresh_r.get(src as usize).copied())
+                        .unwrap_or(false));
             if let Some(slot) = fresh_r.get_mut(dst as usize) {
-                *slot = d.opname.starts_with("new");
+                *slot = fresh;
             }
             // The wrapper-argument array can move between Ref colors before its
             // length check.  Only a plain ref copy preserves that entry fact.
