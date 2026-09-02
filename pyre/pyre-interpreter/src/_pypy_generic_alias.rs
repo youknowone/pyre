@@ -76,51 +76,88 @@ pub fn generic_alias_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
 /// `GenericAlias.__new__` (`_pypy_generic_alias.py:19`) — wrap a bare item
 /// into a 1-tuple, collect the free parameters, allocate.
 pub fn make_generic_alias(origin: PyObjectRef, item: PyObjectRef) -> crate::PyResult {
-    let args = if unsafe { is_tuple(item) } {
-        item
+    // `collect_parameters` runs Python at every turn of its walk, and the
+    // argument tuple it is handed is nursery-allocated, so the word built here
+    // is the pre-move one by the time the alias is stamped with it.  Stamping a
+    // stale tuple is worse than reading one: the alias is a traced object, so
+    // the collector follows the dead word on the next walk rather than at the
+    // next use.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[origin, item]);
+    let origin = || pyre_object::gc_roots::shadow_stack_get(base);
+    let item = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let args = if unsafe { is_tuple(item()) } {
+        item()
     } else {
-        w_tuple_new(vec![item])
+        w_tuple_new(vec![item()])
     };
-    let parameters = collect_parameters(args)?;
-    Ok(w_generic_alias_new(origin, args, parameters))
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args);
+    let args = || pyre_object::gc_roots::shadow_stack_get(args_slot);
+    let parameters = collect_parameters(args())?;
+    Ok(w_generic_alias_new(origin(), args(), parameters))
 }
 
 /// `_collect_parameters(args)` (`_pypy_generic_alias.py:150`) — gather the
 /// free type variables in order of first appearance.
 pub(crate) fn collect_parameters(args: PyObjectRef) -> crate::PyResult {
-    let mut params: Vec<PyObjectRef> = Vec::new();
-    let n = unsafe { w_tuple_len(args) };
+    // Every turn of this walk runs Python — the `__typing_subst__` and
+    // `__parameters__` lookups, and the `__eq__` behind the uniqueness test —
+    // and `args`, the tuples and lists nested inside it, and the parameters
+    // gathered out of them are all nursery-allocated.  One scope owns the whole
+    // walk: the accumulator holds slot indices, and the two helpers pin into
+    // this scope instead of opening their own, because an inner scope's drop
+    // truncates the stack back to its base and would take the accumulated
+    // slots with it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args);
+    let args = || pyre_object::gc_roots::shadow_stack_get(args_slot);
+    let mut param_slots: Vec<usize> = Vec::new();
+    let n = unsafe { w_tuple_len(args()) };
     for i in 0..n {
-        if let Some(t) = unsafe { w_tuple_getitem(args, i as i64) } {
-            collect_parameters_one(t, &mut params)?;
+        if let Some(t) = unsafe { w_tuple_getitem(args(), i as i64) } {
+            collect_parameters_one(t, &mut param_slots)?;
         }
     }
+    let params: Vec<PyObjectRef> = param_slots
+        .iter()
+        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+        .collect();
     Ok(w_tuple_new(params))
 }
 
+/// One element of the [`collect_parameters`] walk.  Pins into the caller's
+/// scope: `param_slots` names slots the caller reads once this returns.
 fn collect_parameters_one(
     t: PyObjectRef,
-    params: &mut Vec<PyObjectRef>,
+    param_slots: &mut Vec<usize>,
 ) -> Result<(), crate::PyError> {
+    let t_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(t);
+    let t = || pyre_object::gc_roots::shadow_stack_get(t_slot);
     unsafe {
-        if is_type(t) {
+        if is_type(t()) {
             // A bare class exposes no `__parameters__` descriptor of its own.
             return Ok(());
         }
-        if is_tuple(t) || is_list(t) {
-            let n = if is_tuple(t) {
-                w_tuple_len(t)
+        // A collection cannot change what `t` is, so the container kind is read
+        // once and the recursion below re-reads only the address.
+        let container_is_tuple = is_tuple(t());
+        if container_is_tuple || is_list(t()) {
+            let n = if container_is_tuple {
+                w_tuple_len(t())
             } else {
-                w_list_len(t)
+                w_list_len(t())
             };
             for i in 0..n {
-                let x = if is_tuple(t) {
-                    w_tuple_getitem(t, i as i64)
+                let x = if container_is_tuple {
+                    w_tuple_getitem(t(), i as i64)
                 } else {
-                    w_list_getitem(t, i as i64)
+                    w_list_getitem(t(), i as i64)
                 };
                 if let Some(x) = x {
-                    collect_parameters_one(x, params)?;
+                    collect_parameters_one(x, param_slots)?;
                 }
             }
             return Ok(());
@@ -129,9 +166,9 @@ fn collect_parameters_one(
     // `hasattr(t, '__typing_subst__')` → `t` is itself a parameter.  `hasattr`
     // only swallows `AttributeError`; a misbehaving descriptor that raises
     // anything else propagates.
-    match crate::baseobjspace::getattr_str(t, "__typing_subst__") {
+    match crate::baseobjspace::getattr_str(t(), "__typing_subst__") {
         Ok(_) => {
-            push_unique(params, t)?;
+            push_unique(param_slots, t())?;
             return Ok(());
         }
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {}
@@ -139,13 +176,16 @@ fn collect_parameters_one(
     }
     // Otherwise pull `getattr(t, '__parameters__', ())` — the `()` default
     // applies only on `AttributeError`.
-    match crate::baseobjspace::getattr_str(t, "__parameters__") {
+    match crate::baseobjspace::getattr_str(t(), "__parameters__") {
         Ok(sub) => {
             if unsafe { is_tuple(sub) } {
-                let n = unsafe { w_tuple_len(sub) };
+                let sub_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(sub);
+                let sub = || pyre_object::gc_roots::shadow_stack_get(sub_slot);
+                let n = unsafe { w_tuple_len(sub()) };
                 for i in 0..n {
-                    if let Some(x) = unsafe { w_tuple_getitem(sub, i as i64) } {
-                        push_unique(params, x)?;
+                    if let Some(x) = unsafe { w_tuple_getitem(sub(), i as i64) } {
+                        push_unique(param_slots, x)?;
                     }
                 }
             }
@@ -156,15 +196,21 @@ fn collect_parameters_one(
     Ok(())
 }
 
-fn push_unique(params: &mut Vec<PyObjectRef>, item: PyObjectRef) -> Result<(), crate::PyError> {
-    // `if item not in parameters: parameters.append(item)` — the `in` test is
-    // `tuple.__contains__`, so a raising `__eq__` propagates.
-    for &p in params.iter() {
+/// `if item not in parameters: parameters.append(item)`.  The `in` test is
+/// `tuple.__contains__`, so a raising `__eq__` propagates — and a returning one
+/// may have moved both operands, so each comparison reads its pair back out of
+/// the slots.  Pins into the caller's scope, as [`collect_parameters_one`] does.
+fn push_unique(param_slots: &mut Vec<usize>, item: PyObjectRef) -> Result<(), crate::PyError> {
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(item);
+    for index in 0..param_slots.len() {
+        let p = pyre_object::gc_roots::shadow_stack_get(param_slots[index]);
+        let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
         if crate::baseobjspace::eq_w(p, item)? {
             return Ok(());
         }
     }
-    params.push(item);
+    param_slots.push(item_slot);
     Ok(())
 }
 
@@ -350,10 +396,17 @@ fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
 /// `ValueError` raised when the item is absent.  A raising `__eq__`
 /// propagates (`tuple.index` does not swallow comparison errors).
 fn tuple_index(t: PyObjectRef, item: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
-    let n = unsafe { w_tuple_len(t) };
+    // `__eq__` is user code and both operands are nursery-allocated, so the
+    // tuple is re-read for every element rather than indexed from the word
+    // that was live before the first comparison.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[t, item]);
+    let t = || pyre_object::gc_roots::shadow_stack_get(base);
+    let item = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let n = unsafe { w_tuple_len(t()) };
     for i in 0..n {
-        if let Some(x) = unsafe { w_tuple_getitem(t, i as i64) }
-            && crate::baseobjspace::eq_w(x, item)?
+        if let Some(x) = unsafe { w_tuple_getitem(t(), i as i64) }
+            && crate::baseobjspace::eq_w(x, item())?
         {
             return Ok(Some(i));
         }
@@ -753,13 +806,18 @@ fn subs_tvars(
             continue;
         };
         // `try: argitems[params.index(param)] except ValueError: param`.
-        let arg = match tuple_index(params(), param)? {
-            Some(idx) => unsafe { w_tuple_getitem(argitems(), idx as i64) }.unwrap_or(param),
-            None => param,
+        // The search runs `__eq__` on every turn, so `param` is published
+        // before it and read back from the slot for each use afterwards.
+        let param_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(param);
+        let param = || pyre_object::gc_roots::shadow_stack_get(param_slot);
+        let arg = match tuple_index(params(), param())? {
+            Some(idx) => unsafe { w_tuple_getitem(argitems(), idx as i64) }.unwrap_or(param()),
+            None => param(),
         };
         // `if isinstance(param, TypeVarTuple): subargs.extend(arg)` — a
         // `TypeVarTuple` captures a sequence, so its bound `arg` is spliced.
-        if is_typevartuple(param) {
+        if is_typevartuple(param()) {
             let members = crate::builtins::collect_iterable(arg)?;
             let member_base = pyre_object::gc_roots::pin_roots(&members);
             for index in 0..members.len() {

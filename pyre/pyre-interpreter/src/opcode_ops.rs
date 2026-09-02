@@ -328,8 +328,9 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
     // reach a collection while the fresh set and sentinel still have no heap
     // edge.  Hold all of them on the shadow stack and read each back at its
     // use; the results accumulate in slots rather than in a native `Vec`,
-    // which would keep pre-move addresses.  The keys themselves are hashable,
-    // so no kind that moves reaches `key_items`.
+    // which would keep pre-move addresses.  The keys go the same way: being
+    // hashable does not make one immobile, and a value pattern that names a
+    // tuple (`case {Cls.KEY: v}`) puts a nursery-allocated key in `key_items`.
     let _roots = pyre_object::gc_roots::push_roots();
     let subject_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(subject);
@@ -347,12 +348,18 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(
         crate::typedef::gettypeobject(&pyre_object::pyobject::INSTANCE_TYPE),
     ));
+    let keys_base = pyre_object::gc_roots::shadow_stack_len();
+    for &key in &key_items {
+        let _ = pyre_object::gc_roots::pin_root(key);
+    }
     let values_base = pyre_object::gc_roots::shadow_stack_len();
     let mut value_count = 0usize;
     let mut all_match = true;
-    for key in key_items {
+    for key_index in 0..key_items.len() {
+        let key = pyre_object::gc_roots::shadow_stack_get(keys_base + key_index);
         let w_seen = pyre_object::gc_roots::shadow_stack_get(seen_slot);
         if crate::baseobjspace::contains(w_seen, key)? {
+            let key = pyre_object::gc_roots::shadow_stack_get(keys_base + key_index);
             let key_repr = unsafe { crate::display::py_repr_wtf8(key)? };
             return Err(PyError::value_error(crate::display::wtf8_format!(
                 "mapping pattern checks duplicate key (",
@@ -360,12 +367,20 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
                 ")"
             )));
         }
-        unsafe { pyre_object::w_set_add(pyre_object::gc_roots::shadow_stack_get(seen_slot), key) };
+        unsafe {
+            pyre_object::w_set_add(
+                pyre_object::gc_roots::shadow_stack_get(seen_slot),
+                pyre_object::gc_roots::shadow_stack_get(keys_base + key_index),
+            )
+        };
         let w_sentinel = pyre_object::gc_roots::shadow_stack_get(sentinel_slot);
         let w_value = crate::baseobjspace::call_method(
             pyre_object::gc_roots::shadow_stack_get(subject_slot),
             "get",
-            &[key, w_sentinel],
+            &[
+                pyre_object::gc_roots::shadow_stack_get(keys_base + key_index),
+                w_sentinel,
+            ],
         );
         if w_value.is_null() {
             return Err(crate::call::take_call_error()
@@ -774,7 +789,16 @@ pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError
             return Ok(());
         }
     }
-    let keys_method = crate::baseobjspace::getattr_str(source, "keys")?;
+    // The scope opens ahead of the key fetch, not after it: `getattr_str`, the
+    // `keys()` call and the iteration of whatever it answers are all Python,
+    // and `dict` is a `W_DictObject`, which relocates.  Pinning the pair below
+    // the fetch published the words that were live before it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict);
+    let _ = pyre_object::gc_roots::pin_root(source);
+    let source_now = || pyre_object::gc_roots::shadow_stack_get(sp + 1);
+    let keys_method = crate::baseobjspace::getattr_str(source_now(), "keys")?;
     let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
     let keys = crate::builtins::collect_iterable(keys_obj)?;
     unsafe {
@@ -786,19 +810,14 @@ pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError
         // duration: `getitem` (arbitrary `__getitem__`) and
         // `try_hash_value` (arbitrary `__hash__`) both may allocate and
         // move them.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let dict = pyre_object::gc_roots::pin_root(dict);
-        let source = pyre_object::gc_roots::pin_root(source);
-        let key_base = sp + 2;
+        let key_base = pyre_object::gc_roots::shadow_stack_len();
         for index in 0..keys.len() {
             let _ = pyre_object::gc_roots::pin_root(keys[index]);
         }
         let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
         for i in 0..key_len {
-            let source = pyre_object::gc_roots::shadow_stack_get(sp + 1);
             let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
-            let val = crate::baseobjspace::getitem(source, key)?;
+            let val = crate::baseobjspace::getitem(source_now(), key)?;
             let _val_root = pyre_object::gc_roots::push_roots();
             let val_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(val);

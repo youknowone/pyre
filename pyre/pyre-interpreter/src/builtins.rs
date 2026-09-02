@@ -16088,6 +16088,19 @@ pub(crate) fn exec_or_eval(
             (crate::box_code_object(code), false)
         }
     };
+    // A compiled source has just been boxed, and this local is its only
+    // referrer: the wrapper is `try_gc_alloc_stable`, so it does not move, but
+    // it is swept like any other unreferenced object.  Everything below runs
+    // Python -- the `__getitem__` probes on the namespace arguments, and then
+    // `ensure_*_builtins` through the globals mapping's `setdefault` (exec) or
+    // `__setitem__` (eval) -- and the frame is built from this word at the very
+    // end, so a collection in between leaves `createframe_obj` handing a reused
+    // block to `w_code_frame_stores_global`'s write barrier.  `code_ptr` below
+    // is a host allocation the destructor leaves standing, so only the wrapper
+    // needs the root.
+    let _code_roots = pyre_object::gc_roots::push_roots();
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(code_obj_ref);
     let raw_code = unsafe {
         crate::w_code_get_ptr(code_obj_ref as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
@@ -16300,6 +16313,20 @@ pub(crate) fn exec_or_eval(
     } else {
         pyre_object::w_dict_new()
     };
+    // The namespace mappings this function hands to the new frame are dicts,
+    // which the nursery relocates, and the `exec(src)` snapshot below has no
+    // referrer at all until `setdictscope` stores it.  `ensure_*_builtins`, the
+    // frame construction and `pick_builtin_obj_checked` each dispatch through a
+    // dict subclass and can collect, so all three are published here and read
+    // back at the site that consumes them.  Every pin is taken before
+    // `_closure_root` opens: a slot claimed after that scope would be truncated
+    // away by its drop.
+    let ns_roots = pyre_object::gc_roots::push_roots();
+    let w_globals_slot = (!w_globals.is_null()).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = ns_roots.pin_root(w_globals);
+        slot
+    });
     // pyopcode.py:773-774 `space.call_method(w_globals, 'setdefault', ...)`
     // (exec) and compiling.py:109-110 `space.setitem_str(w_globals, ...)`
     // (eval) dispatch on the ORIGINAL `w_globals` object so a dict-subclass
@@ -16342,6 +16369,11 @@ pub(crate) fn exec_or_eval(
         // function from adding `y` to that function's locals.
         implicit_caller_locals = unsafe { (*caller_frame).frame_locals_snapshot()? };
     }
+    let implicit_locals_slot = (!implicit_caller_locals.is_null()).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = ns_roots.pin_root(implicit_caller_locals);
+        slot
+    });
     let mut locals_object_arg: pyre_object::PyObjectRef = std::ptr::null_mut();
     if !is_none_or_null(locals_arg) {
         let same_as_globals =
@@ -16360,6 +16392,11 @@ pub(crate) fn exec_or_eval(
             locals_object_arg = locals_arg;
         }
     }
+    let locals_object_slot = (!locals_object_arg.is_null()).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = ns_roots.pin_root(locals_object_arg);
+        slot
+    });
     // function.py Function.__init__ — build the closure carrier for
     // `exec(code, ..., closure=...)`.  A `Function` whose `__closure__` is the
     // validated cell tuple; createframe reads it back through
@@ -16373,7 +16410,7 @@ pub(crate) fn exec_or_eval(
     let outer_func = if inject_closure {
         let name = unsafe { (&*raw_code).obj_name.clone() };
         let f = crate::function::function_new_with_closure(
-            code_obj_ref as *const (),
+            pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
             name,
             pyre_object::PY_NULL,
             closure,
@@ -16388,14 +16425,18 @@ pub(crate) fn exec_or_eval(
     // None so createframe surfaces pyframe.py:242-246's TypeError "directly
     // executed code object may not contain free variables" — exec()'s
     // closure-mismatch TypeError was already raised above.
-    let mut frame =
-        match crate::createframe_obj(code_obj_ref as *const (), w_globals, exec_ctx, outer_func) {
-            Ok(frame) => frame,
-            Err(err) => {
-                let _ = raw_code;
-                return Err(err);
-            }
-        };
+    let mut frame = match crate::createframe_obj(
+        pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
+        w_globals_slot.map_or(w_globals, pyre_object::gc_roots::shadow_stack_get),
+        exec_ctx,
+        outer_func,
+    ) {
+        Ok(frame) => frame,
+        Err(err) => {
+            let _ = raw_code;
+            return Err(err);
+        }
+    };
     // Python 3.14 always selects the builtin namespace supplied through an
     // explicit exec/eval globals dict.  PyPy expresses the same selection as
     // `space.builtin.pick_builtin(w_globals)` when
@@ -16428,14 +16469,15 @@ pub(crate) fn exec_or_eval(
     // were separately supplied.  Without this call, initialize_frame_scopes'
     // module-code arm has already bound w_locals = w_globals, matching
     // PyPy's `exec(src, g)` (and `exec(src, g, l)` where `l is g`).
-    if !locals_object_arg.is_null() {
-        frame.setdictscope(locals_object_arg)?;
-    } else if !implicit_caller_locals.is_null() {
+    if let Some(slot) = locals_object_slot {
+        frame.setdictscope(pyre_object::gc_roots::shadow_stack_get(slot))?;
+    } else if let Some(implicit_locals_slot) = implicit_locals_slot {
         // pyopcode.py:2015 — `exec(src)` with no globals/locals uses
         // the caller's `getdictscope()` as locals.  Skip when the
         // resolved object is the caller's globals (module-level exec
         // collapses to locals=globals — same-dict shape kept by the
         // module-frame's initialize_frame_scopes binding).
+        let implicit_caller_locals = pyre_object::gc_roots::shadow_stack_get(implicit_locals_slot);
         let caller_globals_obj = unsafe { (*caller_anchor.live()).get_w_globals() };
         let same_as_globals = !caller_globals_obj.is_null()
             && std::ptr::eq(implicit_caller_locals, caller_globals_obj);
@@ -22786,9 +22828,24 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let _name_roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(name_obj);
-    let globals = scope[1];
-    let locals = scope[2];
-    let fromlist = scope[3];
+    // The other three bound arguments outlive `level.__index__` too, and each
+    // is a kind the nursery relocates: two dicts and the `fromlist` tuple.
+    // Publish them beside the name and read every one back below.
+    let globals_slot = (!scope[1].is_null()).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(scope[1]);
+        slot
+    });
+    let locals_slot = (!scope[2].is_null()).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(scope[2]);
+        slot
+    });
+    let fromlist_slot = (!scope[3].is_null()).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(scope[3]);
+        slot
+    });
     let level_obj = scope[4];
     // `@unwrap_spec(level=int)` — an omitted level defaults to 0; a supplied
     // non-integer raises through the index protocol rather than defaulting.
@@ -22808,6 +22865,13 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     // such spelling goes straight to the app-level bootstrap.  Re-read the
     // name through its root: `space_index_w` above may have moved it.
     let name_obj = pyre_object::gc_roots::shadow_stack_get(name_slot);
+    let read = |slot: Option<usize>| {
+        slot.map_or(
+            pyre_object::PY_NULL,
+            pyre_object::gc_roots::shadow_stack_get,
+        )
+    };
+    let (globals, locals, fromlist) = (read(globals_slot), read(locals_slot), read(fromlist_slot));
     let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name_obj) }) else {
         return crate::importing::dunder_import_name_obj(
             name_obj, globals, locals, fromlist, level,

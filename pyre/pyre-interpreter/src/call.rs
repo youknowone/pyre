@@ -4756,7 +4756,14 @@ fn update_bases(
     // `__mro_entries__` call both run Python.  Pinning each returned tuple
     // keeps its entries traced for the rest of the walk; the caller's
     // `w_tuple_new` re-pins them before it allocates.
+    //
+    // `w_orig_bases` is the tuple every `__mro_entries__` in the walk is handed,
+    // and it is nursery-allocated: the caller's pin keeps it alive and forwards
+    // its slot, but this parameter copy is the pre-move word from the first
+    // `getattr_str` onwards.  Re-publish it here and read the slot at each call.
     let _entry_roots = pyre_object::gc_roots::push_roots();
+    let orig_bases_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_orig_bases);
     let mut new_bases: Option<Vec<PyObjectRef>> = None;
     for (i, &w_base) in base_args.iter().enumerate() {
         if unsafe { pyre_object::is_type(w_base) } {
@@ -4773,7 +4780,10 @@ fn update_bases(
             }
             Err(e) => return Err(e),
             Ok(w_meth) => {
-                let w_new_base = crate::call_function(w_meth, &[w_orig_bases]);
+                let w_new_base = crate::call_function(
+                    w_meth,
+                    &[pyre_object::gc_roots::shadow_stack_get(orig_bases_slot)],
+                );
                 if w_new_base.is_null() {
                     if let Some(err) = take_call_error() {
                         return Err(err);
@@ -5013,9 +5023,9 @@ pub fn build_class_body_namespace_is_module_dict(args: &[PyObjectRef]) -> bool {
 
 /// `bases` and `w_orig_bases` are borrowed, not owned: the only caller,
 /// `real_build_class`, keeps both pinned for the whole of this call.  They are
-/// tuples, so they never move and the raw copies below stay valid addresses;
-/// what the caller's scope buys is that the blocks are still allocated when
-/// the class body returns.  A second caller would have to pin them the same
+/// nursery-allocated tuples, so the parameter copies go stale as soon as
+/// `__prepare__` or the class body collects; both are re-published below and
+/// read back at each use.  A second caller would have to pin them the same
 /// way before calling.
 fn build_class_inner(
     body_fn: PyObjectRef,
@@ -5040,11 +5050,11 @@ fn build_class_inner(
     let current_kwds = || kwds_roots.as_ref().map(|(scope, slot)| scope.get(*slot));
 
     // `bases` and `w_orig_bases` are raw copies taken before `__prepare__` and
-    // before the class body runs, and both execute Python.  A tuple does not
-    // move, but one with no heap edge is sweepable rather than merely immobile,
-    // so a copy held across those calls can name freed memory by the time
-    // `is_tuple` / `w_tuple_len` read it.  Publish both and read them back at
-    // each site that consumes them.
+    // before the class body runs, and both execute Python.  A tuple is
+    // nursery-allocated, so a copy held across those calls names the pre-move
+    // address by the time `is_tuple` / `w_tuple_len` read it, and one with no
+    // heap edge is swept besides.  Publish both and read them back at each site
+    // that consumes them.
     let bases_scope = pyre_object::gc_roots::push_roots();
     let bases_slot = bases_scope.base();
     let _ = bases_scope.pin_root(bases);
@@ -5053,14 +5063,16 @@ fn build_class_inner(
         let _ = pyre_object::gc_roots::pin_root(w_orig_bases);
         slot
     });
+    // The class body's frame is built from the function's code, globals and
+    // closure at the bottom of this function, after `__prepare__`, the
+    // namespace allocations and the namespace replay have all run.  The globals
+    // are a dict and the closure a tuple, both nursery-allocated, so the three
+    // are read off `body_fn` there rather than cached here.  A `Function` is
+    // `try_gc_alloc_stable`, so its own address survives; what the pin buys is
+    // that the block is still allocated when that late read happens.
+    let body_fn_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(body_fn);
     let bases = || bases_scope.get(bases_slot);
-
-    let w_code = unsafe { crate::getcode(body_fn) };
-    let w_globals = unsafe { function_get_globals_obj(body_fn) };
-    let closure = unsafe { function_get_closure(body_fn) };
-    let func_code = unsafe {
-        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
-    };
 
     // Call metaclass.__prepare__(name, bases, **kwds) if it exists.
     // PyPy: build_class → metaclass.__prepare__(name, bases, **kwds)
@@ -5223,6 +5235,16 @@ fn build_class_inner(
     // Create frame with class_locals set AND closure from enclosing scope.
     // PyPy: executes class body with w_locals = fresh dict, w_globals = module globals,
     // and the closure tuple is passed through for LOAD_DEREF access.
+    //
+    // Read the three off the pinned function here: everything above ran Python
+    // or allocated, and the globals dict and the closure tuple both relocate.
+    let body_fn = pyre_object::gc_roots::shadow_stack_get(body_fn_slot);
+    let w_code = unsafe { crate::getcode(body_fn) };
+    let w_globals = unsafe { function_get_globals_obj(body_fn) };
+    let closure = unsafe { function_get_closure(body_fn) };
+    let func_code = unsafe {
+        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
+    };
     // Debug: dump code object for __class__ cell investigation. Reads the real
     // process env + writes real stderr, so keep it out of the sandbox build.
     #[cfg(not(feature = "sandbox"))]
