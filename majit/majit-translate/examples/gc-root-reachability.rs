@@ -355,11 +355,23 @@ fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let movable_callees =
-            liveness::movable_callee_ids(&cg, liveness::MOVABLE_GC_MARKERS, movable_hops);
+        // Asked of the JOINED graph and projected back, the same way `reach` is:
+        // `w_tuple_getitem` and most of the rest of the markers are declared in
+        // this artefact but bodied in a donor, so resolving them against `cg`
+        // alone answers with whatever subset happens to carry a body here.
+        let movable_callees = joined.project(
+            0,
+            &liveness::movable_callee_ids(
+                &joined.graph,
+                liveness::MOVABLE_GC_MARKERS,
+                movable_hops,
+            ),
+        );
         println!(
-            "   movable-addressing callees at {movable_hops} hop(s): {}",
-            movable_callees.len()
+            "   movable-addressing callees at {movable_hops} hop(s): {} \
+             ({} before the join)",
+            movable_callees.len(),
+            liveness::movable_callee_ids(&cg, liveness::MOVABLE_GC_MARKERS, movable_hops).len()
         );
         let gc_tys = liveness::gc_ptr_type_ids(&llbc);
         if gc_tys.is_empty() {
@@ -383,6 +395,13 @@ fn main() {
         println!(
             "       and {} body/bodies with a statement this reader could not parse",
             stats.unparsed_statement_bodies
+        );
+        // What the `movable` columns below had to work with.  A zero says the
+        // ranking never had an input, which is not the same answer as a clean
+        // corpus and must not be read as one.
+        println!(
+            "       movable-argument supply: {} bodies hand {} GC pointer(s) to one",
+            stats.bodies_with_movable_args, stats.movable_arg_locals
         );
         // The withheld figure above says a bracket dominates the call.  It does
         // not say the root the call needed is in that bracket, and nothing has

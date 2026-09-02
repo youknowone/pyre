@@ -43,8 +43,8 @@ pub struct Finding {
     /// Live across the call because the call itself takes them.
     pub live_arg: Vec<String>,
     /// Of the live pointers, those the function later hands to a callee whose
-    /// name says it addresses a `list` or a `dict` — the only two kinds whose
-    /// header a minor collection relocates.  A stale pointer that is only
+    /// name says it addresses a kind whose header a minor collection
+    /// relocates.  A stale pointer that is only
     /// stored or returned is a different (and rarer) problem; this column is
     /// where a stale pointer is actually dereferenced as a movable object.
     pub movable_use: Vec<String>,
@@ -98,7 +98,7 @@ pub struct ScanStats {
     /// produced itself, which no caller's bracket can be covering.
     pub withheld_bracket_short_body_local: usize,
     /// Of [`Self::withheld_bracket_short`], those missing a root this body goes
-    /// on to address as a `list` or `dict`.  A caller's pin does not answer for
+    /// on to address as a movable kind.  A caller's pin does not answer for
     /// these, so they do not depend on the intra-procedural limit.
     pub withheld_bracket_short_movable: usize,
     /// The [`ScanStats::withheld_bracket_short`] calls, named.
@@ -107,10 +107,22 @@ pub struct ScanStats {
     /// slot.  Not a missing root -- a stale word.  See [`StalePinRead`].
     pub pin_arg_read_after: usize,
     /// Of those, the ones reading a local this body later addresses as a
-    /// `list` or `dict`, where the stale word is dereferenced.
+    /// movable kind, where the stale word is dereferenced.
     pub pin_arg_read_after_movable: usize,
     /// The [`Self::pin_arg_read_after`] pins, named.
     pub stale_pin_reads: Vec<StalePinRead>,
+    /// Bodies that hand at least one GC pointer to a movable-addressing callee.
+    ///
+    /// The `movable` columns are all filters over this set, so a zero here says
+    /// the ranking never had anything to rank -- a different fact from "nothing
+    /// ranked".  Worth a counter of its own: the marker list, the id space the
+    /// callees are resolved in, and the operand shape a call argument takes each
+    /// silence the columns the same way, and only this number separates "the
+    /// scan found no such call" from "the scan found them and none was stale".
+    pub bodies_with_movable_args: usize,
+    /// Locals summed over [`Self::bodies_with_movable_args`], so a body that
+    /// contributes one argument is told apart from one that contributes twenty.
+    pub movable_arg_locals: usize,
 }
 
 /// A pin whose argument the body goes on to read.
@@ -134,7 +146,7 @@ pub struct StalePinRead {
     pub pin_name: String,
     /// The locals handed to the pin and still read afterwards.
     pub locals: Vec<String>,
-    /// Of those, the ones this body later addresses as a `list` or `dict`,
+    /// Of those, the ones this body later addresses as a movable kind,
     /// which is where a stale word is dereferenced rather than merely carried.
     pub movable: Vec<String>,
 }
@@ -160,7 +172,7 @@ pub struct ShortBracket {
     /// local it produced, so these are the ones a caller cannot account for.
     pub missing_local: Vec<String>,
     /// Of [`Self::missing`], those this body later hands to a callee whose name
-    /// says it addresses a `list` or a `dict` -- the two kinds whose header a
+    /// says it addresses a movable kind -- one whose header a
     /// minor collection relocates.  A caller's pin cannot rescue one of these:
     /// the collection rewrites the caller's slot, not this body's copy, so the
     /// word in hand is a corpse either way.  The bracket-contents twin of the
@@ -173,9 +185,10 @@ pub struct ShortBracket {
 
 /// Callee names that say the pointer is addressed as a movable object.
 ///
-/// `list` and `dict` are the only two kinds whose header a minor collection
-/// relocates, so a stale `PyObjectRef` handed to one of these is dereferenced
-/// as a corpse rather than merely stored or returned.
+/// A stale `PyObjectRef` handed to one of these is dereferenced as a corpse
+/// rather than merely stored or returned.  The set is not the whole moving
+/// heap: it is the part of it a callee's *name* identifies, and the entries
+/// below record which kind each spelling was checked against.
 pub const MOVABLE_GC_MARKERS: &[&str] = &[
     "w_list_",
     "w_dict_",
@@ -191,11 +204,22 @@ pub const MOVABLE_GC_MARKERS: &[&str] = &[
     // Spelled at the moving constructor rather than at the family prefix: a
     // `w_weakref_lifeline_*` is `allocate_stable` and a `w_str_new` is
     // immortal, so the wider spelling would name a pointer that cannot move.
+    // `w_dict_view_*` needs no entry of its own -- the `w_dict_` prefix already
+    // spells it.
+    //
+    // `str` has no entry at all, and deliberately.  Its mobility is decided per
+    // constructor -- `w_str_from_wtf8_managed_collecting` is the one nursery
+    // spelling, while `w_str_from_wtf8_managed` is `try_gc_alloc_stable` and
+    // `w_str_new` is immortal -- so the accessors every one of them shares
+    // cannot say which kind the pointer reaching them is.  Naming a constructor
+    // here would add nothing either: they take a `Wtf8Buf`, never a
+    // `PyObjectRef`, so no GC-pointer local is ever an argument of one.  The
+    // same reading rules out the items-block and JITFRAME allocators, whose
+    // arguments are a capacity and a type id.
     "w_tuple_",
     "w_method_",
     "w_gc_weakref_box_",
     "w_weakref_new",
-    "w_str_from_wtf8_managed",
 ];
 
 /// The callees that say a pointer reaching them is addressed as a movable
@@ -414,6 +438,24 @@ fn chase_pinned(l: u64, defs: &HashMap<u64, PinSrc>, out: &mut HashSet<u64>, dep
     }
 }
 
+/// Every local an argument to a movable-addressing callee is spelled by.
+///
+/// The alias half of [`chase_pinned`], and needed for the same reason on the
+/// other side of the intersection: a call argument is materialised as its own
+/// temporary (`_t = copy _obj; w_tuple_getitem(move _t, ..)`), so matching the
+/// argument local against the pinned local compares two spellings of one value
+/// and finds nothing.  Aggregates are not followed here -- `pin_roots(&[a, b])`
+/// pins each element, but a callee handed a container is addressing the
+/// container, not the elements.
+fn chase_arg_aliases(l: u64, defs: &HashMap<u64, PinSrc>, out: &mut HashSet<u64>, depth: u32) {
+    if !out.insert(l) || depth > 8 {
+        return;
+    }
+    if let Some(PinSrc::Alias(next)) = defs.get(&l) {
+        chase_arg_aliases(*next, defs, out, depth + 1);
+    }
+}
+
 /// The functions that write a livevar onto the root stack.
 ///
 /// `push_roots` opens the scope and takes no arguments; the set is named
@@ -583,7 +625,8 @@ pub fn scan(
                         // rewound by the *innermost* live guard, because
                         // `RootScope::drop` truncates the shadow stack to the
                         // length it saved, so ownership needs nesting order.
-                        if opens && let Some(scope) = bare_local(&call.dest)
+                        if opens
+                            && let Some(scope) = bare_local(&call.dest)
                             && !normal.contains(&scope)
                         {
                             normal.push(scope);
@@ -913,8 +956,7 @@ pub fn scan(
             })
             .collect();
         for _round in 0..n + 8 {
-            let outs: Vec<HashSet<(u64, u64)>> =
-                (0..n).map(|b| out_of(b, &pinned_in)).collect();
+            let outs: Vec<HashSet<(u64, u64)>> = (0..n).map(|b| out_of(b, &pinned_in)).collect();
             let mut changed = false;
             let mut next: Vec<HashSet<(u64, u64)>> = Vec::with_capacity(n);
             for b in 0..n {
@@ -968,8 +1010,10 @@ pub fn scan(
             }
         }
 
-        // Locals this body hands to a `list`/`dict`-addressing callee.  Built
-        // once: it does not depend on which collecting call is being judged.
+        // Locals this body hands to a callee that addresses a nursery-allocated
+        // kind.  Built once: it does not depend on which collecting call is
+        // being judged, so a local that reaches such a callee anywhere in the
+        // body is in the set for every call the body makes.
         let mut movable_args: HashSet<u64> = HashSet::new();
         for other in &body.body {
             let Ok(TermKind::Call { call: c2, .. }) = other.term() else {
@@ -985,8 +1029,23 @@ pub fn scan(
                 continue;
             }
             for a in &c2.args {
-                use_operand(a, &mut movable_args);
+                let mut seed: HashSet<u64> = HashSet::new();
+                use_operand(a, &mut seed);
+                for l in seed {
+                    chase_arg_aliases(l, &defs, &mut movable_args, 0);
+                }
             }
+        }
+        // Count only the GC pointers: a `Wtf8Buf` or a capacity handed to a
+        // marked callee is an argument the `movable` filters can never select,
+        // so counting it here would report a live ranking that is not one.
+        let movable_gc_args = movable_args
+            .iter()
+            .filter(|l| gc_locals.contains_key(*l))
+            .count();
+        if movable_gc_args > 0 {
+            stats.bodies_with_movable_args += 1;
+            stats.movable_arg_locals += movable_gc_args;
         }
 
         // Every pin whose argument the body goes on to read.  Independent of
@@ -1180,7 +1239,7 @@ pub fn scan(
                 .collect();
             non_arg.sort();
             in_arg.sort();
-            // Does any live pointer reach a list/dict-addressing callee in this
+            // Does any live pointer reach a movable-addressing callee in this
             // body?  Anywhere in the body, not only in the dominated
             // successors — this is a ranking signal, not a proof.
             let mut movable_use: Vec<String> = after

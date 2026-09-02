@@ -425,6 +425,13 @@ pub const COLLECTING_SEEDS: &[&str] = &[
     "majit_gc::alloc_nursery_collecting_typed",
     "majit_gc::alloc_nursery_collecting_typed_rooted",
     "majit_gc::alloc_fast_nursery_collecting_typed_rooted",
+    // Reported UNMATCHED, and that is the answer rather than a gap: both are
+    // `#[inline]` and reached only from the two wrappers above them
+    // (`majit-gc/src/lib.rs`) and from the dynasm runner's hook, which is not
+    // in the analysed artefacts.  `reaching(standalone_X)` is therefore a
+    // subset of `reaching(X)`, so naming them adds no closure -- they are kept
+    // so a future extraction that does carry them is seeded, and the gate pins
+    // the unmatched set so the pair cannot quietly grow.
     "majit_gc::standalone_alloc_nursery_collecting_typed_rooted",
     "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
     // The generation-carrying entry every backend trampoline dispatches to;
