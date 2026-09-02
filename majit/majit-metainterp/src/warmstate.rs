@@ -3335,27 +3335,48 @@ impl WarmEnterState {
     ) -> (u64, Option<&BaseJitCell>) {
         let mut count = 0usize;
         let mut found: Option<(&BaseJitCell, u64)> = None;
+        // The cell this slot holds under `hash` ITSELF, whatever bucket filed
+        // it. A key naming no cell of this bucket still names one when `hash`
+        // was minted for a cell of another bucket, and the miss arm below
+        // would otherwise walk back for it; noting it here costs one compare
+        // per chain node instead of a second traversal.
+        let mut by_key: Option<&BaseJitCell> = None;
         let mut cell = self.lookup_chain(hash);
         while let Some(c) = cell {
-            if let Some(cell_key) = c.cell_key
-                && c.cell_bucket == hash
-            {
-                count += 1;
-                if found.is_none() {
-                    found = Some((c, cell_key));
+            if let Some(cell_key) = c.cell_key {
+                if c.cell_bucket == hash {
+                    count += 1;
+                    if found.is_none() {
+                        found = Some((c, cell_key));
+                    }
+                }
+                if cell_key == hash {
+                    by_key = Some(c);
                 }
             }
             cell = c.next.as_deref();
         }
+        // `bucket_of(hash) == hash` says [`Self::cell_by_key`] would search
+        // THIS slot for `hash`, so the walk above has already decided it: a key
+        // is routed to another slot only when [`Self::mint_cell_key`] recorded
+        // it for another bucket, and a cell key names at most one live cell
+        // wherever that cell sits.
+        let cell_named_by_hash = || {
+            if self.bucket_of(hash) == hash {
+                by_key
+            } else {
+                self.cell_by_key(hash)
+            }
+        };
         match (count, found) {
             (1, Some((cell, cell_key))) => (cell_key, Some(cell)),
-            (0, _) => (hash, self.cell_by_key(hash)),
+            (0, _) => (hash, cell_named_by_hash()),
             _ => match make_key {
                 Some(make_key) => {
                     let cell_key = self.cell_key_for(&make_key()).unwrap_or(hash);
                     (cell_key, self.cell_by_key(cell_key))
                 }
-                None => (hash, self.cell_by_key(hash)),
+                None => (hash, cell_named_by_hash()),
             },
         }
     }
