@@ -11863,10 +11863,10 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Built for a guard exit only. Every reader of this field opens it past
-        // its own JUMP arm — the two driver run loops restore the exit values
-        // and return, and the drain loop breaks — so a layout built for a back
-        // edge is a type-vector copy, three refcount pairs and a heap box that
-        // nothing reads.
+        // its own back-edge arm, because a JUMP exit is answered by restoring
+        // the loop-carried state and re-entering — so a layout built for one is
+        // a type-vector copy, three refcount pairs and a heap box that nothing
+        // reads.
         let exit_layout = (!is_jump_exit).then(|| {
             // Fresh lookup, and fallible: the run can re-enter the driver
             // through a residual call and drop this green key (`jitdriver.rs`'s
