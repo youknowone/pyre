@@ -1662,18 +1662,20 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     // `stack_end`.  The null_or_self slot is the one stack slot no source above
     // can speak for, so synthesize its known null and require the callable
     // immediately below it to prove that reconstruction reached the operand
-    // region.  FOR_ITER has only the iterator at `stack_end - 1`: it needs no
-    // synthesized sentinel, and that iterator itself is the proof slot.
-    // `BINARY_OP` / `COMPARE_OP` have `[lhs, rhs]` and likewise synthesize
-    // nothing; `lhs`, the deeper of the two, is the proof.
-    let operand_slots = caller_operand_slots(caller_sym, call_jitcode_pc, stack_end)?;
+    // region.  Every other resume shape synthesizes nothing and proves itself
+    // with the deepest operand it consumes.
+    let Some(operand_slots) = caller_operand_slots(caller_sym, call_jitcode_pc, stack_end) else {
+        if fbw_debug_abort_enabled() {
+            crate::jitcode_dispatch::census_record("CallStack::NoOperandShape");
+        }
+        return None;
+    };
     let (sentinel_slot, proof_slot) = match operand_slots {
         CallerOperandSlots::Call {
             null_or_self,
             callable,
         } => (Some(null_or_self), callable),
-        CallerOperandSlots::ForIter { iterator } => (None, iterator),
-        CallerOperandSlots::Binary { lhs } => (None, lhs),
+        CallerOperandSlots::Operands { deepest } => (None, deepest),
     };
     if let Some(sentinel_slot) = sentinel_slot {
         if sentinel_slot >= nlocals
@@ -1690,10 +1692,15 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     // Ref(0) is valid only for the synthesized null_or_self sentinel.  A null
     // proof value means the sparse vstack/color reconstruction is incomplete;
     // decline instead of publishing an invalid operand region.
-    overrides
+    let proof_value = overrides
         .iter()
-        .find_map(|&(slot, value)| (slot == proof_slot).then_some(value))
-        .filter(|value| !value.is_null())?;
+        .find_map(|&(slot, value)| (slot == proof_slot).then_some(value));
+    if !matches!(proof_value, Some(value) if !value.is_null()) {
+        if fbw_debug_abort_enabled() {
+            crate::jitcode_dispatch::census_record("CallStack::ProofSlotUnresolved");
+        }
+        return None;
+    }
     // Report-only: a slot left absent here is what makes the outer-call flush
     // decline, and the consumer can only say "not capturable". Name each source
     // that passed on it so the gap is attributable to one of them.
@@ -1732,26 +1739,25 @@ enum CallerOperandSlots {
         null_or_self: usize,
         callable: usize,
     },
-    ForIter {
-        iterator: usize,
-    },
-    /// `BINARY_OP` / `COMPARE_OP`: `[lhs, rhs]` ending at `stack_end`.
-    Binary {
-        lhs: usize,
-    },
+    /// A shape with no slot to synthesize: the deepest of the operands it
+    /// consumes is the proof slot.
+    Operands { deepest: usize },
 }
 
 /// Absolute frame slots proving the operand region at `call_jitcode_pc`, for a
 /// caller whose operand stack ends at `stack_end`. CALL names its synthetic
-/// `null_or_self` sentinel and callable proof; FOR_ITER names its iterator
-/// proof; `BINARY_OP` / `COMPARE_OP` name their left operand, the deeper of
-/// the two, for the same role the callable plays for CALL. `None` keeps the
-/// conservative decline for every other resume shape.
+/// `null_or_self` sentinel and callable proof; every other shape names only
+/// how many operands it consumes, and the deepest of those plays the role the
+/// callable plays for CALL. `None` keeps the conservative decline for every
+/// resume shape not listed.
 ///
-/// The last of those is what an inlined dunder needs and had not got: the
-/// entry admits a body on the strength of an abort resuming forward past it,
-/// and with no arm here that reconstruction answered `None`, so the resume
-/// fell back to replaying the loop from its entry.
+/// The non-CALL shapes are what an inlined dunder needs: the entry admits a
+/// body on the strength of an abort resuming forward past it, and with no arm
+/// here that reconstruction answered `None`, so the resume fell back to
+/// replaying the loop from its entry. `LOAD_ATTR` / `STORE_ATTR` are the
+/// attribute-access half of that — a property accessor, a `__getattr__` hook
+/// or a descriptor `__get__` body is reached from one of them, never from a
+/// Python-level CALL.
 fn caller_operand_slots<Sym: WalkSym>(
     caller_sym: &Sym,
     call_jitcode_pc: usize,
@@ -1763,23 +1769,36 @@ fn caller_operand_slots<Sym: WalkSym>(
         crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jitcode_pc)
             as usize;
     let (instruction, op_arg) = pyre_interpreter::decode_instruction_at(code, py_pc)?;
-    match instruction {
+    let operand_count = match instruction {
         pyre_interpreter::Instruction::Call { argc } => {
             let null_or_self = stack_end.checked_sub(argc.get(op_arg) as usize + 1)?;
-            Some(CallerOperandSlots::Call {
+            return Some(CallerOperandSlots::Call {
                 null_or_self,
                 callable: null_or_self.checked_sub(1)?,
-            })
+            });
         }
-        pyre_interpreter::Instruction::ForIter { .. } => Some(CallerOperandSlots::ForIter {
-            iterator: stack_end.checked_sub(1)?,
-        }),
+        // `[iterator]`, and `[owner]` for the attribute read whose descriptor
+        // body is the callee. The method form of `LOAD_ATTR` pushes two
+        // results but still consumes only the owner, and this depth is read
+        // before the instruction runs.
+        pyre_interpreter::Instruction::ForIter { .. }
+        | pyre_interpreter::Instruction::LoadAttr { .. } => 1,
+        // `[lhs, rhs]`, and `[value, owner]` for the attribute store whose
+        // setter body is the callee — `store_attr_cached` pops the owner
+        // first, so `value` is the deeper of the two.
         pyre_interpreter::Instruction::BinaryOp { .. }
-        | pyre_interpreter::Instruction::CompareOp { .. } => Some(CallerOperandSlots::Binary {
-            lhs: stack_end.checked_sub(2)?,
-        }),
-        _ => None,
-    }
+        | pyre_interpreter::Instruction::CompareOp { .. }
+        | pyre_interpreter::Instruction::StoreAttr { .. } => 2,
+        other => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[caller-operand-shape-absent] instruction={other:?} py_pc={py_pc}");
+            }
+            return None;
+        }
+    };
+    Some(CallerOperandSlots::Operands {
+        deepest: stack_end.checked_sub(operand_count)?,
+    })
 }
 
 /// Name the live color that refused a caller image.
@@ -2209,10 +2228,13 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     // The call result is the top operand-stack slot only when it remains live
     // at the return point; a call whose value is immediately discarded can
     // resume with depth zero.
-    let depth = match resume_marker_jit_pc {
+    //
+    // `None` is "this source has no entry for the coordinate", which is not
+    // the same statement as a source answering zero — see the decline below.
+    let depth_read: Option<usize> = match resume_marker_jit_pc {
         Some(marker) => unsafe { &(*caller_sym.jitcode()).payload }
             .depth_trivia_for_jitcode_pc(marker)
-            .unwrap_or(0) as usize,
+            .map(|depth| depth as usize),
         // A missing marker has no fallthrough-native key. Preserve the
         // existing Python-keyed path rather than declining a formerly valid
         // caller frame.
@@ -2222,17 +2244,16 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
                 crate::liveness::liveness_for(code_ptr)
                     .depth_at_py_pc()
                     .get(fallthrough_py_pc as usize)
-                    .copied()
-                    .unwrap_or(0) as usize
+                    .map(|&depth| depth as usize)
             };
             if payload.depth_after_residual_populated() {
                 let depth = payload
                     .depth_after_residual_for_jitcode_pc(call_jit_pc)
-                    .unwrap_or(0) as usize;
+                    .map(|depth| depth as usize);
                 if pcmap_afterresidual_audit_enabled() {
                     assert_eq!(
-                        depth,
-                        raw(),
+                        depth.unwrap_or(0),
+                        raw().unwrap_or(0),
                         "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: inline-caller after-residual depth twin diverged at jit_pc {call_jit_pc} (py {fallthrough_py_pc})"
                     );
                 }
@@ -2242,10 +2263,13 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
             }
         }
     };
-    // A depth read that finds no trivia entry falls back to zero, so a zero
-    // depth only reliably means "empty operand stack" for a CALL that produces
-    // no result at all. Keep declining it otherwise.
-    if depth == 0 && !call_is_void {
+    let depth = depth_read.unwrap_or(0);
+    // A source with no entry for this coordinate defaults to zero, and that
+    // default is the only zero this cannot trust. A source that ANSWERS zero
+    // states an empty operand stack, which is what a call leaving no result
+    // behind resumes with — `STORE_ATTR`'s setter body is that shape, popping
+    // both operands and pushing nothing. Keep declining the defaulted zero.
+    if depth == 0 && !call_is_void && depth_read.is_none() {
         return Err(unavail("Unavail::Top/DepthZero"));
     }
     let call_stack_overrides = collect_call_stack_overrides(caller_sym, ctx, call_jit_pc)
@@ -2274,7 +2298,13 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
             })
             .map(|color| color as usize)
     };
-    if !call_is_void && result_color.is_none() {
+    // A call whose resumed operand stack is EMPTY has no result slot to name,
+    // so the missing color states a fact rather than a gap — `STORE_ATTR`'s
+    // setter body reaches here, its result discarded by the store itself.
+    // The `depth == 0` decline above already refused a defaulted zero, so a
+    // zero surviving to here was answered by a source. Only a non-empty stack
+    // can hide a live result the reconstruction failed to locate.
+    if !call_is_void && depth > 0 && result_color.is_none() {
         return Err(unavail("Unavail::Top/NoResultColor"));
     }
     // Null the not-yet-produced result slot when one is live, build the box
