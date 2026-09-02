@@ -1085,6 +1085,67 @@ fn test_int_sub_ovf_guards_overflow() {
 }
 
 #[test]
+fn test_int_mul_ovf_fuses_its_adjacent_overflow_guard() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let guard = Op::new(OpCode::GuardNoOverflow, &[]);
+    guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+    let ops = vec![
+        make_op(
+            OpCode::IntMulOvf,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            OpRef::int_op(2),
+        ),
+        guard,
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    let (mut widened, mut i32_result_blocks) = (0usize, 0usize);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64ExtendI32U => widened += 1,
+        wasmparser::Operator::If {
+            blockty: wasmparser::BlockType::Type(wasmparser::ValType::I32),
+        } => i32_result_blocks += 1,
+        _ => {}
+    });
+    // Both arms of the signed-32 split answer the same one-bit predicate, so
+    // the block yields it and the guard reads it off the stack -- the shape the
+    // add and sub forms already take, and the one every sibling backend takes
+    // by publishing a condition code instead of a stored flag.
+    assert_eq!(i32_result_blocks, 1, "the split yields the guard predicate");
+    assert_eq!(
+        widened, 0,
+        "a fused predicate never widens into a flag local"
+    );
+}
+
+#[test]
+fn test_int_mul_ovf_guard_overflow_inverts_on_both_split_arms() {
+    // `GuardOverflow` fails when the multiply did NOT overflow, so the fused
+    // predicate is the inverse of `GuardNoOverflow`'s on both arms of the
+    // signed-32 split: the constant the fast arm yields flips, and the
+    // full-width arm's sign-word comparison flips with it.
+    for (a, b) in [(6_i64, 7_i64), (i32::MAX as i64 + 1, 2)] {
+        assert_eq!(
+            execute_ovf_trace_with_guard(OpCode::IntMulOvf, OpCode::GuardOverflow, a, b).0,
+            0,
+            "{a} * {b} does not overflow, so GuardOverflow exits"
+        );
+    }
+    for (a, b) in [(i64::MIN, -1_i64), (1_i64 << 62, 3)] {
+        assert_eq!(
+            execute_ovf_trace_with_guard(OpCode::IntMulOvf, OpCode::GuardOverflow, a, b).0,
+            1,
+            "{a} * {b} overflows, so GuardOverflow passes"
+        );
+    }
+}
+
+#[test]
 fn test_int_mul_ovf_guards_overflow() {
     for (a, b, expected) in [
         (6, 7, 42),

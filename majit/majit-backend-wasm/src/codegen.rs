@@ -5222,11 +5222,9 @@ fn build_function(
                     OpCode::IntMulOvf => BinOp::I64Mul,
                     _ => unreachable!(),
                 };
-                let fused_guard = match binop {
-                    BinOp::I64Add | BinOp::I64Sub => next_ovf_guard(ops, op_idx),
-                    BinOp::I64Mul => None,
-                    _ => unreachable!(),
-                };
+                // Every overflow form leaves its predicate on the stack, so
+                // any of them can hand it straight to an adjacent guard.
+                let fused_guard = next_ovf_guard(ops, op_idx);
                 ovf_flag_live = match emit_ovf_binop(
                     &mut sink,
                     constants,
@@ -9249,7 +9247,10 @@ fn overflow_failure_cmp(cmp: CmpOp, fused_guard: OpCode) -> CmpOp {
         OpCode::GuardOverflow => match cmp {
             CmpOp::I64GtS => CmpOp::I64LeS,
             CmpOp::I64LtS => CmpOp::I64GeS,
-            _ => unreachable!("overflow comparison must be signed lt or gt"),
+            CmpOp::I64Ne => CmpOp::I64Eq,
+            _ => unreachable!(
+                "overflow comparison must be a constant bound or a sign-word inequality"
+            ),
         },
         _ => unreachable!("overflow fusion requires an overflow guard"),
     }
@@ -9273,19 +9274,8 @@ fn emit_ovf_binop(
     }
     let result_local = value_types.local(vi);
 
-    if matches!(binop, BinOp::I64Mul) {
-        debug_assert!(fused_guard.is_none());
-        // Keep both factors in the umulhi scratch bank. The hot signed-32
-        // overflow check below reuses them without resolving the SSA operands
-        // again; the slow 64-bit path is free to overwrite the same bank.
-        emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
-        sink.local_tee(value_local_count + 1);
-        emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
-        sink.local_tee(value_local_count + 2);
-    } else {
-        emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
-        emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
-    }
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
     apply_binop(sink, binop);
     sink.local_set(result_local);
 
@@ -9346,18 +9336,27 @@ fn emit_ovf_binop(
             // every multiplication into a software 64x64->128 product. The
             // exact sign-extension checks preserve the full-width slow path
             // for every value outside that proven-safe domain.
-            sink.local_get(value_local_count + 1);
+            // Resolving an operand is the same single `local.get` that reading
+            // a scratch copy of it would be, so the check reads the operands
+            // and the umulhi bank stays the slow arm's alone.
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
             sink.i64_extend32_s();
-            sink.local_get(value_local_count + 1);
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
             sink.i64_eq();
-            sink.local_get(value_local_count + 2);
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
             sink.i64_extend32_s();
-            sink.local_get(value_local_count + 2);
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
             sink.i64_eq();
             sink.i32_and();
-            sink.if_(BlockType::Empty);
-            sink.i64_const(0);
-            sink.local_set(ovf_flag_local);
+            // Both arms answer the same one-bit predicate, so the block
+            // yields it rather than each arm storing it: an adjacent guard
+            // reads it off the stack the way the add and sub forms do, and
+            // only an unpaired op pays for the flag local. With no paired
+            // guard the predicate to yield is `GuardNoOverflow`'s -- "it
+            // overflowed" -- which is what that local is defined to hold.
+            let failure_of = fused_guard.unwrap_or(OpCode::GuardNoOverflow);
+            sink.if_(BlockType::Result(ValType::I32));
+            sink.i32_const(i32::from(matches!(failure_of, OpCode::GuardOverflow)));
             sink.else_();
 
             // Convert the unsigned high word to the signed high word:
@@ -9387,10 +9386,13 @@ fn emit_ovf_binop(
             sink.local_get(result_local);
             sink.i64_const(63);
             sink.i64_shr_s();
-            sink.i64_ne();
+            apply_cmp(sink, overflow_failure_cmp(CmpOp::I64Ne, failure_of));
+            sink.end();
+            if fused_guard.is_some() {
+                return OvfFlag::FusedCond;
+            }
             sink.i64_extend_i32_u();
             sink.local_set(ovf_flag_local);
-            sink.end();
             return OvfFlag::InLocal;
         }
         _ => unreachable!("overflow emitter requires add, sub, or mul"),
