@@ -4058,6 +4058,14 @@ extern "C" fn plain_malloc_zeroed_shim(size: u64) -> u64 {
     unsafe { std::alloc::alloc_zeroed(layout) as u64 }
 }
 
+/// C `fmod` for the `FLOAT_MOD` lowering, which has no native instruction.
+/// The truncated remainder is the whole of this op: the floored `%` a Python
+/// program sees — the sign correction and the signed zero — is applied above
+/// it, so a floored lowering here would apply that correction twice.
+extern "C" fn fmod_shim(a: f64, b: f64) -> f64 {
+    a % b
+}
+
 /// `gc.py:51` malloc-helper OOM signaling — Cranelift counterpart of
 /// `runner::oom_signal_if_zero`.  `do_malloc_fixedsize_clear` raises
 /// `MemoryError` on failure; translation lowers that to "store the
@@ -13737,9 +13745,12 @@ impl CraneliftBackend {
                 }
 
                 // ── Conditional call with value result ──
-                // args[0] = condition, args[1] = func_ptr, args[2..] = call args
-                // If condition != 0: result = call(func_ptr, args...)
-                // Else: result = condition (0)
+                // args[0] = value, args[1] = func_ptr, args[2..] = call args
+                // If value is 0/NULL: result = call(func_ptr, args...)
+                // Else: result = value, and the call is skipped.
+                // The polarity is the opposite of plain COND_CALL above: this
+                // op fills a lazily-computed cache, so a non-zero value is the
+                // already-computed answer and the call is what fills it.
                 OpCode::CondCallValueI | OpCode::CondCallValueR => {
                     let cond = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let call_block = builder.create_block();
@@ -13753,10 +13764,10 @@ impl CraneliftBackend {
                     let is_zero = builder.ins().icmp(IntCC::Equal, cond, zero);
                     builder.ins().brif(
                         is_zero,
-                        cont_block,
-                        &[BlockArg::from(cond)],
                         call_block,
                         &[],
+                        cont_block,
+                        &[BlockArg::from(cond)],
                     );
 
                     builder.switch_to_block(call_block);
@@ -15309,14 +15320,30 @@ impl CraneliftBackend {
                     builder.def_var(var(vi), r);
                 }
                 OpCode::FloatMod => {
-                    // Python's float mod: a - floor(a/b) * b
+                    // There is no native frem, so call C `fmod` — the bare
+                    // `math_fmod` external, not the `ll_math_fmod` wrapper over
+                    // it, which returns x for a finite x over an infinite y and
+                    // raises EDOM on a NaN result from non-NaN operands.  This
+                    // op is the raw remainder; it cannot collect, so it needs
+                    // neither a gcmap nor a frame reload.
                     let (a, b) = resolve_binop(&mut builder, &constants, op);
                     let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let fb = coerce_ty(&mut builder, b, cl_types::F64);
-                    let fdiv = builder.ins().fdiv(fa, fb);
-                    let ffloor = builder.ins().floor(fdiv);
-                    let prod = builder.ins().fmul(ffloor, fb);
-                    let fr = builder.ins().fsub(fa, prod);
+                    let callee = builder
+                        .ins()
+                        .iconst(ptr_type, fmod_shim as *const () as i64);
+                    let sig = {
+                        let mut sig = cranelift_codegen::ir::Signature::new(call_conv);
+                        sig.params
+                            .push(cranelift_codegen::ir::AbiParam::new(cl_types::F64));
+                        sig.params
+                            .push(cranelift_codegen::ir::AbiParam::new(cl_types::F64));
+                        sig.returns
+                            .push(cranelift_codegen::ir::AbiParam::new(cl_types::F64));
+                        builder.import_signature(sig)
+                    };
+                    let call = builder.ins().call_indirect(sig, callee, &[fa, fb]);
+                    let fr = builder.inst_results(call)[0];
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
                     let r = coerce_ty(&mut builder, fr, want);
                     builder.def_var(var(vi), r);
@@ -22566,6 +22593,37 @@ mod tests {
         assert!((result - 3.25).abs() < 1e-10);
     }
 
+    #[test]
+    fn test_float_mod_keeps_the_dividends_sign() {
+        // `eval_binop_f` executes FLOAT_MOD as `a % b` — C `fmod`, whose
+        // remainder carries the sign of the dividend.  A floored lowering
+        // answers 2.0 here, so a compiled loop and the blackhole it deopts
+        // into would disagree on the same operands.
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_float(0), InputArg::new_float(1)];
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(
+                OpCode::FloatMod,
+                &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
+                2,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
+        ];
+
+        let token = JitCellToken::new(70011);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Float(-7.0), Value::Float(3.0)]);
+        let result = backend.get_float_value(&frame, 0);
+        assert!((result - (-1.0)).abs() < 1e-10, "got {result}");
+    }
+
     // ── Compile bridge test ──
 
     // ── Conditional call tests ──
@@ -22678,8 +22736,17 @@ mod tests {
 
     #[test]
     fn test_cond_call_value_i_nonzero() {
+        static mut COND_CALL_VALUE_CALLS: i64 = 0;
+
         extern "C" fn compute(a: i64) -> i64 {
+            unsafe {
+                COND_CALL_VALUE_CALLS += 1;
+            }
             a * 10
+        }
+
+        unsafe {
+            COND_CALL_VALUE_CALLS = 0;
         }
 
         let mut backend = CraneliftBackend::new();
@@ -22712,8 +22779,13 @@ mod tests {
         let token = JitCellToken::new(42);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
+        // A non-zero args[0] is the already-computed value, so `compute` is
+        // not called and the result is args[0] itself, not `5 * 10`. The
+        // counter is what separates "skipped" from "called and discarded";
+        // the returned value alone cannot.
         let frame = backend.execute_token(&token, &[Value::Int(1), Value::Int(5)]);
-        assert_eq!(backend.get_int_value(&frame, 0), 50);
+        assert_eq!(backend.get_int_value(&frame, 0), 1);
+        assert_eq!(unsafe { COND_CALL_VALUE_CALLS }, 0);
     }
 
     #[test]
@@ -22752,8 +22824,67 @@ mod tests {
         let token = JitCellToken::new(43);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
+        // A zero args[0] is the unfilled cache, so `compute2(5)` runs and its
+        // result — not the zero — is what the op produces.
         let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(5)]);
-        assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(backend.get_int_value(&frame, 0), 50);
+    }
+
+    #[test]
+    fn test_cond_call_value_r_takes_both_arms() {
+        // The Ref twin shares the arm but returns a GC ref, so the fast path
+        // hands `cont_block` a live reference rather than a scalar.
+        static mut FILL_CACHE_CALLS: i64 = 0;
+
+        extern "C" fn fill_cache(_a: i64) -> i64 {
+            unsafe {
+                FILL_CACHE_CALLS += 1;
+            }
+            0x5678
+        }
+
+        for (value, expected, expected_calls) in [(0x1234i64, 0x1234i64, 0i64), (0, 0x5678, 1)] {
+            unsafe {
+                FILL_CACHE_CALLS = 0;
+            }
+
+            let mut backend = CraneliftBackend::new();
+            let descr = make_call_descr(vec![Type::Ref], Type::Ref);
+
+            let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+            let ops = vec![
+                mk_op(
+                    OpCode::Label,
+                    &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+                    OpRef::NONE.raw(),
+                ),
+                mk_op_with_descr(
+                    OpCode::CondCallValueR,
+                    &[
+                        OpRef::input_arg_ref(0),
+                        OpRef::int_op(100),
+                        OpRef::input_arg_ref(1),
+                    ],
+                    2,
+                    descr,
+                ),
+                mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
+            ];
+
+            let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+            constants.insert(100, fill_cache as *const () as i64);
+            backend.set_constants(constants);
+
+            let token = JitCellToken::new(70012);
+            backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+            let frame = backend.execute_token(
+                &token,
+                &[Value::Ref(GcRef(value as usize)), Value::Ref(GcRef(9))],
+            );
+            assert_eq!(backend.get_ref_value(&frame, 0), GcRef(expected as usize));
+            assert_eq!(unsafe { FILL_CACHE_CALLS }, expected_calls);
+        }
     }
 
     // ── Guard variant tests ──
