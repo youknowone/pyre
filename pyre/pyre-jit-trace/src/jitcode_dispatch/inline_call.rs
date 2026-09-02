@@ -1277,14 +1277,15 @@ fn switch_descr_targets(descr_index: usize) -> Option<Vec<usize>> {
 ///
 /// This is the static counterpart of the corresponding `opimpl_*` methods in
 /// `pyjitpl.py`: it does not invent a value for a red operand.  It only folds
-/// when every input is already known, either from `constants_i` (`c`) or from
-/// a previously folded Int register (`i`).  Unknown and overflow-sensitive
-/// operations stay unknown, so the caller keeps both successors.
+/// when every input is already known: an `i` operand names a slot whose value
+/// the scan carries (a register it folded, or a constant one of the pool slots
+/// above `num_regs_i` was seeded with), and a `c` operand is the value itself.
+/// Unknown and overflow-sensitive operations stay unknown, so the caller keeps
+/// both successors.
 fn known_int_result(
     code: &[u8],
     op: &crate::jitcode_runtime::DecodedOp,
     known_i: &[Option<i64>],
-    constants_i: &[i64],
     known_array_len_r: &[Option<usize>],
 ) -> Option<i64> {
     let int = |offset: usize| {
@@ -1293,11 +1294,10 @@ fn known_int_result(
             .copied()
             .flatten()
     };
-    let constant = |offset: usize| {
-        code.get(op.pc + 1 + offset)
-            .and_then(|&slot| constants_i.get(slot as usize))
-            .copied()
-    };
+    // A `c` argcode is `assembler.py emit_const(allow_short=True)`: the small
+    // ConstInt is written inline as one signed byte, so the byte is the source
+    // value and there is no pool slot to index.
+    let immediate = |offset: usize| code.get(op.pc + 1 + offset).map(|&byte| byte as i8 as i64);
     let bool_word = |value: bool| i64::from(value);
 
     match op.key {
@@ -1308,7 +1308,7 @@ fn known_int_result(
             .flatten()
             .and_then(|value| i64::try_from(value).ok()),
         "int_copy/i>i" => int(0),
-        "int_copy/c>i" => constant(0),
+        "int_copy/c>i" => immediate(0),
         "int_add/ii>i" => Some(int(0)?.wrapping_add(int(1)?)),
         "int_sub/ii>i" => Some(int(0)?.wrapping_sub(int(1)?)),
         "int_mul/ii>i" => Some(int(0)?.wrapping_mul(int(1)?)),
@@ -1719,7 +1719,7 @@ pub(crate) fn summarize_body_blockers_with(
             .is_some_and(|(_, dst)| dst == "i")
             && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
         {
-            let carried = known_int_result(code, &d, &known_i, constants_i, &known_array_len_r);
+            let carried = known_int_result(code, &d, &known_i, &known_array_len_r);
             if let Some(slot) = known_i.get_mut(dst as usize) {
                 *slot = carried;
             }
