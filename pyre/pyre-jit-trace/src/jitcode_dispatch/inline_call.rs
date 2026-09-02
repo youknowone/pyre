@@ -2967,9 +2967,21 @@ fn binop_nested_filter_enabled() -> bool {
 /// alone: a guard the speculative walk attached before it declined keeps
 /// naming positions the cut has since handed to other operations, and the
 /// unroll's Phase 2 remap reports such a position as a `phase2 snapshot remap
-/// cache miss`.  The `BINARY_OP` entry cuts that way at its own rewind.  Off
-/// by default here because no trace has been found that needs it, while
-/// `cut_trace`'s own note records that truncating regressed a bench.
+/// cache miss`.  The `BINARY_OP` entry cuts that way at its own rewind.
+///
+/// Not truncating is the ported behaviour, not a shortcut: `Trace.cut_point`
+/// returns the two snapshot lengths as the last elements of its five-tuple and
+/// `Trace.cut_at` restores only `_pos`, `_count` and `_index` from it, leaving
+/// `_snapshot_data` and `_snapshot_array_data` as they stand -- the same two
+/// elements `cut_trace_from` destructures and never reads.  Upstream is not
+/// exposed by that because its snapshots live inline in the trace byte stream,
+/// where anything past the restored `_pos` is unreachable and the next append
+/// overwrites it; pyre owns them in a `Vec<Snapshot>` beside the stream, where
+/// a stale entry keeps its index.  The exposure is that representation, whose
+/// migration to the byte-stream form `TraceRecordBuffer` already carries is
+/// recorded on `TraceCtx::snapshots` -- so this stays off, and truncating is
+/// the deviation held for the trace that needs it.  `cut_trace`'s own note
+/// records that truncating regressed a bench.
 fn cut_declined_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
@@ -7815,29 +7827,10 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     // The walker is the executor here, so the instance the rest of this walk
     // reads has to be a real one — the same split `trace_box_int` makes between
     // the recorded allocation and the concrete object it hands back.
-    let concrete_instance = pyre_object::w_instance_new(w_type);
-    let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
-    let instance =
-        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const);
-    // Bind the emitted allocation to the object the walker actually made, and
-    // record the layout its `NewWithVtable` stamps.  Without the concrete
-    // binding the instance reaches a residual as a box with no value and the
-    // residual declines (`[fbw-resid-decline] box_value=None`), which costs the
-    // recording iteration; without the class the receiver re-guards its own
-    // freshly emitted layout.
-    ctx.trace_ctx.set_opref_concrete(
-        instance,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),
-    );
-    ctx.trace_ctx.heap_cache_mut().class_now_known(
-        instance,
-        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
-    );
-    // Inside a `BINARY_OP` / `COMPARE_OP` rewind region, the `__init__` below
-    // writes this instance's slots through the store-attr resolver, which
-    // refuses an unjournaled commit unless the receiver is one of the region's
-    // own allocations.
-    fbw_binop_rewind_note_fresh(ctx, instance);
+    // The `__init__` below writes this instance's slots through the store-attr
+    // resolver, which inside a rewind region refuses an unjournaled commit
+    // unless the receiver is one of the region's own allocations.
+    let (instance, concrete_instance) = emit_walker_instance(ctx, w_type, type_const, terminator);
     if fbw_inline_diag_enabled() {
         eprintln!(
             "[type-call-inline] pc={} class={} init={}",
@@ -7907,6 +7900,41 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
+}
+
+/// Emit the instance allocation both instantiation folds perform, and bind the
+/// emitted box to the object the walker actually made.
+///
+/// The walker is the executor here, so the instance the rest of the walk reads
+/// has to be a real one -- the same split `trace_box_int` makes between the
+/// recorded allocation and the concrete object it hands back.  Without the
+/// concrete binding the instance reaches a residual as a box with no value and
+/// the residual declines (`[fbw-resid-decline] box_value=None`), which costs
+/// the recording iteration; without the class the receiver re-guards its own
+/// freshly emitted layout.
+///
+/// The caller pins the class version tag first -- [`try_walker_inline_type_call`]
+/// pins a metaclass beside it, which is why that stays at the call site.
+fn emit_walker_instance<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    w_type: pyre_object::PyObjectRef,
+    type_const: OpRef,
+    terminator: *mut pyre_object::PyObject,
+) -> (OpRef, pyre_object::PyObjectRef) {
+    let concrete_instance = pyre_object::w_instance_new(w_type);
+    let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
+    let instance =
+        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const);
+    ctx.trace_ctx.set_opref_concrete(
+        instance,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),
+    );
+    ctx.trace_ctx.heap_cache_mut().class_now_known(
+        instance,
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
+    );
+    fbw_binop_rewind_note_fresh(ctx, instance);
+    (instance, concrete_instance)
 }
 
 /// Fold `object.__new__(cls)` to the allocation it performs.
@@ -8006,19 +8034,7 @@ pub(crate) fn try_walker_inline_object_new<Sym: WalkSym>(
         .replace_box(r_args[2], type_const);
     walker_pin_type_version_tag(ctx, op.pc, type_const)?;
 
-    let concrete_instance = pyre_object::w_instance_new(w_type);
-    let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
-    let instance =
-        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const);
-    ctx.trace_ctx.set_opref_concrete(
-        instance,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),
-    );
-    ctx.trace_ctx.heap_cache_mut().class_now_known(
-        instance,
-        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
-    );
-    fbw_binop_rewind_note_fresh(ctx, instance);
+    let (instance, concrete_instance) = emit_walker_instance(ctx, w_type, type_const, terminator);
     if fbw_inline_diag_enabled() {
         eprintln!("[object-new-inline] pc={} class={}", op.pc, unsafe {
             pyre_object::w_type_get_name(w_type)
@@ -10397,8 +10413,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         ));
     };
     // The two operands bind the first two parameters.  A longer signature is
-    // not itself unbindable: `funccall_valuestack` fills every parameter the
-    // call leaves unbound from `defs_w` (`function.py:188-193`), and the
+    // not itself unbindable: `Function.funccall_valuestack` fills every
+    // parameter the call leaves unbound from `defs_w`, and the
     // resolved descent below already seeds that tail from `__defaults__` --
     // it declines on its own when the defaults do not cover the whole tail.
     // `_pydecimal`'s dunders are all `(self, other, context=None)`, so a hard

@@ -652,6 +652,17 @@ pub struct WalkSession {
     ///
     /// Emptied by the outermost [`fbw_state::BinopRewindInlineGuard`], so it
     /// never carries an entry from a region that has already unwound.
+    ///
+    /// Beside the box rather than on it, which the porting rules otherwise ask
+    /// for, because there is no slot to reach: the record-time store for a
+    /// per-box fact is the heap cache, whose flag word is heapcache.py's own
+    /// six `HF_*` bits with the version counter occupying everything above
+    /// them, and the fact itself is pyre-only -- upstream has no rewind region
+    /// at a dunder entry, so it has nothing that means "allocated inside one".
+    /// What the box does own is consulted: the exemption also requires
+    /// `is_unescaped`, so escaping the object, or any reset of the cache,
+    /// withdraws it. Membership is only ever the instantiations one dunder body
+    /// performs, and both ends of the region clear it.
     pub binop_rewind_fresh: Vec<OpRef>,
 }
 
