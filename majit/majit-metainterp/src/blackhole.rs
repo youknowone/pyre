@@ -13136,7 +13136,26 @@ fn handler_inline_call_nested_ext(
             break 'callee Err(DispatchError::LeaveFrame);
         }
 
-        if let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() {
+        let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() else {
+            // No trailing return opcode means the callee produced no value.
+            // The caller's three slots are all `NO_RETURN_REG` in that case —
+            // `inline_call_typed` emits a real register only for the kind the
+            // callee returns — so a slot that IS a register here names a
+            // destination nothing will write, and the caller goes on to read
+            // whatever the previous occupant of that register left.  Upstream
+            // cannot reach the state: `bhimpl_inline_call_*` gets its value
+            // from `cpu.bh_call_*`, whose result kind is the calldescr's.
+            assert!(
+                return_i.is_none() && return_r.is_none() && return_f.is_none(),
+                "inline_call: callee jitcode {:?} index {:?} ends without a \
+                 typed return opcode, but the caller declared result slots \
+                 (i={return_i:?} r={return_r:?} f={return_f:?})",
+                callee.jitcode.name,
+                callee.jitcode.try_index(),
+            );
+            break 'callee Ok(p);
+        };
+        {
             match return_kind {
                 JitArgKind::Int => {
                     let caller_dst =
@@ -13159,6 +13178,18 @@ fn handler_inline_call_nested_ext(
         Ok(p)
     };
 
+    // `called_residual` is "this frame left the interpreter", and
+    // `jitdriver.rs` reads it to decide whether a guard may spawn a bridge —
+    // a residual call is not a value the bridge can recompute.  The native arm
+    // of this opcode sets the CALLER's flag, because `inline_call_native` goes
+    // through `bhimpl_residual_call_*` on `bh` itself.  The interpreted arm
+    // runs the callee's own opcodes on `callee`, so a residual call inside it
+    // set the callee's flag and the caller's stayed clear: the same source
+    // call was judged escaping or not depending on which arm ran it.  Fold the
+    // callee's answer into the caller's before the frame is reset.
+    if callee.called_residual.get() {
+        bh.called_residual.set(true);
+    }
     callee.reset_for_inline_reuse();
     bh.inline_callee_scratch = Some(callee);
     outcome
