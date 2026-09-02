@@ -9887,11 +9887,6 @@ impl<M: Clone> MetaInterp<M> {
         self.clear_retrace_state();
         if let Some(ctx) = self.tracing.take() {
             let green_key = ctx.green_key;
-            // A recorder panic settles the question the `MAX_TRACE_ABORT_COUNT`
-            // ceiling would otherwise take that many attempts to reach: the walk
-            // stopped on something about the jitcode it was reading, so every
-            // later attempt at this key reads it again. Ban the key here.
-            let permanent = permanent || ctx.recorder_panicked;
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] abort trace at key={} (permanent={})",
@@ -11587,6 +11582,7 @@ impl<M: Clone> MetaInterp<M> {
             is_finish,
             is_exit_frame_with_exception,
             exit_layout: exit_layout.map(Box::new),
+            rd_loop_token,
             savedata,
             exception,
             status,
@@ -11819,6 +11815,7 @@ impl<M: Clone> MetaInterp<M> {
                 is_finish,
                 is_exit_frame_with_exception,
                 exit_layout: None,
+                rd_loop_token: None,
                 savedata: None,
                 exception: ExceptionState {
                     exc_class: 0,
@@ -11841,8 +11838,20 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
+        // A plain loop back-edge carries neither a guard nor a resume point.
+        // `warmstate.py execute_assembler` never builds a description for one:
+        // the JUMP has already re-entered the loop's own LABEL, and what comes
+        // back out is the loop-carried state, not a failure to recover from.
+        let is_jump_exit = Self::is_jump_exit(is_finish, fail_index);
         // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
-        let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
+        // Only the layout fallback and the `must_compile` identity read it, and
+        // a JUMP exit reaches neither, so the weakref upgrade the resolution
+        // costs is not paid on the back edge.
+        let rd_loop_token = if is_jump_exit {
+            None
+        } else {
+            majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key())
+        };
         Self::finish_compiled_run_io();
 
         // RPython: guard failure counter tick and bridge compilation happen
@@ -11853,46 +11862,59 @@ impl<M: Clone> MetaInterp<M> {
             self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
-        // Fresh lookup, and fallible: the run can re-enter the driver through
-        // a residual call and drop this green key (`jitdriver.rs`'s
-        // `remove_compiled_loop` on the unrecoverable-resume path), in which
-        // case the exit falls through to the `rd_loop_token` lookup and then
-        // to the synthesized default layout below.
-        let compiled = self.compiled_loops.get(&green_key);
-        // Only a guard exit reaches here — a final descr returned through the
-        // fast path above — so the layout comes from the failing guard's own
-        // trace, and falls back to a synthesized one per `run_compiled_detailed`
-        // when the green key no longer holds it.
-        let mut exit_layout = compiled
-            .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
-            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
-            .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
-            .and_then(|(owning_key, resolved_id, trace)| {
-                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
-            })
-            .unwrap_or_else(|| CompiledExitLayout {
-                rd_loop_token: green_key,
-                trace_id,
-                fail_index,
-                source_op_index: None,
-                exit_types: ExitTypes::from_slice(exit_types),
-                is_finish,
-                is_exception_exit: is_exit_frame_with_exception,
-                recovery_layout: None,
-                resume_layout: None,
-                // The green-key index no longer holds this trace, but the
-                // failing descr still carries the resume payload it was
-                // compiled with (`compile.py get_resumestorage`), so a
-                // blackhole resume off this layout stays possible.
-                storage: crate::resume::ResumeStorage::from_fail_descr(descr)
-                    .map(std::sync::Arc::new),
-            });
-        // RPython: deadframe has ALL jitframe slots accessible.
-        // If the backend's descr covers more slots than the trace layout,
-        // extend exit_layout.exit_types to match (conservative Int for extras).
-        if exit_types.len() > exit_layout.exit_types.len() {
-            exit_layout.exit_types.resize(exit_types.len(), Type::Int);
-        }
+        // Built for a guard exit only. Every reader of this field opens it past
+        // its own back-edge arm, because a JUMP exit is answered by restoring
+        // the loop-carried state and re-entering — so a layout built for one is
+        // a type-vector copy, three refcount pairs and a heap box that nothing
+        // reads.
+        let exit_layout = (!is_jump_exit).then(|| {
+            // Fresh lookup, and fallible: the run can re-enter the driver
+            // through a residual call and drop this green key (`jitdriver.rs`'s
+            // `remove_compiled_loop` on the unrecoverable-resume path), in
+            // which case the exit falls through to the `rd_loop_token` lookup
+            // and then to the synthesized default layout below.
+            let compiled = self.compiled_loops.get(&green_key);
+            // The layout comes from the failing guard's own trace, and falls
+            // back to a synthesized one per `run_compiled_detailed` when the
+            // green key no longer holds it.
+            let mut exit_layout = compiled
+                .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
+                .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+                .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
+                .and_then(|(owning_key, resolved_id, trace)| {
+                    Self::compiled_exit_layout_from_trace(
+                        trace,
+                        owning_key,
+                        resolved_id,
+                        fail_index,
+                    )
+                })
+                .unwrap_or_else(|| CompiledExitLayout {
+                    rd_loop_token: green_key,
+                    trace_id,
+                    fail_index,
+                    source_op_index: None,
+                    exit_types: ExitTypes::from_slice(exit_types),
+                    is_finish,
+                    is_exception_exit: is_exit_frame_with_exception,
+                    recovery_layout: None,
+                    resume_layout: None,
+                    // The green-key index no longer holds this trace, but the
+                    // failing descr still carries the resume payload it was
+                    // compiled with (`compile.py get_resumestorage`), so a
+                    // blackhole resume off this layout stays possible.
+                    storage: crate::resume::ResumeStorage::from_fail_descr(descr)
+                        .map(std::sync::Arc::new),
+                });
+            // RPython: deadframe has ALL jitframe slots accessible.
+            // If the backend's descr covers more slots than the trace layout,
+            // extend exit_layout.exit_types to match (conservative Int for
+            // extras).
+            if exit_types.len() > exit_layout.exit_types.len() {
+                exit_layout.exit_types.resize(exit_types.len(), Type::Int);
+            }
+            Box::new(exit_layout)
+        });
         let savedata = self.backend.get_savedata_ref(&frame);
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
         let exc_value_ref = self.backend.grab_exc_value(&frame);
@@ -11916,7 +11938,8 @@ impl<M: Clone> MetaInterp<M> {
             descr_arc: Some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
-            exit_layout: Some(Box::new(exit_layout)),
+            exit_layout,
+            rd_loop_token,
             savedata,
             exception,
             status,
@@ -12712,21 +12735,24 @@ impl<M: Clone> MetaInterp<M> {
     /// hands on enters that same cell's code. Asking for them separately walks
     /// the chain twice; see [`WarmState::resolved_cell_procedure_token`].
     ///
-    /// The key comes back because the second conjunct of the runnable predicate
-    /// reads `compiled_loops`, which is indexed by that key and is not a cell
-    /// walk, so the caller still needs it.
-    /// `gate` runs on the resolved key before the token is read — see
-    /// [`WarmState::resolved_cell_procedure_token`] for why a caller would
-    /// want that.
+    /// The key comes back because the remaining conjunct of the runnable
+    /// predicate reads `compiled_loops`, which is indexed by that key and is
+    /// not a cell walk, so the caller still needs it. That conjunct stays with
+    /// the caller rather than being taken here as a gate: a door that enters
+    /// wants the metadata's VALUE, so testing its presence separately would
+    /// probe the same map twice for one entry.
+    ///
+    /// `make_green_key` is consulted only on an ambiguous bucket, and a caller
+    /// that holds no structured key passes `None` — see
+    /// [`Self::resolve_cell_key`], whose key this reports.
     pub fn resolved_entry_procedure_token(
         &self,
         green_key_hash: u64,
-        make_green_key: impl FnOnce() -> majit_ir::GreenKey,
-        gate: impl FnOnce(u64) -> bool,
+        make_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
     ) -> (u64, Option<std::sync::Arc<JitCellToken>>) {
-        let (cell_key, token) =
-            self.warm_state
-                .resolved_cell_procedure_token(green_key_hash, make_green_key, gate);
+        let (cell_key, token) = self
+            .warm_state
+            .resolved_cell_procedure_token(green_key_hash, make_green_key);
         (cell_key, token.filter(|token| token.has_compiled_code()))
     }
 
@@ -12893,6 +12919,34 @@ impl<M: Clone> MetaInterp<M> {
     const TY_REF: u64 = 0x04;
     const TY_FLOAT: u64 = 0x06;
 
+    /// Green key of the loop a failing guard belongs to.
+    ///
+    /// `compile.py _trace_and_compile_from_bridge` walks
+    /// `resumedescr.rd_loop_token.loop_token_wref()` for the owning JCT.  When
+    /// the weakref is dead (memmgr eviction — `compile.py compile.giveup()`
+    /// parity), no other identity is recoverable, so the caller's own outer
+    /// entry key stands in.  RPython has no such fallback because its identity
+    /// is descr-pointer-based, never indirected through a numeric `green_key`.
+    ///
+    /// A JitCellToken invalidated by `QuasiImmut.invalidate()` (quasiimmut.py)
+    /// still resolves here, and the `must_compile` tick that follows still
+    /// fires: warmstate.py:191-196 stops returning the dead token as a
+    /// procedure token, so once the counter fires, the walk reaches
+    /// `reached_loop_header` (pyjitpl.py) with no compiled target, falls
+    /// through to `compile_loop` and installs a live replacement for the key.
+    /// Suppressing that tick strands every later activation of the dead trace
+    /// in blackhole resume forever.
+    pub fn owning_key_for_descr(
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+        fallback_green_key: u64,
+    ) -> u64 {
+        descr_arc
+            .as_fail_descr()
+            .and_then(majit_backend::descr_owning_jct)
+            .map(|jct| jct.green_key())
+            .unwrap_or(fallback_green_key)
+    }
+
     /// compile.py: must_compile — read self.status directly from
     /// the failed descriptor (by descr_addr), compute hash, tick jitcounter.
     ///
@@ -12907,10 +12961,8 @@ impl<M: Clone> MetaInterp<M> {
     /// loop_token_wref()`, `trace_id` mirrors `assembler.py:227
     /// self.faildescr.trace_id`, and `fail_index_per_trace` mirrors
     /// `self.faildescr.index = i`.  The `fallback_green_key` only fires
-    /// when `descr_owning_jct` returns `None` (the JCT was evicted by
-    /// memmgr, equivalent to RPython's `compile.py:725-729 compile.
-    /// giveup()` path), so callers pass their own outer entry key as
-    /// the safe default.
+    /// when the owning-JCT walk returns `None`; see
+    /// [`Self::owning_key_for_descr`].
     ///
     /// Returns (should_compile, owning_green_key).
     pub fn must_compile_with_values(
@@ -12920,6 +12972,25 @@ impl<M: Clone> MetaInterp<M> {
         guard_value_operand: Option<i64>,
         fallback_green_key: u64,
     ) -> (bool, u64) {
+        let owning_key = Self::owning_key_for_descr(descr_arc, fallback_green_key);
+        self.must_compile_with_owning_key(descr_arc, fail_values, guard_value_operand, owning_key)
+    }
+
+    /// [`Self::must_compile_with_values`] for a caller that has already
+    /// resolved the owning loop.
+    ///
+    /// `compile.py handle_fail` reads `resumedescr.rd_loop_token` once per
+    /// failure and `must_compile` never re-derives the loop it belongs to; a
+    /// caller that walked the owning JCT to look the guard's layout up holds
+    /// the same answer and hands it in rather than paying the weakref upgrade
+    /// a second time inside one event.
+    pub fn must_compile_with_owning_key(
+        &mut self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+        fail_values: &[i64],
+        guard_value_operand: Option<i64>,
+        owning_key: u64,
+    ) -> (bool, u64) {
         crate::mc_diag_bump(0); // must_compile_with_values entered
         let descr_addr = std::sync::Arc::as_ptr(descr_arc) as *const () as usize;
         let descr_fd = descr_arc
@@ -12927,18 +12998,6 @@ impl<M: Clone> MetaInterp<M> {
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
-        // `must_compile` ticks the counter for every reported guard failure,
-        // including one whose owning JitCellToken has since been invalidated by
-        // `QuasiImmut.invalidate()` (quasiimmut.py).  That tick is the
-        // recovery path, not a leak: warmstate.py:191-196 stops returning the
-        // dead token as a procedure token, so once the counter fires, the walk
-        // reaches `reached_loop_header` (pyjitpl.py) with no compiled
-        // target, falls through to `compile_loop` and installs a live
-        // replacement for the key.  Suppressing the tick strands every later
-        // activation of the dead trace in blackhole resume forever.
-        let owning_key = majit_backend::descr_owning_jct(descr_fd)
-            .map(|jct| jct.green_key())
-            .unwrap_or(fallback_green_key);
         // A guard whose bridge was refused by a terminal-declining backend
         // (`bridge_decline_is_terminal()`, currently wasm) or by a structural
         // full-body-walk decline must not re-fire: re-tracing rebuilds the same
@@ -12949,14 +13008,6 @@ impl<M: Clone> MetaInterp<M> {
             crate::mc_diag_bump(1); // guard-descr terminal-decline short-circuit
             return (false, owning_key);
         }
-        // compile.py `_trace_and_compile_from_bridge` walks
-        // `resumedescr.rd_loop_token.loop_token_wref()` for the owning
-        // JCT.  When the weakref is dead (memmgr eviction —
-        // `compile.py compile.giveup()` parity), no other
-        // identity is recoverable, so we fall back to the caller's
-        // outer entry key.  RPython doesn't have this fallback because
-        // its identity is descr-pointer-based, never indirected through
-        // a numeric `green_key`.
         if descr_addr == 0 {
             crate::mc_diag_bump(2); // descr_addr==0 skip
             crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");

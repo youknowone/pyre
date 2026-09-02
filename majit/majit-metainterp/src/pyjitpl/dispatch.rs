@@ -3163,7 +3163,6 @@ where
                     // The unwind left `code_cursor` inside the panicking
                     // instruction, so the frames name no resumable position.
                     ctx.abort_after_panic = true;
-                    ctx.recorder_panicked = true;
                     sym.abort_portal_op();
                     return TraceAction::Abort;
                 }
@@ -6532,6 +6531,51 @@ where
                     // box handling in between, neither of which reads the
                     // heapcache, so reset-then-guard is the faithful order.
                     ctx.heap_cache_mut().reset();
+                    // pyjitpl.py reached_loop_header, its second statement:
+                    //
+                    //     self.remove_consts_and_duplicates(
+                    //         self.virtualizable_boxes,
+                    //         len(self.virtualizable_boxes) - 1, duplicates)
+                    //     live_arg_boxes += self.virtualizable_boxes
+                    //
+                    // The normalization is IN PLACE on `virtualizable_boxes`
+                    // and runs on EVERY visit, before the list is spliced into
+                    // the loop-carried args — so the args a merge point carries
+                    // never hold a constant and never repeat a box.  The two
+                    // merge-point registration sites below normalize their own
+                    // COPY, which leaves the closing JUMP — built by
+                    // `collect_jump_args_with_boxes` out of `sym` plus a fresh
+                    // splice of `virtualizable_boxes` — splicing the raw list.
+                    // A guard-origin bridge reaches here with that list still
+                    // holding whatever `seed_bridge_virtualizable_boxes`
+                    // decoded, and a `TAGCONST` element decodes to a constant
+                    // `OpRef`, so the JUMP into the parent loop carried a bare
+                    // literal in an element position: a value read off ONE
+                    // guard failure, frozen into an edge every later entry
+                    // takes.  Normalizing here, and handing the result back so
+                    // the splice sees it, is what upstream's in-place rewrite
+                    // does.
+                    //
+                    // The identity sits outside the `endindex = len - 1`
+                    // window and is never rewritten: it is a live red input box
+                    // that `standard_virtualizable_jitcode_argbox` and the
+                    // resume reader both index by position.
+                    //
+                    // Upstream shares one `duplicates` set with the reds it
+                    // normalized first; the reds here live in `sym`'s scalar
+                    // fields, which this expansion cannot rewrite, so the
+                    // element block gets its own set.  The registration sites
+                    // below still run the combined pass over their copy, and
+                    // `remove_consts_and_duplicates` is idempotent on an
+                    // already-normalized list.
+                    if let Some(mut typed) = ctx.collect_virtualizable_typed_boxes() {
+                        if let Some(end) = typed.len().checked_sub(1) {
+                            ctx.remove_consts_and_duplicates(&mut typed[..end]);
+                            let elements: Vec<OpRef> =
+                                typed[..end].iter().map(|(opref, _)| *opref).collect();
+                            ctx.adopt_normalized_virtualizable_elements(&elements);
+                        }
+                    }
                     // pyjitpl.py reached_loop_header: generate a dummy
                     // GUARD_FUTURE_CONDITION just before the implicit JUMP so
                     // unroll's `jump_to_existing_trace` has a `patchguardop`

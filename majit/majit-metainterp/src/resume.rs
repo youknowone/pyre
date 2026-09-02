@@ -660,6 +660,9 @@ pub struct ResumeStorage {
     /// resume.py:468 `storage.rd_pendingfields` — pending field writes
     /// replayed during blackhole resume.
     pub rd_pendingfields: SharedResumeSlice<majit_ir::GuardPendingFieldEntry>,
+    /// `rd_virtuals` in the shape `ResumeDataDirectReader` consumes, built
+    /// once — see [`ResumeStorage::virtual_infos`].
+    virtual_infos: std::sync::OnceLock<Vec<VirtualInfo>>,
 }
 
 impl ResumeStorage {
@@ -683,6 +686,7 @@ impl ResumeStorage {
             rd_consts: descr.rd_consts_arc()?,
             rd_virtuals: descr.rd_virtuals_arc().into(),
             rd_pendingfields: descr.rd_pendingfields_arc().into(),
+            virtual_infos: std::sync::OnceLock::new(),
         })
     }
 }
@@ -717,6 +721,7 @@ impl ResumeStorage {
             rd_consts: majit_ir::SharedConstPool::new(rd_consts),
             rd_virtuals: rd_virtuals.into(),
             rd_pendingfields: rd_pendingfields.into(),
+            virtual_infos: std::sync::OnceLock::new(),
         })
     }
 
@@ -751,6 +756,32 @@ impl ResumeStorage {
         self.rd_pendingfields.as_slice()
     }
 
+    /// `resume.py ResumeDataReader._prepare_virtuals`: `self.virtuals =
+    /// storage.rd_virtuals` — a bare assignment, because upstream builds the
+    /// `AbstractVirtualInfo` objects once, at compile time, in
+    /// `ResumeDataVirtualAdder.finish`.
+    ///
+    /// Pyre records `RdVirtualInfo` on the guard and reshapes it for the
+    /// reader, so the reshape lands here instead. It is a pure function of
+    /// `rd_virtuals` — the tagged `fieldnums` stay tagged and every descriptor
+    /// is cloned as-is — and `rd_virtuals` is immutable once the guard owns it,
+    /// so the result is built on the first resume off this guard and shared by
+    /// every later one rather than rebuilt per failure.
+    ///
+    /// Nothing in the result is a GC reference: the field sources are
+    /// numbering tags, and the descriptors, type ids, known-class vtable words
+    /// and raw-buffer function pointers are all immortal. The minor-collection
+    /// root walker therefore has nothing to rewrite here, and visits
+    /// `rd_consts` alone as before.
+    pub fn virtual_infos(&self) -> &[VirtualInfo] {
+        self.virtual_infos.get_or_init(|| {
+            self.rd_virtuals()
+                .iter()
+                .map(|rd| virtual_info_from_rd(rd))
+                .collect()
+        })
+    }
+
     pub fn with_shared_consts(
         rd_numb: Arc<[u8]>,
         rd_consts: Arc<majit_ir::SharedConstPool>,
@@ -762,6 +793,7 @@ impl ResumeStorage {
             rd_consts,
             rd_virtuals: rd_virtuals.into(),
             rd_pendingfields: rd_pendingfields.into(),
+            virtual_infos: std::sync::OnceLock::new(),
         })
     }
 }
@@ -1556,6 +1588,19 @@ pub fn rd_virtual_to_virtual_info(
     _count: i32,
     _num_virtuals: usize,
 ) -> VirtualInfo {
+    virtual_info_from_rd(rd)
+}
+
+/// The conversion itself.
+///
+/// It reads nothing but `rd`: the tagged `fieldnums` stay tagged for
+/// `ResumeDataDirectReader` to resolve against the live pool, so the constant
+/// pool, the deadframe width and the virtual count that a reader would need to
+/// resolve them play no part here. Callers holding those may go through
+/// `rd_virtual_to_virtual_info`, which names them for the reader-shaped call
+/// sites; the purity is what lets `ResumeStorage::virtual_infos` build the
+/// result once.
+pub fn virtual_info_from_rd(rd: &majit_ir::RdVirtualInfo) -> VirtualInfo {
     match rd {
         majit_ir::RdVirtualInfo::VirtualInfo {
             descr,
@@ -5820,7 +5865,7 @@ mod tests {
             offset: 0,
             fieldnums: vec![],
         };
-        let virtuals = [rd_virtual_to_virtual_info(&rd, &[], 0, 1)];
+        let virtuals = [virtual_info_from_rd(&rd)];
         let mut reader = ResumeDataDirectReader::new(
             &[0, 0],
             &[],
@@ -5859,7 +5904,7 @@ mod tests {
             fieldnums: vec![tagged],
         };
         let mut consts = vec![majit_ir::Const::Ref(majit_ir::GcRef(0x1000))];
-        let virtual_info = rd_virtual_to_virtual_info(&rd, &consts, 0, 1);
+        let virtual_info = virtual_info_from_rd(&rd);
         let VirtualInfo::VRawSlice { parent, .. } = virtual_info else {
             panic!("expected VRawSlice");
         };

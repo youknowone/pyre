@@ -448,8 +448,8 @@ pub struct Optimizer {
     /// makes. That one runs `Optimizer.optimize_loop`, whose result is a
     /// `BasicLoopInfo` and the operations; the short-preamble export and the
     /// `ExportedState` it produces belong to `UnrollOptimizer.optimize_preamble`
-    /// alone, and `unroll.py:454-457`'s force-then-flush-then-virtual-state runs
-    /// only there. pyre folds that preview into the shared
+    /// alone, and the force-then-flush-then-virtual-state that opens
+    /// `UnrollOptimizer.export_state` runs only there. pyre folds that preview into the shared
     /// `optimize_with_constants_and_inputs_at`, so a simple compile needs this
     /// flag to reach the same shape: no forcing of the closing JUMP's arguments
     /// for a preamble that is not being built, and no exported state, which no

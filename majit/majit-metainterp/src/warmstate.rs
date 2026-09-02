@@ -3278,7 +3278,7 @@ impl WarmEnterState {
         }
     }
 
-    /// [`Self::resolve_cell_key`] and [`Self::get_procedure_token`] answered
+    /// [`Self::resolve_cell_key`] and the resolved cell's ENTRY TOKEN answered
     /// from ONE walk of the bucket.
     ///
     /// A door that resolves a hash and then reads the resolved key's token
@@ -3288,61 +3288,96 @@ impl WarmEnterState {
     /// holds exactly this key's cell — has the cell in hand at the moment the
     /// count reaches one, so the token is read there.
     ///
+    /// `JC_TEMPORARY` is read off that same borrow, and a cell carrying it
+    /// reports no token: `warmstate.py maybe_compile_and_run` tests the flag
+    /// before it considers a token executable, and a `compile_tmp_callback`
+    /// token has a body like any other, so nothing about the token itself
+    /// answers that question. Folding it in here is what lets the whole
+    /// cell-owned half of an entry decision cost one walk — asked separately it
+    /// was a third walk of the same chain for the same cell.
+    ///
     /// The other two cases are the second walk, unchanged. On a miss the key a
     /// later install would take is `hash`, but `hash` may itself be a minted
-    /// key filed under a different bucket, so the token read has to go through
-    /// [`Self::get_procedure_token`], which maps it. On an ambiguous bucket the
-    /// greens are what settle it, exactly as [`Self::resolve_cell_key`] says.
-    /// `gate` runs on the resolved key, BEFORE the token is read.
+    /// key filed under a different bucket, so the cell has to be looked up
+    /// through [`Self::cell_by_key`], which maps it. On an ambiguous bucket the
+    /// greens are what settle it, exactly as [`Self::resolve_cell_key`] says —
+    /// and a caller that cannot build them (`make_key` is `None`) gets the raw
+    /// hash back, naming that bucket's original occupant or nothing, which is
+    /// the same answer [`Self::sole_cell_key`] gives such a caller.
     ///
-    /// Reading a token is a `Weak::upgrade` and the `Arc` drop that answers it
-    /// — one atomic each. A caller whose real question is a conjunction of that
-    /// read and something cheaper about the same key wants the cheap half
-    /// first, and cannot have it while the resolve and the read are one step:
-    /// the cheap half needs the resolved key, which only the walk produces.
-    ///
-    /// The resolve is unaffected — the key comes back whatever `gate` answers,
-    /// and a refused gate reports no token, which is what the conjunction was
-    /// going to conclude anyway. A caller with no second conjunct passes a gate
-    /// that always accepts.
+    /// The resolve is unaffected by the token: the key comes back whether or
+    /// not one is found, because every consumer downstream is keyed by it.
     pub fn resolved_cell_procedure_token(
         &self,
         hash: u64,
-        make_key: impl FnOnce() -> GreenKey,
-        gate: impl FnOnce(u64) -> bool,
+        make_key: Option<&dyn Fn() -> GreenKey>,
     ) -> (u64, Option<Arc<JitCellToken>>) {
+        let (cell_key, cell) = self.resolved_cell(hash, make_key);
+        let token = cell.and_then(|cell| {
+            if cell.flags.contains(JcFlags::JC_TEMPORARY) {
+                return None;
+            }
+            cell.get_procedure_token()
+        });
+        (cell_key, token)
+    }
+
+    /// [`Self::resolve_cell_key`]'s answer together with the cell it names,
+    /// from the one walk that produces both.
+    ///
+    /// The key alone is what `resolve_cell_key` reports, and every arm here
+    /// hands back exactly the key that function would; a caller that needs
+    /// anything OFF the cell would otherwise walk back to it.
+    fn resolved_cell(
+        &self,
+        hash: u64,
+        make_key: Option<&dyn Fn() -> GreenKey>,
+    ) -> (u64, Option<&BaseJitCell>) {
         let mut count = 0usize;
         let mut found: Option<(&BaseJitCell, u64)> = None;
+        // The cell this slot holds under `hash` ITSELF, whatever bucket filed
+        // it. A key naming no cell of this bucket still names one when `hash`
+        // was minted for a cell of another bucket, and the miss arm below
+        // would otherwise walk back for it; noting it here costs one compare
+        // per chain node instead of a second traversal.
+        let mut by_key: Option<&BaseJitCell> = None;
         let mut cell = self.lookup_chain(hash);
         while let Some(c) = cell {
-            if let Some(cell_key) = c.cell_key
-                && c.cell_bucket == hash
-            {
-                count += 1;
-                if found.is_none() {
-                    found = Some((c, cell_key));
+            if let Some(cell_key) = c.cell_key {
+                if c.cell_bucket == hash {
+                    count += 1;
+                    if found.is_none() {
+                        found = Some((c, cell_key));
+                    }
+                }
+                if cell_key == hash {
+                    by_key = Some(c);
                 }
             }
             cell = c.next.as_deref();
         }
-        match (count, found) {
-            (1, Some((cell, cell_key))) => (
-                cell_key,
-                gate(cell_key).then(|| cell.get_procedure_token()).flatten(),
-            ),
-            (0, _) => (
-                hash,
-                gate(hash).then(|| self.get_procedure_token(hash)).flatten(),
-            ),
-            _ => {
-                let cell_key = self.cell_key_for(&make_key()).unwrap_or(hash);
-                (
-                    cell_key,
-                    gate(cell_key)
-                        .then(|| self.get_procedure_token(cell_key))
-                        .flatten(),
-                )
+        // `bucket_of(hash) == hash` says [`Self::cell_by_key`] would search
+        // THIS slot for `hash`, so the walk above has already decided it: a key
+        // is routed to another slot only when [`Self::mint_cell_key`] recorded
+        // it for another bucket, and a cell key names at most one live cell
+        // wherever that cell sits.
+        let cell_named_by_hash = || {
+            if self.bucket_of(hash) == hash {
+                by_key
+            } else {
+                self.cell_by_key(hash)
             }
+        };
+        match (count, found) {
+            (1, Some((cell, cell_key))) => (cell_key, Some(cell)),
+            (0, _) => (hash, cell_named_by_hash()),
+            _ => match make_key {
+                Some(make_key) => {
+                    let cell_key = self.cell_key_for(&make_key()).unwrap_or(hash);
+                    (cell_key, self.cell_by_key(cell_key))
+                }
+                None => (hash, cell_named_by_hash()),
+            },
         }
     }
 
@@ -7086,6 +7121,65 @@ mod tests {
             ws.cell_by_key(bucket).and_then(|cell| cell.cell_key),
             Some(first_key),
         );
+    }
+
+    /// The one-walk resolve answers an ambiguous bucket with no greens exactly
+    /// as the two readers it replaced did.
+    ///
+    /// [`WarmEnterState::resolved_cell`] folds
+    /// [`WarmEnterState::cell_keys_at`] and [`WarmEnterState::cell_by_key`]
+    /// into a single traversal, and its `(count > 1, make_key: None)` arm is
+    /// the one that cannot be checked against a caller's greens: it reports the
+    /// raw hash and whatever cell that hash names. That arm reaches the cell
+    /// through `by_key`, a candidate noted DURING the walk, where the readers
+    /// it replaced reached it by walking back from the key — so the two can
+    /// only be shown to agree on a bucket that actually holds more than one
+    /// candidate, which is the fixture below.
+    #[test]
+    fn an_ambiguous_bucket_resolved_without_greens_names_the_cell_its_key_names() {
+        let mut ws = WarmEnterState::new(100);
+        let first = GreenKey::new(vec![4100, 4200]);
+        let second = GreenKey::new(vec![4300, colliding_last_green(&first, 4300)]);
+        let bucket = first.get_uhash();
+
+        // A procedure token keeps the first cell non-removable so the second
+        // install chains it rather than pruning it — the same shape
+        // `a_chained_bucket_reached_without_greens_answers_the_first_occupant`
+        // builds, because a single-candidate bucket takes the `(1, _)` arm and
+        // never reaches the branch under test.
+        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        attach_alive_for_key(&mut ws, &first, token);
+        let first_key = ws
+            .cell_key_for(&first)
+            .expect("the first key owns the cell it just installed");
+        let _second_key = ws.ensure_cell_key(&second);
+
+        let (count, first_found) = ws.cell_keys_at(bucket);
+        assert!(
+            count > 1,
+            "fixture: the bucket must own two candidates, or the resolve takes              its single-candidate arm and the branch under test never runs",
+        );
+        assert_eq!(
+            first_found,
+            Some(first_key),
+            "fixture: and the first of them is the occupant that kept the raw              hash",
+        );
+
+        let (cell_key, cell) = ws.resolved_cell(bucket, None);
+        assert_eq!(
+            cell_key, bucket,
+            "with no greens to settle the bucket, the resolve reports the raw              hash, exactly as `sole_cell_key` declines and `resolve_cell_key`              falls back",
+        );
+
+        let by_key = ws
+            .cell_by_key(bucket)
+            .expect("the raw hash names the bucket's original occupant");
+        let cell = cell.expect("and the resolve hands that same cell back");
+        assert!(
+            std::ptr::eq(cell, by_key),
+            "the cell noted during the walk must BE the one a walk back from              the key finds, not merely one with equal fields",
+        );
+        assert_eq!(cell.cell_key, Some(first_key));
     }
 
     /// The number of cells linked at `hash`'s table slot, counting the

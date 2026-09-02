@@ -546,14 +546,17 @@ pub fn no_bridge_enabled() -> bool {
 /// limit cannot draw, because declining N also declines everything after it.
 /// Off by default; an unparsable entry is ignored rather than reported, since
 /// the variable exists only for a bisect the operator is reading anyway.
-fn bridge_fuel_skipped(n: u64) -> bool {
+fn bridge_fuel_skip_set() -> &'static [u64] {
     static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
         std::env::var("MAJIT_SKIP_BRIDGES")
             .map(|v| v.split(',').filter_map(|p| p.trim().parse().ok()).collect())
             .unwrap_or_default()
     })
-    .contains(&n)
+}
+
+fn bridge_fuel_skipped(n: u64) -> bool {
+    bridge_fuel_skip_set().contains(&n)
 }
 /// `MAJIT_MAX_BRIDGES=N` (diagnostic): allow the first N bridge compilations
 /// and behave as `MAJIT_NO_BRIDGE` from then on.  Bisecting N names the bridge
@@ -562,6 +565,10 @@ fn bridge_fuel_skipped(n: u64) -> bool {
 /// already held, so the count is bridges actually taken — place it last in the
 /// `&&` chain.  `MAJIT_BRIDGE_FUEL_LOG` reports each one taken.
 ///
+/// `MAJIT_SKIP_BRIDGES` names positions in this same sequence, so either gate
+/// alone starts the count: numbering only when a limit is set would leave the
+/// skip list naming positions nothing ever allocates.
+///
 /// Public for the same reason `no_bridge_enabled` is: a frontend with its own
 /// guard-failure entry point spends fuel there too, and a counter that only
 /// half the bridges draw from makes `MAJIT_MAX_BRIDGES=0` disagree with
@@ -569,16 +576,21 @@ fn bridge_fuel_skipped(n: u64) -> bool {
 /// every bridge that entry point reaches.
 pub fn bridge_fuel_take() -> bool {
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let Some(limit) = *LIMIT.get_or_init(|| {
+    let limit = *LIMIT.get_or_init(|| {
         std::env::var("MAJIT_MAX_BRIDGES")
             .ok()
             .and_then(|v| v.parse().ok())
-    }) else {
+    });
+    // The sequence number belongs to the pair, not to the limit: the skip list
+    // names positions in this same count, so a run that configures only the
+    // skip list still has to number the bridges it takes. Numbering only when a
+    // limit is set would leave the skip list naming positions nothing allocates.
+    if limit.is_none() && bridge_fuel_skip_set().is_empty() {
         return true;
-    };
+    }
     static USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = USED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n >= limit {
+    if limit.is_some_and(|limit| n >= limit) {
         return false;
     }
     if bridge_fuel_skipped(n) {
@@ -842,20 +854,6 @@ fn format_rca_live_values(labels: Option<&[String]>, values: &[Value]) -> String
         );
     }
     out
-}
-
-fn convert_rd_virtuals_for_storage(
-    storage: &crate::resume::ResumeStorage,
-    raw_value_count: usize,
-) -> Vec<crate::resume::VirtualInfo> {
-    let rd_consts = storage.rd_consts();
-    let count = raw_value_count as i32;
-    let num_virtuals = storage.rd_virtuals().len();
-    storage
-        .rd_virtuals()
-        .iter()
-        .map(|rd| crate::resume::rd_virtual_to_virtual_info(rd, rd_consts, count, num_virtuals))
-        .collect()
 }
 
 use crate::TraceAction;
@@ -5900,11 +5898,24 @@ impl<S: JitState> JitDriver<S> {
         // rebuild the caller's `GreenKey` on a chained bucket, and the whole
         // point of the carry is that the key, the token and the run come from
         // one resolution.
-        let green_key = if carried_procedure_token.is_some() {
-            green_key_hash
-        } else {
-            self.meta
-                .resolve_cell_key(green_key_hash, structured_green_key)
+        //
+        // The cell-owned half of the entry decision is taken from that same
+        // resolution rather than from later walks back to the cell it already
+        // found: `resolve_cell_key`, the token read and the `JC_TEMPORARY` test
+        // are three questions about ONE cell, and upstream asks all three off
+        // the single `cell` its chain walk bound
+        // (`WarmEnterState.maybe_compile_and_run` — "these few lines inline
+        // some logic that is also on the JitCell class, to avoid computing the
+        // hash several times"). The `compiled_loops` conjunct is still taken
+        // below, where the metadata's value is wanted anyway.
+        //
+        // Which shape the gate below takes, recorded before the token is moved
+        // into it, so the amplified gate can take the same one.
+        #[cfg(feature = "__back-edge-stage-probe")]
+        let carried_token = carried_procedure_token.is_some();
+        let (green_key, entry_procedure_token) = match carried_procedure_token {
+            Some(token) => (green_key_hash, Some(token)),
+            None => self.resolved_entry_procedure_token(green_key_hash, structured_green_key),
         };
         let single_pass_dispatch_key =
             self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
@@ -5950,11 +5961,11 @@ impl<S: JitState> JitDriver<S> {
         // `warmstate.py maybe_compile_and_run`: a cell whose token was
         // `attached by compile_tmp_callback()` is NOT entered — upstream falls
         // straight to `jitcounter.tick(hash, increment_threshold)` and, on
-        // overflow, `bound_reached`. `runnable_procedure_token` reads the
+        // overflow, `bound_reached`. The resolution above reads the
         // cell-owned `JC_TEMPORARY` flag explicitly: a callback token has a
         // body, and pyre may retain frontend metadata for the loop it
         // displaced, so neither token nor metadata presence identifies it.
-        // Binding the token here rather than testing a predicate and
+        // Binding the token rather than testing a predicate and
         // unwrapping afterwards keeps the decision and execution in step — the
         // fall-through below IS the counter processing upstream continues
         // with. Token presence stays one conjunct: it is the
@@ -5975,7 +5986,8 @@ impl<S: JitState> JitDriver<S> {
         // runner receives it and never asks the cell again. This is the same
         // resolve-once discipline the cell key above already follows, one
         // level in: the token the gate said yes about IS the token executed,
-        // and a warm entry pays for one cell lookup rather than two.
+        // and a warm entry pays for one cell lookup, not one per question it
+        // asks about that cell.
         //
         // A caller that already took its own decision on this cell's token
         // hands that same object in, and it is entered unread — the carry
@@ -5988,12 +6000,7 @@ impl<S: JitState> JitDriver<S> {
         // this load nor the loops it feeds.
         #[cfg(feature = "__back-edge-stage-probe")]
         let stage_repeats = back_edge_stage_repeats();
-        // Which shape the gate below takes, recorded before the token is moved
-        // into it, so the amplified gate can take the same one.
-        #[cfg(feature = "__back-edge-stage-probe")]
-        let carried_token = carried_procedure_token.is_some();
-        if let Some(procedure_token) =
-            carried_procedure_token.or_else(|| self.runnable_procedure_token(green_key))
+        if let Some(procedure_token) = entry_procedure_token
             && let Some(compiled_meta) = self.meta.get_compiled_meta(green_key).cloned()
         {
             // warmstate.py `WarmEnterState.make_entry_point` /
@@ -6382,6 +6389,9 @@ impl<S: JitState> JitDriver<S> {
                 .take()
                 .expect("a guard exit carries its descr");
             let guard_value_operand = result.guard_value_operand;
+            // `compile.py handle_fail` `resumedescr.rd_loop_token`, resolved
+            // once where the run handed the descr back.
+            let descr_owning_key = result.rd_loop_token;
             // blackhole.py `_prepare_resume_from_failure(deadframe)`:
             // the pending exception grabbed at guard failure
             // (cpu.grab_exc_value) must seed the blackhole resume so an
@@ -6430,11 +6440,16 @@ impl<S: JitState> JitDriver<S> {
             } else {
                 green_key
             };
-            let (must_compile, owning_key) = self.meta.must_compile_with_values(
+            // Resolved once for the whole event, where the run handed the descr
+            // back, and carried here: `compile.py handle_fail` reads
+            // `resumedescr.rd_loop_token` once and hands the loop it names to
+            // both the layout it looks up and the `must_compile` call.
+            let owning_key = descr_owning_key.unwrap_or(fallback_green_key);
+            let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
                 &descr_arc,
                 &raw_values,
                 guard_value_operand,
-                fallback_green_key,
+                owning_key,
             );
             // compile.py: must_compile() and not stack_almost_full().
             // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
@@ -6447,13 +6462,6 @@ impl<S: JitState> JitDriver<S> {
                 && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full()
                 && !no_bridge_enabled()
                 && bridge_fuel_take();
-
-            // compile.py:710 recovery_layout header_pc parity:
-            // guard resume_pc comes from the guard's recovery metadata.
-            let guard_resume_pc = self
-                .get_merge_point_pc(owning_key, trace_id, fail_index)
-                .map(|pc| pc as usize)
-                .unwrap_or(target_pc);
 
             // compile.py handle_fail. `must_compile() and not
             // stack_almost_full()` → `_trace_and_compile_from_bridge`, else
@@ -6497,10 +6505,10 @@ impl<S: JitState> JitDriver<S> {
                 let rd_numb = storage.rd_numb.as_ref();
                 let rd_consts_slice: &[Const] = storage.rd_consts();
 
-                // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
-                let rd_virtuals_converted =
-                    Some(convert_rd_virtuals_for_storage(storage, raw_values.len()));
-                let rd_virtuals_slice = rd_virtuals_converted.as_deref();
+                // `resume.py _prepare_virtuals` — off the guard's own storage,
+                // which builds the reader-shaped virtuals once and hands the
+                // same list to every later resume off this guard.
+                let rd_virtuals_slice = Some(storage.virtual_infos());
 
                 // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
                 // curbh.setposition(jitcode, pc)`.  Per-driver
@@ -6749,13 +6757,19 @@ impl<S: JitState> JitDriver<S> {
                     // actually happened records it.
                     //
                     // A walk that crossed a frame boundary is not judged by one
-                    // frame's registers, so it does not qualify.
+                    // frame's registers, so it does not qualify — and cannot be:
+                    // each pop above rebinds `bh` to its caller, while the spans
+                    // were measured against the bank of the frame the guard
+                    // failed in. The frame-count test therefore has to come
+                    // first, so the comparison is reached only while the spans
+                    // still describe the bank they are indexing.
                     let guard_may_bridge = match &sf_before {
                         Some((before_i, before_r, before_f)) => {
-                            let tail_wrote_state = bh.registers_i[sf_i] != before_i[..]
-                                || bh.registers_r[sf_r] != before_r[..]
-                                || bh.registers_f[sf_f] != before_f[..];
-                            bh_frames_popped == 0 && !bh.called_residual.get() && !tail_wrote_state
+                            bh_frames_popped == 0
+                                && !bh.called_residual.get()
+                                && bh.registers_i[sf_i] == before_i[..]
+                                && bh.registers_r[sf_r] == before_r[..]
+                                && bh.registers_f[sf_f] == before_f[..]
                         }
                         // Only reachable with `should_bridge` false, where the
                         // reader below short-circuits before asking.
@@ -6986,6 +7000,29 @@ impl<S: JitState> JitDriver<S> {
             // interpreter has no exception machinery — unreachable for an
             // exception-less interpreter): fall back to crude state recovery and
             // resume the interpreter at the guard pc.
+            //
+            // `AbstractResumeGuardDescr.handle_fail` parity: a guard failure
+            // that does not compile is answered by `resume_in_blackhole`, which
+            // rebuilds the frame chain and `setposition`s it at the pc the
+            // guard's own resume data encodes. The header pc of the guard's
+            // recovery frame is that position here. Resolved at the head of
+            // this block for two reasons. It sits inside the block because the
+            // block is the only reader — every other exit from the guard arm
+            // returns a pc the bridge or the blackhole reported — and it sits
+            // ahead of the retirement below because the index lookup is keyed on
+            // a compiled loop that `remove_compiled_loop` is about to drop:
+            // asking afterwards finds nothing and silently answers `target_pc`,
+            // which resumes at the loop entry against state the recovery has
+            // already rewound. The failing guard's own layout carries the same
+            // header pc, so reading it first also answers without a lookup.
+            let guard_resume_pc = exit_layout
+                .recovery_layout
+                .as_ref()
+                .and_then(|recovery| recovery.frames.first())
+                .and_then(|frame| frame.header_pc)
+                .or_else(|| self.get_merge_point_pc(owning_key, trace_id, fail_index))
+                .map(|pc| pc as usize)
+                .unwrap_or(target_pc);
             state.recover_after_compiled_run();
             self.meta.invalidate_loop(green_key);
             self.meta.remove_compiled_loop(green_key);
@@ -7190,26 +7227,21 @@ impl<S: JitState> JitDriver<S> {
         // the same two checks, and folding three doors into one slot would say
         // nothing about any of them.
         crate::mc_diag_bump(61); // mst_entered
-        // warmstate.py `maybe_compile_and_run` consults the cell before
-        // `bound_reached` builds tracing state. Pyre's abort ceiling is the
-        // equivalent permanent refusal. Resolve it through the same typed-key
-        // helper as `on_back_edge_typed_decision` below; the public
-        // hash-only doors fall back through the same u64 arm as that decision.
-        // Keep slot 81 on the same population as the mirrored refusal in
-        // `maybe_compile_decision_with_meta`.
-        let ceiling_latched = match MetaInterp::<S::Meta>::with_typed_decision_key(
-            green_key,
-            (state.code_ptr(), target_pc),
-            |key| self.meta.warm_state.is_ceiling_latched_for_key(key),
-        ) {
-            Some(latched) => latched,
-            None => self.meta.warm_state.is_ceiling_latched(green_key),
-        };
-        if ceiling_latched {
-            crate::mc_diag_bump(81); // abort_ceiling_refused
-            return false;
-        }
-
+        // The abort ceiling is NOT consulted separately here. It is a refusal
+        // the decision below already owns: `maybe_compile_decision_with_key`
+        // takes it in the position `warmstate.py maybe_compile_and_run` gives
+        // `confirm_enter_jit`, above the counter tick and above the
+        // `decay_all_counters` inside `bound_reached`, so a latched cell
+        // reaches neither — which is the whole reason the ceiling decides
+        // early. Asking first resolved the same cell through the same typed
+        // chain walk a second time, for an answer
+        // `is_ceiling_latched_agrees_with_the_decision_it_mirrors` pins equal
+        // to the one the decision reaches; `maybe_compile_and_run` binds its
+        // cell once ("to avoid computing the hash several times") and answers
+        // every question about it off that binding. Slot 81 counts the same
+        // population either way, because only one of the two refusals can fire
+        // for a given edge: every state in which the mirror answered `false`
+        // returns above the decision's ceiling arm or fails its condition.
         match self
             .meta
             .on_back_edge_typed_decision(green_key, (state.code_ptr(), target_pc))
@@ -8062,6 +8094,8 @@ impl<S: JitState> JitDriver<S> {
         // `result` is dropped just below, so the buffer has no reader left.
         let typed_values = std::mem::take(&mut result.typed_values).into_vec();
         let guard_value_operand = result.guard_value_operand;
+        // See the sibling run loop.
+        let descr_owning_key = result.rd_loop_token;
         // llmodel.py grab_exc_value: the pending exception captured at
         // guard failure travels with the GuardFailure outcome so the
         // blackhole resume can seed it (blackhole.py:1794).
@@ -8099,11 +8133,13 @@ impl<S: JitState> JitDriver<S> {
         } else {
             green_key
         };
-        let (must_compile, owning_key) = self.meta.must_compile_with_values(
+        // Carried off the result — see the sibling run loop.
+        let owning_key = descr_owning_key.unwrap_or(fallback_green_key);
+        let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
             &descr_arc,
             &raw_values,
             guard_value_operand,
-            fallback_green_key,
+            owning_key,
         );
         // compile.py: must_compile() and not stack_almost_full().
         // `no_bridge_enabled()` is the same opt-out the two sibling loops
@@ -8238,52 +8274,41 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// See [`MetaInterp::runnable_generation`]: a number that holds while
-    /// [`Self::resolved_runnable_procedure_token`] cannot change its answer
+    /// [`Self::resolved_entry_procedure_token`] cannot change its answer
     /// for any key, and moves when it may.
     #[inline]
     pub fn runnable_generation(&self) -> u64 {
         self.meta.runnable_generation()
     }
 
-    /// [`Self::resolve_cell_key`] and [`Self::runnable_procedure_token`] from
-    /// one walk of the cell chain.
+    /// [`Self::resolve_cell_key`] and the whole CELL-OWNED half of
+    /// [`Self::runnable_procedure_token`] from one walk of the cell chain.
     ///
-    /// The two together are what a door holding a raw bucket hash asks: which
-    /// cell do my greens own, and does that cell have code to enter. Asked
-    /// separately they walk the chain twice for the same cell — see
+    /// The pair is what a door holding a raw bucket hash asks: which cell do my
+    /// greens own, and does that cell have code that may be entered. Asked
+    /// separately they walked the chain three times for the same cell — once to
+    /// resolve, once to read the token, once for `JC_TEMPORARY` — see
     /// [`MetaInterp::resolved_entry_procedure_token`]. The answer is identical
     /// to resolving first and then asking; this only stops paying for the
-    /// second walk.
+    /// repeats.
     ///
-    /// The resolved key travels back with the token because a caller that goes
-    /// on to run needs it, and because the `compiled_loops` half of the
-    /// predicate is keyed by it.
+    /// `JC_TEMPORARY` is part of the answer because retained frontend metadata
+    /// must not make a `compile_tmp_callback` token executable as the loop it
+    /// displaced, matching the flag-first branch of
+    /// `WarmEnterState.maybe_compile_and_run`.
     ///
-    /// The `compiled_loops` half is asked FIRST, as the gate the token read
-    /// sits behind. The resolved cell's `JC_TEMPORARY` flag is then the final
-    /// filter, matching `WarmEnterState.maybe_compile_and_run`; retained
-    /// frontend metadata must not make a callback executable as the displaced
-    /// loop. These are pure reads of the same resolved key. A key with no
-    /// compiled entry — which is every key a door declines on — still stops at
-    /// the cheap map probe before the token's `Weak::upgrade` / `Arc` drop.
+    /// The `compiled_loops` conjunct is NOT part of it, and the resolved key
+    /// travels back so the caller can take it: a door that goes on to run needs
+    /// that map's VALUE, so a presence test here would probe it twice for one
+    /// entry, and a door that declines is answered by the walk alone.
     #[inline]
-    pub fn resolved_runnable_procedure_token(
+    pub fn resolved_entry_procedure_token(
         &self,
         green_key_hash: u64,
-        make_green_key: impl FnOnce() -> GreenKey,
+        make_green_key: Option<&dyn Fn() -> GreenKey>,
     ) -> (u64, Option<std::sync::Arc<majit_backend::JitCellToken>>) {
-        let (cell_key, token) =
-            self.meta
-                .resolved_entry_procedure_token(green_key_hash, make_green_key, |cell_key| {
-                    self.meta.get_compiled_meta(cell_key).is_some()
-                });
-        let token = token.filter(|_| {
-            !self
-                .meta
-                .warm_state_ref()
-                .procedure_token_is_temporary(cell_key)
-        });
-        (cell_key, token)
+        self.meta
+            .resolved_entry_procedure_token(green_key_hash, make_green_key)
     }
 
     /// The token [`Self::has_runnable_compiled_loop`] says yes about, handed
