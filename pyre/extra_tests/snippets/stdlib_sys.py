@@ -184,11 +184,20 @@ with assert_raises(TypeError):
 with assert_raises(TypeError):
     sys.getsizeof("x", 1, 2)
 
-# CPython 3.14 adds a two-word PyGC_Head according to the type's GC flag, not
-# the object's current tracked state, plus two managed-prefix words for heap
-# instances with a managed dict or weakref slot.
+# `sys.getsizeof` adds a pre-header the object's type asks for, read off the
+# type's flags rather than off the object's current tracked state: two
+# managed-prefix words for a heap instance with a managed dict or weakref slot,
+# and a two-word PyGC_Head for a type the collector tracks.
+#
+# The PyGC_Head half exists only in a build that has a global interpreter lock.
+# Without one the collector keeps its bits in the object header, so the header
+# a tracked type already carries covers it and the pre-header charges nothing;
+# `Py_GIL_DISABLED` is the config var that names which of the two layouts the
+# running build was compiled with.
+import sysconfig
+
 pointer_size = (sys.maxsize.bit_length() + 7) // 8
-gc_head = 2 * pointer_size
+gc_head = 0 if sysconfig.get_config_var("Py_GIL_DISABLED") else 2 * pointer_size
 managed_prefix = 2 * pointer_size
 
 
@@ -261,4 +270,7 @@ def test_getframemodulename():
 
 test_getframemodulename.__module__ = "awesome_module"
 
+# `sys__getframemodulename_impl` reads the module off the frame's function
+# object (`PyFunction_GetModule`), so a `__module__` reassigned after definition
+# is what the call answers.
 assert test_getframemodulename() == "awesome_module"
