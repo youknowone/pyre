@@ -279,6 +279,21 @@ impl Op {
         self.args.borrow().iter().cloned().collect()
     }
 
+    /// `resoperation.py:281 AbstractResOp.getarglist` parity for a reader
+    /// that only walks the arguments: upstream returns `self._args` itself,
+    /// and only `getarglist_copy` (`N_aryOp`) returns `self._args[:]`.
+    /// [`getarglist`](Self::getarglist) has to copy so the `RefCell` borrow
+    /// does not outlive the call, which charges every read an `Operand` clone
+    /// per argument and a heap spill past the inline three; this hands the
+    /// stored slot to `f` instead.
+    ///
+    /// `f` must not call `setarg` / `initarglist` on the same op — the borrow
+    /// is live for its body, which is the invariant the copying accessor buys
+    /// its callers.
+    pub fn with_arglist<R>(&self, f: impl FnOnce(&[crate::operand::Operand]) -> R) -> R {
+        f(&self.args.borrow())
+    }
+
     /// `resoperation.py AbstractResOp.getarglist_copy` parity —
     /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
     /// an owned `SmallVec` of the stored operands.

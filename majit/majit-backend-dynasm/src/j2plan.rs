@@ -221,13 +221,13 @@ impl fmt::Display for TracePlanSummary<'_> {
 fn lower_op(op: &Op) -> LirOp {
     match op.opcode {
         OpCode::Label => LirOp::Label {
-            args: op.getarglist().iter().map(|a| a.to_opref()).collect(),
+            args: op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
         },
         OpCode::Jump => LirOp::Jump {
-            args: op.getarglist().iter().map(|a| a.to_opref()).collect(),
+            args: op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
         },
         OpCode::Finish => LirOp::Finish {
-            args: op.getarglist().iter().map(|a| a.to_opref()).collect(),
+            args: op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
         },
         OpCode::IntAdd
         | OpCode::IntAddOvf
@@ -289,7 +289,7 @@ fn lower_op(op: &Op) -> LirOp {
             offset: Some(op.arg(1).to_opref()),
             index: None,
             scale: None,
-            size: op.getarglist().get(2).map(|a| a.to_opref()),
+            size: op.with_arglist(|args| args.get(2).map(|a| a.to_opref())),
         },
         OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF
             if op.num_args() >= 5 =>
@@ -342,7 +342,7 @@ fn lower_op(op: &Op) -> LirOp {
         },
         opcode if opcode.is_guard() => LirOp::Guard {
             kind: guard_kind(opcode),
-            args: op.getarglist().iter().map(|a| a.to_opref()).collect(),
+            args: op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
             fail_args: op
                 .getfailargs()
                 .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
@@ -351,12 +351,12 @@ fn lower_op(op: &Op) -> LirOp {
         opcode if opcode.is_call() => LirOp::Call {
             opcode,
             dst: result_ref(op),
-            args: op.getarglist().iter().map(|a| a.to_opref()).collect(),
+            args: op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
         },
         opcode => LirOp::Opcode {
             opcode,
             dst: result_ref(op),
-            args: op.getarglist().iter().map(|a| a.to_opref()).collect(),
+            args: op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
             fail_args: op
                 .getfailargs()
                 .map(|fa| fa.iter().map(|a| a.to_opref()).collect())

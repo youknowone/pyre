@@ -2297,7 +2297,7 @@ fn residual_call_i64_arity(op: &Op, constants: &indexmap::IndexMap<u32, i64>) ->
     }
     // `getarglist()[0]` is the func pointer; the call args are `[1..]`. The
     // descr's `arg_types` describes those call args, so the counts must match.
-    let nargs = op.getarglist().len().saturating_sub(1);
+    let nargs = op.num_args().saturating_sub(1);
     if arg_types.len() != nargs {
         return None;
     }
@@ -2407,7 +2407,7 @@ fn residual_call_typed_sig(
     }
     // `getarglist()[0]` is the func pointer; the call args are `[1..]`. The
     // descr's `arg_types` describes those call args, so the counts must match.
-    let nargs = op.getarglist().len().saturating_sub(1);
+    let nargs = op.num_args().saturating_sub(1);
     if params.len() != nargs {
         return None;
     }
@@ -2448,7 +2448,7 @@ fn residual_call_void_word_arity(
     {
         return None;
     }
-    let nargs = op.getarglist().len().saturating_sub(1);
+    let nargs = op.num_args().saturating_sub(1);
     if arg_types.len() != nargs {
         return None;
     }
@@ -2487,7 +2487,7 @@ fn residual_call_void_true_arity(
     {
         return None;
     }
-    let nargs = op.getarglist().len().saturating_sub(1);
+    let nargs = op.num_args().saturating_sub(1);
     if arg_types.len() != nargs {
         return None;
     }
@@ -7892,7 +7892,7 @@ pub fn is_single_label_peeled(ops: &[Op]) -> bool {
 pub fn label_arg_counts(ops: &[Op]) -> Vec<usize> {
     ops.iter()
         .filter(|op| op.opcode == OpCode::Label)
-        .map(|op| op.getarglist().len())
+        .map(|op| op.num_args())
         .collect()
 }
 
