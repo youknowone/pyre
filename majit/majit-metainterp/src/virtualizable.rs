@@ -519,8 +519,12 @@ impl VirtualizableInfo {
     /// virtualizable.py `finish()` registers the `clear_vable_ptr`
     /// function pointer and `clear_vable_descr` call descriptor.
     ///
-    /// `clear_fn` is an `extern "C" fn(*mut u8)` that clears the vable token,
-    /// forcing the virtualizable if necessary. Hosts must call this after
+    /// `clear_fn` clears the vable token, forcing the virtualizable if
+    /// necessary. Its ABI is the one `make_clear_vable_descr` declares —
+    /// `[Ref] -> Void`, taking the virtualizable as a single machine word —
+    /// spelled `extern "C" fn(i64)`, because that is what the compiled
+    /// `COND_CALL` `emit_force_virtualizable` builds passes and what
+    /// `bh_clear_vable_token` calls it as.  Hosts must call this after
     /// `build_virtualizable_info()` to enable `emit_force_virtualizable`.
     pub fn set_clear_vable(&mut self, clear_fn: *const (), clear_descr: DescrRef) {
         self.clear_vable_ptr = Some(clear_fn as usize);
@@ -3214,21 +3218,28 @@ pub(crate) unsafe fn vable_write_array_item_at(
 
 /// virtualizable.py clear_vable_token, blackhole context.
 ///
-/// Upstream `clear_vable_token` calls `force_now(virtualizable)` when the token
-/// is set, then asserts it cleared — `force_now` writes the live JIT-register
-/// copy of the virtualizable's fields back to the heap object. Here that step
-/// is intentionally omitted: it is a semantic no-op in the blackhole and pyre
-/// has no blackhole `force_now`. The Active token (a force_token = address of a
-/// live JIT frame) only exists while compiled JIT code holds the frame in
-/// registers; by the time the blackhole interprets a vable op, resume has
-/// already materialized every field into the heap object, so no register copy
-/// remains to force back. The token can only be TOKEN_NONE (nothing to do) or
-/// TOKEN_TRACING_RESCALL (a marker, no un-written-back state), so clearing it
-/// unconditionally reaches the same post-state as `force_now` + assert. (If a
-/// blackhole path were ever found to carry a live Active token, that would be a
-/// real bug needing a blackhole force_now — not the case under the current
-/// resume-materializes-then-interprets model, which all virtualizable JIT
-/// tests exercise without any force_now.)
+/// `virtualizable.py:218-222` is `if virtualizable.vable_token: force_now(...)`
+/// followed by `assert not virtualizable.vable_token`, and `force_now`
+/// (`:248-260`) splits on the token:
+///
+///   * `TOKEN_TRACING_RESCALL` — a marker naming no register copy, so clearing
+///     it is the whole of the force for that arm.
+///   * anything else non-zero — the address of a live JIT frame, handed to
+///     `ResumeGuardForcedDescr.force_now`, which writes the compiled
+///     activation's registers back into the frame.
+///
+/// This used to clear both arms alike, on the argument that an Active token
+/// cannot reach the blackhole because resume has already materialized every
+/// field. The sibling helper on the compiled side (`frame_layout.rs`
+/// `pyre_clear_vable_token`) carried the same argument, backed by a census —
+/// "recorded 183 times and invoked 0 times over 462 fixtures" — and that
+/// census has since stopped holding, so the arm is live there. An argument of
+/// that shape is not load-bearing enough to drop a register write-back on:
+/// when it fails the field reads stale and nothing reports it.
+///
+/// So the Active arm now goes through the host's force helper, which is the
+/// very function `emit_force_virtualizable` compiles a `COND_CALL` to
+/// (`trace_ctx.rs`), reached here by address instead of through compiled code.
 ///
 /// # Safety
 /// `obj_ptr` must point to a valid virtualizable object.
@@ -3242,9 +3253,34 @@ pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *m
     unsafe {
         let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
         let token = *token_ptr;
-        if token != 0 {
-            *token_ptr = 0;
+        if token == 0 {
+            return;
         }
+        if token == token_tracing_rescall() as usize {
+            // virtualizable.py:250-255: the values are already correct during
+            // tracing; the marker only tells the tracer this one escaped.
+            *token_ptr = 0;
+            return;
+        }
+        let Some(clear_vable_ptr) = vinfo.clear_vable_ptr else {
+            // A machine that registered no force helper has no compiled
+            // activation to write back either: `emit_force_virtualizable`
+            // `expect`s this same field, so a trace that could have parked an
+            // Active token here could not have been built.  Clear it, matching
+            // the post-state `force_now` guarantees.
+            *token_ptr = 0;
+            return;
+        };
+        // `make_clear_vable_descr` declares `[Ref] -> Void` and
+        // `frame_layout.rs` registers a function taking that word as `i64`;
+        // spelling the pointee any other way mismatches the wasm32 signature
+        // and traps on call.
+        let force: unsafe extern "C" fn(i64) = std::mem::transmute(clear_vable_ptr);
+        force(obj_ptr as i64);
+        assert_eq!(
+            *token_ptr, 0,
+            "virtualizable.py:222 — force_now must leave TOKEN_NONE behind"
+        );
     }
 }
 
