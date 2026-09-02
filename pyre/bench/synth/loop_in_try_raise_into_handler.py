@@ -21,7 +21,7 @@
 # generator: none of these loops compiles today, so pyre runs them interpreted
 # against a pypy that traces them.  It tightens on its own if the decline is
 # ever lifted.
-N = 630000
+N = 1688200
 R = 20
 
 

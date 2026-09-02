@@ -5,7 +5,7 @@
 # The trip count puts pypy's execution above the startup-subtraction floor, so
 # this ratio is a measurement. A ceiling far above the measurement would
 # disable the gate at both ends, the derived floor included.
-N = 38000000
+N = 93041900
 
 
 # UNARY_NEGATIVE in a hot loop lowers to the `unary_negative(value)` HLOp →

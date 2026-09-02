@@ -20,7 +20,7 @@
 K = 5000
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 10193192
+N = 23830300
 
 x = 1
 i = 0

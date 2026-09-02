@@ -6,7 +6,7 @@
 # measurable runs cpython past its reference timeout, since cpython raises and
 # catches all 41M of these for real. cpython is dropped deliberately rather
 # than by spending the whole timeout to discover the same drop.
-N = 41258646
+N = 157070200
 
 
 def may_fail(i):

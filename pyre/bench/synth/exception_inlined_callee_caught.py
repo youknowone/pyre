@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=73
-N = 200000
+# pyre-check: max-pypy-ratio=3
+N = 131327700
 
 
 # Data descriptor with __delete__ but no __set__: a read-only data

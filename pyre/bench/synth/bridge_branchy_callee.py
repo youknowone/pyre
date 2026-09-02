@@ -14,7 +14,7 @@
 # inlines the branchy callee and bridges the cold arm), so a decline that keeps
 # every crossing interpreted balloons the ratio well past the limit.
 
-N = 8_000_000
+N = 34995800
 M = 1_000_000_007
 
 

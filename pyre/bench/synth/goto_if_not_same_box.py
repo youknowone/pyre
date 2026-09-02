@@ -26,13 +26,13 @@
 # startup-subtracted times, so a sample where pypy's execution is smaller than
 # pypy's own ~16ms startup is dominated by how far that one startup estimate
 # missed: at N=6000000 pypy executes in ~9ms and the gate swings past 6x on
-# startup noise alone.  At this N pypy executes in ~21ms, comfortably above its
-# startup, and the measured ratio settles near 2.2x.  A regression that puts
-# the residuals back is then a twenty-four-million-call blow-up, far outside
-# that margin.
+# startup noise alone.  At this N pypy's raw time sits above 0.1s, so the
+# ratio is a measurement of the loop rather than of process startup.  A
+# regression that puts the residuals back is then a twenty-four-million-call
+# blow-up, far outside that margin.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 30430992
+N = 85677100
 
 
 def same_box_int():

@@ -14,7 +14,7 @@
 # doubled.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 12420652
+N = 12751800
 hits = [0]
 
 

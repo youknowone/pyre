@@ -10,7 +10,7 @@
 # `bh_call_fn(float_type, NULL, x)` residual, so the result virtualizes.  A
 # rebound `float` name or a float subclass (which reboxes) falls through to the
 # residual.
-N = 600000
+N = 80008700
 
 
 def run():

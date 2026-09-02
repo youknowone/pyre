@@ -21,7 +21,7 @@
 # stable across resizings, which is what every interpreter's output is
 # compared against.
 OUTPUT_N = 200000
-N = 64000000
+N = 119172400
 
 
 class Fresh:

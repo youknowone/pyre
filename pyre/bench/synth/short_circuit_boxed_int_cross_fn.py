@@ -25,7 +25,7 @@
 # arithmetic -> deterministic checksum.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 13838411
+N = 23452600
 
 
 def sc_small():

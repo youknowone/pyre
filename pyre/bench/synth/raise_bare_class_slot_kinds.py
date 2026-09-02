@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=25
+# pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
 # cpython 4.45s vs pyre 0.21s (21.2x on the ubuntu runner), and it is not
 # gated on — only pypy is.
@@ -13,7 +13,7 @@
 # N is large because the residual shape this replaces degrades super-linearly:
 # 30k iterations hide it inside compile time, while 3M separate the two shapes
 # by two orders of magnitude.
-N = 6000000
+N = 50986400
 
 
 def stop_iteration():

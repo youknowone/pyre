@@ -40,7 +40,7 @@ try:
 except ImportError:
     pass
 
-N = 3000000
+N = 3492400
 FLIP_AT = 2000000
 
 
