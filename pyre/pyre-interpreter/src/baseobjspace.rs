@@ -14556,6 +14556,7 @@ fn generator_unpack_into(
                 Some(pyre_object::w_none()),
                 None,
                 None,
+                false,
             );
             match result {
                 // `_invoke_execute_frame` has already applied PEP 479 and
@@ -14565,7 +14566,7 @@ fn generator_unpack_into(
                     // generator.py:339-341 — frame finished ⇒ RETURNed,
                     // mark exhausted and stop without appending.
                     if frame.frame_finished_execution() {
-                        generator_frame_is_finished(gen_obj(), frame);
+                        generator_frame_is_finished(gen_obj(), frame, false);
                         break;
                     }
                     // generator.py `results.append(w_result)`.
@@ -18716,18 +18717,18 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 /// clearing on `close()`.  Dropping the generator's frame edge releases all
 /// suspended locals; an escaped `gi_frame` remains a valid, cleared frame.
 ///
-/// Releasing them is where this ends.  A local left unreachable by the release
-/// is finalized on the collector's own schedule: the `rgc` FinalizerQueue hands
-/// it to `UserDelAction`, which runs `__del__` at a following dispatch
-/// boundary, which is where `generator.py descr_close` leaves it too.  Forcing
-/// a major collection here so that `__del__` lands before `close()` returns
-/// buys a refcount's promptness at the price of a whole-heap mark and sweep on
-/// every close of a live generator.
+/// Ordinary completion leaves finalization on the collector's own schedule.
+/// An explicit close first asks whether the graph behind the references being
+/// cleared contains a pending finalizer; only that case pays the non-moving
+/// major needed to reproduce CPython's prompt refcount boundary.
 pub(crate) unsafe fn generator_frame_is_finished(
     gen_obj: PyObjectRef,
     frame: &mut crate::pyframe::PyFrame,
+    prompt_finalization: bool,
 ) {
     use pyre_object::generator::*;
+    let released_graph_has_finalizer =
+        prompt_finalization && frame.cleared_references_have_pending_finalizer();
     unsafe { w_generator_set_exhausted(gen_obj) };
     frame.set_frame_finished_execution(true);
     frame.w_yielding_from = PY_NULL;
@@ -18743,6 +18744,32 @@ pub(crate) unsafe fn generator_frame_is_finished(
     // reads, and it is gone, so nothing is left for the queue to deliver this
     // object for.
     crate::executioncontext::may_ignore_finalizer(gen_obj);
+    if prompt_finalization {
+        // Accumulated, not assigned: one `close()` finishes every frame in a
+        // `yield from` chain, and the delegate is finished first. Assigning
+        // here would let the delegating frame's own census -- usually false --
+        // replace a delegate's true one before `descr_close` reads it, and the
+        // object whose last reference was a delegate local would not run
+        // `__del__` before `close()` returned.
+        PENDING_CLOSE_FINALIZER.with(|slot| slot.set(slot.get() || released_graph_has_finalizer));
+    }
+}
+
+/// Whether any frame finished since the last read released a graph that can
+/// run application code -- the census [`generator_frame_is_finished`] takes
+/// before it clears a frame's references, held until `descr_close` is back on
+/// its own stack.
+///
+/// The collection this gates runs `__del__`, so it cannot run from inside the
+/// teardown: `_invoke_execute_frame`'s `finally` has not restored the
+/// execution context yet and the frame it is unwinding is still reachable from
+/// native locals the collector does not root.
+thread_local! {
+    static PENDING_CLOSE_FINALIZER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn take_pending_close_finalizer() -> bool {
+    PENDING_CLOSE_FINALIZER.with(|slot| slot.replace(false))
 }
 
 /// CPython 3.14 `gen_close` / `_PyFrame_ClearExceptCode`: releasing the
@@ -18756,14 +18783,15 @@ pub(crate) unsafe fn generator_frame_is_finished(
 /// the very next opcode.  The non-moving collector follows `do_collect_full`'s
 /// explicit-collection shape — finish an older incremental cycle, then take a
 /// fresh root snapshot — so the pass observes the frame release even when a
-/// major was already in progress.  The pending-finalizer census avoids paying
-/// for a collection when no application callback could be observed.
+/// major was already in progress.  The released-frame graph census avoids
+/// paying for a collection when no application callback could be observed,
+/// while following container edges so an indirect `__del__` is not missed.
 ///
 /// The PyPy load-bearing-hint census around `GeneratorIterator` finds only
 /// `_immutable_fields_ = ['pycode']` and `rgc.may_ignore_finalizer(self)`;
 /// neither governs the released locals or their finalization timing.
-pub(crate) fn generator_close_finalizer_boundary() {
-    if !majit_gc::gc_has_pending_finalizers() {
+pub(crate) fn generator_close_finalizer_boundary(released_graph_has_finalizer: bool) {
+    if !released_graph_has_finalizer {
         return;
     }
     let action = crate::executioncontext::space_user_del_action();
@@ -18782,6 +18810,7 @@ unsafe fn generator_invoke_execute_frame(
     w_inputvalue: Option<PyObjectRef>,
     operr: Option<PyError>,
     throw_args: Option<([PyObjectRef; 3], usize)>,
+    prompt_finalization: bool,
 ) -> PyResult {
     use pyre_object::generator::*;
     if w_generator_is_running(gen_obj) {
@@ -18803,7 +18832,7 @@ unsafe fn generator_invoke_execute_frame(
     let result = frame.execute_generator_frame(w_inputvalue, operr, throw_args);
     let result = match result {
         Err(e) => {
-            generator_frame_is_finished(gen_obj, frame);
+            generator_frame_is_finished(gen_obj, frame, prompt_finalization);
             // generator.py `_leak_stopiteration` and
             // `_leak_stopasynciteration`, which differ only in the name they
             // format after KIND.  The second is reachable on async generators
@@ -18921,12 +18950,19 @@ fn generator_send_ex(
         } else {
             None
         };
-        match generator_invoke_execute_frame(gen_obj, frame, w_inputvalue, operr, throw_args) {
+        match generator_invoke_execute_frame(
+            gen_obj,
+            frame,
+            w_inputvalue,
+            operr,
+            throw_args,
+            closing,
+        ) {
             Ok(value) => {
                 // generator.py:109-114 — if the frame marked itself finished,
                 // it was RETURNed from; otherwise it YIELDed.
                 if frame.frame_finished_execution() {
-                    generator_frame_is_finished(gen_obj, frame);
+                    generator_frame_is_finished(gen_obj, frame, closing);
                     if is_async_generator(gen_obj) {
                         return Err(PyError::stop_async_iteration());
                     }
@@ -19398,16 +19434,27 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             if frame_ptr.is_null() {
                 w_generator_set_exhausted(gen_obj);
             } else {
-                generator_frame_is_finished(gen_obj, &mut *frame_ptr);
-                if prompt_finalizers {
-                    generator_close_finalizer_boundary();
-                }
+                generator_frame_is_finished(gen_obj, &mut *frame_ptr, prompt_finalizers);
             }
+            let released_graph_has_finalizer = take_pending_close_finalizer();
+            generator_close_finalizer_boundary(prompt_finalizers && released_graph_has_finalizer);
             return Ok(w_none());
         }
     }
     let err = PyError::new(PyErrorKind::GeneratorExit, String::new());
-    match generator_send_ex(gen_obj, w_none(), Some(err), None, true) {
+    let sent = generator_send_ex(gen_obj, w_none(), Some(err), None, true);
+    // Taken unconditionally, so a census no arm below spends cannot be read by
+    // a later close.  `generator_send_ex` records one whenever it closes,
+    // while only an explicit app-level `close()` may spend it: inside
+    // `_finalize_`'s queue drain the boundary would re-enter the finalizer
+    // queue once per unreachable generator chain.
+    let released_graph_has_finalizer = take_pending_close_finalizer() && prompt_finalizers;
+    // The boundary collection runs `__del__`, so only an arm that has already
+    // consumed the propagation root may take it. `Ok(_)` and the trailing
+    // `Err(e)` leave their exception in flight in this native local, which the
+    // collector does not root, and a collection there sweeps its traceback
+    // chain out from under `record_application_traceback`.
+    match sent {
         Ok(_) => {
             // Generator yielded after GeneratorExit — RuntimeError.
             // generator.py:267-268 `"%s ignored GeneratorExit" % self.KIND`.
@@ -19427,9 +19474,7 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             // unlike a Python handler, no PUSH_EXC_INFO will clear the
             // temporary propagation root for us.
             crate::eval::set_in_flight_exception(PY_NULL);
-            if prompt_finalizers {
-                generator_close_finalizer_boundary();
-            }
+            generator_close_finalizer_boundary(released_graph_has_finalizer);
             value
         }
         Err(e) if e.kind == PyErrorKind::GeneratorExit => {
@@ -19437,9 +19482,7 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
             // GeneratorExit after matching it.  Mirror PUSH_EXC_INFO's
             // ownership transfer by ending pyre's propagation root here.
             crate::eval::set_in_flight_exception(PY_NULL);
-            if prompt_finalizers {
-                generator_close_finalizer_boundary();
-            }
+            generator_close_finalizer_boundary(released_graph_has_finalizer);
             Ok(w_none())
         }
         Err(e) => Err(e),

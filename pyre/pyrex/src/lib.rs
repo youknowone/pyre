@@ -1242,12 +1242,10 @@ fn maybe_print_mc_diag() {
 /// line is the arming witness — a run that compiled nothing exercised no cell
 /// mint, and its `cells` says nothing about growth.
 ///
-/// `pinned_refs` is normally 0 because `RetainedGreens` retains through
-/// `majit_ir::set_ref_resolver`,
-/// which no pyre frontend calls — the whole tree's only callers are in
-/// `warmstate.rs`'s own tests — so a stored `Ref` green owns nothing and the
-/// column reports the hook's absence, not an empty pinned set. A nonzero value
-/// here means somebody registered a resolver and this paragraph is stale.
+/// `pinned_refs` counts the GC owner-root slots held by stored Ref greens.
+/// Pyre registers `majit_ir::set_ref_resolver` during JIT bootstrap, matching
+/// the ordinary traced fields `JitCell.__init__` stores upstream; a nonzero
+/// value therefore reports the live code/string objects the cell table owns.
 ///
 /// Same prefix discipline as [`maybe_print_gc_diag`]: not `[jit-stats]`, and
 /// behind its own env gate, so the committed per-bench baselines never see it.

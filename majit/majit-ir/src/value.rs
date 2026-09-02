@@ -734,14 +734,15 @@ pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
 /// citing a `warmstate.py` helper; none exists, and a faithful citation over
 /// unfaithful code is worse than no citation.
 ///
-/// The invariant it restores: `equal_whatever(Ref, ..)` and
-/// `hash_whatever(Ref, ..)` both reduce a `Ref` green to its raw address, and
-/// **address equality is a correct identity only while both addresses are kept
-/// alive by their owners** — two distinct *live* objects cannot share an
-/// address.  Upstream satisfies this because the cell that stores the key is
-/// the owner.  Without these hooks a freed referent's address can be recycled
-/// by a different object, whose green key is then byte-identical to the dead
-/// one's: a true collision in the identity that no comparator can resolve.
+/// The invariant it restores: `equal_whatever(Ref, ..)` compares the stored
+/// pointer with the live pointer, so **address equality is a correct identity
+/// only while the stored referent is kept alive by its owner** — two distinct
+/// *live* objects cannot share an address.  `hash_whatever(Ref, ..)` separately
+/// uses the GC's stable identity hash.  Upstream satisfies both because the
+/// cell that stores the key is the owner.  Without these hooks a freed
+/// referent's address can be recycled by a different object, whose green key
+/// is then byte-identical to the dead one's: a true collision in the identity
+/// that no comparator can resolve.
 ///
 /// Ownership belongs to the **stored** key, not to [`GreenKey`] as a type.
 /// A key built to *look up* a cell is transient and the caller is executing
@@ -750,18 +751,33 @@ pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
 /// `GreenKey` a `Drop` would leak the old referent and fail to retain the new
 /// one on every back edge.  Retain where the cell takes its copy, which is
 /// also where upstream's `setattr` runs.
-pub type RefRetainFn = fn(i64);
-pub type RefReleaseFn = fn(i64);
+pub type RefRetainFn = fn(i64) -> usize;
+pub type RefCurrentFn = fn(usize) -> i64;
+pub type RefReleaseFn = fn(usize);
+pub type RefHashFn = fn(i64) -> u64;
 
 static REF_RETAIN: std::sync::OnceLock<RefRetainFn> = std::sync::OnceLock::new();
+static REF_CURRENT: std::sync::OnceLock<RefCurrentFn> = std::sync::OnceLock::new();
 static REF_RELEASE: std::sync::OnceLock<RefReleaseFn> = std::sync::OnceLock::new();
+static REF_HASH: std::sync::OnceLock<RefHashFn> = std::sync::OnceLock::new();
 
 /// Frontend-registered `Ref` green ownership hooks.  Same init-once contract
 /// as [`set_str_resolver`].  Register at JitDriver startup, before any cell
 /// stores a typed green key.
-pub fn set_ref_resolver(retain: RefRetainFn, release: RefReleaseFn) {
+pub fn set_ref_resolver(retain: RefRetainFn, current: RefCurrentFn, release: RefReleaseFn) {
     let _ = REF_RETAIN.set(retain);
+    let _ = REF_CURRENT.set(current);
     let _ = REF_RELEASE.set(release);
+}
+
+/// Runtime implementation of RPython's `lltype.identityhash` for generic GC
+/// pointer greens.  The GC owns this operation: in minimark it gives nursery
+/// objects a stable shadow address and applies `mangle_hash`, while old-gen
+/// objects use their non-moving address.  Frontends without a moving GC may
+/// leave this unset and retain the raw-address fallback used before the hook
+/// existed.
+pub fn set_ref_hash_resolver(hash: RefHashFn) {
+    let _ = REF_HASH.set(hash);
 }
 
 /// OPEN POLICY FORK — the one place that decides what an unregistered
@@ -782,9 +798,9 @@ pub fn set_ref_resolver(retain: RefRetainFn, release: RefReleaseFn) {
 /// into a checkable one.  Until that is decided, registering is opt-in: a
 /// frontend that registers gets the invariant, one that does not is no worse
 /// off than before.
-fn ref_hooks() -> Option<(RefRetainFn, RefReleaseFn)> {
-    match (REF_RETAIN.get(), REF_RELEASE.get()) {
-        (Some(retain), Some(release)) => Some((*retain, *release)),
+fn ref_hooks() -> Option<(RefRetainFn, RefCurrentFn, RefReleaseFn)> {
+    match (REF_RETAIN.get(), REF_CURRENT.get(), REF_RELEASE.get()) {
+        (Some(retain), Some(current), Some(release)) => Some((*retain, *current, *release)),
         _ => None,
     }
 }
@@ -803,21 +819,21 @@ fn ref_hooks() -> Option<(RefRetainFn, RefReleaseFn)> {
 /// grow with it.
 #[derive(Debug, Default)]
 pub struct RetainedGreens {
-    retained: Vec<i64>,
+    /// `(GreenKey.values index, frontend root handle)`.
+    retained: Vec<(usize, usize)>,
 }
 
 impl RetainedGreens {
     /// Retain every non-null `Ref` green in `key`.  A null slot is skipped:
     /// `hash_whatever` already folds null to 0 and there is nothing to own.
     pub fn retain(key: &GreenKey) -> Self {
-        let Some((retain, _)) = ref_hooks() else {
+        let Some((retain, _, _)) = ref_hooks() else {
             return RetainedGreens::default();
         };
         let mut retained = Vec::new();
         for (i, &value) in key.values.iter().enumerate() {
             if key.types.get(i).copied().unwrap_or(GreenType::Int) == GreenType::Ref && value != 0 {
-                retain(value);
-                retained.push(value);
+                retained.push((i, retain(value)));
             }
         }
         RetainedGreens { retained }
@@ -834,15 +850,32 @@ impl RetainedGreens {
     pub fn is_empty(&self) -> bool {
         self.retained.is_empty()
     }
+
+    /// Current address of the retained Ref at `green_index`.
+    ///
+    /// RPython stores the green directly in the GC-managed `JitCell`, so the
+    /// collector rewrites that field. Pyre's cell is Rust-owned; the frontend
+    /// root slot is the corresponding owning field and this read supplies its
+    /// forwarded value to `JitCell.comparekey`.
+    pub fn current_value(&self, green_index: usize, fallback: i64) -> i64 {
+        let Some((_, handle)) = self
+            .retained
+            .iter()
+            .find(|(index, _)| *index == green_index)
+        else {
+            return fallback;
+        };
+        ref_hooks().map_or(fallback, |(_, current, _)| current(*handle))
+    }
 }
 
 impl Drop for RetainedGreens {
     fn drop(&mut self) {
-        let Some((_, release)) = ref_hooks() else {
+        let Some((_, _, release)) = ref_hooks() else {
             return;
         };
-        for &value in &self.retained {
-            release(value);
+        for &(_, handle) in &self.retained {
+            release(handle);
         }
     }
 }
@@ -1092,8 +1125,14 @@ pub fn hash_whatever(tp: GreenType, value: i64) -> u64 {
                  115-121 ll_strhash parity)",
         )(value),
         GreenType::Ref => {
-            // identityhash(x) or 0
-            if value != 0 { value as u64 } else { 0 }
+            // warmstate.py `hash_whatever`: identityhash(x) or 0.  The
+            // identity hash is a GC operation, not the pointer bits: minimark
+            // gives a nursery object a shadow before hashing it.
+            if value == 0 {
+                0
+            } else {
+                REF_HASH.get().map_or(value as u64, |hash| hash(value))
+            }
         }
         GreenType::Float => {
             // rffi.cast(Signed, x) — truncate float to integer

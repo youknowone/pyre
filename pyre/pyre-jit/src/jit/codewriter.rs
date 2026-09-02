@@ -3173,6 +3173,9 @@ fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::
     if w_code.is_null() {
         return None;
     }
+    let roots = pyre_object::gc_roots::push_roots();
+    let code_slot = roots.base();
+    let w_code = roots.pin_root(w_code);
     // pyopcode.py `_load_global`: `finditem_str(self.get_w_globals_storage(),
     // varname)` then the builtins fallback. Read the globals OBJECT
     // (`pycode.w_globals`) rather than the off-GC proxy storage.
@@ -3189,9 +3192,9 @@ fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::
     // That lookup reaches a user `__getitem__` on a non-dict mapping, and a
     // dict is one of the two kinds a minor collection relocates.  Re-read the
     // globals off the code object rather than reuse the pointer from before the
-    // call: `PyCode` is minted through `malloc_typed_stable` (`pycode.rs:664`)
-    // and so keeps its address, and the collector forwards its `w_globals`.
-    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
+    // call. `PyCode` is movable, so reload it from the shadow stack before
+    // reading the collector-forwarded `w_globals` field again.
+    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(roots.get(code_slot)) };
     let w_builtin = pyre_interpreter::baseobjspace::finditem_str(w_globals, "__builtins__")
         .ok()
         .flatten()?;

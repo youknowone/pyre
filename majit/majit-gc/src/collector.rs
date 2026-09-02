@@ -7273,6 +7273,46 @@ impl MiniMarkGC {
         self.registered_finalizer_count() != 0 || self.rawrefcount_enabled()
     }
 
+    /// A read-only reachability prepass for prompt-finalization boundaries.
+    ///
+    /// CPython releases a generator frame's locals by refcount, so only the
+    /// graph behind those released edges can produce an immediate `__del__`.
+    /// Pyre must collect to discover whether those objects are otherwise
+    /// unreachable, but it need not collect when that graph contains no
+    /// registered finalizer at all.  Walk the same traced edges as marking and
+    /// use inspector.py's `GCFLAG_EXTRA` visited bit, restoring every bit
+    /// before returning.  This is a conservative prefilter: rawrefcount can
+    /// run external deallocators whose ownership graph is not represented by
+    /// these fields, so an enabled rawrefcount bridge always keeps the sweep.
+    pub fn do_subgraph_has_pending_finalizer(&self, roots: &[GcRef]) -> bool {
+        if self.registered_finalizer_count() == 0 {
+            return self.rawrefcount_enabled();
+        }
+        if self.rawrefcount_enabled() {
+            return true;
+        }
+
+        let mut pending = Vec::new();
+        for &root in roots {
+            self.heap_dump_add(root, &mut pending);
+        }
+        let marked_roots = pending.clone();
+        let mut found = false;
+        while let Some(obj) = pending.pop() {
+            let hdr = unsafe { header_of(obj.0) };
+            if unsafe {
+                (*hdr).has_flag(GcFlags::FINALIZER_REGISTERED)
+                    && !(*hdr).has_flag(GcFlags::FINALIZER_RUN)
+                    && !(*hdr).has_flag(GcFlags::GCFLAG_IGNORE_FINALIZER)
+            } {
+                found = true;
+            }
+            self.visit_referents(obj.0, &mut |child| self.heap_dump_add(child, &mut pending));
+        }
+        self.heap_dump_clear_gcflag(marked_roots);
+        found
+    }
+
     /// incminimark.py `deal_with_objects_with_finalizers`.
     fn deal_with_objects_with_finalizers(&mut self) {
         let mut new_with_finalizer = VecDeque::new();
@@ -8661,6 +8701,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn get_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) {
         self.do_get_referents(obj, visitor)
+    }
+
+    fn subgraph_has_pending_finalizer(&mut self, roots: &[GcRef]) -> bool {
+        self.do_subgraph_has_pending_finalizer(roots)
     }
 
     fn is_tracked(&mut self, obj: GcRef) -> bool {
@@ -14654,6 +14698,31 @@ cache size\t: 8192 kB\n";
         // can stay true for a freed block while the current arena is retained.
         // The allocator's exact live count verifies reclamation here.
         assert_eq!(gc.oldgen.object_count(), 0);
+    }
+
+    #[test]
+    fn finalizer_subgraph_prefilter_follows_container_edges() {
+        fn trigger() {}
+
+        let mut gc = test_gc(4096);
+        let leaf_tid = gc.register_type(TypeInfo::simple(16));
+        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<GcRef>(),
+            vec![0],
+        ));
+        let unrelated = gc.alloc_in_oldgen_clear(leaf_tid, GcHeader::SIZE + 16);
+        let finalizable = gc.alloc_in_oldgen_clear(leaf_tid, GcHeader::SIZE + 16);
+        let holder =
+            gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + std::mem::size_of::<GcRef>());
+        unsafe { *(holder.0 as *mut GcRef) = finalizable };
+        GcAllocator::register_finalizer(&mut gc, 0, finalizable, trigger);
+
+        assert!(!gc.do_subgraph_has_pending_finalizer(&[unrelated]));
+        assert!(gc.do_subgraph_has_pending_finalizer(&[holder]));
+        // The inspector visited bit is scratch state, not a semantic mark.
+        for obj in [unrelated, finalizable, holder] {
+            assert!(unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
+        }
     }
 
     /// incminimark.py:2492,2570-2573,3011-3020: objects marked solely to

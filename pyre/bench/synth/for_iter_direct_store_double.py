@@ -1,6 +1,9 @@
-# pyre-check: max-pypy-ratio=0.4
-# Ubuntu run 33279264115: 0.1-0.2x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=1.0
+# Restoring `MIFrame._create_segmented_trace_and_blackhole` parity makes this
+# deliberately tiny trace limit exercise repeated segment compilation, like
+# PyPy (whose oracle reports trace-too-long and segmenting aborts here).  Local
+# post-parity runs are 0.4-0.5x; the ceiling is twice the slowest, rounded up to
+# one decimal place.
 # pyre-check: spec-folds=store_attr_direct
 try:
     import pypyjit

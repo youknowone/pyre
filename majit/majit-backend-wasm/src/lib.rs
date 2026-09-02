@@ -1111,6 +1111,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_write_barrier_before_move(Some(wasm_active_gc_write_barrier_before_move));
     majit_gc::set_active_get_objects(Some(wasm_get_objects));
     majit_gc::set_active_get_referents(Some(wasm_get_referents));
+    majit_gc::set_active_subgraph_has_pending_finalizer(Some(wasm_subgraph_has_pending_finalizer));
     majit_gc::set_active_is_tracked(Some(wasm_is_tracked));
     majit_gc::set_active_get_rpy_memory_usage(Some(wasm_get_rpy_memory_usage));
     majit_gc::set_active_get_rpy_type_index(Some(wasm_get_rpy_type_index));
@@ -1356,6 +1357,10 @@ fn wasm_get_objects(generation: i8, visitor: majit_gc::GetObjectsVisitorFn) {
 fn wasm_get_referents(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
     let mut visit = visitor;
     with_wasm_active_gc_mut(|gc| gc.get_referents(obj, &mut visit));
+}
+
+fn wasm_subgraph_has_pending_finalizer(roots: &[GcRef]) -> bool {
+    with_wasm_active_gc_mut(|gc| gc.subgraph_has_pending_finalizer(roots)).unwrap_or(false)
 }
 
 fn wasm_is_tracked(obj: GcRef) -> bool {

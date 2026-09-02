@@ -2360,7 +2360,10 @@ impl<'a> RegAlloc<'a> {
                 continue;
             }
             let tp = self.tp(arg);
-            locs.push(Some(self.loc_must_exist(arg, tp)));
+            // x86/regalloc.py `RegAlloc.locs_for_fail` calls `self.loc(arg)`:
+            // a box reused from ResumeDataLoopMemo may be live only in this
+            // guard and therefore need its frame binding allocated here.
+            locs.push(Some(self.loc(arg, tp)));
         }
         locs
     }

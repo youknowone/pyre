@@ -4633,13 +4633,23 @@ impl<S: JitState> JitDriver<S> {
                     // SwitchToBlackhole and that is the reason the handler sees.
                     self.meta.aborted_tracing(abort_reason);
                 }
+                TraceAction::Decline => {
+                    // This is a pre-trace coverage refusal, not
+                    // `SwitchToBlackhole`.  Upstream's
+                    // `maybe_compile_and_run` only clears `JC_TRACING` in its
+                    // `finally` arm; charging `abort_trace_live` here made five
+                    // unrelated declines trip pyre's local abort ceiling.
+                    self.meta.decline_trace_live();
+                    self.sym = None;
+                    self.bridge_body_start_op_counts = None;
+                    self.bridge_attempt_declined = false;
+                    self.meta.clear_trace_session();
+                }
                 // Consumed inside the metainterp dispatch loop
                 // (PyreMetaInterp::step_inline_frame pops the inline frame and
                 // records the CALL_ASSEMBLER); it never reaches the jitdriver.
                 // Defensive: treat an escaped instance as a plain Abort.
-                action @ (TraceAction::RecursiveCallAssembler { .. }
-                | TraceAction::Abort
-                | TraceAction::Decline) => {
+                action @ (TraceAction::RecursiveCallAssembler { .. } | TraceAction::Abort) => {
                     if self.meta.bridge_info().is_some() {
                         crate::debug::log_one("jit-abort", "Abort during bridge tracing");
                     }
@@ -4830,13 +4840,10 @@ impl<S: JitState> JitDriver<S> {
                         }
                     }
                     self.meta.abort_trace_live(false);
-                    // `pyjitpl.py:2785-2789` counts every SwitchToBlackhole abort,
-                    // including a bridge whose greenkey is None. `Decline` is a
-                    // pyre pre-trace coverage fallback, not a traced abort, so it
-                    // deliberately remains outside `aborted_tracing` accounting.
-                    if !matches!(action, TraceAction::Decline) {
-                        self.meta.aborted_tracing(reason_int);
-                    }
+                    // `MetaInterp._interpret` counts every
+                    // `SwitchToBlackhole` abort, including a bridge whose
+                    // greenkey is None.
+                    self.meta.aborted_tracing(reason_int);
                     self.sym = None;
                     self.bridge_body_start_op_counts = None;
                     self.bridge_attempt_declined = false;

@@ -339,6 +339,18 @@ fn pyre_object_gc_identity_hash_trampoline(addr: usize) -> usize {
     majit_gc::gc_id_or_identityhash(addr)
 }
 
+fn retain_green_ref(value: i64) -> usize {
+    majit_gc::shadow_stack::acquire_owner_root(majit_ir::GcRef(value as usize))
+}
+
+fn current_green_ref(handle: usize) -> i64 {
+    majit_gc::shadow_stack::get_owner_root(handle).0 as i64
+}
+
+fn release_green_ref(handle: usize) {
+    majit_gc::shadow_stack::release_owner_root(handle);
+}
+
 fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
     majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
@@ -2801,10 +2813,10 @@ fn build_gc() -> Box<MiniMarkGC> {
     // guard below.  This keeps the net register-call count up to
     // `W_MODULE_DICT_GC_TYPE_ID = 48` unchanged (one explicit
     // registration here, one fewer from the loop), so no downstream
-    // hardcoded tid shifts. `w_code_new` allocates the wrapper in stable
-    // oldgen. Its Rust-owned cache vectors require the custom walk, and their
-    // allocations are released with the wrapper just as PyPy's list fields
-    // are reclaimed with its `PyCode`.
+    // hardcoded tid shifts. `w_code_new` allocates the wrapper as a normal
+    // movable GC object. Its Rust-owned cache vectors require the custom walk,
+    // and their allocations are released with the wrapper just as PyPy's list
+    // fields are reclaimed with its `PyCode`.
     let w_code_tid = gc.register_type(
         TypeInfo::object_subclass_with_custom_trace(
             std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
@@ -5988,11 +6000,12 @@ unsafe fn jitcode_constants_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    // Every collection, minor included.  `jitcode.py JitCode` is an ordinary
-    // GC object upstream and `constants_r` an ordinary traced field of it, so
-    // the collector keeps and forwards its entries whatever generation they
-    // are in.  pyre owns the array in `Arc` memory, out of the object graph,
-    // so this walker IS that tracing and owes the same guarantee.
+    // `jitcode.py JitCode` is an ordinary GC object upstream and `constants_r`
+    // an ordinary traced field of it. Major marking therefore walks every
+    // live pool. A minor collection reaches only JitCodes recorded by the
+    // write barrier in `old_objects_pointing_to_young`; pyre's off-GC analog
+    // is `MetaInterpStaticData.jitcodes_with_young_constants`, consumed by the
+    // state-side walker below.
     //
     // This used to skip minor collections when tagged ints were disabled, on
     // the claim that the entries were then "stable old-generation int/float
@@ -6000,10 +6013,11 @@ unsafe fn jitcode_constants_root_walker_area(
     // consequence was the fault it was meant to make impossible: upstream
     // builds every jitcode at translation time, while pyre builds one per
     // CodeObject at RUN time, so a trace's `Operand::ConstRef` reaches the pool
-    // straight off the heap.  Measured with `PYRE_PROBE14=1` on
+    // straight off the heap. Measured with `PYRE_PROBE14=1` on
     // `_pending/exec_foreign_globals_gc_root.py`, one slot holds a NURSERY
-    // object on every walk; skipped by the minor pass, it was neither kept
-    // alive nor forwarded, and the next major seeded a corpse
+    // object on the first post-publication walk; skipped by the old blanket
+    // minor bypass, it was neither kept alive nor forwarded, and the next
+    // major seeded a corpse
     // (`GC BUG: invalid type_id ... site=jitcode_constants`).
     unsafe { pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor) };
 }
@@ -6011,9 +6025,13 @@ unsafe fn jitcode_constants_root_walker_area(
 /// The `code_ptr -> wrapper` half of the population the comment above
 /// describes, registered separately so a failing root names it.
 ///
-/// Same minor-collection skip and the same justification for it: a wrapper is
-/// placed by `malloc_typed_stable`, so it is not a nursery object and a minor
-/// collection has nothing to do here.  `PYRE_PROBE14=1` tests that claim
+/// Skipped on a minor collection: `w_code_new_owned` places the wrapper with
+/// `malloc_typed_stable`, so it is born in oldgen and never relocates, and its
+/// managed children are reached through the wrapper's own trace and write
+/// barrier.  The walk is not free -- it iterates every
+/// `MetaInterpStaticData.jitcodes` entry and takes the `LIVE_CODE_WRAPPERS`
+/// lock once per entry -- so running it per nursery cycle would cost a whole
+/// registry scan for nothing.  `PYRE_PROBE14=1` tests the placement claim
 /// directly rather than by its relocation consequence.
 unsafe fn jitcode_code_root_walker_area(
     data: *const (),
@@ -8152,6 +8170,11 @@ pub fn init_jit_hooks() {
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
+    // `warmstate.py JitCell.__init__` stores every green as an ordinary field
+    // on a GC object, so a Ref green is both owned and forwarded with the
+    // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
+    // same field semantics; `comparekey_matches` reads the current slot value.
+    majit_ir::set_ref_resolver(retain_green_ref, current_green_ref, release_green_ref);
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     // `get_printable_location` was ported for JitDriver parity with no runtime
     // consumer; the compile census is that consumer. The green tuple carries

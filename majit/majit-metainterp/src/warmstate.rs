@@ -245,10 +245,21 @@ impl BaseJitCell {
     /// inserting cells through the typed-key path
     /// (`WarmEnterState::ensure_cell_for_key`).
     pub fn comparekey_matches(&self, other: &GreenKey) -> bool {
-        match &self.comparekey {
-            Some(stored) => stored == other,
-            None => false,
+        let Some(stored) = &self.comparekey else {
+            return false;
+        };
+        if stored.values.len() != other.values.len() || stored.types != other.types {
+            return false;
         }
+        for index in 0..stored.values.len() {
+            let stored_value = self
+                .retained_greens
+                .current_value(index, stored.values[index]);
+            if !majit_ir::equal_whatever(stored.types[index], stored_value, other.values[index]) {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn is_tracing(&self) -> bool {
@@ -837,6 +848,16 @@ impl WarmEnterState {
 
     /// Create a new WarmEnterState with an explicit Logger.
     pub fn with_jitlog(threshold: u32, jitlog: Option<Logger>) -> Self {
+        // warmstate.py `hash_whatever` calls `lltype.identityhash` for every
+        // non-null generic GC pointer green.  Its translated minimark owner is
+        // `MiniMarkGC.identityhash`: obtain the move-stable address first,
+        // then apply `mangle_hash`.  Register here because majit-ir cannot
+        // depend on majit-gc (the GC already depends on the IR), while every
+        // JitDriver constructs this warm state before hashing a green key.
+        majit_ir::set_ref_hash_resolver(|value| {
+            let identity = majit_gc::gc_id_or_identityhash(value as usize) as u64;
+            identity ^ (identity >> 4)
+        });
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         // rlib/jit.py PARAMETERS default decay=40.
         counter.set_decay(40);
@@ -1486,6 +1507,19 @@ impl WarmEnterState {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags &= !JcFlags::JC_TRACING;
             // State remains Tracing until attach_procedure_to_interp is called.
+        }
+    }
+
+    /// Undo a tracing start which the frontend declined before recording.
+    ///
+    /// This is the local counterpart of `warmstate.py`
+    /// `maybe_compile_and_run`'s unconditional `finally` clear when the
+    /// pre-trace policy refuses a graph: there is no `SwitchToBlackhole`, so
+    /// `aborted_tracing` and the pyre-local abort ceiling do not participate.
+    pub fn decline_tracing(&mut self, cell_key: u64) {
+        if let Some(cell) = self.cell_by_key_mut(cell_key) {
+            cell.flags &= !JcFlags::JC_TRACING;
+            cell.state = BaseJitCellState::NotHot;
         }
     }
 
@@ -5013,6 +5047,28 @@ mod tests {
         );
     }
 
+    /// A frontend coverage decline happens before upstream enters
+    /// `MetaInterp._interpret`, so it cannot raise `SwitchToBlackhole` or
+    /// contribute to `aborted_tracing`.  Repeating the local fallback past the
+    /// pyre-only ceiling must therefore leave the cell traceable.
+    #[test]
+    fn a_pretrace_decline_does_not_charge_the_abort_ceiling() {
+        let mut ws = WarmEnterState::new(2);
+        let key = 0xDEC11E;
+
+        for _ in 0..=MAX_TRACE_ABORT_COUNT {
+            ws.mark_as_being_traced(key);
+            ws.decline_tracing(key);
+        }
+
+        let cell = ws.get_cell(key).expect("decline keeps the warm-state cell");
+        assert_eq!(cell.abort_count, 0);
+        assert_eq!(cell.state, BaseJitCellState::NotHot);
+        assert!(!cell.flags.contains(JcFlags::JC_TRACING));
+        assert!(!cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE));
+        assert!(ws.can_inline_callable(key));
+    }
+
     #[test]
     fn test_tracing_generation_increments() {
         let mut ws = WarmEnterState::new(2);
@@ -5505,6 +5561,24 @@ mod tests {
         }
     }
 
+    /// warmstate.py `hash_whatever` routes a generic GC pointer through
+    /// `lltype.identityhash`; minimark's implementation is
+    /// `mangle_hash(id_or_identityhash(obj))`, not the raw pointer bits.
+    #[test]
+    fn warm_state_registers_gc_ref_identity_hash() {
+        let _ws = WarmEnterState::new(100);
+        let addr = 0x5eed_1230usize;
+        let identity = majit_gc::gc_id_or_identityhash(addr) as u64;
+        assert_eq!(
+            majit_ir::value::hash_whatever(majit_ir::GreenType::Ref, addr as i64),
+            identity ^ (identity >> 4),
+        );
+        assert_eq!(
+            majit_ir::value::hash_whatever(majit_ir::GreenType::Ref, 0),
+            0,
+        );
+    }
+
     /// warmstate.py:575-582 — `comparekey_matches` returns true only
     /// when the cell carries a stored GreenKey equal to the probe.
     /// Cells without a comparekey (legacy hash-only path) always fail.
@@ -5537,13 +5611,26 @@ mod tests {
     // live would move a count, but cannot forge these addresses.
     static RETAIN_LOG: parking_lot::Mutex<Vec<i64>> = parking_lot::Mutex::new(Vec::new());
     static RELEASE_LOG: parking_lot::Mutex<Vec<i64>> = parking_lot::Mutex::new(Vec::new());
+    static CURRENT_REF_GREEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-    fn test_retain(value: i64) {
+    fn test_retain(value: i64) -> usize {
         RETAIN_LOG.lock().push(value);
+        value as usize
     }
 
-    fn test_release(value: i64) {
-        RELEASE_LOG.lock().push(value);
+    fn test_current(handle: usize) -> i64 {
+        const REF_GREEN: i64 = 0x5EED_0001;
+        if handle as i64 == REF_GREEN {
+            let current = CURRENT_REF_GREEN.load(std::sync::atomic::Ordering::SeqCst);
+            if current != 0 {
+                return current;
+            }
+        }
+        handle as i64
+    }
+
+    fn test_release(handle: usize) {
+        RELEASE_LOG.lock().push(handle as i64);
     }
 
     /// warmstate.py:568-573 — a cell's stored green key OWNS its `Ref`
@@ -5561,10 +5648,12 @@ mod tests {
     /// 4. dropping the cell releases exactly what it retained.
     #[test]
     fn stored_green_key_owns_its_ref_referents() {
-        majit_ir::set_ref_resolver(test_retain, test_release);
+        majit_ir::set_ref_resolver(test_retain, test_current, test_release);
 
         const REF_GREEN: i64 = 0x5EED_0001;
+        const MOVED_REF_GREEN: i64 = 0x5EED_1001;
         const INT_GREEN: i64 = 0x5EED_0002;
+        CURRENT_REF_GREEN.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let key = GreenKey::with_types(
             vec![7, INT_GREEN, REF_GREEN, 0],
@@ -5601,6 +5690,19 @@ mod tests {
             assert!(
                 !RELEASE_LOG.lock().contains(&REF_GREEN),
                 "nothing may be released while the cell that owns it is alive"
+            );
+
+            CURRENT_REF_GREEN.store(MOVED_REF_GREEN, std::sync::atomic::Ordering::SeqCst);
+            let moved_key = GreenKey::with_types(
+                vec![7, INT_GREEN, MOVED_REF_GREEN, 0],
+                vec![Type::Int, Type::Int, Type::Ref, Type::Ref],
+            );
+            let cell = ws
+                .lookup_chain(key.get_uhash())
+                .expect("the retained cell stays in its original identity-hash bucket");
+            assert!(
+                cell.comparekey_matches(&moved_key),
+                "comparekey must read the collector-forwarded owner-root value"
             );
         }
 

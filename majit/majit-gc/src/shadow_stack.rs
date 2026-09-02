@@ -666,6 +666,15 @@ pub fn release_owner_root(index: usize) {
     });
 }
 
+/// Read a fixed owner-root slot after any collector forwarding.
+///
+/// The slot belongs to the current thread and must still be acquired. This is
+/// the handle-based counterpart of [`OwnerRootGuard::get`] for Rust-owned
+/// containers whose dependency layer cannot store the guard type directly.
+pub fn get_owner_root(index: usize) -> GcRef {
+    OWNER_ROOTS.with(|roots| roots.borrow()[index].expect("reading an inactive owner-root slot"))
+}
+
 /// RAII owner for one fixed translated-livevar root slot.
 pub struct OwnerRootGuard {
     index: usize,

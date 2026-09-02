@@ -85,6 +85,22 @@ pub(crate) fn walker_capture_snapshot_for_last_guard<Sym: WalkSym>(
     walker_capture_snapshot_for_last_guard_scoped(ctx, op_pc, GuardCaptureScope::default())
 }
 
+/// Capture the `GUARD_ALWAYS_FAILS` used by a synthesized per-Python-opcode
+/// debug merge point.
+///
+/// Upstream records that guard in the interpreter dispatch JitCode, after its
+/// real `jit_merge_point`; `after_residual_call=True` advances past that marker
+/// and lands on the Python opcode the dispatch loop is about to execute.
+/// Pyre's per-CodeObject JitCode has no such marker. Its synthesized DMP is
+/// already sitting at the first operation of that Python opcode, so applying
+/// the generic `GUARD_ALWAYS_FAILS` advance would skip the opcode entirely.
+pub(crate) fn walker_capture_segmented_python_opcode_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    walker_capture_snapshot_for_last_guard_impl(ctx, op_pc, false, GuardCaptureScope::default())
+}
+
 pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

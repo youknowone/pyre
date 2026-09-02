@@ -1598,6 +1598,18 @@ pub struct MetaInterp<M: Clone> {
     /// Bumped by every insertion into and removal from `compiled_loops`, in
     /// this file's non-test code. One input of [`Self::runnable_generation`].
     compiled_loops_generation: u64,
+    /// Aggregate write-barrier bit for the GC-traced graphs stored off-heap
+    /// under `compiled_loops` (`ResumeGuardDescr.rd_consts` and
+    /// `TargetToken` virtual-state/short-preamble fields).
+    ///
+    /// In RPython these owners are GC objects. MiniMark's write barrier puts
+    /// the modified object on `old_objects_pointing_to_young`, so a minor
+    /// collection never searches the whole compiled-loop graph merely to find
+    /// each object's dirty bit. Pyre's Rust-owned graph has no GC header; this
+    /// owner bit is its remembered-set boundary. Every compilation path arms
+    /// it before it can publish or mutate one of those fields, and the next
+    /// minor root walk consumes it. Major marking still scans everything.
+    compiled_graph_minor_scan_pending: bool,
     /// warmstate.py `JitCell.get_jit_cell_at_key` analog for the
     /// merge-point green vocabulary: the header greens (`(ints, refs,
     /// floats)`) each compiled loop was traced under, keyed by its green key.
@@ -2546,49 +2558,59 @@ impl<M: Clone> MetaInterp<M> {
         let generation = RD_CONSTS_WALK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
             == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
-        for entry in self.compiled_loops.values_mut() {
-            for trace in entry.traces.values_mut() {
-                for layout in trace.exit_layouts.values_mut() {
-                    visit_pool(
-                        layout.storage.as_ref().map(|storage| &storage.rd_consts),
-                        generation,
-                        is_minor,
-                        &mut visitor,
-                    );
-                    let descr_pool = layout
-                        .descr
-                        .as_ref()
-                        .and_then(|descr| descr.as_fail_descr())
-                        .and_then(|fd| fd.rd_consts_arc());
-                    visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
-                }
-                for layout in trace.terminal_exit_layouts.values_mut() {
-                    visit_pool(
-                        layout.storage.as_ref().map(|storage| &storage.rd_consts),
-                        generation,
-                        is_minor,
-                        &mut visitor,
-                    );
-                    let descr_pool = layout
-                        .descr
-                        .as_ref()
-                        .and_then(|descr| descr.as_fail_descr())
-                        .and_then(|fd| fd.rd_consts_arc());
-                    visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
-                }
-            }
-            for tt in entry.front_target_tokens.iter_mut() {
-                // `history.TargetToken` is a GC object upstream.  MiniMark
-                // visits it in a minor only while its write barrier is dirty;
-                // after forwarding its graph, clean tokens stay out of later
-                // minor walks until another traced-field store.  A major must
-                // still see every token graph.
-                if !is_minor || tt.take_minor_scan_pending() {
-                    if let Some(virtual_state) = tt.virtual_state.as_mut() {
-                        virtual_state.walk_const_ptr_refs_mut(&mut visitor);
+        // MiniMark enters `old_objects_pointing_to_young` directly; it does
+        // not traverse the complete old object graph to inspect each owner's
+        // dirty flag. `compiled_graph_minor_scan_pending` is the off-GC owner
+        // bit for this whole Rust graph, armed at every compilation boundary.
+        // Keep the per-pool/per-token bits below as the second-level exact
+        // filter when a publication did change only part of the graph.
+        let scan_compiled_graph =
+            !is_minor || std::mem::take(&mut self.compiled_graph_minor_scan_pending);
+        if scan_compiled_graph {
+            for entry in self.compiled_loops.values_mut() {
+                for trace in entry.traces.values_mut() {
+                    for layout in trace.exit_layouts.values_mut() {
+                        visit_pool(
+                            layout.storage.as_ref().map(|storage| &storage.rd_consts),
+                            generation,
+                            is_minor,
+                            &mut visitor,
+                        );
+                        let descr_pool = layout
+                            .descr
+                            .as_ref()
+                            .and_then(|descr| descr.as_fail_descr())
+                            .and_then(|fd| fd.rd_consts_arc());
+                        visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
                     }
-                    if let Some(sp) = tt.short_preamble.as_mut() {
-                        sp.walk_const_ptr_refs_mut(&mut visitor);
+                    for layout in trace.terminal_exit_layouts.values_mut() {
+                        visit_pool(
+                            layout.storage.as_ref().map(|storage| &storage.rd_consts),
+                            generation,
+                            is_minor,
+                            &mut visitor,
+                        );
+                        let descr_pool = layout
+                            .descr
+                            .as_ref()
+                            .and_then(|descr| descr.as_fail_descr())
+                            .and_then(|fd| fd.rd_consts_arc());
+                        visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
+                    }
+                }
+                for tt in entry.front_target_tokens.iter_mut() {
+                    // `history.TargetToken` is a GC object upstream. MiniMark
+                    // visits it in a minor only while its write barrier is
+                    // dirty; after forwarding its graph, clean tokens stay out
+                    // of later minor walks until another traced-field store. A
+                    // major must still see every token graph.
+                    if !is_minor || tt.take_minor_scan_pending() {
+                        if let Some(virtual_state) = tt.virtual_state.as_mut() {
+                            virtual_state.walk_const_ptr_refs_mut(&mut visitor);
+                        }
+                        if let Some(sp) = tt.short_preamble.as_mut() {
+                            sp.walk_const_ptr_refs_mut(&mut visitor);
+                        }
                     }
                 }
             }
@@ -2631,6 +2653,16 @@ impl<M: Clone> MetaInterp<M> {
             memo.walk_const_ptr_refs_mut(&mut visitor);
             true
         });
+    }
+
+    /// Arm the off-GC compiled-graph write barrier around a compile that can
+    /// publish `ResumeGuardDescr.rd_consts` or mutate a `TargetToken` graph.
+    /// Compilation entry arms it for in-place mutations; every publication
+    /// arms it again, because a collection during compilation may have
+    /// consumed the entry-side bit before the new graph became reachable.
+    #[inline]
+    fn remember_compiled_graph_write(&mut self) {
+        self.compiled_graph_minor_scan_pending = true;
     }
 
     /// framework.py `root_walker.walk_roots` hook for the stashed
@@ -3448,6 +3480,7 @@ impl<M: Clone> MetaInterp<M> {
             backend: BackendImpl::new(),
             compiled_loops: indexmap::IndexMap::new(),
             compiled_loops_generation: 0,
+            compiled_graph_minor_scan_pending: true,
             loop_header_greens: indexmap::IndexMap::new(),
             cut_compiled_keys: indexmap::IndexSet::new(),
             speculative_cut_owned_key: None,
@@ -6499,6 +6532,7 @@ impl<M: Clone> MetaInterp<M> {
     /// is dropped alongside it; if not (early-Cancelled paths), both
     /// halves stay live for continued tracing.
     pub fn compile_loop(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
+        self.remember_compiled_graph_write();
         let outcome = self.compile_loop_body(jump_args, meta);
         self.retire_speculative_cut_key(outcome);
         self.compile_snapshot_refs.clear();
@@ -7875,6 +7909,7 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref,
                     },
                 );
+                self.remember_compiled_graph_write();
                 self.warm_state.log_compile(
                     green_key,
                     num_ops_before,
@@ -8195,6 +8230,7 @@ impl<M: Clone> MetaInterp<M> {
         finish_descr: Option<majit_ir::DescrRef>,
         entry_bridge: Option<(u64, M)>,
     ) -> CompileOutcome {
+        self.remember_compiled_graph_write();
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -8567,6 +8603,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns true if compilation succeeded.
     pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
+        self.remember_compiled_graph_write();
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -9265,6 +9302,7 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref,
                     },
                 );
+                self.remember_compiled_graph_write();
                 self.warm_state.log_compile(
                     green_key,
                     num_ops_before,
@@ -9568,6 +9606,7 @@ impl<M: Clone> MetaInterp<M> {
                         },
                     );
                 }
+                self.remember_compiled_graph_write();
                 self.warm_state.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
@@ -9717,6 +9756,26 @@ impl<M: Clone> MetaInterp<M> {
         self.clear_trace_session();
     }
 
+    /// Drop a trace which the frontend declined before it became a traced
+    /// abort.
+    ///
+    /// `TraceAction::Decline` is pyre's pre-trace coverage fallback.  Its
+    /// upstream counterpart refuses the graph before entering
+    /// `MetaInterp._interpret`, so no `SwitchToBlackhole` reaches
+    /// `MetaInterp.aborted_tracing`; `WarmEnterState.maybe_compile_and_run`
+    /// only clears `JC_TRACING` in its `finally` arm.  Undo the locally-started
+    /// tracing state without charging the pyre-local abort ceiling.
+    pub fn decline_trace_live(&mut self) {
+        self.force_finish_trace = false;
+        self.clear_retrace_state();
+        if let Some(ctx) = self.tracing.take() {
+            self.warm_state.decline_tracing(ctx.green_key);
+            self.pending_token = None;
+        }
+        self.clear_pending_abort();
+        self.clear_trace_session();
+    }
+
     /// Drop the `pending_abort_*` payload staged by live trace teardown.
     ///
     /// `abort_trace_live` stages `(green_key, permanent)` for the
@@ -9754,6 +9813,7 @@ impl<M: Clone> MetaInterp<M> {
         meta: M,
         exit_with_exception: bool,
     ) -> Result<(), SwitchToBlackhole> {
+        self.remember_compiled_graph_write();
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -10205,6 +10265,7 @@ impl<M: Clone> MetaInterp<M> {
                             next_global_opref,
                         },
                     );
+                    self.remember_compiled_graph_write();
                 }
                 self.warm_state.log_compile(
                     green_key,
@@ -10593,6 +10654,7 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref,
                     },
                 );
+                self.remember_compiled_graph_write();
                 self.warm_state.log_compile(
                     green_key,
                     num_ops_before,
@@ -13526,6 +13588,7 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref,
                     },
                 );
+                self.remember_compiled_graph_write();
                 self.warm_state.log_compile(
                     original_green_key,
                     bridge_ops.len(),
@@ -13661,6 +13724,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_frame_pcs: SnapshotFramePcs,
         call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
     ) -> bool {
+        self.remember_compiled_graph_write();
         self.last_compiled_artifact_token = None;
         crate::mc_diag_bump(8); // compile_bridge entered
         if !self.compiled_loops.contains_key(&green_key) {
@@ -14380,6 +14444,7 @@ impl<M: Clone> MetaInterp<M> {
                         },
                     );
                 }
+                self.remember_compiled_graph_write();
                 self.warm_state.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
                 // `cpu.tracker.total_compiled_bridges` is bumped inside
@@ -16733,25 +16798,24 @@ impl<M: Clone> MetaInterp<M> {
                 Some((bridge.trace_id, bridge.fail_index)),
                 finish_descr,
             );
-            // pyjitpl.py raise_if_successful(): successful
-            // bridge closure terminates tracing.  Consume the whole
-            // session (bridge + trace_meta) and unwind the tracer via
-            // `abort_trace_live` (live cleanup + `pending_abort_*`
-            // staging) — NOT `abort_trace`, because that also fires
-            // `aborted_tracing(Generic)` which would double-count the
-            // upstream abort hook (pyjitpl.py:2491 fires it once with
-            // `stb.reason` via the caller-side catch).  On success no
-            // catch fires, so we clear the staged `pending_abort_*`
-            // below to keep the next aborted_tracing clean.
+            // pyjitpl.py `raise_if_successful`: a compiled bridge leaves via
+            // `ContinueRunningNormally`, not the `SwitchToBlackhole` catch in
+            // `MetaInterp._interpret`.  It therefore clears the live tracing
+            // state without calling `WarmEnterState.abort_tracing`; charging
+            // this successful FINISH as an abort makes the source loop hit
+            // pyre's abort ceiling after several recursive bridges.
             self.clear_trace_session();
-            self.abort_trace_live(false);
             return match outcome {
-                CompileOutcome::Compiled { .. } | CompileOutcome::Cancelled => {
-                    // Drop the `pending_abort_*` staged by
-                    // `abort_trace_live` — on success no abort hook
-                    // fires, so letting stale greenkey linger would
-                    // attach this successfully-compiled bridge's key
-                    // to a later, unrelated abort.
+                CompileOutcome::Compiled { .. } => {
+                    self.finish_trace_live();
+                    self.clear_pending_abort();
+                    Ok(())
+                }
+                CompileOutcome::Cancelled => {
+                    // Preserve the existing cancelled-compile teardown: it
+                    // does not propagate a SwitchToBlackhole reason, but it is
+                    // not a successful compile either.
+                    self.abort_trace_live(false);
                     self.clear_pending_abort();
                     Ok(())
                 }
@@ -16761,6 +16825,7 @@ impl<M: Clone> MetaInterp<M> {
                 // bridge FINISH path shares the same giveup reason as
                 // the root FINISH path.
                 CompileOutcome::Aborted => {
+                    self.abort_trace_live(false);
                     crate::mc_diag_bump(49);
                     Err(SwitchToBlackhole::giveup())
                 }
@@ -23702,6 +23767,83 @@ mod tests {
         let mut visited = 0u32;
         meta.walk_active_trace_refs(|_| visited += 1);
         assert_eq!(visited, 0);
+    }
+
+    /// `incminimark.py old_objects_pointing_to_young`: the off-GC compiled
+    /// graph is absent from clean minor walks, is visited once after its
+    /// publication barrier fires, and remains visible to every major walk.
+    #[test]
+    fn compiled_graph_root_walk_consumes_its_aggregate_minor_barrier() {
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let storage = crate::resume::ResumeStorage::new(
+            Vec::new(),
+            vec![majit_ir::Const::Ref(GcRef(0x1000))],
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut exit_layouts = indexmap::IndexMap::new();
+        exit_layouts.insert(
+            0,
+            StoredExitLayout {
+                source_op_index: None,
+                recovery_layout: None,
+                resume_layout: None,
+                storage: Some(storage.clone()),
+                descr: None,
+                op_arg_types_for_jump: None,
+            },
+        );
+        let mut traces = indexmap::IndexMap::new();
+        traces.insert(
+            1,
+            CompiledTrace {
+                inputargs: Vec::new(),
+                ops: Vec::new(),
+                constants: majit_ir::ConstMap::new(),
+                exit_layouts,
+                terminal_exit_layouts: indexmap::IndexMap::new(),
+            },
+        );
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.compiled_loops.insert(
+            7,
+            CompiledEntry {
+                token: std::sync::Weak::new(),
+                meta: std::sync::Arc::new(()),
+                front_target_tokens: Vec::new(),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces,
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Minor);
+        meta.compiled_graph_minor_scan_pending = false;
+        let mut seen = 0;
+        meta.walk_rd_consts_refs(|_| seen += 1);
+        assert_eq!(seen, 0, "a clean compiled graph is absent from a minor");
+
+        meta.remember_compiled_graph_write();
+        meta.walk_rd_consts_refs(|slot| {
+            seen += 1;
+            slot.0 = 0x2000;
+        });
+        assert_eq!(seen, 1);
+        assert!(matches!(
+            storage.rd_consts()[0],
+            majit_ir::Const::Ref(GcRef(0x2000))
+        ));
+        meta.walk_rd_consts_refs(|_| seen += 1);
+        assert_eq!(seen, 1, "the publication barrier is consumed once");
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        meta.walk_rd_consts_refs(|_| seen += 1);
+        assert_eq!(seen, 2, "major marking always sees the compiled graph");
     }
 
     #[test]

@@ -1281,11 +1281,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             pending_ctor_tail = Some(tail);
             continue;
         }
-        // `InlineFrame.w_code` is the portal green (`W_Code`) used by
-        // `fbw_inline_recursion_count`, not the raw `CodeObject*` carried by
-        // a reconstruction recipe.  Forward inlining pushes the wrapper too;
-        // preserving the same identity here makes reconstructed and newly
-        // entered frames one recursion chain, as in `MIFrame.greenkey`.
+        // Preserve the wrapper identity for frame-local metadata, but not a
+        // recursion greenkey: `resume.rebuild_from_resumedata` reconstructs
+        // every frame through `MetaInterp.newframe(jitcode)`, so
+        // `MIFrame.greenkey` is `None` and `_opimpl_recursive_call` skips it.
         let parent_w_code =
             crate::state::recover_inline_callee_code(parent_recipe.code_ptr) as usize;
         if parent_w_code == 0 {
@@ -1298,6 +1297,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         parent_guards.push(InlineFrameGuard::enter(
             session,
             parent_w_code,
+            false,
             guard_parents,
         ));
         parent_for_current = recipe_parent_frame_from_recipe(
@@ -1384,7 +1384,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         };
         let mut callee_parents = vec![parent_for_current];
         callee_parents.extend(pending_ctor_tail.take());
-        let _inline_frame = InlineFrameGuard::enter(session, callee_w_code, callee_parents);
+        let _inline_frame = InlineFrameGuard::enter(session, callee_w_code, false, callee_parents);
         // No `InlineConcreteFrameGuard` here.  A forward-inline sub-walk owns
         // the callee frame it publishes, so retargeting `last_instr` /
         // `valuestackdepth` onto it is the whole point.  A bridge-resume

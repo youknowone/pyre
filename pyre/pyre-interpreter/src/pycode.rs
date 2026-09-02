@@ -786,14 +786,16 @@ pub unsafe fn w_code_getweakref(w_code: PyObjectRef) -> PyObjectRef {
 }
 
 /// `make_weakref_descr(PyCode).setweakref` — publish the lifeline and retain
-/// the old-to-young edge when a stable-oldgen code object receives it.
+/// the old-to-young edge when a tenured code object receives it.
 ///
 /// # Safety
 /// `w_code` must point to a live [`PyCode`].
 pub unsafe fn w_code_setweakref(w_code: PyObjectRef, lifeline: PyObjectRef) {
     unsafe {
+        let published = publish_code_slot_store_rooting(w_code, &[lifeline]);
+        let w_code = published.owner();
+        let lifeline = published.get(0);
         (*(w_code as *mut PyCode)).w_weakreflifeline = lifeline;
-        pyre_object::gc_hook::try_gc_write_barrier(w_code as *mut u8);
     }
 }
 
@@ -811,6 +813,9 @@ pub unsafe fn w_code_setweakref(w_code: PyObjectRef, lifeline: PyObjectRef) {
 /// `w_code` must point to a valid `PyCode`.
 pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
     unsafe {
+        let roots = pyre_object::gc_roots::push_roots();
+        let code_slot = roots.base();
+        let w_code = roots.pin_root(w_code);
         let cached = (*(w_code as *const PyCode)).w_qualname;
         if !cached.is_null() {
             return cached;
@@ -819,10 +824,12 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
         if code_ptr.is_null() {
             return pyre_object::PY_NULL;
         }
-        // `w_str_new` is a collection point, but the wrapper is stable-address
-        // and so never relocates; the fresh string is stored through the
-        // still-valid `w_code` before any further allocation can sweep it.
+        // `w_str_new` is a collection point. RPython keeps the live `self`
+        // reference in the shadow stack across it; reload the possibly moved
+        // wrapper before publishing the cache field.
         let w_qualname = w_str_new(&(*code_ptr).qualname);
+        publish_code_slot_store(roots.get(code_slot));
+        let w_code = roots.get(code_slot);
         (*(w_code as *mut PyCode)).w_qualname = w_qualname;
         w_qualname
     }
@@ -840,6 +847,9 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
 /// `w_code` must point to a valid `PyCode`.
 pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
     unsafe {
+        let roots = pyre_object::gc_roots::push_roots();
+        let code_slot = roots.base();
+        let w_code = roots.pin_root(w_code);
         let cached = (*(w_code as *const PyCode)).w_name;
         if !cached.is_null() {
             return cached;
@@ -848,10 +858,12 @@ pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
         if code_ptr.is_null() {
             return pyre_object::PY_NULL;
         }
-        // `w_str_new` is a collection point, but the wrapper is stable-address
-        // and so never relocates; the fresh string is stored through the
-        // still-valid `w_code` before any further allocation can sweep it.
+        // `w_str_new` is a collection point. RPython keeps the live `self`
+        // reference in the shadow stack across it; reload the possibly moved
+        // wrapper before publishing the cache field.
         let w_name = w_str_new(&(*code_ptr).obj_name);
+        publish_code_slot_store(roots.get(code_slot));
+        let w_code = roots.get(code_slot);
         (*(w_code as *mut PyCode)).w_name = w_name;
         w_name
     }
@@ -888,7 +900,7 @@ pub unsafe fn w_code_filename_obj(w_code: PyObjectRef) -> PyObjectRef {
 /// without first becoming a function or frame. Only wrappers created before
 /// the runtime GC hook is installed stay outside the collector; expose that
 /// fallback family through one small insertion-ordered registry. Ordinary
-/// runtime wrappers are managed stable-oldgen objects.
+/// runtime wrappers are managed objects.
 static PREBUILT_CODE_ROOTS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> =
     std::sync::OnceLock::new();
 
@@ -1103,17 +1115,18 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// either obtained via `Box::into_raw` or nested inside one such owner.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the body
-/// boxes the `PyCode` through the prebuilt allocator and its per-name cache
+/// boxes the `PyCode` through the managed allocator and its per-name cache
 /// tables through direct raw allocations. Residualise the whole
 /// constructor — a `PyObjectRef` GCREF modelled by signature. Code objects are
 /// built at import/compile time, never on a traced hot path.
 ///
-/// `pycode.py` makes `PyCode` an ordinary GC object, so upstream traces
-/// `w_globals` and the cache tables structurally through it. `malloc_typed`
-/// here makes it immortal and non-moving instead, which nothing traces into —
-/// so every GC-heap slot it owns needs an explicit root walker
-/// ([`walk_w_globals_stamped_code_roots`], [`walk_mapdict_method_cache_gc`]).
-/// Those registries retire when code objects become GC-managed.
+/// `pycode.py` makes `PyCode` an ordinary GC object. Pyre's current JIT seam,
+/// however, still carries raw wrapper addresses alongside `CodeObject*` in
+/// compiled and resume metadata. Keep the wrapper collector-owned but
+/// stable-address until those remaining raw couriers are replaced with GC
+/// references; the collector can still reclaim it and its namespace cycle.
+/// Bootstrap wrappers created before GC installation fall back to the
+/// prebuilt family and use the explicit root walkers.
 #[majit_macros::dont_look_inside]
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
     // Zero owner: this entry point's contract is that the body is never
@@ -1185,7 +1198,7 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
     };
     // `pycode.py self.co_consts_w = consts` — allocate the wrapped-constant
     // table at the compiler/interpreter boundary. It is filled immediately
-    // after the stable `PyCode` allocation below.
+    // after the rooted `PyCode` allocation below.
     let co_consts_w = if !code_ptr_aligned {
         std::ptr::null_mut()
     } else {
@@ -1282,15 +1295,13 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
             std::sync::atomic::AtomicI64::new(ADDR2LINE_MEMO_EMPTY)
         }),
     };
-    // PyPy's `PyCode` is an ordinary GC object.  Keep the address stable for
-    // the raw `code_ptr -> wrapper` JIT seam, but let the collector reclaim
-    // the wrapper so its `w_globals` field participates in cycles instead of
-    // making every `exec` namespace process-global.  Before GC installation,
-    // `malloc_typed_stable` falls back to the prebuilt family and the explicit
-    // root registry remains necessary.
+    // The raw-address JIT compatibility seam described above requires a
+    // stable wrapper address. `malloc_typed_stable` is still a managed
+    // allocation: unlike the prebuilt allocator it can be reclaimed by a
+    // major collection, but it is born in oldgen and never relocates.
     let obj = pyre_object::lltype::malloc_typed_stable(obj) as PyObjectRef;
     // PyPy's ast compiler has already wrapped every entry before PyCode.__init__
-    // (`assemble.py:479-492`). Pin the freshly allocated stable wrapper while
+    // (`assemble.py add_const`). Pin the freshly allocated wrapper while
     // recursive code constants and managed scalar constants allocate, then
     // publish one object in every co_consts_w slot before returning PyCode.
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1438,13 +1449,21 @@ unsafe fn box_code_constant_inheriting_unit(
     parent: &PyCode,
 ) -> PyObjectRef {
     let owner = code_unit_owner(parent.code_ptr);
-    let obj = unsafe { box_code_constant_in_place(code, parent.hidden_applevel, owner) };
-    if parent.filename_inherits_to_nested
+    let hidden_applevel = parent.hidden_applevel;
+    let inherited_filename = if parent.filename_inherits_to_nested
         && unsafe { &*code }.source_path
             == unsafe { &*(parent.code_ptr as *const crate::CodeObject) }.source_path
         && !parent.filename_bytes.is_null()
     {
-        let bytes = unsafe { (&*parent.filename_bytes).clone() };
+        Some(unsafe { (&*parent.filename_bytes).clone() })
+    } else {
+        None
+    };
+    // Boxing can collect and move `parent`. Snapshot every value needed from
+    // it first, just as RPython's GC transform spills live fields before the
+    // allocation rather than retaining a native reference into the object.
+    let obj = unsafe { box_code_constant_in_place(code, hidden_applevel, owner) };
+    if let Some(bytes) = inherited_filename {
         unsafe { set_filename_bytes(obj, Some(bytes)) };
         unsafe { (*(obj as *mut PyCode)).filename_inherits_to_nested = true };
     }
@@ -1621,11 +1640,17 @@ struct RootedSlotStore {
 }
 
 impl RootedSlotStore {
+    /// The code object that owns the slot, reloaded after the barrier.
+    #[inline]
+    fn owner(&self) -> PyObjectRef {
+        self.scope.get(self.base)
+    }
+
     /// The `index`th word handed to [`publish_code_slot_store_rooting`], as it
     /// stands now.
     #[inline]
     fn get(&self, index: usize) -> PyObjectRef {
-        self.scope.get(self.base + index)
+        self.scope.get(self.base + 1 + index)
     }
 }
 
@@ -1642,9 +1667,11 @@ impl RootedSlotStore {
 /// address. Publish those words here and read them back.
 fn publish_code_slot_store_rooting(obj: PyObjectRef, children: &[PyObjectRef]) -> RootedSlotStore {
     let scope = pyre_object::gc_roots::push_roots();
-    let base = scope.publish(children);
-    scope.normalize(base, children.len());
-    publish_code_slot_store(obj);
+    let base = scope.base();
+    let _ = scope.pin_root(obj);
+    let children_base = scope.publish(children);
+    scope.normalize(children_base, children.len());
+    publish_code_slot_store(scope.get(base));
     RootedSlotStore { scope, base }
 }
 
@@ -1672,6 +1699,11 @@ pub(crate) unsafe fn w_code_fill_wrapped_consts(obj: PyObjectRef, constants: &[P
 /// fields other than `co_consts`. PyPy copies its already-wrapped list; pyre
 /// copies those same eager slot identities into the newly built wrapper.
 unsafe fn w_code_copy_const_slots(dst: PyObjectRef, src: PyObjectRef) {
+    let roots = pyre_object::gc_roots::push_roots();
+    let root_base = roots.publish(&[dst, src]);
+    roots.normalize(root_base, 2);
+    let dst = roots.get(root_base);
+    let src = roots.get(root_base + 1);
     let dst_code = unsafe { &*(dst as *const PyCode) };
     let src_code = unsafe { &*(src as *const PyCode) };
     if dst_code.co_consts_w.is_null() || src_code.co_consts_w.is_null() {
@@ -3115,6 +3147,9 @@ pub(crate) unsafe fn obj_to_constant_data(
 /// `w_code_obj` must point to a valid `PyCode`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let code_slot = roots.base();
+    let w_code_obj = roots.pin_root(w_code_obj);
     let w_code = unsafe { &*(w_code_obj as *const PyCode) };
     // Guard `code_ptr` before dereferencing it — the same null/alignment check
     // the lazy-cache initializers use. A null/misaligned pointer means the
@@ -3155,7 +3190,7 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     // published it or selected the concurrently-published canonical object.
     let candidate_root = &mut realized as *mut PyObjectRef as *mut *mut u8;
     let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(candidate_root) };
-    publish_code_slot_store(w_code_obj);
+    publish_code_slot_store(roots.get(code_slot));
     let published = match slot.compare_exchange(
         std::ptr::null_mut(),
         realized,
@@ -3190,6 +3225,8 @@ pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectR
     if w_code_obj.is_null() {
         return pyre_object::pyobject::PY_NULL;
     }
+    let roots = pyre_object::gc_roots::push_roots();
+    let w_code_obj = roots.pin_root(w_code_obj);
     let w_code = unsafe { &*(w_code_obj as *const PyCode) };
     if w_code.co_names_w.is_null() {
         return pyre_object::pyobject::PY_NULL;
@@ -3418,6 +3455,7 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     // A bootstrap code slot is reached only by the prebuilt root walk, which
     // clean minor collections may skip; record the store before making it.
     let published = publish_code_slot_store_rooting(obj, &[w_globals]);
+    let obj = published.owner();
     let w_globals = published.get(0);
     unsafe {
         std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!(
@@ -3441,6 +3479,10 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     if obj.is_null() {
         return false;
     }
+    let roots = pyre_object::gc_roots::push_roots();
+    let root_base = roots.publish(&[obj, w_globals]);
+    roots.normalize(root_base, 2);
+    let obj = roots.get(root_base);
     // `pycode.py frame_stores_global` reads the slot and stores into it under
     // the GIL, which makes the pair indivisible. Pyre is free-threaded, and a
     // `false` answer is what makes a frame take its globals from the code
@@ -3458,7 +3500,13 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
         // before the publication, so a collection that observes the new child
         // through this slot finds the slot already remembered. A lost race
         // leaves only a conservative barrier behind.
-        let rooted = publish_code_slot_store_rooting(obj, &[w_globals]);
+        let rooted =
+            publish_code_slot_store_rooting(roots.get(root_base), &[roots.get(root_base + 1)]);
+        let obj = rooted.owner();
+        let code = obj as *mut PyCode;
+        let slot = unsafe {
+            std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!((*code).w_globals))
+        };
         let w_globals = rooted.get(0);
         match slot.compare_exchange(
             pyre_object::PY_NULL,
@@ -3474,6 +3522,12 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
             Err(winner) => published = winner,
         }
     }
+    // The wrapper may have moved since its first globals stamp. The live frame
+    // supplying `obj` is authoritative, so keep the raw-code compatibility
+    // registry synchronized even on the cache-hit path.
+    let obj = roots.get(root_base);
+    let w_globals = roots.get(root_base + 1);
+    register_live_code_wrapper(unsafe { (*(obj as *const PyCode)).code_ptr }, obj);
     !std::ptr::eq(published, w_globals)
 }
 
@@ -3804,10 +3858,11 @@ pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool
 /// wrapper (and hence its `w_globals`) from a raw code pointer it already
 /// holds, so the JIT need not carry the wrapper identity as a separate
 /// `w_code` courier. First-write-wins, mirroring the first-store-wins
-/// `PyCode.w_globals` semantics in `w_code_frame_stores_global`. Wrappers use
-/// stable GC allocation; `MetaInterpStaticData.jitcodes` roots the ones it
-/// retains and the collector destructor removes every other mapping before its
-/// pointer can dangle.
+/// `PyCode.w_globals` semantics in `w_code_frame_stores_global`.
+/// `MetaInterpStaticData.jitcodes` roots the wrappers it retains and forwards
+/// this mapping during every minor collection; an executing frame also
+/// refreshes the mapping from its live `pycode` field. The collector destructor
+/// removes every other mapping before its pointer can dangle.
 ///
 /// Process-global, not per-thread: `pycode.py:159` keeps `w_globals` on the
 /// shared `PyCode` instance, and a code object stamped on one thread must be
@@ -3823,16 +3878,18 @@ fn live_code_wrappers() -> &'static parking_lot::Mutex<std::collections::HashMap
     LIVE_CODE_WRAPPERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Record `wrapper` as the live wrapper for `code_ptr`, keeping the first one
-/// stamped (later stores are ignored). No-op on null inputs.
+/// Record `wrapper` as the live wrapper for `code_ptr`. No-op on null inputs.
+///
+/// The frame/function field supplying `wrapper` is the authoritative GC edge.
+/// Refreshing an existing entry is required now that `PyCode` follows
+/// `pycode.py class PyCode(W_Root)` and can move between calls.
 pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
     if code_ptr.is_null() || wrapper.is_null() {
         return;
     }
     live_code_wrappers()
         .lock()
-        .entry(code_ptr as usize)
-        .or_insert(wrapper as usize);
+        .insert(code_ptr as usize, wrapper as usize);
 }
 
 /// Recover the live wrapper previously registered for `code_ptr`, or `PY_NULL`
@@ -3841,10 +3898,34 @@ pub fn live_code_wrapper(code_ptr: *const ()) -> PyObjectRef {
     if code_ptr.is_null() {
         return PY_NULL;
     }
-    live_code_wrappers()
-        .lock()
-        .get(&(code_ptr as usize))
-        .map_or(PY_NULL, |&w| w as PyObjectRef)
+    let mut wrappers = live_code_wrappers().lock();
+    let Some(wrapper) = wrappers.get_mut(&(code_ptr as usize)) else {
+        return PY_NULL;
+    };
+    // A collection root walk may have installed a forwarding pointer before
+    // this side table itself is visited. Follow it eagerly so every reader
+    // sees the live address and write the answer back for later readers.
+    *wrapper = pyre_object::gc_hook::try_gc_current_object_address(*wrapper as *mut u8) as usize;
+    *wrapper as PyObjectRef
+}
+
+/// Forward one JitCode-retained live-wrapper entry in place.
+///
+/// Called only from the collector's per-mutator root-area walk while that
+/// mutator is quiesced. `MetaInterpStaticData.jitcodes` is the strong owner,
+/// matching `warmspot.py self.metainterp_sd.jitcodes`; the address-keyed map is
+/// only pyre's raw-CodeObject compatibility seam.
+pub fn walk_live_code_wrapper(code_ptr: *const (), forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    if code_ptr.is_null() {
+        return;
+    }
+    let mut wrappers = live_code_wrappers().lock();
+    let Some(wrapper) = wrappers.get_mut(&(code_ptr as usize)) else {
+        return;
+    };
+    let mut root = *wrapper as PyObjectRef;
+    forward(&mut root);
+    *wrapper = root as usize;
 }
 
 /// One `box_code_object` allocation graph and what still reads it.
@@ -4668,14 +4749,14 @@ mod tests {
     }
 
     #[test]
-    fn live_code_wrapper_round_trips_first_write() {
+    fn live_code_wrapper_refreshes_to_latest_live_owner() {
         let code = 0x1000usize as *const ();
         let w1 = 0x2000usize as PyObjectRef;
         let w2 = 0x3000usize as PyObjectRef;
         register_live_code_wrapper(code, w1);
-        // First-write-wins: a later store for the same code is ignored.
+        // A later authoritative GC edge refreshes the movable wrapper address.
         register_live_code_wrapper(code, w2);
-        assert_eq!(live_code_wrapper(code), w1);
+        assert_eq!(live_code_wrapper(code), w2);
         // An unregistered code pointer recovers to PY_NULL.
         assert!(live_code_wrapper(0x9999usize as *const ()).is_null());
         // Null inputs are no-ops / recover to PY_NULL.
@@ -4904,7 +4985,7 @@ mod tests {
         }
         assert!(
             visited,
-            "Box-immortal PyCode must expose managed co_consts_w values as roots"
+            "managed PyCode must expose managed co_consts_w values as roots"
         );
 
         let mut globally_visited = false;
