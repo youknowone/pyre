@@ -46,6 +46,11 @@ class _SuperResult:
 # A hot outer method inlines a non-portal callee whose zero-argument super()
 # must read that callee's own frame.  This is the shape used by pluggy's
 # PluginManager.register -> parse_hookimpl_opts call during pytest startup.
+#
+# The loop has to clear `DEFAULT_THRESHOLD` (1039) or the JIT never sees it and
+# the assertion below reports only that the interpreter is right, which is not
+# what this block is here for.  `class_super_zero_arg_inlined_callee.py` gates
+# the same shape.
 class _PluginBase:
     def parse_hookimpl_opts(self, value):
         return value + 1
@@ -57,12 +62,12 @@ class _PluginManager(_PluginBase):
 
     def register(self):
         total = 0
-        for value in range(200):
+        for value in range(2000):
             total += self.parse_hookimpl_opts(value)
         return total
 
 
-assert _PluginManager().register() == sum(range(200)) + 400
+assert _PluginManager().register() == sum(range(2000)) + 4000
 
 
 _super_calls = []
