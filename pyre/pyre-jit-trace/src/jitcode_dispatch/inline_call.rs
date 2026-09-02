@@ -7081,9 +7081,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // those stores also emits the promote guard in
                 // `vable_getfield_*` (`pyjitpl.py:1916,2582`), whose resume
                 // image must include the paused caller frame
-                // (`opencoder.py:819`). Every admitted inline now carries one,
-                // so the remaining question is only whether the callee's own
-                // frame reds were seeded; an unseeded callee keeps folding.
+                // (`opencoder.py capture_resumedata`). Every admitted inline
+                // now carries one, so the remaining question is only whether
+                // the callee's own frame reds were seeded; an unseeded callee
+                // keeps folding.
                 shadow.frame_materialized = callee_frame_materialized_has_resume;
             }
             for i in 0..seeded_locals {

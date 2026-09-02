@@ -1117,7 +1117,7 @@ fn run_frame_through_portal(frame_ptr: i64, entry: PortalEntry) -> i64 {
             // `pos_exc_value()` (`llmodel.py`), `bhimpl_recursive_call_*`
             // through the propagated RPython exception (`blackhole.py`), and
             // the trace-time execution `do_recursive_call` performs through
-            // `metainterp.execute_raised` (`executor.py:52-78`).  Pyre spells
+            // `metainterp.execute_raised` (`executor.py _do_call`).  Pyre spells
             // that one state as two carriers, so this raise owes both:
             // `execute_varargs_call` (majit-metainterp `executor.rs`) reads
             // only `BH_LAST_EXC_VALUE`, and with the backend cells alone it
@@ -1352,15 +1352,16 @@ pub extern "C" fn bh_portal_runner_c(
         Ok(result) => result as i64,
         Err(mut err) => {
             // The other portal door, and it owes the same two carriers for the
-            // same reason: `warmspot.py:998-1006` raises for real, so the state
-            // a portal raise arms is caller-blind.  This address serves both
-            // `bhimpl_recursive_call_*` (`blackhole.py:1095-1116`), which reads
-            // `BH_LAST_EXC_VALUE`, and — through `get_jitcode_calldescr` — the
-            // `fnaddr` every JitCode carries, which upstream is a call target
-            // for `bhimpl_inline_call_*` (`blackhole.py:1284`) and for a trace's
-            // own residual call, and those read the backend cells.  Publishing
-            // both is also what the catch side already assumes: `route_to_catch`
-            // drains `BH_LAST_EXC_VALUE` and the backend cells together.
+            // same reason: `warmspot.py handle_jitexception` raises for real,
+            // so the state a portal raise arms is caller-blind.  This address
+            // serves both `bhimpl_recursive_call_*` (`blackhole.py`), which
+            // reads `BH_LAST_EXC_VALUE`, and — through `get_jitcode_calldescr`
+            // — the `fnaddr` every JitCode carries, which upstream is a call
+            // target for `bhimpl_inline_call_*` (`blackhole.py`) and for a
+            // trace's own residual call, and those read the backend cells.
+            // Publishing both is also what the catch side already assumes:
+            // `route_to_catch` drains `BH_LAST_EXC_VALUE` and the backend cells
+            // together.
             publish_residual_call_exception(err.to_exc_object() as i64);
             pyre_object::PY_NULL as i64
         }
@@ -3420,7 +3421,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                 // publishes the pending exception, not just cranelift.
                 //
                 // Both carriers, because `handle_jitexception` reaches this arm
-                // by `raise value` (warmspot.py:996-1003) into RPython's single
+                // by `raise value` (warmspot.py) into RPython's single
                 // ll exception state, which is caller-blind: the compiled
                 // `CALL_ASSEMBLER` reads it through the backend cells and the
                 // walker's trace-time `execute_varargs_call` reads it through

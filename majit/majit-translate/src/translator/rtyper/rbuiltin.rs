@@ -4725,10 +4725,10 @@ mod tests {
         assert!(err.to_string().contains("rtype_builtin_bool"));
     }
 
-    /// `rvirtualizable.py:49 VirtualizableInstanceRepr.hook_access_field`
+    /// `rvirtualizable.py VirtualizableInstanceRepr.hook_access_field`
     /// emits the force for every redirected field.  Pyre spells that hook as a
     /// callable marker, so this typer is what each frame gateway's force
-    /// resolves to, and its emitted shape is what `jtransform.py:2164-2172
+    /// resolves to, and its emitted shape is what `jtransform.py
     /// rewrite_op_jit_force_virtualizable` matches on when it deletes the op
     /// from a looked-inside graph.  A wrong arity, a lost repr conversion or a
     /// missing exception declaration would break every gateway silently.
