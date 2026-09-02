@@ -1012,6 +1012,27 @@ impl<'a> Transformer<'a> {
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
 
+        // `jtransform.py transform_graph` opens with
+        // `constant_fold_ll_issubclass(graph, cpu)`, which folds a
+        // `direct_call` to `exceptiondata.fn_exception_match` whose
+        // arguments are all `Constant`.  It has no counterpart here, and
+        // cannot acquire one without two upstream pieces pyre does not
+        // have:
+        //
+        // * The calls it folds are the ones `inline.py`'s
+        //   `rewire_exceptblock_with_guard` / `generic_exception_matching`
+        //   insert.  `Inliner::inline_once` refuses that whole path with
+        //   `CannotInline`, so no such call is ever inserted.
+        // * `rclass::ll_issubclass`, `ll_issubclass_const` and
+        //   `ll_isinstance` are not lifted at all — `cutover` skips their
+        //   bodies (`skip-issubclass-helper-body`) because
+        //   `flowspace_adapter::translate_op` has already rewritten every
+        //   call site into the high-level `issubtype` / `isinstance` op,
+        //   which the rtyper lowers to an `int_between`-over-
+        //   `subclassrange` helper graph.  A constant-argument class check
+        //   therefore reaches this pass as a range test on constants, not
+        //   as a call to fold.
+
         // RPython `rtyper/rpbc.py::SingleFrozenPBCRepr` resolves
         // zero-arg unit-variant PBC ctors to a singleton
         // `Constant(prebuilt_instance_ptr)` before jtransform runs.
@@ -3367,6 +3388,26 @@ impl<'a> Transformer<'a> {
     /// * `IR_QUASIIMMUTABLE[_ARRAY]` → emit `[-live-, record_quasiimmut_field,
     ///   getfield_*_pure]` — `jtransform.py:895-903`.
     /// * mutable                  → keep as-is.
+    ///
+    /// Three upstream branches of `rewrite_op_getfield` are absent because
+    /// nothing in pyre produces the op shape they test for:
+    ///
+    /// * `is_typeptr_getset` → `handle_getfield_typeptr`, which replaces the
+    ///   read with `[-live-, guard_class]`.  Pyre never reads the class word
+    ///   through a field access — the header words are folded into
+    ///   `new_with_vtable` on the store side, and `heaptracker::is_header_word`
+    ///   keeps `typeptr` / `ob_type` / `PyObject::w_class` out of the
+    ///   field-descriptor census entirely, so no descriptor exists to match.
+    /// * the `rstr.STR` / `rstr.UNICODE` hash check that rewrites to
+    ///   `strhash` / `unicodehash`.  Those are not pyre opcodes: the
+    ///   `bh_strhash` / `bh_unicodehash` helpers exist at the backend layer
+    ///   for dict lookups, but there is no `OpCode` for either, and a string
+    ///   constant's hash is precomputed into the jitcode's `str_consts`
+    ///   rather than read from the object at run time.
+    /// * the `_greenfield` variant, gated on
+    ///   `CallControl::could_be_green_field`.  The query is implemented as a
+    ///   structural predicate, but `pyjitpl` has no greenfield mechanism to
+    ///   answer it against, so the rank is never `_greenfield`.
     fn rewrite_op_getfield(
         &mut self,
         op: &SpaceOperation,
