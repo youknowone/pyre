@@ -6253,8 +6253,10 @@ fn build_function(
                 }
             }
             // Emitted by `RawBufferPtrInfo::_force_elements` after a
-            // `RAW_MALLOC_VARSIZE_CHAR`, which pyre never produces, so this
-            // does not reach a wasm trace today. Declined rather than skipped:
+            // `RAW_MALLOC_VARSIZE_CHAR`. The sole carrier of that oopspec is
+            // `_cffi_backend::cdataobj::raw_malloc_varsize_char`, and
+            // `_cffi_backend` is not compiled for wasm32, so this does not
+            // reach a wasm trace. Declined rather than skipped:
             // the allocation helpers do return 0 on OOM (that is how
             // `alloc_with_type` drives this op on the native backends), and an
             // unchecked null is worse on wasm than on native — address 0 is

@@ -3161,8 +3161,10 @@ impl OptHeap {
     /// thirteen `list.*` entries in `pyre-object/src/listobject.rs`, and the
     /// programmatic `mark_oopspec` table registers only the `jit.*` builtins and
     /// `newlist_clear` — so `_handle_stroruni_call` never fires and the
-    /// `opt_call_stroruni_*` handlers are unreachable.  And nothing ever assigns
-    /// `RawMallocVarsizeChar` to a call, so no virtual raw buffer is built.
+    /// `opt_call_stroruni_*` handlers are unreachable.  The raw-buffer half now
+    /// has one carrier, `_cffi_backend::cdataobj::raw_malloc_varsize_char`, so
+    /// a build that includes that module can reach the virtual raw buffer;
+    /// wasm32, which excludes it, cannot.
     ///
     /// Annotating a string helper with
     /// `#[majit_macros::oopspec("stroruni.concat")]` is what would make this
