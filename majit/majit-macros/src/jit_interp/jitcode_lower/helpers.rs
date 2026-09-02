@@ -578,6 +578,66 @@ pub(super) fn binop_f_emit_tokens(
     quote! { __builder.record_binop_f(#dst, majit_ir::OpCode::#opcode, #lhs, #rhs); }
 }
 
+/// jtransform.py `_rewrite_symmetric`'s binding list, in this layer's operator
+/// domain: the symmetric arithmetic and bitwise operators plus every
+/// comparison (upstream binds `int_lt` .. `uint_ge` and `float_lt` ..
+/// `float_ge`, and reaches the same function again as `_rewrite_equality`'s
+/// fallthrough for `int_eq` / `int_ne` / `ptr_eq` / `ptr_ne`).  `-`, the
+/// divisions and the shifts are absent for the same reason they are absent
+/// upstream: they are not symmetric.
+pub(super) fn binop_is_symmetric(op: &BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add(_)
+            | BinOp::Mul(_)
+            | BinOp::BitAnd(_)
+            | BinOp::BitOr(_)
+            | BinOp::BitXor(_)
+            | BinOp::And(_)
+            | BinOp::Or(_)
+            | BinOp::Eq(_)
+            | BinOp::Ne(_)
+            | BinOp::Lt(_)
+            | BinOp::Le(_)
+            | BinOp::Gt(_)
+            | BinOp::Ge(_)
+    )
+}
+
+/// jtransform.py `_rewrite_symmetric`'s `reversename` table: swapping the
+/// operands of an ordered comparison mirrors it.  Everything else keeps its
+/// operator, which is upstream's `.get(op.opname, op.opname)` default.
+pub(super) fn mirrored_compare_binop(op: &BinOp) -> BinOp {
+    match op {
+        BinOp::Lt(_) => BinOp::Gt(Default::default()),
+        BinOp::Le(_) => BinOp::Ge(Default::default()),
+        BinOp::Gt(_) => BinOp::Lt(Default::default()),
+        BinOp::Ge(_) => BinOp::Le(Default::default()),
+        other => *other,
+    }
+}
+
+/// `isinstance(arg, Constant)` plus the `arg.value` `_rewrite_equality` tests,
+/// answered at the layer this lowering runs in: the operand is still a source
+/// literal, not yet a flow-graph `Constant`.  A `bool` literal counts because
+/// its lowered register holds `0` / `1`, which is the same `lltype.Bool` the
+/// upstream test sees.
+pub(super) fn int_literal_value(expr: &syn::Expr) -> Option<i64> {
+    match expr {
+        syn::Expr::Group(group) => int_literal_value(&group.expr),
+        syn::Expr::Paren(paren) => int_literal_value(&paren.expr),
+        syn::Expr::Lit(lit) => match &lit.lit {
+            syn::Lit::Int(value) => value.base10_parse::<i64>().ok(),
+            syn::Lit::Bool(value) => Some(i64::from(value.value)),
+            _ => None,
+        },
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+            int_literal_value(&unary.expr).and_then(i64::checked_neg)
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn opcode_for_binop(op: &BinOp) -> Option<Ident> {
     let name = match op {
         BinOp::Add(_) => "IntAdd",

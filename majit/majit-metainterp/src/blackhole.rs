@@ -9652,6 +9652,12 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         // absent from this curated set, so a blackhole-executed drain hit
         // the unwired-opcode panic at the first back-edge test.
         ("int_is_true/i>i", majit_translate::insns::BC_INT_IS_TRUE),
+        // `int_is_zero/i>i` — the `not a` sibling of `int_is_true`
+        // (`blackhole.py bhimpl_int_is_zero`).  Same wiring gap as the
+        // entry above: `wire_bhimpl_handlers` binds `handler_int_is_zero`,
+        // so without the byte here `wire_handler` no-ops and a
+        // blackhole-executed `x == 0` test hits the unwired-opcode panic.
+        ("int_is_zero/i>i", majit_translate::insns::BC_INT_IS_ZERO),
         ("float_add/ff>f", majit_translate::insns::BC_FLOAT_ADD),
         ("float_sub/ff>f", majit_translate::insns::BC_FLOAT_SUB),
         ("float_mul/ff>f", majit_translate::insns::BC_FLOAT_MUL),

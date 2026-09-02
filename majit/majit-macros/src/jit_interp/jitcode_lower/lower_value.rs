@@ -2235,13 +2235,111 @@ impl<'c> Lowerer<'c> {
                 struct_type: None,
             });
         }
+        // jtransform.py `rewrite_op_ptr_eq` / `rewrite_op_ptr_ne`: comparing
+        // two pointers is `ptr_eq` / `ptr_ne`, not the integer compare.  Both
+        // operands stay ref-banked and the result is int (`ptr_eq/rr>i`) --
+        // the same split the float arm above makes, with the banks carried on
+        // the `Register`s so `BinopI` is only the op-kind label.  Before this
+        // arm a Ref pair fell through to the Int check below and declined,
+        // which degraded the whole dispatch arm to the interpreter.
+        //
+        // RPython promotes the pair to `instance_ptr_eq` / `instance_ptr_ne`
+        // when `_is_rclass_instance(args[0])`, asserting the other side is one
+        // too.  `struct_type` is this layer's record of "a Ref whose struct is
+        // known", so both sides carrying one is that same fact.  Only one side
+        // carrying it means the lowering never tracked the other, not that it
+        // is not an instance, so that case takes the plain pointer compare
+        // instead of upstream's assert.
+        //
+        // RPython has no ordered pointer comparison, so any other operator
+        // declines and the arm keeps running in the interpreter.
+        if matches!(lhs.kind, BindingKind::Ref) && matches!(rhs.kind, BindingKind::Ref) {
+            let is_eq = match expr.op {
+                BinOp::Eq(_) => true,
+                BinOp::Ne(_) => false,
+                _ => return None,
+            };
+            let both_instances = lhs.struct_type.is_some() && rhs.struct_type.is_some();
+            let name = match (both_instances, is_eq) {
+                (true, true) => "InstancePtrEq",
+                (true, false) => "InstancePtrNe",
+                (false, true) => "PtrEq",
+                (false, false) => "PtrNe",
+            };
+            let opcode = Ident::new(name, proc_macro2::Span::call_site());
+            let reg = self.alloc_reg();
+            let lhs_reg = lhs.reg;
+            let rhs_reg = rhs.reg;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopI,
+                    Register::refs(&[lhs_reg, rhs_reg]),
+                    vec![Register::int(reg)],
+                ),
+                quote! { __builder.record_binop_r(#reg, majit_ir::OpCode::#opcode, #lhs_reg, #rhs_reg); },
+            );
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Int,
+                depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+                struct_type: None,
+            });
+        }
         if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
             return None;
         }
-        let opcode = opcode_for_binop(&expr.op)?;
+        let depends_on_stack = lhs.depends_on_stack || rhs.depends_on_stack;
+        // jtransform.py `_rewrite_symmetric` -- "rewrite 'c1+v2' into 'v2+c1'
+        // in an attempt to avoid generating too many variants of the
+        // bytecode".  Upstream reads `isinstance(op.args[0], Constant)` off
+        // the flow graph; here the constant is still a source literal, so the
+        // syn expression answers the same question.  Swapping the operands of
+        // an ordered comparison mirrors it; every other operator keeps its
+        // spelling, which is upstream's `.get(op.opname, op.opname)` default.
+        let swap = binop_is_symmetric(&expr.op)
+            && int_literal_value(&expr.left).is_some()
+            && int_literal_value(&expr.right).is_none();
+        let (op, rhs_expr, lhs_reg, rhs_reg) = if swap {
+            (
+                mirrored_compare_binop(&expr.op),
+                &*expr.left,
+                rhs.reg,
+                lhs.reg,
+            )
+        } else {
+            (expr.op, &*expr.right, lhs.reg, rhs.reg)
+        };
+        // jtransform.py `_rewrite_equality` via `rewrite_op_int_eq` /
+        // `rewrite_op_int_ne`: a comparison against zero is the unary
+        // `int_is_zero` / `int_is_true`, which is also the form
+        // `goto_if_not_int_is_zero` can fuse.  The swap above already moved a
+        // literal left operand to the right, so both spellings arrive here as
+        // `<value> <op> 0`.
+        if matches!(op, BinOp::Eq(_) | BinOp::Ne(_)) && int_literal_value(rhs_expr) == Some(0) {
+            let name = if matches!(op, BinOp::Eq(_)) {
+                "IntIsZero"
+            } else {
+                "IntIsTrue"
+            };
+            let opcode = Ident::new(name, proc_macro2::Span::call_site());
+            let reg = self.alloc_reg();
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::UnaryI,
+                    Register::ints(&[lhs_reg]),
+                    vec![Register::int(reg)],
+                ),
+                quote! { __builder.record_unary_i(#reg, majit_ir::OpCode::#opcode, #lhs_reg); },
+            );
+            return Some(Binding {
+                reg,
+                kind: BindingKind::Int,
+                depends_on_stack,
+                struct_type: None,
+            });
+        }
+        let opcode = opcode_for_binop(&op)?;
         let reg = self.alloc_reg();
-        let lhs_reg = lhs.reg;
-        let rhs_reg = rhs.reg;
         self.emit_op(
             OpMeta::linear(
                 OpKind::BinopI,
@@ -2253,7 +2351,7 @@ impl<'c> Lowerer<'c> {
         Some(Binding {
             reg,
             kind: BindingKind::Int,
-            depends_on_stack: lhs.depends_on_stack || rhs.depends_on_stack,
+            depends_on_stack,
             struct_type: None,
         })
     }
@@ -2869,5 +2967,167 @@ mod tests {
         assert_eq!(lowerer.lower_record_exact_class_stmt(&expr), None);
         assert!(lowerer.op_metadata.is_empty());
         assert!(lowerer.statements.is_empty());
+    }
+
+    /// `rewrite_op_ptr_eq` / `_rewrite_equality` / `_rewrite_symmetric` at the
+    /// jitcode-lowering layer.  Each test drives `lower_binary` through
+    /// `lower_value_expr` so the operand bindings are the ones production
+    /// builds.
+    mod ptr_and_equality_tests {
+        use super::*;
+
+        fn emitted(lowerer: &Lowerer<'_>) -> String {
+            lowerer
+                .statements
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        fn lower(
+            src: &str,
+            setup: impl FnOnce(&mut Lowerer<'_>),
+        ) -> (Lowerer<'static>, Option<Binding>) {
+            let mut lowerer = Lowerer::new(None);
+            setup(&mut lowerer);
+            let expr: Expr = syn::parse_str(src).expect("parse binary expr");
+            let Expr::Binary(binary) = expr else {
+                panic!("expected a binary expression");
+            };
+            let out = lowerer.lower_binary(&binary);
+            (lowerer, out)
+        }
+
+        fn ref_binding(reg: u16, struct_type: Option<syn::Path>) -> Binding {
+            Binding {
+                reg,
+                kind: BindingKind::Ref,
+                depends_on_stack: false,
+                struct_type,
+            }
+        }
+
+        #[test]
+        fn two_ref_operands_compare_with_ptr_eq() {
+            let (lowerer, out) = lower("a == b", |l| {
+                l.bindings.insert("a".into(), ref_binding(0, None));
+                l.bindings.insert("b".into(), ref_binding(1, None));
+            });
+            assert!(out.is_some(), "a Ref pair must not decline the arm");
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("record_binop_r") && text.contains("PtrEq"),
+                "expected ptr_eq, got:\n{text}"
+            );
+        }
+
+        #[test]
+        fn two_ref_operands_compare_with_ptr_ne() {
+            let (lowerer, out) = lower("a != b", |l| {
+                l.bindings.insert("a".into(), ref_binding(0, None));
+                l.bindings.insert("b".into(), ref_binding(1, None));
+            });
+            assert!(out.is_some());
+            assert!(emitted(&lowerer).contains("PtrNe"));
+        }
+
+        #[test]
+        fn an_ordered_compare_over_refs_still_declines() {
+            let (_lowerer, out) = lower("a < b", |l| {
+                l.bindings.insert("a".into(), ref_binding(0, None));
+                l.bindings.insert("b".into(), ref_binding(1, None));
+            });
+            assert!(out.is_none(), "RPython has no ordered pointer comparison");
+        }
+
+        #[test]
+        fn two_tracked_struct_refs_use_instance_ptr_eq() {
+            let path: syn::Path = syn::parse_quote!(Frame);
+            let (lowerer, out) = lower("a == b", |l| {
+                l.bindings
+                    .insert("a".into(), ref_binding(0, Some(path.clone())));
+                l.bindings.insert("b".into(), ref_binding(1, Some(path)));
+            });
+            assert!(out.is_some());
+            assert!(
+                emitted(&lowerer).contains("InstancePtrEq"),
+                "both sides carry a struct_type, which is this layer's \
+                 `_is_rclass_instance`"
+            );
+        }
+
+        #[test]
+        fn an_int_equality_against_zero_lowers_to_int_is_zero() {
+            let (lowerer, out) = lower("n == 0", |l| {
+                l.bindings.insert("n".into(), binding(4, BindingKind::Int));
+            });
+            assert!(out.is_some());
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("record_unary_i") && text.contains("IntIsZero"),
+                "expected the unary zero test, got:\n{text}"
+            );
+        }
+
+        #[test]
+        fn an_int_inequality_against_zero_lowers_to_int_is_true() {
+            let (lowerer, out) = lower("n != 0", |l| {
+                l.bindings.insert("n".into(), binding(4, BindingKind::Int));
+            });
+            assert!(out.is_some());
+            assert!(emitted(&lowerer).contains("IntIsTrue"));
+        }
+
+        #[test]
+        fn a_zero_on_the_left_folds_the_same_way() {
+            let (lowerer, out) = lower("0 == n", |l| {
+                l.bindings.insert("n".into(), binding(4, BindingKind::Int));
+            });
+            assert!(out.is_some());
+            assert!(
+                emitted(&lowerer).contains("IntIsZero"),
+                "`0 == n` is `_rewrite_symmetric` then the same fold"
+            );
+        }
+
+        #[test]
+        fn a_literal_left_operand_of_an_ordered_compare_mirrors_it() {
+            let (lowerer, out) = lower("5 < n", |l| {
+                l.bindings.insert("n".into(), binding(4, BindingKind::Int));
+            });
+            assert!(out.is_some());
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("IntGt"),
+                "`5 < n` must become `n > 5`, got:\n{text}"
+            );
+        }
+
+        #[test]
+        fn a_subtraction_keeps_its_literal_left_operand() {
+            let (lowerer, out) = lower("5 - n", |l| {
+                l.bindings.insert("n".into(), binding(4, BindingKind::Int));
+            });
+            assert!(out.is_some());
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("IntSub"),
+                "`-` is not symmetric, got:\n{text}"
+            );
+        }
+
+        #[test]
+        fn a_nonzero_literal_keeps_the_binary_compare() {
+            let (lowerer, out) = lower("n == 5", |l| {
+                l.bindings.insert("n".into(), binding(4, BindingKind::Int));
+            });
+            assert!(out.is_some());
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("IntEq") && !text.contains("IntIsZero"),
+                "only the zero literal folds, got:\n{text}"
+            );
+        }
     }
 }
