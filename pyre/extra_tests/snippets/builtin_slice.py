@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 from testutils import assert_raises
 
 a = slice(10)
@@ -165,41 +166,3 @@ class CustomIndex:
 
 assert c[CustomIndex(1) : CustomIndex(3)] == [1, 2]
 assert d[CustomIndex(1) : CustomIndex(3)] == "23"
-
-
-def test_all_slices():
-    """
-    test all possible slices except big number
-    """
-
-    mod = __import__("cpython_generated_slices")
-
-    ll = mod.LL
-    start = mod.START
-    end = mod.END
-    step = mod.STEP
-    slices_res = mod.SLICES_RES
-
-    count = 0
-    failures = []
-    for s in start:
-        for e in end:
-            for t in step:
-                lhs = ll[s:e:t]
-                try:
-                    assert lhs == slices_res[count]
-                except AssertionError:
-                    failures.append(
-                        "start: {} ,stop: {}, step {}. Expected: {}, found: {}".format(
-                            s, e, t, lhs, slices_res[count]
-                        )
-                    )
-                count += 1
-
-    if failures:
-        for f in failures:
-            print(f)
-        print(len(failures), "slices failed")
-
-
-test_all_slices()

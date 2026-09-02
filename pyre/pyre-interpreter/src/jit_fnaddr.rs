@@ -4598,8 +4598,9 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
 /// appears in the first and not the second.  A name bound at build time and
 /// missing at run time keeps the build-process address baked in the constant
 /// pool, because `runtime_fnaddr_patch::patch_static_addr_constants` re-pairs
-/// only names present in both; `reject_unpaired_build_addrs` refuses the load
-/// once such an address actually reaches a constant pool.
+/// only names present in both; `disarm_unpaired_build_addrs` writes zero over
+/// such an address, which is the "no address" value every call site already
+/// declines.
 pub fn pyre_class_pytype_addrs() -> Vec<(&'static str, i64)> {
     let mut rows = Vec::new();
     pyre_object::lltype::for_each_class_descriptor(|d| {

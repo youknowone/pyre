@@ -294,12 +294,19 @@ static UNPAIRED_BUILD_ADDRS: LazyLock<HashMap<i64, String>> = LazyLock::new(|| {
 ///
 /// Such a value is a pointer into the build-script process, and every use the
 /// pools have for one is wrong with it: as a residual call target it enters
-/// whatever this process holds at that address, as a `PyType` operand it is
-/// dereferenced by a type test, and as a pointer-`eq` operand it answers "not
-/// this type" for every object.  Zero is the substitute because it is the one
-/// value none of those can mistake for a real target — a call through it faults
-/// on the first instruction, a dereference faults at the first field, and a
-/// comparison never matches.
+/// whatever this process holds at that address, and as a `PyType` operand it is
+/// dereferenced by a type test or compared against every object's type.
+///
+/// Zero is not a chosen poison, it is the spelling this already has for "no
+/// address" — `jitcode.py JitCode.__init__ fnaddr=None` — and both consumers
+/// test for it before they branch.  A call target goes through
+/// `is_callable_fnaddr`, so the blackhole's `residual_call_*` and
+/// `inline_call_*` handlers decline it and hand the continuation back to the
+/// interpreter, and the walker's residual path declines the same value as
+/// `ResidualDecline::Symbolic`.  A type operand is only ever compared, and a
+/// comparison against zero matches no object, so the guard reading it fails
+/// and the path leaves the JIT before anything can dereference it.  That is
+/// what makes zero an answer here rather than a trap laid for later.
 ///
 /// All three pools are cleared, `constants_r` included: that pool already
 /// carries words that are not gcrefs — patched host statics and pre-patch
