@@ -366,9 +366,9 @@ fn jit_look_inside_hint(hints: &[String]) -> Option<bool> {
 /// over the same startblock-reachable block closure
 /// `graph.iterblocks()` yields.
 ///
-/// The three `supports_*` flags are upstream's signature and stay on
-/// pyre's, but nothing here consults them: the two families they gate
-/// (`Float` under a CPU without float registers, `SingleFloat`) are not
+/// `supports_singlefloats` reaches [`value_type_has_kind`], which is the
+/// flag's whole purpose upstream.  `supports_floats` and
+/// `supports_longlong` stay unconsulted: neither family they gate is
 /// refusable in pyre's `ValueType` domain.  See [`value_type_has_kind`].
 ///
 /// `look_inside_graph` turns a `true` here into a refusal, which makes
@@ -379,7 +379,7 @@ pub fn contains_unsupported_variable_type(
     graph: &FunctionGraph,
     _supports_floats: bool,
     _supports_longlong: bool,
-    _supports_singlefloats: bool,
+    supports_singlefloats: bool,
 ) -> bool {
     // `iterblocks()` parity (`rpython/flowspace/model.py:66`): the
     // startblock-reachable closure over `Block.exits`, id-keyed because
@@ -399,7 +399,10 @@ pub fn contains_unsupported_variable_type(
         for op in &block.operations {
             declared.clear();
             collect_declared_value_types(&op.kind, &mut declared);
-            if declared.iter().any(|ty| !value_type_has_kind(ty)) {
+            if declared
+                .iter()
+                .any(|ty| !value_type_has_kind(ty, supports_singlefloats))
+            {
                 return true;
             }
         }
@@ -411,16 +414,31 @@ pub fn contains_unsupported_variable_type(
 /// Whether `history.py:56-69 getkind(TYPE, ...)` has a register kind for
 /// `ty`, or raises `NotImplementedError` on it.
 ///
-/// `getkind` refuses three families.  Two of them have no [`ValueType`]
-/// spelling to refuse:
+/// `getkind` refuses three families.
 ///
-///   - `SingleFloat` (`history.py:59`, refused when the CPU has no
-///     single-float support) has no variant in this enum at all.
-///   - `Float` is refused by the same line when `supports_floats` is
-///     false, but pyre's kind projection does not model a float-less
-///     CPU: both `value_type_to_kind` copies map `Float` to `'f'`
-///     unconditionally, so refusing a graph for a float here would
-///     refuse one the codewriter goes on to lower.
+/// `history.py:58-61` refuses `SingleFloat` unless the CPU supports
+/// single floats, which is what `supports_singlefloats` carries.  Pyre's
+/// effective value is `false`: `warmspot.py:250`
+/// (`policy.set_supports_singlefloats(cpu.supports_singlefloats)`) has no
+/// port, so the flag keeps the base backend's answer
+/// (`backend/model.py:20`).
+///
+/// It must stay false for a reason upstream does not have to state.
+/// Upstream's "singlefloats are stored in an int" holds because RPython
+/// gives `SingleFloat` no arithmetic at all — `rffi` converts to `Float`,
+/// computes, and converts back, so the rtyper never emits a float-kind
+/// operation over a SingleFloat operand.  Rust source does contain native
+/// `f32` arithmetic, and pyre has no `cast_singlefloat_to_float` to
+/// bracket it with, so an accepted `f32` graph lowers that arithmetic
+/// over the float's bit pattern in the integer bank.  Flipping this flag
+/// is sound only once those casts exist and `f32` arithmetic lowers
+/// through them.
+///
+/// `Float` is refused by the same line when `supports_floats` is false,
+/// but pyre's kind projection does not model a float-less CPU: both
+/// `value_type_to_kind` copies map `Float` to `'f'` unconditionally, so
+/// refusing a graph for a float here would refuse one the codewriter goes
+/// on to lower.
 ///
 /// The third is `history.py:60-63`, `"type %s is too large"`, for a
 /// primitive wider than `Signed`.  [`ValueType::Int128`] /
@@ -433,10 +451,14 @@ pub fn contains_unsupported_variable_type(
 /// copies, `jtransform`'s `value_type_to_ir_type`, `flatten`'s
 /// `constvalue_kind`, and `call`'s array-descr item projection — and the
 /// one this refuses.
-fn value_type_has_kind(ty: &ValueType) -> bool {
+fn value_type_has_kind(ty: &ValueType, supports_singlefloats: bool) -> bool {
     match ty {
         // `raise NotImplementedError("type %s is too large" % TYPE)`
         ValueType::Int128 | ValueType::UInt128 => false,
+        // `if TYPE is lltype.SingleFloat and supports_singlefloats`,
+        // falling through to `raise NotImplementedError("type %s not
+        // supported" % TYPE)` when it does not.
+        ValueType::SingleFloat => supports_singlefloats,
         ValueType::Int
         | ValueType::Unsigned
         | ValueType::Bool
@@ -735,6 +757,30 @@ mod tests {
         let entry = g.startblock;
         g.push_op_var(entry, OpKind::ConstUInt128(1), true);
         assert!(contains_unsupported_variable_type(&g, true, true, true));
+    }
+
+    /// `history.py:58-61`: a singlefloat is refused unless the CPU
+    /// supports one, and pyre's effective answer is the base backend's
+    /// `False` (`backend/model.py:20`) because `warmspot.py:250` has no
+    /// port. The flag is honoured rather than hardcoded, so both answers
+    /// are asserted here — the `true` leg is what upstream's x86 gets
+    /// (`backend/x86/runner.py:21`), and reaching it in pyre would need
+    /// the singlefloat casts first.
+    #[test]
+    fn a_singlefloat_is_unsupported_unless_the_cpu_supports_one() {
+        let mut g = FunctionGraph::new("narrow_float");
+        let entry = g.startblock;
+        g.push_op_var(
+            entry,
+            OpKind::Input {
+                name: "x".into(),
+                ty: ValueType::SingleFloat,
+                class_root: None,
+            },
+            true,
+        );
+        assert!(contains_unsupported_variable_type(&g, true, true, false));
+        assert!(!contains_unsupported_variable_type(&g, true, true, true));
     }
 
     /// Word-sized and float values keep their kinds, so an ordinary

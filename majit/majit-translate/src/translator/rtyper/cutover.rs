@@ -2661,6 +2661,7 @@ fn valuetype_to_lltype(vt: &crate::model::ValueType) -> Option<LowLevelType> {
         ValueType::UInt128 => LowLevelType::UnsignedLongLongLong,
         ValueType::Bool => LowLevelType::Bool,
         ValueType::Float => LowLevelType::Float,
+        ValueType::SingleFloat => LowLevelType::SingleFloat,
         ValueType::Str => crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
         ValueType::StringBuilder => {
             crate::translator::rtyper::lltypesystem::rbuilder::STRINGBUILDERPTR.clone()

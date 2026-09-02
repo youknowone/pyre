@@ -81,9 +81,11 @@ pub(crate) fn valuetype_to_concrete(vt: &ValueType) -> ConcreteType {
         ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => ConcreteType::GcRef,
         ValueType::Float => ConcreteType::Float,
         ValueType::Void => ConcreteType::Void,
-        ValueType::State | ValueType::Unknown | ValueType::Int128 | ValueType::UInt128 => {
-            ConcreteType::Unknown
-        }
+        ValueType::State
+        | ValueType::Unknown
+        | ValueType::Int128
+        | ValueType::UInt128
+        | ValueType::SingleFloat => ConcreteType::Unknown,
     }
 }
 

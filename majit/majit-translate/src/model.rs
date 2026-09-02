@@ -39,6 +39,21 @@ pub enum ValueType {
     /// from the word-sized `Int`: PyPy's source translator and rtyper
     /// preserve it, while `history.getkind` rejects it at the JIT
     /// codewriter boundary because it occupies 16 bytes.
+    /// RPython `lltype.SingleFloat` — `rffi.r_singlefloat`, a Rust `f32`.
+    ///
+    /// Distinct from both [`ValueType::Int`] and [`ValueType::Float`].
+    /// `history.getkind` banks it as `'int'` ("singlefloats are stored in
+    /// an int") but only when the CPU supports singlefloats; the base
+    /// backend does not (`backend/model.py:20`), and RPython gives it no
+    /// arithmetic at all — `rffi` converts through `cast_singlefloat_to_float`
+    /// before computing and back afterwards, so the rtyper never emits a
+    /// float-kind operation over a SingleFloat operand.
+    ///
+    /// It is spelled here so the codewriter policy can refuse a graph that
+    /// carries one, rather than collapsing into `Int` and letting Rust's
+    /// native `f32` arithmetic lower to an integer operation over the
+    /// float's bit pattern.
+    SingleFloat,
     Int128,
     /// RPython `r_ulonglonglong` / `lltype.UnsignedLongLongLong`.
     UInt128,

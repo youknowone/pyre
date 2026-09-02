@@ -1479,7 +1479,8 @@ fn tuple_field_value_type(type_name: &str) -> ValueType {
         // kind rather than collapsing into `Int` like the word-sized integers.
         "i128" => ValueType::Int128,
         "u128" => ValueType::UInt128,
-        "bool" | "char" | "f32" | "i8" | "i16" | "i32" | "i64" | "isize" => ValueType::Int,
+        "f32" => ValueType::SingleFloat,
+        "bool" | "char" | "i8" | "i16" | "i32" | "i64" | "isize" => ValueType::Int,
         // A `u*` element shells to an unsigned `SomeInteger`
         // (`valuetype_to_someshell(Unsigned)`), so an `r_uint` tuple element
         // reconciles with the FORCE_ATTRIBUTES seed instead of walling
@@ -20664,6 +20665,11 @@ fn value_type_bank(ty: &ValueType) -> u8 {
         ValueType::Unknown => 5,
         ValueType::Int128 => 6,
         ValueType::UInt128 => 7,
+        // Its own bank, not the integer one `getkind` would give it: a
+        // same-bank pair is aliased without an op, and an `f32` that
+        // aliased an `i64` is what let Rust's native `f32` arithmetic
+        // lower to integer arithmetic over the float's bit pattern.
+        ValueType::SingleFloat => 8,
     }
 }
 
@@ -20901,11 +20907,13 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
                 return ValueType::Bool;
             }
             if let Some(f) = lit_obj.get("Float").and_then(serde_json::Value::as_str) {
-                // `getkind(SingleFloat) == 'int'` (history.py): single
-                // floats live in the int register bank; only `f64`
-                // (`lltype.Float`) keeps the float kind.
+                // A singlefloat is neither `Int` nor `Float`: `getkind`
+                // banks it as `'int'`, but only where the CPU supports
+                // singlefloats, and RPython gives it no arithmetic to
+                // bank in the first place.  Spelling it apart is what
+                // lets the codewriter policy refuse the graph.
                 return if f == "F32" {
-                    ValueType::Int
+                    ValueType::SingleFloat
                 } else {
                     ValueType::Float
                 };
@@ -21440,6 +21448,7 @@ fn dont_look_inside_return_token(
         ValueType::Int128 => "i128",
         ValueType::UInt128 => "u128",
         ValueType::Float => "f64",
+        ValueType::SingleFloat => "f32",
         // A `*mut PyObject` result keeps its typed `OBJECTPTR` lowering, so a
         // caller reading the returned object's fields rtypes against the real
         // struct; the generic `GCREF` `ref` token would erase that and stub
@@ -21574,10 +21583,10 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
                 return ValueType::Bool;
             }
             if let Some(f) = lit_obj.get("Float").and_then(serde_json::Value::as_str) {
-                // `getkind(SingleFloat) == 'int'`: single floats are
-                // int-banked; only `f64` keeps the float kind.
+                // See [`tyref_to_value_type`]: a singlefloat is spelled
+                // apart from both banks so the policy can refuse it.
                 return if f == "F32" {
-                    ValueType::Int
+                    ValueType::SingleFloat
                 } else {
                     ValueType::Float
                 };

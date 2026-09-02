@@ -46,6 +46,13 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
         // codewriter / regalloc share register classes via Int|Unsigned
         // arms downstream.
         ValueType::Int => Some(SomeValue::Integer(SomeInteger::default())),
+        // `SomeSingleFloat`, agreeing with the bookkeeper, which already
+        // shells a Rust `f32` field this way (`bookkeeper.rs`'s `"f32"`
+        // arm).  Shelling it as `SomeInteger` made the two disagree
+        // about the same type.
+        ValueType::SingleFloat => Some(SomeValue::SingleFloat(
+            crate::annotator::model::SomeSingleFloat::new(),
+        )),
         ValueType::Unsigned => Some(SomeValue::Integer(SomeInteger::new(false, true))),
         ValueType::Int128 => Some(SomeValue::Integer(SomeInteger::new_with_knowntype(
             false,

@@ -3572,6 +3572,12 @@ fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
         ValueType::Int128 | ValueType::UInt128 => {
             panic!("getkind: 128-bit integer type is too large (history.py:62)")
         }
+        ValueType::SingleFloat => panic!(
+            "getkind: SingleFloat is not supported (history.py:61) — majit is \
+             the `supports_singlefloats = False` CPU (backend/model.py:20), so \
+             the codewriter policy refuses a graph carrying one; reaching here \
+             means a carrier escaped `collect_declared_value_types`"
+        ),
     }
 }
 

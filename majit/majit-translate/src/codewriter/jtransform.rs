@@ -1499,7 +1499,10 @@ impl<'a> Transformer<'a> {
             }
             ValueType::Float => crate::codewriter::type_state::ConcreteType::Float,
             ValueType::Void => crate::codewriter::type_state::ConcreteType::Void,
-            ValueType::Unknown | ValueType::Int128 | ValueType::UInt128 => return,
+            ValueType::Unknown
+            | ValueType::Int128
+            | ValueType::UInt128
+            | ValueType::SingleFloat => return,
         };
         self.stamp_value_kind(graph, value, ty);
     }
@@ -7719,6 +7722,12 @@ fn value_type_to_kind(ty: &ValueType) -> char {
         ValueType::Int128 | ValueType::UInt128 => {
             panic!("getkind: 128-bit integer type is too large (history.py:62)")
         }
+        ValueType::SingleFloat => panic!(
+            "getkind: SingleFloat is not supported (history.py:61) — majit is \
+             the `supports_singlefloats = False` CPU (backend/model.py:20), so \
+             the codewriter policy refuses a graph carrying one; reaching here \
+             means a carrier escaped `collect_declared_value_types`"
+        ),
     }
 }
 
@@ -7790,6 +7799,12 @@ fn value_type_to_ir_type(ty: &ValueType) -> majit_ir::value::Type {
         ValueType::Int128 | ValueType::UInt128 => {
             panic!("getkind: 128-bit integer type is too large (history.py:62)")
         }
+        ValueType::SingleFloat => panic!(
+            "getkind: SingleFloat is not supported (history.py:61) — majit is \
+             the `supports_singlefloats = False` CPU (backend/model.py:20), so \
+             the codewriter policy refuses a graph carrying one; reaching here \
+             means a carrier escaped `collect_declared_value_types`"
+        ),
     }
 }
 
@@ -15317,6 +15332,7 @@ mod tests {
                 "String"
             }
             ValueType::Float => "f64",
+            ValueType::SingleFloat => "f32",
             ValueType::Void => "",
             ValueType::Bool => "bool",
             ValueType::Int128 => "i128",
@@ -15571,6 +15587,7 @@ mod tests {
                 "String"
             }
             ValueType::Float => "f64",
+            ValueType::SingleFloat => "f32",
             ValueType::Void => "",
             ValueType::Bool => "bool",
             ValueType::Int128 => "i128",
