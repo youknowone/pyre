@@ -3549,7 +3549,7 @@ pub fn step<Sym: WalkSym>(
     // Consume it first so the marker on the following real op captures this
     // opcode's own live anchor rather than the preceding one's.
     if op.opname != "live" && !op.key.starts_with("jit_merge_point") {
-        if let Some(outcome) = record_python_debug_merge_point(ctx, op.pc)? {
+        if let Some(outcome) = record_python_debug_merge_point(ctx, code, op.pc)? {
             return Ok((outcome, op.next_pc));
         }
     }
@@ -5366,32 +5366,15 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
                 return Ok(false);
             }
         }
-        // `pyjitpl.py _establish_nullity`: a box's nullity is immutable, so a
-        // guard the trace already carries answers for every later fold site.
-        // Every LOAD_GLOBAL in the frame reaches here, and a trace that
-        // re-records the same guard per site spends its `trace_limit` on ops
-        // the optimizer then removes.
-        let known = ctx
-            .trace_ctx
-            .heap_cache()
-            .is_nullity_known(debugdata_op, |op| {
-                op.inline_const_to_value().and_then(|v| match v {
-                    majit_ir::Value::Int(n) => Some(n),
-                    majit_ir::Value::Ref(gc) => Some(gc.0 as i64),
-                    _ => None,
-                })
-            });
-        if known != Some(present) {
-            let opcode = if present {
-                OpCode::GuardNonnull
-            } else {
-                OpCode::GuardIsnull
-            };
-            walker_emit_fold_guard_with_snapshot(ctx, op_pc, opcode, &[debugdata_op])?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .nullity_now_known(debugdata_op, present);
-        }
+        // Every LOAD_GLOBAL in the frame reaches here, and the emitter's
+        // `_establish_nullity` consult is what keeps the second one from
+        // spending `trace_limit` on a guard the first already carries.
+        let opcode = if present {
+            OpCode::GuardNonnull
+        } else {
+            OpCode::GuardIsnull
+        };
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, opcode, &[debugdata_op])?;
         if !present {
             // No payload, so the namespace IS `pycode.w_globals` — the constant
             // already compared above.
@@ -8130,12 +8113,24 @@ impl ActiveResumeFrame {
 /// transient, then resume without the caught exception.
 fn record_python_debug_merge_point<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
     jit_pc: usize,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     let Some(active) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) else {
         return Ok(None);
     };
     if active.0.code_ptr.is_null() || !active.0.metadata.built_as_portal {
+        return Ok(None);
+    }
+    // `jit_pc` indexes the body being walked, and `py_floor_by_jit_pc`
+    // indexes the active frame's.  A helper sub-walk pushes no Python frame,
+    // so the active frame stays the caller's while the offsets restart from
+    // zero inside the helper, and a small offset that happens to land on one
+    // of the caller's opcode boundaries reads back as a dispatch of the
+    // caller's first instructions.  `debug_merge_point` belongs to
+    // `opimpl_jit_merge_point` (`pyjitpl.py`), which only the portal reaches,
+    // so require the walked body to be the frame's own.
+    if !std::ptr::eq(code.as_ptr(), active.0.jitcode.code.as_slice().as_ptr()) {
         return Ok(None);
     }
     let Ok(boundary_index) = active
@@ -9584,15 +9579,62 @@ fn walker_coerce_dispatching_operand_to_float<Sym: WalkSym>(
 /// Emit a walker-native guard (`record_guard` + the walker snapshot for
 /// the just-recorded guard).  Mirrors `MIFrame::generate_guard` for the
 /// full-body walk.
+///
+/// A guard whose subject is a constant is not recorded, matching
+/// `pyjitpl.py generate_guard`'s `if isinstance(box, Const): return`: the
+/// property the guard would test is already decided by the constant, so the
+/// op is dead weight the trace still pays for against `trace_limit`.  The
+/// first argument of a data guard is its subject; a control-flow guard
+/// (`GUARD_NOT_INVALIDATED`, ...) passes none and is always recorded, which is
+/// the `box=None` arm of the same test.
 fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     opcode: OpCode,
     args: &[OpRef],
 ) -> Result<(), DispatchError> {
+    let subject = args.first().copied();
+    if subject.is_some_and(|arg| arg.is_constant()) {
+        return Ok(());
+    }
+    // `pyjitpl.py _establish_nullity`: a box's nullity is immutable, so the
+    // first guard on it answers for every later site, and `heapcache.py
+    // is_nullity_known` is what the second site asks.  A fold reaches a
+    // receiver the surrounding opcode has already proved non-null often
+    // enough that the repeat is a whole operand's worth of `trace_limit`.
+    let nullity = match opcode {
+        OpCode::GuardNonnull => Some(true),
+        OpCode::GuardIsnull => Some(false),
+        _ => None,
+    };
+    if let (Some(subject), Some(is_nonnull)) = (subject, nullity)
+        && ctx
+            .trace_ctx
+            .heap_cache()
+            .is_nullity_known(subject, walker_inline_const_word)
+            == Some(is_nonnull)
+    {
+        return Ok(());
+    }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
     ctx.trace_ctx.record_guard(opcode, args, 0);
+    if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .nullity_now_known(subject, is_nonnull);
+    }
     walker_capture_snapshot_for_last_guard(ctx, op_pc)
+}
+
+/// The word a constant `OpRef` stands for, in the shape
+/// `heapcache::is_nullity_known` wants: RPython reads `box.getref_base()` off
+/// the box itself, and the Rust constant namespace needs the pool consulted.
+fn walker_inline_const_word(op: OpRef) -> Option<i64> {
+    op.inline_const_to_value().and_then(|v| match v {
+        majit_ir::Value::Int(n) => Some(n),
+        majit_ir::Value::Ref(gc) => Some(gc.0 as i64),
+        _ => None,
+    })
 }
 
 /// A recording-path `GUARD_VALUE(box, const)` has already observed equality.
@@ -9607,26 +9649,20 @@ fn stamp_guard_value_concrete(trace_ctx: &mut TraceCtx, opcode: OpCode, args: &[
     }
 }
 
-/// Fold-specific guard snapshot: records the guard and delegates to the
-/// standard `walker_capture_snapshot_for_last_guard` which handles both the
-/// FBW path (fresh `collect_outer_active_boxes` from `fbw_mode.snapshot_sym`)
-/// and the per-opcode arm path (`ctx.outer_active_boxes`).
+/// [`walker_emit_guard_with_snapshot`] named for a hand-fold's guards.
 ///
-/// Previous attempt used `ctx.outer_active_boxes` directly, which is correct
-/// for the per-opcode arm entry but empty (`Vec::new()`) in the main FBW
-/// walk (`dispatch_via_miframe`).  The FBW path in
-/// `walker_capture_snapshot_for_last_guard_impl` re-derives `py_pc` from
-/// `op_pc` and computes a fresh active-box set per guard, matching the
-/// decoder's liveness query.
+/// A fold reaches this from both the per-opcode arm entry, where the outer
+/// active-box set is `ctx.outer_active_boxes`, and the main full-body walk,
+/// where that set is empty and the snapshot helper re-derives `py_pc` from
+/// `op_pc` and recomputes the active boxes per guard.  Both are the shared
+/// emitter's business, so the two spellings record the same thing.
 fn walker_emit_fold_guard_with_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     opcode: OpCode,
     args: &[OpRef],
 ) -> Result<(), DispatchError> {
-    stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
-    ctx.trace_ctx.record_guard(opcode, args, 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)
+    walker_emit_guard_with_snapshot(ctx, op_pc, opcode, args)
 }
 
 fn walker_flush_guard_not_invalidated<Sym: WalkSym>(

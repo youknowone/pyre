@@ -17,14 +17,15 @@
 # then produces is the one `locals_in_wide_portal_frame` records for the same
 # frame.
 #
-# The limit is 200 and the frame is 44 slots wide, so one expansion is worth
-# roughly 88 ops -- enough to cross it partway through.  Measured on release
-# dynasm:
+# The limit is 180 and the frame is 44 slots wide, so one expansion is worth
+# roughly 88 ops -- enough to cross it partway through.  The limit tracks what
+# the walk records ahead of the expansion, so it is re-fit by sweeping whenever
+# that moves, never nudged.  Measured on release dynasm:
 #
 #                       builtin_locals   ..._trace_limit_cut   abrt_too_long
 #   with the cut        consulted=10     consulted=5 fired=5   5
 #                       fired=5
-#   cut suppressed      consulted=10     suppressed=80         5
+#   cut suppressed      consulted=10     suppressed=45         5
 #                       fired=10
 #
 # Five of the ten expansions now end inside the unroll instead of emitting all
@@ -59,7 +60,7 @@
 # thing under test to one side of it.
 import pypyjit
 
-pypyjit.set_param("trace_limit=200")
+pypyjit.set_param("trace_limit=180")
 
 import sys
 
