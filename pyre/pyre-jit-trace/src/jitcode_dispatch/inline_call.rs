@@ -1976,6 +1976,30 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // over: without it the activation the CALL_ASSEMBLER runs never reaches
     // `topframeref`, so `sys._getframe().f_back` walks straight from the
     // callee's callee to this caller and every level in between is missing.
+    // Ahead of it stands `execute_frame`'s operation 0, which
+    // `insert_ll_stackcheck` (`rpython/translator/transform.py`) puts in front
+    // of the `enter` the next line records.  Upstream keeps it out of jitcodes
+    // and lets the backend's per-fragment SP probe stand for it; that probe
+    // answers the native half only, and `jit_activation_enter_abi` documents
+    // why the logical half has to be recorded here instead.
+    //
+    // It pays for the inlined levels above it as well.  This fold re-enters
+    // the fragment that inlined them, so charging one unit here would count
+    // one activation per fragment and divide the recursion's depth by the
+    // inline width; `open_inline_activations` is that width, and it is
+    // charged here because this is the seam a guard cannot leave unbalanced.
+    let units = ctx
+        .trace_ctx
+        .const_int(i64::from(open_inline_activations() + 1));
+    let displaced_activation = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallI,
+        pyre_interpreter::stack_check::jit_activation_enter_abi as *const (),
+        &[callee_frame, units],
+        &[Type::Ref, Type::Int],
+        Type::Int,
+        majit_metainterp::can_raise_effect_info(),
+    );
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
     record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, ec);
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
@@ -2162,6 +2186,17 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // calls).  The residual exposure — a failing GUARD_NOT_FORCED — is the one
     // `TopFrameRefGuard` (`pyre-jit/src/eval.rs`) already covers.
     record_ec_leave_frame_chain(ctx.trace_ctx, callee_frame, ec);
+    // `execute_frame`'s `finally` half of the same seam: the unit the enter
+    // spent, given back where the frame chain is given back.  It takes the
+    // enter's own result, so the two are one dataflow edge apart.
+    ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallI,
+        pyre_interpreter::stack_check::jit_activation_leave_abi as *const (),
+        &[displaced_activation, units],
+        &[Type::Int, Type::Int],
+        Type::Int,
+        majit_metainterp::cannot_raise_effect_info(),
+    );
     // pyjitpl.py `handle_possible_exception`.
     if exec_raised {
         // Raising branch (pyjitpl.py): `GUARD_EXCEPTION` with
@@ -3172,6 +3207,42 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         false,
         None,
     )
+}
+
+/// How many activations the fragment being recorded has minted by inlining a
+/// callee body, at the point the walk has reached.
+///
+/// Record-time only: it costs the compiled code nothing and exists so the one
+/// seam that does survive to run time can name the width it stands for.  The
+/// walk is single-threaded and this counts its own nesting, so a thread-local
+/// is the whole of the state.
+fn open_inline_activations() -> u32 {
+    OPEN_INLINE_ACTIVATIONS.with(|c| c.get())
+}
+
+thread_local! {
+    static OPEN_INLINE_ACTIVATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Holds one inlined level open for as long as the walk is inside its body.
+///
+/// A guard rather than a pair of calls because the region between
+/// [`walker_ec_enter`] and [`walker_ec_leave`] has many ways out — a declined
+/// sub-walk, a poisoned pc, a rewind — and a width that leaks would price
+/// every later `CALL_ASSEMBLER` in the same trace too high.
+struct OpenInlineActivation;
+
+impl OpenInlineActivation {
+    fn open() -> Self {
+        OPEN_INLINE_ACTIVATIONS.with(|c| c.set(c.get() + 1));
+        Self
+    }
+}
+
+impl Drop for OpenInlineActivation {
+    fn drop(&mut self) {
+        OPEN_INLINE_ACTIVATIONS.with(|c| c.set(c.get().saturating_sub(1)));
+    }
 }
 
 /// `executioncontext.py ExecutionContext.enter`, at an inlined call.
@@ -6522,11 +6593,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // so `enter` runs on a real frame object.  The frame `perform_call` →
     // `newframe` pushes (`pyjitpl.py, 1862-1874`) is the tracer's
     // `MIFrame` instead, and is not what `enter` takes its vref of.
-    let entered_ec = callee_frame_seeded && !ca_concrete_frame.is_null() && {
+    let entered_ec = if callee_frame_seeded && !ca_concrete_frame.is_null() {
         let concrete_ec = pyre_interpreter::call::getexecutioncontext()
             as *mut pyre_interpreter::PyExecutionContext;
         if concrete_ec.is_null() {
-            false
+            None
         } else {
             walker_ec_enter(
                 ctx.trace_ctx,
@@ -6535,8 +6606,24 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ca_concrete_frame,
                 concrete_ec,
             );
-            true
+            // This inlined level is an activation `execute_frame` would have
+            // charged the recursion counter for.  Counting it at RUN time is
+            // what a recorded call would do, and that is exactly wrong here: a
+            // guard leaving this callee skips the recorded release the same
+            // way it skips the `ec.topframeref` restore below, and a loop that
+            // keeps running inside one portal activation never reaches the
+            // boundary that repairs it — the depth then climbs until an
+            // unrelated call raises `RecursionError`.
+            //
+            // So the level is counted at RECORD time instead, as a width the
+            // seam that does survive to run time — the `CALL_ASSEMBLER` fold,
+            // which runs once per fragment entry — charges in one go.  The
+            // guard makes the width balanced across every early return between
+            // here and the `leave`.
+            Some(OpenInlineActivation::open())
         }
+    } else {
+        None
     };
     let (callee_outcome, callee_class_of_last_exc_is_const) = {
         let mut sub_wc = WalkContext {
@@ -7040,7 +7127,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Converging needs the `leave` reachable from those guard exits — a
     // resume-side leave, or the exception path recording its own — not a
     // reorder.
-    if entered_ec {
+    if let Some(open_activation) = entered_ec {
         let concrete_ec = pyre_interpreter::call::getexecutioncontext()
             as *mut pyre_interpreter::PyExecutionContext;
         // `leave(frame, w_exitvalue, got_exception)` — the caller passes true
@@ -7058,6 +7145,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             concrete_ec,
             got_exception,
         );
+        drop(open_activation);
     }
     // RPython has one MetaInterp shared by every MIFrame.  The sub-walk uses
     // a copied FbwWalkMode only to satisfy Rust's nested borrow, so write the
