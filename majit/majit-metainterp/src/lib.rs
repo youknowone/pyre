@@ -494,6 +494,18 @@ pub fn mptrace_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_MPTRACE").is_some())
 }
 
+/// Prints the control-flow decisions a walk of the portal jitcode makes: the
+/// interpreter pc every `jit_merge_point` visit carries, and — for the root
+/// jitcode frame alone — every `switch`, every `goto_if_not`, and every
+/// `loop_header`.
+///
+/// A walk that records without ever closing gives the same reading at the top
+/// (`seen_loop_header_for_jdindex` stays -1 at every merge point) whether the
+/// `loop_header` op was never reached or was reached and declined, and the two
+/// call for opposite fixes. The branch lines name which edge diverted the walk,
+/// so the answer is the sequence itself rather than an inference from its
+/// absence. Restricted to the root frame because the ops in question are the
+/// portal's own; an inlined callee's branches would bury them.
 pub fn pcseq_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_PCSEQ").is_some())

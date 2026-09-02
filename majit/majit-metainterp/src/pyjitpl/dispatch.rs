@@ -2315,6 +2315,29 @@ where
         );
     }
 
+    /// Print one control-flow edge of the root jitcode frame under
+    /// `MAJIT_PCSEQ` (see `crate::pcseq_enabled`).
+    ///
+    /// `value` is the concrete word the edge was decided on and `target` the
+    /// cursor it moves to, so a run's lines read as the walk's own path
+    /// through the portal.  Silent for an inlined callee: the ops this exists
+    /// to follow are the portal's, and the callees run orders of magnitude
+    /// more of them.
+    fn pcseq_branch(&mut self, kind: &str, opcode_pc: usize, value: i64, target: Option<usize>) {
+        if !crate::pcseq_enabled() || self.frames.len() != 1 {
+            return;
+        }
+        let name = &self.frames.current_mut().jitcode.name;
+        match target {
+            Some(t) => {
+                eprintln!("@@@PCSEQ {kind} jitcode={name} pc={opcode_pc} value={value} -> {t}")
+            }
+            None => eprintln!(
+                "@@@PCSEQ {kind} jitcode={name} pc={opcode_pc} value={value} -> fallthrough"
+            ),
+        }
+    }
+
     /// pyjitpl.py: vable array descriptor lookup.  Converts a bytecode
     /// array index to the cached `(arrayfielddescr, arraydescr)` pair
     /// from `VirtualizableInfo` and pairs it with the box operand
@@ -5545,6 +5568,12 @@ where
                     )
                 };
                 let (cond, cond_value) = self.read_int_reg(cond_idx);
+                self.pcseq_branch(
+                    "goto_if_not",
+                    opcode_pc,
+                    cond_value,
+                    (cond_value == 0).then_some(target),
+                );
                 self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, true);
             }
             // pyjitpl.py opimpl_goto_if_not_int_is_true(box, target):
@@ -5741,7 +5770,9 @@ where
                     .unwrap_or_else(|| panic!("BC_SWITCH descrs[{descr_idx}] is not a BhDescr"))
                     .clone();
                 let (value_box, concrete_value) = self.read_int_reg(value_idx);
-                if let Some(target) = descr.switch_lookup(concrete_value) {
+                let hit = descr.switch_lookup(concrete_value);
+                self.pcseq_branch("switch", opcode_pc, concrete_value, hit);
+                if let Some(target) = hit {
                     let const_ref = ctx.const_int(concrete_value);
                     self.record_state_guard(
                         ctx,
@@ -7000,6 +7031,13 @@ where
                 // setter; the close happens in BC_JIT_MERGE_POINT after
                 // the assert/reset on the next iteration.
                 self.seen_loop_header_for_jdindex = jdindex as i32;
+                if crate::pcseq_enabled() {
+                    eprintln!(
+                        "@@@PCSEQ loop_header jdindex={jdindex} num_ops={} depth={}",
+                        ctx.num_ops(),
+                        self.frames.len(),
+                    );
+                }
             }
             jitcode::insns::BC_JUMP => {
                 let target = self.frames.current_mut().next_u16() as usize;

@@ -386,7 +386,7 @@ cover the condition they diagnose.
 
 - Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `pcseq_enabled()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
+- What it does: Prints the control-flow decisions a walk of the portal jitcode makes: the interpreter pc every `jit_merge_point` visit carries, and — for the root jitcode frame alone — every `switch`, every `goto_if_not`, and every `loop_header`. A walk that records without ever closing gives the same reading at the top (`seen_loop_header_for_jdindex` stays -1 at every merge point) whether the `loop_header` op was never reached or was reached and declined, and the two call for opposite fixes; the branch lines name which edge diverted the walk.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_PORTAL_INLINE`
