@@ -6567,9 +6567,9 @@ unsafe fn super_getattribute_wtf8(
             if !past_super || !is_type(t) {
                 continue;
             }
-            // typeobject.py:468 `w_value = w_class.getdictvalue(space, name)`
-            // — this class's own namespace only, since the walk above is the
-            // MRO traversal.  `getdictvalue` and not the raw dict probe: the
+            // `lookup_starting_at`'s `w_value = w_class.getdictvalue(space,
+            // name)` — this class's own namespace only, since the walk above
+            // is the MRO traversal.  `getdictvalue` and not the raw dict probe: the
             // former routes the read through an `@elidable` keyed on the
             // version tag, which both folds it and keeps every argument inside
             // the residual call ABI's one machine word.
@@ -10216,16 +10216,17 @@ pub unsafe fn _pure_lookup_class_with_method_cache(
 /// `typeobject.py _pure_getdictvalue_no_unwrapping` — the `@elidable` read of
 /// a type's *own* namespace, keyed on `(version_tag, name)`.  `getdictvalue`
 /// consults it whenever the type carries a version tag
-/// (typeobject.py:389-396), so the trace records a `CALL_PURE_R` and folds
-/// repeated same-key reads instead of probing the dict storage per iteration.
+/// (`W_TypeObject.getdictvalue`), so the trace records a `CALL_PURE_R` and
+/// folds repeated same-key reads instead of probing the dict storage per
+/// iteration.
 ///
 /// Elidability rests on the version tag: a namespace write runs `mutated()`
 /// before it stores, so a tag that is still current witnesses a namespace that
 /// has not changed since the folded read.  Unlike
 /// [`_pure_lookup_where_with_method_cache`] this consults one type rather than
-/// the MRO, which is what `typeobject.py:460-471 lookup_starting_at` needs: it
+/// the MRO, which is what `typeobject.py lookup_starting_at` needs: it
 /// walks `mro_w` itself and reads each class past `w_starttype` with
-/// `w_class.getdictvalue(space, name)` (typeobject.py:468).
+/// `w_class.getdictvalue(space, name)`.
 ///
 /// `name` arrives as `w_name`, an interned immortal str object
 /// (`box_str_constant`), for the reason it does on that sibling: the residual
@@ -10432,7 +10433,7 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
 /// `version_tag is None`, never on `we_are_jitted()`): promote the type and
 /// its `version_tag`, then read through the `@elidable`
 /// [`_pure_getdictvalue_no_unwrapping`].  Without a tag the read is
-/// uncacheable and runs raw (typeobject.py:393-395).
+/// uncacheable and runs raw, through `_getdictvalue_no_unwrapping`.
 ///
 /// The raw probe this replaces on the traced path reaches `w_dict_getitem_wtf8`
 /// with a `&Wtf8`, whose two machine words exceed the residual call ABI's one,
@@ -10453,13 +10454,21 @@ pub(crate) unsafe fn w_type_getdictvalue(
     }
     // No `promote(self)` here: `lookup_where_with_method_cache` promotes
     // because it keys a shared cache on the pair, whereas `getdictvalue` reads
-    // the one type it was handed (typeobject.py:390 is just
+    // the one type it was handed (`W_TypeObject.getdictvalue` opens with just
     // `version_tag = self.version_tag()`).
     let version_tag = w_type_version_tag(w_type);
-    if version_tag == 0 || w_name.is_null() || !majit_metainterp::jit::we_are_jitted() {
-        // No tag means uncacheable (typeobject.py:393-395).  The interpreter
-        // takes the same raw arm, as does any caller that reached this walk
-        // holding only the unwrapped name -- see the `w_name` note below.
+    if version_tag == 0 || w_name.is_null() {
+        // No tag means uncacheable: `W_TypeObject.getdictvalue`'s untagged
+        // arm reads raw.  A caller that reached this walk holding only the
+        // unwrapped name takes that same arm, because the elidable's ABI needs
+        // the wrapper -- see the `w_name` note below.
+        //
+        // Both are tests on what this call was handed, not on
+        // `we_are_jitted()`: the tagged read has one owner for interpreter and
+        // JIT alike, which is what the doc above claims and what upstream
+        // does.  Nothing is lost by routing the interpreter through the
+        // elidable, whose body is the same `type_dict_lookup_wtf8` this arm
+        // calls directly.
         return crate::type_dict_lookup_wtf8(w_type, name);
     }
     // `w_name` is the caller's own wrapped name, not a fresh
@@ -11119,8 +11128,8 @@ pub unsafe fn bound_method_attr_fast_path(
     Some((w_type, version_tag, w_descr, owes_shadow_guard))
 }
 
-/// `_super_check`'s third arm for a receiver whose `__class__` read settles
-/// without running Python (descriptor.py:139-146).
+/// `_super_check`'s third arm (pypy/module/__builtin__/descriptor.py), for a
+/// receiver whose `__class__` read settles without running Python.
 ///
 /// [`crate::builtins::super_check_python_free`] answers the first two arms,
 /// which consult installed MROs alone.  The third asks the receiver itself for
@@ -11161,7 +11170,7 @@ pub unsafe fn super_check_apparent_fast_path(
     }
     let (receiver_type, receiver_version_tag, receiver_map, objtype) =
         crate::objspace::std::mapdict::class_attr_fast_path(obj, "__class__")?;
-    // descriptor.py:145 `if space.issubtype_w(w_type, w_starttype)`.  The arm
+    // `_super_check`'s `if space.issubtype_w(w_type, w_starttype)`.  The arm
     // yields the apparent class only when that holds; otherwise `_super_check`
     // raises, which is not an answer this predicate offers.
     if !is_type(objtype) || !issubtype_w(objtype, start_type) {
