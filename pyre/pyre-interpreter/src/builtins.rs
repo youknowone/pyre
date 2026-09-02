@@ -20016,7 +20016,7 @@ fn eintr_retry(e: std::io::Error) -> Result<(), crate::PyError> {
     eintr_retry_with(e, fd_io_err)
 }
 
-/// PyPy `W_FileIO.direct_read`: perform one raw read of at most `n` bytes.
+/// PyPy `W_FileIO.read_w`: perform one raw read of at most `n` bytes.
 ///
 /// This must not fill the requested size.  A pipe may have one complete line
 /// available while its writer remains open; waiting for the rest of the
@@ -20028,8 +20028,7 @@ fn fd_read(fd: i32, n: usize) -> Result<Option<Vec<u8>>, crate::PyError> {
     // reaches here as a request the allocator cannot meet.  `os.read` sizes
     // its buffer through `rffi.scoped_alloc_buffer`, which raises
     // `MemoryError`; an infallible `vec![0; n]` would abort the process.
-    let mut out = try_vec_with_capacity::<u8>(n)?;
-    out.resize(n, 0);
+    let mut out = try_vec_zeroed(n)?;
     loop {
         let got = match fd_read_into(fd, &mut out) {
             Ok(got) => got,
