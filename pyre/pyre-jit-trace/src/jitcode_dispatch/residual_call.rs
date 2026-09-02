@@ -1353,7 +1353,17 @@ impl Drop for InlineConcreteFrameGuard {
 /// guard's own index and was truncated away when the guard exited.
 struct ResidualFrameChainGuard {
     ec: *mut pyre_interpreter::PyExecutionContext,
-    frame: *mut pyre_interpreter::PyFrame,
+    /// A root, not a raw copy.  The callee frame an inline sub-walk executes
+    /// is a nursery allocation (`emit_new_pyframe_inline_with_params` ->
+    /// `NewWithVtable`), so a minor collection inside the residual relocates
+    /// it and `Drop`'s `f_backref` / `escaped()` reads would follow a stale
+    /// address.  The collector forwards `OWNER_ROOTS` in place
+    /// (`shadow_stack::walk_roots`), which is the same reason
+    /// [`current_inline_concrete_frame`] reads its frame back out of a root
+    /// rather than out of a copy.  Rooting is also why this can be an owner
+    /// root and not a shadow-stack slot: the shadow stack is LIFO and the
+    /// residual publishes across this scope.
+    frame_root: majit_gc::shadow_stack::OwnerRootGuard,
     previous_published: *mut pyre_interpreter::PyFrame,
     previous_shadow: Option<(*const super::CalleeLocalsShadow, u16)>,
     /// Whether this guard performed the chain write, so `Drop` restores only
@@ -1408,11 +1418,20 @@ impl ResidualFrameChainGuard {
         let previous_shadow = PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(shadow));
         Some(Self {
             ec,
-            frame,
+            frame_root: majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
+                frame as usize,
+            )),
             previous_published,
             previous_shadow,
             entered,
         })
+    }
+
+    /// The frame as the collector last left it.  Every read below goes through
+    /// here rather than through a field, so a residual that collected cannot
+    /// hand `Drop` an address from before the move.
+    fn frame(&self) -> *mut pyre_interpreter::PyFrame {
+        self.frame_root.get().0 as *mut pyre_interpreter::PyFrame
     }
 }
 
@@ -1432,10 +1451,11 @@ impl Drop for ResidualFrameChainGuard {
                 // written to, so a collection during the residual forwarded it
                 // in place.  Only the `entered` path wrote `f_backref`, and
                 // only that path has anything to restore.
-                (*self.ec).topframeref = (*self.frame).f_backref;
+                (*self.ec).topframeref = (*self.frame()).f_backref;
             }
-            if (*self.frame).escaped() {
-                let f_back = (*self.frame).get_f_back();
+            let frame = self.frame();
+            if (*frame).escaped() {
+                let f_back = (*frame).get_f_back();
                 if !f_back.is_null() {
                     (*f_back).mark_as_escaped();
                 }
