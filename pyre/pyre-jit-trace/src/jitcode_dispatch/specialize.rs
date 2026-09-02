@@ -4834,6 +4834,19 @@ fn try_walker_orthodox_load_super_attr<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // An orthodox helper sub-walk records a synthetic sub-body whose register
+    // bank is its own.  While an inlined callee sits on the framestack,
+    // `ActiveResumeFrame::current` resolves the branch-resume gate to THAT
+    // callee's jitcode, so a kept-slot colour read out of its `pcdep` map
+    // indexes this walk's `concrete_registers_r` --- two different colour
+    // spaces.  `kept_stack_has_boxed_int_hazard` then reads whatever word the
+    // colour lands on as a `PyObjectRef`, and faults inside `is_int` rather
+    // than answering wrongly.  The two spaces coincide only when the walk is
+    // executing the framestack frame's own jitcode, which is what an empty
+    // framestack witnesses here.
+    if !ctx.session.borrow().framestack.is_empty() {
+        return Ok(None);
+    }
     let Some(jc_arc) = crate::jitcode_runtime::load_super_attr_value_jitcode() else {
         return Ok(None);
     };
