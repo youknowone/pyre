@@ -856,20 +856,6 @@ fn format_rca_live_values(labels: Option<&[String]>, values: &[Value]) -> String
     out
 }
 
-fn convert_rd_virtuals_for_storage(
-    storage: &crate::resume::ResumeStorage,
-    raw_value_count: usize,
-) -> Vec<crate::resume::VirtualInfo> {
-    let rd_consts = storage.rd_consts();
-    let count = raw_value_count as i32;
-    let num_virtuals = storage.rd_virtuals().len();
-    storage
-        .rd_virtuals()
-        .iter()
-        .map(|rd| crate::resume::rd_virtual_to_virtual_info(rd, rd_consts, count, num_virtuals))
-        .collect()
-}
-
 use crate::TraceAction;
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
@@ -6510,10 +6496,10 @@ impl<S: JitState> JitDriver<S> {
                 let rd_numb = storage.rd_numb.as_ref();
                 let rd_consts_slice: &[Const] = storage.rd_consts();
 
-                // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
-                let rd_virtuals_converted =
-                    Some(convert_rd_virtuals_for_storage(storage, raw_values.len()));
-                let rd_virtuals_slice = rd_virtuals_converted.as_deref();
+                // `resume.py _prepare_virtuals` — off the guard's own storage,
+                // which builds the reader-shaped virtuals once and hands the
+                // same list to every later resume off this guard.
+                let rd_virtuals_slice = Some(storage.virtual_infos());
 
                 // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
                 // curbh.setposition(jitcode, pc)`.  Per-driver
