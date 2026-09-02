@@ -12616,16 +12616,7 @@ impl<'a> Lowering<'a> {
             .llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::get");
-        let callsite_index_is_scalar = index_ty
-            .is_some_and(|ty| vec_index_type_is_scalar(ty, self.llbc))
-            || reg
-                .generics
-                .get("types")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|types| types.get(1))
-                .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())
-                .is_some_and(|ty| vec_index_type_is_scalar(&ty, self.llbc));
-        is_get && callsite_index_is_scalar
+        is_get && callsite_or_generic_index_is_scalar(reg, index_ty, self.llbc)
     }
 
     /// ARRAY identity proof for the scalar-index `<[T]>::get` rewrite.
@@ -18593,6 +18584,20 @@ fn vec_index_regular_leaf_with_callsite(
     llbc: &Llbc,
 ) -> Option<&'static str> {
     let leaf = vec_index_regular_unchecked_leaf(reg, llbc)?;
+    callsite_or_generic_index_is_scalar(reg, index_ty, llbc).then_some(leaf)
+}
+
+/// Whether either source Charon preserves proves an integer-bank index.
+///
+/// The substitution and the call-site operand are the two spellings of the
+/// same upstream fact, so a `Range*` (Ref-bank) index is rejected by both
+/// answering `false`.  Shared because `<[T]>::get` classifies its index by
+/// exactly this rule, and a fix to one reading has to reach the other.
+fn callsite_or_generic_index_is_scalar(
+    reg: &RegularCall,
+    index_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> bool {
     let generic_index_is_scalar = reg
         .generics
         .get("types")
@@ -18600,8 +18605,7 @@ fn vec_index_regular_leaf_with_callsite(
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
         .is_some_and(|t| vec_index_type_is_scalar(&t, llbc));
-    (generic_index_is_scalar || index_ty.is_some_and(|ty| vec_index_type_is_scalar(ty, llbc)))
-        .then_some(leaf)
+    generic_index_is_scalar || index_ty.is_some_and(|ty| vec_index_type_is_scalar(ty, llbc))
 }
 
 /// The Vec Index/IndexMut leaf before classifying its index argument.  Scalar
