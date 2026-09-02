@@ -80,17 +80,31 @@ PATTERNS = [
      r"tier 1 \(callee IS a dispatch seed\): (?P<v>\d+) call\(s\) in (?P<w>\d+) fn"),
 ]
 
-# Held at zero rather than ratcheted.  `tier 1.5` is a live pointer later
-# addressed as a list or dict -- the two kinds a minor collection relocates, so
-# a stale one is dereferenced as a corpse rather than merely stored.  A frame
-# carried across a collecting call whose callee is a dispatch seed is the same
-# hazard for the frame itself.
-INVARIANT_ZERO = ("tier15_calls", "frame_tier1_calls")
+# Held at zero rather than ratcheted.  A frame carried across a collecting call
+# whose callee is a dispatch seed is a stale frame, not a backlog entry.
+INVARIANT_ZERO = ("frame_tier1_calls",)
 
 # Ratcheted: may fall, may not rise.
+#
+# `tier15_calls` was held at zero here until the column that feeds it was
+# measured and found dead: the pinned locals and the movable-callee arguments
+# were two spellings of one value -- MIR materialises a call argument as its own
+# temporary -- so the intersection was empty whatever the corpus contained, and
+# the zero said nothing.  With the alias closure in place the same corpus scores
+# in the hundreds, and the first site the column named reproduced a crash at
+# production defaults, so the entries are real rather than noise.  A ratchet is
+# what a real backlog gets; restoring the zero would mean either the dead column
+# or a corpus nobody has paid down yet.
+#
+# The label the report prints still reads `list/dict`, and the regex above
+# matches it: it is the report's wording, not this gate's claim, and the two
+# are kept in step rather than corrected apart.  Read this count with the
+# `movable-argument supply` line beside it -- the column ranks only what that
+# supply feeds it, so a fall here is progress only while that supply holds.
 RATCHET = (
     "unbracketed_calls",
     "tier1_calls",
+    "tier15_calls",
     "frames_across_collecting",
     "brackets_reaching_no_collection",
 )
