@@ -13250,15 +13250,30 @@ impl<M: Clone> MetaInterp<M> {
     /// every guard has recovery_layout with header_pc on all frames.
     /// Returns None only if the (green_key, trace_id, fail_index) lookup
     /// itself fails — a metadata consistency error, not a missing field.
+    ///
+    /// Resolved here rather than through `get_compiled_exit_layout_in_trace`,
+    /// which answers the same two lookups by building a whole
+    /// `CompiledExitLayout` around them: `StoredExitLayout::public` copies the
+    /// exit types and clones three `Arc`s, and the backend arm reassembles a
+    /// `ResumeStorage` out of clones of the fail descriptor's whole `rd_*`
+    /// pool. A caller after one `u64` drops every one of them again, and this
+    /// one runs on each reported guard failure. The resolution order is the
+    /// same — the trace's own entry first, the backend's only when the trace
+    /// holds none — so the two agree on which layout answers.
     pub fn get_merge_point_pc(
         &self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
     ) -> Option<u64> {
-        let exit_layout =
-            self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
-        let recovery = exit_layout.recovery_layout.as_ref()?;
+        let compiled = self.compiled_loops.get(&green_key)?;
+        if let Some((_, trace)) = Self::trace_for_exit(compiled, trace_id)
+            && let Some(layout) = trace.exit_layouts.get(&fail_index)
+        {
+            return layout.recovery_layout.as_ref()?.frames.first()?.header_pc;
+        }
+        let backend = self.backend_fail_descr_layout(compiled, trace_id, fail_index)?;
+        let recovery = backend.recovery_layout.as_ref()?;
         recovery.frames.first()?.header_pc
     }
 
@@ -24795,6 +24810,78 @@ mod tests {
             .get_rd_pendingfields(green_key, trace_id, fail_index)
             .expect("stored exit layout should expose rd_pendingfields");
         assert!(pendingfields.is_empty());
+    }
+
+    /// The trace's own entry is the whole answer once it exists: a guard the
+    /// trace holds with no recovery layout resolves to no merge point rather
+    /// than to whatever the backend would say about the same fail index.
+    /// `get_compiled_exit_layout_in_trace` picks the layout the same way, and
+    /// reads `recovery_layout` off it afterwards.
+    #[test]
+    fn a_trace_entry_without_a_recovery_layout_answers_no_merge_point() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let green_key = 61;
+        let trace_id = 67;
+        let fail_index = 2;
+
+        let mut exit_layouts: indexmap::IndexMap<u32, StoredExitLayout> = indexmap::IndexMap::new();
+        exit_layouts.insert(
+            fail_index,
+            StoredExitLayout {
+                source_op_index: Some(0),
+                recovery_layout: None,
+                resume_layout: None,
+                storage: None,
+                descr: Some(crate::compile::make_fail_descr_typed(vec![Type::Int])),
+                op_arg_types_for_jump: None,
+            },
+        );
+
+        let mut traces = indexmap::IndexMap::new();
+        traces.insert(
+            trace_id,
+            CompiledTrace {
+                inputargs: vec![],
+                ops: vec![],
+                constants: majit_ir::ConstMap::new(),
+                exit_layouts,
+                terminal_exit_layouts: indexmap::IndexMap::new(),
+            },
+        );
+
+        let token = std::sync::Arc::new(JitCellToken::new(3));
+        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
+        meta.warm_state_mut()
+            .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: std::sync::Arc::downgrade(&token),
+                meta: std::sync::Arc::new(()),
+                front_target_tokens: Vec::new(),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: trace_id,
+                traces,
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        assert_eq!(
+            meta.get_merge_point_pc(green_key, trace_id, fail_index),
+            None
+        );
+        // A fail index the trace does not hold falls through to the backend,
+        // which holds nothing for this fixture either.
+        assert_eq!(meta.get_merge_point_pc(green_key, trace_id, 99), None);
+        // An unknown green key resolves no compiled entry at all.
+        assert_eq!(
+            meta.get_merge_point_pc(green_key + 1, trace_id, fail_index),
+            None
+        );
     }
 
     #[test]
