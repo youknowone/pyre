@@ -4154,26 +4154,33 @@ static MEMORY_ERROR_PROVIDER: std::sync::OnceLock<fn() -> i64> = std::sync::Once
 /// is stored there, with zero replaced by 29872897 so a computed value is
 /// distinguishable from the sentinel.
 ///
-/// The word is read and written the same way the compiled path reaches it.
-/// `build_ll_strhash_internal_helper_graph` implements `_ll_strhash` as an
-/// ordinary `getfield`/`setfield` pair on this field, and both backends lower
-/// those to plain loads and stores, so this must not be the one accessor that
-/// makes it atomic: a location reached atomically by one writer and plainly by
-/// another is a data race whichever way the race resolves.
+/// The word is reached with the same MACHINE instructions the compiled path
+/// uses.  `build_ll_strhash_internal_helper_graph` implements `_ll_strhash` as
+/// an ordinary `getfield`/`setfield` pair on this field and both backends lower
+/// those to a plain load and store, so an acquire load and a compare-exchange
+/// here made this the one accessor that fenced and retried.
 ///
-/// The store stays benign for the same reason it is in `LLHelpers`: every racing
-/// writer computes the identical value from immutable characters, so a losing
-/// writer overwrites the word with what is already there.
+/// `Relaxed` is the spelling that matches: on every target pyre builds for it
+/// emits exactly the plain load and store the compiled path emits, while
+/// keeping the access an atomic one in Rust's model — a plain `ptr::read` /
+/// `ptr::write` racing with another thread's write is undefined behaviour even
+/// when both threads store identical bits, so "the compiled path uses plain
+/// accesses" is a reason to drop the fences, not a reason to drop the atomic.
+///
+/// The store itself stays unguarded for the same reason it is in `LLHelpers`:
+/// every racing writer computes the identical value from immutable characters,
+/// so a losing writer overwrites the word with what is already there.
 fn blackhole_cached_hash(string_ptr: i64, compute: impl FnOnce() -> i64) -> i64 {
+    use std::sync::atomic::{AtomicIsize, Ordering};
     assert_ne!(string_ptr, 0, "blackhole string hash: null string");
-    let cache = string_ptr as usize as *mut isize;
-    let cached = unsafe { std::ptr::read(cache) };
+    let cache = unsafe { &*(string_ptr as usize as *const AtomicIsize) };
+    let cached = cache.load(Ordering::Relaxed);
     if cached != 0 {
         return cached as i64;
     }
     let computed = compute() as isize;
     let computed = if computed == 0 { 29_872_897 } else { computed };
-    unsafe { std::ptr::write(cache, computed) };
+    cache.store(computed, Ordering::Relaxed);
     computed as i64
 }
 
