@@ -40,7 +40,7 @@
 use std::collections::HashSet;
 
 use crate::front::semantic::SemanticFunction;
-use crate::model::FunctionGraph;
+use crate::model::{Block, BlockId, FunctionGraph, OpKind, ValueType};
 
 /// policy.py: shared mutable state and the default classifier.
 ///
@@ -327,24 +327,234 @@ fn jit_look_inside_hint(hints: &[String]) -> Option<bool> {
     None
 }
 
-/// policy.py `contains_unsupported_variable_type(graph, ...)`.
+/// `policy.py:88-108 contains_unsupported_variable_type(graph, ...)`.
 ///
-/// TODO: pyre's value-id table does not yet carry the
-/// per-value lltype information that RPython walks here.  Since pyre
-/// always supports floats and the codewriter never produces longlong /
-/// singlefloat values, the upstream check would never reject a graph in
-/// the current state.  We keep the function signature (and behaviour
-/// "everything is supported") so that `look_inside_graph` matches the
-/// upstream control flow.  When the IR gains per-value lltype metadata
-/// the body must walk every `Block.inputargs` / `SpaceOperation.kind`
-/// arg and result identical to `policy.py:90-104`.
+/// ```python
+/// def contains_unsupported_variable_type(graph, supports_floats,
+///                                               supports_longlong,
+///                                               supports_singlefloats):
+///     getkind = history.getkind
+///     try:
+///         for block in graph.iterblocks():
+///             for v in block.inputargs:
+///                 getkind(v.concretetype, ...)
+///             for op in block.operations:
+///                 for v in op.args:
+///                     getkind(v.concretetype, ...)
+///                 v = op.result
+///                 getkind(v.concretetype, ...)
+///     except NotImplementedError as e:
+///         log.WARNING('%s, ignoring graph' % (e,))
+///         log.WARNING('  %s' % (graph,))
+///         return True
+///     return False
+/// ```
+///
+/// Upstream reaches every value's type through `v.concretetype`, so it
+/// can call `getkind` on `block.inputargs`, `op.args` and `op.result`
+/// alike.  Pyre's per-`Variable` type is
+/// [`crate::codewriter::type_state::ConcreteType`], a four-way
+/// `Signed / GcRef / Float / Void` projection with no width axis: a
+/// 128-bit value is indistinguishable from a word-sized one there, and
+/// walking `inputargs` would answer `Signed` for both.  The width
+/// survives only on the [`ValueType`] an [`OpKind`] declares, which is
+/// the same field the two `value_type_to_kind` copies
+/// (`codewriter/jtransform.rs`, `codewriter/assembler.rs`) later read to
+/// form an opname, and which the sibling `value_type_to_ir_type` /
+/// `constvalue_kind` / array-descr arms panic on in the same shape.  So
+/// this walks that field set — see [`collect_declared_value_types`] —
+/// over the same startblock-reachable block closure
+/// `graph.iterblocks()` yields.
+///
+/// The three `supports_*` flags are upstream's signature and stay on
+/// pyre's, but nothing here consults them: the two families they gate
+/// (`Float` under a CPU without float registers, `SingleFloat`) are not
+/// refusable in pyre's `ValueType` domain.  See [`value_type_has_kind`].
+///
+/// `look_inside_graph` turns a `true` here into a refusal, which makes
+/// the call residual; the census records it under the
+/// `"unsupported-variable-type"` reason, standing in for upstream's
+/// `log.WARNING('%s, ignoring graph')`.
 pub fn contains_unsupported_variable_type(
-    _graph: &FunctionGraph,
+    graph: &FunctionGraph,
     _supports_floats: bool,
     _supports_longlong: bool,
     _supports_singlefloats: bool,
 ) -> bool {
+    // `iterblocks()` parity (`rpython/flowspace/model.py:66`): the
+    // startblock-reachable closure over `Block.exits`, id-keyed because
+    // block ids need not be index-aligned with `blocks` storage order.
+    let by_id: std::collections::HashMap<BlockId, &Block> =
+        graph.blocks.iter().map(|b| (b.id, b)).collect();
+    let mut block_seen: HashSet<BlockId> = HashSet::new();
+    let mut stack = vec![graph.startblock];
+    let mut declared: Vec<&ValueType> = Vec::new();
+    while let Some(bid) = stack.pop() {
+        if !block_seen.insert(bid) {
+            continue;
+        }
+        let Some(block) = by_id.get(&bid) else {
+            continue;
+        };
+        for op in &block.operations {
+            declared.clear();
+            collect_declared_value_types(&op.kind, &mut declared);
+            if declared.iter().any(|ty| !value_type_has_kind(ty)) {
+                return true;
+            }
+        }
+        stack.extend(block.exits.iter().rev().map(|e| e.target));
+    }
     false
+}
+
+/// Whether `history.py:56-69 getkind(TYPE, ...)` has a register kind for
+/// `ty`, or raises `NotImplementedError` on it.
+///
+/// `getkind` refuses three families.  Two of them have no [`ValueType`]
+/// spelling to refuse:
+///
+///   - `SingleFloat` (`history.py:59`, refused when the CPU has no
+///     single-float support) has no variant in this enum at all.
+///   - `Float` is refused by the same line when `supports_floats` is
+///     false, but pyre's kind projection does not model a float-less
+///     CPU: both `value_type_to_kind` copies map `Float` to `'f'`
+///     unconditionally, so refusing a graph for a float here would
+///     refuse one the codewriter goes on to lower.
+///
+/// The third is `history.py:60-63`, `"type %s is too large"`, for a
+/// primitive wider than `Signed`.  [`ValueType::Int128`] /
+/// [`ValueType::UInt128`] (RPython `SignedLongLongLong` /
+/// `UnsignedLongLongLong`) are 16 bytes, twice a word; upstream's
+/// `supports_longlong` arm asserts a width of exactly 8 before handing
+/// the value the `'float'` slot, so no flag setting rescues a 16-byte
+/// type from the raise.  That arm is the one every downstream kind
+/// projection panics on rather than declines — both `value_type_to_kind`
+/// copies, `jtransform`'s `value_type_to_ir_type`, `flatten`'s
+/// `constvalue_kind`, and `call`'s array-descr item projection — and the
+/// one this refuses.
+fn value_type_has_kind(ty: &ValueType) -> bool {
+    match ty {
+        // `raise NotImplementedError("type %s is too large" % TYPE)`
+        ValueType::Int128 | ValueType::UInt128 => false,
+        ValueType::Int
+        | ValueType::Unsigned
+        | ValueType::Bool
+        | ValueType::State
+        | ValueType::Ref(_)
+        | ValueType::Str
+        | ValueType::StringBuilder
+        | ValueType::Unknown
+        | ValueType::Float
+        | ValueType::Void => true,
+    }
+}
+
+/// Append the [`ValueType`]s one operation declares to `out`.
+///
+/// Two surfaces declare one.  Most variants carry it in a `ty` /
+/// `item_ty` / `result_ty` field, which is what the `value_type_to_kind`
+/// copies read.  The `ConstInt128` / `ConstUInt128` variants carry no
+/// such field — the width is in the variant name and the payload is a
+/// Rust literal — but they are the op form of upstream's
+/// `Constant(value, SignedLongLongLong)` operand, which `policy.py:96-98`
+/// reaches through `op.args` and refuses like any other value.  They
+/// report the type they materialise, so a graph holding a 128-bit
+/// literal is refused here instead of panicking later in
+/// `assembler.rs`'s opname formation.
+///
+/// The match is exhaustive and deliberately carries no wildcard arm: an
+/// `OpKind` variant added with a `ValueType` field has to be classified
+/// here, and until it is the crate does not compile.  A wildcard would
+/// let a new carrier of a 128-bit type pass the policy gate and reach
+/// `value_type_to_kind`, which panics rather than declining.
+pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a ValueType>) {
+    // The 128-bit constant variants have no `ValueType` field to borrow
+    // from, and `ValueType` owns a `String` so it cannot be promoted to a
+    // `&'static` from a `const`.  Name the two shapes once instead.
+    static INT128: ValueType = ValueType::Int128;
+    static UINT128: ValueType = ValueType::UInt128;
+
+    match kind {
+        // The type of the value the op reads or writes.
+        OpKind::Input { ty, .. }
+        | OpKind::ConstSymbolic { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::FieldWrite { ty, .. }
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::VableFieldWrite { ty, .. }
+        | OpKind::LoadStatic { ty, .. } => out.push(ty),
+
+        // The element type of the array or interior field addressed.
+        OpKind::NewArrayClear { item_ty, .. }
+        | OpKind::NewListClear { item_ty, .. }
+        | OpKind::ArrayRead { item_ty, .. }
+        | OpKind::ArrayWrite { item_ty, .. }
+        | OpKind::RawLoad { item_ty, .. }
+        | OpKind::RawStore { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::InteriorFieldWrite { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. }
+        | OpKind::VableArrayWrite { item_ty, .. }
+        | OpKind::VableArrayLen { item_ty, .. } => out.push(item_ty),
+
+        // The declared type of the op's result.
+        OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. }
+        | OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. }
+        | OpKind::IsInstance { result_ty, .. } => out.push(result_ty),
+
+        // `policy.py:96-98`'s `for v in op.args: getkind(v.concretetype)`
+        // over a `Constant` of the 16-byte primitive.
+        OpKind::ConstInt128(_) => out.push(&INT128),
+        OpKind::ConstUInt128(_) => out.push(&UINT128),
+
+        // No value type declared.  The remaining constant variants carry
+        // a Rust literal whose kind is fixed by the variant name, and the
+        // call variants downstream of `jtransform` carry a `result_kind`
+        // char that `value_type_to_kind` already produced.
+        OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_)
+        | OpKind::ConstBool(_)
+        | OpKind::ConstFloat(_)
+        | OpKind::ConstStr(_)
+        | OpKind::ConstRef(_)
+        | OpKind::ConstRefNull
+        | OpKind::ConstNone
+        | OpKind::ConstRefAddr(_)
+        | OpKind::New { .. }
+        | OpKind::NewWithVtable { .. }
+        | OpKind::ArrayLen { .. }
+        | OpKind::GuardTrue { .. }
+        | OpKind::GuardFalse { .. }
+        | OpKind::GuardValue { .. }
+        | OpKind::VtableMethodPtr { .. }
+        | OpKind::VableForce { .. }
+        | OpKind::Hint { .. }
+        | OpKind::CallElidable { .. }
+        | OpKind::CallResidual { .. }
+        | OpKind::CallMayForce { .. }
+        | OpKind::InlineCall { .. }
+        | OpKind::RecursiveCall { .. }
+        | OpKind::JitDebug { .. }
+        | OpKind::AssertGreen { .. }
+        | OpKind::CurrentTraceLength
+        | OpKind::IsConstant { .. }
+        | OpKind::IsVirtual { .. }
+        | OpKind::ConditionalCall { .. }
+        | OpKind::ConditionalCallValue { .. }
+        | OpKind::RecordKnownResult { .. }
+        | OpKind::RecordQuasiImmutField { .. }
+        | OpKind::Live
+        | OpKind::JitMergePoint { .. }
+        | OpKind::LoopHeader { .. }
+        | OpKind::Abort { .. }
+        | OpKind::NewTuple { .. }
+        | OpKind::NewList { .. }
+        | OpKind::GetSlice { .. }
+        | OpKind::LoweredBlackholeOp { .. } => {}
+    }
 }
 
 /// `rpython.translator.backendopt.support.find_backedges(graph)`.
@@ -484,6 +694,98 @@ mod tests {
         g.set_goto(entry, entry, Vec::new());
         assert!(!policy.look_inside_graph(&SemanticFunction {
             name: "loopy".into(),
+            graph: g,
+            return_type: None,
+            self_ty_root: None,
+            trait_impl_id: None,
+            hints: vec![],
+            module_path: String::new(),
+            trait_root: None,
+            trait_qualified: None,
+            returns_objectptr: false,
+        }));
+    }
+
+    /// `policy.py:88-108`: a graph holding a value `history.getkind`
+    /// refuses is refused here, not carried to the codewriter — where
+    /// `value_type_to_kind` panics rather than declining.
+    #[test]
+    fn a_128_bit_result_type_is_unsupported() {
+        let mut g = FunctionGraph::new("wide");
+        let entry = g.startblock;
+        g.push_op_var(
+            entry,
+            OpKind::Input {
+                name: "x".into(),
+                ty: ValueType::Int128,
+                class_root: None,
+            },
+            true,
+        );
+        assert!(contains_unsupported_variable_type(&g, true, true, true));
+    }
+
+    /// The 128-bit constants declare their width through the variant
+    /// name rather than a `ValueType` field, and are refused all the
+    /// same — `policy.py:96-98` reaches upstream's equivalent
+    /// `Constant(value, SignedLongLongLong)` through `op.args`.
+    #[test]
+    fn a_128_bit_constant_is_unsupported() {
+        let mut g = FunctionGraph::new("wide_const");
+        let entry = g.startblock;
+        g.push_op_var(entry, OpKind::ConstUInt128(1), true);
+        assert!(contains_unsupported_variable_type(&g, true, true, true));
+    }
+
+    /// Word-sized and float values keep their kinds, so an ordinary
+    /// graph is not refused.  The `supports_*` flags do not enter into
+    /// it: `false` for all three answers the same as `true`, because
+    /// pyre's kind projection models no float-less CPU.
+    #[test]
+    fn ordinary_value_types_are_supported() {
+        let mut g = FunctionGraph::new("narrow");
+        let entry = g.startblock;
+        for ty in [
+            ValueType::Int,
+            ValueType::Unsigned,
+            ValueType::Bool,
+            ValueType::Float,
+            ValueType::Void,
+            ValueType::Ref(None),
+        ] {
+            g.push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty,
+                    class_root: None,
+                },
+                true,
+            );
+        }
+        assert!(!contains_unsupported_variable_type(&g, true, true, true));
+        assert!(!contains_unsupported_variable_type(&g, false, false, false));
+    }
+
+    /// The gate that consumes it: a graph the codewriter cannot give a
+    /// register kind is declined rather than reaching
+    /// `value_type_to_kind`.
+    #[test]
+    fn look_inside_graph_declines_a_128_bit_graph() {
+        let mut policy = DefaultJitPolicy::new();
+        let mut g = FunctionGraph::new("wide");
+        let entry = g.startblock;
+        g.push_op_var(
+            entry,
+            OpKind::Input {
+                name: "x".into(),
+                ty: ValueType::UInt128,
+                class_root: None,
+            },
+            true,
+        );
+        assert!(!policy.look_inside_graph(&SemanticFunction {
+            name: "wide".into(),
             graph: g,
             return_type: None,
             self_ty_root: None,
