@@ -1276,6 +1276,7 @@ fn expand_pyre_class(
     let ptr_offsets_const = format_ident!("W_{}_GC_PTR_OFFSETS", suffix);
     let descriptor_static = format_ident!("W_{}_PYRE_CLASS_DESCRIPTOR", suffix);
     let descriptor_slice_elem = format_ident!("W_{}_PYRE_CLASS_DESCRIPTOR_SLICE", suffix);
+    let descriptor_ctor_fn = format_ident!("__register_w_{}_pyre_class_descriptor", suffix);
 
     // When the user declared `type_id = N` we pre-initialize the cell
     // to `N` and additionally emit the legacy `pub const W_X_GC_TYPE_ID:
@@ -1399,15 +1400,21 @@ fn expand_pyre_class(
                 ),
             };
 
-        /// Link-time registration of this class's descriptor into the
-        /// whole-program `PYRE_CLASS_DESCRIPTORS` slice, so the JIT
-        /// driver's GC-root completeness oracle can see every
-        /// `#[pyre_class]` type without a hand-maintained list.  Native
-        /// only, matching the slice: `distributed_slice` rejects `wasm32`.
+        /// Registration of this class's descriptor into the whole-program
+        /// registry, so the JIT driver's GC-root completeness oracle and
+        /// the `PyType`-address binder see every `#[pyre_class]` type
+        /// without a hand-maintained list.  `distributed_slice` rejects
+        /// `wasm32`, which registers from a constructor instead.
         #[cfg(not(target_arch = "wasm32"))]
         #[::linkme::distributed_slice(::pyre_object::lltype::PYRE_CLASS_DESCRIPTORS)]
         static #descriptor_slice_elem: &'static ::pyre_object::lltype::PyreClassDescriptor =
             &#descriptor_static;
+
+        #[cfg(target_arch = "wasm32")]
+        #[::ctor::ctor(unsafe)]
+        fn #descriptor_ctor_fn() {
+            ::pyre_object::lltype::register_class_descriptor(&#descriptor_static);
+        }
 
         impl ::pyre_object::lltype::PyreClassPyTypeOf for #st_name {
             const PYTYPE: *const ::pyre_object::PyType =
@@ -2543,16 +2550,8 @@ fn expand_pyre_methods(
         // Publish this accessor's residual-call address.  `type_object` is
         // `dont_look_inside` (the JIT never lifts the `OnceLock` body — its
         // `CELL` read is unliftable host plumbing), so the codewriter emits a
-        // residual call the runtime resolves through `jit_trace_fnaddrs`, which
-        // iterates this slice.  Native only, matching the slice.
-        #[cfg(not(target_arch = "wasm32"))]
-        #[::linkme::distributed_slice(::pyre_object::lltype::PYRE_TYPE_OBJECT_FNADDRS)]
-        #[allow(non_upper_case_globals)]
-        static __PYRE_TYPE_OBJECT_FNADDR: ::pyre_object::lltype::TypeObjectFnDescriptor =
-            ::pyre_object::lltype::TypeObjectFnDescriptor {
-                path: ::core::concat!(::core::module_path!(), "::type_object"),
-                func: type_object,
-            };
+        // residual call the runtime resolves through `jit_trace_fnaddrs`.
+        ::pyre_object::register_type_object_fnaddr!();
     };
 
     Ok(quote! {

@@ -1109,23 +1109,22 @@ fn real_main() {
     // build-script process the translator runs in, so the captured
     // addresses match a direct `&pyre_object::X` read at the codewriter
     // call site.
-    let mut static_pytype_addrs = pyre_interpreter::jit_static_pytype_addrs();
+    let static_pytype_addrs = pyre_interpreter::jit_static_pytype_addrs();
     // This script is compiled for the host even when the crate it feeds is
-    // built for wasm, so the `#[pyre_class]` registry is populated here and
-    // empty there.  Binding a name the wasm runtime cannot re-pair would
-    // leave this process's address baked in the constant pool
-    // (`runtime_fnaddr_patch::patch_static_addr_constants` rewrites only
-    // names it finds in both pools), so drop the registry-derived rows when
-    // the target is wasm and let those statics stay unbound instead.
+    // built for another target, so a name bound here is only useful if the
+    // runtime pool carries it too — `runtime_fnaddr_patch::
+    // patch_static_addr_constants` rewrites only names it finds in both, and
+    // an unmatched name keeps this process's address.  The `#[pyre_class]`
+    // registry populates on every target for that reason; where the two pools
+    // can still disagree is the module set, which this process cannot read for
+    // another target, and `reject_unpaired_build_addrs` refuses the load if
+    // one of those names reaches a constant pool.
     let registry_rows = pyre_interpreter::pyre_class_pytype_addrs();
     let registry_keys: std::collections::HashSet<&str> =
         registry_rows.iter().map(|&(key, _)| key).collect();
-    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
-        static_pytype_addrs.retain(|(key, _)| !registry_keys.contains(key));
-    }
     // Counts the rows that survived, not the registry's size: the table
     // drops every registry row whose static a hand-written row already
-    // names, and all of them when the target is wasm.
+    // names.
     let kept_from_registry = static_pytype_addrs
         .iter()
         .filter(|(key, _)| registry_keys.contains(key))

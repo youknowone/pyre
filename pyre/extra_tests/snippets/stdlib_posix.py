@@ -1,3 +1,5 @@
+# pyre-check: gate=1
+# pyre-check: platforms=darwin,linux
 import gc
 import shutil
 import sys
@@ -79,6 +81,15 @@ class FsPathBytes:
 assert os.fspath(FsPathOk()) == "fspath-ok"
 assert os.fspath(FsPathProperty()) == "fspath-property"
 assert os.fspath(FsPathBytes()) == b"fspath-bytes"
+
+# Builtins taking a path resolve the descriptor the same way, so what the
+# property answers is what gets called and its result is the name opened.
+try:
+    open(FsPathProperty())
+except FileNotFoundError as exc:
+    assert "fspath-property" in str(exc), exc
+else:
+    raise AssertionError("open(FsPathProperty()) did not raise")
 
 try:
     os.fspath(FsPathInt())
