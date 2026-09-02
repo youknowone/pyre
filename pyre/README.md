@@ -38,7 +38,7 @@ The latest full comparison includes both raw user CPU times and relative speed; 
 
 `dynasm` is the default backend of the `pyre` binary; `cranelift` and `wasm` are the other two MaJIT code generators. Cranelift was not measured in this comparison.
 
-The CPython and wasm/native comparisons are approximate quotients of the displayed, rounded times. The PyPy comparisons use `check.py`'s execution-only ratios, which subtract measured interpreter startup; a reported 0.8x execution time is therefore written as 1.25x faster, while a reported 1.2x is written as 1.2x slower. Absolute results are machine-dependent, so read a single run as indicative rather than reproducible to the digit.
+The CPython and wasm/native comparisons are approximate quotients of the displayed, rounded times. The PyPy comparisons use `check.py`'s execution-only ratios, which subtract pypy's measured startup from both sides; a reported 0.8x execution time is therefore written as 1.25x faster, while a reported 1.2x is written as 1.2x slower. Absolute results are machine-dependent, so read a single run as indicative rather than reproducible to the digit.
 
 The native JIT is approximately 1.24x–28.5x faster than CPython across all ten benchmarks. Against PyPy it is 1.25x faster on `float_loop` and 1.1x–2.0x slower on the other nine. Wasm is about even with the native JIT on `int_loop`, approximately 1.16x faster on `float_loop`, and 1.12x–2.22x slower on the other eight. These are small synthetic benchmarks selected to exercise specific JIT paths, not a representative sample of general Python workloads; do not read these ratios as overall application-performance claims.
 
