@@ -338,6 +338,31 @@ fn _break_context_cycle(w_value: PyObjectRef, w_context: PyObjectRef) -> Result<
     Ok(())
 }
 
+/// `_PyErr_FormatFromCause`: a `SystemError` carrying `cause` as both its
+/// `__context__` and its `__cause__`.
+///
+/// A callee that reported success while leaving an exception set has already
+/// lost the raise site, so the exception it left behind is the only
+/// description of what went wrong and is chained onto the report rather than
+/// discarded.  `_Py_CheckFunctionResult` raises through here, and so does the
+/// C-API shim's own success-with-exception check.
+pub(crate) fn system_error_from_cause(message: String, mut cause: PyError) -> PyError {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cause_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(cause.to_exc_object());
+    let mut error = PyError::new(PyErrorKind::SystemError, message);
+    let error_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(error.to_exc_object());
+    let w_cause = pyre_object::gc_roots::shadow_stack_get(cause_slot);
+    let w_error = pyre_object::gc_roots::shadow_stack_get(error_slot);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_context(w_error, w_cause);
+        pyre_object::interp_exceptions::w_exception_set_cause(w_error, w_cause);
+        pyre_object::interp_exceptions::w_exception_set_suppress_context(w_error, true);
+    }
+    unsafe { PyError::from_exc_object(w_error) }
+}
+
 /// Record `active` as `exc.__context__` when `exc` is raised while `active`
 /// is the exception currently being handled — the shared primitive for both
 /// explicit (`raise`) and implicit (builtin/operator) raises.  Only writes
