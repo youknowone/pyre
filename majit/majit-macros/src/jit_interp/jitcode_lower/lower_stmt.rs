@@ -463,6 +463,37 @@ impl<'c> Lowerer<'c> {
             );
             return None;
         }
+        // `hint_fresh_virtualizable` is the fourth member, and the purity test
+        // is blind to it in the same way: the hint reads nothing, writes
+        // nothing and calls nothing, so a statement whose only content is the
+        // hint is scored inert and dropped.  Dropping it is what the previous
+        // lowering did on purpose -- and that is the defect, because the hint
+        // is not inert.  Upstream records `fresh_virtualizable` in
+        // `Transformer.vable_flags` and reads it back in `is_vable_getfield` /
+        // `is_vable_setfield`, which then answer `False` so the following field
+        // accesses stay off the `getfield_vable_*` / `setfield_vable_*` path.
+        // This lowering has no carrier for that flag, so it cannot honour the
+        // hint; suppressing it leaves every following access on the vable path,
+        // which is the opposite of what was asked and is invisible in the
+        // emitted jitcode.  Refuse the statement rather than answer it wrongly.
+        //
+        // `hint_access_directly` is deliberately not covered: upstream drops it
+        // at the same site, and the flag it records is consulted for
+        // `fresh_virtualizable` alone.
+        if stmt_contains_fresh_virtualizable_hint(stmt) {
+            if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+                eprintln!(
+                    "[majit-macro] lower_stmt rejected ({what}): statement encloses a \
+                     `hint_fresh_virtualizable` this lowering has no flag to carry: {}",
+                    quote!(#stmt)
+                );
+            }
+            self.record_body_failure(
+                "encloses a `hint_fresh_virtualizable` this lowering has no flag to carry",
+                stmt,
+            );
+            return None;
+        }
         // A write to a green is the third member of the family above, and the
         // purity test is blind to it for the same reason it is blind to
         // `break`: `stmt_modifies_jit_state` scores writes to `state.*`, and a
@@ -2601,6 +2632,55 @@ fn stmt_contains_loop_control(stmt: &Stmt) -> bool {
         hit: false,
         loop_depth: 0,
     };
+    probe.visit_stmt(stmt);
+    probe.hit
+}
+
+/// Whether `stmt` encloses a `hint_fresh_virtualizable` in either spelling.
+///
+/// The hint reaches the lowerer two ways: as a call
+/// (`lower_vable_hint_identity_call` matches `Expr::Call`) and as a macro
+/// (`lower_vable_hint_suppress` matches `Expr::Macro`).  Both are refused, so
+/// the probe has to see both -- and it has to see them anywhere in the
+/// statement, because the call form appears in value position
+/// (`let f = hint_fresh_virtualizable(frame);`) where the statement that gets
+/// refused is the `let`.
+///
+/// Closures and nested items are not skipped the way `stmt_contains_return`
+/// skips them: a hint inside a closure still names this body's virtualizable.
+fn stmt_contains_fresh_virtualizable_hint(stmt: &Stmt) -> bool {
+    use syn::visit::Visit;
+    struct Probe {
+        hit: bool,
+    }
+    impl<'ast> Visit<'ast> for Probe {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let Expr::Path(p) = &*node.func
+                && classify_virtualizable_hint_syn_path(&p.path)
+                    == Some(VirtualizableHintKind::FreshVirtualizable)
+            {
+                self.hit = true;
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+            if classify_virtualizable_hint_syn_path(&node.mac.path)
+                == Some(VirtualizableHintKind::FreshVirtualizable)
+            {
+                self.hit = true;
+            }
+            syn::visit::visit_expr_macro(self, node);
+        }
+        fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+            if classify_virtualizable_hint_syn_path(&node.mac.path)
+                == Some(VirtualizableHintKind::FreshVirtualizable)
+            {
+                self.hit = true;
+            }
+            syn::visit::visit_stmt_macro(self, node);
+        }
+    }
+    let mut probe = Probe { hit: false };
     probe.visit_stmt(stmt);
     probe.hit
 }
