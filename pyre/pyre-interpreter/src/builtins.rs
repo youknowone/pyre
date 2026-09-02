@@ -20857,34 +20857,13 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             && !pyre_object::bytesobject::is_bytes(file_now)
             && !pyre_object::is_int(file_now)
     } {
-        let fspath_fn = crate::typedef::r#type(file_now).and_then(|pt| unsafe {
-            crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__")
-        });
-        // A `None` left on the type switches the protocol off the way
-        // `__hash__ = None` does, so the object is turned away as not
-        // path-like rather than reported as an uncallable `None`.
-        let Some(fspath_fn) = fspath_fn.filter(|&fn_obj| unsafe { !pyre_object::is_none(fn_obj) })
-        else {
-            return Err(crate::PyError::type_error(format!(
-                "expected str, bytes or os.PathLike object, not {}",
-                crate::gateway::short_type_name(file_now)
-            )));
-        };
-        let _ = pyre_object::gc_roots::pin_root(fspath_fn);
-        let fspath_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let resolved = crate::call::call_function_impl_result(
-            pyre_object::gc_roots::shadow_stack_get(fspath_slot),
-            &[pyre_object::gc_roots::shadow_stack_get(file_slot)],
-        )?;
-        if unsafe {
-            !pyre_object::is_str(resolved) && !pyre_object::bytesobject::is_bytes(resolved)
-        } {
-            return Err(crate::PyError::type_error(format!(
-                "expected {}.__fspath__() to return str or bytes, not {}",
-                crate::gateway::short_type_name(pyre_object::gc_roots::shadow_stack_get(file_slot)),
-                crate::gateway::short_type_name(resolved)
-            )));
-        }
+        // The protocol itself is `fspath`'s: `__fspath__` is bound before it is
+        // called, so a descriptor on the type runs and what it answers is what
+        // gets called, and a `None` left there switches the protocol off rather
+        // than being called and reported as uncallable.  Both refusals name the
+        // object's own type, which is the wording this call site needs.
+        let resolved =
+            crate::module::posix::fspath(pyre_object::gc_roots::shadow_stack_get(file_slot))?;
         let _ = pyre_object::gc_roots::pin_root(resolved);
         file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     }
