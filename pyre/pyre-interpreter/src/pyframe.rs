@@ -949,19 +949,25 @@ pub mod frame_locals_proxy {
             // Routing it into `update` instead iterated the operand: a list of
             // pairs was accepted and a `str` reported a `dict.update` error.
             //
-            // A merge that fails AFTER that type check propagates its real
-            // exception here.  `framelocalsproxy_inplace_or` instead returns
-            // `NotImplemented` with the exception still set, and the binary-op
-            // machinery reports that as `SystemError: <slot wrapper
-            // '__ior__' of 'FrameLocalsProxy' objects> returned a result with
-            // an exception set` — measured with a `dict` subclass whose
-            // `keys()` raises.
-            // Reporting the operand's own error is deliberate; do not
-            // "restore" the SystemError.
-            if !self.merge(other)? {
-                return Ok(pyre_object::w_not_implemented());
+            // A merge that fails AFTER that type check does not surface its own
+            // exception: `framelocalsproxy_inplace_or` returns `NotImplemented`
+            // with the exception still set, `binary_iop1` discards that and
+            // falls through to `framelocalsproxy_or`, and the `PyDict_Update`
+            // there calls the proxy's `keys` — whose `_Py_CheckFunctionResult`
+            // sees the pending exception and raises the chained `SystemError`.
+            //
+            // pyre cannot tell an explicit `p.__ior__(d)` from `|=`, so the
+            // message names `keys` in both, where the explicit call names the
+            // `__ior__` slot wrapper instead.
+            match self.merge(other) {
+                Ok(true) => Ok(self as *mut FrameLocalsProxy as PyObjectRef),
+                Ok(false) => Ok(pyre_object::w_not_implemented()),
+                Err(error) => Err(crate::error::system_error_from_cause(
+                    "<method 'keys' of 'FrameLocalsProxy' objects> returned a result with an exception set"
+                        .to_string(),
+                    error,
+                )),
             }
-            Ok(self as *mut FrameLocalsProxy as PyObjectRef)
         }
 
         fn __eq__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {

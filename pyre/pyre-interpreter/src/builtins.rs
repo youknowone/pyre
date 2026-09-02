@@ -6399,17 +6399,30 @@ pub(crate) fn type_new_take_qualname(w_type: PyObjectRef, ns: PyObjectRef) -> cr
 }
 
 /// `type_new_set_classcell` / `type_new_set_classdictcell` refuse a namespace
-/// entry that is not a cell.  The offending type is spelled with `%.200R`,
-/// i.e. the repr of the type object rather than its bare name.
+/// entry that is not a cell.  The offending type is spelled with `%.200R`, so
+/// a metaclass `__repr__` renders it — and when that repr raises,
+/// `_PyErr_FormatV` returns without setting the `TypeError`, leaving the
+/// repr's own exception in its place.
 pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyError {
-    let name = match crate::typedef::r#type(value) {
-        Some(w_valtype) => unsafe {
-            crate::baseobjspace::type_repr_qualified_name(w_valtype.as_ptr())
+    // `%.200R` clips the rendering at 200 code points.
+    const MAX_REPR_CODE_POINTS: usize = 200;
+    let rendered = match crate::typedef::r#type(value) {
+        Some(w_valtype) => match unsafe { crate::display::py_repr_wtf8(w_valtype.as_ptr()) } {
+            Ok(rendered) => rendered,
+            Err(error) => return error,
         },
-        None => crate::error::type_name_of(value),
+        None => rustpython_wtf8::Wtf8Buf::from_string(format!(
+            "<class '{}'>",
+            crate::error::type_name_of(value)
+        )),
     };
-    crate::PyError::type_error(format!(
-        "{key} must be a nonlocal cell, not <class '{name}'>"
+    let mut clipped = rustpython_wtf8::Wtf8Buf::new();
+    for point in rendered.code_points().take(MAX_REPR_CODE_POINTS) {
+        clipped.push(point);
+    }
+    crate::PyError::type_error(crate::display::wtf8_format!(
+        format!("{key} must be a nonlocal cell, not "),
+        clipped
     ))
 }
 
@@ -6527,7 +6540,27 @@ fn type_descr_new_with_metaclass(
         let _class_ns_root = pyre_object::gc_roots::push_roots();
         let namespace_root = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_namespace_dict);
-        let class_ns = pyre_object::w_dict_new();
+        // `type.__new__` accepts any `dict` subclass as the namespace
+        // (the check is `PyDict_Check`, not `PyDict_CheckExact`); resolve
+        // the dict backing so e.g. an `enum._EnumDict` class body is
+        // walked instead of dropped.
+        //
+        // `type_new_init` opens with `PyDict_Copy(ctx->orig_dict)` and then
+        // mutates that one dict, so the scratch namespace is a clone rather
+        // than a per-key refill.  The clone carries each key's cached hash,
+        // where a re-store would call `__hash__` again — running a
+        // side-effecting one an extra time, and dropping the entry outright
+        // once that `__hash__` starts raising, since the store surface cannot
+        // report an error.
+        let backing_root = pyre_object::gc_roots::shadow_stack_len();
+        let w_ns_backing = pyre_object::gc_roots::pin_root(w_ns_backing);
+        let class_ns = if w_ns_backing.is_null() {
+            pyre_object::w_dict_new()
+        } else {
+            unsafe {
+                pyre_object::w_dict_copy(pyre_object::gc_roots::shadow_stack_get(backing_root))
+            }
+        };
         let class_ns_root = pyre_object::gc_roots::shadow_stack_len();
         let class_ns = pyre_object::gc_roots::pin_root(class_ns);
         // type_new_classcell — capture the `__classcell__` cell and keep
@@ -6540,15 +6573,10 @@ fn type_descr_new_with_metaclass(
         // can introduce such a key; every later pass installs descriptors
         // under interned names.
         let mut has_non_string_key = false;
-        // `type.__new__` accepts any `dict` subclass as the namespace
-        // (the check is `PyDict_Check`, not `PyDict_CheckExact`); resolve
-        // the dict backing so e.g. an `enum._EnumDict` class body is
-        // walked instead of dropped.
         let w_namespace_dict = pyre_object::gc_roots::shadow_stack_get(namespace_root);
-        if !w_ns_backing.is_null() {
-            let backing_root = pyre_object::gc_roots::shadow_stack_len();
-            let w_ns_backing = pyre_object::gc_roots::pin_root(w_ns_backing);
-            let items = unsafe { pyre_object::w_dict_items(w_ns_backing) };
+        {
+            let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+            let items = unsafe { pyre_object::w_dict_items(class_ns) };
             let item_root = pyre_object::gc_roots::shadow_stack_len();
             for &(key, value) in &items {
                 let _ = pyre_object::gc_roots::pin_root(key);
@@ -6557,38 +6585,27 @@ fn type_descr_new_with_metaclass(
             for index in 0..items.len() {
                 let key = pyre_object::gc_roots::shadow_stack_get(item_root + index * 2);
                 let value = pyre_object::gc_roots::shadow_stack_get(item_root + index * 2 + 1);
-                let key_text = if unsafe { pyre_object::is_str(key) } {
-                    Some(unsafe { pyre_object::w_str_get_wtf8(key) })
-                } else {
+                if !unsafe { pyre_object::is_str(key) } {
                     has_non_string_key = true;
-                    None
-                };
-                if key_text
-                    .as_ref()
-                    .is_some_and(|key| key.as_str() == Ok("__classcell__"))
-                {
-                    if !unsafe { pyre_object::is_cell(value) } {
-                        return Err(cell_slot_type_error("__classcell__", value));
-                    }
-                    let root = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(value);
-                    classcell_root = Some(root);
                     continue;
                 }
-                if key_text
-                    .as_ref()
-                    .is_some_and(|key| key.as_str() == Ok("__classdictcell__"))
-                {
-                    if !unsafe { pyre_object::is_cell(value) } {
-                        return Err(cell_slot_type_error("__classdictcell__", value));
-                    }
-                    let root = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(value);
+                let key_text = unsafe { pyre_object::w_str_get_wtf8(key) };
+                let name = match key_text.as_str() {
+                    Ok(name @ ("__classcell__" | "__classdictcell__")) => name,
+                    _ => continue,
+                };
+                if !unsafe { pyre_object::is_cell(value) } {
+                    return Err(cell_slot_type_error(name, value));
+                }
+                let root = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(value);
+                if name == "__classcell__" {
+                    classcell_root = Some(root);
+                } else {
                     classdictcell_root = Some(root);
-                    continue;
                 }
                 let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                unsafe { pyre_object::w_dict_store(class_ns, key, value) };
+                unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, name) };
             }
         }
         // typeobject.py:ensure_common_attributes / ensure_module_attr.  Direct
@@ -19999,7 +20016,7 @@ fn eintr_retry(e: std::io::Error) -> Result<(), crate::PyError> {
     eintr_retry_with(e, fd_io_err)
 }
 
-/// PyPy `W_FileIO.direct_read`: perform one raw read of at most `n` bytes.
+/// PyPy `W_FileIO.read_w`: perform one raw read of at most `n` bytes.
 ///
 /// This must not fill the requested size.  A pipe may have one complete line
 /// available while its writer remains open; waiting for the rest of the
@@ -20011,8 +20028,7 @@ fn fd_read(fd: i32, n: usize) -> Result<Option<Vec<u8>>, crate::PyError> {
     // reaches here as a request the allocator cannot meet.  `os.read` sizes
     // its buffer through `rffi.scoped_alloc_buffer`, which raises
     // `MemoryError`; an infallible `vec![0; n]` would abort the process.
-    let mut out = try_vec_with_capacity::<u8>(n)?;
-    out.resize(n, 0);
+    let mut out = try_vec_zeroed(n)?;
     loop {
         let got = match fd_read_into(fd, &mut out) {
             Ok(got) => got,

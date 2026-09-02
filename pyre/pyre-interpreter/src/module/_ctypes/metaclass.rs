@@ -248,7 +248,7 @@ fn install_shared_meta(ns: PyObjectRef) {
         crate::typedef::make_getset_property_named(
             crate::make_builtin_function_with_arity("__pointer_type__", pointer_type_get, 2),
             crate::make_builtin_function_with_arity("__pointer_type__", pointer_type_set, 3),
-            pyre_object::PY_NULL,
+            crate::make_builtin_function_with_arity("__pointer_type__", pointer_type_del, 2),
             "__pointer_type__",
         ),
     );
@@ -259,6 +259,11 @@ fn install_shared_meta(ns: PyObjectRef) {
     );
 }
 
+/// No `fdel`: upstream `_fields_` is an ordinary class attribute that
+/// `_structunion_setattro` intercepts on the way through `tp_setattro`, so a
+/// delete there re-runs `PyCStructUnionType_update_stginfo` and then removes
+/// the class-dict entry.  Reproducing that needs the setattro hook this getset
+/// stands in for, not a deleter.
 fn install_fields_getset(ns: PyObjectRef) {
     type_ns_store(
         ns,
@@ -400,7 +405,15 @@ fn init_pointer_base(ns: PyObjectRef) {
         crate::typedef::make_getset_property_named(
             crate::make_builtin_function_with_arity("contents", contents_get, 2),
             crate::make_builtin_function_with_arity("contents", contents_set, 3),
-            pyre_object::PY_NULL,
+            crate::make_builtin_function_with_arity(
+                "contents",
+                |_args| {
+                    Err(crate::PyError::type_error(
+                        "Pointer does not support item deletion",
+                    ))
+                },
+                2,
+            ),
             "contents",
         ),
     );
@@ -1121,16 +1134,51 @@ fn meta_from_param(args: &[PyObjectRef]) -> PyResult {
     Ok(args.get(1).copied().unwrap_or_else(pyre_object::w_none))
 }
 
+/// `%R must have storage info`: `ctype_get_pointer_type` and
+/// `ctype_set_pointer_type` open with this refusal, and the setter is what
+/// serves a delete.
+fn no_storage_info(cls: PyObjectRef) -> crate::PyError {
+    let rendered = match unsafe { crate::display::py_repr_wtf8(cls) } {
+        Ok(rendered) => rendered,
+        Err(error) => return error,
+    };
+    crate::PyError::type_error(crate::display::wtf8_format!(
+        rendered,
+        " must have storage info"
+    ))
+}
+
 fn pointer_type_get(args: &[PyObjectRef]) -> PyResult {
     let cls = args[1];
-    if let Some(info) = stginfo::stginfo_of(cls)
-        && let Some(pt) = stginfo::stginfo_pointer_type(info)
-    {
+    // `ctype_get_pointer_type` splits the two absences: a class with no
+    // storage info at all is the `TypeError` above, and one whose
+    // `pointer_type` is unset names itself with `%R`.
+    let Some(info) = stginfo::stginfo_of(cls) else {
+        return Err(no_storage_info(cls));
+    };
+    if let Some(pt) = stginfo::stginfo_pointer_type(info) {
         return Ok(pt);
     }
+    let rendered = unsafe { crate::display::py_repr_wtf8(cls) }?;
     Err(crate::PyError::attribute_error(
-        "type has no attribute '__pointer_type__'",
+        crate::display::wtf8_format!(rendered, " has no attribute '__pointer_type__'"),
     ))
+}
+
+/// The setter's operand reaches `Py_XSETREF` unchecked, so deleting clears
+/// the cached pointer type and the next read reports it absent again.
+/// `stginfo_pointer_type` spells absence as `None`, which is what the clear
+/// stores; a raw null would instead read back as a getter that answered
+/// nothing, and the attribute machinery would fall through to the descriptor.
+fn pointer_type_del(args: &[PyObjectRef]) -> PyResult {
+    let cls = args[1];
+    match stginfo::stginfo_of(cls) {
+        Some(info) => {
+            stginfo::stginfo_set_pointer_type(info, pyre_object::w_none());
+            Ok(pyre_object::w_none())
+        }
+        None => Err(no_storage_info(cls)),
+    }
 }
 
 fn pointer_type_set(args: &[PyObjectRef]) -> PyResult {
@@ -1141,9 +1189,7 @@ fn pointer_type_set(args: &[PyObjectRef]) -> PyResult {
             stginfo::stginfo_set_pointer_type(info, value);
             Ok(pyre_object::w_none())
         }
-        None => Err(crate::PyError::attribute_error(
-            "cannot set '__pointer_type__'",
-        )),
+        None => Err(no_storage_info(cls)),
     }
 }
 
@@ -2192,7 +2238,11 @@ fn install_char_array_getsets(cls: PyObjectRef) {
         crate::typedef::make_getset_property_named(
             crate::make_builtin_function_with_arity("raw", char_array_get_raw, 2),
             crate::make_builtin_function_with_arity("raw", char_array_set_raw, 3),
-            pyre_object::PY_NULL,
+            crate::make_builtin_function_with_arity(
+                "raw",
+                |_args| Err(crate::PyError::attribute_error("cannot delete attribute")),
+                2,
+            ),
             "raw",
         ),
     );
@@ -2253,7 +2303,11 @@ fn install_wchar_array_getsets(cls: PyObjectRef) {
         crate::typedef::make_getset_property_named(
             crate::make_builtin_function_with_arity("value", wchar_array_get_value, 2),
             crate::make_builtin_function_with_arity("value", wchar_array_set_value, 3),
-            pyre_object::PY_NULL,
+            crate::make_builtin_function_with_arity(
+                "value",
+                |_args| Err(crate::PyError::type_error("can't delete attribute")),
+                2,
+            ),
             "value",
         ),
     );

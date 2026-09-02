@@ -76,10 +76,10 @@ pub mod _overlapped;
 #[allow(non_snake_case)]
 pub mod _pickle;
 #[allow(non_snake_case)]
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+#[cfg(all(unix, not(feature = "sandbox")))]
 pub mod _posixshmem;
 #[allow(non_snake_case)]
-#[cfg(not(feature = "sandbox"))]
+#[cfg(all(unix, not(feature = "sandbox")))]
 pub mod _posixsubprocess;
 #[allow(non_snake_case)]
 pub mod _pypy_generic_alias;

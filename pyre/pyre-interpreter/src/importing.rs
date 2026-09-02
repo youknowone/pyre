@@ -818,8 +818,18 @@ pub fn install_builtin_modules() {
             not(target_arch = "wasm32")
         ))]
         pyre_install_module!(_cffi_backend);
-        #[cfg(not(target_arch = "wasm32"))]
+        // Both are POSIX-only upstream, and their callers know it:
+        // `shared_memory.py` and `resource_tracker.py` import `_posixshmem`
+        // only in their `os.name != 'nt'` arm, and `subprocess.py` imports
+        // `_posixsubprocess` only in the `else` of `if _mswindows`.  PyPy's
+        // pypyoption drops `_posixsubprocess` from `working_modules` on
+        // win32 and builds `_posixshmem` as a cffi shim that Windows never
+        // gets.  Registering an empty module here instead flips availability
+        // probes such as `test_audit`'s `import_module("_posixsubprocess")`
+        // from skip to run.
+        #[cfg(unix)]
         pyre_install_module!(_posixshmem);
+        #[cfg(unix)]
         pyre_install_module!(_posixsubprocess);
         pyre_install_module!(_multiprocessing);
     }
@@ -868,6 +878,10 @@ pub fn install_builtin_modules() {
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);
     register_builtin_module("_sysconfig", init_sysconfig_stub);
+    // `_get_sysconfigdata` is reached only from `_init_posix`, which
+    // `sysconfig` runs when `os.name == 'posix'`; a Windows run takes
+    // `_init_non_posix` and never names this module.
+    #[cfg(not(windows))]
     register_builtin_module("_sysconfigdata", init_sysconfigdata);
 }
 

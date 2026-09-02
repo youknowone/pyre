@@ -900,40 +900,53 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 return Err(crate::PyError::type_error("find() missing pattern"));
             }
             let obj = args[0];
-            let (p, len) = mmap_ptr(obj)?;
+            let (_, len_at_entry) = mmap_ptr(obj)?;
+            // `interp_mmap.py find` is handed `space.bufferstr_w(w_tofind)`, a
+            // copy.  The pattern's own storage is not held across the
+            // `getindex_w` calls below: a `bytearray` pattern reallocated by
+            // one of their `__index__` hooks would leave a borrowed slice
+            // naming freed memory.
             let needle = unsafe {
                 if !pyre_object::bytesobject::is_bytes_like(args[1]) {
                     return Err(crate::PyError::type_error(
                         "find: pattern must be bytes-like",
                     ));
                 }
-                pyre_object::bytesobject::bytes_like_data(args[1])
+                pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
             };
             // `interp_mmap.py find(w_tofind, w_start=None,
             // w_end=None)` defaults w_start to `self.mmap.pos` then
             // routes through rmmap.find which handles negative start /
             // end by adding `size` and clamping to 0.
             let cur = mmap_get_attr_i64(obj, "_pos") as usize;
-            let start = if args.len() >= 3 {
-                let s = mmap_index_w(obj, args[2])?;
-                if s < 0 {
-                    ((s + len as i64).max(0)) as usize
-                } else {
-                    (s as usize).min(len)
-                }
-            } else {
-                cur
+            let start_raw = match args.get(2) {
+                Some(&value) => Some(mmap_index_w(obj, value)?),
+                None => None,
             };
-            let end = if args.len() >= 4 {
-                let e = mmap_index_w(obj, args[3])?;
-                if e < 0 {
-                    ((e + len as i64).max(0)) as usize
-                } else {
-                    (e as usize).min(len)
-                }
-            } else {
-                len
+            let end_raw = match args.get(3) {
+                Some(&value) => Some(mmap_index_w(obj, value)?),
+                None => None,
             };
+            // `rmmap.find` reads `self.data` and `self.size` at this point,
+            // after the `check_valid()` that follows `getindex_w`: an
+            // `__index__` above is free to `resize()` the mapping, which
+            // installs a new view at a new address.  Both the pointer and
+            // every bound are therefore taken from the mapping as it is now.
+            let (p, len) = mmap_ptr(obj)?;
+            let clamp = |v: i64| {
+                if v < 0 {
+                    ((v + len as i64).max(0)) as usize
+                } else {
+                    (v as usize).min(len)
+                }
+            };
+            let start = start_raw.map_or_else(|| cur.min(len), clamp);
+            // [3.14-spec] `mmap_gfind_lock_held` evaluates `end = self->size`
+            // at entry and the clamp below it only ever lowers the value, so a
+            // mapping grown by one of the conversions above keeps the size it
+            // had on the way in.  `interp_mmap.py find` reads `self.mmap.size`
+            // after the start conversion instead, which reports the new one.
+            let end = end_raw.map_or_else(|| len_at_entry.min(len), clamp);
             if start > end {
                 return Ok(pyre_object::w_int_new(-1));
             }
@@ -945,7 +958,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 return Ok(pyre_object::w_int_new(-1));
             }
             let pos = (0..=hay.len().saturating_sub(needle.len()))
-                .find(|&i| &hay[i..i + needle.len()] == needle)
+                .find(|&i| &hay[i..i + needle.len()] == needle.as_slice())
                 .map(|i| (start + i) as i64)
                 .unwrap_or(-1);
             Ok(pyre_object::w_int_new(pos))
@@ -960,40 +973,46 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 return Err(crate::PyError::type_error("rfind() missing pattern"));
             }
             let obj = args[0];
-            let (p, len) = mmap_ptr(obj)?;
+            let (_, len_at_entry) = mmap_ptr(obj)?;
+            // `interp_mmap.py rfind` is handed `space.bufferstr_w(w_tofind)`, a
+            // copy.  The pattern's own storage is not held across the
+            // `getindex_w` calls below: a `bytearray` pattern reallocated by
+            // one of their `__index__` hooks would leave a borrowed slice
+            // naming freed memory.
             let needle = unsafe {
                 if !pyre_object::bytesobject::is_bytes_like(args[1]) {
                     return Err(crate::PyError::type_error(
                         "rfind: pattern must be bytes-like",
                     ));
                 }
-                pyre_object::bytesobject::bytes_like_data(args[1])
+                pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
             };
             // `interp_mmap.py rfind(w_tofind, w_start=None,
             // w_end=None)` defaults w_start to `self.mmap.pos`, not 0.
             // Negative args run through rmmap.find which adds `size`
             // and clamps to 0.
             let cur = mmap_get_attr_i64(obj, "_pos") as usize;
-            let start = if args.len() >= 3 {
-                let s = mmap_index_w(obj, args[2])?;
-                if s < 0 {
-                    ((s + len as i64).max(0)) as usize
-                } else {
-                    (s as usize).min(len)
-                }
-            } else {
-                cur
+            let start_raw = match args.get(2) {
+                Some(&value) => Some(mmap_index_w(obj, value)?),
+                None => None,
             };
-            let end = if args.len() >= 4 {
-                let e = mmap_index_w(obj, args[3])?;
-                if e < 0 {
-                    ((e + len as i64).max(0)) as usize
-                } else {
-                    (e as usize).min(len)
-                }
-            } else {
-                len
+            let end_raw = match args.get(3) {
+                Some(&value) => Some(mmap_index_w(obj, value)?),
+                None => None,
             };
+            // As in `find`: the mapping `getindex_w` left behind is the one
+            // this reads, so the address and every bound come from it.
+            let (p, len) = mmap_ptr(obj)?;
+            let clamp = |v: i64| {
+                if v < 0 {
+                    ((v + len as i64).max(0)) as usize
+                } else {
+                    (v as usize).min(len)
+                }
+            };
+            let start = start_raw.map_or_else(|| cur.min(len), clamp);
+            // As in `find`: the entry size bounds the default end.
+            let end = end_raw.map_or_else(|| len_at_entry.min(len), clamp);
             if start > end {
                 return Ok(pyre_object::w_int_new(-1));
             }
@@ -1006,7 +1025,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             }
             let pos = (0..=hay.len().saturating_sub(needle.len()))
                 .rev()
-                .find(|&i| &hay[i..i + needle.len()] == needle)
+                .find(|&i| &hay[i..i + needle.len()] == needle.as_slice())
                 .map(|i| (start + i) as i64)
                 .unwrap_or(-1);
             Ok(pyre_object::w_int_new(pos))
@@ -1064,12 +1083,27 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 }
                 let obj = args[0];
                 let index = args[1];
-                let (_, len) = mmap_ptr(obj)?;
-                let len_i64 = len as i64;
+                let _ = mmap_ptr(obj)?;
                 if unsafe { pyre_object::is_slice(index) } {
-                    let (start, stop, step) =
-                        unsafe { crate::baseobjspace::normalize_slice(index, len_i64)? };
-                    let (p, _) = mmap_ptr(obj)?;
+                    // `mmap_subscript` runs `PySlice_Unpack` (which may call
+                    // `__index__`), then `CHECK_VALID`, and only then
+                    // `PySlice_AdjustIndices(self->size, ...)` — so the size
+                    // the bounds are clamped against is the one the mapping
+                    // has after that call, not before it.
+                    let (start_raw, stop_raw, step) = unsafe {
+                        crate::sliceobject::slice_unpack(
+                            pyre_object::sliceobject::w_slice_get_start(index),
+                            pyre_object::sliceobject::w_slice_get_stop(index),
+                            pyre_object::sliceobject::w_slice_get_step(index),
+                        )?
+                    };
+                    let (p, len) = mmap_ptr(obj)?;
+                    let (start, stop, step, _) = crate::sliceobject::slice_adjust_indices(
+                        start_raw,
+                        stop_raw,
+                        step,
+                        len as i64,
+                    );
                     if step == 1 {
                         if stop <= start {
                             return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
@@ -1090,7 +1124,11 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out));
                 }
                 let mut idx = mmap_index_w(obj, index)?;
-                let (p, _) = mmap_ptr(obj)?;
+                // `mmap_subscript`'s integer arm re-checks validity after
+                // `PyNumber_AsSsize_t` and then reads `self->size`, so a
+                // `resize()` from that `__index__` moves the bound too.
+                let (p, len) = mmap_ptr(obj)?;
+                let len_i64 = len as i64;
                 if idx < 0 {
                     idx += len_i64;
                 }
@@ -1125,12 +1163,25 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 if access == MMAP_ACCESS_READ {
                     return Err(crate::PyError::type_error("mmap is read-only"));
                 }
-                let (_, len) = mmap_ptr(obj)?;
-                let len_i64 = len as i64;
+                let _ = mmap_ptr(obj)?;
                 if unsafe { pyre_object::is_slice(index) } {
-                    let (start, stop, step) =
-                        unsafe { crate::baseobjspace::normalize_slice(index, len_i64)? };
-                    let (p, _) = mmap_ptr(obj)?;
+                    // `mmap_ass_subscript` splits the same way `mmap_subscript`
+                    // does: unpack, re-check, then adjust against the size the
+                    // mapping has now.
+                    let (start_raw, stop_raw, step) = unsafe {
+                        crate::sliceobject::slice_unpack(
+                            pyre_object::sliceobject::w_slice_get_start(index),
+                            pyre_object::sliceobject::w_slice_get_stop(index),
+                            pyre_object::sliceobject::w_slice_get_step(index),
+                        )?
+                    };
+                    let (p, len) = mmap_ptr(obj)?;
+                    let (start, stop, step, _) = crate::sliceobject::slice_adjust_indices(
+                        start_raw,
+                        stop_raw,
+                        step,
+                        len as i64,
+                    );
                     let length = if step > 0 && stop > start {
                         (1 + (i128::from(stop) - i128::from(start) - 1) / i128::from(step)) as i64
                     } else if step < 0 && start > stop {
@@ -1174,7 +1225,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     return Ok(pyre_object::w_none());
                 }
                 let mut idx = mmap_index_w(obj, index)?;
-                let (p, _) = mmap_ptr(obj)?;
+                let (p, len) = mmap_ptr(obj)?;
+                let len_i64 = len as i64;
                 if idx < 0 {
                     idx += len_i64;
                 }
@@ -1242,7 +1294,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         "madvise",
         crate::make_builtin_function("madvise", |args| {
             let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-            let (_, total) = mmap_ptr(obj)?;
+            let _ = mmap_ptr(obj)?;
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("madvise() requires option"));
             }
@@ -1251,14 +1303,18 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 Some(&value) => mmap_index_w(obj, value)?,
                 None => 0,
             };
+            let length_arg = match args.get(3) {
+                Some(&value) => Some(mmap_index_w(obj, value)?),
+                None => None,
+            };
+            // Every `__index__` above could have resized the mapping, so the
+            // extent the advice is applied to is read once they are all done.
+            let (_, total) = mmap_ptr(obj)?;
             if start_raw < 0 || usize::try_from(start_raw).map_or(true, |start| start >= total) {
                 return Err(crate::PyError::value_error("madvise start out of bounds"));
             }
             let start = start_raw as usize;
-            let length_raw = match args.get(3) {
-                Some(&value) => mmap_index_w(obj, value)?,
-                None => (total - start) as i64,
-            };
+            let length_raw = length_arg.unwrap_or((total - start) as i64);
             if length_raw < 0 {
                 return Err(crate::PyError::value_error("madvise length invalid"));
             }

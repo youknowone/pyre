@@ -1371,19 +1371,36 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// `fromcache(UnicodeDictStrategy)` / `get_empty_storage()` pair rather
     /// than starting the copy on the object strategy.  Every key below is a
     /// str, so the fill stays on the strategy it was born with.
+    ///
+    /// A dict that has already promoted to object storage takes the
+    /// `AbstractTypedStrategy.copy` route instead — upstream leaves
+    /// `ModuleDictStrategy` when it switches, so that is the `copy` it
+    /// reaches.  Cloning the backing keeps each key's cached hash, where a
+    /// re-store would call `__hash__` again and drop the entry (silently,
+    /// this being an infallible surface) once the key's hash started raising.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
+        if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
+            let new_storage = crate::gc_storage::gc_alloc_storage_box(
+                entries.clone(),
+                crate::dictmultiobject::object_dict_storage_gc_type_id(),
+            );
+            return crate::dictmultiobject::w_dict_new_with(
+                &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF,
+                new_storage as *mut u8,
+            );
+        }
         let strategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
         let new_dict =
             crate::dictmultiobject::w_dict_new_with(strategy, strategy.get_empty_storage());
-        if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
-            for (k, &v) in entries.iter() {
-                crate::dictmultiobject::w_dict_store(new_dict, k.obj, v);
-            }
-            return new_dict;
-        }
         let storage = crate::dictmultiobject::w_module_dict_module_storage(w_dict);
         for (key, &cell) in storage.entries.iter() {
             let unwrapped = unwrap_cell(cell);
+            // An empty cell names nothing — `getitem_str` reads a null unwrap
+            // as absence — so it does not become a null-valued entry of the
+            // ordinary dict this hands back.
+            if unwrapped.is_null() {
+                continue;
+            }
             let key_obj = _wrapkey(key);
             crate::dictmultiobject::w_dict_store(new_dict, key_obj, unwrapped);
         }

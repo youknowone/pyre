@@ -1931,7 +1931,15 @@ fn patch_object_class_descriptor() {
         make_getset_property_full(
             class_getter,
             class_setter,
-            pyre_object::PY_NULL,
+            make_builtin_function_with_arity(
+                "__class__",
+                |_args| {
+                    Err(crate::PyError::type_error(
+                        "can't delete __class__ attribute",
+                    ))
+                },
+                2,
+            ),
             pyre_object::PY_NULL,
             object_type,
             Some("__class__"),
@@ -8859,7 +8867,11 @@ fn init_frame_type(ns: PyObjectRef) {
             make_getset_property_named(
                 lineno_getter,
                 lineno_setter,
-                pyre_object::PY_NULL,
+                make_builtin_function_with_arity(
+                    "f_lineno",
+                    |_args| Err(crate::PyError::attribute_error("cannot delete attribute")),
+                    2,
+                ),
                 "f_lineno",
             ),
         )
@@ -8907,13 +8919,30 @@ fn init_frame_type(ns: PyObjectRef) {
             make_getset_property_named(
                 trace_lines_getter,
                 trace_lines_setter,
-                pyre_object::PY_NULL,
+                make_builtin_function_with_arity(
+                    "f_trace_lines",
+                    |_args| {
+                        Err(crate::PyError::type_error(
+                            "can't delete numeric/char attribute",
+                        ))
+                    },
+                    2,
+                ),
                 "f_trace_lines",
             ),
         )
     };
 
-    // f_trace_opcodes — read/write bool (pyframe.py:793-797).
+    // f_trace_opcodes — read/write bool (pyframe.py fget_f_trace_opcodes /
+    // fset_f_trace_opcodes).
+    //
+    // `frame_trace_opcodes_set_impl` opens with `PyBool_Check(value)` and has
+    // no null branch, so a delete faults there rather than answering.  The
+    // message below is `frame_lineno_set_impl`'s own null branch, the
+    // frame-attribute spelling of a refused delete.  An explicit `fdel` is
+    // installed only to override what stands in for it: with none,
+    // `descr_property_del` answers its own
+    // `cannot delete '%s' attribute of immutable type '%N'`.
     let trace_opcodes_getter = make_builtin_function_with_arity(
         "f_trace_opcodes",
         crate::pyframe::__majit_wrap_descr_typecheck_fget_f_trace_opcodes,
@@ -8931,7 +8960,11 @@ fn init_frame_type(ns: PyObjectRef) {
             make_getset_property_named(
                 trace_opcodes_getter,
                 trace_opcodes_setter,
-                pyre_object::PY_NULL,
+                make_builtin_function_with_arity(
+                    "f_trace_opcodes",
+                    |_args| Err(crate::PyError::attribute_error("cannot delete attribute")),
+                    2,
+                ),
                 "f_trace_opcodes",
             ),
         )
@@ -11656,8 +11689,11 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                         if fset.is_null() || unsafe { pyre_object::is_none(fset) } {
                             return Err(getset_no_accessor(w_self, "writable"));
                         }
-                        // ...or runs the setter, whose own refusal for a null
-                        // value is the setter's to word.
+                        // ...or reports the refusal below.  A setter with a
+                        // NULL-value branch of its own words that branch
+                        // through an `fdel` at its registration, because a
+                        // pyre setter is a builtin called with a real
+                        // argument slice and has no null operand to receive.
                         // typedef.py:404-405:
                         //   raise oefmt(space.w_AttributeError,
                         //       "cannot delete '%s' attribute of immutable type '%N'",

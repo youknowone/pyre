@@ -5556,37 +5556,23 @@ fn build_class_inner(
         crate::builtins::type_new_set_hash_if_eq(class_ns);
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         crate::builtins::type_new_wrap_special_methods(class_ns);
-        let dict_root = pyre_object::gc_roots::shadow_stack_len();
-        let dict_obj = pyre_object::w_dict_new();
-        let dict_obj = pyre_object::gc_roots::pin_root(dict_obj);
         // `PyDict_Copy(ctx->orig_dict)` — the class dict is the namespace as
-        // the body left it, keys of every type included.  The pairs sit in a
-        // native Vec the collector does not walk while each store hashes its
-        // own key and may grow the destination, so they are rooted and read
-        // back one at a time.
+        // the body left it, keys of every type included.  The clone carries
+        // each key's cached hash across, where a per-key re-store would call
+        // `__hash__` again — running a side-effecting one an extra time, and
+        // dropping the entry outright once that `__hash__` starts raising,
+        // because the store surface cannot report an error.
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        let entries = unsafe { pyre_object::w_dict_items(class_ns) };
-        let mut has_non_string_key = false;
-        {
-            let _entry_roots = pyre_object::gc_roots::push_roots();
-            let entry_root = pyre_object::gc_roots::shadow_stack_len();
-            for &(key, value) in &entries {
-                let _ = pyre_object::gc_roots::pin_root(key);
-                let _ = pyre_object::gc_roots::pin_root(value);
-            }
-            for index in 0..entries.len() {
-                let key = pyre_object::gc_roots::shadow_stack_get(entry_root + index * 2);
-                let value = pyre_object::gc_roots::shadow_stack_get(entry_root + index * 2 + 1);
-                if value.is_null() {
-                    continue;
-                }
-                if !unsafe { pyre_object::is_str(key) } {
-                    has_non_string_key = true;
-                }
-                let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
-                unsafe { pyre_object::w_dict_store(dict_obj, key, value) };
-            }
-        }
+        let dict_root = pyre_object::gc_roots::shadow_stack_len();
+        let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
+        let dict_obj = pyre_object::gc_roots::pin_root(dict_obj);
+        // `_PyDict_HasOnlyStringKeys(type->tp_dict)` decides the
+        // `RuntimeWarning` reported below; reading the keys answers it
+        // without hashing any of them.
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        let has_non_string_key = unsafe { pyre_object::w_dict_items(class_ns) }
+            .iter()
+            .any(|&(key, _)| !unsafe { pyre_object::is_str(key) });
         let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
         // Slot creation, C3 validation and `__set_name__` below all allocate
         // and can execute Python; the nascent type has no other referrer

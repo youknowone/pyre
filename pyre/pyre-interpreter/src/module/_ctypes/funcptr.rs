@@ -98,7 +98,7 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
         crate::typedef::make_getset_property_named(
             crate::make_builtin_function_with_arity("restype", restype_getter, 2),
             crate::make_builtin_function_with_arity("restype", restype_setter, 3),
-            pyre_object::PY_NULL,
+            crate::make_builtin_function_with_arity("restype", restype_deleter, 2),
             "restype",
         ),
     );
@@ -108,7 +108,7 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
         crate::typedef::make_getset_property_named(
             crate::make_builtin_function_with_arity("argtypes", argtypes_getter, 2),
             crate::make_builtin_function_with_arity("argtypes", argtypes_setter, 3),
-            pyre_object::PY_NULL,
+            crate::make_builtin_function_with_arity("argtypes", argtypes_deleter, 2),
             "argtypes",
         ),
     );
@@ -669,6 +669,14 @@ fn restype_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_none())
 }
 
+/// `_ctypes_CFuncPtr_restype_set_impl`'s `value == NULL` branch clears both
+/// `restype` and the `_check_retval_` checker it was derived from, leaving the
+/// getter to answer from the class again.
+fn restype_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    instance_del(args[1], RESTYPE_KEY);
+    Ok(pyre_object::w_none())
+}
+
 fn argtypes_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let obj = args[1];
     if let Some(v) = instance_get(obj, ARGTYPES_KEY) {
@@ -699,6 +707,13 @@ fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(pyre_object::w_none())
 }
 
+/// `_ctypes_CFuncPtr_argtypes_set_impl` treats a NULL operand exactly as it
+/// treats `None`: the argtypes and their converters are cleared.
+fn argtypes_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    instance_del(args[1], ARGTYPES_KEY);
+    Ok(pyre_object::w_none())
+}
+
 fn errcheck_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(instance_get(args[1], ERRCHECK_KEY).unwrap_or_else(pyre_object::w_none))
 }
@@ -718,15 +733,22 @@ fn errcheck_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 fn errcheck_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let d = crate::baseobjspace::getdict_native(args[1]);
-    if !d.is_null() {
-        // Deleting one that was never set is not an error.
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_delitem_str(d, ERRCHECK_KEY);
-            drop_settled(d);
-        }
-    }
+    instance_del(args[1], ERRCHECK_KEY);
     Ok(pyre_object::w_none())
+}
+
+/// Drop one of the per-instance slots a [`CallPlan`] is settled from.  Every
+/// key here reaches the plan, so the delete drops it the way [`instance_set`]
+/// does; deleting one that was never set is not an error.
+fn instance_del(obj: PyObjectRef, key: &str) {
+    let d = crate::baseobjspace::getdict_native(obj);
+    if d.is_null() {
+        return;
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_delitem_str(d, key);
+        drop_settled(d);
+    }
 }
 
 /// Reject keyword arguments: ctypes foreign calls and `_CFuncPtr(...)` take

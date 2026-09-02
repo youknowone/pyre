@@ -735,7 +735,7 @@ pub(super) fn create_module_from_def_and_spec(
             && let Some(pending) = pyerrors::take_pending_error()
         {
             unsafe { pyobject::decref(result) };
-            return Err(super::system_error_from_cause(
+            return Err(crate::error::system_error_from_cause(
                 format!("creation of module {name} raised unreported exception"),
                 pending,
             ));
@@ -834,7 +834,7 @@ fn exec_def_of(module: PyObjectRef, def: *mut CPyModuleDef) -> Result<(), crate:
                 }));
             }
             if let Some(pending) = pyerrors::take_pending_error() {
-                return Err(super::system_error_from_cause(
+                return Err(crate::error::system_error_from_cause(
                     format!(
                         "execution of module {} raised unreported exception",
                         text_or_empty(unsafe { (*def).m_name })
