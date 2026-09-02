@@ -519,6 +519,105 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Exact-int `//` / `%` by a zero divisor, recorded as the interpreter's raise
+/// rather than as the descent's materialiser call.
+///
+/// `binary_value_from_tag`'s `int_floordiv` / `int_mod` bodies build their
+/// `ZeroDivisionError` through `pyerror_zero_division_to_exc_object`, a
+/// published `dont_look_inside` materialiser (`front/result_exc.rs`
+/// `FUSED_KIND_CTORS`).  A descent therefore records the instance as the result
+/// of an opaque call, and an opaque call's result is a concrete object:
+/// `OptVirtualize` can fold away neither it, nor the `PyTraceback` the raise
+/// links onto it, nor the `sys_exc_value` save/restore around the handler.  A
+/// `try: x // 0 / except ZeroDivisionError:` loop then materialises all of them
+/// on every iteration.  `walker_emit_recorded_builtin_raise` records the same
+/// construction as generated ops, which the optimizer removes when nothing
+/// observes the instance.
+///
+/// The divisor test is a `GUARD_TRUE(int_eq(divisor, 0))`, so a later non-zero
+/// divisor side-exits to a bridge that takes the dividing arm.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_binary_op_int_zero_div<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    use pyre_interpreter::bytecode::BinaryOperator;
+    if !matches!(
+        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+        Some(
+            BinaryOperator::FloorDivide
+                | BinaryOperator::InplaceFloorDivide
+                | BinaryOperator::Remainder
+                | BinaryOperator::InplaceRemainder
+        )
+    ) {
+        return Ok(None);
+    }
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let (Some(lhs_obj), Some(rhs_obj)) = (
+        walker_concrete_ref_object(ctx, lhs),
+        walker_concrete_ref_object(ctx, rhs),
+    ) else {
+        return Ok(None);
+    };
+    // Same exactness gate as `try_walker_specialize_truth_int`: `is_int` reads
+    // `ob_type`, which an `int` subclass shares, and
+    // `walker_numeric_builtin_class` answers with the canonical `int` for one.
+    unsafe {
+        for obj in [lhs_obj, rhs_obj] {
+            if !pyre_object::is_int(obj)
+                || pyre_object::is_bool(obj)
+                || !pyre_object::is_exact_builtin_instance(obj)
+            {
+                return Ok(None);
+            }
+        }
+        if pyre_object::w_int_get_value(rhs_obj) != 0 {
+            return Ok(None);
+        }
+    }
+    // The raising arm needs the helper-produced exception as its concrete
+    // shadow, but records no helper call in the trace.
+    let Some(Err(exc_i64)) = walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)
+    else {
+        return Ok(None);
+    };
+    // The helper publishes through both the blackhole cell (drained by
+    // `execute_residual_call`) and the backend exception cells.  The latter
+    // belong to compiled execution; drain the trace-time publish before the
+    // walk continues into the Python handler.
+    if let Some(cb) = crate::callbacks::try_get() {
+        (cb.drain_backend_jit_exc)();
+    }
+    let exc = exc_i64 as usize as pyre_object::PyObjectRef;
+    let kind = pyre_object::interp_exceptions::ExcKind::ZeroDivisionError;
+    if !walker_recorded_builtin_raise_is_supported(exc, kind) {
+        return Ok(None);
+    }
+    let Some(ec) = walker_ensure_execution_context(ctx) else {
+        return Ok(None);
+    };
+
+    // Commit to the raising arm only after every decline.
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let _lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
+    let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
+    let rhs_zero = walker_int_eq_const(ctx, rhs_raw, 0, 1);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[rhs_zero])?;
+    Ok(Some(walker_emit_recorded_builtin_raise(ctx, ec, exc, kind)))
+}
+
 /// Walker-native `W_LongObject // W_IntObject` / `%` specialization for the
 /// `BINARY_OP` helper residual_call.
 ///

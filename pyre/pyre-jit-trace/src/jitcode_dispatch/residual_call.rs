@@ -3419,6 +3419,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
+            // The refusal names the helper and slot it fired on, because the
+            // repair for a helper that does check its NULL is a row in
+            // `mayforce_null_ref_arg_is_checked_sentinel` and the row needs
+            // both coordinates.
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[nullref-refusal] helper={helper:?} arg_index={i} nargs={} pc={op_pc} opcode={call_opcode:?}",
+                    args.len()
+                );
+            }
             return Ok(declined_symbolic(call_opcode));
         }
     }
@@ -9117,6 +9127,19 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             )
                         })?
                     } else {
+                        // The exact-int zero-divisor raise runs BEFORE the
+                        // descent: the descended body reaches its
+                        // `ZeroDivisionError` through an opaque published
+                        // materialiser, whose concrete result no longer
+                        // virtualizes (see
+                        // `try_walker_specialize_binary_op_int_zero_div`).
+                        if let Some(outcome) = spec_gate(SpecFold::BinaryOpIntZeroDiv, || {
+                            try_walker_specialize_binary_op_int_zero_div(
+                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst_bank,
+                            )
+                        })? {
+                            return Ok((outcome, op.next_pc));
+                        }
                         // Descend the helper whole ahead of the hand folds, so
                         // their `consulted` counts read whether the descent
                         // took the site.
