@@ -214,10 +214,20 @@ impl W_BufferedReader {
     /// in a memoryview, and `_raw_read` wraps a `SubBuffer` of the destination
     /// in a `SimpleView`; either way the read lands where the caller wants it
     /// and no second buffer is allocated or copied through.
-    fn raw_read(&mut self, dest: *mut u8, length: usize) -> Result<usize, crate::PyError> {
+    fn raw_read(
+        &mut self,
+        w_owner: PyObjectRef,
+        dest: *mut u8,
+        length: usize,
+    ) -> Result<usize, crate::PyError> {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(self.self_obj());
-        let sp = pyre_object::gc_roots::shadow_stack_len() - 1;
+        // `SubBuffer(buffer, start, length)` holds the destination buffer
+        // itself, so the storage `dest` names outlives the `readinto` even
+        // when the call reassigns the field it was read from.  `dest` is a
+        // bare address, so the owner is rooted here instead.
+        let _ = pyre_object::gc_roots::pin_root(w_owner);
+        let sp = pyre_object::gc_roots::shadow_stack_len() - 2;
         let _ = pyre_object::gc_roots::pin_root(crate::builtins::w_memoryview_new_raw_window(
             dest as usize,
             length,
@@ -225,12 +235,12 @@ impl W_BufferedReader {
         let outcome = super::call_method_result(
             self.w_raw,
             "readinto",
-            &[pyre_object::gc_roots::shadow_stack_get(sp + 1)],
+            &[pyre_object::gc_roots::shadow_stack_get(sp + 2)],
         );
         // The window names memory this call borrowed, so it is closed whatever
         // the outcome rather than left writable to a raw stream that kept it.
         let _ =
-            crate::builtins::memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(sp + 1)]);
+            crate::builtins::memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(sp + 2)]);
         let result = outcome?;
         if unsafe { pyre_object::is_none(result) } {
             return Err(make_blocking_error());
@@ -254,7 +264,7 @@ impl W_BufferedReader {
         let dest = unsafe {
             pyre_object::bytearrayobject::w_bytearray_data_mut(self.buffer)[start..].as_mut_ptr()
         };
-        let size = self.raw_read(dest, length)?;
+        let size = self.raw_read(self.buffer, dest, length)?;
         if size > 0 {
             self.read_end = (start + size) as i64;
             self.raw_pos = self.read_end;
@@ -364,10 +374,11 @@ impl W_BufferedReader {
             // `out + written`: the whole reservation above is the destination,
             // so the block lands in it with nothing copied afterwards.  The
             // reservation is exact and never exceeded, so the pointer stays
-            // valid for every pass.
+            // valid for every pass, and no Python object names it for the
+            // raw stream to drop.
             let written = output.len();
             let dest = unsafe { output.as_mut_ptr().add(written) };
-            let size = match self.raw_read(dest, block) {
+            let size = match self.raw_read(pyre_object::w_none(), dest, block) {
                 Ok(size) => size,
                 Err(error) if is_blocking_error(&error) => {
                     return if output.is_empty() {
@@ -458,15 +469,17 @@ impl W_BufferedReader {
                     let requested = size as usize;
                     // `_io__Buffered_read1_impl` allocates the whole request
                     // with `PyBytes_FromStringAndSize(NULL, n)` and fills it
-                    // from a single raw read.
+                    // from a single raw read.  The reservation is local, so
+                    // there is no owner for the raw stream to drop.
                     let mut out = crate::builtins::try_vec_with_capacity::<u8>(requested)?;
-                    let read = match this.raw_read(out.as_mut_ptr(), requested) {
-                        Ok(read) => read,
-                        // `r == -2` there -- the raw stream would have blocked
-                        // -- is read as zero bytes, not as an error.
-                        Err(error) if is_blocking_error(&error) => 0,
-                        Err(error) => return Err(error),
-                    };
+                    let read =
+                        match this.raw_read(pyre_object::w_none(), out.as_mut_ptr(), requested) {
+                            Ok(read) => read,
+                            // `r == -2` there -- the raw stream would have blocked
+                            // -- is read as zero bytes, not as an error.
+                            Err(error) if is_blocking_error(&error) => 0,
+                            Err(error) => return Err(error),
+                        };
                     unsafe { out.set_len(read) };
                     return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out));
                 }
@@ -523,9 +536,10 @@ impl W_BufferedReader {
                 if remaining > this.buffer_size as usize {
                     // `_buffered_readinto_generic` reads into
                     // `buf.buf + written`, so the raw stream fills the caller's
-                    // own buffer and nothing is copied afterwards.
+                    // own buffer and nothing is copied afterwards.  `target`
+                    // roots that buffer's owner for its whole lease.
                     let dest = (unsafe { target.as_mut_slice() })[written..].as_mut_ptr();
-                    let size = match this.raw_read(dest, remaining) {
+                    let size = match this.raw_read(pyre_object::w_none(), dest, remaining) {
                         Ok(size) => size,
                         Err(error) if is_blocking_error(&error) => break,
                         Err(error) => return Err(error),
