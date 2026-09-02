@@ -3660,7 +3660,7 @@ impl ControlFlowOpcodeHandler for PyFrame {
         // Signal a back-edge to the main eval_loop, which handles
         // JIT counting and compiled code execution via try_back_edge_jit.
         Ok(StepResult::CloseLoop {
-            jump_args: vec![],
+            jump_args: None,
             loop_header_pc: target,
         })
     }
