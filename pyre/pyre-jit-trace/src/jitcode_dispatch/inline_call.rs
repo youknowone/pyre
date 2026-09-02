@@ -14,7 +14,7 @@
 //! `dispatch_inline_call_*` per-shape dispatchers. The `inline_call_*`
 //! opname arms stay in `handle` (mod.rs) and call into these.
 
-use majit_translate::codewriter::jitcode::DescentBlockerSummary;
+use majit_translate::codewriter::jitcode::{DESCENT_ENTRY_LEN_SLOTS, DescentBlockerSummary};
 use rustpython_wtf8::Wtf8;
 
 use super::*;
@@ -783,9 +783,11 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// `jit_metadata.json` carries.
 ///
 /// The answer is memoized on the jitcode itself, so the scan runs once per
-/// body rather than once per call site.  Only this entry point memoizes: the
-/// summary a cycle produces belongs to the occurrence that opened it, not to
-/// the body, so [`summarize_descent_blockers`] caches nothing.
+/// (body, entry argument-array length) rather than once per call site.  Only
+/// this entry point memoizes: the summary a cycle produces belongs to the
+/// occurrence that opened it, not to the body, so
+/// [`summarize_descent_blockers`] caches nothing, and a body entered with more
+/// than [`DESCENT_ENTRY_LEN_SLOTS`] arguments recomputes.
 fn descent_decline(
     jitcode_index: usize,
     entry_array_lengths: &[(usize, usize)],
@@ -793,10 +795,10 @@ fn descent_decline(
     if !descent_unlowered_helper_scan_enabled() {
         return None;
     }
-    let summary = if entry_array_lengths.is_empty() {
-        descent_blocker_summary(jitcode_index)
-    } else {
-        summarize_descent_blockers_with_entry(jitcode_index, &mut Vec::new(), entry_array_lengths)
+    let summary = match entry_array_lengths {
+        [] => descent_blocker_summary(jitcode_index),
+        &[(0, entry_len)] => descent_blocker_summary_for_entry_len(jitcode_index, entry_len),
+        other => summarize_descent_blockers_with_entry(jitcode_index, &mut Vec::new(), other),
     };
     if summary.body_not_walked {
         return Some(DescentDecline::BodyNotWalked);
@@ -1091,6 +1093,20 @@ fn body_not_walked() -> DescentBlockerSummary {
     }
 }
 
+/// Memoizing entry point for [`summarize_descent_blockers`] with the entry
+/// argument-array length a call site knows.
+fn descent_blocker_summary_for_entry_len(
+    jitcode_index: usize,
+    entry_len: usize,
+) -> DescentBlockerSummary {
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return body_not_walked();
+    };
+    jitcode.descent_blocker_summary_for_entry_len(entry_len, || {
+        summarize_descent_blockers_with_entry(jitcode_index, &mut Vec::new(), &[(0, entry_len)])
+    })
+}
+
 /// Memoizing entry point for [`summarize_descent_blockers`].
 fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSummary {
     let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
@@ -1349,6 +1365,45 @@ fn summarize_descent_blockers(
     summarize_descent_blockers_with_entry(jitcode_index, seen, &[])
 }
 
+thread_local! {
+    /// How many times the scan has answered for a body already on its own
+    /// stack.  Read as a fence around a subtree: a subtree that leaves it
+    /// unchanged never consulted the stack.
+    static DESCENT_SCAN_CYCLE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`summarize_descent_blockers`] for a callee, memoized on the callee's body
+/// when the answer belongs to that body.
+///
+/// A callee is scanned with no entry facts, so what it computes is the same
+/// fact-free summary [`descent_blocker_summary`] holds — except under a cycle,
+/// where a body already on the stack answers "executes an effect, names no
+/// blocker" for the occurrence that opened the cycle rather than for the body.
+/// A subtree that took that arm nowhere did not read the stack at all and its
+/// answer is a property of the body alone.  Without the memo a callee shared by
+/// several paths is re-walked once per path, and the walk is transitive, so the
+/// scan a single gateway pays grows with the shape of the graph beneath it.
+fn summarize_descent_blockers_cached(
+    jitcode_index: usize,
+    seen: &mut Vec<usize>,
+) -> DescentBlockerSummary {
+    if seen.contains(&jitcode_index) {
+        return summarize_descent_blockers(jitcode_index, seen);
+    }
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        return summarize_descent_blockers(jitcode_index, seen);
+    };
+    if let Some(cached) = jitcode.descent_blocker_summary_if_computed() {
+        return cached;
+    }
+    let cycles_before = DESCENT_SCAN_CYCLE_HITS.with(|c| c.get());
+    let summary = summarize_descent_blockers(jitcode_index, seen);
+    if DESCENT_SCAN_CYCLE_HITS.with(|c| c.get()) == cycles_before {
+        jitcode.descent_blocker_summary(|| summary);
+    }
+    summary
+}
+
 /// [`summarize_descent_blockers`] with concrete facts known at the entry of
 /// the top body.  Callee facts are not guessed: without mapping an
 /// `inline_call_*` varlist into the callee banks, recursive bodies use their
@@ -1359,6 +1414,7 @@ fn summarize_descent_blockers_with_entry(
     entry_array_lengths: &[(usize, usize)],
 ) -> DescentBlockerSummary {
     if seen.contains(&jitcode_index) {
+        DESCENT_SCAN_CYCLE_HITS.with(|c| c.set(c.get() + 1));
         return DescentBlockerSummary {
             may_execute_effect: true,
             ..DescentBlockerSummary::default()
@@ -1392,7 +1448,7 @@ fn summarize_descent_blockers_with_entry(
             descrs
                 .at(descr_index)
                 .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                .map(|callee| summarize_descent_blockers(callee, seen))
+                .map(|callee| summarize_descent_blockers_cached(callee, seen))
         },
         &mut |_blocker, _effect| true,
         &mut residual_call_is_effect_free,
