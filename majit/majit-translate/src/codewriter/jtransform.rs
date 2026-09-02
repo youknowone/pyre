@@ -7450,6 +7450,29 @@ fn goto_if_not_fusable(kind: &OpKind) -> Option<(String, Vec<crate::flowspace::m
         {
             Some((op.clone(), vec![lhs.clone(), rhs.clone()]))
         }
+        // The same integer comparisons under the spelling that actually
+        // reaches here.  `front::mir::canonical_binop_label` leaves a
+        // comparison bare and the `int_` prefix is added by
+        // `assembler::op_kind_to_opname_with_kinds`, which runs after
+        // flatten -- so the `int_lt` arm above matches nothing the front end
+        // produces, while `float_lt` and `ptr_eq` do match because
+        // `rewrite_operation` renamed them.  The fused exitswitch has to
+        // name the opcode the assembler will look up
+        // (`goto_if_not_int_lt/iiL`), so the prefix is applied here.
+        //
+        // Both operands must be `'i'`: the argcodes come from the register
+        // kinds, and there is no `goto_if_not_int_lt/rrL` entry.  A ref or
+        // float comparison that still reads bare never had its operands
+        // rewritten and so is not one of these.
+        OpKind::BinOp { op, lhs, rhs, .. }
+            if matches!(op.as_str(), "lt" | "le" | "eq" | "ne" | "gt" | "ge")
+                && FunctionGraph::concretetype_of(lhs)
+                    == crate::codewriter::type_state::ConcreteType::Signed
+                && FunctionGraph::concretetype_of(rhs)
+                    == crate::codewriter::type_state::ConcreteType::Signed =>
+        {
+            Some((format!("int_{op}"), vec![lhs.clone(), rhs.clone()]))
+        }
         OpKind::UnaryOp { op, operand, .. }
             if matches!(
                 op.as_str(),
@@ -16510,5 +16533,119 @@ mod tests {
                 "`x == 5` stays a binary compare: {ops:?}"
             );
         }
+    }
+
+    /// `goto_if_not_fusable` names the RPython opnames (`int_lt`), but the
+    /// front end spells a comparison bare (`front::mir::canonical_binop_label`)
+    /// and only the assembler adds the `int_` prefix -- after flatten.  A
+    /// production integer compare therefore reaches the exitswitch under the
+    /// bare name.
+    #[test]
+    fn a_bare_int_compare_fuses_into_the_exitswitch() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = FunctionGraph::new("bare_compare_fuse");
+        let a = graph.alloc_value_var();
+        let b = graph.alloc_value_var();
+        a.set_concretetype(Some(LowLevelType::Signed));
+        b.set_concretetype(Some(LowLevelType::Signed));
+        let t = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "lt".to_string(),
+                    lhs: a.clone(),
+                    rhs: b.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        t.set_concretetype(Some(LowLevelType::Bool));
+
+        let if_false = graph.create_block();
+        let if_true = graph.create_block();
+        let true_iarg = graph.alloc_value_var();
+        graph.push_inputarg_var(if_true, true_iarg);
+        let start = graph.startblock.0;
+        graph.set_control_flow_metadata(
+            graph.startblock,
+            Some(ExitSwitch::Value(t.clone())),
+            vec![
+                Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
+                Link::new_mixed(
+                    vec![LinkArg::Value(t.clone())],
+                    if_true,
+                    Some(ExitCase::Bool(true)),
+                ),
+            ],
+        );
+
+        assert!(
+            super::optimize_goto_if_not(&mut graph, start),
+            "a bare `lt` is the spelling production emits and must fuse",
+        );
+        match &graph.blocks[start].exitswitch {
+            Some(ExitSwitch::Fused { opname, args }) => {
+                assert_eq!(
+                    opname, "int_lt",
+                    "the fused exitswitch must name the opcode the assembler \
+                     looks up (`goto_if_not_int_lt/iiL`)",
+                );
+                assert_eq!(args, &vec![a, b]);
+            }
+            other => panic!("expected a fused exitswitch, got {other:?}"),
+        }
+    }
+
+    /// The bare arm is guarded on `Signed` operands because the argcodes
+    /// follow the register kinds and `insns.rs` registers no
+    /// `goto_if_not_int_eq/rrL`.  A ref comparison that still reads bare
+    /// never went through the `ptr_eq` rewrite, so it must not fuse.
+    #[test]
+    fn a_bare_compare_over_ref_operands_does_not_fuse() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = FunctionGraph::new("bare_ref_compare");
+        let a = graph.alloc_value_var();
+        let b = graph.alloc_value_var();
+        let t = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "eq".to_string(),
+                    lhs: a.clone(),
+                    rhs: b.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        t.set_concretetype(Some(LowLevelType::Bool));
+
+        let if_false = graph.create_block();
+        let if_true = graph.create_block();
+        let true_iarg = graph.alloc_value_var();
+        graph.push_inputarg_var(if_true, true_iarg);
+        let start = graph.startblock.0;
+        graph.set_control_flow_metadata(
+            graph.startblock,
+            Some(ExitSwitch::Value(t.clone())),
+            vec![
+                Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
+                Link::new_mixed(
+                    vec![LinkArg::Value(t.clone())],
+                    if_true,
+                    Some(ExitCase::Bool(true)),
+                ),
+            ],
+        );
+
+        assert!(
+            !super::optimize_goto_if_not(&mut graph, start),
+            "an unstamped operand pair has no `iiL` opcode to fuse into",
+        );
     }
 }
