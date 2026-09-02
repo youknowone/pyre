@@ -3636,17 +3636,19 @@ pub unsafe fn connection_read_plain(
 ) -> TlsResult<Vec<u8>> {
     use std::io::Read;
     let connection = unsafe { &mut *connection };
-    connection.process_received_tls()?;
     // `_ssl__SSLSocket_read_impl` allocates the destination with
     // `PyBytes_FromStringAndSize(NULL, len)` before it reaches `SSL_read`, so
     // a length no allocator can satisfy raises rather than aborting.  The
     // `resize` below cannot grow past what this reserved, so it cannot abort
-    // either.
+    // either.  It also comes before the queued records are fed in: those
+    // advance the read cursor and latch the peer's close/alert state, and a
+    // refused reservation must not consume them.
     let mut output: Vec<u8> = Vec::new();
     if output.try_reserve_exact(size).is_err() {
         return Err((TLS_ERROR_NO_MEMORY, String::new()));
     }
     output.resize(size, 0);
+    connection.process_received_tls()?;
     match connection.active_mut()?.reader().read(&mut output) {
         // A clean close_notify is EOF at the Python stream layer. CPython's
         // SSL_read wrapper returns b"" here; SSLZeroReturnError is reserved
