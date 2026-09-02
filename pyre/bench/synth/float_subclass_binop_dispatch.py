@@ -3,11 +3,13 @@
 # recursive portal, as PyPy does.  The oracle reports 35 loops / 0 bridges;
 # pyre reports 33 / 0, including nine function-entry activations.  wasm must
 # compile each trace as a separate module: PYRE_WASM_JIT_STATS measures 33
-# materializations and 314ms of trace compilation on this host.  The old 4x
-# ceiling was fitted while those calls incorrectly stayed on the plain
-# evaluator.  The new topology reads 4.4x and 4.8x here, so 5.6x is the highest
-# observation plus WASM_RATIO_FIT_HEADROOM (15%), not an exemption from the
-# topology or correctness gates.
+# materializations and 314ms of trace compilation on darwin-arm64.  The old
+# 4x ceiling was fitted while those calls incorrectly stayed on the plain
+# evaluator.  The new topology reads 4.4x and 4.8x there, so 5.6x is the
+# highest observation plus WASM_RATIO_FIT_HEADROOM (15%), not an exemption
+# from the topology or correctness gates.  One ubuntu-24.04 run read it at
+# 2.6x and so named the allowance outgrown; the allowance is for the darwin
+# reading no CI run measures.
 #
 # A float subclass that overrides the arithmetic and comparison dunders, driven
 # hot enough to compile. The walker's float specialization lowers BINARY_OP to

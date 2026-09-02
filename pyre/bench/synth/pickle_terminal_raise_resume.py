@@ -6,8 +6,12 @@
 # pyre's wasm run reaches 72 / 0, so suppressing those entry traces to recover
 # the old timing would move away from the oracle.  wasm materializes the traces
 # as separate modules, while this fixture also retains 450 host residual calls.
-# The post-port ratios reproduce at 5.3x and 5.4x against dynasm; 6.3x is the
-# highest observation plus WASM_RATIO_FIT_HEADROOM (15%).
+# The post-port ratios reproduce at 5.3x and 5.4x against dynasm on
+# darwin-arm64; 6.3x is the highest observation plus WASM_RATIO_FIT_HEADROOM
+# (15%).  One ubuntu-24.04 run read it at 3.5x, far enough under the 4x
+# ceiling's fit margin that the summary there names the allowance
+# outgrown -- it is the darwin reading no CI run measures that this holds
+# for.
 # The attribute fold, 690 firings across the corpus and undeclared. Pure-Python
 # pickle drives it 122 times here, more than any other fixture.  It also reaches
 # `builtin_getattr`, which a corpus census found no other fixture firing: once
