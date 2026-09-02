@@ -4818,6 +4818,9 @@ fn build_function(
                     op,
                     block_exit_depth,
                     guard_dispatch,
+                    // Emitted at statement level: this exit is unconditional,
+                    // so no `if` stands between it and the region blocks.
+                    0,
                 );
                 guard_idx += 1;
             }
@@ -6005,6 +6008,11 @@ fn build_function(
                     op,
                     block_exit_depth,
                     guard_dispatch,
+                    // Emitted at statement level: this guard has no passing
+                    // outcome, so no `if` stands between it and the region
+                    // blocks. A loop-closing bridge merges into exactly this
+                    // exit when the owner is a segmented trace's cut.
+                    0,
                 );
                 guard_idx += 1;
             }
@@ -8318,8 +8326,41 @@ fn emit_guard_if_exit(
         op,
         block_exit_depth + 1,
         dispatch,
+        1,
     );
     sink.end();
+}
+
+/// Branch depth from the emitting instruction out to the `block` opened for
+/// `inline`'s region.
+///
+/// A family's blocks close one per region as the walk reaches each region's
+/// ops, so the ordinal counts from whichever of them are still open here.
+/// `build_function` refuses any region whose source guard does not precede its
+/// own ops, which is what keeps this subtraction from going negative.
+///
+/// `enclosing_frames` is what the caller opened between those blocks and this
+/// instruction — one for the failing `if` of a conditional guard, none for an
+/// exit emitted at statement level. Assuming the `if` unconditionally sends a
+/// statement-level exit one frame too far out: for a region inside the header
+/// `loop`, to the `loop` itself, which turns the exit into a back edge over the
+/// owner's ops alone and leaves the region unreachable.
+fn inline_region_br_depth(
+    inline: &InlineGuard<'_>,
+    dispatch: &BridgeDispatch<'_>,
+    enclosing_frames: u32,
+) -> u32 {
+    let ordinal = if inline.outside_loop {
+        inline.region_ordinal - dispatch.closed_outside_regions
+    } else {
+        inline.region_ordinal - dispatch.closed_body_regions
+    };
+    let depth = if inline.outside_loop {
+        dispatch.outside_region_base + ordinal
+    } else {
+        ordinal
+    };
+    depth + enclosing_frames
 }
 
 fn emit_guard_exit(
@@ -8330,6 +8371,7 @@ fn emit_guard_exit(
     op: &Op,
     block_exit_depth: u32,
     dispatch: BridgeDispatch<'_>,
+    enclosing_frames: u32,
 ) {
     if let Some(inline) = dispatch
         .inline_guards
@@ -8345,25 +8387,7 @@ fn emit_guard_exit(
             op,
             inline.inputargs,
         );
-        // The target depth is measured outside this failing `if`; include the
-        // `if` itself before selecting the enclosing bridge block.
-        //
-        // A family's blocks close one per region as the walk reaches each
-        // region's ops, so the ordinal counts from whichever of them are still
-        // open here. `build_function` refuses any region whose source guard
-        // does not precede its own ops, which is what keeps this subtraction
-        // from going negative.
-        let ordinal = if inline.outside_loop {
-            inline.region_ordinal - dispatch.closed_outside_regions
-        } else {
-            inline.region_ordinal - dispatch.closed_body_regions
-        };
-        let depth = if inline.outside_loop {
-            dispatch.outside_region_base + ordinal
-        } else {
-            ordinal
-        };
-        sink.br(depth + 1);
+        sink.br(inline_region_br_depth(inline, &dispatch, enclosing_frames));
         return;
     }
     if dispatch.param_type_indices.is_empty() {
@@ -9363,6 +9387,53 @@ mod tests {
         }
 
         assert_eq!(bytes, [0x22, 0x01]);
+    }
+
+    /// A guard exit that jumps into a merged region counts only the frames its
+    /// own emission opened. A conditional guard branches from inside its
+    /// failing `if`; `GUARD_ALWAYS_FAILS` and `FINISH` branch at statement
+    /// level, and charging them for an `if` they never open would send the
+    /// branch to the enclosing `loop` instead of the region's block.
+    #[test]
+    fn inline_region_br_depth_counts_only_the_frames_the_caller_opened() {
+        let ref_homes = RefHomes {
+            by_id: Vec::new(),
+            len: 0,
+        };
+        let param_type_indices = indexmap::IndexMap::new();
+        let spill_helpers = indexmap::IndexMap::new();
+        let inline = InlineGuard {
+            guard_idx: 0,
+            inputargs: &[],
+            region_ordinal: 0,
+            outside_loop: false,
+        };
+        let dispatch = BridgeDispatch {
+            cells_base: 0,
+            fail_index_base: 0,
+            bridge_slot_local: 0,
+            enabled: false,
+            param_type_indices: &param_type_indices,
+            inline_guards: std::slice::from_ref(&inline),
+            outside_region_base: 4,
+            closed_body_regions: 0,
+            closed_outside_regions: 0,
+            ref_homes: &ref_homes,
+            frame: FrameGeometry::compact(1, 0, 0),
+            counter_slot: None,
+            spill_helpers: &spill_helpers,
+        };
+
+        assert_eq!(inline_region_br_depth(&inline, &dispatch, 0), 0);
+        assert_eq!(inline_region_br_depth(&inline, &dispatch, 1), 1);
+
+        // A preamble region is reached from the outside-loop base instead.
+        let outside = InlineGuard {
+            outside_loop: true,
+            ..inline
+        };
+        assert_eq!(inline_region_br_depth(&outside, &dispatch, 0), 4);
+        assert_eq!(inline_region_br_depth(&outside, &dispatch, 1), 5);
     }
 
     #[test]
