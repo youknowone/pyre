@@ -3422,10 +3422,21 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // The refusal names the helper and slot it fired on, because the
             // repair for a helper that does check its NULL is a row in
             // `mayforce_null_ref_arg_is_checked_sentinel` and the row needs
-            // both coordinates.
+            // both coordinates.  A call the effect info gives no
+            // `RuntimeHelperKind` for has only the funcbox to name it by, so
+            // resolve that against the published registry too.
             if fbw_debug_abort_enabled() {
+                let target = match allboxes.first().and_then(|&b| ctx.trace_ctx.box_value(b)) {
+                    Some(majit_ir::Value::Int(addr)) => addr,
+                    _ => 0,
+                };
+                let name = pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .find(|&(_, addr)| addr == target)
+                    .map_or("-", |(name, _)| name);
                 eprintln!(
-                    "[nullref-refusal] helper={helper:?} arg_index={i} nargs={} pc={op_pc} opcode={call_opcode:?}",
+                    "[nullref-refusal] helper={helper:?} target={name}/{target:#x} \
+                     arg_index={i} nargs={} pc={op_pc} opcode={call_opcode:?}",
                     args.len()
                 );
             }
