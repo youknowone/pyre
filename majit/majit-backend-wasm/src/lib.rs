@@ -87,8 +87,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// edge. 40-43 split a rejected inline trial into value-layout,
 /// Ref-home-layout, missing-local-label, and other backend errors. 44 = a
 /// bridge compiled with a parameter entry; 45 = parameter entry declined
-/// because the source module has frame-only dispatch; 46 = parameter entry
-/// declined because the source guard and bridge input arities disagree; 47 =
+/// because the source module has frame-only dispatch; 46 = the bridge entry
+/// cannot name the source guard's fail arguments — a parameter entry whose
+/// arity disagrees with the guard's live count, or a frame entry whose
+/// positional slots are not where that guard spilled them (the two arms are
+/// mutually exclusive: `bridge_params_enabled` selects one for the whole
+/// process); 47 =
 /// LABEL publication suppressed because the bridge entry has nonzero parameters.
 /// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
 /// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
@@ -1595,6 +1599,24 @@ fn wasm_bh_alloc_struct(sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
     wasm_bh_alloc(sizedescr.resolve_gc_tid(), size)
 }
 
+/// `gc.py` malloc-helper OOM signalling, the twin of the dynasm runner's
+/// `oom_signal_if_zero`: translated `do_malloc_fixedsize_clear` raises
+/// `MemoryError`, which lowers to "store the singleton in `pos_exc_value`,
+/// return NULL". These trampolines return 0 directly, so the store belongs
+/// here — the emitted memory-error check (`codegen.rs`
+/// `emit_memory_error_check`) moves the value out of the cell and into the
+/// frame's exception exit slot.
+#[inline]
+fn oom_signal_if_zero(result: i64) -> i64 {
+    if result == 0 {
+        let value = majit_backend::memory_error_singleton_ref();
+        if value != 0 {
+            jit_exc_raise(value);
+        }
+    }
+    result
+}
+
 /// JIT-trace allocation trampoline target for `New` / `NewWithVtable`.
 ///
 /// A compiled trace cannot allocate directly (the GC lives behind the
@@ -1612,8 +1634,11 @@ fn wasm_bh_alloc_struct(sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
 /// allocation. So it uses the *collecting* `alloc_nursery_typed`, which
 /// triggers a minor collection on nursery-full instead of leaking to old-gen.
 pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
-    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_typed(type_id as u32, size as usize).0 as i64)
-        .unwrap_or(0)
+    let obj = with_wasm_active_gc_mut(|gc| {
+        gc.alloc_nursery_typed(type_id as u32, size as usize).0 as i64
+    })
+    .unwrap_or(0);
+    oom_signal_if_zero(obj)
 }
 
 /// JIT-trace variable-size allocation trampoline target for `NewArray` /
@@ -1626,10 +1651,12 @@ pub extern "C" fn wasm_jit_alloc_array(
     length: i64,
     len_offset: i64,
 ) -> i64 {
+    // `incminimark.py external_malloc` refuses a negative length by raising
+    // `MemoryError`, so this edge signals like an exhausted heap.
     let Ok(length) = usize::try_from(length) else {
-        return 0;
+        return oom_signal_if_zero(0);
     };
-    with_wasm_active_gc_mut(|gc| {
+    let obj = with_wasm_active_gc_mut(|gc| {
         let obj = gc.alloc_varsize_typed(
             type_id as u32,
             base_size as usize,
@@ -1645,7 +1672,8 @@ pub extern "C" fn wasm_jit_alloc_array(
             obj.0 as i64
         }
     })
-    .unwrap_or(0)
+    .unwrap_or(0);
+    oom_signal_if_zero(obj)
 }
 
 /// Old-generation twin of [`wasm_jit_alloc`], selected by the `New` /
@@ -1660,8 +1688,10 @@ pub extern "C" fn wasm_jit_alloc_array(
 /// (`rewrite.rs` `handle_new`); wasm lowers `New` itself, so it must apply the
 /// same policy here.
 pub extern "C" fn wasm_jit_alloc_oldgen(type_id: i64, size: i64) -> i64 {
-    with_wasm_active_gc_mut(|gc| gc.alloc_oldgen_typed(type_id as u32, size as usize).0 as i64)
-        .unwrap_or(0)
+    let obj =
+        with_wasm_active_gc_mut(|gc| gc.alloc_oldgen_typed(type_id as u32, size as usize).0 as i64)
+            .unwrap_or(0);
+    oom_signal_if_zero(obj)
 }
 
 /// Old-generation twin of [`wasm_jit_alloc_array`], selected by the `NewArray` /
@@ -1676,10 +1706,10 @@ pub extern "C" fn wasm_jit_alloc_array_oldgen(
     len_offset: i64,
 ) -> i64 {
     let Ok(length) = usize::try_from(length) else {
-        return 0;
+        return oom_signal_if_zero(0);
     };
     let payload_size = base_size as usize + item_size as usize * length;
-    with_wasm_active_gc_mut(|gc| {
+    let obj = with_wasm_active_gc_mut(|gc| {
         let obj = gc.alloc_oldgen_typed(type_id as u32, payload_size);
         if obj.is_null() {
             0
@@ -1690,7 +1720,8 @@ pub extern "C" fn wasm_jit_alloc_array_oldgen(
             obj.0 as i64
         }
     })
-    .unwrap_or(0)
+    .unwrap_or(0);
+    oom_signal_if_zero(obj)
 }
 
 /// Table indices of the four allocation trampolines, for the `New*` /
@@ -4190,6 +4221,24 @@ impl majit_backend::Backend for WasmBackend {
             }
             Some(inputargs.len())
         } else {
+            // A frame entry reads bridge input `k` out of the positional exit
+            // slot `k`, while `emit_guard_fail_args_spill` writes each fail
+            // argument into the slot named by its own resume position, holes
+            // included. `initialize_state_from_guard_failure` drops those
+            // holes, so input `k` is the k-th LIVE position and the two orders
+            // coincide only while every hole trails the last live one.
+            // `rebuild_faillocs_from_descr` is where a live position's own
+            // location is recovered instead; this entry has no table to do it
+            // with, so decline the shape rather than hand the bridge a
+            // neighbouring fail argument's slot.
+            if !codegen::frame_entry_reads_live_positions(fail_descr, inputargs.len()) {
+                diag_bump(46);
+                return Err(BackendError::Unsupported(
+                    "wasm backend: frame-entry bridge cannot address the source guard's \
+                     live fail-arg slots"
+                        .into(),
+                ));
+            }
             None
         };
         let allow_ca = ca_candidate;

@@ -1085,6 +1085,67 @@ fn test_int_sub_ovf_guards_overflow() {
 }
 
 #[test]
+fn test_int_mul_ovf_fuses_its_adjacent_overflow_guard() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let guard = Op::new(OpCode::GuardNoOverflow, &[]);
+    guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+    let ops = vec![
+        make_op(
+            OpCode::IntMulOvf,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            OpRef::int_op(2),
+        ),
+        guard,
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    let (mut widened, mut i32_result_blocks) = (0usize, 0usize);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64ExtendI32U => widened += 1,
+        wasmparser::Operator::If {
+            blockty: wasmparser::BlockType::Type(wasmparser::ValType::I32),
+        } => i32_result_blocks += 1,
+        _ => {}
+    });
+    // Both arms of the signed-32 split answer the same one-bit predicate, so
+    // the block yields it and the guard reads it off the stack -- the shape the
+    // add and sub forms already take, and the one every sibling backend takes
+    // by publishing a condition code instead of a stored flag.
+    assert_eq!(i32_result_blocks, 1, "the split yields the guard predicate");
+    assert_eq!(
+        widened, 0,
+        "a fused predicate never widens into a flag local"
+    );
+}
+
+#[test]
+fn test_int_mul_ovf_guard_overflow_inverts_on_both_split_arms() {
+    // `GuardOverflow` fails when the multiply did NOT overflow, so the fused
+    // predicate is the inverse of `GuardNoOverflow`'s on both arms of the
+    // signed-32 split: the constant the fast arm yields flips, and the
+    // full-width arm's sign-word comparison flips with it.
+    for (a, b) in [(6_i64, 7_i64), (i32::MAX as i64 + 1, 2)] {
+        assert_eq!(
+            execute_ovf_trace_with_guard(OpCode::IntMulOvf, OpCode::GuardOverflow, a, b).0,
+            0,
+            "{a} * {b} does not overflow, so GuardOverflow exits"
+        );
+    }
+    for (a, b) in [(i64::MIN, -1_i64), (1_i64 << 62, 3)] {
+        assert_eq!(
+            execute_ovf_trace_with_guard(OpCode::IntMulOvf, OpCode::GuardOverflow, a, b).0,
+            1,
+            "{a} * {b} overflows, so GuardOverflow passes"
+        );
+    }
+}
+
+#[test]
 fn test_int_mul_ovf_guards_overflow() {
     for (a, b, expected) in [
         (6, 7, 42),
@@ -2318,6 +2379,87 @@ fn test_true_void_int_ref_call_uses_void_result_type_without_drop() {
         )
     );
     assert_eq!(drops, 0, "a genuine void call has no result to drop");
+}
+
+#[test]
+fn a_pointer_array_item_is_read_and_written_at_the_same_width() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    // A descriptor claiming the host's eight-byte pointer. The guest's is four,
+    // and whichever of the two the arms take, the read and the write have to
+    // take the same one: a four-byte read of an eight-byte write returns half a
+    // pointer, and an eight-byte write over four-byte items clobbers the next.
+    let descr: majit_ir::DescrRef = Arc::new(SimpleArrayDescr::new(0, 16, 8, 71, Type::Ref));
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Ref, 2),
+    ];
+    let get = make_op(
+        OpCode::GetarrayitemGcR,
+        &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+        OpRef::ref_op(3),
+    );
+    get.setdescr(Arc::clone(&descr));
+    let set = make_op(
+        OpCode::SetarrayitemGc,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_ref(2),
+        ],
+        OpRef::NONE,
+    );
+    set.setdescr(descr);
+    let ops = vec![get, set, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(3))])];
+    let (bytes, _guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    let (mut narrow_loads, mut narrow_stores, mut wide_stores) = (0usize, 0usize, 0usize);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Load32U { memarg } if memarg.offset == 16 => narrow_loads += 1,
+        wasmparser::Operator::I64Store32 { memarg } if memarg.offset == 16 => narrow_stores += 1,
+        wasmparser::Operator::I64Store { memarg } if memarg.offset == 16 => wide_stores += 1,
+        _ => {}
+    });
+    assert_eq!(
+        (narrow_loads, narrow_stores, wide_stores),
+        (1, 1, 0),
+        "the item read and the item write moved different widths"
+    );
+}
+
+#[test]
+fn an_allocation_is_followed_by_a_memory_error_check() {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(1));
+    new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
+    let ops = vec![
+        new_op,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, _guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    let mut seq: Vec<String> = Vec::new();
+    count_operators(&bytes, |op| seq.push(format!("{op:?}")));
+    // `rewrite.py` `_gen_call_malloc_gc` puts a NULL test after every
+    // collecting malloc, and the peephole pass fuses the arm's store-then-read
+    // of the result into a `local.tee`. Only the test itself is asserted: which
+    // of the two failing arms follows it turns on whether the cpu has been
+    // handed an `exit_frame_with_exception_descr_ref`, which a backend-only
+    // module build has not.
+    let checked = seq.windows(4).any(|w| {
+        w[0].starts_with("CallIndirect")
+            && w[1].starts_with("LocalTee")
+            && w[2] == "I64Eqz"
+            && w[3].starts_with("If")
+    });
+    assert!(checked, "the allocation emitted no NULL test: {seq:#?}");
 }
 
 #[test]
@@ -5828,7 +5970,260 @@ fn interior_field_ops_compile() {
     assert_eq!(shl, 1, "item_size 8 on the RAW store is get_scale 3");
 }
 
+/// Count the operators a test cares about in the one code section entry.
+fn count_operators(bytes: &[u8], mut f: impl FnMut(&wasmparser::Operator<'_>)) {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                f(&operators.read().unwrap());
+            }
+        }
+    }
+}
+
+/// x86/regalloc.py `consider_cond_call`, COND_CALL_VALUE arm: the call happens
+/// when args[0] is 0/NULL, args[1] is the callee, and the result is args[0]
+/// otherwise. Sharing the generic CALL arm called unconditionally through
+/// args[0].
+#[test]
+fn cond_call_value_tests_its_value_and_calls_arg_one() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::CondCallValueI,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::const_int(0x100),
+                OpRef::input_arg_int(1),
+            ],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let (mut eqz, mut ifs) = (0, 0);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Eqz => eqz += 1,
+        wasmparser::Operator::If { .. } => ifs += 1,
+        _ => {}
+    });
+    assert!(eqz >= 1, "COND_CALL_VALUE tests its value with i64.eqz");
+    assert_eq!(ifs, 1, "the call sits under exactly one predicate");
+    assert!(
+        import_func_type(&bytes, "jit_call_compact").is_some(),
+        "COND_CALL_VALUE uses the residual trampoline"
+    );
+}
+
+/// x86/assembler.py `genop_guard_guard_nonnull_class` guards the class compare
+/// with `CMP(ptr, 1)`; sharing the GUARD_CLASS arm let a NULL receiver be
+/// decided by a read of linear-memory address 0, which on wasm does not trap.
+#[test]
+fn guard_nonnull_class_also_tests_for_null() {
+    let build = |opcode: OpCode| {
+        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+        let ops = vec![
+            make_guard(
+                opcode,
+                &[OpRef::input_arg_ref(0), OpRef::const_int(0x55)],
+                &[OpRef::input_arg_ref(0)],
+            ),
+            Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]),
+        ];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        let (mut eqz, mut ors) = (0, 0);
+        count_operators(&bytes, |op| match op {
+            wasmparser::Operator::I64Eqz => eqz += 1,
+            wasmparser::Operator::I32Or => ors += 1,
+            _ => {}
+        });
+        (eqz, ors)
+    };
+    assert_eq!(
+        build(OpCode::GuardClass),
+        (0, 0),
+        "GUARD_CLASS is the class compare alone"
+    );
+    assert_eq!(
+        build(OpCode::GuardNonnullClass),
+        (1, 1),
+        "GUARD_NONNULL_CLASS ors in a null test"
+    );
+}
+
+/// pyjitpl.py `direct_call_release_gil` records `[savebox, funcbox] + args`, so
+/// the callee is arg 1. The shared CALL arm read arg 0 — the `save_err`
+/// immediate — as the callee and passed the real function as the first
+/// argument.
+#[test]
+fn call_release_gil_takes_its_callee_from_arg_one() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let call = make_op(
+        OpCode::CallReleaseGilI,
+        &[
+            OpRef::const_int(0x11),  // save_err
+            OpRef::const_int(0x22),  // the real callee
+            OpRef::input_arg_int(0), // its one argument
+        ],
+        OpRef::int_op(1),
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0x5100_0000,
+        vec![Type::Int],
+        Type::Int,
+        true,
+        8,
+        EffectInfo::default(),
+    )));
+    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let mut nargs_consts = Vec::new();
+    count_operators(&bytes, |op| {
+        if let wasmparser::Operator::I64Const { value } = op {
+            nargs_consts.push(*value);
+        }
+    });
+    assert!(
+        nargs_consts.contains(&0x22),
+        "the callee stored to the call area is arg 1"
+    );
+    assert!(
+        nargs_consts.contains(&1),
+        "one call argument, not two: {nargs_consts:?}"
+    );
+}
+
+/// `raw_load_f` is a translated operation (`insns.rs` BC_RAW_LOAD_F), and the
+/// int form was lowered while the float form declined the trace.
+#[test]
+fn raw_load_f_loads_a_double() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let descr = Arc::new(SimpleArrayDescr::new(1, 0, 8, 55, Type::Float));
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let load = make_op(
+        OpCode::RawLoadF,
+        &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+        OpRef::float_op(2),
+    );
+    load.setdescr(descr);
+    let ops = vec![load, Op::new(OpCode::Finish, &[rb(OpRef::float_op(2))])];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let mut f64_loads = 0;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::F64Load { .. }) {
+            f64_loads += 1;
+        }
+    });
+    assert_eq!(f64_loads, 1, "the float raw load is an f64.load");
+}
+
+/// resoperation.py `int_between(a, b, c)` is `a <= b < c`, signed.
+#[test]
+fn int_between_is_two_signed_comparisons() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Int, 2),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::IntBetween,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::input_arg_int(1),
+                OpRef::input_arg_int(2),
+            ],
+            OpRef::int_op(3),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let (mut le_s, mut lt_s, mut ands) = (0, 0, 0);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64LeS => le_s += 1,
+        wasmparser::Operator::I64LtS => lt_s += 1,
+        wasmparser::Operator::I32And => ands += 1,
+        _ => {}
+    });
+    assert_eq!((le_s, lt_s, ands), (1, 1, 1), "a <= b, b < c, and");
+}
+
 /// `genop_discard_cond_call`: CondCallN is a real conditional call, not a no-op.
+#[test]
+fn cond_call_reload_sits_on_the_arm_that_called() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::CondCallN,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::const_int(0x100),
+                OpRef::input_arg_ref(1),
+            ],
+            OpRef::NONE,
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(1))]),
+    ];
+    let frame = codegen::FrameGeometry::compact(
+        codegen::frame_value_slots(&inputargs, &ops),
+        codegen::count_ref_homes(&inputargs, &ops),
+        0,
+    );
+    let (bytes, _) = build_module_with_frame(
+        &inputargs,
+        &ops,
+        &indexmap::IndexMap::new(),
+        Some(0),
+        &codegen::GuardGcTypeInfo::default(),
+        frame,
+    );
+    validate_wasm(&bytes);
+    let mut seq: Vec<String> = Vec::new();
+    count_operators(&bytes, |op| seq.push(format!("{op:?}")));
+
+    // The reload exists because the callee may collect, so it belongs on the
+    // arm that called: between the `else` and the `end` that closes it, not
+    // after the join where the untaken arm would pay for it too.
+    let home = format!("offset: {},", frame.home_slot_base);
+    let else_at = seq
+        .iter()
+        .position(|o| o == "Else")
+        .expect("the cond call puts its trampoline in an else arm");
+    let end_at = else_at
+        + seq[else_at..]
+            .iter()
+            .position(|o| o == "End")
+            .expect("the else arm closes");
+    let reload_at = seq
+        .iter()
+        .position(|o| o.starts_with("I64Load ") && o.contains(&home))
+        .expect("the cond call reloads the live Ref from its home slot");
+    assert!(
+        else_at < reload_at && reload_at < end_at,
+        "the ref-home reload is outside the calling arm: {seq:#?}"
+    );
+}
+
 #[test]
 fn cond_call_n_emits_predicate_and_trampoline() {
     let inputargs = vec![
@@ -5849,20 +6244,12 @@ fn cond_call_n_emits_predicate_and_trampoline() {
     ];
     let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
     validate_wasm(&bytes);
-    let mut eqz = 0;
-    let mut ifs = 0;
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
-        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
-            let mut operators = body.get_operators_reader().unwrap();
-            while !operators.eof() {
-                match operators.read().unwrap() {
-                    wasmparser::Operator::I64Eqz => eqz += 1,
-                    wasmparser::Operator::If { .. } => ifs += 1,
-                    _ => {}
-                }
-            }
-        }
-    }
+    let (mut eqz, mut ifs) = (0, 0);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Eqz => eqz += 1,
+        wasmparser::Operator::If { .. } => ifs += 1,
+        _ => {}
+    });
     assert!(eqz >= 1, "CondCallN tests the predicate with i64.eqz");
     assert!(ifs >= 1, "CondCallN wraps the call in an if");
     assert!(

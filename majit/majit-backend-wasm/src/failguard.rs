@@ -573,6 +573,23 @@ pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
         FailDescrSlot::Registered(reserved_finish_descr(exit_index, Some(descr)));
 }
 
+/// Whether the cpu has been handed `exit_frame_with_exception_descr_ref`.
+///
+/// The memory-error check the allocation codegen emits leaves through
+/// [`FINISH_EXIT_INDEX_EXC`], and only the attached metainterp descr carries
+/// `is_exit_frame_with_exception`. The reserved entry on its own reads as a
+/// plain finish, which would hand the raised value back as the loop's result
+/// instead of raising it, so the emitter has to know which of the two it has.
+pub fn exit_frame_with_exception_attached() -> bool {
+    let mut reg = FAIL_DESCR_REGISTRY.lock();
+    let vec = reg.get_or_insert_with(Default::default);
+    reserve_finish_exit_block(vec);
+    matches!(
+        &vec[FINISH_EXIT_INDEX_EXC as usize],
+        FailDescrSlot::Registered(reserved) if reserved.meta_descr.is_some()
+    )
+}
+
 /// Stable, guest-memory dispatch entries, keyed by CALL_ASSEMBLER token.
 /// `Box` is intentional: an emitted module bakes the entry address.
 pub static WASM_CA_DISPATCH: parking_lot::Mutex<

@@ -471,7 +471,12 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
     }
 
     fn i32_wrap_i64(&mut self) -> &mut Self {
-        if let Some(PendingInstruction::I64Const(value)) = self.pending.pop() {
+        // Inspect the tail before removing it, the way every other fold here
+        // does: `pending` is a lookbehind buffer, not an operand stack, so a
+        // tail this fold does not consume still owes its instruction to
+        // `flush`.
+        if let Some(PendingInstruction::I64Const(value)) = self.pending.last().copied() {
+            self.pending.pop();
             self.pending
                 .push(PendingInstruction::I32Const(value as u64 as u32 as i32));
         } else {
@@ -719,6 +724,22 @@ fn field_is_float_from_descr(op: &Op) -> bool {
 fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
     op.with_array_descr(|ad| (ad.item_size(), ad.is_item_signed()))
         .unwrap_or_else(|| missing_layout_descr("array descr (item size/sign)", op))
+}
+
+/// `raw_load` / `raw_store` address `arg(0) + arg(1)` and nothing else: a raw
+/// buffer has no GC array header, so the descr's base size is not part of the
+/// address the way it is for the `GETARRAYITEM` family.
+fn emit_raw_addr(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    op: &Op,
+) {
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+    sink.i32_wrap_i64();
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+    sink.i32_wrap_i64();
+    sink.i32_add();
 }
 
 fn array_item_is_float_from_descr(op: &Op) -> bool {
@@ -1972,15 +1993,6 @@ fn emit_reload_ca_input_refs_from_homes(
     }
 }
 
-/// llsupport/gc.py GcLLDescr_framework
-///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-/// Looks up the materialized table populated by the runner from the
-/// active gc_ll_descr. RPython resolves the same value via
-/// `cpu.gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr`.
-fn lookup_typeid_from_classptr(table: &HashMap<i64, u32>, classptr: usize) -> Option<u32> {
-    table.get(&(classptr as i64)).copied()
-}
-
 /// Information about a guard exit collected during pre-scan.
 /// The live-position mask a guard's bridge inputargs were filtered by.
 ///
@@ -2032,6 +2044,34 @@ pub fn live_fail_arg_extent(meta_descr: Option<&majit_ir::DescrRef>, n: usize) -
         .iter()
         .rposition(|&live| live)
         .map_or(0, |i| i + 1)
+}
+
+/// Whether a guard's live fail-arg positions ARE the positional exit slots a
+/// frame bridge entry reads.
+///
+/// `emit_guard_fail_args_spill` writes fail argument `i` into slot `i`, holes
+/// included, because the deadframe readers index that same logical layout.
+/// `initialize_state_from_guard_failure` instead drops the holes, so bridge
+/// input `k` names the k-th LIVE position — the two orders coincide only while
+/// every hole trails the last live position. `rebuild_faillocs_from_descr` is
+/// where a location per live position is recovered; the frame entry in
+/// `build_function` has no such table and can only read slot `k`, so a caller
+/// that cannot honour this must decline the bridge.
+///
+/// A descr whose `rd_locs` was never sized to its fail-arg list declares every
+/// position live — the reading `live_fail_arg_mask` takes — and its positions
+/// are then the slots by construction.
+pub fn frame_entry_reads_live_positions(
+    fail_descr: &dyn majit_ir::FailDescr,
+    bridge_inputs: usize,
+) -> bool {
+    let n = fail_descr.fail_arg_types().len();
+    let locs = fail_descr.rd_locs();
+    if locs.len() != n {
+        return bridge_inputs == n;
+    }
+    let live = locs.iter().filter(|&&pos| pos != 0xFFFF).count();
+    bridge_inputs == live && locs[..live].iter().all(|&pos| pos != 0xFFFF)
 }
 
 pub struct GuardExit {
@@ -2275,6 +2315,15 @@ fn residual_call_typed_sig(
         // parameter puts it outside `residual_call_void_true_arity`'s uniform
         // word family.  `all_float` below is false for it, so it reaches the
         // allow-list check like every other mixed shape.
+        //
+        // Only a descr that records `()` names such a callee.  A void-recorded
+        // descr carrying `result_size == 8` (the `make_call_descr_void_word_abi`
+        // shape) names one that really returns a machine word, and an empty
+        // result list is a different type from the one the callee has.  The i64
+        // family `residual_call_void_word_arity` selects is where that ABI is
+        // spelled; where that family declines -- a float parameter it cannot
+        // carry -- the reflecting trampoline is the arm that stays correct.
+        Type::Void if cd.result_size() != 0 => return None,
         Type::Void => None,
     };
     let arg_types = cd.arg_types();
@@ -4922,30 +4971,47 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                     sink.i64_ne();
                 } else {
-                    // gcremovetypeptr fallback (assembler.py:1893-1901):
-                    //   on x86_64 the typeid is a 32-bit value at offset 0.
-                    let class_arg = op.arg(1).to_opref();
-                    // history.py — inline-Const carries its class pointer directly.
-                    let classptr = class_arg.const_int_value().expect(
-                        "_cmp_guard_class: gcremovetypeptr requires \
-                             loc_classptr to be a ConstInt immediate \
-                             (aarch64/regalloc.py:829 op.getarg(1).getint())",
-                    );
-                    let expected_typeid =
-                        lookup_typeid_from_classptr(classptr_to_typeid, classptr as usize).expect(
-                            "GuardClass: vtable_offset is None but the wasm \
-                                 backend has no gc_ll_descr.\
-                                 get_typeid_from_classptr_if_gcremovetypeptr",
-                        );
+                    // x86/assembler.py `_cmp_guard_class` hands the
+                    // gcremovetypeptr case to `_cmp_guard_gc_type`, whose
+                    // layout keeps the type id in the object's first word.
+                    // majit keeps it in the GC header word placed immediately
+                    // before the payload — the lower `TYPE_ID_BITS` of
+                    // `majit_gc::header::GcHeader`'s `tid_and_flags`, the
+                    // address the `GuardGcType`, `GuardIsObject` and
+                    // `GuardSubclass` arms read. Under that layout `obj[0]` is
+                    // a payload field, so comparing it against a type id
+                    // answers a different question.
+                    //
+                    // Reading the header instead is not enough on its own
+                    // here: this arm evaluates the class compare
+                    // unconditionally and ORs the null test in afterwards, so
+                    // for a NULL receiver `obj - GcHeader::SIZE` addresses
+                    // below linear memory and traps instead of failing the
+                    // guard — `genop_guard_guard_nonnull_class` avoids that
+                    // with a forward jump this arm does not have. Decline: a
+                    // frontend that emits GUARD_CLASS configures the vtable
+                    // offset (pyre passes `OB_TYPE_OFFSET`), so no trace pays
+                    // for the decline.
+                    return Err(BackendError::Unsupported(format!(
+                        "wasm backend: {:?} with cpu.vtable_offset = None \
+                         (gcremovetypeptr) is unsupported; the type id lives \
+                         in the GC header and this arm has no null-safe \
+                         header compare",
+                        op.opcode
+                    )));
+                }
+                if op.opcode == OpCode::GuardNonnullClass {
+                    // x86/assembler.py genop_guard_guard_nonnull_class wraps
+                    // `_cmp_guard_class` in `CMP(ptr, 1)` plus a forward `B`
+                    // jump, so a NULL receiver reaches the guard already
+                    // failing and never has its class read. Here the class
+                    // compare above has already run — harmlessly, since the
+                    // only shape this arm lowers reads the vtable offset, and
+                    // a NULL receiver puts that read inside the first page —
+                    // so the guard's answer is the disjunction.
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i32_const(expected_typeid as i32);
-                    sink.i32_ne();
+                    sink.i64_eqz();
+                    sink.i32_or();
                 }
                 emit_guard_if_exit(
                     &mut sink,
@@ -5159,11 +5225,9 @@ fn build_function(
                     OpCode::IntMulOvf => BinOp::I64Mul,
                     _ => unreachable!(),
                 };
-                let fused_guard = match binop {
-                    BinOp::I64Add | BinOp::I64Sub => next_ovf_guard(ops, op_idx),
-                    BinOp::I64Mul => None,
-                    _ => unreachable!(),
-                };
+                // Every overflow form leaves its predicate on the stack, so
+                // any of them can hand it straight to an adjacent guard.
+                let fused_guard = next_ovf_guard(ops, op_idx);
                 ovf_flag_live = match emit_ovf_binop(
                     &mut sink,
                     constants,
@@ -5219,6 +5283,40 @@ fn build_function(
                     s.i64_xor();
                 },
             ),
+            // resoperation.py `int_between(a, b, c)` is the three-operand
+            // range test `a <= b < c`, signed on all three. jtransform lowers
+            // the name directly (`jtransform_opname.rs`), and the bigint
+            // compare path mints it as `int_between(-1, i2 >> 48, 1)`, so a
+            // trace can carry it.
+            OpCode::IntBetween => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                    sink.i64_le_s();
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
+                    sink.i64_lt_s();
+                    sink.i32_and();
+                    sink.i64_extend_i32_u();
+                    sink.local_set(value_types.local(vi));
+                }
+            }
+
+            // `float_mod` is C `fmod`: the interpreter evaluates it as Rust's
+            // `a % b`, which truncates toward zero. Wasm has no float
+            // remainder instruction, and `a - (a/b).floor() * b` answers
+            // Python's floored `%` instead — a different result for mixed
+            // signs, and inexact for a large quotient either way. Decline
+            // until there is a host helper to call.
+            OpCode::FloatMod => {
+                return Err(BackendError::Unsupported(
+                    "wasm backend: FloatMod is unsupported (fmod has no wasm \
+                     instruction); declining the trace"
+                        .to_string(),
+                ));
+            }
+
             // ── Extended integer ops ──
             OpCode::IntSignext => {
                 // int_signext(val, num_bytes): sign-extend from num_bytes width
@@ -5446,7 +5544,7 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let base_size = emit_array_addr(&mut sink, constants, value_types, op);
-                    let (item_size, signed) = array_item_size_sign_from_descr(op);
+                    let (item_size, signed) = array_item_access_size_sign(op);
                     emit_sized_int_load(&mut sink, base_size, item_size, signed);
                     sink.local_set(value_types.local(vi));
                 }
@@ -5455,7 +5553,8 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let base_size = emit_array_addr(&mut sink, constants, value_types, op);
-                    sink.i64_load32_u(memarg(base_size, 2));
+                    let (item_size, signed) = array_item_access_size_sign(op);
+                    emit_sized_int_load(&mut sink, base_size, item_size, signed);
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -5490,7 +5589,7 @@ fn build_function(
                     // A Ref item is pointer-width (4 bytes on wasm32). Storing a
                     // fixed 8 bytes would clobber the next item, or run past the
                     // array end on the last item and corrupt the heap.
-                    let (item_size, _signed) = array_item_size_sign_from_descr(op);
+                    let (item_size, _signed) = array_item_access_size_sign(op);
                     emit_sized_int_store(&mut sink, base_size, item_size);
                 }
             }
@@ -5521,14 +5620,11 @@ fn build_function(
                     // register class — it is what the value local was declared
                     // from — so it picks the load the same way the three
                     // `Getarrayitem` arms do.
-                    match op.opcode {
-                        OpCode::GetinteriorfieldGcF => {
-                            sink.f64_load(mem64(base));
-                        }
-                        OpCode::GetinteriorfieldGcR => {
-                            sink.i64_load32_u(memarg(base, 2));
-                        }
-                        _ => emit_sized_int_load(&mut sink, base, field.field_size, field.signed),
+                    if op.opcode == OpCode::GetinteriorfieldGcF {
+                        sink.f64_load(mem64(base));
+                    } else {
+                        let (size, signed) = field.access_size_sign();
+                        emit_sized_int_load(&mut sink, base, size, signed);
                     }
                     sink.local_set(value_types.local(vi));
                 }
@@ -5564,7 +5660,7 @@ fn build_function(
                     sink.f64_store(mem64(base));
                 } else {
                     emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    emit_sized_int_store(&mut sink, base, field.access_size());
+                    emit_sized_int_store(&mut sink, base, field.access_size_sign().0);
                 }
             }
 
@@ -5589,11 +5685,13 @@ fn build_function(
             }
 
             // ── GC memory ops ──
-            // The indexed forms are also wired as real frontend blackhole ops
-            // (blackhole.rs `gc_load_indexed_{i,f}` / `gc_store_indexed_{i,f}`),
-            // so an llop/buffer trace can carry them into the backend. This
-            // backend has no descr-driven lowering for them, so decline
-            // (interpreter fallback) rather than aborting the whole compile.
+            // The indexed forms have the same sole producer as the bare ones
+            // below — `GcRewriterImpl`, which this backend does not run — and
+            // no opimpl records them, so nothing carries them here. The
+            // blackhole wiring for `gc_load_indexed_{i,f}` /
+            // `gc_store_indexed_{i,f}` executes them, it does not trace them.
+            // Decline (interpreter fallback) rather than aborting the whole
+            // compile.
             OpCode::GcLoadIndexedI
             | OpCode::GcLoadIndexedR
             | OpCode::GcLoadIndexedF
@@ -5621,25 +5719,24 @@ fn build_function(
             }
 
             // ── Raw memory access ──
-            OpCode::RawLoadI => {
+            OpCode::RawLoadI | OpCode::RawLoadF => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // ptr
-                    sink.i32_wrap_i64();
-                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref()); // offset
-                    sink.i32_wrap_i64();
-                    sink.i32_add();
-                    let (item_size, signed) = array_item_size_sign_from_descr(op);
-                    emit_sized_int_load(&mut sink, 0, item_size, signed);
+                    emit_raw_addr(&mut sink, constants, value_types, op);
+                    if op.opcode == OpCode::RawLoadF {
+                        sink.f64_load(mem64(0));
+                    } else {
+                        let (item_size, signed) = array_item_size_sign_from_descr(op);
+                        emit_sized_int_load(&mut sink, 0, item_size, signed);
+                    }
                     sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::RawStore => {
-                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                sink.i32_wrap_i64();
-                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
-                sink.i32_wrap_i64();
-                sink.i32_add();
+                emit_raw_addr(&mut sink, constants, value_types, op);
+                // `emit_resolve` hands back a Float operand as the `i64` its
+                // bits spell, so the width-sized integer store writes the same
+                // eight bytes an `f64.store` would.
                 emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
                 let (item_size, _signed) = array_item_size_sign_from_descr(op);
                 emit_sized_int_store(&mut sink, 0, item_size);
@@ -5729,12 +5826,12 @@ fn build_function(
                     sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
                 }
                 emit_jit_call(&mut sink, jit_call);
-                sink.end();
                 // COND_CALL sits inside the CALL opcode range, so a Ref living
-                // across it already owns a home; the collection that home
-                // exists for can happen on the taken arm. Reloading after the
-                // `if` covers both arms, and on the untaken one it re-reads
-                // slots the stores kept current.
+                // across it already owns a home. Only the arm that called can
+                // have collected, so the reload belongs on it: after the `if`
+                // it would run on the untaken arm too, re-reading slots that
+                // nothing moved, once per iteration of a loop whose whole
+                // reason for a COND_CALL is that the call is rare.
                 if call_can_collect(op) {
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -5752,6 +5849,82 @@ fn build_function(
                         frame,
                     );
                 }
+                sink.end();
+            }
+            OpCode::CondCallValueI | OpCode::CondCallValueR => {
+                // x86/regalloc.py `consider_cond_call`, COND_CALL_VALUE arm:
+                // "Calls the function when args[0] is equal to 0 or NULL.
+                // Returns the result from the function call if done, or args[0]
+                // if it was not 0/NULL." Upstream forces the result into
+                // args[0]'s register and lets the call overwrite it; the result
+                // local plays that register's part here.
+                //
+                // The operand roles are COND_CALL's: predicate, callee, then the
+                // call's own arguments. Sharing the generic CALL arm read args[0]
+                // as the callee and args[1] as the first argument, and called
+                // unconditionally.
+                //
+                // `do_conditional_call` asserts the callee forces no virtual or
+                // virtualizable, so unlike the CALL arm this needs no force
+                // bracket.
+                let jit_call =
+                    jit_call_idx.expect("COND_CALL_VALUE op present but jit_call not imported");
+                let vi = op.pos.get().raw();
+                let has_result = !OpRef::raw_is_constant(vi);
+                let cond = op.arg(0).to_opref();
+                let func = op.arg(1).to_opref();
+                let call_args = &op.getarglist()[2..];
+
+                if has_result {
+                    emit_resolve(&mut sink, constants, value_types, cond);
+                    sink.local_set(value_types.local(vi));
+                }
+                // The predicate is a full word: `i32.wrap_i64` would read a
+                // value whose only set bits are above 32 as NULL and call on a
+                // live one, so the test has to be `i64.eqz`.
+                emit_resolve(&mut sink, constants, value_types, cond);
+                sink.i64_eqz();
+                sink.if_(BlockType::Empty);
+                emit_call_area_addr(&mut sink);
+                emit_resolve(&mut sink, constants, value_types, func);
+                sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+                emit_call_area_addr(&mut sink);
+                sink.i64_const(call_args.len() as i64);
+                sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+                for (i, arg) in call_args.iter().enumerate() {
+                    emit_call_area_addr(&mut sink);
+                    emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
+                }
+                emit_jit_call(&mut sink, jit_call);
+                if has_result {
+                    // Int and Ref are the only result types
+                    // `do_conditional_call` mints this opcode for, so the
+                    // trampoline's word needs no float reinterpretation.
+                    emit_call_area_addr(&mut sink);
+                    sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
+                    sink.local_set(value_types.local(vi));
+                }
+                // Only the arm that called can have collected, so the reload
+                // sits on it rather than after the `if`.
+                if call_can_collect(op) {
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        has_result.then_some(vi),
+                        frame,
+                    );
+                }
+                sink.end();
             }
 
             // x86/assembler.py genop_guard_guard_gc_type:
@@ -6016,30 +6189,23 @@ fn build_function(
                 );
                 guard_idx += 1;
             }
+            // `reached_loop_header` mints this op only to donate its
+            // `rd_resume_position` to the guards `jump_to_existing_trace` and
+            // `inline_short_preamble` stamp; both `optimize_GUARD_FUTURE_CONDITION`
+            // arms then consume it into `patchguardop` and emit nothing, which is
+            // why nothing under `rpython/jit/backend` lowers it. Reaching a
+            // backend means the optimizer did not consume it, and there is
+            // nothing correct to lower it to: it is nullary, so there is no
+            // condition to test, and an exit publishing neither `frame[0]` nor
+            // the fail args leaves the resume reading whatever the frame last
+            // held.
             OpCode::GuardFutureCondition => {
-                // This arm writes neither the fail args nor `frame[0]`, so it
-                // keeps branching to the shared epilogue — giving it the
-                // ordinary guard spill would change what the exit reports, not
-                // just how it gets there. The epilogue takes a cell address
-                // when bridge dispatch is on; otherwise retain the unused index
-                // write unchanged.
-                if !guard_dispatch.param_type_indices.is_empty() {
-                    emit_guard_param_tail_call(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        guard_idx,
-                        op,
-                        guard_dispatch,
-                    );
-                } else if guard_dispatch.enabled {
-                    emit_guard_bridge_dispatch(&mut sink, guard_idx, guard_dispatch);
-                } else {
-                    sink.i32_const(guard_idx as i32);
-                    sink.local_set(bridge_slot_local);
-                }
-                sink.br(block_exit_depth);
-                guard_idx += 1;
+                return Err(BackendError::Unsupported(
+                    "wasm backend: GuardFutureCondition is unsupported (the optimizer \
+                     consumes it into patchguardop and no backend lowers it); \
+                     declining the trace"
+                        .to_string(),
+                ));
             }
 
             // ── Quasi-immutable / record / assert ──
@@ -6057,7 +6223,9 @@ fn build_function(
             // — there is no `Newstr` / `Strsetitem` / `Copystrcontent`
             // producer outside majit's ported RPython infrastructure, so
             // string work stays in residual interpreter calls and none of
-            // these reach a wasm trace today.
+            // these reach a wasm trace today. The setitem pair is named here
+            // rather than left to the catch-all so the whole family declines
+            // from one place.
             //
             // They are declined rather than left as silent no-ops. The old
             // arms emitted nothing for the copies and, for the allocations, a
@@ -6070,7 +6238,9 @@ fn build_function(
             OpCode::Newstr
             | OpCode::Newunicode
             | OpCode::Copystrcontent
-            | OpCode::Copyunicodecontent => {
+            | OpCode::Copyunicodecontent
+            | OpCode::Strsetitem
+            | OpCode::Unicodesetitem => {
                 return Err(BackendError::Unsupported(format!(
                     "wasm backend: {:?} is unsupported (no rstr lowering); \
                      declining the trace",
@@ -6089,8 +6259,10 @@ fn build_function(
                 }
             }
             // Emitted by `RawBufferPtrInfo::_force_elements` after a
-            // `RAW_MALLOC_VARSIZE_CHAR`, which pyre never produces, so this
-            // does not reach a wasm trace today. Declined rather than skipped:
+            // `RAW_MALLOC_VARSIZE_CHAR`. The sole carrier of that oopspec is
+            // `_cffi_backend::cdataobj::raw_malloc_varsize_char`, and
+            // `_cffi_backend` is not compiled for wasm32, so this does not
+            // reach a wasm trace. Declined rather than skipped:
             // the allocation helpers do return 0 on OOM (that is how
             // `alloc_with_type` drives this op on the native backends), and an
             // unchecked null is worse on wasm than on native — address 0 is
@@ -6451,8 +6623,6 @@ fn build_function(
             | OpCode::CallAssemblerN
             | OpCode::CallReleaseGilI
             | OpCode::CallReleaseGilN
-            | OpCode::CondCallValueI
-            | OpCode::CondCallValueR
             | OpCode::CallLoopinvariantI
             | OpCode::CallLoopinvariantR
             | OpCode::CallLoopinvariantN
@@ -6474,6 +6644,16 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 let can_collect = call_can_collect(op);
 
+                // pyjitpl.py `direct_call_release_gil` records CALL_RELEASE_GIL_*
+                // as `[savebox, funcbox] + argboxes[1:]`, so its callee is arg 1
+                // and its own arguments start at 2. Every other CALL keeps the
+                // callee at arg 0.
+                let func_ofs = usize::from(matches!(
+                    op.opcode,
+                    OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN
+                ));
+                let func_ptr_ref = op.arg(func_ofs).to_opref();
+
                 // Direct in-module residual call: skip the `jit_call` host hop and
                 // `call_indirect` the callee's table slot with a static
                 // `(i64×n)->i64` type. The residual ABI is uniformly i64 for
@@ -6484,12 +6664,12 @@ fn build_function(
                 if let (Some(base), Some(nargs)) =
                     (residual_type_base, residual_call_i64_arity(op, constants))
                 {
-                    let call_args = &op.getarglist()[1..];
+                    let call_args = &op.getarglist()[func_ofs + 1..];
                     for arg in call_args {
                         emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     }
                     // func_ptr (arg 0) is the table slot — wrap to i32 index.
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     // call_indirect(table_index, type_index): table 0, type for arity n.
                     sink.call_indirect(0, base + nargs as u32);
@@ -6524,11 +6704,11 @@ fn build_function(
                     // Direct in-module word-ABI void residual call: the callee
                     // really is `(i64×n)->i64` (descr result_size == 8), so use
                     // the i64 family and drop the dummy result.
-                    let call_args = &op.getarglist()[1..];
+                    let call_args = &op.getarglist()[func_ofs + 1..];
                     for arg in call_args {
                         emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     }
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
                     sink.drop();
@@ -6559,7 +6739,7 @@ fn build_function(
                     // Direct in-module typed residual call with the
                     // descr-derived mixed `(i64/f64...) -> i64/f64` signature.
                     let (params, _) = &sig;
-                    let call_args = &op.getarglist()[1..];
+                    let call_args = &op.getarglist()[func_ofs + 1..];
                     debug_assert_eq!(call_args.len(), params.len());
                     for (arg, ty) in call_args.iter().zip(params) {
                         if *ty == ValType::F64 {
@@ -6569,7 +6749,7 @@ fn build_function(
                         }
                     }
                     // func_ptr (arg 0) is the table slot — wrap to i32 index.
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, type_idx);
                     // A void callee leaves nothing on the stack, so there is
@@ -6607,11 +6787,11 @@ fn build_function(
                     // Direct in-module true-void residual call: the callee is
                     // `(i64×n)->()` (descr result_size == 0), so the call has no
                     // result to drop.
-                    let call_args = &op.getarglist()[1..];
+                    let call_args = &op.getarglist()[func_ofs + 1..];
                     for arg in call_args {
                         emit_resolve(&mut sink, constants, value_types, arg.to_opref());
                     }
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
                     if can_collect {
@@ -6634,9 +6814,7 @@ fn build_function(
                 } else {
                     let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
 
-                    // args[0] = func_ptr, args[1..] = call arguments
-                    let func_ptr_ref = op.arg(0).to_opref();
-                    let call_args = &op.getarglist()[1..];
+                    let call_args = &op.getarglist()[func_ofs + 1..];
 
                     // Store func_ptr to call area
                     emit_call_area_addr(&mut sink);
@@ -6870,6 +7048,17 @@ fn build_function(
                     }
                 }
 
+                // The check `rewrite.py` `_gen_call_malloc_gc` puts after a
+                // collecting malloc: the vtable and class-word stores below
+                // address the result directly and must not run on a NULL.
+                emit_memory_error_check(
+                    &mut sink,
+                    value_types,
+                    vi,
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
                 if !OpRef::raw_is_constant(vi) {
                     // llmodel.py write_int_at_mem(res, vtable_offset,
                     // WORD, vtable). The `ob_type` field is pointer-width: 4
@@ -7304,6 +7493,18 @@ fn build_function(
                         sink.local_set(value_types.local(vi));
                     }
                 }
+                // The check `rewrite.py` `_gen_call_malloc_gc` puts after a
+                // collecting malloc. Here the helper writes the length field
+                // itself, so the NULL escapes into the following item stores
+                // rather than into a store this arm emits.
+                emit_memory_error_check(
+                    &mut sink,
+                    value_types,
+                    vi,
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
                 // `wasm_jit_alloc_array` collects; reload other live Refs. The
                 // inline-bump paths already emitted this inside their slow arms.
                 if residual_type_base.is_none()
@@ -7413,12 +7614,19 @@ fn build_function(
             | OpCode::Keepalive => {}
 
             _ => {
-                // An opcode with no codegen arm. If it produces a value (a
-                // result local that later ops read), silently skipping it
-                // leaves a stale slot and yields wrong results, so decline the
-                // whole trace and let the metainterp fall back to the
-                // interpreter (correct, unaccelerated). Side-effect-free
-                // metadata opcodes that produce no value are enumerated above.
+                // An opcode with no codegen arm declines the whole trace and
+                // lets the metainterp fall back to the interpreter (correct,
+                // unaccelerated). That covers a void opcode too: its `pos` is
+                // `OpRef::NONE`, whose raw is `u32::MAX`, and
+                // `raw_is_constant` rejects the sentinel range. So the only op
+                // that reaches here and emits nothing is one the optimizer
+                // folded into the constant namespace, which by then is pure and
+                // has no side effect left to drop.
+                //
+                // An opcode that must emit nothing belongs in one of the no-op
+                // arms above, where the reason it owes no code is written down;
+                // a side-effecting op put there is dropped in silence, which is
+                // what `CondCallN` was.
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     return Err(BackendError::Unsupported(format!(
@@ -8076,10 +8284,32 @@ fn emit_array_addr(
     )
 }
 
-/// The width of a GC pointer in the wasm32 guest heap, which is what
-/// `GetarrayitemGcR` reads back. A descriptor's `field_size` reports the width
-/// on whichever target compiled it.
+/// The width of a GC pointer in the wasm32 guest heap.
+///
+/// A descriptor mints its width from the compiling target, so for a pyre descr
+/// this is already what `field_size` / `item_size` says. It stays as its own
+/// constant for the descr that does not: a pointer is four bytes here whatever
+/// the descr claims, and a reading arm and its writing arm must take the width
+/// from ONE place — the two spellings agreeing today is not the same as them
+/// being one rule.
 const GUEST_PTR_SIZE: usize = 4;
+
+/// The width an access to one array item moves, and how a read of it extends.
+/// The array twin of [`InteriorFieldLayout::access_size`]; every
+/// `GETARRAYITEM` / `SETARRAYITEM` arm reads it from here.
+///
+/// The address stride still comes from the descriptor's own `item_size`
+/// (`emit_array_addr`), which is what the allocation laid the array out with.
+fn array_item_access_size_sign(op: &Op) -> (usize, bool) {
+    op.with_array_descr(|ad| {
+        if ad.is_array_of_pointers() {
+            (GUEST_PTR_SIZE, false)
+        } else {
+            (ad.item_size(), ad.is_item_signed())
+        }
+    })
+    .unwrap_or_else(|| missing_layout_descr("array descr (item size/sign)", op))
+}
 
 /// `descr.py unpack_interiorfielddescr`: `ofs = basesize + field.offset`,
 /// plus the element stride and the field's own width / signedness / kind.
@@ -8096,14 +8326,15 @@ struct InteriorFieldLayout {
 }
 
 impl InteriorFieldLayout {
-    /// The width an access to this field moves. A pointer field is
-    /// guest-pointer-wide, the width `GetarrayitemGcR` reads back; the
-    /// descriptor's own `field_size` is the host's.
-    fn access_size(&self) -> usize {
+    /// The width an access to this field moves, and how a read of it extends.
+    /// A pointer is guest-pointer-wide and never extends as signed, whatever
+    /// the descriptor says; every reading and writing arm takes both from here
+    /// so the two cannot drift apart.
+    fn access_size_sign(&self) -> (usize, bool) {
         if self.is_ptr {
-            GUEST_PTR_SIZE
+            (GUEST_PTR_SIZE, false)
         } else {
-            self.field_size
+            (self.field_size, self.signed)
         }
     }
 }
@@ -8727,6 +8958,75 @@ fn exit_fail_args(op: &Op) -> Vec<OpRef> {
         .unwrap_or_else(|| op.getarglist().iter().map(|a| a.to_opref()).collect())
 }
 
+/// x86/assembler.py `genop_discard_check_memory_error`: the NULL test
+/// `rewrite.py` `_gen_call_malloc_gc` attaches to every collecting malloc.
+/// wasm lowers `New` / `NewArray` itself in place of the GC rewrite, so it owes
+/// itself the same check — address 0 is ordinary linear memory here, so the
+/// vtable, class-word and item stores that follow an allocation would corrupt
+/// it silently rather than fault.
+///
+/// The failing arm is `_build_propagate_exception_path` in this backend's exit
+/// spelling. `_store_and_reset_exception` moves the `MemoryError` the
+/// allocation helper published (`lib.rs` `oom_signal_if_zero`) out of the
+/// shared cells and into the frame's first exit slot, `frame[0]` takes the
+/// reserved `exit_frame_with_exception_descr_ref` exit, and the function
+/// returns its frame pointer. It returns rather than branching to the hot-exit
+/// block because the epilogue there dispatches on a per-guard bridge cell, and
+/// this exit belongs to no guard and owns no cell.
+///
+/// A collecting helper can move the frame before it fails, so local 0 is
+/// reloaded on this arm; the reload reads the shadow-stack top, so a caller
+/// that already reloaded pays nothing for the second one.
+///
+/// Two configurations cannot deliver the exception and trap instead of
+/// reporting a wrong one: a cpu that was never handed
+/// `exit_frame_with_exception_descr_ref`, whose exit would resolve to a bare
+/// finish and hand the exception back as the loop's result (the same choice
+/// the cranelift sibling's `emit_memory_error_check` makes for an unattached
+/// `propagate_exception_descr`), and a `MemoryError` provider that was never
+/// registered, whose exit slot would carry a null reference into the
+/// frontend's re-raise.
+fn emit_memory_error_check(
+    sink: &mut PeepSink<'_, '_>,
+    value_types: &ValueLocals,
+    vi: u32,
+    residual_type_base: Option<u32>,
+    ca_reload_fn_ptr: i64,
+    jf_top_addr: Option<u32>,
+) {
+    if OpRef::raw_is_constant(vi) {
+        return;
+    }
+    sink.local_get(value_types.local(vi));
+    sink.i64_eqz();
+    sink.if_(BlockType::Empty);
+    if crate::failguard::exit_frame_with_exception_attached() {
+        emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
+        sink.local_get(0);
+        sink.i32_const(crate::jit_exc_value_addr() as i32);
+        sink.i64_load(mem64(0));
+        sink.i64_store(mem64(FRAME_SLOT_BASE));
+        sink.i32_const(crate::jit_exc_value_addr() as i32);
+        sink.i64_const(0);
+        sink.i64_store(mem64(0));
+        sink.i32_const(crate::jit_exc_type_addr() as i32);
+        sink.i64_const(0);
+        sink.i64_store(mem64(0));
+        sink.local_get(0);
+        sink.i64_load(mem64(FRAME_SLOT_BASE));
+        sink.i64_eqz();
+        sink.if_(BlockType::Empty);
+        sink.unreachable();
+        sink.end();
+        emit_guard_fail_index_store(sink, crate::failguard::FINISH_EXIT_INDEX_EXC);
+        sink.local_get(0);
+        sink.return_();
+    } else {
+        sink.unreachable();
+    }
+    sink.end();
+}
+
 fn emit_guard_fail_index_store(sink: &mut PeepSink<'_, '_>, guard_idx: u32) {
     sink.local_get(0);
     sink.i64_const(guard_idx as i64);
@@ -8971,7 +9271,10 @@ fn overflow_failure_cmp(cmp: CmpOp, fused_guard: OpCode) -> CmpOp {
         OpCode::GuardOverflow => match cmp {
             CmpOp::I64GtS => CmpOp::I64LeS,
             CmpOp::I64LtS => CmpOp::I64GeS,
-            _ => unreachable!("overflow comparison must be signed lt or gt"),
+            CmpOp::I64Ne => CmpOp::I64Eq,
+            _ => unreachable!(
+                "overflow comparison must be a constant bound or a sign-word inequality"
+            ),
         },
         _ => unreachable!("overflow fusion requires an overflow guard"),
     }
@@ -8995,19 +9298,8 @@ fn emit_ovf_binop(
     }
     let result_local = value_types.local(vi);
 
-    if matches!(binop, BinOp::I64Mul) {
-        debug_assert!(fused_guard.is_none());
-        // Keep both factors in the umulhi scratch bank. The hot signed-32
-        // overflow check below reuses them without resolving the SSA operands
-        // again; the slow 64-bit path is free to overwrite the same bank.
-        emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
-        sink.local_tee(value_local_count + 1);
-        emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
-        sink.local_tee(value_local_count + 2);
-    } else {
-        emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
-        emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
-    }
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
     apply_binop(sink, binop);
     sink.local_set(result_local);
 
@@ -9068,18 +9360,27 @@ fn emit_ovf_binop(
             // every multiplication into a software 64x64->128 product. The
             // exact sign-extension checks preserve the full-width slow path
             // for every value outside that proven-safe domain.
-            sink.local_get(value_local_count + 1);
+            // Resolving an operand is the same single `local.get` that reading
+            // a scratch copy of it would be, so the check reads the operands
+            // and the umulhi bank stays the slow arm's alone.
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
             sink.i64_extend32_s();
-            sink.local_get(value_local_count + 1);
+            emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
             sink.i64_eq();
-            sink.local_get(value_local_count + 2);
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
             sink.i64_extend32_s();
-            sink.local_get(value_local_count + 2);
+            emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
             sink.i64_eq();
             sink.i32_and();
-            sink.if_(BlockType::Empty);
-            sink.i64_const(0);
-            sink.local_set(ovf_flag_local);
+            // Both arms answer the same one-bit predicate, so the block
+            // yields it rather than each arm storing it: an adjacent guard
+            // reads it off the stack the way the add and sub forms do, and
+            // only an unpaired op pays for the flag local. With no paired
+            // guard the predicate to yield is `GuardNoOverflow`'s -- "it
+            // overflowed" -- which is what that local is defined to hold.
+            let failure_of = fused_guard.unwrap_or(OpCode::GuardNoOverflow);
+            sink.if_(BlockType::Result(ValType::I32));
+            sink.i32_const(i32::from(matches!(failure_of, OpCode::GuardOverflow)));
             sink.else_();
 
             // Convert the unsigned high word to the signed high word:
@@ -9109,10 +9410,13 @@ fn emit_ovf_binop(
             sink.local_get(result_local);
             sink.i64_const(63);
             sink.i64_shr_s();
-            sink.i64_ne();
+            apply_cmp(sink, overflow_failure_cmp(CmpOp::I64Ne, failure_of));
+            sink.end();
+            if fused_guard.is_some() {
+                return OvfFlag::FusedCond;
+            }
             sink.i64_extend_i32_u();
             sink.local_set(ovf_flag_local);
-            sink.end();
             return OvfFlag::InLocal;
         }
         _ => unreachable!("overflow emitter requires add, sub, or mul"),
