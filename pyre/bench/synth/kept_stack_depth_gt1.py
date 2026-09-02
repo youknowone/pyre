@@ -12,7 +12,7 @@
 # decline removal: `0 < a < b < 9` must read 375000 (a miscompile gives
 # 749949) and `total + (a + ((i & 1) or 5))` 1275003750000 (miscompile:
 # 1837502750500).
-N = 1500000
+N = 2923000
 
 
 def chain2():

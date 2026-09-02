@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=13
-N = 400000
+# pyre-check: max-pypy-ratio=3
+N = 156150700
 
 G = 100
 

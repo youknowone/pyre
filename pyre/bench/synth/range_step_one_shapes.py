@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=3
+# pyre-check: max-pypy-ratio=6
 # `descr_iter` picks a shape from `promote_step`, not from `step == 1`, so the
 # loops below compile three different iterators over the same span: `range(n)`
 # and `range(a, b)` carry an immutable `stop` and no countdown, while

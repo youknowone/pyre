@@ -11,7 +11,7 @@
 # walk.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 8912862
+N = 10700000
 FLIP_AT = 200000
 
 

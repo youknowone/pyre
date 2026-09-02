@@ -15,7 +15,7 @@
 # that the SWAP-bearing handler tail resumes byte-identically.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 28115472
+N = 68889600
 
 
 def raise_then_return(n):

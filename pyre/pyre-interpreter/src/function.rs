@@ -3800,9 +3800,20 @@ pub fn funccall_valuestack(
     let fast_natural_arity =
         unsafe { crate::pycode::code_get_fast_natural_arity(code as PyObjectRef) } as usize;
 
+    // function.py:153-199 — the four fast-path arms are an `elif` chain, so an
+    // arm whose *outer* test matches consumes the call even when its inner
+    // dispatch declines: `function.py:154-184` dispatches only arities 0..=4,
+    // and a natural-arity call above that falls out of the whole chain to
+    // `make_arguments` below rather than into a later arm.  The exclusivity is
+    // load-bearing, not stylistic — `fast_natural_arity` carries FLATPYCALL in
+    // its 0x100 bit, so an `nargs` equal to it also satisfies the next arm's
+    // `nargs | FLATPYCALL == fast_natural_arity` and would enter `_flat_pycall`
+    // with 0x100 more arguments than the callee has local slots.
+    let natural_arity_call = nargs == fast_natural_arity;
+
     // function.py:153-184 — nargs == fast_natural_arity: builtin fast path
     // baseobjspace.py:1243 — skip when profiling (c_call/c_return events)
-    if nargs == fast_natural_arity && nargs <= 4 && !frame.get_is_being_profiled() {
+    if natural_arity_call && nargs <= 4 && !frame.get_is_being_profiled() {
         debug_assert!(
             (fast_natural_arity & crate::FLATPYCALL as usize) == 0,
             "FLATPYCALL bit set on arity {fast_natural_arity} — not a builtin code"
@@ -3868,12 +3879,12 @@ pub fn funccall_valuestack(
     }
 
     // function.py:185-187 — (nargs | FLATPYCALL) == fast_natural_arity
-    if (nargs | crate::FLATPYCALL as usize) == fast_natural_arity {
+    if !natural_arity_call && (nargs | crate::FLATPYCALL as usize) == fast_natural_arity {
         return _flat_pycall(func, code, nargs, frame, dropvalues);
     }
 
     // function.py:188-193 — FLATPYCALL bit set + nargs within defaults range
-    if (fast_natural_arity & crate::FLATPYCALL as usize) != 0 {
+    if !natural_arity_call && (fast_natural_arity & crate::FLATPYCALL as usize) != 0 {
         let natural_arity = fast_natural_arity & 0xff;
         if nargs < natural_arity {
             let raw_defs = unsafe { crate::function_get_defaults(func) };
@@ -3904,7 +3915,7 @@ pub fn funccall_valuestack(
     // single BuiltinCodeFn signature already takes a flat slice, so the
     // peek/Arguments split is structural — the final closure invocation
     // sees `[w_obj, ...rest]` exactly as PyPy's post-merge args_w.
-    if fast_natural_arity == crate::PASSTHROUGHARGS1 as usize && nargs >= 1 {
+    if !natural_arity_call && fast_natural_arity == crate::PASSTHROUGHARGS1 as usize && nargs >= 1 {
         let w_obj = frame.peekvalue(nargs - 1);
         let rest = frame.make_arguments(nargs - 1, false, func);
         // Same live-variable set as the fixed-arity arm above, for the same

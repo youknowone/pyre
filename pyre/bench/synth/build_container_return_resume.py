@@ -8,7 +8,7 @@
 # build_tuple_large.py — which builds inside the traced loop body — the build
 # here is reached only on the resume path, exercising the blackhole builder's
 # coverage of the GC array-build family.
-N = 4000000
+N = 42611100
 
 
 def build_tuple(n):

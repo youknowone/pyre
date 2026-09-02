@@ -32,7 +32,7 @@
 # reports anywhere from 6x to 22x depending on runner speed. At this N the
 # ratio is 2.5x (dynasm) / 3.1x (cranelift), which is the value the gate is
 # meant to bound.
-N = 4000000
+N = 12195900
 
 
 def add_body(a, i):

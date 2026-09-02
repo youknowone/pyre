@@ -1,8 +1,4 @@
-# pyre-check: max-pypy-ratio=27
-# The ceiling is twice the slowest ratio observed, 13.5x on the macos
-# runner. pypy runs this in under the execution floor, so every reading is
-# a lower bound on the true ratio and the ceiling is the conservative side
-# of one: the derived floor stays disarmed here for the same reason.
+# pyre-check: max-pypy-ratio=4
 # A hot `float(x)` builtin-call loop over int and float arguments.  The walker
 # specializes the call (`try_walker_specialize_float_call`) to an inline
 # conversion — `CastIntToFloat` + `wrapfloat` for an int/bool argument, or the
@@ -10,7 +6,7 @@
 # `bh_call_fn(float_type, NULL, x)` residual, so the result virtualizes.  A
 # rebound `float` name or a float subclass (which reboxes) falls through to the
 # residual.
-N = 600000
+N = 80008700
 
 
 def run():

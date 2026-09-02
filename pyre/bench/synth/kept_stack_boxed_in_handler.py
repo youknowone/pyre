@@ -14,7 +14,7 @@
 # rebuilds the kept boxed int (or the re-raised exception) as NULL / a wrong
 # value and the handler arithmetic diverges from the interpreter.  Pure
 # arithmetic -> deterministic checksum.
-N = 18800000
+N = 31310100
 
 
 def main():

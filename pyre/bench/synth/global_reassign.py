@@ -17,7 +17,7 @@
 # Correct output is verified against CPython/PyPy.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 5886741
+N = 16730700
 
 
 def run_int():

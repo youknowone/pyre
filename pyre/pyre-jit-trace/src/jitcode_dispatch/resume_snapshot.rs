@@ -1745,11 +1745,11 @@ enum CallerOperandSlots {
 }
 
 /// Absolute frame slots proving the operand region at `call_jitcode_pc`, for a
-/// caller whose operand stack ends at `stack_end`. CALL names its synthetic
-/// `null_or_self` sentinel and callable proof; every other shape names only
-/// how many operands it consumes, and the deepest of those plays the role the
-/// callable plays for CALL. `None` keeps the conservative decline for every
-/// resume shape not listed.
+/// caller whose operand stack ends at `stack_end`. The two CALL forms name
+/// their synthetic `null_or_self` sentinel and callable proof; every other
+/// shape names only how many operands it consumes, and the deepest of those
+/// plays the role the callable plays for CALL. `None` keeps the conservative
+/// decline for every resume shape not listed.
 ///
 /// The non-CALL shapes are what an inlined dunder needs: the entry admits a
 /// body on the strength of an abort resuming forward past it, and with no arm
@@ -1758,6 +1758,11 @@ enum CallerOperandSlots {
 /// attribute-access half of that — a property accessor, a `__getattr__` hook
 /// or a descriptor `__get__` body is reached from one of them, never from a
 /// Python-level CALL.
+///
+/// CALL_KW is here for the opposite reason: it IS a Python-level call, and
+/// without an arm the seeded inline had no caller image for one, so every
+/// keyword call stayed a residual `CallMayForce` with its arguments built on
+/// the heap once per execution.
 fn caller_operand_slots<Sym: WalkSym>(
     caller_sym: &Sym,
     call_jitcode_pc: usize,
@@ -1769,14 +1774,24 @@ fn caller_operand_slots<Sym: WalkSym>(
         crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jitcode_pc)
             as usize;
     let (instruction, op_arg) = pyre_interpreter::decode_instruction_at(code, py_pc)?;
+    // `[callable, null_or_self, arg0 .. arg_{argc-1}]` for CALL, and the
+    // keyword-name tuple one slot above that block for CALL_KW: `call_kw`
+    // (`eval.rs`) pops the names first and then the identical argument block,
+    // so the two shapes differ only in where the stack ends above the
+    // arguments, and both name the same synthetic sentinel and callable proof.
+    let call_shape = match instruction {
+        pyre_interpreter::Instruction::Call { argc } => Some((argc, 1usize)),
+        pyre_interpreter::Instruction::CallKw { argc } => Some((argc, 2usize)),
+        _ => None,
+    };
+    if let Some((argc, slots_above_args)) = call_shape {
+        let null_or_self = stack_end.checked_sub(argc.get(op_arg) as usize + slots_above_args)?;
+        return Some(CallerOperandSlots::Call {
+            null_or_self,
+            callable: null_or_self.checked_sub(1)?,
+        });
+    }
     let operand_count = match instruction {
-        pyre_interpreter::Instruction::Call { argc } => {
-            let null_or_self = stack_end.checked_sub(argc.get(op_arg) as usize + 1)?;
-            return Some(CallerOperandSlots::Call {
-                null_or_self,
-                callable: null_or_self.checked_sub(1)?,
-            });
-        }
         // `[iterator]`, and `[owner]` for the attribute read whose descriptor
         // body is the callee. The method form of `LOAD_ATTR` pushes two
         // results but still consumes only the owner, and this depth is read

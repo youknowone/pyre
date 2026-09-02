@@ -32,7 +32,7 @@
 # above it.  The other bound is ~195ns/iteration here against pypy's fraction
 # of one, and this fixture must not become the slowest baseline run in the
 # suite.
-N = 72000000
+N = 311320500
 
 
 def run(n):

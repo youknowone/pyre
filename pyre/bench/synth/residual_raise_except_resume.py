@@ -29,7 +29,7 @@
 # difference clamps to the 5ms floor, and unchanged code reports anywhere from
 # 3x to 18x depending on runner speed. At this N the ratio is 1.8x (dynasm) /
 # 1.9x (cranelift), which is the value the gate is meant to bound.
-N = 20000000
+N = 67110700
 
 
 def divide_by_zero_const(n):

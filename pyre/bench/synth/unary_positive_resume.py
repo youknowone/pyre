@@ -5,7 +5,7 @@
 # warmup, which the longer loop amortises, so the same code reads 2.1x where
 # it read ~44x against the floor. The ceiling is twice the slowest of the
 # three backends observed (2.1x on wasm); the previous 90 gated nothing.
-N = 110000000
+N = 200000000
 
 
 def main():

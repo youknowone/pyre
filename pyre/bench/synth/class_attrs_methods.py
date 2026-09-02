@@ -4,7 +4,7 @@
 # A hot `getattr(type, name)` loop rides along: the read resolves through the
 # class MRO, and without the `builtin_type_getattr` fold it measures 13.1x on
 # its own (0.091s -> 1.190s).
-N = 1200000
+N = 152863600
 
 
 class Counter:

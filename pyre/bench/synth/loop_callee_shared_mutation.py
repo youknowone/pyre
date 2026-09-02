@@ -14,7 +14,7 @@
 # Expected: len(acc) == 2 * N. Under the bug the JIT printed 2*N + 3 (a constant
 # over-count, independent of N, present only once N crosses the compile
 # threshold), on both backends, which share the trace/resume layer.
-N = 1200000
+N = 3114800
 
 
 def fill(out):
