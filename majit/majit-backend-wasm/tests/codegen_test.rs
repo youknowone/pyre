@@ -6106,6 +6106,64 @@ fn int_between_is_two_signed_comparisons() {
 
 /// `genop_discard_cond_call`: CondCallN is a real conditional call, not a no-op.
 #[test]
+fn cond_call_reload_sits_on_the_arm_that_called() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::CondCallN,
+            &[
+                OpRef::input_arg_int(0),
+                OpRef::const_int(0x100),
+                OpRef::input_arg_ref(1),
+            ],
+            OpRef::NONE,
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(1))]),
+    ];
+    let frame = codegen::FrameGeometry::compact(
+        codegen::frame_value_slots(&inputargs, &ops),
+        codegen::count_ref_homes(&inputargs, &ops),
+        0,
+    );
+    let (bytes, _) = build_module_with_frame(
+        &inputargs,
+        &ops,
+        &indexmap::IndexMap::new(),
+        Some(0),
+        &codegen::GuardGcTypeInfo::default(),
+        frame,
+    );
+    validate_wasm(&bytes);
+    let mut seq: Vec<String> = Vec::new();
+    count_operators(&bytes, |op| seq.push(format!("{op:?}")));
+
+    // The reload exists because the callee may collect, so it belongs on the
+    // arm that called: between the `else` and the `end` that closes it, not
+    // after the join where the untaken arm would pay for it too.
+    let home = format!("offset: {},", frame.home_slot_base);
+    let else_at = seq
+        .iter()
+        .position(|o| o == "Else")
+        .expect("the cond call puts its trampoline in an else arm");
+    let end_at = else_at
+        + seq[else_at..]
+            .iter()
+            .position(|o| o == "End")
+            .expect("the else arm closes");
+    let reload_at = seq
+        .iter()
+        .position(|o| o.starts_with("I64Load ") && o.contains(&home))
+        .expect("the cond call reloads the live Ref from its home slot");
+    assert!(
+        else_at < reload_at && reload_at < end_at,
+        "the ref-home reload is outside the calling arm: {seq:#?}"
+    );
+}
+
+#[test]
 fn cond_call_n_emits_predicate_and_trampoline() {
     let inputargs = vec![
         InputArg::from_type(Type::Int, 0),

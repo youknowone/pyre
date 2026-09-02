@@ -5825,12 +5825,12 @@ fn build_function(
                     sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
                 }
                 emit_jit_call(&mut sink, jit_call);
-                sink.end();
                 // COND_CALL sits inside the CALL opcode range, so a Ref living
-                // across it already owns a home; the collection that home
-                // exists for can happen on the taken arm. Reloading after the
-                // `if` covers both arms, and on the untaken one it re-reads
-                // slots the stores kept current.
+                // across it already owns a home. Only the arm that called can
+                // have collected, so the reload belongs on it: after the `if`
+                // it would run on the untaken arm too, re-reading slots that
+                // nothing moved, once per iteration of a loop whose whole
+                // reason for a COND_CALL is that the call is rare.
                 if call_can_collect(op) {
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -5848,6 +5848,7 @@ fn build_function(
                         frame,
                     );
                 }
+                sink.end();
             }
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
                 // x86/regalloc.py `consider_cond_call`, COND_CALL_VALUE arm:
@@ -5903,10 +5904,8 @@ fn build_function(
                     sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
                     sink.local_set(value_types.local(vi));
                 }
-                sink.end();
-                // The call arm can collect, so reload after the `if`; on the
-                // arm that did not call, the slots the reload re-reads are the
-                // ones the stores kept current.
+                // Only the arm that called can have collected, so the reload
+                // sits on it rather than after the `if`.
                 if call_can_collect(op) {
                     emit_reload_frame_if_necessary(
                         &mut sink,
@@ -5924,6 +5923,7 @@ fn build_function(
                         frame,
                     );
                 }
+                sink.end();
             }
 
             // x86/assembler.py genop_guard_guard_gc_type:
