@@ -531,6 +531,11 @@ impl Assembler {
                     })
                     .unwrap_or_else(|| panic!("runtime assembler opcode space exhausted for {key}"))
             });
+        // The byte has to reach the trace decoder as well: `decode_op_at`
+        // resolves every opcode through the byte -> opname map, and a byte only
+        // this table knows makes the body undecodable, which its callers read
+        // as "assume the worst".
+        pyre_jit_trace::jitcode_runtime::publish_runtime_insn(&key, opcode);
         self.insns.insert(key, opcode);
         Some(opcode)
     }
@@ -763,7 +768,9 @@ fn dispatch_op(
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
             match (lhs, rhs) {
-                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs))
+                    if both_int_operands_are_registers(&args[0], &args[1]) =>
+                {
                     state.builder.goto_if_not_int_eq(lhs, rhs, label_id)
                 }
                 _ => state.builder.goto_if_not_int_operands(
@@ -780,7 +787,9 @@ fn dispatch_op(
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
             match (lhs, rhs) {
-                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs))
+                    if both_int_operands_are_registers(&args[0], &args[1]) =>
+                {
                     state.builder.goto_if_not_int_ne(lhs, rhs, label_id)
                 }
                 _ => state.builder.goto_if_not_int_operands(
@@ -797,7 +806,9 @@ fn dispatch_op(
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
             match (lhs, rhs) {
-                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs))
+                    if both_int_operands_are_registers(&args[0], &args[1]) =>
+                {
                     state.builder.goto_if_not_int_lt(lhs, rhs, label_id)
                 }
                 _ => state.builder.goto_if_not_int_operands(
@@ -814,7 +825,9 @@ fn dispatch_op(
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
             match (lhs, rhs) {
-                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs))
+                    if both_int_operands_are_registers(&args[0], &args[1]) =>
+                {
                     state.builder.goto_if_not_int_le(lhs, rhs, label_id)
                 }
                 _ => state.builder.goto_if_not_int_operands(
@@ -831,7 +844,9 @@ fn dispatch_op(
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
             match (lhs, rhs) {
-                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs))
+                    if both_int_operands_are_registers(&args[0], &args[1]) =>
+                {
                     state.builder.goto_if_not_int_gt(lhs, rhs, label_id)
                 }
                 _ => state.builder.goto_if_not_int_operands(
@@ -848,7 +863,9 @@ fn dispatch_op(
             let label = expect_tlabel(&args[2]);
             let label_id = builder_label(state, &label.name);
             match (lhs, rhs) {
-                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs))
+                    if both_int_operands_are_registers(&args[0], &args[1]) =>
+                {
                     state.builder.goto_if_not_int_ge(lhs, rhs, label_id)
                 }
                 _ => state.builder.goto_if_not_int_operands(
@@ -1524,7 +1541,9 @@ fn dispatch_op(
             let lhs = expect_jitcode_int_operand(state, &args[0], use_c_form(opname));
             let rhs = expect_jitcode_int_operand(state, &args[1], use_c_form(opname));
             match (lhs, rhs) {
-                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs)) => {
+                (JitCodeIntOperand::Register(lhs), JitCodeIntOperand::Register(rhs))
+                    if both_int_operands_are_registers(&args[0], &args[1]) =>
+                {
                     state.builder.record_binop_i(dst, opcode, lhs, rhs)
                 }
                 _ => state.builder.record_binop_i_operands(
@@ -2153,6 +2172,22 @@ fn expect_int_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
             other
         ),
     }
+}
+
+/// True when both integer positions are real registers, so the fixed
+/// `ii>i`/`iiL` emitters' `touch_reg` bound (`reg < num_regs_i`) holds.
+///
+/// A `ConstInt` becomes either a `ShortConst` or — when it does not fit the
+/// signed byte — a constants-pool slot, which
+/// [`expect_int_reg_or_pool`] numbers `num_regs_i + idx`.  `JitCodeIntOperand`
+/// spells that slot `Register` because `assembler.py` gives it the same `i`
+/// argcode (`blackhole.py` `registers_i` spans registers then constants), but
+/// only the `*_operands` emitters account for the wider namespace with
+/// `touch_int_reg_or_pool_slot`.  Routing a pool slot to the fixed emitter
+/// trips that assert once register counts are frozen, and silently inflates
+/// `num_regs_i` — shifting every later pool slot — before they are.
+fn both_int_operands_are_registers(lhs: &Operand, rhs: &Operand) -> bool {
+    matches!(lhs, Operand::Register(_)) && matches!(rhs, Operand::Register(_))
 }
 
 fn expect_jitcode_int_operand(

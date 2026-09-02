@@ -89,8 +89,14 @@ pub struct VableArrayInfo {
     /// (`unpack_arraydescr`).  This is the authoritative stride: 64-bit
     /// payloads (e.g. `i64` list-strategy backing arrays) carry an explicit
     /// 8-byte descriptor that `item_size_for_type` would under-size to a
-    /// machine word on 32-bit targets.
+    /// machine word on 32-bit targets.  It is also the authoritative LOAD
+    /// WIDTH: `bh_getarrayitem_gc_i` dispatches on `item_size` × sign
+    /// (`majit-backend` `model.rs`), so a narrower item must not be read as a
+    /// full word.
     pub item_size: usize,
+    /// `arraydescr.is_item_signed()` — the other half of that dispatch.
+    /// Meaningless for `Ref` and `Float` items, which have one representation.
+    pub item_signed: bool,
     /// Byte offset of the array pointer in the heap object.
     pub field_offset: usize,
     /// GC type id of the array object stored in a `DirectPointer` field.
@@ -519,8 +525,12 @@ impl VirtualizableInfo {
     /// virtualizable.py `finish()` registers the `clear_vable_ptr`
     /// function pointer and `clear_vable_descr` call descriptor.
     ///
-    /// `clear_fn` is an `extern "C" fn(*mut u8)` that clears the vable token,
-    /// forcing the virtualizable if necessary. Hosts must call this after
+    /// `clear_fn` clears the vable token, forcing the virtualizable if
+    /// necessary. Its ABI is the one `make_clear_vable_descr` declares —
+    /// `[Ref] -> Void`, taking the virtualizable as a single machine word —
+    /// spelled `extern "C" fn(i64)`, because that is what the compiled
+    /// `COND_CALL` `emit_force_virtualizable` builds passes and what
+    /// `bh_clear_vable_token` calls it as.  Hosts must call this after
     /// `build_virtualizable_info()` to enable `emit_force_virtualizable`.
     pub fn set_clear_vable(&mut self, clear_fn: *const (), clear_descr: DescrRef) {
         self.clear_vable_ptr = Some(clear_fn as usize);
@@ -617,11 +627,13 @@ impl VirtualizableInfo {
     ) {
         let name = name.into();
         let item_size = array_descr_item_size(&array_descr, item_type);
+        let item_signed = array_descr_item_signed(&array_descr);
         let array_type_id = array_field_type_id(&name, &array_descr);
         self.array_fields.push(VableArrayInfo {
             name,
             item_type,
             item_size,
+            item_signed,
             field_offset,
             array_type_id,
             storage: VableArrayStorage::DirectPointer,
@@ -653,11 +665,13 @@ impl VirtualizableInfo {
     ) {
         let name = name.into();
         let item_size = array_descr_item_size(&array_descr, item_type);
+        let item_signed = array_descr_item_signed(&array_descr);
         let array_type_id = array_field_type_id(&name, &array_descr);
         self.array_fields.push(VableArrayInfo {
             name,
             item_type,
             item_size,
+            item_signed,
             field_offset,
             array_type_id,
             storage: VableArrayStorage::EmbeddedArray { ptr_offset },
@@ -684,11 +698,13 @@ impl VirtualizableInfo {
     ) {
         let name = name.into();
         let item_size = array_descr_item_size(&array_descr, item_type);
+        let item_signed = array_descr_item_signed(&array_descr);
         let array_type_id = array_field_type_id(&name, &array_descr);
         self.array_fields.push(VableArrayInfo {
             name,
             item_type,
             item_size,
+            item_signed,
             field_offset,
             array_type_id,
             storage: VableArrayStorage::RustVec {
@@ -1723,6 +1739,20 @@ fn array_descr_item_size(array_descr: &DescrRef, item_type: Type) -> usize {
     majit_ir::descr::unpack_arraydescr(array_descr)
         .map(|(_, item_size, _)| item_size)
         .unwrap_or_else(|| item_size_for_type(item_type))
+}
+
+/// `arraydescr.is_item_signed()`, the sign half of `bh_getarrayitem_gc_i`'s
+/// `(item_size, is_item_signed)` dispatch.
+///
+/// A field with no array descriptor falls back to signed: `item_size_for_type`
+/// gives such a field the machine word, and RPython's word-sized integer array
+/// is `Signed`.  The two answers only differ for a narrower item, which cannot
+/// arise without a descriptor to declare the narrower size.
+fn array_descr_item_signed(array_descr: &DescrRef) -> bool {
+    array_descr
+        .as_array_descr()
+        .map(|ad| ad.is_item_signed())
+        .unwrap_or(true)
 }
 
 pub fn item_size_for_type(ty: Type) -> usize {
@@ -2983,18 +3013,33 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         reader: &mut crate::resume::ResumeDataDirectReader,
     ) {
         let vable_ptr = virtualizable as *mut u8;
-        if vable_ptr.is_null() {
-            return;
-        }
         // virtualizable.py:131-133: ALL static fields.  Route through
         // `write_field` so the resume bits are specialized back to the field
         // type (`f64::from_bits` for `Float`); a raw `i64` write would store a
         // float's bit pattern as an integer and corrupt the field.
+        //
+        // The reader is a cursor over one shared stream, so the item COUNT this
+        // function consumes is what keeps every later section (vrefs, then the
+        // frames) aligned — and `get_total_size` right below already promises
+        // that count to `consume_vable_info`'s `== vable_size - 1` assert.  It
+        // counts `static_fields.len()` whether or not there is a virtualizable
+        // to read the array lengths off, so the static items must be consumed
+        // unconditionally too; skipping the loop on a null identity leaves them
+        // in the stream to be re-read as somebody else's values.  A null gets
+        // no write — upstream has no such case at all, `cast_gcref_to_vtype`
+        // hands `setattr` a null and it crashes — but the read still happens.
         for (field_index, field) in self.static_fields.iter().enumerate() {
             let value = reader.next_value_of_type(field.field_type);
-            unsafe {
-                self.write_field(vable_ptr, field_index, value);
+            if !vable_ptr.is_null() {
+                unsafe {
+                    self.write_field(vable_ptr, field_index, value);
+                }
             }
+        }
+        if vable_ptr.is_null() {
+            // Matches `get_total_size`, which adds no array length without a
+            // virtualizable to measure: there are no array items encoded.
+            return;
         }
         // virtualizable.py:134-137: array items
         for array in &self.array_fields {
@@ -3078,40 +3123,81 @@ pub(crate) unsafe fn bhimpl_arraybase_vable(
 pub(crate) unsafe fn vable_read_array_item(
     vable_ptr: *const u8,
     array: &VableArrayInfo,
-    index: usize,
+    index: i64,
 ) -> i64 {
     unsafe {
         // Stride from the field's array descriptor: a pointer array is
         // `size_of::<usize>()` (4 bytes on wasm32) while an `i64` payload
         // array is a fixed 8, regardless of word width.
         let item_size = array.item_size;
+        // `bhimpl_getarrayitem_vable_*` (`blackhole.py:1374-1387`) takes the
+        // index with argcode `i` and hands it to `bh_getarrayitem_gc_*`
+        // SIGNED.  The operand is an interpreter register, so a stale or
+        // clobbered one arrives here as any `i64`; casting it to `usize` turns
+        // a negative one into a huge offset and `data_ptr.add` then names an
+        // address gigabytes away, which reads as a value of `item_type` — for
+        // a `Ref` array, a pointer the caller dereferences.  Refuse it where
+        // it can still be attributed to this array.
+        assert!(
+            index >= 0,
+            "vable_read_array_item: negative index {index} into virtualizable \
+             array {:?} (item_type {:?})",
+            array.name,
+            array.item_type,
+        );
+        let index = index as usize;
         let data_ptr = bhimpl_arraybase_vable(vable_ptr, array);
-        if data_ptr.is_null() {
-            0
-        } else {
-            // An index past the end reads whatever follows the payload and
-            // hands it back as a value of `item_type` — for a `Ref` array that
-            // is a pointer the caller will dereference, so the fault lands in
-            // whatever consumes the result rather than here.  The operand is
-            // an interpreter register, so a stale or clobbered one is a defect
-            // in the producer; report it against this array instead of letting
-            // the poison value travel.
-            if crate::jit_strict_mode() {
-                let len = bhimpl_arraylen_vable(vable_ptr, array);
-                assert!(
-                    index < len,
-                    "vable_read_array_item: index {index} is past the end of \
-                     virtualizable array {:?} (len {len}, item_type {:?})",
-                    array.name,
-                    array.item_type,
-                );
-            }
-            let src = data_ptr.add(index * item_size);
-            if array.item_type == Type::Ref {
-                *(src as *const usize) as i64
-            } else {
-                std::ptr::read(src as *const i64)
-            }
+        // Upstream reaches the items through `bh_getfield_gc_r` and then
+        // `bh_getarrayitem_gc_*`, and a null array field faults in the second.
+        // Answering `0` instead hands a `Ref` read a null the caller
+        // dereferences somewhere else, and an `Int` read a plausible zero that
+        // never surfaces at all.
+        assert!(
+            !data_ptr.is_null(),
+            "vable_read_array_item: virtualizable array {:?} is null \
+             (item_type {:?}, index {index})",
+            array.name,
+            array.item_type,
+        );
+        // An index past the end reads whatever follows the payload and hands
+        // it back as a value of `item_type`, so the fault lands in whatever
+        // consumes the result rather than here.
+        if crate::jit_strict_mode() {
+            let len = bhimpl_arraylen_vable(vable_ptr, array);
+            assert!(
+                index < len,
+                "vable_read_array_item: index {index} is past the end of \
+                 virtualizable array {:?} (len {len}, item_type {:?})",
+                array.name,
+                array.item_type,
+            );
+        }
+        let src = data_ptr.add(index * item_size);
+        match array.item_type {
+            // `llmodel.py read_ref_at_mem` — one machine word.
+            Type::Ref => *(src as *const usize) as i64,
+            // `llmodel.py read_float_at_mem` — the f64 bit pattern, which the
+            // caller re-reads as one.
+            Type::Float => std::ptr::read(src as *const i64),
+            // `bh_getarrayitem_gc_i` dispatches on `(item_size,
+            // is_item_signed)` (`majit-backend` `model.rs`); reading a
+            // narrower item as a full word takes the bytes that follow it.
+            Type::Int | Type::Void => match (item_size, array.item_signed) {
+                (8, true) => *(src as *const i64),
+                (8, false) => *(src as *const u64) as i64,
+                (4, true) => *(src as *const i32) as i64,
+                (4, false) => *(src as *const u32) as i64,
+                (2, true) => *(src as *const i16) as i64,
+                (2, false) => *(src as *const u16) as i64,
+                (1, true) => *(src as *const i8) as i64,
+                (1, false) => *(src as *const u8) as i64,
+                // `llmodel.py:478 else: raise NotImplementedError`.
+                _ => panic!(
+                    "vable_read_array_item: virtualizable array {:?} has no \
+                     integer load for item_size {item_size} (signed {})",
+                    array.name, array.item_signed,
+                ),
+            },
         }
     }
 }
@@ -3145,12 +3231,46 @@ pub(crate) unsafe fn vable_array_write_base(
 pub(crate) unsafe fn vable_write_array_item(
     vable_ptr: *mut u8,
     array: &VableArrayInfo,
-    index: usize,
+    index: i64,
     value: i64,
 ) {
     unsafe {
+        // `bhimpl_setarrayitem_vable_*` (`blackhole.py:1390-1403`) takes the
+        // index with argcode `i` and hands it to `bh_setarrayitem_gc_*`
+        // SIGNED, exactly as the read path does.  Casting a clobbered
+        // register to `usize` turns a negative index into a huge offset and
+        // the store then lands gigabytes past the array.
+        assert!(
+            index >= 0,
+            "vable_write_array_item: negative index {index} into virtualizable \
+             array {:?} (item_type {:?})",
+            array.name,
+            array.item_type,
+        );
         let (data_ptr, owner_ptr) = vable_array_write_base(vable_ptr, array);
-        vable_write_array_item_at(vable_ptr, array, data_ptr, owner_ptr, index, value);
+        // Upstream reaches the items through `bh_getfield_gc_r` and then
+        // `bh_setarrayitem_gc_*`, and a null array field faults in the second.
+        // Dropping the store instead leaves the item holding whatever it held
+        // before, and the mismatch surfaces at some later read with nothing
+        // naming this array.
+        assert!(
+            !data_ptr.is_null(),
+            "vable_write_array_item: virtualizable array {:?} is null \
+             (item_type {:?}, index {index})",
+            array.name,
+            array.item_type,
+        );
+        if crate::jit_strict_mode() {
+            let len = bhimpl_arraylen_vable(vable_ptr as *const u8, array);
+            assert!(
+                (index as usize) < len,
+                "vable_write_array_item: index {index} is past the end of \
+                 virtualizable array {:?} (len {len}, item_type {:?})",
+                array.name,
+                array.item_type,
+            );
+        }
+        vable_write_array_item_at(vable_ptr, array, data_ptr, owner_ptr, index as usize, value);
     }
 }
 
@@ -3190,8 +3310,26 @@ pub(crate) unsafe fn vable_write_array_item_at(
                         majit_gc::gc_write_barrier(majit_ir::GcRef(vable_ptr as usize));
                     }
                 }
-            } else {
+            } else if array.item_type == Type::Float {
+                // `llmodel.py write_float_at_mem` — the f64 bit pattern, which
+                // the caller handed over as one.
                 std::ptr::write(dest as *mut i64, value);
+            } else {
+                // `bh_setarrayitem_gc_i` stores at the descriptor's width
+                // (`majit-backend` `model.rs`); a fixed 8-byte store into a
+                // narrower item overwrites the items that follow it.
+                match item_size {
+                    8 => std::ptr::write(dest as *mut i64, value),
+                    4 => std::ptr::write(dest as *mut i32, value as i32),
+                    2 => std::ptr::write(dest as *mut i16, value as i16),
+                    1 => std::ptr::write(dest as *mut i8, value as i8),
+                    // `llmodel.py:478 else: raise NotImplementedError`.
+                    _ => panic!(
+                        "vable_write_array_item: virtualizable array {:?} has \
+                         no integer store for item_size {item_size}",
+                        array.name,
+                    ),
+                }
             }
         }
     }
@@ -3199,21 +3337,28 @@ pub(crate) unsafe fn vable_write_array_item_at(
 
 /// virtualizable.py clear_vable_token, blackhole context.
 ///
-/// Upstream `clear_vable_token` calls `force_now(virtualizable)` when the token
-/// is set, then asserts it cleared — `force_now` writes the live JIT-register
-/// copy of the virtualizable's fields back to the heap object. Here that step
-/// is intentionally omitted: it is a semantic no-op in the blackhole and pyre
-/// has no blackhole `force_now`. The Active token (a force_token = address of a
-/// live JIT frame) only exists while compiled JIT code holds the frame in
-/// registers; by the time the blackhole interprets a vable op, resume has
-/// already materialized every field into the heap object, so no register copy
-/// remains to force back. The token can only be TOKEN_NONE (nothing to do) or
-/// TOKEN_TRACING_RESCALL (a marker, no un-written-back state), so clearing it
-/// unconditionally reaches the same post-state as `force_now` + assert. (If a
-/// blackhole path were ever found to carry a live Active token, that would be a
-/// real bug needing a blackhole force_now — not the case under the current
-/// resume-materializes-then-interprets model, which all virtualizable JIT
-/// tests exercise without any force_now.)
+/// `virtualizable.py:218-222` is `if virtualizable.vable_token: force_now(...)`
+/// followed by `assert not virtualizable.vable_token`, and `force_now`
+/// (`:248-260`) splits on the token:
+///
+///   * `TOKEN_TRACING_RESCALL` — a marker naming no register copy, so clearing
+///     it is the whole of the force for that arm.
+///   * anything else non-zero — the address of a live JIT frame, handed to
+///     `ResumeGuardForcedDescr.force_now`, which writes the compiled
+///     activation's registers back into the frame.
+///
+/// This used to clear both arms alike, on the argument that an Active token
+/// cannot reach the blackhole because resume has already materialized every
+/// field. The sibling helper on the compiled side (`frame_layout.rs`
+/// `pyre_clear_vable_token`) carried the same argument, backed by a census —
+/// "recorded 183 times and invoked 0 times over 462 fixtures" — and that
+/// census has since stopped holding, so the arm is live there. An argument of
+/// that shape is not load-bearing enough to drop a register write-back on:
+/// when it fails the field reads stale and nothing reports it.
+///
+/// So the Active arm now goes through the host's force helper, which is the
+/// very function `emit_force_virtualizable` compiles a `COND_CALL` to
+/// (`trace_ctx.rs`), reached here by address instead of through compiled code.
 ///
 /// # Safety
 /// `obj_ptr` must point to a valid virtualizable object.
@@ -3227,9 +3372,34 @@ pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *m
     unsafe {
         let token_ptr = obj_ptr.add(vinfo.token_offset) as *mut usize;
         let token = *token_ptr;
-        if token != 0 {
-            *token_ptr = 0;
+        if token == 0 {
+            return;
         }
+        if token == token_tracing_rescall() as usize {
+            // virtualizable.py:250-255: the values are already correct during
+            // tracing; the marker only tells the tracer this one escaped.
+            *token_ptr = 0;
+            return;
+        }
+        let Some(clear_vable_ptr) = vinfo.clear_vable_ptr else {
+            // A machine that registered no force helper has no compiled
+            // activation to write back either: `emit_force_virtualizable`
+            // `expect`s this same field, so a trace that could have parked an
+            // Active token here could not have been built.  Clear it, matching
+            // the post-state `force_now` guarantees.
+            *token_ptr = 0;
+            return;
+        };
+        // `make_clear_vable_descr` declares `[Ref] -> Void` and
+        // `frame_layout.rs` registers a function taking that word as `i64`;
+        // spelling the pointee any other way mismatches the wasm32 signature
+        // and traps on call.
+        let force: unsafe extern "C" fn(i64) = std::mem::transmute(clear_vable_ptr);
+        force(obj_ptr as i64);
+        assert_eq!(
+            *token_ptr, 0,
+            "virtualizable.py:222 — force_now must leave TOKEN_NONE behind"
+        );
     }
 }
 

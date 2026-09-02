@@ -4154,27 +4154,34 @@ static MEMORY_ERROR_PROVIDER: std::sync::OnceLock<fn() -> i64> = std::sync::Once
 /// is stored there, with zero replaced by 29872897 so a computed value is
 /// distinguishable from the sentinel.
 ///
-/// PyPy relies on process serialization here.  Pyre's CPython-3.14t contract
-/// permits concurrent readers, so the same one-word owner is accessed
-/// atomically rather than duplicated in a side table.
+/// The word is reached with the same MACHINE instructions the compiled path
+/// uses.  `build_ll_strhash_internal_helper_graph` implements `_ll_strhash` as
+/// an ordinary `getfield`/`setfield` pair on this field and both backends lower
+/// those to a plain load and store, so an acquire load and a compare-exchange
+/// here made this the one accessor that fenced and retried.
+///
+/// `Relaxed` is the spelling that matches: on every target pyre builds for it
+/// emits exactly the plain load and store the compiled path emits, while
+/// keeping the access an atomic one in Rust's model — a plain `ptr::read` /
+/// `ptr::write` racing with another thread's write is undefined behaviour even
+/// when both threads store identical bits, so "the compiled path uses plain
+/// accesses" is a reason to drop the fences, not a reason to drop the atomic.
+///
+/// The store itself stays unguarded for the same reason it is in `LLHelpers`:
+/// every racing writer computes the identical value from immutable characters,
+/// so a losing writer overwrites the word with what is already there.
 fn blackhole_cached_hash(string_ptr: i64, compute: impl FnOnce() -> i64) -> i64 {
+    use std::sync::atomic::{AtomicIsize, Ordering};
     assert_ne!(string_ptr, 0, "blackhole string hash: null string");
-    let cache = unsafe { &*(string_ptr as usize as *const std::sync::atomic::AtomicIsize) };
-    let cached = cache.load(std::sync::atomic::Ordering::Acquire);
+    let cache = unsafe { &*(string_ptr as usize as *const AtomicIsize) };
+    let cached = cache.load(Ordering::Relaxed);
     if cached != 0 {
         return cached as i64;
     }
     let computed = compute() as isize;
     let computed = if computed == 0 { 29_872_897 } else { computed };
-    match cache.compare_exchange(
-        0,
-        computed,
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-    ) {
-        Ok(_) => computed as i64,
-        Err(winner) => winner as i64,
-    }
+    cache.store(computed, Ordering::Relaxed);
+    computed as i64
 }
 
 /// Install the `memory_error` singleton provider.  Called once from

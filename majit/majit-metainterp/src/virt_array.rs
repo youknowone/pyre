@@ -661,7 +661,7 @@ mod tests {
         );
         for (index, expected) in [10i64, 20, 30].into_iter().enumerate() {
             assert_eq!(
-                unsafe { crate::virtualizable::vable_read_array_item(vable, array, index) },
+                unsafe { crate::virtualizable::vable_read_array_item(vable, array, index as i64) },
                 expected
             );
         }
