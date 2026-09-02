@@ -4522,6 +4522,7 @@ fn try_walker_orthodox_load_super_attr<Sym: WalkSym>(
         op_pc,
         sym,
         &sub_body,
+        None,
         "load_super_attr_value_commit",
         "load_super_attr_value_call_site",
         &[is_two_arg, self_is_cell_arg, class_slot_arg],
@@ -4538,6 +4539,7 @@ fn try_walker_orthodox_load_super_attr<Sym: WalkSym>(
             ConcreteValue::Ref(frame_ptr as pyre_object::PyObjectRef),
             ConcreteValue::Ref(w_name),
         ],
+        &[],
     );
     let (outcome, _walk_start) = match walk {
         Ok(pair) => pair,
@@ -15663,7 +15665,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
     let helper_frame =
-        nested_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, vec![frame]));
+        nested_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]));
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op_pc,
