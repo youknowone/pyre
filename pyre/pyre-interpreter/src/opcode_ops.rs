@@ -42,7 +42,12 @@ fn inplace_dunder_name(op: BinaryOperator) -> Option<&'static str> {
 fn skips_inplace_special(a: PyObjectRef, b: PyObjectRef, op: BinaryOperator) -> bool {
     matches!(op, BinaryOperator::InplaceMultiply)
         && unsafe { crate::objspace::descroperation::is_repeat_sequence(a) }
-        && !unsafe { crate::objspace::descroperation::seq_repeat_override(a, &["__imul__"]) }
+        && !unsafe {
+            crate::objspace::descroperation::seq_repeat_override(
+                a,
+                crate::objspace::descroperation::RepeatDunder::IMul,
+            )
+        }
         && unsafe { crate::baseobjspace::lookup(b, "__index__").is_none() }
 }
 
@@ -54,7 +59,14 @@ pub fn binary_value(
     // descroperation.py `inplace_impl` — consult the in-place
     // special first; fall through to the binary op below when absent or
     // `NotImplemented`.
-    if let Some(idunder) = inplace_dunder_name(op).filter(|_| !skips_inplace_special(a, b, op)) {
+    // Written as a let-chain rather than `Option::filter`: the combinator's
+    // closure captures `a`, `b` and `op`, so it reaches the JIT as an
+    // aggregate plus a `call_once` whose path the host does not bind, and a
+    // walk of this handler stops at that residual.  The chain evaluates the
+    // guard only in the `Some` arm, exactly as `filter` did.
+    if let Some(idunder) = inplace_dunder_name(op)
+        && !skips_inplace_special(a, b, op)
+    {
         // `seq_bug_compat` applies only to `+=` / `*=`; pass the reflected
         // name so the builtin-sequence rhs-first branch can fire.
         let (rdunder, seq_bug_compat) = match op {

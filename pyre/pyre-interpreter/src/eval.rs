@@ -269,6 +269,27 @@ impl FrameAnchor {
         }
     }
 
+    /// Read the anchored frame back out of its shadow-stack slot.
+    ///
+    /// Opaque to the tracer for the same reason `new` is, arrived at
+    /// differently: `new`'s aggregate return keeps it out of inlining on its
+    /// own, while this one returns a single word and would otherwise be
+    /// inlined. An inlined body is wrong here. `front::mir` aliases an
+    /// `Rvalue::Ref` over a bare local to that local's own Variable without
+    /// emitting an address-of, so `&self` arrives as the one-word anchor's
+    /// VALUE — the depth — and the inlined body's `getfield_gc_i` on
+    /// `FrameAnchor.depth` reads that depth as an address. A walk of
+    /// `push_anchored` faulted on exactly that, at the depth itself
+    /// (`KERN_INVALID_ADDRESS at 0x9`, offset 0 of a one-field struct).
+    /// `frame_anchor_live_method_jit_abi` is the spelling that reconstructs
+    /// the anchor from the word, and it is only reachable while this stays a
+    /// residual.
+    ///
+    /// No effect information is lost by closing it: the whole body is a call
+    /// to `frame_anchor_live`, which is `dont_look_inside` already, so the
+    /// wrapper's graph could never have told the optimizer more than its
+    /// callee's does.
+    #[majit_macros::dont_look_inside]
     pub fn live(&self) -> *mut PyFrame {
         frame_anchor_live(self.depth)
     }

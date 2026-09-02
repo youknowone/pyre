@@ -4462,6 +4462,18 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:3330: virtualizable_boxes.append(virtualizable_box)
         // is folded inside init_virtualizable_boxes (it pushes vable_ref
         // at the end of the list).
+        if crate::vable_read_probe_enabled() {
+            eprintln!(
+                "[vable-read-probe] init virtualizable_box={virtualizable_box:?} \
+                 virtualizable_value={virtualizable_value:?} num_greens={num_green_args} \
+                 num_reds={num_reds} index_of_virtualizable={index_of_virtualizable} \
+                 identity_ref_bank_index={:?} identity_index={identity_index:?} \
+                 box_ref_index={box_ref_index} num_static={num_static} \
+                 array_lengths={array_lengths:?} has_expanded_tail={has_expanded_tail} \
+                 live_values={:?}",
+                info.identity_ref_bank_index, live_values,
+            );
+        }
         ctx.init_virtualizable_boxes(
             info,
             virtualizable_box,
@@ -14185,18 +14197,19 @@ impl<M: Clone> MetaInterp<M> {
         }
         // compile.py: BridgeCompileData carries the trace/runtime boxes into
         // `UnrollOptimizer.optimize_bridge`, whose first operation is
-        // unroll.py:187 `trace = trace.get_iter()`.  In the Rust port the
-        // CompileData dispatch is flattened into this method (compile.rs
-        // `CompileData`), so build its short-lived view over that iterator's
-        // canonical `Rc<Op>` objects.  Building a separate `TreeLoop` from
+        // `trace = trace.get_iter()`.  In the Rust port the CompileData
+        // dispatch is flattened into this method (compile.rs `CompileData`),
+        // so build its short-lived view over that iterator's canonical
+        // `Rc<Op>` objects.  Building a separate `TreeLoop` from
         // `bridge_ops.to_vec()` here used to allocate one throw-away `Rc<Op>`
         // for every recorded operation, immediately before TraceIterator
         // allocated the real fresh objects consumed by the optimizer.
         let bridge_runtime_boxes: Vec<OpRef> =
             Self::closing_jump_runtime_boxes(bridge_ops, bridge_inputargs);
-        // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
-        // ResOperation objects in a disjoint OpRef namespace
-        // (`opencoder.py:259-262 self.inputargs = [rop.inputarg_from_tp(...)]`).
+        // `UnrollOptimizer.optimize_bridge`'s `trace = trace.get_iter()`: mint
+        // fresh InputArg / ResOperation objects in a disjoint OpRef namespace
+        // (`TraceIterator.__init__`, `opencoder.py`:
+        // `self.inputargs = [rop.inputarg_from_tp(arg.type) for ...]`).
         let prepared = prepare_bridge_trace_for_optimizer(
             bridge_ops,
             bridge_inputargs,
@@ -16703,7 +16716,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             // pyjitpl.py: frame.cleanup_registers().
             frame.cleanup_registers();
-            // pyjitpl.py:2477: self.free_frames_list.append(frame).
+            // `MetaInterp.popframe`'s `self.free_frames_list.append(frame)`.
             self.free_frames_list.push(frame);
         }
         // Mirror the TraceCtx inline-depth counter so trace recorder

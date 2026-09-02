@@ -49,6 +49,7 @@ cover the condition they diagnose.
 | `MAJIT_TRACE_CALL_DIAG` | OFF | Reports calls emitted by the native backend; remove when call lowering has sufficient trace-level coverage. |
 | `MAJIT_TRACE_OPS_DIAG` | OFF | Reports operations executed by the native backend; remove when operation lowering has sufficient trace-level coverage. |
 | `MAJIT_VABLE_IDX_PROBE` | OFF | Reports whether virtualizable array indices are constant; remove when supported index shapes are covered by ordinary tests. |
+| `MAJIT_VABLE_READ_PROBE` | OFF | Prints every exit of the virtualizable ref read, with the vable identity and the reading register, because a `getarrayitem_vable_r` that answers `(opref, None)` panics later in `read_ref_reg` naming none of the four exits that produce it; also names which cause made a vable descriptor lookup decline, since "no vinfo bound" and "index past the declared list" abort the walk identically and call for opposite fixes; remove when the concrete-less exits are separated by focused tests. |
 
 ### `MAJIT_BH_DEBUG`
 
@@ -385,7 +386,7 @@ cover the condition they diagnose.
 
 - Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `pcseq_enabled()`
-- What it does: **UNRECORDED** — no doc comment at the read site.
+- What it does: Prints the control-flow decisions a walk of the portal jitcode makes: the interpreter pc every `jit_merge_point` visit carries, and — for the root jitcode frame alone — every `switch`, every `goto_if_not`, and every `loop_header`. A walk that records without ever closing gives the same reading at the top (`seen_loop_header_for_jdindex` stays -1 at every merge point) whether the `loop_header` op was never reached or was reached and declined, and the two call for opposite fixes; the branch lines name which edge diverted the walk.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_PORTAL_INLINE`

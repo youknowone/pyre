@@ -1525,6 +1525,36 @@ fn rewire_one_call_site(
                  switches would read garbage"
             ));
         }
+        // The forward needs no CFG rewrite — but it does need the same
+        // retyping the diamond arm performs, and for the same reason.
+        // `front::mir` types every aggregate `Ref`, so the call declares
+        // the `Result` shell; once the callee is transformed it hands
+        // back `T` and the raise travels the exception edge, so the value
+        // crossing this link is the payload.  Narrow the call's declared
+        // result to `T` exactly as the diamond's `collapse_pos0_read` arm
+        // does (`narrow_call_result_ty` below), so the payload's kind is
+        // what the rtyper colours and what flows on to `returnblock`.
+        //
+        // Leaving it `Ref` is not a cosmetic mislabel; it is the whole
+        // disagreement `CallControl.getcalldescr` (`call.py`) exists to
+        // prevent — it refuses a call whose `op.result.concretetype`
+        // differs from its `FUNC.RESULT` — and it lands on BOTH sides of
+        // this graph:
+        //
+        //   - inside, the call emits `inline_call_r_r` while the callee's
+        //     transformed CFG `int_return`s, and the metainterp's
+        //     `typed_return_without_caller_destination` fires because the
+        //     caller encoded NO_RETURN_REG in the int bank;
+        //   - outside, this graph's own returnblock inherits the `Ref` and
+        //     `graph_result_kind` reports `r` (`codewriter.rs`
+        //     `result_type = declared_kind.unwrap_or(cfg_kind)`), so every
+        //     `?`-site calling it — whose diamond DID narrow to `T` —
+        //     emits `_i` against an `r` calldescr.
+        //
+        // A wrapper whose every return is such a forward (`is_true`) is the
+        // shape that shows both at once, which is why the two mismatch
+        // classes are one defect and not two.
+        narrow_call_result_ty(graph, a, r, payload_ty.clone());
         return Ok(SiteOutcome::TailForward);
     }
     let (b, r_b) =
@@ -1963,6 +1993,23 @@ fn catch_and_rewrap(
         Some(ExitSwitch::LastException),
         vec![Link::new_mixed(value_args, n_id, None), exc_link],
     );
+    // The normal arm above wrapped `r` in a fresh `Ok` shell, which is a
+    // statement about what `r` now IS: the raw payload the transformed
+    // callee returns, not the `Result` it returned before.  Retype the call
+    // to match, the same narrowing the diamond and tail-forward arms perform
+    // (`narrow_call_result_ty`).  Without it the call keeps the shell's
+    // `Ref`, so a callee that `int_return`s is invoked through
+    // `inline_call_*_r` and the returned value has no destination in the int
+    // bank — and the `Ok` shell built here would be handed the register the
+    // caller never wrote.
+    //
+    // Gated on `has_r` for the same reason the shells are: when the result
+    // does not flow along the original exit there is no payload to speak of
+    // and nothing consumes the call's type.  Placed last, after this rule's
+    // final mutation, so a decline still leaves the graph untouched.
+    if has_r {
+        narrow_call_result_ty(graph, a, r, payload_ty.clone());
+    }
     Ok(())
 }
 

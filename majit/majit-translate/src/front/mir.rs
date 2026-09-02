@@ -20622,6 +20622,25 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
             }
         }
     }
+    // A trait associated-type projection (`Self::Truth`) has no
+    // representation of its own — it is whatever the selected impl binds
+    // it to.  The decl-level type cannot name that, but with exactly ONE
+    // impl of the trait in this LLBC the binding is recoverable, which is
+    // the same walk `charon_type_value_to_ast_string` already performs for
+    // the rendered form (`resolve_trait_assoc_type_value`).
+    //
+    // Resolving it HERE is what keeps one projection in one register bank
+    // across the whole program.  A *required* trait method is lowered from
+    // the impl, where `Self` is concrete and the projection is already the
+    // bound type; a *provided* default body with no override is lowered
+    // from the trait, where it is not.  Without this arm the two spellings
+    // of the same value disagree on its bank — a caller reaches
+    // `concrete_truth_as_bool(_, truth)` wanting `i` and
+    // `record_branch_guard(_, truth, ..)` wanting `r`, and no kind for the
+    // caller's variable satisfies both.
+    if let Some(resolved) = trait_assoc_projection_target(value, llbc) {
+        return tyref_to_value_type(&resolved, llbc);
+    }
     // RPython `history.getkind` classifies `Ptr(FuncType)` through the raw
     // pointer arm, hence as `int`.  Charon's equivalent is a top-level
     // `FnPtr`: it is the machine address that `FunctionReprBase.call` feeds
@@ -23008,6 +23027,66 @@ fn resolve_trait_assoc_type(
     llbc: &Llbc,
     depth: usize,
 ) -> Option<String> {
+    let value = resolve_trait_assoc_type_value(traitref, assoc, llbc)?;
+    Some(charon_type_value_to_ast_string(value, llbc, depth + 1))
+}
+
+/// Peel a trait associated-type projection to the type the trait's unique
+/// impl binds it to, following a chain of projections but stopping at a
+/// small bound so a self-referential binding cannot spin.  `None` when the
+/// value is not a projection, or when the walk cannot resolve one.
+fn trait_assoc_projection_target<'a>(
+    value: &'a serde_json::Value,
+    llbc: &'a Llbc,
+) -> Option<TyRef> {
+    let mut cur: &serde_json::Value = value;
+    let mut resolved: Option<&'a serde_json::Value> = None;
+    for _ in 0..4 {
+        let Some(arr) = trait_type_projection_args(cur) else {
+            break;
+        };
+        let next = resolve_trait_assoc_type_value(&arr[0], &arr[1], llbc)?;
+        resolved = Some(next);
+        cur = next;
+    }
+    // Hand back only a value that is no longer a projection.  The caller
+    // resolves the answer by recursing into `tyref_to_value_type`, which
+    // enters this walk again with a fresh hop budget, so returning a
+    // still-unresolved projection would make the four-hop cap local rather
+    // than total: an `A::X = B::Y`, `B::Y = A::X` binding would then recurse
+    // without bound.  Declining here caps the whole resolution at four hops
+    // and leaves such a chain typed `Ref`, which is what it was before this
+    // walk existed.
+    if trait_type_projection_args(cur).is_some() {
+        return None;
+    }
+    // The binding is an ordinary type reference: it may be inline, hash
+    // consed or a dedup id, and `TyRef`'s own deserializer is what knows
+    // the three shapes apart.
+    serde_json::from_value::<TyRef>(resolved?.clone()).ok()
+}
+
+/// The `[traitref, assoc]` pair of an unresolved `Self::Assoc` projection,
+/// or `None` when the value is any other type shape.
+fn trait_type_projection_args(value: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    value
+        .as_object()
+        .and_then(|o| o.get("TraitType"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .filter(|arr| arr.len() == 2)
+}
+
+/// The type value the trait's unique impl binds to `assoc` — the shared
+/// half of [`resolve_trait_assoc_type`], kept separate so a caller that
+/// needs the register bank rather than the rendered name
+/// ([`tyref_to_value_type`]) reads the same binding through the same
+/// uniqueness rule instead of re-deriving it.
+fn resolve_trait_assoc_type_value<'a>(
+    traitref: &serde_json::Value,
+    assoc: &serde_json::Value,
+    llbc: &'a Llbc,
+) -> Option<&'a serde_json::Value> {
     let trait_id = traitref_decl_id(traitref, llbc, 0)?;
     let mut unique: Option<&serde_json::Value> = None;
     for ti in llbc.trait_impls_raw() {
@@ -23032,8 +23111,7 @@ fn resolve_trait_assoc_type(
             continue;
         };
         if kind.len() == 2 && &kind[1] == assoc {
-            let value = entry.get("skip_binder")?.get("value")?;
-            return Some(charon_type_value_to_ast_string(value, llbc, depth + 1));
+            return entry.get("skip_binder")?.get("value");
         }
     }
     None

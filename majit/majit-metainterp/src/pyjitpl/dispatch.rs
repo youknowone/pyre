@@ -2274,9 +2274,68 @@ where
         field_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let info = ctx.virtualizable_info()?;
-        let descr = info.static_field_descrs().get(field_idx)?.clone();
-        Some((vable_opref, descr))
+        let descr = ctx
+            .virtualizable_info()
+            .and_then(|info| info.static_field_descrs().get(field_idx).cloned());
+        match descr {
+            Some(descr) => Some((vable_opref, descr)),
+            None => {
+                let declared = ctx
+                    .virtualizable_info()
+                    .map(|info| info.static_field_descrs().len());
+                self.report_absent_vable_descr("static field", field_idx, declared);
+                None
+            }
+        }
+    }
+
+    /// Name the reason a vable descriptor lookup declined, under
+    /// `MAJIT_VABLE_READ_PROBE`.
+    ///
+    /// Both causes — no `VirtualizableInfo` bound to the trace at all, and an
+    /// index past the declared list — return `None` here and abort the walk
+    /// identically, and the abort is reported by jitcode and cursor alone.
+    /// Without this the two are indistinguishable from outside, and they call
+    /// for opposite fixes: the first is a trace that was started without
+    /// `initialize_virtualizable`, the second a codewriter index that does not
+    /// match the runtime declaration.
+    fn report_absent_vable_descr(&mut self, kind: &str, index: usize, declared: Option<usize>) {
+        if !crate::vable_read_probe_enabled() {
+            return;
+        }
+        let depth = self.frames.len();
+        let frame = self.frames.current_mut();
+        let cause = match declared {
+            None => "no vinfo bound to the trace".to_owned(),
+            Some(n) => format!("declared {n}"),
+        };
+        eprintln!(
+            "[vable-read-probe] no {kind} descr jitcode={} depth={} cursor={} index={index} {cause}",
+            frame.jitcode.name, depth, frame.code_cursor,
+        );
+    }
+
+    /// Print one control-flow edge of the root jitcode frame under
+    /// `MAJIT_PCSEQ` (see `crate::pcseq_enabled`).
+    ///
+    /// `value` is the concrete word the edge was decided on and `target` the
+    /// cursor it moves to, so a run's lines read as the walk's own path
+    /// through the portal.  Silent for an inlined callee: the ops this exists
+    /// to follow are the portal's, and the callees run orders of magnitude
+    /// more of them.
+    fn pcseq_branch(&mut self, kind: &str, opcode_pc: usize, value: i64, target: Option<usize>) {
+        if !crate::pcseq_enabled() || self.frames.len() != 1 {
+            return;
+        }
+        let name = &self.frames.current_mut().jitcode.name;
+        match target {
+            Some(t) => {
+                eprintln!("@@@PCSEQ {kind} jitcode={name} pc={opcode_pc} value={value} -> {t}")
+            }
+            None => eprintln!(
+                "@@@PCSEQ {kind} jitcode={name} pc={opcode_pc} value={value} -> fallthrough"
+            ),
+        }
     }
 
     /// pyjitpl.py: vable array descriptor lookup.  Converts a bytecode
@@ -2290,10 +2349,21 @@ where
         array_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let info = ctx.virtualizable_info()?;
-        let fdescr = info.array_field_descrs().get(array_idx)?.clone();
-        let adescr = info.array_descrs.get(array_idx)?.clone();
-        Some((vable_opref, fdescr, adescr))
+        let pair = ctx.virtualizable_info().and_then(|info| {
+            let fdescr = info.array_field_descrs().get(array_idx)?.clone();
+            let adescr = info.array_descrs.get(array_idx)?.clone();
+            Some((fdescr, adescr))
+        });
+        match pair {
+            Some((fdescr, adescr)) => Some((vable_opref, fdescr, adescr)),
+            None => {
+                let declared = ctx
+                    .virtualizable_info()
+                    .map(|info| info.array_field_descrs().len());
+                self.report_absent_vable_descr("array", array_idx, declared);
+                None
+            }
+        }
     }
 
     /// Resolve a `d`-argcode descr index against the current frame's
@@ -5074,6 +5144,19 @@ where
                     let (vable_reg, array_idx, index_reg, dest) = frame.read_vable_getarrayitem();
                     (opcode_pc, vable_reg, array_idx, index_reg, dest)
                 };
+                if crate::vable_read_probe_enabled() {
+                    let depth = self.frames.len();
+                    let frame = self.frames.current_mut();
+                    eprintln!(
+                        "[vable-read-probe] reg jitcode={} depth={} vable_reg={} \
+                         reg_opref={:?} reg_value={:?}",
+                        frame.jitcode.name,
+                        depth,
+                        vable_reg,
+                        frame.ref_regs[vable_reg],
+                        frame.ref_values[vable_reg].map(|v| format!("0x{v:x}")),
+                    );
+                }
                 let Some((vable_opref, fdescr, adescr)) =
                     self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
@@ -5485,6 +5568,12 @@ where
                     )
                 };
                 let (cond, cond_value) = self.read_int_reg(cond_idx);
+                self.pcseq_branch(
+                    "goto_if_not",
+                    opcode_pc,
+                    cond_value,
+                    (cond_value == 0).then_some(target),
+                );
                 self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, true);
             }
             // pyjitpl.py opimpl_goto_if_not_int_is_true(box, target):
@@ -5681,7 +5770,9 @@ where
                     .unwrap_or_else(|| panic!("BC_SWITCH descrs[{descr_idx}] is not a BhDescr"))
                     .clone();
                 let (value_box, concrete_value) = self.read_int_reg(value_idx);
-                if let Some(target) = descr.switch_lookup(concrete_value) {
+                let hit = descr.switch_lookup(concrete_value);
+                self.pcseq_branch("switch", opcode_pc, concrete_value, hit);
+                if let Some(target) = hit {
                     let const_ref = ctx.const_int(concrete_value);
                     self.record_state_guard(
                         ctx,
@@ -6940,6 +7031,13 @@ where
                 // setter; the close happens in BC_JIT_MERGE_POINT after
                 // the assert/reset on the next iteration.
                 self.seen_loop_header_for_jdindex = jdindex as i32;
+                if crate::pcseq_enabled() {
+                    eprintln!(
+                        "@@@PCSEQ loop_header jdindex={jdindex} num_ops={} depth={}",
+                        ctx.num_ops(),
+                        self.frames.len(),
+                    );
+                }
             }
             jitcode::insns::BC_JUMP => {
                 let target = self.frames.current_mut().next_u16() as usize;
@@ -7900,6 +7998,21 @@ where
                     // writes the call result into the frame *before*
                     // vable_after_residual_call fires GUARD_NOT_FORCED
                     // (see legacy BC_CALL_MAY_FORCE_INT arm for rationale).
+                    // `pyjitpl.py execute_and_record_varargs` runs the call
+                    // through `executor.execute_varargs` and hands the result
+                    // to `history.record_nospec`, so the recorded op carries
+                    // the executed value on its own frontend slot -- every
+                    // later `getvalue()` of that box answers it.  Writing the
+                    // value into the destination register alone leaves
+                    // `concrete_of_opref` answering `None` for the box, and
+                    // the two readers then disagree: `_nonstandard_virtualizable`
+                    // asks the box, so a residual that returns the standard
+                    // virtualizable (the portal's `reload_top_root`) loses its
+                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
+                    // vable access on that register takes the nonstandard leg.
+                    // The full-body walker already stamps its own residual
+                    // results this way (`jitcode_dispatch/residual_call.rs`).
+                    ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
                     self.set_int_reg(dst, Some(traced), Some(concrete));
                     if is_forces
                         && matches!(
@@ -8175,6 +8288,24 @@ where
                         }
                         _ => traced,
                     };
+                    // `pyjitpl.py execute_and_record_varargs` runs the call
+                    // through `executor.execute_varargs` and hands the result
+                    // to `history.record_nospec`, so the recorded op carries
+                    // the executed value on its own frontend slot -- every
+                    // later `getvalue()` of that box answers it.  Writing the
+                    // value into the destination register alone leaves
+                    // `concrete_of_opref` answering `None` for the box, and
+                    // the two readers then disagree: `_nonstandard_virtualizable`
+                    // asks the box, so a residual that returns the standard
+                    // virtualizable (the portal's `reload_top_root`) loses its
+                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
+                    // vable access on that register takes the nonstandard leg.
+                    // The full-body walker already stamps its own residual
+                    // results this way (`jitcode_dispatch/residual_call.rs`).
+                    ctx.set_opref_concrete(
+                        traced,
+                        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                    );
                     self.set_ref_reg(dst, Some(traced), Some(concrete));
                     if is_forces
                         && matches!(
@@ -8433,6 +8564,21 @@ where
                         }
                         _ => traced,
                     };
+                    // `pyjitpl.py execute_and_record_varargs` runs the call
+                    // through `executor.execute_varargs` and hands the result
+                    // to `history.record_nospec`, so the recorded op carries
+                    // the executed value on its own frontend slot -- every
+                    // later `getvalue()` of that box answers it.  Writing the
+                    // value into the destination register alone leaves
+                    // `concrete_of_opref` answering `None` for the box, and
+                    // the two readers then disagree: `_nonstandard_virtualizable`
+                    // asks the box, so a residual that returns the standard
+                    // virtualizable (the portal's `reload_top_root`) loses its
+                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
+                    // vable access on that register takes the nonstandard leg.
+                    // The full-body walker already stamps its own residual
+                    // results this way (`jitcode_dispatch/residual_call.rs`).
+                    ctx.set_opref_concrete(traced, majit_ir::Value::Float(concrete));
                     self.set_float_reg(dst, Some(traced), Some(concrete.to_bits() as i64));
                     if is_forces
                         && matches!(

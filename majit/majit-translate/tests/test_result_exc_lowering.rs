@@ -91,6 +91,107 @@ fn unit_result_callee_declares_void_return() {
     );
 }
 
+/// A wrapper whose every return is `return f(...)` — no `Ok`/`Err` shell of
+/// its own — must still retype those calls to the payload.
+///
+/// `is_true` is that shape: `if …  { return is_true_slot(obj); }
+/// is_true_lookup(obj)`.  Both callees are scoped `Result<bool, PyError>`
+/// graphs the exception-link lowering transforms into plain `bool` returns,
+/// so the value each call hands back is the payload — but `front::mir` types
+/// every aggregate `Ref`, and a tail forward has no `__pos_0` read for the
+/// diamond arm's `collapse_pos0_read` to narrow through.  Left `Ref`, the
+/// disagreement lands on both sides of this graph: the calls emit
+/// `inline_call_r_r` against callees that `int_return`, and the returnblock
+/// inherits the `Ref` so `graph_result_kind` reports `r` to every `?`-site
+/// caller whose own diamond narrowed to `bool`.
+///
+/// Assert the call ops themselves, not the return kind: the returnblock's
+/// `ConcreteType` is coloured later by the rtyper, so this pass's output is
+/// the declared `result_ty` on the two `Call`s.
+#[test]
+fn a_tail_forwarding_wrapper_retypes_its_calls_to_the_payload() {
+    let graph =
+        lower_function(interp(), "pyre_interpreter::baseobjspace::is_true").expect("lower is_true");
+    let mut forwarded = 0usize;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call {
+                target, result_ty, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            let CallTarget::FunctionPath { segments } = target else {
+                continue;
+            };
+            let Some(leaf) = segments.last() else {
+                continue;
+            };
+            if leaf != "is_true_slot" && leaf != "is_true_lookup" {
+                continue;
+            }
+            forwarded += 1;
+            assert_eq!(
+                *result_ty,
+                majit_translate::model::ValueType::Bool,
+                "{leaf}: a tail-forwarded scoped callee hands back its `bool` \
+                 payload, so the call must declare it -- not the `Result` shell \
+                 (`Ref`, which is what this reads before the retype)"
+            );
+        }
+    }
+    assert_eq!(
+        forwarded, 2,
+        "is_true tail-forwards both is_true_slot and is_true_lookup"
+    );
+}
+
+/// The catch-and-rewrap fallback rebuilds the shell from the call's result,
+/// which means that result IS the payload — so the call has to be retyped
+/// like the diamond and tail-forward arms do.
+///
+/// `int_w` is `Result<i64, PyError>`; its consumers here match on the shell
+/// by hand rather than through `?`, so the site takes `catch_and_rewrap`.
+/// Left `Ref`, the call is emitted as `inline_call_*_r` against a callee that
+/// `int_return`s (the returned value then has no destination in the int
+/// bank), and the `Ok` shell the rewrite builds is handed a register the
+/// caller never wrote.
+#[test]
+fn a_rewrapped_call_site_retypes_its_call_to_the_payload() {
+    for name in [
+        "pyre_interpreter::baseobjspace::_check_len_result",
+        "pyre_interpreter::baseobjspace::getindex_w_index",
+        "pyre_interpreter::baseobjspace::index_int_w_preserve_negative",
+    ] {
+        let graph = lower_function(interp(), name).expect("lower");
+        let mut seen = 0usize;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    result_ty,
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if segments.last().map(String::as_str) != Some("int_w") {
+                    continue;
+                }
+                seen += 1;
+                assert_eq!(
+                    *result_ty,
+                    majit_translate::model::ValueType::Int,
+                    "{name}: the rewrap rebuilds `Ok(r)` from the call result, so \
+                     the call declares int_w's `i64` payload -- not the `Result` \
+                     shell (`Ref`, which is what this reads before the retype)"
+                );
+            }
+        }
+        assert!(seen >= 1, "{name} calls int_w");
+    }
+}
+
 #[test]
 fn pop_value_lowers_to_raise_links() {
     let llbc = interp();

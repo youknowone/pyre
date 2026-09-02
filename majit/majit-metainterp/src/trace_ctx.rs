@@ -5391,6 +5391,22 @@ impl TraceCtx {
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
+        if crate::vable_read_probe_enabled() {
+            eprintln!(
+                "[vable-read-probe] enter pc={pc} nonstandard={nonstandard} \
+                 index_value={index_runtime_value} vable_concrete={} boxes={:?} lengths={:?} \
+                 vable_opref={vable_opref:?} standard_box={:?} hc_nonstandard={} \
+                 heap_ptr=0x{:x} shadow_concrete={:?}",
+                concrete.is_some(),
+                self.virtualizable_boxes.as_ref().map(Vec::len),
+                self.virtualizable_array_lengths.as_deref(),
+                self.standard_virtualizable_box(),
+                self.heap_cache
+                    .is_known_nonstandard_virtualizable(vable_opref),
+                self.diag_virtualizable_heap_ptr(),
+                self.standard_virtualizable_concrete(),
+            );
+        }
         if nonstandard {
             let fwd = self.nonstandard_vable_element_concrete(
                 vable_opref,
@@ -5400,16 +5416,28 @@ impl TraceCtx {
             );
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             let item = self.vable_getarrayitem_ref_descr(array_opref, index, adescr);
+            if crate::vable_read_probe_enabled() {
+                eprintln!(
+                    "[vable-read-probe] exit=nonstandard concrete={}",
+                    fwd.is_some()
+                );
+            }
             if let Some(v) = fwd {
                 self.set_opref_concrete(item, v);
                 return (item, Some(v));
             }
             return (item, None);
         }
-        if let Some(flat_idx) =
-            self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
-            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
-        {
+        let flat_idx = self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr);
+        let entry = flat_idx.and_then(|flat_idx| self.virtualizable_entry_at(flat_idx));
+        if crate::vable_read_probe_enabled() {
+            eprintln!(
+                "[vable-read-probe] exit=standard flat_idx={flat_idx:?} entry={} concrete={}",
+                entry.is_some(),
+                entry.is_some_and(|(_, value)| concrete_shadow_value(value).is_some()),
+            );
+        }
+        if let Some((op, value)) = entry {
             return (op, concrete_shadow_value(value));
         }
         // `stamp_vable_array_base` supplies the concrete after the record, so
@@ -5423,14 +5451,22 @@ impl TraceCtx {
             0,
         );
         self.stamp_vable_array_base(array_opref, concrete, &fdescr);
-        if let Ok(item_index) = usize::try_from(index_runtime_value) {
+        let result = if let Ok(item_index) = usize::try_from(index_runtime_value) {
             self.vable_getarrayitem_ref_vable(array_opref, &fdescr, item_index, adescr)
         } else {
             (
                 self.vable_getarrayitem_ref_descr(array_opref, index, adescr),
                 None,
             )
+        };
+        if crate::vable_read_probe_enabled() {
+            eprintln!(
+                "[vable-read-probe] exit=fallback base_concrete={} concrete={}",
+                concrete.is_some(),
+                result.1.is_some(),
+            );
         }
+        result
     }
 
     /// Standard virtualizable array item read (float).
