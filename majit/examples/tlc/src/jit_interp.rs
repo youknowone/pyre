@@ -153,11 +153,17 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     });
     let mut pc: usize = 0;
     let stacksize: i32 = 0;
-    // tlc.py `self.stack = []` is a plain dynamic Python list (no
-    // virtualizable). pyre's `state_fields = [int; virt]` requires a fixed
-    // size; use `program.len()` as a safe upper bound (no sequence of
-    // bytecode ops can push more than one value per opcode without
-    // eventually popping, so peak stack depth is bounded by code length).
+    // The size is `tl.py interp`'s: it builds its stack as `Stack(len(code))`,
+    // and `Stack.__init__` fills `[0] * size` once, because the same
+    // `_virtualizable_ = ['stackpos', 'stack[*]']` this state field ports needs
+    // a length the entry can rebuild from. tlc.py's own `self.stack = []`
+    // grows, but tlc.py's stack is not the virtualizable one.
+    //
+    // A fixed size is a bound, not a proof: a back-edge over a net-pushing
+    // region can outrun `program.len()`, and the write then panics on the
+    // slice rather than growing. Upstream carries the same exposure for the
+    // same reason, and this example runs fixture bytecode, so the size is left
+    // as upstream spells it.
     let mut state = TlcState {
         stackpos: 0,
         stack: VirtArray::filled(0i64, program.len()),
