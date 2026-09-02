@@ -860,6 +860,130 @@ pub fn is_rerunnable_bookkeeping_residual(addr: usize) -> bool {
     addrs.contains(&(addr as i64))
 }
 
+/// True when `addr` names a root-bracket helper a rewound descent may re-run.
+///
+/// The bracket reads the shadow stack and pushes to it; neither is a value any
+/// later reader can disagree about, because slot indices are absolute and a
+/// re-executed body re-pins from the top it finds.  What a rewind leaves behind
+/// is slots above the save point, which is retention and not a wrong answer.
+///
+/// This is [`is_rerunnable_bookkeeping_residual`]'s question asked by the
+/// static descent scan rather than by the walk's odometer.  The two are
+/// separate because the odometer sees an executed call and this sees a funcbox
+/// constant, but they must agree: a body the scan calls effectful and the walk
+/// does not is a descent refused for an effect that never happens.
+pub fn is_rewindable_root_bracket_residual(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.ends_with("::RootScope::pin_root")
+                    || path.ends_with("::RootScope::get")
+                    || path.ends_with("::RootScope::base")
+                    || path.ends_with("::gc_roots::shadow_stack_cell")
+                    || *path == "pyre_object::shadow_stack_cell"
+                    || path.ends_with("::gc_roots::shadow_stack_cell_len")
+                    || *path == "pyre_object::shadow_stack_cell_len"
+                    || path.ends_with("::gc_roots::shadow_stack_cell_truncate")
+                    || *path == "pyre_object::shadow_stack_cell_truncate"
+                    || path.ends_with("::gc_roots::root_scope_close")
+                    || *path == "pyre_object::root_scope_close"
+                    || path.ends_with("::gc_roots::shadow_stack_len")
+                    || *path == "pyre_object::shadow_stack_len"
+                    || path.ends_with("::gc_roots::shadow_stack_get")
+                    || *path == "pyre_object::shadow_stack_get"
+                    || path.ends_with("::gc_roots::pin_root")
+                    || *path == "pyre_object::pin_root"
+                    || path.ends_with("::gc_roots::push_roots")
+                    || *path == "pyre_object::push_roots"
+            })
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
+/// [`is_rewindable_root_bracket_residual`] over the `i64` a funcbox constant
+/// carries, which is how the descent scan holds an address.
+pub fn is_rewindable_root_bracket_residual_i64(fnaddr: i64) -> bool {
+    is_rewindable_root_bracket_residual(fnaddr as usize)
+}
+
+/// True when `addr` is `RootScope::pin_root`'s registered fnaddr — the write
+/// half of a source root bracket.
+///
+/// A walk that records the pin also records which box landed in the slot, so
+/// the matching read-back has an answer without a second residual call.
+///
+/// Matches the registered fnaddr for the same address-stability reason as
+/// [`is_list_write_barrier`].
+pub fn is_root_scope_pin(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static PIN_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = PIN_ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| path.ends_with("::RootScope::pin_root"))
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
+/// True when `addr` is `RootScope::get`'s registered fnaddr — the read half.
+pub fn is_root_scope_get(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static GET_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = GET_ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| path.ends_with("::RootScope::get"))
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
+/// True when `addr` names a helper that can change what a shadow-stack slot
+/// already holds: an overwrite, a rewind, or a forwarding pass over a run.
+///
+/// A pin identifies its slot's contents only until one of these runs, so a
+/// reader that remembers pins has to forget them here.  The set is the
+/// registered writers; the scope-local `set` / `publish` / `normalize` are not
+/// registered and reach a walk as symbolic fnaddrs, which decline before this
+/// question is asked.
+pub fn is_shadow_stack_slot_overwrite(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static OVERWRITE_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = OVERWRITE_ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.ends_with("::gc_roots::shadow_stack_set")
+                    || *path == "pyre_object::shadow_stack_set"
+                    || path.ends_with("::gc_roots::shadow_stack_cell_truncate")
+                    || *path == "pyre_object::shadow_stack_cell_truncate"
+                    || path.ends_with("::gc_roots::root_scope_close")
+                    || *path == "pyre_object::root_scope_close"
+                    || path.ends_with("::gc_roots::normalize_roots")
+                    || *path == "pyre_object::normalize_roots"
+                    || path.ends_with("::gc_roots::publish_roots")
+                    || *path == "pyre_object::publish_roots"
+                    || path.ends_with("::gc_roots::pin_roots")
+                    || *path == "pyre_object::pin_roots"
+                    || path.ends_with("::RootScope::set")
+                    || path.ends_with("::RootScope::publish")
+                    || path.ends_with("::RootScope::normalize")
+                    || path.ends_with("::RootScope::normalize_moved")
+            })
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
 /// Build-time equivalent of `#[jit_module]::__majit_helper_trace_fnaddrs()`.
 ///
 /// The registry includes both the module-qualified path produced by the
@@ -1106,6 +1230,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
             "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_void",
             "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_void",
             crate::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_void,
+        );
+        // The four typed entry points above all tail into this one, which is
+        // where the `libffi_call` oopspec actually lands.  Unregistered it
+        // reaches a walk as a symbolic fnaddr, which the descent scan reads as
+        // an un-lowered helper and declines on.
+        upa3(
+            &mut entries,
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::imp::jit_ffi_call_impl_any",
+            "pyre_interpreter::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_any",
+            crate::module::_cffi_backend::jit_libffi::jit_ffi_call_impl_any,
         );
         p2(
             &mut entries,
@@ -1446,6 +1580,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::gc_roots::shadow_stack_cell_truncate",
         "pyre_object::shadow_stack_cell_truncate",
         pyre_object::gc_roots::shadow_stack_cell_truncate,
+    );
+    // The bracket's close, which a lowered `Drop` of the guard calls with the
+    // guard itself: one word in, nothing out, and the truncate above behind
+    // it.  A crate that carries no declaration of the guard's fields cannot
+    // spell the close as those two reads, so it names this instead.
+    pa1(
+        &mut entries,
+        "pyre_object::gc_roots::root_scope_close",
+        "pyre_object::root_scope_close",
+        pyre_object::gc_roots::root_scope_close,
     );
     cpa2(
         &mut entries,
