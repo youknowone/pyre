@@ -3093,6 +3093,7 @@ where
                     // The unwind left `code_cursor` inside the panicking
                     // instruction, so the frames name no resumable position.
                     ctx.abort_after_panic = true;
+                    ctx.recorder_panicked = true;
                     sym.abort_portal_op();
                     return TraceAction::Abort;
                 }

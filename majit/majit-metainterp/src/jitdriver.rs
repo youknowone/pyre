@@ -539,6 +539,22 @@ pub fn no_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_BRIDGE").is_some())
 }
+/// `MAJIT_SKIP_BRIDGES=a,b,...` (diagnostic): decline exactly the listed
+/// `MAJIT_MAX_BRIDGES` sequence numbers and take every other one.  Where the
+/// fuel limit answers "the first N are sound", this answers "is number N the
+/// one that corrupts, or is the corruption cumulative" — a distinction the
+/// limit cannot draw, because declining N also declines everything after it.
+/// Off by default; an unparsable entry is ignored rather than reported, since
+/// the variable exists only for a bisect the operator is reading anyway.
+fn bridge_fuel_skipped(n: u64) -> bool {
+    static SET: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        std::env::var("MAJIT_SKIP_BRIDGES")
+            .map(|v| v.split(',').filter_map(|p| p.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    })
+    .contains(&n)
+}
 /// `MAJIT_MAX_BRIDGES=N` (diagnostic): allow the first N bridge compilations
 /// and behave as `MAJIT_NO_BRIDGE` from then on.  Bisecting N names the bridge
 /// whose compilation first produces a wrong value, at seconds per run rather
@@ -565,10 +581,41 @@ pub fn bridge_fuel_take() -> bool {
     if n >= limit {
         return false;
     }
+    if bridge_fuel_skipped(n) {
+        if std::env::var_os("MAJIT_BRIDGE_FUEL_LOG").is_some() {
+            eprintln!("@@@FUEL bridge #{n} SKIPPED");
+        }
+        return false;
+    }
     if std::env::var_os("MAJIT_BRIDGE_FUEL_LOG").is_some() {
         eprintln!("@@@FUEL bridge #{n}");
     }
     true
+}
+/// `MAJIT_NO_GUARD_RESUME_BRIDGE`: decline every bridge entry taken directly
+/// from a guard failure, so each one resumes through the blackhole and the
+/// bridge is grown from the next merge point instead.  Narrower than
+/// `MAJIT_NO_BRIDGE`, which suppresses bridge recording outright: this leaves
+/// the merge-point-grown bridges in place, so a wrong answer that survives
+/// `MAJIT_NO_BRIDGE` and disappears here is attributable to what the walk
+/// rebuilds from resume data rather than to bridges as such.  Costly — the
+/// blackhole arm reaches the merge point by interpreting — so it is a bisection
+/// tool, not a policy.  Off by default.
+fn no_guard_resume_bridge_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_GUARD_RESUME_BRIDGE").is_some())
+}
+/// Restores the refusal of a guard-resume bridge for a guard whose deferred
+/// writes span more than one virtual.
+///
+/// Off by default, because upstream has no such refusal —
+/// `compile.py ResumeGuardDescr.handle_fail` bridges whenever `must_compile`
+/// fires. The cut decides a large share of every bridge opportunity, so the
+/// two answers have to stay comparable inside ONE binary; a second build is
+/// not a control for that question.
+fn guard_resume_refuse_pending_fields() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_GUARD_RESUME_REFUSE_PENDING_FIELDS").is_some())
 }
 fn guardlog_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4012,11 +4059,33 @@ impl<S: JitState> JitDriver<S> {
                             .meta
                             .trace_ctx()
                             .and_then(|ctx| ctx.close_greens.clone());
-                        let resolved_key = self
-                            .meta
-                            .trace_ctx()
-                            .and_then(|ctx| ctx.close_green_key_hash())
-                            .or_else(|| self.current_trace_green_key());
+                        // `get_procedure_token(greenboxes)` (pyjitpl.py) walks
+                        // the cell chain and settles a chained bucket on the
+                        // greens themselves; a bare bucket hash cannot, because a
+                        // bucket whose occupant was filed under a minted cell key
+                        // holds no cell AT the hash. `compile_loop` files and
+                        // looks its loop up under the resolved key
+                        // (`WarmEnterState::resolve_cell_key`), so a door reading
+                        // the unresolved hash and a `compile_loop` reading the
+                        // resolved one answer differently about one close: the
+                        // door reports no target and falls through to a
+                        // `compile_loop` that refuses the same key for already
+                        // having a loop, giving the trace up as ABORT_BAD_LOOP.
+                        // The guard is left as it was, so every later failure
+                        // retraces it to the same answer and no bridge is ever
+                        // built. Resolve here so both doors read one cell.
+                        let close_key = self.meta.trace_ctx().and_then(|ctx| ctx.close_green_key());
+                        let resolved_key = match &close_key {
+                            Some(key) => {
+                                let make_key = || key.clone();
+                                Some(self.meta.resolve_cell_key(
+                                    key.get_uhash(),
+                                    Some(&make_key as &dyn Fn() -> majit_ir::GreenKey),
+                                ))
+                            }
+                            // `ctx.green_key` is resolved at trace start.
+                            None => self.current_trace_green_key(),
+                        };
                         // The cell token a close resolves is `jump_op.getdescr()`
                         // upstream (unroll.py:196 `cell_token =
                         // jump_op.getdescr()`, :321-322 `jitcelltoken =
@@ -4032,7 +4101,11 @@ impl<S: JitState> JitDriver<S> {
                         );
                         if crate::closedbg_enabled() {
                             eprintln!(
-                                "@@@CLOSE BRIDGE-TARGET close_greens={close_greens:?} resolved_key={} origin_key={}",
+                                "@@@CLOSE BRIDGE-TARGET close_greens={close_greens:?} close_hash={} resolved_key={} origin_key={}",
+                                close_key
+                                    .as_ref()
+                                    .map(|k| k.get_uhash() as i64)
+                                    .unwrap_or(-1),
                                 resolved_key.map(|k| k as i64).unwrap_or(-1),
                                 self.current_trace_green_key()
                                     .map(|k| k as i64)
@@ -5327,63 +5400,22 @@ impl<S: JitState> JitDriver<S> {
         // position to re-enter at; every other JitState resumes through its
         // own frontend.
         let dispatch = self.dispatch_jitcode().cloned()?;
-        // OPEN, and the cut below is a MASK rather than the boundary. It
-        // refuses a guard whose deferred writes span more than one virtual,
-        // and at the parameter table's `trace_eagerness` a self-interpreting
-        // workload is byte-exact with it in place. Lowering that parameter —
-        // nothing else — reproduces the same class of wrong answer WITH the
-        // cut in place, deterministically, from one setting downwards.
+        // The cut below is OFF by default and upstream has no equivalent:
+        // `compile.py ResumeGuardDescr.handle_fail` bridges whenever
+        // `must_compile` fires, whatever the guard's deferred writes look
+        // like. What the guard's pendingfields once threatened was a double
+        // application — the entry's applying reader storing them on its way
+        // in and the blackhole arm this decline hands the guard to storing
+        // them again — and that is answered by SITING the decision ahead of
+        // `start_bridge_tracing`, which is where it now is, not by refusing.
+        // A guard admitted here reaches exactly one of the two readers.
         //
-        // What that reproduction settles, and what it overturns:
-        //
-        //   * declining EVERY guard-resume entry restores the correct output
-        //     at every `trace_eagerness` tried, and also with the cut widened
-        //     to serve every deferred-write guard. This entry is the necessary
-        //     component; the virtual count is not.
-        //   * `MAJIT_MAX_BRIDGES` bisects the reproduction to one entry, and
-        //     that entry carries NO deferred writes and NO virtuals at all.
-        //     Seventy-one guard-resume entries precede it and are sound. The
-        //     shape this comment used to blame — a two-node push chain whose
-        //     outer virtual names the inner and whose one deferred write is
-        //     the list head — is what the cut refuses, not what corrupts.
-        //
-        // What the corrupting entry records is a bridge that closes with a
-        // JUMP into an already-compiled loop, and it passes a VARIABLE in the
-        // argument position that every other close in the same run fills with
-        // a literal — one of a handful of literals, each the value the loop
-        // behind that target token was specialized on. The bridge's own
-        // guards prove only that the variable is not one OTHER literal.
-        //
-        // Nothing in this frontend's close path proves the incoming state
-        // satisfies the target label: `unroll.py jump_to_existing_trace` is
-        // where upstream generates the guards that make a specialized label
-        // safe to enter, and its per-target-token log is EMPTY for this
-        // workload — with the unroll pass enabled as well as without it.
-        // Enabling that pass changes which bytes come out wrong and not that
-        // they are wrong, so the missing pass is not by itself the account.
-        //
-        // Also measured out, in the same reproduction:
-        //
-        //   * a `GuardRequirement` whose box is not reachable from the jump
-        //     arguments emits nothing and is skipped rather than declined —
-        //     a real hole, but declining on it fires on no target token here
-        //     and leaves every wrong byte unchanged,
-        //   * `rd_locs.len()` equals `num_failargs` on every guard in the
-        //     refused census, so no failarg resolves through the deadframe's
-        //     out-of-range identity-slot fallback,
-        //   * the bridge's inputargs are contiguous and cover every failarg,
-        //   * the rewrite lowers a resumed `New` to the headerless nursery
-        //     opcode, so materialized objects come from the frontend's own
-        //     pool at the offsets their descrs carry, and
-        //   * the collector is not involved: the wrong bytes are identical
-        //     with collection disabled, the run performs none, and the
-        //     frontend's own structural invariant stays silent. What the
-        //     served entry produces is a wrong VALUE on an intact structure.
-        //
-        // The cut stays because it is measured to halve this frontend's
-        // guard failures and because widening it is measured to produce a
-        // wrong answer at the shipped parameter; it is NOT a soundness
-        // argument, and the entry above it is where the account is still owed.
+        // The wrong answers that later narrowed the cut to `nv > 1` were
+        // never this entry's either: they are made at the CLOSE, by a loop
+        // whose single LABEL its own closing JUMP specialized, and
+        // `compile_loop` now declines to compile that shape rather than
+        // publishing a label nothing can enter soundly (see
+        // `MetaInterp::closing_jump_fixes_label_slots`).
         //
         // Sited here rather than in the ladder below because
         // `compile.py ResumeGuardDescr.handle_fail` runs ONE of resume.py's
@@ -5391,7 +5423,10 @@ impl<S: JitState> JitDriver<S> {
         // for the applying one, which stores the deferred writes on its way
         // in, and the blackhole arm this decline hands the guard to then
         // stores them a second time.
-        if self.guard_carries_pending_fields(descr_arc) {
+        if no_guard_resume_bridge_enabled() {
+            return None;
+        }
+        if guard_resume_refuse_pending_fields() && self.guard_carries_pending_fields(descr_arc) {
             let why = GuardResumeDecline::ReplayIncomplete;
             crate::mc_diag_bump(why.diag_slot());
             if crate::majit_log_enabled() {
@@ -6646,9 +6681,19 @@ impl<S: JitState> JitDriver<S> {
                         bh_sf.float_scalar_base,
                         bh_sf.num_float_scalars,
                     );
-                    let sf_before_i = bh.registers_i[sf_i.clone()].to_vec();
-                    let sf_before_r = bh.registers_r[sf_r.clone()].to_vec();
-                    let sf_before_f = bh.registers_f[sf_f.clone()].to_vec();
+                    // Three register-bank copies, and their only purpose is
+                    // `guard_may_bridge` below, whose only reader takes them
+                    // under `should_bridge`. A guard the counter has not
+                    // fired for pays them on every failure and asks nothing
+                    // of them, and that is the common case by orders of
+                    // magnitude.
+                    let sf_before = should_bridge.then(|| {
+                        (
+                            bh.registers_i[sf_i.clone()].to_vec(),
+                            bh.registers_r[sf_r.clone()].to_vec(),
+                            bh.registers_f[sf_f.clone()].to_vec(),
+                        )
+                    });
                     let outcome = loop {
                         match bh.resume_mainloop(cur_exc) {
                             Ok(next_exc) => match bh.nextblackholeinterp.take() {
@@ -6705,11 +6750,17 @@ impl<S: JitState> JitDriver<S> {
                     //
                     // A walk that crossed a frame boundary is not judged by one
                     // frame's registers, so it does not qualify.
-                    let tail_wrote_state = bh.registers_i[sf_i] != sf_before_i[..]
-                        || bh.registers_r[sf_r] != sf_before_r[..]
-                        || bh.registers_f[sf_f] != sf_before_f[..];
-                    let guard_may_bridge =
-                        bh_frames_popped == 0 && !bh.called_residual.get() && !tail_wrote_state;
+                    let guard_may_bridge = match &sf_before {
+                        Some((before_i, before_r, before_f)) => {
+                            let tail_wrote_state = bh.registers_i[sf_i] != before_i[..]
+                                || bh.registers_r[sf_r] != before_r[..]
+                                || bh.registers_f[sf_f] != before_f[..];
+                            bh_frames_popped == 0 && !bh.called_residual.get() && !tail_wrote_state
+                        }
+                        // Only reachable with `should_bridge` false, where the
+                        // reader below short-circuits before asking.
+                        None => false,
+                    };
                     let mut portal_crn_handled = false;
                     let resume_pc = match outcome {
                         // Next merge point reached (loop back-edge): flush the

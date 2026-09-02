@@ -1510,6 +1510,14 @@ impl<'c> Lowerer<'c> {
                         crate::jit_interp::CallPolicyKind::ResidualVoidCannotRaise,
                     );
                     let write_ei = self.residual_write_effect_info_tokens(func, !cannot_raise);
+                    // The register literals must be spelled inside the
+                    // `__builder` call itself: `regalloc`'s rewriter recolors
+                    // only the arguments of a non-aux builder method call, so
+                    // arguments bound to a local first would keep the register
+                    // numbers the lowerer handed out before coloring.
+                    let typed_args = typed_call_arg_tokens(&arg_bindings);
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
                     let call_stmt = if let Some(write_ei) = write_ei {
                         // Declared field mutator: residual with a write-set
                         // naming the mutated field so the optimizer invalidates
@@ -1518,7 +1526,7 @@ impl<'c> Lowerer<'c> {
                         quote! {
                             __builder.residual_call_void_canonical_via_target_with_effect_info(
                                 __fn_idx,
-                                __typed_args,
+                                #typed_args,
                                 #write_ei,
                             );
                         }
@@ -1526,40 +1534,22 @@ impl<'c> Lowerer<'c> {
                         quote! {
                             __builder.residual_call_void_canonical_via_target_with_effect_info(
                                 __fn_idx,
-                                __typed_args,
+                                #typed_args,
                                 majit_metainterp::cannot_raise_effect_info(),
                             );
                         }
                     } else {
                         quote! {
-                            __builder.residual_call_void_canonical_via_target(__fn_idx, __typed_args);
+                            __builder.residual_call_void_canonical_via_target(__fn_idx, #typed_args);
                         }
                     };
-                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
-                        let typed_args = quote! {
-                            &[#(majit_metainterp::JitCallArg::int(#arg_regs)),*]
-                        };
-                        self.emit_op(
-                            OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
-                            quote! {
-                                let __fn_idx = __builder.add_word_abi_fn_ptr_void(#word_void_addr);
-                                let __typed_args = #typed_args;
-                                #call_stmt
-                            },
-                        );
-                    } else {
-                        let typed_args = typed_call_arg_tokens(&arg_bindings);
-                        let __arg_regs: Vec<Register> =
-                            arg_bindings.iter().map(Register::from_binding).collect();
-                        self.emit_op(
-                            OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
-                            quote! {
-                                let __fn_idx = __builder.add_word_abi_fn_ptr_void(#word_void_addr);
-                                let __typed_args = #typed_args;
-                                #call_stmt
-                            },
-                        );
-                    }
+                    self.emit_op(
+                        OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
+                        quote! {
+                            let __fn_idx = __builder.add_word_abi_fn_ptr_void(#word_void_addr);
+                            #call_stmt
+                        },
+                    );
                 }
                 crate::jit_interp::CallPolicyKind::InlineVoid => {
                     let shared_path = inline_shared_path(&call.func)?;
@@ -2005,12 +1995,16 @@ impl<'c> Lowerer<'c> {
                     let throwaway_reg = self.alloc_reg();
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    // The register literals must be spelled inside the
+                    // `__builder` call itself: `regalloc`'s rewriter recolors
+                    // only the arguments of a non-aux builder method call, so
+                    // arguments bound to a local first would keep the register
+                    // numbers the lowerer handed out before coloring.
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
                         quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            let __typed_args = #typed_args;
-                            __builder.residual_call_ref_canonical_via_target(__fn_idx, __typed_args, #throwaway_reg);
+                            __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg);
                         },
                     );
                 }
@@ -2019,12 +2013,16 @@ impl<'c> Lowerer<'c> {
                     let throwaway_reg = self.alloc_reg();
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    // The register literals must be spelled inside the
+                    // `__builder` call itself: `regalloc`'s rewriter recolors
+                    // only the arguments of a non-aux builder method call, so
+                    // arguments bound to a local first would keep the register
+                    // numbers the lowerer handed out before coloring.
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
                         quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            let __typed_args = #typed_args;
-                            __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, __typed_args, #throwaway_reg, majit_metainterp::nursery_alloc_effect_info());
+                            __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #throwaway_reg, majit_metainterp::nursery_alloc_effect_info());
                         },
                     );
                 }

@@ -444,6 +444,17 @@ pub struct Optimizer {
     /// is NON-fatal (exported_loop_state = None) instead of escaping as an
     /// InvalidLoop that discards the bridge (the pi guard-9 infinite-deopt hang).
     building_bridge: bool,
+    /// Whether this call is the one `compile.py`'s `SimpleCompileData.optimize`
+    /// makes. That one runs `Optimizer.optimize_loop`, whose result is a
+    /// `BasicLoopInfo` and the operations; the short-preamble export and the
+    /// `ExportedState` it produces belong to `UnrollOptimizer.optimize_preamble`
+    /// alone, and `unroll.py:454-457`'s force-then-flush-then-virtual-state runs
+    /// only there. pyre folds that preview into the shared
+    /// `optimize_with_constants_and_inputs_at`, so a simple compile needs this
+    /// flag to reach the same shape: no forcing of the closing JUMP's arguments
+    /// for a preamble that is not being built, and no exported state, which no
+    /// reader of a simple loop's result consults.
+    pub simple_compile: bool,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Taken from MIStaticData at optimizer construction, returned after.
     /// descr.py:25-47: descriptors get descr_index assigned inline during
@@ -1520,6 +1531,7 @@ impl Optimizer {
             final_ctx: None,
             pending_bridge_rd: None,
             building_bridge: false,
+            simple_compile: false,
             all_descrs: Arc::new(Vec::new()),
             constant_fold_alloc: None,
             string_length_resolver: None,
@@ -3141,7 +3153,10 @@ impl Optimizer {
         // for the preview virtual-state mismatch below propagates out of
         // `optimize_with_constants_and_inputs_at`, not just the closure.
         let building_bridge = self.building_bridge;
-        self.exported_loop_state = match jump {
+        // `Optimizer.optimize_loop` (optimizer.py) is the whole of
+        // `SimpleCompileData.optimize`; there is no `optimize_preamble` behind
+        // it to export for. See [`Self::simple_compile`].
+        self.exported_loop_state = match jump.filter(|_| !self.simple_compile) {
             Some(jump) => 'export: {
                 // RPython unroll.py:454-457 order:
                 //   end_args = [force_box_for_end_of_preamble(a) for a ...]

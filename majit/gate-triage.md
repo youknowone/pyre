@@ -255,6 +255,13 @@ cover the condition they diagnose.
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_GUARD_RESUME_REFUSE_PENDING_FIELDS`
+
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
+- Accessor: `guard_resume_refuse_pending_fields()`
+- What it does: Restores `guard_carries_pending_fields`, the refusal to build a guard-resume bridge for a guard whose deferred writes span more than one virtual. Off by default: upstream has no such refusal, and the double-application it once guarded against is answered by siting the decision ahead of `start_bridge_tracing` rather than by declining. Kept so the two answers stay comparable inside one binary, which a second build cannot do.
+- Retirement condition: Remove once no consumer needs the refusal restored to attribute a result.
+
 ### `MAJIT_HEAPDBG`
 
 - Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
@@ -353,6 +360,13 @@ cover the condition they diagnose.
 - What it does: `MAJIT_NO_BRIDGE`: suppress bridge recording so every guard failure resumes through the blackhole.  Public because a frontend that owns its own guard-failure entry point has to honour it there too — gating only the jitdriver-internal paths leaves the variable set but inert, which reads as "bridges are off" while they keep recording.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_NO_GUARD_RESUME_BRIDGE`
+
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
+- Accessor: `no_guard_resume_bridge_enabled()`
+- What it does: `MAJIT_NO_GUARD_RESUME_BRIDGE`: decline every bridge entry taken directly from a guard failure, so each one resumes through the blackhole and the bridge is grown from the next merge point instead.  Narrower than `MAJIT_NO_BRIDGE`, which suppresses bridge recording outright: this leaves the merge-point-grown bridges in place, so a wrong answer that survives `MAJIT_NO_BRIDGE` and disappears here is attributable to what the walk rebuilds from resume data rather than to bridges as such.  Costly — the blackhole arm reaches the merge point by interpreting — so it is a bisection tool, not a policy.  Off by default.
+- Retirement condition: Remove when a bridge entered from a guard failure records the same answer as the blackhole arm reaching the same merge point, so the two arms have nothing left to separate.
+
 ### `MAJIT_OPREF_VARIANT_AUDIT`
 
 - Read sites: 1 — `majit/majit-ir/src/opref_audit.rs`
@@ -395,6 +409,13 @@ cover the condition they diagnose.
 - What it does: available only in a `jit-audits` build; records the source location of the latest write to each integer register, so a later read can report its writer. The ordinary build contains neither the state nor its call sites. Diagnostic state is thread-local to keep parallel traces independent.
 - Default polarity: **OFF**; unset, empty, and `0` disable it.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
+
+### `MAJIT_SKIP_BRIDGES`
+
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
+- Accessor: `bridge_fuel_skipped()`
+- What it does: `MAJIT_SKIP_BRIDGES=a,b,...`: decline exactly the listed `MAJIT_MAX_BRIDGES` sequence numbers and take every other one, so a bisect can ask whether one numbered bridge corrupts on its own or whether the corruption is cumulative. The fuel limit cannot answer that, because declining number N also declines everything after it.
+- Retirement condition: Remove with `MAJIT_MAX_BRIDGES`, once a compiled bridge cannot produce a value the same guard's blackhole resume would not.
 
 ### `MAJIT_SMALLIR`
 

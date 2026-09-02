@@ -6987,7 +6987,7 @@ impl<M: Clone> MetaInterp<M> {
         // optimizer's `&[Op]` surface gets owned data. The deep-clone
         // mirrors PyPy's `cls()` fresh ResOperation per iteration —
         // optimizer mutations don't leak into TreeLoop.ops identity.
-        let trace_ops: Vec<Op> = preamble_data
+        let mut trace_ops: Vec<Op> = preamble_data
             .base
             .operations()
             .iter()
@@ -7037,11 +7037,6 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // Save trace_ops + constants snapshot for potential unroll-free retry
-        // (pyjitpl.py:3016-3021).
-        let trace_ops_snapshot = trace_ops.clone();
-        let constants_snapshot = constants.clone();
-
         // PyPy: pyjitpl.py:3016-3017 gates unrolling on `unroll` in
         // warmstate.enable_opts. MAJIT_NO_UNROLL remains a diagnostic override.
         let no_unroll_reason = crate::unroll_skip_reason(
@@ -7049,6 +7044,19 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state.get_enable_opts(),
         );
         let no_unroll = no_unroll_reason.is_some();
+
+        // Save trace_ops + constants snapshot for potential unroll-free retry
+        // (pyjitpl.py:3016-3021).
+        //
+        // `compile.py:271-273` reaches `compile_simple_loop` by branching before
+        // `PreambleCompileData` exists, and hands it the same trace object. Pyre
+        // reaches that compile through the retry below instead, so the copy is
+        // what stands in for the branch: it exists because a peeling attempt
+        // that ran first may have left the recorded operations forwarded. When
+        // the attempt is skipped they are still as the recorder left them, and
+        // the retry takes them rather than a copy.
+        let trace_ops_snapshot: Option<Vec<Op>> = (!no_unroll).then(|| trace_ops.clone());
+        let constants_snapshot = constants.clone();
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
@@ -7092,10 +7100,15 @@ impl<M: Clone> MetaInterp<M> {
         // namespace, so no seed can resolve cut-op lookups anyway; an explicit
         // empty seed states that (producer lookup runs off new_operations /
         // phase1_emit_ops / resop_refs).
-        unroll_opt.phase2_input_ops_seed = Some(if cross_loop_cut.is_none() {
-            preamble_data.base.operations().to_vec()
-        } else {
+        // Only the peeling arm below reads this seed. When the jitdriver's
+        // `enable_opts` omits `unroll`, the optimize call is `InvalidLoop`
+        // before it looks at any of `unroll_opt`, and the retry builds its own
+        // `explicit_input_ops_seed` from the same operations — so populating it
+        // here would copy the whole recorded trace to be dropped.
+        unroll_opt.phase2_input_ops_seed = Some(if no_unroll || cross_loop_cut.is_some() {
             Vec::new()
+        } else {
+            preamble_data.base.operations().to_vec()
         });
         unroll_opt.call_pure_results = preamble_data.call_pure_results.clone();
         // RPython Box type parity: each InputArg carries its type from
@@ -7122,11 +7135,19 @@ impl<M: Clone> MetaInterp<M> {
         // intrinsic attribute on the Box itself, so no raw-u32 type
         // side-table propagation is needed; callers recover the type
         // through `OpRef::ty()` / `Const::get_type()`.
-        unroll_opt.snapshot_boxes = snapshot_map.clone();
-        unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
-        unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
-        unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
-        unroll_opt.snapshot_frame_pcs = snapshot_frame_pcs.clone();
+        // Phase 1's copy of the snapshot banks. The originals stay owned here
+        // because the `InvalidLoop` arm below moves them into the unroll-free
+        // optimizer, so this is a second set, one `Vec<SnapshotBox>` per
+        // recorded guard. A trace that records guards in the thousands makes
+        // that the largest single allocation of the compile, and the arm that
+        // never peels never reads it.
+        if !no_unroll {
+            unroll_opt.snapshot_boxes = snapshot_map.clone();
+            unroll_opt.snapshot_frame_sizes = snapshot_frame_size_map.clone();
+            unroll_opt.snapshot_vable_boxes = snapshot_vable_map.clone();
+            unroll_opt.snapshot_vref_boxes = snapshot_vref_map.clone();
+            unroll_opt.snapshot_frame_pcs = snapshot_frame_pcs.clone();
+        }
         // The original snapshot maps are re-cloned into `simple_opt` on the
         // InvalidLoop retry below, so they must stay rooted across the WHOLE
         // unroll. Each phase's `replace_compile_snapshot_roots` overwrites the
@@ -7140,15 +7161,26 @@ impl<M: Clone> MetaInterp<M> {
             &mut snapshot_vref_map,
         ]);
         // Until the first phase replace, also root unroll_opt's own clones (the
-        // phase-1 source) alongside the persistent originals.
-        self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
-            &mut unroll_opt.snapshot_boxes,
-            &mut unroll_opt.snapshot_vable_boxes,
-            &mut unroll_opt.snapshot_vref_boxes,
-            &mut snapshot_map,
-            &mut snapshot_vable_map,
-            &mut snapshot_vref_map,
-        ]);
+        // phase-1 source) alongside the persistent originals. Where there is no
+        // phase 1 those clones were never taken, and naming empty banks here
+        // would root nothing; the originals still are, which is what the arm
+        // that moves them into the unroll-free optimizer needs.
+        self.compile_snapshot_refs = if no_unroll {
+            collect_snapshot_const_ptr_slots(&mut [
+                &mut snapshot_map,
+                &mut snapshot_vable_map,
+                &mut snapshot_vref_map,
+            ])
+        } else {
+            collect_snapshot_const_ptr_slots(&mut [
+                &mut unroll_opt.snapshot_boxes,
+                &mut unroll_opt.snapshot_vable_boxes,
+                &mut unroll_opt.snapshot_vref_boxes,
+                &mut snapshot_map,
+                &mut snapshot_vable_map,
+                &mut snapshot_vref_map,
+            ])
+        };
 
         // RPython compile.py:278-294 parity: Phase 1 results must survive
         // Phase 2 InvalidLoop. Phase 1 writes to phase1_out on the caller's
@@ -7261,6 +7293,9 @@ impl<M: Clone> MetaInterp<M> {
                         // read-only after `setup_descrs`; `bridgeopt.py:155`
                         // indexes it blind.
                         simple_opt.all_descrs = unroll_opt.all_descrs.clone();
+                        // compile.py:272 `compile_simple_loop` — this retry is
+                        // that call, so it optimizes as `SimpleCompileData` does.
+                        simple_opt.simple_compile = true;
                         // history.py/261/307: `Const.type` /
                         // `InputArg.type` are intrinsic on the box;
                         // no raw-u32 type side-table propagation is
@@ -7286,9 +7321,12 @@ impl<M: Clone> MetaInterp<M> {
                         // `Rc<Op>`), so producer lookup resolves identity.
                         simple_opt.explicit_input_ops_seed =
                             Some(preamble_data.base.operations().to_vec());
+                        // Consumed here and nowhere else, so the operations move
+                        // into their `Rc`s instead of being copied into them.
                         let trace_ops_snapshot_rc: Vec<majit_ir::OpRc> = trace_ops_snapshot
-                            .iter()
-                            .map(|op| std::rc::Rc::new(op.clone()))
+                            .unwrap_or_else(|| std::mem::take(&mut trace_ops))
+                            .into_iter()
+                            .map(std::rc::Rc::new)
                             .collect();
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7615,6 +7653,60 @@ impl<M: Clone> MetaInterp<M> {
 
         // resume.py parity: rd_numb is now produced inline during optimization
         // (ctx.emit → store_final_boxes_in_guard) rather than post-assembly.
+
+        // A loop compiled without the peel has ONE label and no virtual
+        // state, so nothing distinguishes a general entry from a specialized
+        // one — and the loop's own closing JUMP specializes it wherever it
+        // fills a slot the LABEL declares as a box with a constant. The body
+        // may never read that slot, so a value any entry supplies survives one
+        // iteration and the back edge writes the constant over it. The peel is
+        // what keeps that from mattering: it leaves the unspecialized preamble
+        // at `target_tokens[0]` and puts the loop's invariants in the peeled
+        // label's virtual state, which `unroll.py jump_to_existing_trace` must
+        // match or fall back to the preamble for.
+        //
+        // Refusing the compile is a DEVIATION. `pyjitpl.py` computes
+        // `can_use_unroll = cpu.supports_guard_gc_type and 'unroll' in
+        // enable_opts` and forwards a false value through `compile_loop` to
+        // `compile_simple_loop`, which publishes exactly this shape with
+        // `patch_jumpop_at_end=True`; `optimize_bridge` then takes
+        // `target_tokens[0]` through `jump_to_preamble`, whose only assertion
+        // is that the head carries no virtual state. Nothing on that route
+        // examines the closing JUMP, so the specialized label is entered with
+        // no guard proving the constant. With no peel there is no preamble to
+        // fall back to and no state to match, so declining the loop is the
+        // only answer left that is not the wrong one.
+        //
+        // Only for a jitdriver whose `enable_opts` has no `unroll` at all.
+        // `retried_without_unroll` is also set by the other route into this
+        // retry — the `InvalidLoop` the peeling attempt itself raised, which
+        // `compile.py` answers by trying one last time without unrolling. That
+        // retry is a rescue: the key does peel, this trace's peeled form was
+        // rejected, and what the retry publishes is the only compile the trace
+        // will get. Declining it costs the loop and the rescue both, and
+        // nothing upstream declines it. Where the driver has no peel the shape
+        // is not one trace's bad luck but every loop the key will ever hold, so
+        // there refusing is the whole of the answer.
+        //
+        // The abort ceiling turns a key that keeps producing this shape into a
+        // `JC_DONT_TRACE_HERE`, so the frontend converges on interpreting it.
+        if no_unroll
+            && retried_without_unroll
+            && Self::closing_jump_fixes_label_slots(&compiled_ops)
+        {
+            crate::mc_diag_bump(crate::mc_diag_slot(
+                "peel_less_loop_label_is_const_specialized",
+            ));
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] unroll-free loop label is specialized by its own \
+                     closing jump at key={green_key}"
+                );
+            }
+            self.warm_state.abort_tracing(green_key, false);
+            self.exported_state = None;
+            return CompileOutcome::Aborted;
+        }
 
         // Use the pre-allocated token object if available (for self-recursion
         // support), otherwise allocate a fresh one.
@@ -8354,6 +8446,31 @@ impl<M: Clone> MetaInterp<M> {
                 crate::mc_diag_bump(29); // compile_trace: no front target token
                 return CompileOutcome::Cancelled;
             };
+            // `unroll.py jump_to_preamble` reaches this same unconditional
+            // take of the head, and it opens with
+            // `assert cell_token.target_tokens[0].virtual_state is None`.
+            // That assertion is what makes the take sound: a head carrying a
+            // virtual state is a specialized label, and entering one needs the
+            // guards `_jump_to_existing_trace` derives from that state — which
+            // the take, by construction, does not emit. The crate layering
+            // keeps `virtual_state` off the backend's descr list (see the note
+            // below), so read it from the `compiled_loops` projection the head
+            // is mirrored into. Upstream states this as unreachable; declining
+            // costs a bridge where crashing would cost the process.
+            if self
+                .compiled_loops
+                .get(&green_key)
+                .and_then(|compiled| compiled.front_target_tokens.first())
+                .is_some_and(|front| front.virtual_state.is_some())
+            {
+                if crate::closedbg_enabled() {
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
+                }
+                crate::mc_diag_bump(crate::mc_diag_slot(
+                    "bridge_close_head_target_has_virtual_state",
+                ));
+                return CompileOutcome::Cancelled;
+            }
             // The descr list on the token and the value list in
             // `compiled_loops` are two projections of one thing, written by
             // separate statements, and nothing else checks that they agree.
@@ -9758,6 +9875,11 @@ impl<M: Clone> MetaInterp<M> {
         self.clear_retrace_state();
         if let Some(ctx) = self.tracing.take() {
             let green_key = ctx.green_key;
+            // A recorder panic settles the question the `MAX_TRACE_ABORT_COUNT`
+            // ceiling would otherwise take that many attempts to reach: the walk
+            // stopped on something about the jitcode it was reading, so every
+            // later attempt at this key reads it again. Ban the key here.
+            let permanent = permanent || ctx.recorder_panicked;
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit] abort trace at key={} (permanent={})",
@@ -10524,6 +10646,35 @@ impl<M: Clone> MetaInterp<M> {
 
         let optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
 
+        // This path mints one TargetToken with no virtual state and no
+        // preamble in front of it, so its LABEL is the only entry the key
+        // has — and the trace's own closing JUMP specializes that LABEL
+        // wherever it fills a slot the LABEL declares as a box with a
+        // constant. See `closing_jump_fixes_label_slots` for why that is a
+        // wrong answer rather than a lost optimization, and `compile_loop`'s
+        // sibling refusal for the same shape reached the other way.
+        //
+        // The segmented caller is upstream's `patch_jumpop_at_end=False`
+        // case: `pyjitpl.py _create_segmented_trace_and_blackhole` records an
+        // unreachable FINISH and asks for no back edge, so the LABEL it
+        // publishes exists only for a later segment to close onto. A trace
+        // that arrives here carrying a back edge is outside that contract,
+        // and the closing JUMP below would descr it onto this very token.
+        if Self::closing_jump_fixes_label_slots(&optimized_ops) {
+            crate::mc_diag_bump(crate::mc_diag_slot(
+                "segmented_loop_label_is_const_specialized",
+            ));
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit] compile_simple_loop: label is specialized by its own \
+                     closing jump at key={green_key}"
+                );
+            }
+            self.warm_state.abort_tracing(green_key, false);
+            self.compile_snapshot_refs.clear();
+            return None;
+        }
+
         // Allocate token and compile.
         let token_num = self.warm_state.alloc_token_number();
         // `compile.py jitcell_token = make_jitcell_token(jitdriver_sd)`.
@@ -11032,6 +11183,40 @@ impl<M: Clone> MetaInterp<M> {
             packed.push(value);
         }
         Some(packed)
+    }
+
+    /// Whether the loop's own closing JUMP fills a slot the LABEL declares as
+    /// a box with a constant, which makes the LABEL a specialized entry.
+    ///
+    /// `remove_consts_and_duplicates` (pyjitpl.py) records a `SAME_AS` for
+    /// every constant it meets in the merge point's live boxes, and the
+    /// rewrite pass folds that straight back, so a slot whose value the
+    /// metainterp knows as a constant reaches the optimized JUMP as one.
+    /// Against a LABEL that declares a box there, the pair says "any value may
+    /// enter, and this constant is what leaves" — sound for the trace that
+    /// recorded it, and an overwrite for anything else that enters.
+    ///
+    /// An op list whose LABEL has not been synthesized yet answers from the
+    /// JUMP alone: that LABEL will declare the trace's inputargs, which are
+    /// boxes without exception, so every constant in the JUMP lands on one.
+    ///
+    /// Conservative on purpose: a constant an operation in the loop genuinely
+    /// derives is refused too. Both compiles that consult this publish a
+    /// single label with no preamble behind it, and there refusing the compile
+    /// costs a loop where admitting it costs the answer.
+    fn closing_jump_fixes_label_slots(ops: &[majit_ir::OpRc]) -> bool {
+        let Some(jump) = ops.last().filter(|op| op.opcode == OpCode::Jump) else {
+            return false;
+        };
+        let jump_args = jump.getarglist();
+        let Some(label) = ops.iter().find(|op| op.opcode == OpCode::Label) else {
+            return jump_args.iter().any(|arg| arg.is_constant());
+        };
+        let label_args = label.getarglist();
+        jump_args
+            .iter()
+            .zip(label_args.iter())
+            .any(|(jump_arg, label_arg)| jump_arg.is_constant() && !label_arg.is_constant())
     }
 
     fn front_entry_index_for(tokens: &[crate::history::TargetToken]) -> Option<usize> {
@@ -13079,15 +13264,30 @@ impl<M: Clone> MetaInterp<M> {
     /// every guard has recovery_layout with header_pc on all frames.
     /// Returns None only if the (green_key, trace_id, fail_index) lookup
     /// itself fails — a metadata consistency error, not a missing field.
+    ///
+    /// Resolved here rather than through `get_compiled_exit_layout_in_trace`,
+    /// which answers the same two lookups by building a whole
+    /// `CompiledExitLayout` around them: `StoredExitLayout::public` copies the
+    /// exit types and clones three `Arc`s, and the backend arm reassembles a
+    /// `ResumeStorage` out of clones of the fail descriptor's whole `rd_*`
+    /// pool. A caller after one `u64` drops every one of them again, and this
+    /// one runs on each reported guard failure. The resolution order is the
+    /// same — the trace's own entry first, the backend's only when the trace
+    /// holds none — so the two agree on which layout answers.
     pub fn get_merge_point_pc(
         &self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
     ) -> Option<u64> {
-        let exit_layout =
-            self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
-        let recovery = exit_layout.recovery_layout.as_ref()?;
+        let compiled = self.compiled_loops.get(&green_key)?;
+        if let Some((_, trace)) = Self::trace_for_exit(compiled, trace_id)
+            && let Some(layout) = trace.exit_layouts.get(&fail_index)
+        {
+            return layout.recovery_layout.as_ref()?.frames.first()?.header_pc;
+        }
+        let backend = self.backend_fail_descr_layout(compiled, trace_id, fail_index)?;
+        let recovery = backend.recovery_layout.as_ref()?;
         recovery.frames.first()?.header_pc
     }
 
@@ -24626,6 +24826,78 @@ mod tests {
         assert!(pendingfields.is_empty());
     }
 
+    /// The trace's own entry is the whole answer once it exists: a guard the
+    /// trace holds with no recovery layout resolves to no merge point rather
+    /// than to whatever the backend would say about the same fail index.
+    /// `get_compiled_exit_layout_in_trace` picks the layout the same way, and
+    /// reads `recovery_layout` off it afterwards.
+    #[test]
+    fn a_trace_entry_without_a_recovery_layout_answers_no_merge_point() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let green_key = 61;
+        let trace_id = 67;
+        let fail_index = 2;
+
+        let mut exit_layouts: indexmap::IndexMap<u32, StoredExitLayout> = indexmap::IndexMap::new();
+        exit_layouts.insert(
+            fail_index,
+            StoredExitLayout {
+                source_op_index: Some(0),
+                recovery_layout: None,
+                resume_layout: None,
+                storage: None,
+                descr: Some(crate::compile::make_fail_descr_typed(vec![Type::Int])),
+                op_arg_types_for_jump: None,
+            },
+        );
+
+        let mut traces = indexmap::IndexMap::new();
+        traces.insert(
+            trace_id,
+            CompiledTrace {
+                inputargs: vec![],
+                ops: vec![],
+                constants: majit_ir::ConstMap::new(),
+                exit_layouts,
+                terminal_exit_layouts: indexmap::IndexMap::new(),
+            },
+        );
+
+        let token = std::sync::Arc::new(JitCellToken::new(3));
+        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
+        meta.warm_state_mut()
+            .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: std::sync::Arc::downgrade(&token),
+                meta: std::sync::Arc::new(()),
+                front_target_tokens: Vec::new(),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: trace_id,
+                traces,
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        assert_eq!(
+            meta.get_merge_point_pc(green_key, trace_id, fail_index),
+            None
+        );
+        // A fail index the trace does not hold falls through to the backend,
+        // which holds nothing for this fixture either.
+        assert_eq!(meta.get_merge_point_pc(green_key, trace_id, 99), None);
+        // An unknown green key resolves no compiled entry at all.
+        assert_eq!(
+            meta.get_merge_point_pc(green_key + 1, trace_id, fail_index),
+            None
+        );
+    }
+
     #[test]
     fn test_handle_async_forcing_prepares_rd_virtuals_from_exit_layout() {
         let mut meta = MetaInterp::<()>::new(1);
@@ -27312,5 +27584,95 @@ mod loop_side_table_tests {
             Some(7),
             "copying old_entry.loop_header_pc across keeps the close target"
         );
+    }
+}
+
+/// The predicate that tells a specialized label from a general one on a loop
+/// compiled without the peel.
+///
+/// `compile_simple_loop` mints one TargetToken and gives it no
+/// `virtual_state`, so the only evidence a close has that the label is
+/// specialized is the loop's own closing JUMP: a constant there against a box
+/// in the LABEL says "any value may enter, and this constant is what leaves".
+/// The body may never read that slot, so a value the close supplies survives
+/// exactly one iteration and the back edge writes the constant over it.
+#[cfg(test)]
+mod closing_jump_fixes_label_slots_tests {
+    use super::*;
+    use majit_ir::operand::Operand;
+    use majit_ir::{Op, OpRef, Type};
+
+    fn op(opcode: OpCode, args: &[OpRef]) -> majit_ir::OpRc {
+        let args: Vec<Operand> = args.iter().map(|a| Operand::bound_from_opref(*a)).collect();
+        std::rc::Rc::new(Op::new(opcode, &args))
+    }
+
+    /// An `OpRef` naming a producer, i.e. what a LABEL declares each of its
+    /// slots as.
+    fn boxed(pos: u32) -> OpRef {
+        OpRef::op_typed(pos, Type::Int)
+    }
+
+    #[test]
+    fn a_constant_against_a_declared_box_is_the_specializing_shape() {
+        let ops = vec![
+            op(OpCode::Label, &[boxed(1), boxed(2)]),
+            op(OpCode::Jump, &[boxed(1), OpRef::ConstInt(605)]),
+        ];
+        assert!(
+            MetaInterp::<()>::closing_jump_fixes_label_slots(&ops),
+            "slot 1 enters as a box and leaves as 605, so anything that enters \
+             carrying another value loses it on the back edge",
+        );
+    }
+
+    /// The control: a loop whose closing JUMP hands every slot back as the box
+    /// it was declared as is a general entry, and refusing closes onto it
+    /// would cost bridges for nothing.
+    #[test]
+    fn a_jump_that_returns_every_slot_unchanged_is_a_general_entry() {
+        let ops = vec![
+            op(OpCode::Label, &[boxed(1), boxed(2)]),
+            op(OpCode::Jump, &[boxed(1), boxed(2)]),
+        ];
+        assert!(!MetaInterp::<()>::closing_jump_fixes_label_slots(&ops));
+    }
+
+    /// A slot the LABEL itself declares as a constant is already specialized
+    /// in a way every entry has to match, and the JUMP handing the same
+    /// constant back adds nothing.
+    #[test]
+    fn a_constant_the_label_itself_declares_is_not_this_defect() {
+        let ops = vec![
+            op(OpCode::Label, &[boxed(1), OpRef::ConstInt(605)]),
+            op(OpCode::Jump, &[boxed(1), OpRef::ConstInt(605)]),
+        ];
+        assert!(!MetaInterp::<()>::closing_jump_fixes_label_slots(&ops));
+    }
+
+    /// Without a back edge there is no loop to speak about.
+    #[test]
+    fn an_op_list_without_a_closing_jump_answers_no() {
+        assert!(!MetaInterp::<()>::closing_jump_fixes_label_slots(&[]));
+        assert!(!MetaInterp::<()>::closing_jump_fixes_label_slots(&[op(
+            OpCode::Label,
+            &[boxed(1)]
+        )]));
+    }
+
+    /// The compile-time site runs before the LABEL is synthesized, and that
+    /// LABEL will declare the trace's inputargs — boxes without exception. A
+    /// constant in the JUMP therefore lands on one, and answering from the
+    /// JUMP alone is what lets the check sit ahead of the token.
+    #[test]
+    fn a_jump_with_no_label_yet_answers_from_the_jump_alone() {
+        assert!(MetaInterp::<()>::closing_jump_fixes_label_slots(&[op(
+            OpCode::Jump,
+            &[boxed(1), OpRef::ConstInt(605)]
+        )]));
+        assert!(!MetaInterp::<()>::closing_jump_fixes_label_slots(&[op(
+            OpCode::Jump,
+            &[boxed(1), boxed(2)]
+        )]));
     }
 }

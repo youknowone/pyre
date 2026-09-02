@@ -1899,6 +1899,27 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     // value identifies compatibility callers that still need typed-key
     // threading.
     "confirm_enter_jit_missing_key",
+    // A bridge close resolved a head target token that carries a virtual
+    // state. `unroll.py jump_to_preamble` asserts the head has none before
+    // pointing the JUMP at it, because entering a specialized label needs the
+    // guards `_jump_to_existing_trace` generates from that state, and the
+    // unconditional take has no way to produce them. The close declines
+    // instead, so a nonzero value names the traces that lost a bridge to an
+    // invariant upstream states as unreachable.
+    "bridge_close_head_target_has_virtual_state",
+    // A loop the unroll-free retry path compiled would have had its single
+    // LABEL specialized by its own closing JUMP: the JUMP fills a slot the
+    // LABEL declares as a box with a constant, and with no peel there is
+    // neither an unspecialized preamble to enter through nor a virtual state
+    // to match. The compile is aborted rather than published. A nonzero value
+    // names the loops a jitdriver that disables `unroll` does not get.
+    "peel_less_loop_label_is_const_specialized",
+    // The same shape reached through `compile_simple_loop`, whose single
+    // LABEL is the only entry the key gets. Upstream's segmented compile
+    // cannot produce it — it records an unreachable FINISH and asks for no
+    // back edge — so a nonzero value names traces that arrived here carrying
+    // one, and were refused rather than published.
+    "segmented_loop_label_is_const_specialized",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

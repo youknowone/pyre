@@ -235,6 +235,10 @@ fn is_aux_builder_method(name: &str) -> bool {
 struct LiteralRegisterRewriter<'a> {
     mapping: &'a HashMap<Register, Register>,
     remaining: HashMap<Register, usize>,
+    /// Every register this rewriter recolored, accumulated across all the
+    /// builder calls in one statement so [`rewrite_statement`] can check that
+    /// the statement spelled each register the [`OpMeta`] declares.
+    recolored: &'a mut BTreeSet<Register>,
 }
 
 impl VisitMut for LiteralRegisterRewriter<'_> {
@@ -262,6 +266,7 @@ impl VisitMut for LiteralRegisterRewriter<'_> {
             "ambiguous cross-bank register literal {index} in one builder call"
         );
         *self.remaining.get_mut(&candidates[0]).unwrap() -= 1;
+        self.recolored.insert(candidates[0]);
         expr.lit = syn::Lit::Int(syn::LitInt::new(
             &format!("{}u16", replacement.index),
             lit.span(),
@@ -272,6 +277,7 @@ impl VisitMut for LiteralRegisterRewriter<'_> {
 struct BuilderStatementRewriter<'a> {
     mapping: &'a HashMap<Register, Register>,
     expected: HashMap<Register, usize>,
+    recolored: BTreeSet<Register>,
 }
 
 impl VisitMut for BuilderStatementRewriter<'_> {
@@ -280,6 +286,7 @@ impl VisitMut for BuilderStatementRewriter<'_> {
             let mut rewrite = LiteralRegisterRewriter {
                 mapping: self.mapping,
                 remaining: self.expected.clone(),
+                recolored: &mut self.recolored,
             };
             for arg in &mut call.args {
                 rewrite.visit_expr_mut(arg);
@@ -304,7 +311,25 @@ fn rewrite_statement(
     }
     let mut block: syn::Block = syn::parse2(quote!({ #statement }))
         .expect("macro-generated JitCode statement must parse as a Rust block");
-    BuilderStatementRewriter { mapping, expected }.visit_block_mut(&mut block);
+    let mut rewriter = BuilderStatementRewriter {
+        mapping,
+        expected: expected.clone(),
+        recolored: BTreeSet::new(),
+    };
+    rewriter.visit_block_mut(&mut block);
+    // Only the arguments of a non-aux `__builder` method call are recolored, so
+    // a register an operation declares but spells anywhere else — bound to a
+    // local first, say — would silently keep the number the lowerer handed out
+    // before coloring, and the emitted call would then read a register nothing
+    // ever writes. Every declared register must therefore appear as a literal
+    // the rewriter reached.
+    for reg in expected.keys() {
+        assert!(
+            rewriter.recolored.contains(reg),
+            "JitCode statement declares {reg:?} but never spells it inside a \
+             `__builder` call, so coloring cannot reach it: {statement}"
+        );
+    }
     block
         .stmts
         .into_iter()
@@ -383,5 +408,38 @@ mod tests {
             .map(ToString::to_string)
             .collect::<String>();
         assert!(!emitted.contains("3u16"));
+    }
+
+    /// The rewriter reaches only the arguments of a `__builder` call, so an
+    /// operation that binds its arguments to a local first would keep its
+    /// pre-coloring register numbers and call a register nothing writes.
+    #[test]
+    #[should_panic(expected = "never spells it inside a")]
+    fn a_declared_register_spelled_outside_the_builder_call_is_rejected() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.emit_op(
+            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(1)]),
+            quote! { __builder.load_const_i_value(1u16, 41i64); },
+        );
+        lowerer.emit_op(
+            OpMeta::linear(OpKind::Call, vec![Register::int(1)], vec![Register::int(2)]),
+            quote! {
+                let __typed_args = &[majit_metainterp::JitCallArg::int(1u16)];
+                __builder.residual_call_int_canonical_via_target(__fn_idx, __typed_args, 2u16);
+            },
+        );
+        lowerer.emit_op(
+            OpMeta::terminal(vec![Register::int(2)]),
+            quote! { __builder.int_return(2u16); },
+        );
+
+        compact_registers(
+            &mut lowerer,
+            RegisterCounts {
+                ints: 1,
+                ..RegisterCounts::default()
+            },
+            Some(Register::int(2)),
+        );
     }
 }

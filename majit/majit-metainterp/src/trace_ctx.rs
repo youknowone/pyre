@@ -556,6 +556,14 @@ pub struct TraceCtx {
     /// instruction boundary).  RPython has no counterpart: it has no panic arm
     /// here.
     pub abort_after_panic: bool,
+    /// Set alongside [`Self::abort_after_panic`], and never consumed before the
+    /// abort reaches the warm-state cell, so `abort_trace_live` can ban the
+    /// green key on the first panic instead of retrying it.  What the recorder
+    /// panicked on is a property of the jitcode it is walking, not of the values
+    /// this attempt happened to see, so every later attempt at the same key
+    /// reads the same thing and panics again.  RPython has no counterpart: it
+    /// has no panic arm here.
+    pub recorder_panicked: bool,
     /// Set when the walk refused a residual call whose target was still a
     /// symbolic path hash.  A dispatch-arm sub-JitCode may contain an earlier
     /// residual call that already executed concretely, so neither replaying
@@ -1776,6 +1784,7 @@ impl TraceCtx {
             walk_final_pc: None,
             last_mp_green_pc: None,
             abort_after_panic: false,
+            recorder_panicked: false,
             symbolic_residual_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
@@ -1875,6 +1884,7 @@ impl TraceCtx {
             walk_final_pc: None,
             last_mp_green_pc: None,
             abort_after_panic: false,
+            recorder_panicked: false,
             symbolic_residual_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),

@@ -1234,12 +1234,16 @@ impl<'c> Lowerer<'c> {
                     let reg = self.alloc_reg();
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    // The register literals must be spelled inside the
+                    // `__builder` call itself: `regalloc`'s rewriter recolors
+                    // only the arguments of a non-aux builder method call, so
+                    // arguments bound to a local first would keep the register
+                    // numbers the lowerer handed out before coloring.
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
                         quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            let __typed_args = #typed_args;
-                            __builder.residual_call_ref_canonical_via_target(__fn_idx, __typed_args, #reg);
+                            __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #reg);
                         },
                     );
                     // jtransform.py:467-470 — a residual ref call can raise, so
@@ -1266,12 +1270,16 @@ impl<'c> Lowerer<'c> {
                     let reg = self.alloc_reg();
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    // The register literals must be spelled inside the
+                    // `__builder` call itself: `regalloc`'s rewriter recolors
+                    // only the arguments of a non-aux builder method call, so
+                    // arguments bound to a local first would keep the register
+                    // numbers the lowerer handed out before coloring.
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
                         quote! {
                             let __fn_idx = __builder.add_fn_ptr(#func as *const ());
-                            let __typed_args = #typed_args;
-                            __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, __typed_args, #reg, majit_metainterp::nursery_alloc_effect_info());
+                            __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #reg, majit_metainterp::nursery_alloc_effect_info());
                         },
                     );
                     // jtransform.py:467-470 — a residual ref call can raise, so
