@@ -5076,7 +5076,27 @@ impl OptContext {
         }
         let host = OpRef::input_arg_typed(self.inputarg_base + slot, arg.type_());
         let imported = self.get_box_replacement_operand_opt(host)?;
-        (!imported.same_box(arg)).then_some(imported)
+        if imported.same_box(arg) {
+            return None;
+        }
+        // Only a value that means the same thing on every entry to the body
+        // may stand for a body operand's label arg.  A constant does, and so
+        // does another input arg: both are fixed for the whole loop, and the
+        // preamble-proved constants this rejoin exists for are exactly the
+        // first case.
+        //
+        // A result produced inside the trace does not.  The loop redefines it
+        // every iteration, so substituting it turns "the value this iteration
+        // started with" into "the value it ends with".  That is not a
+        // theoretical distinction: a virtualized field store is re-resolved
+        // late, when `_force_elements` emits it at the loop-closing jump, so
+        // `head = Node(i, head)` would store the node the body just allocated
+        // into that node's own `next`.
+        //
+        // `unroll.py:497 source.set_forwarded(target)` unifies the label arg
+        // with the value the preamble jumps with, and those name one runtime
+        // value only at loop entry.
+        (imported.is_constant() || imported.is_inputarg()).then_some(imported)
     }
 
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
@@ -10227,6 +10247,53 @@ mod boxref_forwarding_tests {
         assert!(
             ctx.getptrinfo(&resolved).is_some_and(|info| info.is_null()),
             "the body must read the null the preamble proved, not its own slot"
+        );
+    }
+
+    /// A slot whose import forwards to a value the BODY produces must keep
+    /// naming the label arg.
+    ///
+    /// `unroll.py:497 source.set_forwarded(target)` unifies the label arg with
+    /// the value the preamble jumps with, and those are one runtime value only
+    /// at loop entry. A result produced inside the trace is redefined every
+    /// iteration, so substituting it for a body operand turns "the value this
+    /// iteration started with" into "the value it ends with" — and a
+    /// virtualized field store is re-resolved late, at the loop-closing jump,
+    /// which is where that difference becomes a wrong answer: `head =
+    /// Node(i, head)` stores the node the body just allocated into that node's
+    /// own `next`, and the list walk never terminates.
+    #[test]
+    fn a_peeled_body_keeps_its_label_arg_when_the_import_is_body_produced() {
+        use majit_ir::operand::Operand;
+        const BASE: u32 = 71;
+        const SLOT: u32 = 5;
+        const NUM_INPUTS: usize = 11;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(
+            8,
+            NUM_INPUTS,
+            BASE,
+            BASE + NUM_INPUTS as u32,
+        );
+        let recorder = majit_ir::InputArg::from_type_rc(Type::Ref, SLOT);
+        let host = majit_ir::InputArg::from_type_rc(Type::Ref, BASE + SLOT);
+        let host_arg = Operand::from_bound_inputarg(&host);
+        ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
+        ctx.register_carried_host(&host_arg);
+
+        // The import lands on a result the trace produces — what a loop-carried
+        // `head = Node(i, head)` forwards to, in place of the constant the
+        // sibling test proves is still honoured.
+        let produced = ctx.materialize_operand_at(OpRef::ref_op(4_242));
+        ctx.make_equal_to(&host_arg, &produced);
+
+        let body_arg = Operand::from_bound_inputarg(&recorder);
+        let resolved = ctx
+            .resolve_operand_operand_opt(&body_arg)
+            .expect("the body arg resolves");
+        assert!(
+            resolved.same_box(&body_arg),
+            "a body operand must keep its own label arg when the import names a \
+             value the loop redefines, not the body's own result"
         );
     }
 
