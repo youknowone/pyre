@@ -1,10 +1,14 @@
-# pyre-check: max-pypy-ratio=6.4
-# Ubuntu run 33279264115: 1.3-3.2x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
-# The fixture predates the ratio-gate convention and carried no ceiling. It
-# compiles two loops and, at this trip count, pypy's execution clears the
-# startup-subtraction floor, so a ratio here is a measurement of generated
-# code rather than of two interpreters' startup.
+# pyre-check: max-pypy-ratio=4.0
+# The fixture compiles two loops, and at this trip count pypy's own execution
+# is several times the startup-subtraction floor on every runner, so the ratio
+# measures generated code rather than two interpreters' startup.
+#
+# The ceiling is not twice the slowest reading, the convention the other
+# fixtures use.  The two backends read far enough apart on this shape that a
+# ceiling twice the slower one derives a floor above what the faster one reads,
+# so it is fitted between them instead: it clears the slowest reading by about
+# a quarter, and the floor derived under it sits under the fastest by about a
+# sixth.
 # Regression oracle for the #14 inline-frame heap-store double-commit via the
 # loop-bearing-callee path. A loop-bearing callee that mutates a caller-owned
 # heap object inside its own loop double-commits the mutation when the outer
@@ -14,7 +18,7 @@
 # Expected: len(acc) == 2 * N. Under the bug the JIT printed 2*N + 3 (a constant
 # over-count, independent of N, present only once N crosses the compile
 # threshold), on both backends, which share the trace/resume layer.
-N = 1200000
+N = 2400000
 
 
 def fill(out):
