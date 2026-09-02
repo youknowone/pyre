@@ -2887,6 +2887,13 @@ impl TraceCtx {
     /// callee reads the live struct, so the shadow — which carries the values
     /// the walk has produced since the executor last wrote — is what the
     /// callee must see, arrays included.
+    ///
+    /// The write lands on `virtualizable_heap_ptr`, while the stores its one
+    /// caller records name the identity box instead. Those two CAN name
+    /// different objects — a frontend that traces against a private snapshot
+    /// copy points them apart — but only a token-bearing machine seeds that
+    /// way, and the caller returns above on one, so the pair is the same
+    /// object on every path that reaches here.
     fn synchronize_virtualizable_before_residual_call(&self) {
         self.write_virtualizable_back(false);
     }

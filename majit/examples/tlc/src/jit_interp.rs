@@ -178,8 +178,8 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
 
     while pc < program.len() {
         // The `; state` single-pass form. Reaching it took two fixes, because
-        // this file's `ROLL` and `PUSHARG` arms are abort stubs (see
-        // `jit_tier_is_alive`) and its post-loop expression stores:
+        // this file's `PUSHARG` arm is an abort stub (see `jit_tier_is_alive`)
+        // and its post-loop expression stores:
         //
         // 1. A degraded-stub abort resumed at `opcode_pc + 1` — the shared
         //    prologue advance below, not the instruction width — so the
@@ -193,9 +193,9 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
         //    *storing* trailing expression out of the walk; the regression test
         //    is `jit_interp_halt_arm_post_loop_expression.rs`.
         //
-        // Lowering the `ROLL` arm is still open (it needs a macro spelling for
-        // the base pointer of a `[int; virt]` state-field array), but it is no
-        // longer what blocks this merge point.
+        // The `ROLL` arm lowers since the `VirtArray` spelling gave it a base
+        // pointer for its `[int; virt]` state-field array; the degraded-arm
+        // pin below is what states the remaining set.
         jit_merge_point!(driver, program, pc; state);
         let opcode = program[pc];
         pc += 1;

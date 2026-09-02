@@ -2594,7 +2594,9 @@ where
     /// the matched opcode arm. Preserve it before popping the frame so the
     /// single-pass merge hook resumes native execution at the source loop exit.
     /// The scalar state handoff rides `single_pass_scalar_values` (published by
-    /// the jitdriver Finish arm), so only the resume pc is captured here.
+    /// the jitdriver Finish arm); `value` is the terminator's own result, and
+    /// it replaces `walk_finish_values` here so the hook returns the walk's
+    /// result rather than a stale one from an earlier close.
     fn capture_single_pass_finish(&mut self, ctx: &mut TraceCtx, value: Option<Value>) {
         if self.outer_program_pc.is_none() || self.frames.len() != 1 {
             return;

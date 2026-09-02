@@ -60,7 +60,7 @@ def hot(k):
             rec(DEPTH, INNER)
         except ValueError:
             caught += 1
-        except BaseException as exc:
+        except Exception as exc:
             wrong += 1
             if len(seen) < 3:
                 seen.append('%s: %s' % (type(exc).__name__, exc))
