@@ -438,16 +438,21 @@ impl CallControl {
     ///     return (fnaddr, calldescr)
     /// ```
     ///
-    /// Note: pyre's blackhole calls every Python
-    /// function through one `bh_portal_runner(frame: ref) -> ref`
-    /// stub — the C-ABI is identical for every CodeObject because the
-    /// portal runner unwraps the frame and dispatches dynamically. So
-    /// `(fnaddr, calldescr)` is constant across all graphs in pyre,
-    /// while RPython has one pair per `FUNC` type because lltype-typed
-    /// `direct_call` ops can carry varying signatures. Keeping the
-    /// method shape preserves the call.py:167
-    /// `(fnaddr, calldescr) = self.get_jitcode_calldescr(graph)` flow
-    /// even though both values are constants here.
+    /// The pair is constant across every graph, where RPython has one per
+    /// `FUNC` type because lltype-typed `direct_call` ops carry varying
+    /// signatures. Keeping the method shape preserves the call.py:167
+    /// `(fnaddr, calldescr) = self.get_jitcode_calldescr(graph)` flow even so.
+    ///
+    /// Nothing dispatches the address it returns. `bhimpl_recursive_call_*`
+    /// reaches the portal through `get_portal_runner`, which answers
+    /// `bh_portal_runner_c` with the `"iirrr"` descr that really describes it;
+    /// and where upstream's `bhimpl_inline_call_*` calls
+    /// `cpu.bh_call_*(jitcode.fnaddr, …)` (blackhole.py:1279-1320), pyre reads
+    /// its callee out of a build-time descr pool whose `fnaddr` comes from
+    /// `JitCodeBuilder::set_native_entry`, and a CodeObject jitcode minted here
+    /// is never in that pool. So this stamps a non-null placeholder, and the
+    /// descr beside it describes `bh_portal_runner_c`, not the slice-taking
+    /// `bh_portal_runner` whose address it takes.
     pub fn get_jitcode_calldescr(&self, _graph: *const CodeObject) -> (i64, BhCallDescr) {
         let fnaddr = crate::call_jit::bh_portal_runner as *const () as usize as i64;
         let calldescr = BhCallDescr::from_arg_classes(
