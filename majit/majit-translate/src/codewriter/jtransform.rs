@@ -7387,28 +7387,7 @@ fn optimize_goto_if_not(graph: &mut FunctionGraph, block_idx: usize) -> bool {
         return false;
     }
     // `or v.concretetype != lltype.Bool: return False`
-    //
-    // Read off the links when the type slot cannot answer.  Most graphs
-    // reach here with their kinds published through
-    // `FunctionGraph::set_concretetype_of_inline`, which canonicalises a
-    // `ConcreteType` back to one lltype apiece — and `getkind(Bool)` is
-    // `'i'`, so `concrete_to_canonical_lltype` stores a Bool-producing
-    // compare as `Signed` and the literal predicate rejects it.  The fact
-    // upstream's `lltype.Bool` stands for is that this block's two exits
-    // are the false and the true arm, which the links carry directly and
-    // which `flatten::is_bool_branch` independently requires before it
-    // will emit a two-way branch at all; both sides read it through
-    // `flatten::bool_llexitcase` so the two cannot drift.  Declining when
-    // neither witness holds leaves the block on the unfused
-    // `goto_if_not/iL`, which is what it takes today.
-    let exits_are_bool_pair = matches!(
-        (
-            crate::codewriter::flatten::bool_llexitcase(&graph.blocks[block_idx].exits[0]),
-            crate::codewriter::flatten::bool_llexitcase(&graph.blocks[block_idx].exits[1]),
-        ),
-        (Some(false), Some(true)) | (Some(true), Some(false))
-    );
-    if v.concretetype() != Some(LowLevelType::Bool) && !exits_are_bool_pair {
+    if v.concretetype() != Some(LowLevelType::Bool) {
         return false;
     }
 
@@ -7542,29 +7521,6 @@ fn goto_if_not_fusable(kind: &OpKind) -> Option<(String, Vec<crate::flowspace::m
             ) =>
         {
             Some((op.clone(), vec![operand.clone()]))
-        }
-        // The truthify operator the front end emits for a condition that is
-        // not already a comparison.  `assembler::op_kind_to_opname_with_kinds`
-        // names it `int_is_true` for an `i` operand and `ptr_nonzero` for an
-        // `r` one, and that renaming runs after flatten -- so the
-        // `int_is_true` / `ptr_nonzero` arm above matches nothing the front
-        // end produces, the same gap the bare-comparison arm covers.  The
-        // fused exitswitch has to name the key the assembler will look up
-        // (`goto_if_not_int_is_true/iL`, `goto_if_not_ptr_nonzero/rL`), whose
-        // argcode comes from this operand's own register kind, so the two
-        // halves are resolved from one source here.
-        OpKind::UnaryOp { op, operand, .. } if op == "bool" => {
-            let opname = match FunctionGraph::concretetype_of(operand) {
-                crate::codewriter::type_state::ConcreteType::Signed => "int_is_true",
-                crate::codewriter::type_state::ConcreteType::GcRef => "ptr_nonzero",
-                // A Float operand is rewritten to `float_ne` against zero
-                // before reaching here, and an Unknown one takes
-                // `flatten::kind_color_of`'s fallback, which this cannot
-                // predict.  Naming the wrong half would build a key no
-                // handler is wired to, so decline and keep the unfused form.
-                _ => return None,
-            };
-            Some((opname.to_string(), vec![operand.clone()]))
         }
         _ => None,
     }
@@ -9070,152 +9026,6 @@ mod tests {
         assert!(row(&live).contains("1x"), "{}", row(&live));
         assert!(!row(&live).contains("INERT"), "{}", row(&live));
         assert!(row(&inert).contains("0x INERT"), "{}", row(&inert));
-    }
-
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType as LlType;
-
-    /// The shape production actually reaches this pass with: a truthify
-    /// (`OpKind::UnaryOp { op: "bool" }`) whose result carries `Signed`,
-    /// not `Bool`.  Both halves of the fuse have to hold — the two-way
-    /// branch has to be recognised from the links, and `"bool"` has to
-    /// resolve to the `int_is_true` the assembler will name.
-    #[test]
-    fn a_truthify_condition_over_an_int_fuses_as_int_is_true() {
-        let (mut graph, cond, operand, start) = truthify_fixture(LlType::Signed, LlType::Signed);
-        assert!(
-            super::optimize_goto_if_not(&mut graph, start),
-            "a truthify branch must fuse"
-        );
-        let block = &graph.blocks[start];
-        assert!(
-            !block
-                .operations
-                .iter()
-                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "bool")),
-            "the fused truthify op must be removed"
-        );
-        match &block.exitswitch {
-            Some(crate::model::ExitSwitch::Fused { opname, args }) => {
-                assert_eq!(opname, "int_is_true");
-                assert_eq!(args, &vec![operand]);
-            }
-            other => panic!("expected a fused exitswitch, got {other:?}"),
-        }
-        let _ = cond;
-    }
-
-    /// The `r` half of the same resolution: `op_kind_to_opname_with_kinds`
-    /// names a truthify over a Ref operand `ptr_nonzero`, and
-    /// `goto_if_not_ptr_nonzero/rL` is the key that has to be built.
-    #[test]
-    fn a_truthify_condition_over_a_ref_fuses_as_ptr_nonzero() {
-        let (mut graph, _cond, operand, start) = truthify_fixture(
-            crate::translator::rtyper::rclass::OBJECTPTR.clone(),
-            LlType::Signed,
-        );
-        assert!(super::optimize_goto_if_not(&mut graph, start));
-        match &graph.blocks[start].exitswitch {
-            Some(crate::model::ExitSwitch::Fused { opname, args }) => {
-                assert_eq!(opname, "ptr_nonzero");
-                assert_eq!(args, &vec![operand]);
-            }
-            other => panic!("expected a fused exitswitch, got {other:?}"),
-        }
-    }
-
-    /// Control: an operand whose kind this pass cannot resolve takes
-    /// `flatten::kind_color_of`'s fallback, so naming a half here could
-    /// build a key with no handler.  It must decline, not guess.
-    #[test]
-    fn a_truthify_condition_over_an_unresolved_operand_declines() {
-        let (mut graph, _cond, _operand, start) = {
-            let (mut g, c, o, s) = truthify_fixture(LlType::Signed, LlType::Signed);
-            o.set_concretetype(None);
-            (g.clone(), c, o, s)
-        };
-        assert!(
-            !super::optimize_goto_if_not(&mut graph, start),
-            "an unresolved operand kind must decline the fuse"
-        );
-    }
-
-    /// Control: the link-side witness is what stands in for
-    /// `lltype.Bool`, so a two-way branch whose exits are not the false
-    /// and true arms must still decline.
-    #[test]
-    fn a_two_way_branch_without_bool_exitcases_declines() {
-        use crate::flowspace::model::ConstValue;
-        use crate::model::{ExitCase, ExitSwitch, Link};
-        let (mut graph, cond, _operand, start) = truthify_fixture(LlType::Signed, LlType::Signed);
-        let targets: Vec<_> = graph.blocks[start]
-            .exits
-            .iter()
-            .map(|link| link.target)
-            .collect();
-        graph.set_control_flow_metadata(
-            crate::model::BlockId(start),
-            Some(ExitSwitch::Value(cond)),
-            vec![
-                Link::new_mixed(
-                    vec![],
-                    targets[0],
-                    Some(ExitCase::Const(ConstValue::Int(0))),
-                ),
-                Link::new_mixed(
-                    vec![],
-                    targets[1],
-                    Some(ExitCase::Const(ConstValue::Int(1))),
-                ),
-            ],
-        );
-        assert!(
-            !super::optimize_goto_if_not(&mut graph, start),
-            "an integer-cased two-way branch must decline the fuse"
-        );
-    }
-
-    /// `t = bool(x); exitswitch = t` with two bool-cased exits, the
-    /// concretetypes stamped as the caller asks.  Returns the graph, the
-    /// condition variable, the truthify operand, and the start block.
-    fn truthify_fixture(
-        operand_ty: LlType,
-        cond_ty: LlType,
-    ) -> (
-        FunctionGraph,
-        crate::flowspace::model::Variable,
-        crate::flowspace::model::Variable,
-        usize,
-    ) {
-        use crate::model::{ExitCase, ExitSwitch, Link};
-        let mut graph = FunctionGraph::new("goto_if_not_truthify");
-        let operand = graph.alloc_value_var();
-        operand.set_concretetype(Some(operand_ty));
-        let cond = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::UnaryOp {
-                    op: "bool".to_string(),
-                    operand: operand.clone(),
-                    result_ty: ValueType::Bool,
-                },
-                true,
-            )
-            .unwrap();
-        // What production publishes: `getkind(Bool)` is `'i'`, so the
-        // canonicalising writer stores `Signed` here, never `Bool`.
-        cond.set_concretetype(Some(cond_ty));
-        let if_false = graph.create_block();
-        let if_true = graph.create_block();
-        let start = graph.startblock.0;
-        graph.set_control_flow_metadata(
-            graph.startblock,
-            Some(ExitSwitch::Value(cond.clone())),
-            vec![
-                Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
-                Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true))),
-            ],
-        );
-        (graph, cond, operand, start)
     }
 
     /// the GotoIfNotOp lowering Stage 1: `int_lt(a, b); exitswitch = t` fuses into a

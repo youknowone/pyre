@@ -337,14 +337,7 @@ fn is_bool_branch(block: &crate::model::Block) -> bool {
     matches!(cases, (Some(false), Some(true)) | (Some(true), Some(false)),)
 }
 
-/// The link's boolean exit case — `link.llexitcase` first, then
-/// `link.exitcase` for a direct semantic graph.
-///
-/// `jtransform::optimize_goto_if_not` reads the same fact to decide
-/// whether a block is the two-way boolean branch upstream identifies by
-/// `exitswitch.concretetype == lltype.Bool`, so both sides share this
-/// one reader rather than each spelling the source order themselves.
-pub(crate) fn bool_llexitcase(link: &Link) -> Option<bool> {
+fn bool_llexitcase(link: &Link) -> Option<bool> {
     match link.llexitcase.as_ref() {
         Some(ConstValue::Bool(value)) => return Some(*value),
         Some(_) => return None,
