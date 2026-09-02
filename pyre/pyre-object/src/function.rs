@@ -101,7 +101,14 @@ pub fn w_method_new(
         // items block. A nursery shell answers the barrier in its `is_in_nursery`
         // arm, so the call stands for the spill case alone.
         crate::gc_hook::try_gc_write_barrier_managed(raw);
-        for slot in (save_point..save_point + 3).chain(std::iter::once(shell_slot)) {
+        // The four slots are not one contiguous run — `shell_slot` was read
+        // back rather than derived — so walk them by index instead of joining
+        // two iterators. `chain(once(..))` reaches the JIT as four body-less
+        // `core::iter` adapter callees, and an adapter state machine has no
+        // RPython counterpart to lower it to, which drops this graph and every
+        // graph that calls it to the legacy walker.
+        for i in 0..4 {
+            let slot = if i == 3 { shell_slot } else { save_point + i };
             let root = crate::gc_roots::shadow_stack_get(slot);
             let current =
                 crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
