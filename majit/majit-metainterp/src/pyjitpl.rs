@@ -7677,9 +7677,23 @@ impl<M: Clone> MetaInterp<M> {
         // fall back to and no state to match, so declining the loop is the
         // only answer left that is not the wrong one.
         //
+        // Only for a jitdriver whose `enable_opts` has no `unroll` at all.
+        // `retried_without_unroll` is also set by the other route into this
+        // retry — the `InvalidLoop` the peeling attempt itself raised, which
+        // `compile.py` answers by trying one last time without unrolling. That
+        // retry is a rescue: the key does peel, this trace's peeled form was
+        // rejected, and what the retry publishes is the only compile the trace
+        // will get. Declining it costs the loop and the rescue both, and
+        // nothing upstream declines it. Where the driver has no peel the shape
+        // is not one trace's bad luck but every loop the key will ever hold, so
+        // there refusing is the whole of the answer.
+        //
         // The abort ceiling turns a key that keeps producing this shape into a
         // `JC_DONT_TRACE_HERE`, so the frontend converges on interpreting it.
-        if retried_without_unroll && Self::closing_jump_fixes_label_slots(&compiled_ops) {
+        if no_unroll
+            && retried_without_unroll
+            && Self::closing_jump_fixes_label_slots(&compiled_ops)
+        {
             crate::mc_diag_bump(crate::mc_diag_slot(
                 "peel_less_loop_label_is_const_specialized",
             ));
