@@ -1855,6 +1855,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::_pure_lookup_class_with_method_cache",
         pure_lookup_class_with_method_cache,
     );
+    // `W_Super.getattribute` walks the MRO itself and reads each class's own
+    // namespace, so it needs the single-type elidable rather than the
+    // method-cache pair above.
+    let pure_getdictvalue_no_unwrapping: extern "C" fn(i64, i64, i64) -> i64 =
+        crate::baseobjspace::__majit_call_target__pure_getdictvalue_no_unwrapping;
+    cpa3(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::_pure_getdictvalue_no_unwrapping",
+        "pyre_interpreter::_pure_getdictvalue_no_unwrapping",
+        pure_getdictvalue_no_unwrapping,
+    );
     // #346: null-collapsing stable-alloc primitive residualised via
     // `#[dont_look_inside]`, keeping the thread-local GC hook dispatch out of
     // the trace.
