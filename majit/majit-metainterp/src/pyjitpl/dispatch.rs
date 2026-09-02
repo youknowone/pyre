@@ -2324,16 +2324,17 @@ where
     /// to follow are the portal's, and the callees run orders of magnitude
     /// more of them.
     fn pcseq_branch(&mut self, kind: &str, opcode_pc: usize, value: i64, target: Option<usize>) {
-        if !crate::pcseq_enabled() || self.frames.len() != 1 {
+        if !crate::pcseq_enabled() {
             return;
         }
+        let depth = self.frames.len();
         let name = &self.frames.current_mut().jitcode.name;
         match target {
-            Some(t) => {
-                eprintln!("@@@PCSEQ {kind} jitcode={name} pc={opcode_pc} value={value} -> {t}")
-            }
+            Some(t) => eprintln!(
+                "@@@PCSEQ {kind} d={depth} jitcode={name} pc={opcode_pc} value={value} -> {t}"
+            ),
             None => eprintln!(
-                "@@@PCSEQ {kind} jitcode={name} pc={opcode_pc} value={value} -> fallthrough"
+                "@@@PCSEQ {kind} d={depth} jitcode={name} pc={opcode_pc} value={value} -> fallthrough"
             ),
         }
     }
