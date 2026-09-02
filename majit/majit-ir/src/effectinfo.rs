@@ -372,9 +372,9 @@ pub fn intern_effect_info(effect_info: EffectInfo) -> Arc<EffectInfoCell> {
         return Arc::new(EffectInfoCell::new(effect_info));
     }
 
-    // `effectinfo.py:14` spells the interner `_cache = {}` and `:147` probes
-    // it with `key in cls._cache`, so one lookup costs one hash of the key
-    // whatever the cache already holds. A sequence answered the same question
+    // `EffectInfo._cache` is a dict and `EffectInfo.__new__` probes it with
+    // `key in cls._cache`, so one lookup costs one hash of the key whatever
+    // the cache already holds. A sequence answered the same question
     // by running `EffectInfo`'s `==` — which compares six descr sets
     // element-wise — against every cell already interned, so the cost of
     // interning the n-th distinct EffectInfo grew with n.
