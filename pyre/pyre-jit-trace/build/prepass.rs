@@ -1117,8 +1117,8 @@ fn real_main() {
     // an unmatched name keeps this process's address.  The `#[pyre_class]`
     // registry populates on every target for that reason; where the two pools
     // can still disagree is the module set, which this process cannot read for
-    // another target, and `reject_unpaired_build_addrs` refuses the load if
-    // one of those names reaches a constant pool.
+    // another target, and `disarm_unpaired_build_addrs` writes zero over an
+    // address of that kind so the call sites reading it decline.
     let registry_rows = pyre_interpreter::pyre_class_pytype_addrs();
     let registry_keys: std::collections::HashSet<&str> =
         registry_rows.iter().map(|&(key, _)| key).collect();
