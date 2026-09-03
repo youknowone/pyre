@@ -963,12 +963,14 @@ pub enum RuntimeHelperKind {
     /// `bh_format_simple_fn(value)` — the FORMAT_SIMPLE helper
     /// (`runtime_ops::format_value` with the empty spec).  A user
     /// `__format__` runs Python here, so the generic residual is opaque for
-    /// the whole method body.  The full-body walker recognises this tag to
-    /// resolve `__format__` on the promoted receiver class and inline the
-    /// resolved body behind a `guard_class` + version-tag guard, the same
-    /// receiver-pinning route [`RuntimeHelperKind::BinaryOp`] takes for a
-    /// user `__add__`.  A builtin `__format__` is not inlinable Python code
-    /// and falls through to the residual unchanged.
+    /// the whole method body.
+    ///
+    /// No walker route consumes this tag, so a FORMAT_SIMPLE stays residual.
+    /// The receiver-pinning inline [`RuntimeHelperKind::FormatWithSpec`]
+    /// takes needs a spec operand for the callee's second parameter, and
+    /// FORMAT_SIMPLE carries none: `format_value_dispatch` allocates a fresh
+    /// empty `str` per call, which a route would have to synthesize.  The tag
+    /// is what such a route would key on.
     FormatSimple,
     /// `bh_format_with_spec_fn(value, spec)` — the FORMAT_WITH_SPEC helper,
     /// the two-operand sibling of [`RuntimeHelperKind::FormatSimple`] carrying
