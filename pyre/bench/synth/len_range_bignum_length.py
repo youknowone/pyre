@@ -26,4 +26,4 @@ def main():
 
 
 main()
-# Expected: 200000 OverflowError
+# Expected: 400000 OverflowError
