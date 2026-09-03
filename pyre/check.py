@@ -248,7 +248,7 @@ BENCH_COMPARE_BUFFER_S = 0.005
 # Windows process CPU accounting advances in scheduler ticks (normally 1/64 s).
 # Keep the execution floor at least one observable tick on that platform.
 WIN_TIMER_QUANTUM_S = 1.0 / 64
-# Empty-program user-CPU startup is MEASURED (median of STARTUP_SAMPLES runs)
+# Empty-program user-CPU startup is MEASURED (mean of STARTUP_SAMPLES runs)
 # and subtracted from every timed run before ratios and perf gates are
 # computed, so a fixed per-process cost does not inflate the ratio/gate of a
 # short bench. Never hardcode the startup.
@@ -270,21 +270,53 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # denominator and inflates every ratio computed against it.  A CI runner
 # measured pypy startup at 0.031s where the same job on the same platform had
 # measured 0.013s, and three unrelated benches failed their gates in that run
-# while their pyre exec times had gone *down*.  Five samples make the median
-# robust to two outliers instead of one.
+# while their pyre exec times had gone *down*.  That reading is the one the
+# estimator below is chosen against: 0.031s is what a loaded sampling window
+# reports, and the pass that carried it also saw 0.013s.
 #
-# The estimator is the MEDIAN and not the minimum, even though the quantity is a
-# fixed per-process cost whose error sources are all one-sided — contention,
-# cache pressure and page faults only ever add user CPU.  The minimum does
-# recover that cost, but it recovers it for an *idle* machine, and it is
-# subtracted from bench runs that were not idle: under load a bench carries an
-# inflated startup inside it, and taking the unloaded minimum away leaves that
-# inflation behind in `exec`.  Pairing median with median cancels it; pairing an
-# idle minimum with a loaded bench does not.  Measured on one CI job, the
-# minimum came in 15ms under the median for dynasm and 13ms for cranelift, which
-# carried nine short benches whose baseline was pinned to EXEC_TIME_FLOOR_S over
-# their gates at once.  The estimate has to come from the same load conditions
-# as the run it is subtracted from.
+# The estimator is the MEAN, and the reason is that on one platform the samples
+# are quantised far more coarsely than the quantity they measure.  Windows
+# charges process CPU by sampling at WIN_TIMER_QUANTUM_S, so a single reading is
+# a count of ticks the process happened to be caught running for -- an unbiased
+# estimate of the true cost, but one that can only take lattice values.
+# Measured here over 40 empty-program runs, pypy read 0.000s 31 times, 0.016s 8
+# times and 0.031s once: mean 0.0039s against a wall-clock mean of 0.026s.  The
+# cost is about four milliseconds, and NO sample ever reports that.  A median
+# picks a lattice point and so reads 0.016s, four times the cost; across 47 CI
+# sampling passes it reads two ticks, 0.031s, in 19 of them.  A minimum picks
+# the other lattice point and reads 0.000s.  Averaging is what recovers the
+# value between them, and it is the only one of the three that converges on the
+# quantity as samples are added.
+#
+# Off windows the reading is not quantised and the three estimators agree to
+# within a millisecond -- ubuntu 0.012s median against a 0.009s minimum, macos
+# 0.016s against 0.014s -- so this changes almost nothing there.  It is a
+# correction to one platform's instrument, not a policy about how much to
+# subtract, which is why it is not a widening: on the platform it moves, the
+# value it replaces was four times the cost it claimed to be.
+#
+# What rides on it is the denominator.  A startup estimate is subtracted from a
+# baseline whose whole execution time is often the same size: measured across
+# ten CI runs the median `exec` for pypy is 8ms on ubuntu, 10ms on macos and
+# 16ms on windows.  An estimate that lands high collapses that denominator onto
+# EXEC_TIME_FLOOR_S, and a baseline pinned there is not a measurement --
+# `failed_bound` declines BOTH bounds on it, so the fixture's recorded ceiling
+# goes unapplied.  Over-subtraction does not make the gate stricter; it makes
+# the gate absent.
+#
+# The mean is the one estimator of the three that a single slow sample can move,
+# which is what STARTUP_SAMPLES answers: the sampling error of a mean of N falls
+# as sqrt(N), and each pass prints the range it was drawn from so an outlier is
+# visible rather than inferred.
+#
+# This supersedes the MINIMUM, taken here briefly, and the MEDIAN recorded
+# through `bc67f721c42`.  That commit's counter-example -- nine short benches
+# carried over their gates by an estimate 15ms under the median -- described
+# benches gated on a baseline pinned to EXEC_TIME_FLOOR_S, and `6a098e07ce2`
+# later made a pinned baseline decline both bounds, so it no longer describes
+# this code.  What survives of it is that an estimate from an idle window is
+# subtracted from benches that were not idle; the mean is drawn from the same
+# window as the median was, so that argument does not distinguish them.
 #
 # That last condition is what STARTUP_REFRESH_S exists to meet.  A single
 # upfront measurement is subtracted from benches that run for the rest of the
@@ -296,7 +328,7 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # it is taken from, and every pass prints the samples it was drawn from
 # ([min..max]) so the drift is readable in the log rather than inferred from a
 # neighbouring job.
-STARTUP_SAMPLES = 5
+STARTUP_SAMPLES = 7
 # Re-measured no more often than this, and only at a fixture boundary: the
 # pairing argument above requires a fixture's numerator and denominator to be
 # reduced by the SAME estimate, which a refresh between one fixture's backends
@@ -312,7 +344,7 @@ STARTUP_SAMPLES = 5
 # allowed to drift further from what it is subtracted from.
 STARTUP_REFRESH_S = 120
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
-# `exec` is `bench - startup`, and startup is a measured median rather than a
+# `exec` is `bench - startup`, and startup is a measured mean rather than a
 # constant, so whatever the estimate is off by lands whole in `exec`.  That
 # error is real, but NO allowance is granted for it, and a standing allowance
 # was tried and removed.  It read `0.5 * startup`, added to the baseline on
@@ -3188,7 +3220,7 @@ class Check:
         parts = []
         for key, got in samples.items():
             if got:
-                self.startup[key] = statistics.median(got)
+                self.startup[key] = statistics.fmean(got)
                 spread = f"[{min(got):.3f}..{max(got):.3f}]"
             else:
                 spread = "[unsampled]"
@@ -3200,7 +3232,7 @@ class Check:
         """Measure each baseline interpreter's empty-program user-CPU cost.
 
         Runs an empty script STARTUP_SAMPLES times per interpreter, records
-        the median user-CPU in self.startup and prints it beside the range its
+        the mean user-CPU in self.startup and prints it beside the range its
         samples spanned. This is the fixed per-process cost of interpreter
         init, added to every bench regardless of workload; subtracting it
         yields a comparison of the work the fixture asked for. Re-measured
@@ -3211,8 +3243,8 @@ class Check:
             return
         samples, cost = self._sample_startups()
         print(dim(
-            f"startup (empty-program user-CPU, median {STARTUP_SAMPLES} "
-            f"in {cost:.1f}s, shown as median[min..max]; ratios/gates are "
+            f"startup (empty-program user-CPU, mean of {STARTUP_SAMPLES} "
+            f"in {cost:.1f}s, shown as mean[min..max]; ratios/gates are "
             f"execution-only): "
             + self._adopt_startups(samples)
         ))
@@ -3231,7 +3263,7 @@ class Check:
             return
         samples, cost = self._sample_startups()
         print(dim(
-            f"startup re-measured in {cost:.1f}s (median[min..max]): "
+            f"startup re-measured in {cost:.1f}s (mean[min..max]): "
             + self._adopt_startups(samples)
         ))
 
