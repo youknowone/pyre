@@ -5092,7 +5092,7 @@ dependencies = [
 [[package]]
 name = "xz-core"
 version = "0.1.0-rc.0"
-source = "git+https://github.com/youknowone/xz-rs-simnalamburt?rev=9c5cc27154e90b48348f713e28ab02bb2c5b52b4#9c5cc27154e90b48348f713e28ab02bb2c5b52b4"
+source = "git+https://github.com/simnalamburt/xz-rs?rev=5bf95411d0307e052ca2aeb06f0d75565c9a7362#5bf95411d0307e052ca2aeb06f0d75565c9a7362"
 dependencies = [
  "libc",
  "memchr",
