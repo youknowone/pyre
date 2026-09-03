@@ -677,6 +677,14 @@ impl ExecutionContext {
     pub fn clone_for_thread(&self) -> Self {
         let mut ec = self.clone();
         ec.topframeref = std::ptr::null_mut();
+        // The activation accounting is per-context and the worker runs none of
+        // the spawning thread's frames.  Carrying the depth over would spend
+        // part of `sys.getrecursionlimit()` before the thread's first frame;
+        // carrying the address over would let a frame minted here read itself
+        // as already accounted, the way an address reused by this thread's
+        // allocator would, and never pay its unit.
+        ec.py_recursion_depth = 0;
+        ec.accounted_activation = 0;
         ec.w_tracefunc = pyre_object::PY_NULL;
         ec.is_tracing = 0;
         ec.profilefunc = None;

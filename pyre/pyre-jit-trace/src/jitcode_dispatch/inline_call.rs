@@ -3427,7 +3427,16 @@ fn record_activation_charge<Sym: WalkSym>(
         &[limit_addr, zero],
         recursion_limit_word_descr(),
     );
-    let over_limit = ctx.trace_ctx.record_op(OpCode::UintGe, &[charged, limit]);
+    // Strictly greater, because the check this stands in for runs *ahead* of
+    // the charge: `stack_check` reads the depth before `enter_recursive_frame`
+    // spends the unit, so `depth >= limit` refuses only a frame that would
+    // take the depth past the limit and a recursion is allowed to reach the
+    // limit exactly.  Charging first and then testing `charged >= limit` would
+    // refuse at `limit - 1` what the plain evaluator admits, and the two paths
+    // would enforce limits one apart.  `units` covers the inlined levels above
+    // this seam, each of which would have run its own ahead-of-charge check, so
+    // the last of them is the one this test decides.
+    let over_limit = ctx.trace_ctx.record_op(OpCode::UintGt, &[charged, limit]);
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[over_limit])?;
 
     Ok((saved_depth, displaced_activation))

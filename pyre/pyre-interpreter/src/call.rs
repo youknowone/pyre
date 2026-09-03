@@ -304,32 +304,52 @@ fn detached_recursion_state_set(depth: usize, accounted: usize) {
 }
 
 /// Read `(py_recursion_depth, accounted_activation)` from `home`.
+///
+/// Reached through field addresses rather than through `as_ref` / `as_mut`:
+/// the plain evaluator mints a `&mut PyExecutionContext` over this same
+/// context and keeps it live for the whole activation (`eval.rs`, the
+/// `execution_context` that spans `enter` to `leave`), while anything nested
+/// inside that activation -- `enter_native_dispatch`, a re-entered frame --
+/// reaches this pair.  A whole-context reference minted here would alias that
+/// one; a raw field access borrows no more than the field it names.
 #[inline]
 fn recursion_state_get(home: RecursionHome) -> (usize, usize) {
     if home.is_null() {
         detached_recursion_state_get()
     } else {
         // PyPy reads recursion state directly from the live execution
-        // context.  Keep that field access visible to source translation;
-        // `raw_ptr::as_ref` would introduce a Rust-only `Option` call between
-        // the context and its fields.
-        let ec = unsafe { &*home };
-        (ec.py_recursion_depth, ec.accounted_activation)
+        // context (`executioncontext.py ExecutionContext`). Keep the field
+        // access visible to source translation; `raw_ptr::as_ref` would
+        // introduce a Rust-only `Option` call between the context and its
+        // fields. Use field addresses rather than `&*home`: the evaluator
+        // already holds `&mut PyExecutionContext` across this call.
+        unsafe {
+            (
+                (&raw const (*home).py_recursion_depth).read(),
+                (&raw const (*home).accounted_activation).read(),
+            )
+        }
     }
 }
 
 /// Write `(py_recursion_depth, accounted_activation)` back to `home`.
+///
+/// Same field-address treatment as [`recursion_state_get`], for the same
+/// reason -- and the write half is the one that matters, since a second
+/// mutable reference is what invalidates the evaluator's own.
 #[inline]
 fn recursion_state_set(home: RecursionHome, depth: usize, accounted: usize) {
     if home.is_null() {
         detached_recursion_state_set(depth, accounted);
     } else {
-        // This is the write-side twin of `recursion_state_get`: the
-        // execution-context fields, rather than a Rust pointer/Option helper,
-        // are the translated state.
-        let ec = unsafe { &mut *home };
-        ec.py_recursion_depth = depth;
-        ec.accounted_activation = accounted;
+        // Write-side twin of `recursion_state_get`: field addresses, not a
+        // whole-context `&mut`, so this does not alias the evaluator's
+        // live reference. The execution-context fields remain the
+        // translated state.
+        unsafe {
+            (&raw mut (*home).py_recursion_depth).write(depth);
+            (&raw mut (*home).accounted_activation).write(accounted);
+        }
     }
 }
 
