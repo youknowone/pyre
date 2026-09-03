@@ -4402,9 +4402,14 @@ pub(crate) fn exc_handler_rejoins_loop(code: &[u8], catch_target: usize) -> bool
         }
         match op.key {
             "goto/L" => work.push(read_label(code, &op, 0)),
-            "goto_if_not/iL" => {
-                // `iL`: 1B int register + 2B LE label.
-                work.push(read_label(code, &op, 1));
+            // Every member of the family spells its label as the FINAL
+            // operand (`iL`, `iiL`, `rL`, `rrL`, `ffL`), so the operand index
+            // is one less than the argcode count -- 1 for the plain `iL` this
+            // used to hard-code.  Naming a single key here left a fused
+            // branch's taken arm off the worklist, which this walk reads as
+            // "that block is unreachable" rather than as a decline.
+            key if key.starts_with("goto_if_not") && op.argcodes.ends_with('L') => {
+                work.push(read_label(code, &op, op.argcodes.len() - 1));
                 work.push(op.next_pc);
             }
             key if key.starts_with("switch") => {
@@ -12079,9 +12084,21 @@ fn handle<Sym: WalkSym>(
                 if jump { target } else { op.next_pc },
             ))
         }
-        // Same shape with one operand; `goto_if_not_int_is_true` has no arm
-        // because the assembler spells that condition as plain `goto_if_not`,
-        // matching the class-attribute alias upstream gives it.
+        // Same shape with one operand.  `pyjitpl.py`
+        // `opimpl_goto_if_not_int_is_true` and `opimpl_goto_if_not_int_is_zero`
+        // each `self.execute` their unary and hand the fresh condbox to
+        // `opimpl_goto_if_not(..., replace=False)`, so each records its own op
+        // instead of branching on the value.
+        //
+        // Only `blackhole.py` aliases the pair
+        // (`bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`).  The walker
+        // is the metainterp side, where the difference is observable twice
+        // over: the plain arm records no `int_is_true`, and its `replace`
+        // rewrites the *value* box to a constant -- for the fused form that box
+        // is `x`, not the boolean the branch tested.
+        "goto_if_not_int_is_true/iL" => {
+            fused_goto_if_not_int_unary(code, op, ctx, OpCode::IntIsTrue)
+        }
         "goto_if_not_int_is_zero/iL" => {
             fused_goto_if_not_int_unary(code, op, ctx, OpCode::IntIsZero)
         }
