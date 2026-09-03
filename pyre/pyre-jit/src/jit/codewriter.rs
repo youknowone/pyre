@@ -217,6 +217,17 @@ fn portal_jit_merge_point_graph_args(
     // that per-SpaceOp Variable here so the canonical
     // `flatten_graph` driver sees no unresolved `Opaque(Ref)`
     // constants.
+    //
+    // Deviation, currently inert: the `is_being_profiled` green is the
+    // constant `0`, while `interp_jit.py:84,90` hoists
+    // `self.get_is_being_profiled()` and passes the live flag, and every
+    // runtime green-key producer here passes it live too
+    // (`make_green_key(code_ptr, pc, is_being_profiled)` at eval.rs, and
+    // `frame.get_is_being_profiled()` at call_jit.rs).  Nothing reads
+    // `green_int[1]` today, so the emitted tuple and the runtime key
+    // never meet on that slot; a re-entry that starts consuming the full
+    // green tuple would re-enter a profiled portal on the unprofiled
+    // cell, and this operand has to become the live value first.
     let greens = vec![
         super::flow::Constant::signed(next_instr as i64).into(),
         super::flow::Constant::signed(0).into(),

@@ -6843,126 +6843,6 @@ fn apply_jit_param_string(
     majit_metainterp::jit::set_user_param(ws, text).map_err(|_| ())
 }
 
-/// interp_jit.py — set_param(space, __args__).
-///
-/// Configure the tunable JIT parameters.
-///   * set_param(name=value, ...)            # as keyword arguments
-///   * set_param("name=value,name=value")    # as a user-supplied string
-///   * set_param("off")                      # disable the jit
-///   * set_param("default")                  # restore all defaults
-pub fn set_param(
-    _space: pyre_object::PyObjectRef,
-    __args__: &[pyre_object::PyObjectRef],
-) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    let _ = _space;
-    let (driver, _) = driver_pair();
-
-    // Separate positional args from kwargs dict (last arg with __pyre_kw__ marker).
-    let (pos_args, kwds) = split_kwargs(__args__);
-
-    // interp_jit.py:147-148
-    if pos_args.len() > 1 {
-        return Err(pyre_interpreter::PyError::type_error(format!(
-            "set_param() takes at most 1 non-keyword argument, {} given",
-            pos_args.len()
-        )));
-    }
-
-    // interp_jit.py:151-156 — positional string → jit.set_user_param(None, text)
-    if pos_args.len() == 1 {
-        // `space.text_w` rejects a non-str positional with TypeError.
-        let text = pyre_interpreter::baseobjspace::text_w(pos_args[0])?;
-        // rlib/jit.py set_user_param.
-        let ws = driver.meta_interp_mut().warm_state_mut();
-        if apply_jit_param_string(ws, &text).is_err() {
-            return Err(pyre_interpreter::PyError::new(
-                pyre_interpreter::PyErrorKind::ValueError,
-                "error in JIT parameters string".to_string(),
-            ));
-        }
-    }
-
-    // interp_jit.py:157-167 — keyword arguments.  Routed through
-    // strategy-dispatched `w_dict_items` (dictmultiobject.py items)
-    // rather than reaching past the strategy slot into `dstorage` —
-    // the raw cast would tear once a non-Object strategy backs `kwds`.
-    if let Some(kw_dict) = kwds {
-        let ws = driver.meta_interp_mut().warm_state_mut();
-        let items = unsafe { pyre_object::dictmultiobject::w_dict_items(kw_dict) };
-        for (k, v) in items {
-            if !unsafe { pyre_object::is_str(k) } {
-                continue;
-            }
-            let key = unsafe { pyre_object::w_str_get_value(k) };
-            if key == "__pyre_kw__" {
-                continue;
-            }
-            // interp_jit.py:158-159 — `space.text_w` rejects a non-str value.
-            if key == "enable_opts" {
-                ws.set_param_enable_opts(pyre_interpreter::baseobjspace::text_w(v)?);
-                continue;
-            }
-            // interp_jit.py — `intval = space.int_w(w_value)` is computed
-            // (rejecting a non-int value with TypeError) before the parameter
-            // name is validated.
-            let intval = pyre_interpreter::baseobjspace::int_w(v)?;
-            if !is_known_jit_param(key) {
-                return Err(pyre_interpreter::PyError::type_error(format!(
-                    "no JIT parameter '{key}'"
-                )));
-            }
-            ws.set_param(key, intval);
-        }
-    }
-
-    Ok(w_none())
-}
-
-/// rlib/jit.py PARAMETERS — valid parameter names.
-fn is_known_jit_param(name: &str) -> bool {
-    matches!(
-        name,
-        "threshold"
-            | "function_threshold"
-            | "trace_eagerness"
-            | "decay"
-            | "trace_limit"
-            | "inlining"
-            | "loop_longevity"
-            | "retrace_limit"
-            | "pureop_historylength"
-            | "max_retrace_guards"
-            | "max_unroll_loops"
-            | "disable_unrolling"
-            | "enable_opts"
-            | "max_unroll_recursion"
-            | "vec"
-            | "vec_all"
-            | "vec_cost"
-    )
-}
-
-/// Split args into (positional, optional kwargs dict).
-fn split_kwargs(
-    args: &[pyre_object::PyObjectRef],
-) -> (
-    &[pyre_object::PyObjectRef],
-    Option<pyre_object::PyObjectRef>,
-) {
-    if let Some(&last) = args.last() {
-        if !last.is_null()
-            && unsafe { pyre_object::is_dict(last) }
-            && unsafe {
-                pyre_object::w_dict_lookup(last, pyre_object::w_str_new("__pyre_kw__"))
-                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-            }
-        {
-            return (&args[..args.len() - 1], Some(last));
-        }
-    }
-    (args, None)
-}
-
 /// interp_jit.py:258 — `@dont_look_inside`
 ///
 /// Mark all current machine code objects as ready to release.
@@ -12057,7 +11937,11 @@ fn compile_and_run_once(
 /// RPython warmstate.py bound_reached.
 ///
 /// Called when counter threshold fires and no compiled code exists.
-/// Starts tracing via back_edge_or_run_compiled_keyed.
+/// Starts tracing via `compile_and_run_once`, the same call
+/// `warmstate.py:442` makes; a key that already has a runnable procedure
+/// token runs through `run_compiled_detailed_with_bridge_keyed` instead.
+/// The `back_edge_*` family on `JitDriver` is not on this path — nothing
+/// under `pyre/` calls any of it.
 // dont_look_inside: JIT-driver counter/back-edge slow path the tracer must not enter.
 #[cold]
 #[majit_macros::dont_look_inside]

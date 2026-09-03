@@ -1346,8 +1346,13 @@ pub struct JitDriverStaticData {
     /// `CALL_ASSEMBLER` op to handle the `done_with_this_frame_*` /
     /// `propagate_exception` post-loop branch.
     ///
-    /// `0` mirrors upstream's "attribute absent" / "not yet wired" state
-    /// — populated alongside `portal_runner_adr`.
+    /// Stays `0`: the backends reach the same post-loop branch through a
+    /// registration API instead of a per-driver address, so nothing ever
+    /// populates this field. Cranelift and dynasm both call
+    /// `register_call_assembler_{blackhole,bridge,force,unbox_int}`
+    /// (`majit-backend-dynasm/src/lib.rs:192-198`), which `pyre-jit`
+    /// fills in at boot (`call_jit.rs`). The field is kept because
+    /// `jitdriver.py` names it; it is not "not yet wired".
     pub assembler_helper_adr: i64,
     /// jitdriver.py `self.vable_token_descr` (CALL_ASSEMBLER).
     ///
