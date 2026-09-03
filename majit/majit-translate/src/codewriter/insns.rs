@@ -573,8 +573,8 @@ pub const BC_ABORT_RESULT_R: u8 = 195;
 // because Python dispatch goes through `cpu.bh_call_*` resolved at
 // runtime; pyre's Rust port hits this only when a `dyn Trait` method
 // pointer must be reified into the bytecode stream (backend-epic
-// adaptation, see `blackhole.rs`'s
-// `handler_vtable_method_ptr_unimplemented`).
+// adaptation, see `blackhole.rs`'s `handler_vtable_method_ptr_bail`, which
+// aborts the frame rather than manufacturing a pointer).
 pub const BC_VTABLE_METHOD_PTR: u8 = 196;
 
 // `record_quasiimmut_field/rdd` — RPython `blackhole.py:1538-1545`

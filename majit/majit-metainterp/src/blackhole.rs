@@ -999,9 +999,11 @@ impl BlackholeInterpreter {
     /// blackhole.py `get_current_position_info`.
     ///
     /// RPython returns an offset into `metainterp_sd.liveness_info`
-    /// (via `jitcode.get_live_vars_info(self.position, self.builder.op_live)`).
-    /// Pyre uses a temporary per-interpreter sidecar until its codewriter
-    /// emits `-live-` opcodes directly into JitCode.code.
+    /// (via `jitcode.get_live_vars_info(self.position, self.builder.op_live)`),
+    /// and so does this: `get_live_vars_info` reads the `-live-` marker out of
+    /// `JitCode.code` at `position` and decodes the offset that follows it.
+    /// There is no side table to disagree with the code stream, so the marker
+    /// hook's register clear and a resume's register seeding read one source.
     pub fn get_current_position_info(&self) -> usize {
         self.jitcode.get_live_vars_info(self.position, self.op_live)
     }
