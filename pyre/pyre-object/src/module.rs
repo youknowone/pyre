@@ -142,10 +142,9 @@ pub fn w_module_new_managed(name: &str) -> PyObjectRef {
 /// Module(space, None, w_builtin)` where `w_name=None`).
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
-/// the body performs an unported `lltype::malloc_typed` NewWithVtable
-/// (`Module`) that survives `fuse_boxing_alloc` unfused, so the JIT
-/// residualises the whole call to a stable runtime fnaddr instead of
-/// tracing the allocation. The `-> PyObjectRef` result is a plain GCREF with no
+/// the body performs a `lltype::malloc_typed` allocation (`Module`) that
+/// `fuse_boxing_alloc` leaves unfused, so the JIT residualises the whole call
+/// to a stable runtime fnaddr instead of tracing the allocation. The `-> PyObjectRef` result is a plain GCREF with no
 /// discriminant to erase.
 #[majit_macros::dont_look_inside]
 pub fn w_module_new_aliasing_dict(name: &str, w_dict_object: PyObjectRef) -> PyObjectRef {

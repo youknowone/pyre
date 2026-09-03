@@ -3812,11 +3812,15 @@ class Check:
         self, backend, script, timeout, baseline_cmd, expected_output,
         baseline_key,
     ):
-        """Return median (pyre, baseline) timings after a slow first sample.
+        """Median (pyre, baseline) timings, plus the samples they came from.
 
         A retry is deliberately limited to the failed gate: correctness has
         already passed, and a nonzero exit, changed output, or JIT panic in any
         retry remains a failure rather than being hidden by a median.
+
+        The sample lists are returned rather than reduced away because the
+        median alone does not say whether the runs it summarises agreed --
+        `_retry_sample_note` reports that span on the line the verdict prints.
         """
         attempts = PERF_RETRY_RUNS
         effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
@@ -3856,7 +3860,10 @@ class Check:
                 return None
             baseline_times.append(baseline_time)
             pyre_times.append(elapsed)
-        return statistics.median(pyre_times), statistics.median(baseline_times)
+        return (
+            statistics.median(pyre_times), statistics.median(baseline_times),
+            pyre_times, baseline_times,
+        )
 
     def _subtracted_startup(self, key):
         """The startup `_exec_time` actually subtracted for *key*.
@@ -4010,14 +4017,51 @@ class Check:
             baseline_key,
         )
         if retry is not None:
-            median_elapsed, median_baseline = retry
+            median_elapsed, median_baseline, measured_times, baseline_times = retry
             bound = failed_bound(median_elapsed, median_baseline)
             return (
                 bound is None, bound, median_elapsed, median_baseline,
-                f"median {PERF_RETRY_RUNS}",
+                self._retry_sample_note(
+                    backend, measured_times, baseline_key, baseline_times,
+                ),
             )
 
         return False, bound, elapsed, baseline_time, ""
+
+    def _retry_sample_note(
+        self, backend, measured_times, baseline_key, baseline_times,
+    ):
+        """`median N` plus the span each side's samples actually covered.
+
+        The retry medians PERF_RETRY_RUNS interleaved pairs and, until this
+        note, reported only that it had: the samples themselves were reduced
+        and dropped. A verdict read off them rests on those samples agreeing,
+        and nothing on the line said whether they did.
+
+        `_startup_error_margin` does not answer it. That states the margin in
+        units of the startup subtracted on the side the bound is distorted by,
+        which measures a different error and is smallest exactly when the
+        estimate is stable -- so a red produced by the fixture's own
+        run-to-run variance is reported against the one term that did not
+        move, in a unit that says nothing about how far the samples spread.
+        That span is what this failure mode moves, so it is stated beside the
+        median it was reduced to, in the same shape as the startup line's
+        `[min..max]`.
+
+        No threshold: like `_startup_error_margin`, this measures the verdict's
+        context rather than deciding in advance which readings to believe.
+        """
+        parts = []
+        for key, times in (
+            (backend, measured_times), (baseline_key, baseline_times),
+        ):
+            if not times:
+                continue
+            low, high, mid = min(times), max(times), statistics.median(times)
+            span = f" {(high - low) / mid:.0%}" if mid > 0 else ""
+            parts.append(f"{key} {low:.2f}-{high:.2f}s{span}")
+        note = f"median {PERF_RETRY_RUNS}"
+        return f"{note}; {', '.join(parts)}" if parts else note
 
     def _gate_fail_detail(
         self, backend, baseline, measured, baseline_time, limit, bound,

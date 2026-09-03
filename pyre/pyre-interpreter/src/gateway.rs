@@ -757,13 +757,15 @@ pub fn builtin_code_new_passthrough_args1(name: &'static str, func: BuiltinCodeF
 /// object — callers leak it to `'static`.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
-/// `w_dict_new` twin: the body boxes a `BuiltinCode` through the non-numeric
-/// `malloc_typed` (`fuse_boxing_alloc` fuses only the numeric boxes), so
-/// tracing into it carries the unported `malloc->new` lowering into the caller.
-/// Residualise the whole constructor — the JIT models it by signature as a
-/// plain `PyObjectRef` GCREF and emits a residual call. Every
+/// `w_dict_new` twin: residualise the whole constructor — the JIT models it by
+/// signature as a plain `PyObjectRef` GCREF and emits a residual call. Every
 /// `builtin_code_new*` / `make_builtin_function_with_arity` head bottoms out
 /// here.
+///
+/// The allocation is not what the marker is for, unlike its
+/// `w_exception_new_empty_impl` twin: `ob_type` here is `&BUILTIN_CODE_TYPE`,
+/// a constant, so `fuse_boxing_alloc` would take this cluster onto a
+/// `NewWithVtable` like any other.
 #[majit_macros::dont_look_inside]
 fn builtin_code_new_full(
     name: &'static str,
