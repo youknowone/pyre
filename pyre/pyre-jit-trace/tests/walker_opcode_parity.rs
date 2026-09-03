@@ -252,6 +252,21 @@ const PYRE_ONLY: &[&str] = &[
 /// Not the same statement as `PYRE_ONLY` / `MAJIT_ONLY`: a key here is one the
 /// assembler could emit into a jitcode that no tracer could then walk, so a key
 /// ARRIVING here is the move worth reviewing.
+/// Keys the encoding names that neither tracer walks.
+///
+/// Measured once, so that a key ARRIVING here is the thing to look at rather
+/// than the list itself: fourteen of these are never assembled at all — the
+/// registration-gap snapshot in `jitcode_runtime.rs` pins most of them
+/// against `build_emitted_insns()`, the opnames the build actually emitted.
+/// The two the build does emit are both accounted for. `unreachable/` marks
+/// a point control cannot reach, so no walk arrives at it. And
+/// `vtable_method_ptr/rd>i` is the pyre-only `dyn Trait` method-pointer
+/// reification quarantined in `extension_insns()`, whose blackhole handler
+/// is `handler_vtable_method_ptr_bail` — a deliberate refusal, with walking
+/// it left to the backend epic that owns the key.
+///
+/// An unhandled key is a clean `DispatchError::UnsupportedOpname` decline,
+/// so a new arrival costs compilation rather than correctness.
 const NEITHER: &[&str] = &[
     "check_neg_index/rid>i",
     "conditional_call_ir_v/iiIRd",
