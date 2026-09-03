@@ -20059,6 +20059,20 @@ fn analyze_root_brackets(body: &Unstructured, llbc: &Llbc, moved: &bit_set::BitS
     analyze_root_brackets_with(body, moved, |reg| regular_call_name_path(reg, llbc))
 }
 
+/// The root-bracket guards [`lower_fun_decl`] takes out of this body, as MIR
+/// locals.
+///
+/// An erased bracket publishes nothing, so it owes no rewind and lowers no
+/// close.  A test that counts closes needs this to tell that case from a close
+/// the lowering dropped on the floor.
+pub fn erased_root_bracket_guards(llbc: &Llbc, body: &Unstructured) -> Vec<usize> {
+    let moved = moved_out_locals(body);
+    analyze_root_brackets(body, llbc, &moved)
+        .scopes
+        .iter()
+        .collect()
+}
+
 /// [`analyze_root_brackets`] with the callee-name lookup supplied, so the
 /// accept/reject decisions can be exercised without an `Llbc`.
 fn analyze_root_brackets_with(
