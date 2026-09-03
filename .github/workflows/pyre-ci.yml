@@ -675,9 +675,13 @@ jobs:
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: build/codspeed-environment-reference.json
-        # One entry per run, read back by prefix: the newest recording main
-        # wrote is what a later run on any other ref is held to.
-        key: codspeed-environment-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+        # One entry per attempt, read back by prefix: the newest recording
+        # main wrote is what a later run on any other ref is held to.  The
+        # attempt is part of the key because a cache entry cannot be
+        # overwritten -- a re-run that draws a second machine would otherwise
+        # leave the first attempt's recording standing as the reference while
+        # the baseline beside it was measured on the second.
+        key: codspeed-environment-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: codspeed-environment-${{ runner.os }}-${{ runner.arch }}-
     - name: Name the machine this run drew
       id: environment
@@ -763,7 +767,7 @@ jobs:
         # The same path the restore above reads, because a cache entry restores
         # to the path it was archived from and not to the one asked for.
         path: build/codspeed-environment-reference.json
-        key: codspeed-environment-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+        key: codspeed-environment-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
 
   pyre-check-linux:
     name: pyre/check.py ${{ matrix.label }} (ubuntu-24.04)
