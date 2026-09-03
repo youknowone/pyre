@@ -69,4 +69,19 @@ assert pattern.sub(r"[\g<0>]", SUBJECT, Count()) == (
     "a" + ("[b]" + "z") * 3 + ("b" + "z") * 37 + "c"
 )
 
+# A `memoryview` subject is not its own storage: the view's window is gathered
+# into a fresh `bytes` and the walk matches against that object's payload, so
+# the gathered object -- not the view, and not the backing -- is what has to
+# stay rooted across the `__index__` below.  Nothing else refers to it.
+bpattern = re.compile(b"b")
+BACKING = bytearray(b"a" + (b"b" + b"z") * 40 + b"c")
+BYTES_EXPECTED = b"a" + (b"Y" + b"z") * 3 + (b"b" + b"z") * 37 + b"c"
+
+assert bpattern.sub(b"Y", memoryview(BACKING), Count()) == BYTES_EXPECTED
+assert bpattern.subn(b"Y", memoryview(BACKING), Count()) == (BYTES_EXPECTED, 3)
+# `pos` runs the same `__index__`, and `findall` / `split` keep the gathered
+# buffer for the whole walk without a `count` to hang a root on.
+assert len(bpattern.findall(memoryview(BACKING), Count())) == 39
+assert len(bpattern.split(memoryview(BACKING))) == 41
+
 print("ok")
