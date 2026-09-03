@@ -94,7 +94,21 @@ fn collect_sources(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 ///
 /// A form belonging to the other language costs nothing: `env::var(` cannot
 /// occur in Python, nor `environ.get(` in Rust.
-const READ_FORMS: [&str; 4] = ["env::var", "host_os::var", "getenv", "environ.get"];
+///
+/// `read_uint_from_env` is the one name-taking helper in the tree that a gate
+/// literal reaches: the collector's GC knobs pass the name to it and it forwards
+/// to `env::var` with a *variable*, so the literal never sits beside a form
+/// above and three live `MAJIT_GC_BH_PROBE_*` sub-knobs were invisible to both
+/// brakes at once — read but reported as unread, documented but reported as
+/// undocumented. Its sibling `read_float_from_env` is not here because no gate
+/// name reaches it; add it the day one does.
+const READ_FORMS: [&str; 5] = [
+    "env::var",
+    "host_os::var",
+    "getenv",
+    "environ.get",
+    "read_uint_from_env",
+];
 
 /// Cargo's build-script declaration that the build depends on a gate:
 /// `println!("cargo::rerun-if-env-changed=NAME")`.
@@ -189,6 +203,7 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
         os.environ.get("PYRE_F")
         os.getenv("PYRE_G")
         println!("cargo::rerun-if-env-changed=PYRE_H");
+        read_uint_from_env("PYRE_I").unwrap_or(0);
         # a gate written into a child's environment is not a read of ours
         env["PYRE_NOT_A_READ_EITHER"] = "1"
         // PYRE_MENTIONED_IN_A_COMMENT
@@ -202,7 +217,8 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
     assert_eq!(
         got,
         vec![
-            "PYRE_A", "PYRE_B", "PYRE_C", "PYRE_D", "PYRE_E", "PYRE_F", "PYRE_G", "PYRE_H"
+            "PYRE_A", "PYRE_B", "PYRE_C", "PYRE_D", "PYRE_E", "PYRE_F", "PYRE_G", "PYRE_H",
+            "PYRE_I"
         ]
     );
 }

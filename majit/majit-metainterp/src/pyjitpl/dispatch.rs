@@ -1135,16 +1135,6 @@ pub trait JitCodeRuntime {
     }
 }
 
-/// [FR] WIP gate for the state-field recursive-portal Inline re-entry rework.
-/// OFF by default: the state-field `portal_jitcode`-None path keeps its
-/// clean-abort fallback so existing consumers are unaffected. Set
-/// `MAJIT_PORTAL_INLINE=1` to exercise the experimental inline path.
-pub(crate) fn portal_inline_experiment_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_PORTAL_INLINE").is_some());
-    *ENABLED
-}
-
 pub struct ClosureRuntime<FLabel> {
     label_at: FLabel,
 }

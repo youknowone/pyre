@@ -2897,12 +2897,13 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
 /// path it walks, and a body that delegates through `+` is statically
 /// indistinguishable from `return self.v + o.v` over ints.
 ///
-/// What this filters is a shape that is admissible and still does not survive
-/// being recorded.  A body making a nested Python call and then returning
-/// inlines into a peeled loop whose Phase 2 can still die on `phase2 snapshot
-/// remap cache miss` (`unroll.rs`), measured on
-/// `synth/inline_freevar_after_mayforce` with a `Fraction.__gt__`-shaped body --
-/// `return a._richcmp(b, operator.gt)`.  Keep that returning shape declined.
+/// What the nested-call refusal covers, and the one nested shape it lets
+/// through.  A body making a nested Python call and then returning inlines
+/// into a peeled loop whose Phase 2 can still die on `phase2 snapshot remap
+/// cache miss` (`unroll.rs`), measured on
+/// `synth/inline_freevar_after_mayforce` with a `Fraction.__gt__`-shaped body
+/// -- `return a._richcmp(b, operator.gt)`.  That returning shape is what the
+/// refusal is for.
 ///
 /// A straight-line, handler-free body that raises is different: its nested
 /// call constructs the exception and `raise/r` finishes the inlined MIFrame;
@@ -2919,8 +2920,84 @@ pub(crate) fn dunder_body_facts_admissible_on_rewind(
         || (facts.contains_raise && facts.exc_override_straight_line && !facts.has_exception_table)
 }
 
+/// The filter this carried unconditionally was that nested-call refusal, whose
+/// stated cost was a trace dying in the Phase 2 unroll on `phase2 snapshot
+/// remap cache miss`.  That no longer reproduces:
+/// `synth/inline_freevar_after_mayforce` passes with the nested body admitted,
+/// and all 537 bench scripts answer identically with and without it.  Since
+/// the filter also refused every value type the pure-Python stdlib is made of
+/// -- `date.__add__` returns `date(...)`, `Decimal.__add__` returns
+/// `_dec_from_triple(...)` -- it is off, and `PYRE_BINOP_NO_NESTED_INLINE`
+/// puts it back so one binary carries both arms.
 fn dunder_body_admissible_on_rewind(w_code: *const ()) -> bool {
-    sub_jitcode_body_facts_for_code(w_code).is_some_and(dunder_body_facts_admissible_on_rewind)
+    let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return false;
+    };
+    !binop_nested_filter_enabled() || dunder_body_facts_admissible_on_rewind(facts)
+}
+
+/// `PYRE_NO_BINOP_DEFAULTED_PARAMS`: go back to refusing a `BINARY_OP` /
+/// `COMPARE_OP` dunder whose signature has more than the two parameters the
+/// operands bind, instead of leaving the tail to the resolved descent's
+/// `__defaults__` seeding.
+///
+/// On by default; the variable only turns it off, so a bisection can name this
+/// change in one command and one binary carries both arms.
+fn binop_defaulted_params_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_NO_BINOP_DEFAULTED_PARAMS").is_none())
+}
+
+/// `PYRE_BINOP_NO_NESTED_INLINE`: refuse a `BINARY_OP` / `COMPARE_OP` dunder
+/// whose body makes a nested Python call, in the shape
+/// [`dunder_body_facts_admissible_on_rewind`] states, as
+/// [`dunder_body_admissible_on_rewind`] did before.
+fn binop_nested_filter_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_BINOP_NO_NESTED_INLINE").is_some())
+}
+
+/// Discard a declined inline sub-walk: the operations it recorded, and the
+/// heap cache they populated.
+///
+/// The seven call sites all spelled this out as the same two statements.
+///
+/// `PYRE_SUBWALK_CUT_SNAPSHOTS` additionally truncates the snapshot side
+/// table, which [`majit_metainterp::history::TraceCtx::cut_trace`] leaves
+/// alone: a guard the speculative walk attached before it declined keeps
+/// naming positions the cut has since handed to other operations, and the
+/// unroll's Phase 2 remap reports such a position as a `phase2 snapshot remap
+/// cache miss`.  The `BINARY_OP` entry cuts that way at its own rewind.
+///
+/// Not truncating is the ported behaviour, not a shortcut: `Trace.cut_point`
+/// returns the two snapshot lengths as the last elements of its five-tuple and
+/// `Trace.cut_at` restores only `_pos`, `_count` and `_index` from it, leaving
+/// `_snapshot_data` and `_snapshot_array_data` as they stand -- the same two
+/// elements `cut_trace_from` destructures and never reads.  Upstream is not
+/// exposed by that because its snapshots live inline in the trace byte stream,
+/// where anything past the restored `_pos` is unreachable and the next append
+/// overwrites it; pyre owns them in a `Vec<Snapshot>` beside the stream, where
+/// a stale entry keeps its index.  The exposure is that representation, whose
+/// migration to the byte-stream form `TraceRecordBuffer` already carries is
+/// recorded on `TraceCtx::snapshots` -- so this stays off, and truncating is
+/// the deviation held for the trace that needs it.  `cut_trace`'s own note
+/// records that truncating regressed a bench.
+fn cut_declined_subwalk<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+) {
+    if subwalk_cut_snapshots_enabled() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+    } else {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+    }
+    ctx.trace_ctx.heap_cache_mut().reset();
+}
+
+/// `PYRE_SUBWALK_CUT_SNAPSHOTS`: see [`cut_declined_subwalk`].
+fn subwalk_cut_snapshots_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_SUBWALK_CUT_SNAPSHOTS").is_some())
 }
 
 fn callee_body_commits_nothing(w_code: *const ()) -> bool {
@@ -4202,8 +4279,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
                     symbolic as u64,
                 );
             }
-            ctx.trace_ctx.cut_trace(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
+            cut_declined_subwalk(ctx, pre_fold_pos);
             return Ok(None);
         }
         Err(error) => {
@@ -7687,6 +7763,13 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     // Only `object.__new__` allocates the plain `[ob_type | w_class | map |
     // storage]` instance this emit builds; any other `__new__` picks its own
     // layout (a builtin subclass) or runs arbitrary code.
+    //
+    // A `__new__` written in Python is not that -- it ends in
+    // `object.__new__(cls)`, which [`try_walker_inline_object_new`] folds --
+    // but walking it from here in place of the allocation, and letting its
+    // return value stand for the whole of `type.__call__`, was measured to
+    // produce a wrong answer (`TypeError: 'NewOv' object is not callable`, an
+    // instance reaching the callable slot) and is not what this does.
     let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__new__") };
     let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
     if tp_new != obj_new {
@@ -7744,24 +7827,10 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     // The walker is the executor here, so the instance the rest of this walk
     // reads has to be a real one — the same split `trace_box_int` makes between
     // the recorded allocation and the concrete object it hands back.
-    let concrete_instance = pyre_object::w_instance_new(w_type);
-    let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
-    let instance =
-        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const);
-    // Bind the emitted allocation to the object the walker actually made, and
-    // record the layout its `NewWithVtable` stamps.  Without the concrete
-    // binding the instance reaches a residual as a box with no value and the
-    // residual declines (`[fbw-resid-decline] box_value=None`), which costs the
-    // recording iteration; without the class the receiver re-guards its own
-    // freshly emitted layout.
-    ctx.trace_ctx.set_opref_concrete(
-        instance,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),
-    );
-    ctx.trace_ctx.heap_cache_mut().class_now_known(
-        instance,
-        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
-    );
+    // The `__init__` below writes this instance's slots through the store-attr
+    // resolver, which inside a rewind region refuses an unjournaled commit
+    // unless the receiver is one of the region's own allocations.
+    let (instance, concrete_instance) = emit_walker_instance(ctx, w_type, type_const, terminator);
     if fbw_inline_diag_enabled() {
         eprintln!(
             "[type-call-inline] pc={} class={} init={}",
@@ -7828,10 +7897,157 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
                 unsafe { pyre_object::w_type_get_name(w_type) },
             );
         }
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
+}
+
+/// Emit the instance allocation both instantiation folds perform, and bind the
+/// emitted box to the object the walker actually made.
+///
+/// The walker is the executor here, so the instance the rest of the walk reads
+/// has to be a real one -- the same split `trace_box_int` makes between the
+/// recorded allocation and the concrete object it hands back.  Without the
+/// concrete binding the instance reaches a residual as a box with no value and
+/// the residual declines (`[fbw-resid-decline] box_value=None`), which costs
+/// the recording iteration; without the class the receiver re-guards its own
+/// freshly emitted layout.
+///
+/// The caller pins the class version tag first -- [`try_walker_inline_type_call`]
+/// pins a metaclass beside it, which is why that stays at the call site.
+fn emit_walker_instance<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    w_type: pyre_object::PyObjectRef,
+    type_const: OpRef,
+    terminator: *const u8,
+) -> (OpRef, pyre_object::PyObjectRef) {
+    let concrete_instance = pyre_object::w_instance_new(w_type);
+    let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
+    let instance =
+        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const);
+    ctx.trace_ctx.set_opref_concrete(
+        instance,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),
+    );
+    ctx.trace_ctx.heap_cache_mut().class_now_known(
+        instance,
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
+    );
+    fbw_binop_rewind_note_fresh(ctx, instance);
+    (instance, concrete_instance)
+}
+
+/// Fold `object.__new__(cls)` to the allocation it performs.
+///
+/// For a one-argument call on a concrete class, `object_descr_new` reduces to
+/// `w_instance_new(cls)` behind four record-time tests: `cls` is a type, it is
+/// instantiable, it is not abstract, and it is laid out by `object` itself
+/// (`check_user_subclass`).  Pinning the class is what keeps those answers, so
+/// the emit is the same `NewWithVtable` + header/`map` pair
+/// [`try_walker_inline_type_call`] builds for a class it did not have to run a
+/// `__new__` for.
+///
+/// This is how every Python `__new__` ends -- `self = object.__new__(cls)` --
+/// so without it the descent into an overridden `__new__` stops on a residual
+/// whose body reaches `object_descr_new`'s error paths
+/// (`__getslice_minusone`, `abstract_instantiation_error`,
+/// `type_repr_qualified_name`), which is where the builtin route declines with
+/// `un-lowered helper call in body`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_object_new<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 3 {
+        return Ok(None);
+    }
+    // Same two spellings of "no receiver" the type call reads.
+    if walker_concrete_ref_object(ctx, r_args[1])
+        .is_some_and(|null_or_self| !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL)
+    {
+        return Ok(None);
+    }
+    let Some(callable) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    let w_object = pyre_interpreter::typedef::w_object();
+    if w_object.is_null() {
+        return Ok(None);
+    }
+    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
+    if obj_new != Some(callable) {
+        return Ok(None);
+    }
+    let Some(w_type) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_type(w_type) } {
+        return Ok(None);
+    }
+    // The class pin below is what holds `__del__` and the abstract flag, so it
+    // has to be a class whose dict changes are tracked.
+    if unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) } == 0 {
+        return Ok(None);
+    }
+    if unsafe {
+        pyre_object::w_type_disallows_instantiation(w_type)
+            || pyre_object::w_type_is_abstract(w_type)
+            // `w_instance_new` puts an instance of such a class on the
+            // finalizer queue, which `NewWithVtable` does not do.
+            || pyre_object::typeobject::w_type_get_hasuserdel(w_type)
+    } {
+        return Ok(None);
+    }
+    // `check_user_subclass(object, cls)`: the base allocator only knows how to
+    // fill the parent layout, so a subtype that introduces its own is refused.
+    let typedef_of = |w: pyre_object::PyObjectRef| {
+        let layout = unsafe { pyre_object::typeobject::w_type_get_layout_ptr(w) };
+        if layout.is_null() {
+            std::ptr::null()
+        } else {
+            unsafe { (*layout).typedef }
+        }
+    };
+    if !std::ptr::eq(typedef_of(w_object), typedef_of(w_type)) {
+        return Ok(None);
+    }
+    let terminator =
+        unsafe { pyre_interpreter::objspace::std::mapdict::ensure_type_terminator(w_type) };
+    if terminator.is_null() {
+        return Ok(None);
+    }
+
+    let callable_const = ctx.trace_ctx.const_ref(callable as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op.pc,
+        OpCode::GuardValue,
+        &[r_args[0], callable_const],
+    )?;
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[2], type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(r_args[2], type_const);
+    walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+
+    let (instance, concrete_instance) = emit_walker_instance(ctx, w_type, type_const, terminator);
+    if fbw_inline_diag_enabled() {
+        eprintln!("[object-new-inline] pc={} class={}", op.pc, unsafe {
+            pyre_object::w_type_get_name(w_type)
+        });
+    }
+    write_ref_reg(
+        ctx,
+        op.pc,
+        dst,
+        instance,
+        ConcreteValue::Ref(concrete_instance),
+    )?;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Route `str(exc)` / `repr(exc)` through an app-level exception override.
@@ -8370,8 +8586,7 @@ pub(crate) fn try_walker_inline_super_property_get<Sym: WalkSym>(
         None,
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -8493,8 +8708,7 @@ pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
         None,
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -8610,8 +8824,7 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         None,
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -8989,8 +9202,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         }),
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -9102,8 +9314,7 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         None,
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -10201,7 +10412,14 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
         ));
     };
-    if nparams != 2 {
+    // The two operands bind the first two parameters.  A longer signature is
+    // not itself unbindable: `Function.funccall_valuestack` fills every
+    // parameter the call leaves unbound from `defs_w`, and the
+    // resolved descent below already seeds that tail from `__defaults__` --
+    // it declines on its own when the defaults do not cover the whole tail.
+    // `_pydecimal`'s dunders are all `(self, other, context=None)`, so a hard
+    // `!= 2` refuses every arithmetic operator that module defines.
+    if nparams < 2 || (nparams != 2 && !binop_defaulted_params_enabled()) {
         decline!(format_args!("{}.{dunder} takes {nparams} params", unsafe {
             pyre_object::typeobject::w_type_get_name(w_class)
         }));
@@ -10464,7 +10682,9 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
         return Ok(None);
     };
-    if nparams != 2 {
+    // Same reading as the binary-op route: the two operands bind the first two
+    // parameters and the resolved descent seeds the rest from `__defaults__`.
+    if nparams < 2 || (nparams != 2 && !binop_defaulted_params_enabled()) {
         return Ok(None);
     }
     // A `NotImplemented` result below has to be handed back to the full binary

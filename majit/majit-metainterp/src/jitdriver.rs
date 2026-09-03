@@ -161,21 +161,15 @@ fn build_bh_jitdrivers_sd(
 /// Pick the `bh.virtualizable_info` pointer to seed at a guard-failure deopt, or
 /// null to leave it unset. A non-null vinfo lets the blackhole run a mid-body
 /// vable-array op (e.g. the `int_*_jump_if_ovf` overflow guard on a `[int; virt]`
-/// state field). Seed when either the portal-inline experiment is on, or the
-/// machine is a state-field one (no `vable_token` field) whose
-/// `bh_clear_vable_token` is inert so a non-null vinfo cannot corrupt its non-GC
-/// `state` struct. A real heap virtualizable (e.g. PyFrame) is left with null
-/// vinfo to preserve its existing resume contract.
+/// state field). Seed when the machine is a state-field one (no `vable_token`
+/// field) whose `bh_clear_vable_token` is inert so a non-null vinfo cannot
+/// corrupt its non-GC `state` struct. A real heap virtualizable (e.g. PyFrame)
+/// is left with null vinfo to preserve its existing resume contract.
 fn seed_deopt_vinfo_ptr(
     vinfo: Option<&std::sync::Arc<crate::virtualizable::VirtualizableInfo>>,
 ) -> *const crate::virtualizable::VirtualizableInfo {
     match vinfo {
-        Some(info)
-            if crate::pyjitpl::dispatch::portal_inline_experiment_enabled()
-                || !info.has_vable_token() =>
-        {
-            std::sync::Arc::as_ptr(info)
-        }
+        Some(info) if !info.has_vable_token() => std::sync::Arc::as_ptr(info),
         _ => std::ptr::null(),
     }
 }
@@ -9396,17 +9390,13 @@ mod tests {
         // No vinfo available → null.
         assert!(seed_deopt_vinfo_ptr(None).is_null());
 
-        // token_offset > 0 → null while the portal-inline experiment is off, so a
-        // real heap virtualizable keeps its existing null-vinfo resume contract.
-        // (The experiment flag is a process-wide latch; guard the assertion on it
-        // rather than assuming the env is unset.)
-        if !crate::pyjitpl::dispatch::portal_inline_experiment_enabled() {
-            let heap_vable = std::sync::Arc::new(VirtualizableInfo::new(8));
-            assert!(
-                seed_deopt_vinfo_ptr(Some(&heap_vable)).is_null(),
-                "a token_offset>0 heap virtualizable must keep the null-vinfo contract",
-            );
-        }
+        // token_offset > 0 → null, so a real heap virtualizable keeps its
+        // existing null-vinfo resume contract.
+        let heap_vable = std::sync::Arc::new(VirtualizableInfo::new(8));
+        assert!(
+            seed_deopt_vinfo_ptr(Some(&heap_vable)).is_null(),
+            "a token_offset>0 heap virtualizable must keep the null-vinfo contract",
+        );
     }
 
     #[derive(Default)]

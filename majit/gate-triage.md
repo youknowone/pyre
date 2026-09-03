@@ -226,6 +226,27 @@ cover the condition they diagnose.
 - What it does: Whether the blackhole-object probe is enabled.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_GC_BH_PROBE_CLASSES`
+
+- Read sites: 1 — `majit/majit-gc/src/collector.rs`
+- Accessor: `read_uint_from_env("MAJIT_GC_BH_PROBE_CLASSES")`, default 10
+- What it does: How many distinct classes the probe above reports. Reached through a name-taking helper rather than a literal `env::var`, which is why the completeness brake in `pyre/pyrex/tests/gate_triage_complete.rs` does not see it — it is listed here because this document, not the brake, is what claims to hold every live gate.
+- Retirement condition: with `MAJIT_GC_BH_PROBE`, whose report it shapes.
+
+### `MAJIT_GC_BH_PROBE_MINOR`
+
+- Read sites: 1 — `majit/majit-gc/src/collector.rs`
+- Accessor: `read_uint_from_env("MAJIT_GC_BH_PROBE_MINOR")`, default 120
+- What it does: Which minor collection the probe reports at. The interpreter fills the old generation long before the JIT compiles anything, so reporting at minor #1 can only show pre-JIT allocations.
+- Retirement condition: with `MAJIT_GC_BH_PROBE`.
+
+### `MAJIT_GC_BH_PROBE_FROM`
+
+- Read sites: 2 — `majit/majit-gc/src/collector.rs`
+- Accessor: `read_uint_from_env("MAJIT_GC_BH_PROBE_FROM")`, default 0
+- What it does: Skips the minors before the one being investigated. The probe's reachability walk is a whole-heap traversal per minor, too slow to leave on for a whole run.
+- Retirement condition: with `MAJIT_GC_BH_PROBE`.
+
 ### `MAJIT_GC_DRAIN_CENSUS`
 
 - Read sites: 1 — `majit/majit-gc/src/lib.rs`
@@ -408,13 +429,6 @@ cover the condition they diagnose.
 - Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `pcseq_enabled()`
 - What it does: Prints the control-flow decisions a walk makes: the interpreter pc every `jit_merge_point` visit carries, and every `switch`, `goto_if_not` and `loop_header`, each tagged with the jitcode that owns it and its frame depth (`d=`). A walk that records without ever closing gives the same reading at the top (`seen_loop_header_for_jdindex` stays -1 at every merge point) whether the `loop_header` op was never reached or was reached and declined, and the two call for opposite fixes; the branch lines name which edge diverted the walk, at whatever depth it happened.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
-### `MAJIT_PORTAL_INLINE`
-
-- Read sites: 1 — `majit/majit-metainterp/src/pyjitpl/dispatch.rs`
-- Accessor: `portal_inline_experiment_enabled()`
-- What it does: Enables the experimental recursive-portal inline re-entry path. Unset keeps the clean-abort fallback when `portal_jitcode` is absent.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_PROBE_LIVENESS`

@@ -1327,7 +1327,17 @@ impl UnrollOptimizer {
         // Phase 2 namespace; production probes (nbody / fannkuch /
         // fib_loop / fib_recursive / spectral_norm) show zero misses,
         // so promote to a strict panic matching RPython's _get assert.
-        let translate_opref = |opref: OpRef| -> OpRef {
+        // A miss has two shapes and they call for different fixes, so name
+        // which one fired instead of leaving it to be inferred from
+        // `cache_len`.  `TraceIterator::new` sizes the cache from the highest
+        // raw position appearing as an op result, an argument or a failarg in
+        // the range it walks -- snapshot feeds are not consulted -- so a
+        // position ABOVE that is one no operation in the trace mentions at
+        // all, while a position INSIDE it with an empty slot is one the range
+        // covers and no operation produced.  The feed and the frame the entry
+        // sits in are printed for the same reason: the three feeds are
+        // remapped by one closure and the message otherwise cannot say which.
+        let translate_opref = |feed: &str, frame: usize, opref: OpRef| -> OpRef {
             if opref.is_none() || opref.is_constant() {
                 return opref;
             }
@@ -1336,28 +1346,46 @@ impl UnrollOptimizer {
                 .and_then(|slot| slot.as_ref())
                 .map(|b| b.to_opref())
                 .unwrap_or_else(|| {
+                    let shape = if opref.raw() as usize >= p2_cache.len() {
+                        "above every position the trace mentions"
+                    } else {
+                        "inside the range, no operation produced it"
+                    };
+                    // Counted here rather than beside the closure: the happy
+                    // path walks every snapshot entry and must not pay two
+                    // scans of the cache for a message it never prints.
+                    let cache_filled = p2_cache.iter().filter(|slot| slot.is_some()).count();
+                    let cache_high = p2_cache
+                        .iter()
+                        .rposition(std::option::Option::is_some)
+                        .map_or(-1i64, |i| i as i64);
                     panic!(
                         "phase2 snapshot remap cache miss for {opref:?} \
-                         (cache_len={} body_ni={} phase2_inputarg_base={})",
+                         in {feed}[{frame}] ({shape}) \
+                         (cache_len={} filled={} highest_filled={} \
+                          ops={} body_ni={} phase2_inputarg_base={})",
                         p2_cache.len(),
+                        cache_filled,
+                        cache_high,
+                        ops.len(),
                         body_num_inputs,
                         phase2_inputarg_base,
                     )
                 })
         };
-        for boxes in opt_p2.snapshot_boxes.iter_mut().flatten() {
-            for r in boxes.iter_mut() {
-                *r = r.map_opref(translate_opref);
+        for (frame, boxes) in opt_p2.snapshot_boxes.iter_mut().enumerate() {
+            for r in boxes.iter_mut().flatten() {
+                *r = r.map_opref(|opref| translate_opref("snapshot_boxes", frame, opref));
             }
         }
-        for boxes in opt_p2.snapshot_vable_boxes.iter_mut().flatten() {
-            for r in boxes.iter_mut() {
-                *r = r.map_opref(translate_opref);
+        for (frame, boxes) in opt_p2.snapshot_vable_boxes.iter_mut().enumerate() {
+            for r in boxes.iter_mut().flatten() {
+                *r = r.map_opref(|opref| translate_opref("snapshot_vable_boxes", frame, opref));
             }
         }
-        for boxes in opt_p2.snapshot_vref_boxes.iter_mut().flatten() {
-            for r in boxes.iter_mut() {
-                *r = r.map_opref(translate_opref);
+        for (frame, boxes) in opt_p2.snapshot_vref_boxes.iter_mut().enumerate() {
+            for r in boxes.iter_mut().flatten() {
+                *r = r.map_opref(|opref| translate_opref("snapshot_vref_boxes", frame, opref));
             }
         }
         self.replace_compile_snapshot_roots(Self::collect_snapshot_const_ptr_slots(&mut [

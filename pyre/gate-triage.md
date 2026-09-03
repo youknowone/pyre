@@ -56,6 +56,8 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 | MAJIT_GC_ITEMSBLOCK, PYRE_GC_PREBUILT_REMEMBER, PYRE_GC_INTERP, PYRE_GC_INTERP_COLLECT | GC-managed items / prebuilt minor-skip / interpreter allocation + collect rollback | WS3 / #355 / F3 GC rework |
 | MAJIT_CL_NO_CLOSING_JUMP | cranelift attached-loop closing jump | #245 cranelift perf (explicit rollback hatch) |
 | PYRE_NO_BINOP_REWIND | rewind at the `BINARY_OP` / `COMPARE_OP` dunder entry | #1526 binop-dunder inline (explicit rollback hatch) |
+| PYRE_NO_BINOP_DEFAULTED_PARAMS | admitting such a dunder whose signature carries parameters past the two the operands bind | #1526 binop-dunder inline (explicit rollback hatch) |
+| PYRE_BINOP_NO_NESTED_INLINE | admitting such a dunder whose body makes a nested Python call | #1526 binop-dunder inline (explicit rollback hatch) |
 
 `PYRE_GC_INTERP` is default-ON on every target. Its OFF path still selects the
 unmanaged `malloc_typed` stepping-stone allocation and remains a rollback hatch
@@ -70,6 +72,19 @@ static test can tell a committing body from the call-free body this entry
 exists to admit. What replaced those tests is a refusal at the first residual
 that could commit, taken before it runs. The gate goes when the #1526 entry
 closes.
+
+The two beside it are the same hatch for two admissions that entry gained once
+the rewind was in place, each named for the refusal it restores.
+`PYRE_NO_BINOP_DEFAULTED_PARAMS` puts back the `nparams != 2` test, so a
+`__add__(self, o, context=None)` is refused instead of leaving its tail to the
+resolved descent's `__defaults__` seeding.
+`PYRE_BINOP_NO_NESTED_INLINE` puts back the body filter, so a dunder that
+delegates through a nested Python call — `date.__add__` returning `date(...)`,
+`Decimal.__add__` returning `_dec_from_triple(...)` — is refused; the shape it
+still lets through is the one `dunder_body_facts_admissible_on_rewind` states.
+Both read the whole corpus identically with and without them, so each exists to
+bisect this entry's admissions against one binary; they go with the same #1526
+close.
 
 ## §5 — Other live gates (not removal targets by the "already-ON" criterion)
 
@@ -197,7 +212,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 | PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS | reading back the fastlocals a residual wrote to the frame, whether or not it forced, as a recorded `GETARRAYITEM_GC_R` off `locals_cells_stack_w` (`residual_call.rs adopt_residual_locals_writes`); setting it restores the walk that keeps the box it held before the call and so loses the write | when the walk reads a local through a channel a residual cannot leave stale; until then this is the one-binary control that keeps the defect demonstrable, and the parity fixture's two arms (a forcing call, and an inlined callee whose store forces nothing) are only separable with it |
 
-### §6a2 — Default-OFF experiments (6)
+### §6a2 — Default-OFF experiments (10)
 
 Kept as the switched-off arm of a one-binary comparison, not as latent
 defaults.  Bridge inlining reaches module replacement on its own, so
@@ -232,6 +247,7 @@ build.
 | PYRE_WASM_INLINE_TRIP_BYTES | `=N` prices a deferred inline merge at N bridge entries per byte of the module the merge re-emits (`lib.rs inline_trip_threshold_for`), the guest's flat `INLINE_TRIP_THRESHOLD` staying as the floor; unset leaves the built-in `DEFAULT_INLINE_TRIP_BYTES_FACTOR`, and `=0` restores the flat threshold as the whole rule.  A merge re-emits its owner whole, so its cranelift cost scales with the owner's size while the crossings it removes scale with the standing bridge's entries — the flat threshold reads only the second.  Exists so the conversion between the two rates can be re-swept on ONE binary, the guest having no environment to read it from | the corpus stops disagreeing about the value, or the merge decision stops being a single scalar |
 | PYRE_FBW_INLINE_POISON | admits a callee the replay scan declined and refuses at the scan's poisoned pcs during the walk (`diag.rs fbw_inline_poison_enabled`) | when a refusal that follows an executed effect has a resume leg that neither repeats it nor drops it |
 | PYRE_JD1 | arms the jd1 (`unpackiterable_driver`) compiled-loop experiment — `eval.rs jd1_experiment_enabled` is `PYRE_JD1 == "1"`, so nothing else turns it on.  `PYRE_NO_JD1`, `PYRE_JD1=0` and the master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) each force it back off | the jd1 experiment concludes |
+| PYRE_SUBWALK_CUT_SNAPSHOTS | truncates the snapshot side table when a declined inline sub-walk is cut, as well as the operations (`inline_call.rs cut_declined_subwalk`); unset leaves `cut_trace`, which discards the ops and leaves the snapshots naming positions the cut has handed on — the shape the unroll reports as a `phase2 snapshot remap cache miss`.  The `BINARY_OP` entry already cuts that way at its own rewind.  Off here because no trace has been found that needs it, while `cut_trace`'s own note records that truncating regressed a bench | a declined sub-walk is shown to leave a stale snapshot position, or the truncation is measured to cost nothing and becomes unconditional |
 
 ### §6b — VALUE knobs (17): config, not gates
 
