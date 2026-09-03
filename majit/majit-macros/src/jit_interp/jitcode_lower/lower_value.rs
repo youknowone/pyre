@@ -2244,12 +2244,22 @@ impl<'c> Lowerer<'c> {
         // which degraded the whole dispatch arm to the interpreter.
         //
         // RPython promotes the pair to `instance_ptr_eq` / `instance_ptr_ne`
-        // when `_is_rclass_instance(args[0])`, asserting the other side is one
-        // too.  `struct_type` is this layer's record of "a Ref whose struct is
-        // known", so both sides carrying one is that same fact.  Only one side
-        // carrying it means the lowering never tracked the other, not that it
-        // is not an instance, so that case takes the plain pointer compare
-        // instead of upstream's assert.
+        // when `_is_rclass_instance(args[0])`, which is
+        // `lltype._castdepth(v.concretetype.TO, rclass.OBJECT) >= 0` -- the
+        // pointee descends from the instance base.  `struct_type` is a
+        // different fact: "the lowering tracked a pointee layout", which a raw
+        // struct, a `ref_params` entry, a field pointee and an array element
+        // all satisfy.  Reading it as the instance predicate hands non-instance
+        // pointers to instance-only reasoning: `optimize_oois_ooisnot` folds a
+        // pair with two known-but-different classes to a constant, and two
+        // structural views of one raw address are known-different classes that
+        // do alias.
+        //
+        // Nothing in this tree carries the real predicate, so the pair stays on
+        // the plain pointer compare until something does.  That is upstream's
+        // own fallthrough -- `rewrite_op_ptr_eq` promotes only under the test
+        // and otherwise leaves `ptr_eq` alone -- and it costs nothing the
+        // branch had before, which declined the whole dispatch arm here.
         //
         // RPython has no ordered pointer comparison, so any other operator
         // declines and the arm keeps running in the interpreter.
@@ -2259,13 +2269,7 @@ impl<'c> Lowerer<'c> {
                 BinOp::Ne(_) => false,
                 _ => return None,
             };
-            let both_instances = lhs.struct_type.is_some() && rhs.struct_type.is_some();
-            let name = match (both_instances, is_eq) {
-                (true, true) => "InstancePtrEq",
-                (true, false) => "InstancePtrNe",
-                (false, true) => "PtrEq",
-                (false, false) => "PtrNe",
-            };
+            let name = if is_eq { "PtrEq" } else { "PtrNe" };
             let opcode = Ident::new(name, proc_macro2::Span::call_site());
             let reg = self.alloc_reg();
             let lhs_reg = lhs.reg;
@@ -3042,7 +3046,7 @@ mod tests {
         }
 
         #[test]
-        fn two_tracked_struct_refs_use_instance_ptr_eq() {
+        fn two_tracked_struct_refs_still_use_the_plain_ptr_eq() {
             let path: syn::Path = syn::parse_quote!(Frame);
             let (lowerer, out) = lower("a == b", |l| {
                 l.bindings
@@ -3050,10 +3054,15 @@ mod tests {
                 l.bindings.insert("b".into(), ref_binding(1, Some(path)));
             });
             assert!(out.is_some());
+            let emitted = emitted(&lowerer);
             assert!(
-                emitted(&lowerer).contains("InstancePtrEq"),
-                "both sides carry a struct_type, which is this layer's \
-                 `_is_rclass_instance`"
+                emitted.contains("PtrEq"),
+                "a tracked pointee layout is not `_is_rclass_instance`"
+            );
+            assert!(
+                !emitted.contains("InstancePtrEq"),
+                "`instance_ptr_eq` licenses `optimize_oois_ooisnot` to fold a \
+                 known-different-class pair, which raw pointers may not honour"
             );
         }
 
