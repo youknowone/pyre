@@ -157,7 +157,9 @@ pub struct BhJitDriverSd {
     /// `blackhole.py` `_handle_jitexception_in_portal` picks the driver whose
     /// `mainjitcode is self.jitcode`, so a recursive `ContinueRunningNormally`
     /// re-enters the portal that raised it and not some other driver's.
-    /// [`portal_runner_for`] runs that same search.
+    /// [`portal_jd_for`] asks for that same relation through the back-reference
+    /// `call.py:148` writes (`jd.mainjitcode.jitdriver_sd = jd`), which survives
+    /// a resume path materializing a fresh `Arc`.
     pub mainjitcode: Option<std::sync::Arc<JitCode>>,
 }
 
@@ -2850,10 +2852,11 @@ fn handle_jitexception_dispatch(
     // kinds carry the value in different banks — `DoneWithThisFrameInt` at a
     // ref portal would install an integer through `setup_return_value_i` and
     // the caller would read it as a pointer — so the wrong arm is a wrong
-    // answer, not a mislabelled one.  `None` is a jitcode no driver claims
-    // (the unit-test builders build `BhJitDriverSd` without `mainjitcode`);
-    // there is no `result_kind` to test against, so the variant alone decides
-    // as it did before the driver was consulted.
+    // answer, not a mislabelled one.  `None` is a jitcode no driver claims, or
+    // a blackhole assembled without a driver table at all (the unit-test
+    // builders leave `jitdrivers_sd` empty); there is no `result_kind` to test
+    // against, so the variant alone decides as it did before the driver was
+    // consulted.
     let kind_matches = |kind: BhReturnType| result_kind.is_none_or(|want| want == kind);
     let done_arm = |kind: BhReturnType, value: i64| {
         assert!(
@@ -3116,8 +3119,11 @@ fn handle_jitexception(
     // In Rust we can do this directly since JitException carries the result.
     //
     // `bh` is upstream's `self` — the portal frame that raised — so its own
-    // driver owns the runner.  Only a frame no driver claims falls back to the
-    // runner this call was handed.
+    // driver owns the runner, and `_run_forever`'s walk stopped here precisely
+    // because this frame carries a driver stamp.  `portal_runner_for` answers
+    // `None` only when no runner is registered at all, and then the runner this
+    // call was handed stands in; a driver registered without its own runner
+    // fails there rather than borrowing another driver's.
     let own_runner = portal_runner_for(&bh);
     let own_runner = own_runner.as_ref().map(|hook| {
         hook as &dyn Fn(
@@ -3366,7 +3372,8 @@ pub fn convert_and_run_from_pyjitpl(
     // `handle_jitexception_dispatch` has nothing to call and
     // `ContinueRunningNormally` reaches its `expect`.
     //
-    // This is only the fallback for a frame no driver claims: the recursive
+    // This is only the fallback for the entry frame, which has not passed
+    // `_run_forever`'s walk and so need not carry a driver stamp: the recursive
     // level resolves its own runner from the raising portal frame
     // (`portal_runner_for`), because the driver that owns that jitcode is the
     // one whose portal has to be re-entered.
@@ -7211,7 +7218,7 @@ pub type PortalRunnerHook =
 /// self.jitcode`.  Keeping the table beside `BhJitDriverSd` rather than in it
 /// only avoids an initialisation order between the driver table (built once,
 /// lazily) and the consumer's registration; [`portal_runner_for`] joins the two
-/// at the point of use, by the same identity test upstream uses.
+/// at the point of use, through the same relation upstream tests.
 static PORTAL_RUNNER_HOOKS: std::sync::RwLock<Vec<Option<PortalRunnerHook>>> =
     std::sync::RwLock::new(Vec::new());
 
@@ -7240,41 +7247,75 @@ pub fn register_portal_runner_hook(jd_index: usize, hook: PortalRunnerHook) {
 /// jd.handle_jitexc_from_bh(self.nextblackholeinterp, e)
 /// ```
 ///
-/// `bh` is the portal frame that raised, i.e. upstream's `self`.  Upstream
-/// asserts when no driver owns that jitcode; here a miss returns `None` and
-/// each caller keeps the behaviour it had before the driver was consulted,
-/// because a `BhJitDriverSd` table assembled without `mainjitcode` (the
-/// unit-test builders) would otherwise abort paths that used to work.
+/// `bh` is the portal frame that raised, i.e. upstream's `self`.
+///
+/// The relation that loop walks is established from the other end by
+/// `call.py:148` `jd.mainjitcode.jitdriver_sd = jd`, so `jd.mainjitcode is
+/// self.jitcode` and `self.jitcode.jitdriver_sd is jd` answer the same
+/// question.  Reading the stamp is also the form `_run_forever`'s walk already
+/// uses to decide where to stop (`jitcode.jitdriver_sd().is_none()`), so asking
+/// it here leaves one mechanism where two could disagree: `resolve_jitcode`
+/// materializes a fresh `Arc` per resolution on the novable path, and an
+/// `Arc::ptr_eq` against `mainjitcode` misses such a frame even after the walk
+/// accepted it as a portal.
+///
+/// A miss returns `None`.  Upstream's `assert 0, "portal jitcode not found??"`
+/// is unreachable for the walk's own caller, which stops only on a stamped
+/// frame; the entry frame [`run_forever_with_portal`] is handed has not passed
+/// that walk, and neither has the guard-failure loop in `call_jit.rs`.
 fn portal_jd_for(bh: &BlackholeInterpreter) -> Option<usize> {
-    bh.jitdrivers_sd.iter().position(|jd| {
-        jd.mainjitcode
-            .as_ref()
-            .is_some_and(|code| std::sync::Arc::ptr_eq(code, &bh.jitcode))
-    })
+    bh.jitcode.jitdriver_sd()
 }
 
 /// The `jd.handle_jitexc_from_bh` of the driver [`portal_jd_for`] picked.
+///
+/// `None` asks the caller to keep the runner it was handed.  Upstream needs no
+/// such answer: `jd.handle_jitexc_from_bh` exists per driver by construction,
+/// so a found driver always has one.  pyre registers the hooks from the
+/// consumer crate instead, which splits that into two states this must not
+/// conflate — a table nothing has registered into yet, and a table other
+/// drivers registered into while this frame's driver did not.
 fn portal_runner_for(bh: &BlackholeInterpreter) -> Option<PortalRunnerHook> {
     let hooks = PORTAL_RUNNER_HOOKS
         .read()
         .expect("portal runner table poisoned");
-    let own = portal_jd_for(bh).and_then(|jd_index| *hooks.get(jd_index)?);
-    // The search may find nothing, and then this must still hand back the
-    // runner it would have handed back before the search existed.  Upstream can
-    // assert instead (`blackhole.py:1704` "portal jitcode not found??") because
-    // every level it reaches came through `_run_forever`, so the frame that
-    // stopped the walk really is a portal frame.  pyre's production guard-failure
-    // loop in `call_jit.rs` does not go through `_run_forever`, so the chain can
-    // stop at a frame whose jitcode is not any driver's `mainjitcode`; returning
-    // `None` there does not report a missing driver, it silently withdraws the
-    // portal re-entry from a path that had it.
-    own.or_else(|| hooks.iter().find_map(|slot| *slot))
+    let Some(jd_index) = portal_jd_for(bh) else {
+        // No driver claims this jitcode, so there is no owner to be wrong
+        // about, and this must still hand back what it did before the search
+        // existed.  Returning `None` here would not report a missing driver,
+        // it would silently withdraw the portal re-entry from a path that had
+        // it.
+        return hooks.iter().find_map(|slot| *slot);
+    };
+    if let Some(hook) = hooks.get(jd_index).copied().flatten() {
+        return Some(hook);
+    }
+    // The driver that owns this portal registered no runner while other
+    // drivers did.  Substituting one of theirs re-enters *their* portal
+    // carrying this frame's greens and reds — `pyre_portal_runner` reads
+    // `all_r[1]` as a `PyFrame*` — so the type confusion would surface as a
+    // bug in the substituted driver rather than here.  Upstream cannot reach
+    // this state, so failing is what keeps the two tables agreeing.
+    assert!(
+        hooks.is_empty(),
+        "jitdrivers_sd[{jd_index}] owns portal jitcode `{}` but registered no \
+         handle_jitexc_from_bh while {} other driver(s) did",
+        bh.jitcode.name,
+        hooks.iter().filter(|slot| slot.is_some()).count(),
+    );
+    // Nothing is registered at all: the caller's own runner stands in.
+    None
 }
 
 /// The `result_kind` `warmspot.py:984-996` tests each `DoneWithThisFrame*`
-/// against, taken from the same driver [`portal_jd_for`] picked.
+/// against, taken from the same driver [`portal_jd_for`] picked, so the runner
+/// and the kind can never come from different drivers.
+///
+/// `None` when no driver claims the jitcode, and when the driver table was
+/// never installed: a builder that assembles a blackhole without one keeps the
+/// variant-alone behaviour [`handle_jitexception_dispatch`] describes.
 fn portal_result_kind_for(bh: &BlackholeInterpreter) -> Option<BhReturnType> {
-    Some(bh.jitdrivers_sd[portal_jd_for(bh)?].result_type)
+    Some(bh.jitdrivers_sd.get(portal_jd_for(bh)?)?.result_type)
 }
 
 /// Called at every `-live-` marker, i.e. once per source-level instruction the
