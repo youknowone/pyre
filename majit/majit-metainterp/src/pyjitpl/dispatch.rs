@@ -3422,8 +3422,30 @@ where
         // former inline re-entry path recorded a fresh per-driver callee
         // vable identity leaked for the process lifetime — no RPython/PyPy
         // analog (PyPy reconstructs the callee vable from resumedata per
-        // resume) — so it is removed.  This shape aborts to the clean
-        // CALL_ASSEMBLER / retry fallback until a trace-scoped rebuild lands.
+        // resume) — so it is removed.  This shape aborts until a
+        // trace-scoped rebuild lands.
+        //
+        // Sending it to `exec_recursive_call_assembler` instead — which is
+        // what `_opimpl_recursive_call` does for every path that does not
+        // `perform_call`, and which reads as the obvious repair — does NOT
+        // work today, measured: the seam resolves its token through
+        // `get_assembler_token` → `compile_tmp_callback`, and that requires
+        // `jitdriver_sd.portal_runner_adr`.  Registering a driver without one
+        // violates `register_jitdriver_sd`'s documented invariant, and the
+        // `#[jit_interp]` macro install path has no hook that supplies it, so
+        // `majit/examples/tl` — the only crate in the corpus that emits
+        // `BC_RECURSIVE_CALL_*` — registers a driver with `portal_runner_adr`
+        // still 0.  Routing this arm there panics that `debug_assert!`; the
+        // `catch_unwind` in `run_to_end` swallows it into an abort whose
+        // rollback does not undo what the seam already did to the interpreter
+        // state, and `tl`'s `jit_recursive_call_matches_interp` then reads a
+        // wrong stack.  In release the same shape is worse than a panic: the
+        // assertion compiles out and `funcbox` bakes address 0.
+        //
+        // The prerequisite is therefore a portal runner on the driver
+        // (`warmspot.py` `jd.portal_runner_adr = adr_of(ll_portal_runner)`;
+        // `eval.rs` wires one for jd0, which is why production has no such
+        // hole), not a decision-routing change here.
         TraceAction::Abort
     }
 
