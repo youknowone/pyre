@@ -4662,6 +4662,93 @@ mod tests {
         assert!(!is_known_unported(msg));
     }
 
+    /// Graph carrying one `UnaryOp` under `op`, both operand and result
+    /// pre-bound `Int`, returning the result.  `op` decides whether
+    /// `flowspace_adapter::normalize_unary_op_name` accepts the graph, so a
+    /// name it does not register is the smallest unsupported translated op a
+    /// fixture can build.
+    fn one_unary_op_graph(name: &str, op: &str) -> LegacyGraph {
+        let mut graph = LegacyGraph::new(name);
+        let vars = mint_vars(&mut graph, 3);
+        let operand = vars[1].clone();
+        let result = vars[2].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::UnaryOp {
+                    op: op.to_string(),
+                    operand: operand.clone(),
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(result.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        setbinding(&operand, ValueType::Int);
+        setbinding(&result, ValueType::Int);
+        graph
+    }
+
+    /// The negative coverage the retirement plan asks for: introducing a
+    /// translated op the pipeline does not support has to fail the build, not
+    /// recover through the legacy walker.
+    ///
+    /// The fork is `dual_gate_check_with_registry`'s real-path arm — an error
+    /// `is_known_unported` classifies becomes `DualGateOutcome::Skip` and the
+    /// graph silently publishes the legacy walker's types, while an
+    /// unclassified one becomes `Err` and reaches
+    /// `dual_gate_publish_concretetypes`'s final `panic!`.  A new
+    /// `unported_category` arm broad enough to swallow this shape would move
+    /// the whole class from the first behaviour to the second without any
+    /// other test noticing, which is what this pins.
+    #[test]
+    #[should_panic(expected = "MAJIT_RTYPER real-path failure")]
+    fn an_unclassified_translated_op_fails_the_build_instead_of_skipping() {
+        let _lock = anchor_lock();
+        let graph = one_unary_op_graph(
+            "negative_coverage_unsupported_unary",
+            "__negative_coverage_unported_op__",
+        );
+        let mut codewriter = crate::codewriter::CodeWriter::new();
+        let mut callcontrol = crate::codewriter::call::CallControl::new();
+        codewriter.dual_gate_publish_concretetypes(&graph, &mut callcontrol, "negative_coverage");
+    }
+
+    /// The half of the test above that a `should_panic` cannot state: the
+    /// adapter's own refusal text is the one that must stay unclassified.
+    /// `normalize_unary_op_name` registers `pos` / `neg` / `invert` / `bool`
+    /// and the ported `str`; anything else raises this message, and
+    /// `unported_category` deliberately carries no arm for it.
+    #[test]
+    fn the_unary_op_adapter_refusal_carries_no_skip_category() {
+        let msg = "normalize_unary_op_name: pyre UnaryOp \
+                   `__negative_coverage_unported_op__` has no flowspace counterpart";
+        assert_eq!(
+            unported_category(msg),
+            None,
+            "an unsupported unary op must not be Skip-classified — a category here \
+             turns a build failure into a silent legacy-walker recovery"
+        );
+        assert!(!is_known_unported(msg));
+    }
+
     /// An annotator half that fails leaves the unwind carrying its
     /// `AnnotatorError`, not a rendering of it — the payload's type is what
     /// names the failing stage, the way the exception class does upstream.
