@@ -57,7 +57,7 @@ assert raised == 15000, raised
 # The same shape with the string arm second: a trace recorded on the failing
 # answer must not keep raising once the attribute holds a string again.
 obj = Attr()
-obj.out = "s"
+obj.out = 42
 raised = 0
 for i in range(30000):
     if i == 15000:
@@ -67,7 +67,7 @@ for i in range(30000):
     except TypeError:
         raised += 1
     else:
-        assert seen == "s" or seen == "t", seen
-assert raised == 0, raised
+        assert seen == "t", seen
+assert raised == 15000, raised
 
 print("OK")
