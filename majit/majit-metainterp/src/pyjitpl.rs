@@ -3358,22 +3358,14 @@ impl<M: Clone> MetaInterp<M> {
             .and_then(|(_, trace)| Self::infer_exit_types_from_trace(trace, fail_index));
         self.backend_fail_descr_layout(compiled, trace_id, fail_index)
             .map(|layout| {
-                // compile.py copy_all_attributes_from parity:
-                // when the compiled trace has been evicted but the
-                // backend still has rd_numb / rd_consts / rd_virtuals /
-                // rd_pendingfields propagated on the fail descriptor,
-                // reassemble a `ResumeStorage` so downstream consumers
-                // (force_from_resumedata, blackhole) see the same
-                // shared pool the frontend-primed path provides.
-                // Mirrors `merge_backend_exit_layouts` in `compile.rs`.
-                let storage = layout.rd_numb.as_ref().map(|rd_numb| {
-                    crate::resume::ResumeStorage::new(
-                        rd_numb.clone(),
-                        layout.rd_consts.clone().unwrap_or_default(),
-                        layout.rd_virtuals.clone().unwrap_or_default(),
-                        layout.rd_pendingfields.clone().unwrap_or_default(),
-                    )
-                });
+                // `ResumeGuardDescr.get_resumestorage`: the payload is the
+                // descr's own; the layout only names the descr.
+                let storage = layout
+                    .descr
+                    .as_ref()
+                    .and_then(|descr| descr.as_fail_descr())
+                    .and_then(crate::resume::ResumeStorage::from_fail_descr)
+                    .map(std::sync::Arc::new);
                 // `from_vec`, so whichever arm wins hands over the buffer it
                 // already owns instead of being copied into a fresh one.
                 let exit_types = ExitTypes::from_vec(if layout.fail_arg_types.is_empty() {
@@ -7981,7 +7973,7 @@ impl<M: Clone> MetaInterp<M> {
             Ok(_) => {
                 self.last_compiled_artifact_token = Some(token.clone());
                 // compile.py `store_hash`: assign jitcounter hashes.
-                self.assign_guard_hashes(token.as_ref());
+                self.assign_guard_hashes(&compiled_ops);
                 // compile.py send_loop_to_backend registers the token
                 // with the memory manager before record_loop_or_bridge reads it.
                 self.warm_state.memory_manager.keep_loop_alive(&token);
@@ -9407,7 +9399,7 @@ impl<M: Clone> MetaInterp<M> {
         match compile_result {
             Ok(_) => {
                 self.last_compiled_artifact_token = Some(token.clone());
-                self.assign_guard_hashes(token.as_ref());
+                self.assign_guard_hashes(&combined_ops);
                 // `compile.py` `propagate_original_jitcell_token(new_loop)`,
                 // whose body at `:463-468` walks the trace's LABELs and sets
                 // each `TargetToken.original_jitcell_token` to the token this
@@ -9736,7 +9728,7 @@ impl<M: Clone> MetaInterp<M> {
             Ok(_) => {
                 self.last_compiled_artifact_token = Some(source_jct.clone());
                 // compile.py `store_hash` for bridge guards.
-                self.assign_bridge_guard_hashes(source_jct.as_ref(), source_trace_id, fail_index);
+                self.assign_guard_hashes(&combined_ops);
                 // `compile.py propagate_original_jitcell_token` — every
                 // LABEL's TargetToken in the finished trace is rebound to
                 // `new_loop.original_jitcell_token`, which
@@ -10337,7 +10329,7 @@ impl<M: Clone> MetaInterp<M> {
         match compile_loop_result {
             Ok(_) => {
                 self.last_compiled_artifact_token = Some(token.clone());
-                self.assign_guard_hashes(token.as_ref());
+                self.assign_guard_hashes(&optimized_ops);
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py record_loop_or_bridge.
                 self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
@@ -10794,7 +10786,7 @@ impl<M: Clone> MetaInterp<M> {
                 if !self.last_quasi_immutable_deps.is_empty() {
                     crate::mc_diag_bump(75);
                 }
-                self.assign_guard_hashes(token.as_ref());
+                self.assign_guard_hashes(&compiled_ops);
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py record_loop_or_bridge.
                 self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
@@ -13243,56 +13235,28 @@ impl<M: Clone> MetaInterp<M> {
         self.warm_state.memory_manager.keep_loop_alive(&token);
     }
 
-    /// compile.py store_hash: assign jitcounter hashes to guards
-    /// after compile_loop/compile_bridge. RPython calls store_hash during
-    /// optimizer emit (store_final_boxes_in_guard); in majit the backend
-    /// creates fail_descrs, so we assign hashes after compilation.
-    /// Only allocates hashes for real guards (not FINISH/external JUMP).
-    fn assign_guard_hashes(&mut self, token: &JitCellToken) {
-        let layouts = self.backend.compiled_fail_descr_layouts(token);
-        let hashes: Vec<u64> = layouts
-            .iter()
-            .flatten()
-            .map(|layout| {
-                if layout.is_finish {
-                    0 // FINISH/external JUMP — no hash needed
-                } else {
-                    self.warm_state.fetch_next_hash()
-                }
-            })
-            .collect();
-        self.backend.store_guard_hashes(token, &hashes);
-    }
-
-    /// compile.py store_hash for bridge guards.
-    fn assign_bridge_guard_hashes(
-        &mut self,
-        source_token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) {
-        let layouts = self.backend.compiled_bridge_fail_descr_layouts(
-            source_token,
-            source_trace_id,
-            source_fail_index,
-        );
-        let hashes: Vec<u64> = layouts
-            .iter()
-            .flatten()
-            .map(|layout| {
-                if layout.is_finish {
-                    0
-                } else {
-                    self.warm_state.fetch_next_hash()
-                }
-            })
-            .collect();
-        self.backend.store_bridge_guard_hashes(
-            source_token,
-            source_trace_id,
-            source_fail_index,
-            &hashes,
-        );
+    /// `compile.py store_hash`: `self.status = hash & ST_SHIFT_MASK` on every
+    /// guard descr the optimizer stored final boxes in. RPython does it from
+    /// `store_final_boxes`; pyre walks the guards of the trace it just sent
+    /// to the backend. A descr whose status is already set
+    /// (`make_a_counter_per_value`) keeps it, and FINISH descrs have none.
+    fn assign_guard_hashes<T: AsRef<majit_ir::Op>>(&mut self, ops: &[T]) {
+        for op in ops {
+            let op = op.as_ref();
+            if !op.opcode.is_guard() {
+                continue;
+            }
+            let Some(descr) = op.getdescr() else {
+                continue;
+            };
+            let Some(fd) = descr.as_fail_descr() else {
+                continue;
+            };
+            if fd.is_finish() || fd.get_status() != 0 {
+                continue;
+            }
+            fd.store_hash(self.warm_state.fetch_next_hash());
+        }
     }
 
     /// Check whether a bridge was actually compiled and attached for a guard.
@@ -13306,8 +13270,7 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(token) = self.warm_state.get_compiled(green_key)
             && self
                 .backend
-                .compiled_bridge_fail_descr_layouts(&token, trace_id, fail_index)
-                .is_some()
+                .bridge_was_compiled(&token, trace_id, fail_index)
         {
             return true;
         }
@@ -13327,8 +13290,7 @@ impl<M: Clone> MetaInterp<M> {
                 .upgrade()
                 .map(|prev| {
                     self.backend
-                        .compiled_bridge_fail_descr_layouts(&prev, trace_id, fail_index)
-                        .is_some()
+                        .bridge_was_compiled(&prev, trace_id, fail_index)
                 })
                 .unwrap_or(false)
         })
@@ -13898,7 +13860,7 @@ impl<M: Clone> MetaInterp<M> {
                 // compile.py `record_loop_or_bridge` registers every
                 // dependency against the owning token published by this compile.
                 self.last_compiled_artifact_token = Some(token.clone());
-                self.assign_guard_hashes(token.as_ref());
+                self.assign_guard_hashes(&optimized_ops);
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py record_loop_or_bridge.
                 self.last_quasi_immutable_deps =
@@ -14789,7 +14751,7 @@ impl<M: Clone> MetaInterp<M> {
                     // fallback to root_trace_id.
                     fail_descr.trace_id()
                 };
-                self.assign_bridge_guard_hashes(source_jct.as_ref(), source_trace_id, fail_index);
+                self.assign_guard_hashes(&optimized_ops);
                 // `compile.py record_loop_or_bridge(metainterp_sd,
                 //  new_loop)` parity — `new_loop.original_jitcell_token =
                 //  metainterp.resumekey_original_loop_token` (compile.py:801).

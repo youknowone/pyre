@@ -1696,9 +1696,8 @@ impl DynasmBackend {
     /// `asmmemmgr_blocks` is append-only, so retracing the same guard
     /// leaves multiple matching bridges in place.  Walk in reverse to
     /// return the most recently compiled bridge — that is the one
-    /// `store_bridge_guard_hashes` / `compiled_bridge_fail_descr_layouts`
-    /// just wrote against and the one subsequent guard failures should
-    /// dispatch into.
+    /// `bridge_was_compiled` / `compiled_bridge_fail_descr_layouts` ask
+    /// about and the one subsequent guard failures should dispatch into.
     pub fn lookup_bridge_addr(
         &self,
         token: &JitCellToken,
@@ -2346,81 +2345,6 @@ impl DynasmBackend {
         cell.descr.clone()
     }
 
-    /// Find a descr by (trace_id, fail_index) across root loop + all
-    /// bridges. Used by compile_bridge to locate the exact guard descr
-    /// that failed — RPython passes the faildescr object directly.
-    ///
-    /// Panics if not found — in RPython, the faildescr is the exact
-    /// object, so there is no lookup-miss path. Use `try_find_descr` for
-    /// query-style callers (e.g. `bridge_was_compiled` /
-    /// `compiled_bridge_fail_descr_layouts`) that legitimately probe
-    /// "is this guard already compiled?" and must treat the miss as
-    /// `None` (matching cranelift's `?`-on-miss semantics in
-    /// `compiler.rs`).
-    fn find_descr(token: &JitCellToken, trace_id: u64, fail_index: u32) -> majit_ir::DescrRef {
-        Self::try_find_descr(token, trace_id, fail_index).unwrap_or_else(|| {
-            panic!(
-                "find_descr: (trace_id={}, fail_index={}) not found in \
-                 root loop or any bridge — RPython uses exact faildescr \
-                 object identity, so this lookup must succeed",
-                trace_id, fail_index
-            )
-        })
-    }
-
-    fn try_find_descr(
-        token: &JitCellToken,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<majit_ir::DescrRef> {
-        // Query-style miss tolerance: when `token.compiled` is absent
-        // (e.g. a freshly issued JitCellToken whose backend code has
-        // not been attached, or one rotated into `previous_tokens`),
-        // probing callers like `compiled_bridge_fail_descr_layouts`
-        // must observe `None` instead of a panic.  Cranelift's
-        // counterpart at `compiler.rs`
-        // (`token.compiled.as_ref().and_then(|c|
-        // c.downcast_ref::<CompiledLoop>())?`) follows the same
-        // contract.
-        let compiled = token
-            .compiled
-            .get()?
-            .downcast_ref::<CompiledCode>()
-            .expect("compiled data is not CompiledCode");
-        // RPython looks up the faildescr by object identity (the resume
-        // descr stored on the guard op IS what `cpu.get_latest_descr()`
-        // returns).  Pyre's lookup is `(trace_id, fail_index)`-keyed; the
-        // `trace_id` is always a real allocated id (alloc_trace_id starts
-        // at 1).  No `0 → root_trace_id` sentinel — that path was a
-        // pyre-only deviation removed alongside `normalize_trace_id`.
-        //
-        // `fail_descrs[i].fail_index_per_trace() == i` is enforced at
-        // codegen end (`x86/assembler.rs` and
-        // `aarch64/assembler.rs`); the per-Compiled trace
-        // identity is the `CompiledCode::trace_id` field rather than a
-        // per-descr `trace_id()` read.  Look up by position so the
-        // descr's internal per-emission state is not required —
-        // singleton FINISH descrs share an Arc across emissions and
-        // would otherwise answer `fail_index_per_trace()` / `trace_id()`
-        // with the trait default `0`.
-        if compiled.trace_id == trace_id
-            && let Some(found) = compiled.fail_descrs.get(fail_index as usize)
-        {
-            return Some(found.descr.clone());
-        }
-        let blocks_clt = token.compiled_loop_token_expect();
-        let blocks = blocks_clt.asmmemmgr_blocks.lock();
-        for block in blocks.iter() {
-            if let Some(bridge) = block.downcast_ref::<CompiledCode>()
-                && bridge.trace_id == trace_id
-                && let Some(found) = bridge.fail_descrs.get(fail_index as usize)
-            {
-                return Some(found.descr.clone());
-            }
-        }
-        None
-    }
-
     /// `rpython/jit/backend/x86/assembler.py:599` parity: store
     /// `_ll_function_addr` after the loop is fully assembled and retain the
     /// compiled-loop metadata for GC rewrite callbacks.
@@ -2497,6 +2421,7 @@ impl Backend for DynasmBackend {
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        let _writing = majit_backend::AssemblerWriting::enter();
         // `x86/assembler.py:514` parity: PyPy creates the
         // `CompiledLoopToken` inside `assemble_loop`, and that's where
         // the `cpu.tracker.total_compiled_loops` bump and the
@@ -2746,6 +2671,7 @@ impl Backend for DynasmBackend {
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
         _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        let _writing = majit_backend::AssemblerWriting::enter();
         // `x86/runner.py:100-101` parity:
         //   clt = original_loop_token.compiled_loop_token
         //   clt.compiling_a_bridge()
@@ -2834,23 +2760,16 @@ impl Backend for DynasmBackend {
 
         let _orig_compiled = Self::get_compiled(original_token);
 
-        let guard_descr = Self::find_descr(
-            original_token,
-            fail_descr.trace_id(),
-            fail_descr.fail_index_per_trace(),
-        );
         // `assembler.py assemble_bridge` reads the locations off the
         // `faildescr` it was handed — the descr the guard actually failed on —
-        // and `compile.py ResumeGuardDescr.compile_and_attach` is what hands it
-        // over. `guard_descr` below is a `(trace_id, fail_index)` lookup that
-        // exists for `patch_jump_for_descr`'s `adr_jump_offset`, and it can
-        // answer with a different object than the one that failed.
+        // and patches that same descr's jump below; `compile.py
+        // ResumeGuardDescr.compile_and_attach` is what hands it over.
         //
-        // These two must be the same descr: `jitdriver.rs`
-        // `start_bridge_tracing` takes the bridge's inputarg count from
-        // `fail_descr.fail_arg_types().len()`, while `_update_bindings` zips
-        // that inputarg vector against this location vector. Reading the
-        // locations off the other object let the two lengths disagree —
+        // `jitdriver.rs` `start_bridge_tracing` takes the bridge's inputarg
+        // count from `fail_descr.fail_arg_types().len()`, while
+        // `_update_bindings` zips that inputarg vector against this location
+        // vector, so both must come off the one descr. Reading the locations
+        // off a `(trace_id, fail_index)` lookup let the two lengths disagree —
         // measured on `pyre/bench/fannkuch.py`, 17 inputargs against 15
         // locations — and every inputarg past the shorter list then bound
         // nothing at all (`RegisterManager.loc: box InputArgInt(1844) not
@@ -2894,10 +2813,7 @@ impl Backend for DynasmBackend {
             .fetch_max(bridge_frame_depth as usize, Ordering::Release);
 
         // assembler.py:987 patch_jump_for_descr — redirect guard to bridge.
-        // Use the exact guard descr found above, not a fail_index search.
-        let guard_fd = guard_descr
-            .as_fail_descr()
-            .expect("guard_descr is FailDescr");
+        let guard_fd = fail_descr;
         let ajo = guard_fd.adr_jump_offset();
         if crate::majit_log_enabled() {
             eprintln!(
@@ -3237,7 +3153,7 @@ impl Backend for DynasmBackend {
             });
         }
         let exit_layout = Some(crate::guard::layout_for_fail_descr(
-            descr_fd,
+            &descr,
             descr_fd.fail_index_per_trace(),
             descr_fd.trace_id(),
         ));
@@ -3409,6 +3325,7 @@ impl Backend for DynasmBackend {
     }
 
     fn invalidate_loop(&self, token: &JitCellToken) {
+        let _writing = majit_backend::AssemblerWriting::enter();
         // `model.py:145` activates the guards in the loop AND in its attached
         // bridges. Each bridge's GUARD_NOT_INVALIDATED reads its own
         // generation flag, so storing to the root flag alone would leave every
@@ -3422,6 +3339,7 @@ impl Backend for DynasmBackend {
         old: &JitCellToken,
         new: &JitCellToken,
     ) -> Result<(), BackendError> {
+        let _writing = majit_backend::AssemblerWriting::enter();
         let old_compiled = Self::get_compiled(old);
         let new_compiled = Self::get_compiled(new);
         // x86/assembler.py:1146-1151 update_frame_info parity: propagate
@@ -3466,55 +3384,13 @@ impl Backend for DynasmBackend {
 
     // No migrate_bridges — we patch in place.
 
-    fn store_guard_hashes(&self, token: &JitCellToken, hashes: &[u64]) {
-        let compiled = Self::get_compiled(token);
-        for (i, &hash) in hashes.iter().enumerate() {
-            if let Some(descr) = compiled.fail_descrs.get(i) {
-                // `compile.py` `store_hash` only fires for non-final
-                // `AbstractResumeGuardDescr` whose status is still 0 (no
-                // counter yet stamped).  Route the predicate through the
-                // FailDescr trait so the metainterp class hierarchy
-                // (`final_descr=True` on Done*/Exit*/Propagate) answers.
-                if let Some(fd) = descr.as_fail_descr()
-                    && !fd.is_finish()
-                    && fd.get_status() == 0
-                {
-                    fd.store_hash(hash);
-                }
-            }
-        }
-    }
-
-    fn store_bridge_guard_hashes(
+    fn bridge_was_compiled(
         &self,
         token: &JitCellToken,
         source_trace_id: u64,
         source_fail_index: u32,
-        hashes: &[u64],
-    ) {
-        let bridge_addr = self.lookup_bridge_addr(token, source_trace_id, source_fail_index);
-        if bridge_addr == 0 {
-            return;
-        }
-        let blocks_clt = token.compiled_loop_token_expect();
-        let blocks = blocks_clt.asmmemmgr_blocks.lock();
-        for block in blocks.iter() {
-            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
-                let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;
-                if addr == bridge_addr {
-                    for (i, &hash) in hashes.iter().enumerate() {
-                        if let Some(descr) = bridge.fail_descrs.get(i)
-                            && let Some(fd) = descr.as_fail_descr()
-                            && !fd.is_finish()
-                            && fd.get_status() == 0
-                        {
-                            fd.store_hash(hash);
-                        }
-                    }
-                    return;
-                }
-            }
-        }
+    ) -> bool {
+        self.lookup_bridge_addr(token, source_trace_id, source_fail_index) != 0
     }
 
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
@@ -4042,13 +3918,7 @@ impl Backend for DynasmBackend {
                 .fail_descrs
                 .iter()
                 .enumerate()
-                .map(|(idx, d)| {
-                    crate::guard::layout_for_fail_descr(
-                        d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
-                        idx as u32,
-                        trace_id,
-                    )
-                })
+                .map(|(idx, d)| crate::guard::layout_for_fail_descr(&d.descr, idx as u32, trace_id))
                 .collect(),
         )
     }
@@ -4066,11 +3936,7 @@ impl Backend for DynasmBackend {
                     .iter()
                     .enumerate()
                     .map(|(idx, d)| {
-                        crate::guard::layout_for_fail_descr(
-                            d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
-                            idx as u32,
-                            trace_id,
-                        )
+                        crate::guard::layout_for_fail_descr(&d.descr, idx as u32, trace_id)
                     })
                     .collect(),
             );
@@ -4088,11 +3954,7 @@ impl Backend for DynasmBackend {
                         .iter()
                         .enumerate()
                         .map(|(idx, d)| {
-                            crate::guard::layout_for_fail_descr(
-                                d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
-                                idx as u32,
-                                trace_id,
-                            )
+                            crate::guard::layout_for_fail_descr(&d.descr, idx as u32, trace_id)
                         })
                         .collect(),
                 );
@@ -4131,7 +3993,7 @@ impl Backend for DynasmBackend {
                             .enumerate()
                             .map(|(idx, d)| {
                                 crate::guard::layout_for_fail_descr(
-                                    d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
+                                    &d.descr,
                                     idx as u32,
                                     bridge_trace_id,
                                 )
@@ -4797,7 +4659,7 @@ mod tests {
         let failed = backend.execute_token(&token, &[Value::Ref(payload)]);
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
-        let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
+        let guard_descr = backend.get_latest_descr_arc(&failed);
 
         let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         bridge_constants.insert(200, return_ref_passthrough as *const () as usize as i64);
@@ -4894,7 +4756,7 @@ mod tests {
         );
         let guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let guard_trace_id = backend.get_latest_descr(&failed).trace_id();
-        let guard_descr = DynasmBackend::find_descr(&token, guard_trace_id, guard_fail_index);
+        let guard_descr = backend.get_latest_descr_arc(&failed);
 
         backend.set_constants(indexmap::IndexMap::new());
         let field_descr: DescrRef =

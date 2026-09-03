@@ -8198,10 +8198,7 @@ fn fail_descr_layout(
         is_exception_exit: fd.is_exit_frame_with_exception(),
         recovery_layout: recovery,
         frame_stack,
-        rd_numb: fd.rd_numb().map(|s| s.to_vec()),
-        rd_consts: fd.rd_consts().map(|s| s.to_vec()),
-        rd_virtuals: fd.rd_virtuals().map(|s| s.to_vec()),
-        rd_pendingfields: fd.rd_pendingfields().map(|s| s.to_vec()),
+        descr: Some(descr.clone()),
     }
 }
 
@@ -17870,6 +17867,7 @@ impl majit_backend::Backend for CraneliftBackend {
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        let _writing = majit_backend::AssemblerWriting::enter();
         // `x86/assembler.py:514` parity — bump
         // `cpu.tracker.total_compiled_loops` and open the
         // `jit-mem-looptoken-alloc` debug section at the same point
@@ -18013,6 +18011,7 @@ impl majit_backend::Backend for CraneliftBackend {
         previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        let _writing = majit_backend::AssemblerWriting::enter();
         // `x86/runner.py:100-101` parity — bump this backend's
         // tracker and the per-loop bridges_count before assembling.
         if let Some(clt) = original_token.compiled_loop_token() {
@@ -18299,74 +18298,27 @@ impl majit_backend::Backend for CraneliftBackend {
         CraneliftBackend::set_callinfocollection(self, cic);
     }
 
-    fn store_guard_hashes(&self, token: &JitCellToken, hashes: &[u64]) {
-        let compiled = token
-            .compiled
-            .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current);
-        if let Some(compiled) = compiled {
-            for (i, &hash) in hashes.iter().enumerate() {
-                if let Some(descr) = compiled.fail_descrs.get(i) {
-                    // `compile.py` `store_hash` only fires for non-
-                    // final `AbstractResumeGuardDescr` whose status is
-                    // still 0.  Route through the FailDescr trait so the
-                    // metainterp class hierarchy answers `final_descr`
-                    // (Done*/Exit*/Propagate, compile.py:624 / 658-662 /
-                    // 1092) instead of the backend-local mirror.
-                    // `compile.py` `store_hash` only fires on
-                    // `AbstractResumeGuardDescr`.  `is_finish()` excludes
-                    // `Done*` finishes but still permits other final
-                    // non-guard descrs (`ExitFrameWithExceptionDescrRef`,
-                    // `PropagateExceptionDescr`) since they answer
-                    // `is_finish() == false`.  Gate on the canonical
-                    // `ResumeDescr` family instead.
-                    let fd = as_fd(descr);
-                    if (fd.is_resume_guard() || fd.is_resume_guard_copied()) && fd.get_status() == 0
-                    {
-                        fd.store_hash(hash);
-                    }
-                }
-            }
-        }
-    }
-
-    fn store_bridge_guard_hashes(
+    fn bridge_was_compiled(
         &self,
-        token: &JitCellToken,
+        original_token: &JitCellToken,
         source_trace_id: u64,
         source_fail_index: u32,
-        hashes: &[u64],
-    ) {
-        let compiled = token
+    ) -> bool {
+        let Some(original_compiled) = original_token
             .compiled
             .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current);
-        if let Some(compiled) = compiled {
-            // Use recursive search matching compiled_bridge_fail_descr_layouts.
-            let source_descr = find_fail_descr_in_fail_descrs(
-                &compiled.fail_descrs,
-                source_trace_id,
-                source_fail_index,
-            );
-            if let Some(descr) = source_descr
-                && let Some(bridge) = fail_descr_bridge_ref(as_fd(&descr))
-            {
-                for (i, &hash) in hashes.iter().enumerate() {
-                    if let Some(bd) = bridge.fail_descrs.get(i) {
-                        // Same `ResumeDescr`-family gate as in
-                        // `store_guard_hashes` above (compile.py:826-829).
-                        let fd = as_fd(bd);
-                        if (fd.is_resume_guard() || fd.is_resume_guard_copied())
-                            && fd.get_status() == 0
-                        {
-                            fd.store_hash(hash);
-                        }
-                    }
-                }
-            }
-        }
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)
+        else {
+            return false;
+        };
+        find_fail_descr_in_fail_descrs(
+            &original_compiled.fail_descrs,
+            source_trace_id,
+            source_fail_index,
+        )
+        .and_then(|descr| fail_descr_bridge_ref(as_fd(&descr)))
+        .is_some()
     }
 
     fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {
@@ -18986,6 +18938,7 @@ impl majit_backend::Backend for CraneliftBackend {
         old: &JitCellToken,
         new: &JitCellToken,
     ) -> Result<(), BackendError> {
+        let _writing = majit_backend::AssemblerWriting::enter();
         let new_addr = new.ll_function_addr();
         if new_addr != 0 {
             old.set_ll_function_addr(new_addr);

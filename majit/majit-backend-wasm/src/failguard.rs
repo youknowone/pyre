@@ -940,8 +940,8 @@ pub struct CompiledWasmLoop {
     pub bridge_param_dispatch: bool,
     /// `(source_trace_id, source_fail_index, start, count)` ranges into
     /// `fail_descrs` for each chained bridge `compile_bridge` appended (lib.rs
-    /// extend site). Lets `compiled_bridge_fail_descr_layouts` /
-    /// `store_bridge_guard_hashes` map a source guard back to its bridge's
+    /// extend site). Lets `compiled_bridge_fail_descr_layouts` map a source
+    /// guard back to its bridge's
     /// appended descr slice — the wasm analog of dynasm's
     /// `lookup_bridge_addr` (runner.rs). Keyed by BOTH the source guard's
     /// owning trace and its per-trace fail index: with nested chaining, the

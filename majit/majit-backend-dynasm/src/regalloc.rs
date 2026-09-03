@@ -1908,8 +1908,12 @@ impl<'a> RegAlloc<'a> {
             return;
         }
         let descr_id = op.getdescr().as_ref().map(descr_identity);
-        self.final_jump_args =
-            descr_id.map(|id| (id, op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect())));
+        self.final_jump_args = descr_id.map(|id| {
+            (
+                id,
+                op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
+            )
+        });
         self.final_jump_op_position = (operations.len() - 1) as i32;
         let Some(descr) = op.getdescr() else {
             return;
@@ -3404,7 +3408,8 @@ impl<'a> RegAlloc<'a> {
             }
             // aarch64/regalloc.py prepare_op_cond_call_gc_wb
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
+                let args: Vec<OpRef> =
+                    op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
                 let mut arglocs = Vec::new();
                 for (idx, arg) in op.getarglist().iter().enumerate() {
                     let arg = arg.to_opref();
@@ -3571,7 +3576,8 @@ impl<'a> RegAlloc<'a> {
             } else {
                 self.make_sure_var_in_reg(y, Type::Int, &[], Some(ECX), false)
             };
-            let args: Vec<OpRef> = op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
+            let args: Vec<OpRef> =
+                op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect());
             let loc1 = self.rm.force_result_in_reg(
                 op.pos.get(),
                 op.arg(0).to_opref(),
@@ -5733,8 +5739,12 @@ impl<'a> RegAlloc<'a> {
     fn consider_jump(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // x86/regalloc.py:1306-1309: descr = op.getdescr(); self.jump_target_descr = descr
         let descr_id = op.getdescr().as_ref().map(descr_identity);
-        self.final_jump_args =
-            descr_id.map(|id| (id, op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect())));
+        self.final_jump_args = descr_id.map(|id| {
+            (
+                id,
+                op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
+            )
+        });
         self.jump_target_descr = descr_id;
         let mut locs = Vec::new();
         for arg in op.getarglist().iter() {

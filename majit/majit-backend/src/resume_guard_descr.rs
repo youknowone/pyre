@@ -49,7 +49,6 @@ use majit_ir::{
 use crate::CompiledLoopToken;
 use crate::CompiledTraceInfo;
 use crate::rd_payload::RdPayload;
-use crate::resume_value::ResumeData;
 
 // `compile.py AbstractResumeGuardDescr` status-bit constants.
 //
@@ -162,12 +161,6 @@ pub struct ResumeGuardDescr {
     /// `compile.py store_final_boxes` mutates types in place; pyre
     /// uses `UnsafeCell` so identity is preserved across the optimizer.
     pub types: UnsafeCell<Vec<Type>>,
-    /// Pyre keeps `resume_data` (the RPython-style ResumeValueSource
-    /// payload used by `prepare_pendingfields` for the
-    /// `PendingFieldInfo` path) on the descr alongside the RPython
-    /// `_attrs_` rd_* slots — both representations co-exist while
-    /// the runtime resume reader is being aligned with upstream.
-    pub resume_data: ResumeData,
     /// `compile.py:855` `_attrs_ = ('rd_numb', 'rd_consts',
     /// 'rd_virtuals', 'rd_pendingfields', 'status')`.
     pub payload: RdPayload,
@@ -337,7 +330,6 @@ impl Descr for ResumeGuardDescr {
         Some(Arc::new(ResumeGuardDescr {
             fail_index: alloc_fail_index(),
             types: UnsafeCell::new(unsafe { (&*self.types.get()).clone() }),
-            resume_data: self.resume_data.clone(),
             payload: self.payload.deep_clone(),
             vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
             // `compile.py:844-846` mints a default-attributes object;
@@ -617,13 +609,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
     Arc::new(ResumeGuardDescr {
         fail_index: alloc_fail_index(),
         types: UnsafeCell::new(types),
-        resume_data: ResumeData {
-            vable_array: Vec::new(),
-            vref_array: Vec::new(),
-            frames: Vec::new(),
-            virtuals: Vec::new(),
-            pending_fields: Vec::new(),
-        },
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),

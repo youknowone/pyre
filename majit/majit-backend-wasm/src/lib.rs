@@ -4886,9 +4886,7 @@ impl majit_backend::Backend for WasmBackend {
             // Append the bridge's exit descrs to the source loop's flat
             // `fail_descrs` and record the slice they occupy, keyed by the
             // source guard's `fail_index`. `compiled_bridge_fail_descr_layouts`
-            // / `store_bridge_guard_hashes` use that range to stamp jitcounter
-            // hashes onto these bridge-internal guards (compile.py:826-830
-            // store_hash). `start` is captured inside the same `borrow_mut`
+            // maps a source guard back to that range. `start` is captured inside the same `borrow_mut`
             // critical section as the `extend`, so the range stays in lockstep
             // with the vec.
             let count = bridge_descrs.len();
@@ -5063,10 +5061,7 @@ impl majit_backend::Backend for WasmBackend {
                         .unwrap_or(false),
                     recovery_layout: None,
                     frame_stack: None,
-                    rd_numb: meta.and_then(|fd| fd.rd_numb().map(|s| s.to_vec())),
-                    rd_consts: meta.and_then(|fd| fd.rd_consts().map(|s| s.to_vec())),
-                    rd_virtuals: meta.and_then(|fd| fd.rd_virtuals().map(|s| s.to_vec())),
-                    rd_pendingfields: meta.and_then(|fd| fd.rd_pendingfields().map(|s| s.to_vec())),
+                    descr: wfd.meta_descr.clone(),
                 }
             })
             .collect();
@@ -5074,36 +5069,10 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     /// `compile.py` store_hash: stamp the jitcounter hashes assigned by
-    /// `assign_guard_hashes` onto each guard's metainterp `ResumeGuardDescr`
-    /// (`meta_descr`) — the descr `must_compile_with_values` reads the status
-    /// from. Same `ResumeDescr`-family + status-0 gate as the native backends.
-    fn store_guard_hashes(&self, token: &JitCellToken, hashes: &[u64]) {
-        let Some(compiled) = token
-            .compiled
-            .get()
-            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-        else {
-            return;
-        };
-        let descrs = compiled.fail_descrs.borrow();
-        for (i, &hash) in hashes.iter().enumerate() {
-            let Some(wfd) = descrs.get(i) else { break };
-            let Some(meta) = wfd.meta_descr.as_ref().and_then(|m| m.as_fail_descr()) else {
-                continue;
-            };
-            if (meta.is_resume_guard() || meta.is_resume_guard_copied()) && meta.get_status() == 0 {
-                meta.store_hash(hash);
-            }
-        }
-    }
-
-    /// `compile.py` store_hash for the guards INSIDE a compiled bridge.
     /// `compile_bridge` appends a bridge's exit descrs to the source loop's flat
     /// `fail_descrs` and records their `(source_fail_index, start, count)` slice
-    /// in `bridge_descr_ranges`. Return one layout per descr in that slice so
-    /// `assign_bridge_guard_hashes` stamps a jitcounter hash on each non-finish
-    /// bridge guard — without it they stay status 0 and collide in jitcounter
-    /// bucket 0. `fail_index` is the 0-based position within the bridge's own
+    /// in `bridge_descr_ranges`. Return one layout per descr in that slice.
+    /// `fail_index` is the 0-based position within the bridge's own
     /// exit list (matching the bridge's frontend `exit_layouts` keying and the
     /// native backends' `compiled_bridge_fail_descr_layouts`); `trace_id` is the
     /// bridge's own id, stamped on each appended `WasmFailDescr`.
@@ -5144,58 +5113,11 @@ impl majit_backend::Backend for WasmBackend {
                         .unwrap_or(false),
                     recovery_layout: None,
                     frame_stack: None,
-                    rd_numb: meta.and_then(|fd| fd.rd_numb().map(|s| s.to_vec())),
-                    rd_consts: meta.and_then(|fd| fd.rd_consts().map(|s| s.to_vec())),
-                    rd_virtuals: meta.and_then(|fd| fd.rd_virtuals().map(|s| s.to_vec())),
-                    rd_pendingfields: meta.and_then(|fd| fd.rd_pendingfields().map(|s| s.to_vec())),
+                    descr: wfd.meta_descr.clone(),
                 }
             })
             .collect();
         Some(layouts)
-    }
-
-    /// `compile.py` store_hash: stamp the hashes `assign_bridge_guard_hashes`
-    /// assigned onto the metainterp `ResumeGuardDescr` of each guard inside the
-    /// bridge attached at `source_fail_index`. Same `ResumeDescr`-family +
-    /// status-0 gate as `store_guard_hashes`; iterates the same slice in the
-    /// same order as `compiled_bridge_fail_descr_layouts` so the hash vector
-    /// lines up positionally.
-    fn store_bridge_guard_hashes(
-        &self,
-        token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-        hashes: &[u64],
-    ) {
-        let Some(compiled) = token
-            .compiled
-            .get()
-            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-        else {
-            return;
-        };
-        let Some((start, _count)) = compiled
-            .bridge_descr_ranges
-            .borrow()
-            .iter()
-            .rev()
-            .find(|r| r.0 == source_trace_id && r.1 == source_fail_index)
-            .map(|&(_, _, start, count)| (start, count))
-        else {
-            return;
-        };
-        let descrs = compiled.fail_descrs.borrow();
-        for (i, &hash) in hashes.iter().enumerate() {
-            let Some(wfd) = descrs.get(start + i) else {
-                break;
-            };
-            let Some(meta) = wfd.meta_descr.as_ref().and_then(|m| m.as_fail_descr()) else {
-                continue;
-            };
-            if (meta.is_resume_guard() || meta.is_resume_guard_copied()) && meta.get_status() == 0 {
-                meta.store_hash(hash);
-            }
-        }
     }
 
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {

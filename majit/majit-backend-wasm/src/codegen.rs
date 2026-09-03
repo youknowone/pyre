@@ -2614,7 +2614,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
             let meta_descr = op.getdescr();
             // `regalloc.py consider_guard_value` — stamp the per-value
             // counter here, where the native backends stamp it during guard
-            // layout, so `store_guard_hashes`' `status == 0` gate
+            // layout, so the `status == 0` gate of `store_hash`
             // (`compile.py`) leaves it alone and `must_compile` hashes
             // the (guard, failing value) pair. Without it a guard whose failing
             // value never repeats accumulates in one bucket and compiles

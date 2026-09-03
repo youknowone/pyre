@@ -1203,20 +1203,16 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
     ops: &[T],
 ) {
     for layout in backend_layouts {
-        // compile.py copy_all_attributes_from parity: when the backend
-        // exposes resume data (rd_numb / rd_consts / rd_virtuals /
-        // rd_pendingfields) for an exit the frontend never saw, assemble
-        // them into a `ResumeStorage` so downstream consumers
-        // (rebuild_guard_fail_state, blackhole_resume_via_rd_numb) see the
-        // same shared pool they get on the frontend-primed path.
-        let storage_from_backend = layout.rd_numb.clone().map(|numb| {
-            crate::resume::ResumeStorage::new(
-                numb,
-                layout.rd_consts.clone().unwrap_or_default(),
-                layout.rd_virtuals.clone().unwrap_or_default(),
-                layout.rd_pendingfields.clone().unwrap_or_default(),
-            )
-        });
+        // `ResumeGuardDescr.get_resumestorage`: an exit the frontend never
+        // saw still carries its payload on its own descr, so downstream
+        // consumers (rebuild_guard_fail_state, blackhole_resume_via_rd_numb)
+        // see the same pool they get on the frontend-primed path.
+        let storage_from_backend = layout
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_fail_descr())
+            .and_then(crate::resume::ResumeStorage::from_fail_descr)
+            .map(std::sync::Arc::new);
         // Pre-resolve the source-op `descr` for backend-only entries so
         // `entry.descr` matches what `build_guard_metadata` would have
         // primed had the frontend seen this exit.  When the source op
@@ -3321,13 +3317,6 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
     Arc::new(ResumeGuardDescr {
         fail_index,
         types: UnsafeCell::new(vec![Type::Int; num_live]),
-        resume_data: ResumeData {
-            vable_array: Vec::new(),
-            vref_array: Vec::new(),
-            frames: Vec::new(),
-            virtuals: Vec::new(),
-            pending_fields: Vec::new(),
-        },
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
@@ -3415,13 +3404,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
     Arc::new(ResumeGuardDescr {
         fail_index: alloc_fail_index(),
         types: UnsafeCell::new(types),
-        resume_data: ResumeData {
-            vable_array: Vec::new(),
-            vref_array: Vec::new(),
-            frames: Vec::new(),
-            virtuals: Vec::new(),
-            pending_fields: Vec::new(),
-        },
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
@@ -3747,13 +3729,6 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
         inner: ResumeGuardDescr {
             fail_index: alloc_fail_index(),
             types: UnsafeCell::new(types),
-            resume_data: ResumeData {
-                vable_array: Vec::new(),
-                vref_array: Vec::new(),
-                frames: Vec::new(),
-                virtuals: Vec::new(),
-                pending_fields: Vec::new(),
-            },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
@@ -4032,13 +4007,6 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
         inner: ResumeGuardDescr {
             fail_index: alloc_fail_index(),
             types: UnsafeCell::new(types),
-            resume_data: ResumeData {
-                vable_array: Vec::new(),
-                vref_array: Vec::new(),
-                frames: Vec::new(),
-                virtuals: Vec::new(),
-                pending_fields: Vec::new(),
-            },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
@@ -4298,13 +4266,6 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
         inner: ResumeGuardDescr {
             fail_index: alloc_fail_index(),
             types: UnsafeCell::new(types),
-            resume_data: ResumeData {
-                vable_array: Vec::new(),
-                vref_array: Vec::new(),
-                frames: Vec::new(),
-                virtuals: Vec::new(),
-                pending_fields: Vec::new(),
-            },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
@@ -5317,7 +5278,6 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
             inner: ResumeGuardDescr {
                 fail_index: alloc_fail_index(),
                 types: UnsafeCell::new(unsafe { (&*self.inner.types.get()).clone() }),
-                resume_data: self.inner.resume_data.clone(),
                 payload: self.inner.payload.deep_clone(),
                 vector_info: UnsafeCell::new(unsafe { (&*self.inner.vector_info.get()).clone() }),
                 adr_jump_offset: UnsafeCell::new(0),
@@ -5537,13 +5497,6 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
         inner: ResumeGuardDescr {
             fail_index: alloc_fail_index(),
             types: UnsafeCell::new(types),
-            resume_data: ResumeData {
-                vable_array: Vec::new(),
-                vref_array: Vec::new(),
-                frames: Vec::new(),
-                virtuals: Vec::new(),
-                pending_fields: Vec::new(),
-            },
             payload,
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
@@ -6106,13 +6059,6 @@ mod fail_descr_tests {
             inner: ResumeGuardDescr {
                 fail_index: alloc_fail_index(),
                 types: UnsafeCell::new(vec![Type::Int]),
-                resume_data: ResumeData {
-                    vable_array: Vec::new(),
-                    vref_array: Vec::new(),
-                    frames: Vec::new(),
-                    virtuals: Vec::new(),
-                    pending_fields: Vec::new(),
-                },
                 payload: RdPayload::empty(),
                 vector_info: UnsafeCell::new(None),
                 adr_jump_offset: UnsafeCell::new(0),

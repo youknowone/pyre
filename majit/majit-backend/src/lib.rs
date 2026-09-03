@@ -789,17 +789,10 @@ pub struct FailDescrLayout {
     /// Complete frame stack from innermost (this guard's frame) to outermost.
     /// Present when multi-frame reconstruction is supported.
     pub frame_stack: Option<Vec<ExitFrameLayout>>,
-    /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
-    /// Propagated from the backend's fail descriptor so the frontend can
-    /// reconstruct the blackhole chain after a trace's `CompiledTrace` entry
-    /// has been evicted but the descriptor itself is still live.
-    pub rd_numb: Option<Vec<u8>>,
-    /// resume.py:451 — shared constant pool referenced by `rd_numb`.
-    pub rd_consts: Option<Vec<Const>>,
-    /// resume.py:488 — virtual object field info referenced by `rd_numb`.
-    pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
-    /// Deferred heap writes associated with this guard exit.
-    pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
+    /// `cpu.get_latest_descr(deadframe)`: the exit's own descr. The resume
+    /// payload is read off it (`ResumeGuardDescr.get_resumestorage`), never
+    /// copied into the layout. `None` for a synthetic exit that has no descr.
+    pub descr: Option<majit_ir::DescrRef>,
 }
 
 /// Static layout metadata for a terminal exit within a compiled trace.
@@ -2107,6 +2100,127 @@ const ASM_LARGE_ALLOC_SIZE: usize = 1024 * 1024;
 const ASM_MIN_FRAGMENT: usize = 64;
 #[cfg(not(target_arch = "wasm32"))]
 const ASM_NUM_INDICES: usize = 32;
+/// `asmmemmgr.py` `BlockBuilderMixin.ALIGN_MATERIALIZE`: `materialize`
+/// over-allocates by `align - 1` and rounds the start up inside the block.
+#[cfg(not(target_arch = "wasm32"))]
+const ASM_ALIGN_MATERIALIZE: usize = 16;
+
+/// `rmmap.py` `alloc_hinted`: one large JIT mapping, `PROT_EXEC | PROT_READ |
+/// PROT_WRITE`, `MAP_JIT` on darwin/arm64. Blocks of different lifetimes share
+/// it back to back, so the mapping is never re-protected; on darwin/arm64 the
+/// per-thread `pthread_jit_write_protect_np` toggle in
+/// [`enter_assembler_writing`] is what separates writing from executing.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+struct AsmLargeBlock {
+    start: usize,
+    size: usize,
+}
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+impl AsmLargeBlock {
+    fn map(size: usize) -> io::Result<Self> {
+        #[allow(unused_mut)]
+        let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            flags |= libc::MAP_JIT;
+        }
+        let prot = libc::PROT_EXEC | libc::PROT_READ | libc::PROT_WRITE;
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), size, prot, flags, -1, 0) };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            start: ptr as usize,
+            size,
+        })
+    }
+}
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+impl Drop for AsmLargeBlock {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.start as *mut libc::c_void, self.size) };
+    }
+}
+
+#[cfg(windows)]
+struct AsmLargeBlock {
+    start: usize,
+    _allocation: region::Allocation,
+}
+
+#[cfg(windows)]
+impl AsmLargeBlock {
+    fn map(size: usize) -> io::Result<Self> {
+        let mut allocation = region::alloc(size, region::Protection::READ_WRITE_EXECUTE)
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            start: allocation.as_mut_ptr::<u8>() as usize,
+            _allocation: allocation,
+        })
+    }
+}
+
+// `rmmap.py` `Nester`: the depth of `enter_assembler_writing` brackets on
+// this thread. `pthread_jit_write_protect_np` is per-thread state, so the
+// counter is too.
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static ASSEMBLER_WRITING_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// `rmmap.py` `enter_assembler_writing`: on darwin/arm64 switch this thread's
+/// `MAP_JIT` pages from executable to writable; elsewhere the JIT mapping is
+/// RWX and this only counts the bracket.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn enter_assembler_writing() {
+    ASSEMBLER_WRITING_DEPTH.with(|depth| {
+        if depth.get() == 0 {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            unsafe {
+                libc::pthread_jit_write_protect_np(0);
+            }
+        }
+        depth.set(depth.get() + 1);
+    });
+}
+
+/// `rmmap.py` `leave_assembler_writing`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn leave_assembler_writing() {
+    ASSEMBLER_WRITING_DEPTH.with(|depth| {
+        depth.set(depth.get() - 1);
+        if depth.get() == 0 {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            unsafe {
+                libc::pthread_jit_write_protect_np(1);
+            }
+        }
+    });
+}
+
+/// The `try: ... finally: rmmap.leave_assembler_writing()` bracket
+/// (`aarch64/assembler.py` `assemble_loop`, `assemble_bridge`,
+/// `redirect_call_assembler`; `aarch64/runner.py` `invalidate_loop`) as a
+/// guard, so every return path leaves.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct AssemblerWriting(());
+
+#[cfg(not(target_arch = "wasm32"))]
+impl AssemblerWriting {
+    pub fn enter() -> Self {
+        enter_assembler_writing();
+        Self(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for AssemblerWriting {
+    fn drop(&mut self) {
+        leave_assembler_writing();
+    }
+}
 
 /// `rpython/jit/backend/llsupport/asmmemmgr.py:10-145`.
 ///
@@ -2124,15 +2238,15 @@ pub struct AsmMemoryManager {
 
 #[cfg(not(target_arch = "wasm32"))]
 struct AsmMemoryManagerInner {
-    allocations: Vec<region::Allocation>,
+    allocations: Vec<AsmLargeBlock>,
     allocation_ranges: Vec<(usize, usize)>,
     free_blocks: BTreeMap<usize, usize>,
     free_blocks_end: BTreeMap<usize, usize>,
     blocks_by_size: Vec<Vec<usize>>,
 }
 
-// `region::Allocation` is an owning handle to an OS mapping. Moving that
-// handle does not move the mapping or change its thread affinity; Cranelift's
+// `AsmLargeBlock` is an owning handle to an OS mapping. Moving that handle
+// does not move the mapping or change its thread affinity; Cranelift's
 // upstream `ArenaMemoryProvider` makes the same `unsafe impl Send` assertion.
 #[cfg(not(target_arch = "wasm32"))]
 unsafe impl Send for AsmMemoryManagerInner {}
@@ -2210,9 +2324,8 @@ impl AsmMemoryManagerInner {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "JIT arena size overflow")
             })?;
-        let mut allocation =
-            region::alloc(size, region::Protection::READ_WRITE).map_err(io::Error::other)?;
-        let start = allocation.as_mut_ptr::<u8>() as usize;
+        let allocation = AsmLargeBlock::map(size)?;
+        let start = allocation.start;
         let stop = start + size;
         self.allocations.push(allocation);
         self.allocation_ranges.push((start, stop));
@@ -2287,27 +2400,41 @@ impl AsmMemoryManager {
         &self.stats
     }
 
-    /// Allocate one page-isolated range. Page isolation is the W^X adaptation
-    /// needed when compiled blocks with different lifetimes share an arena.
+    /// `asmmemmgr.py` `malloc(minsize, maxsize)` as `materialize` calls it:
+    /// `size` bytes plus `ALIGN_MATERIALIZE - 1` of slack, the start rounded
+    /// up to the alignment inside the block. Blocks sit back to back in the
+    /// RWX mapping; nothing is padded to a page.
     pub fn allocate(self: &Arc<Self>, size: usize, used: usize) -> io::Result<AsmMemoryBlock> {
+        self.allocate_aligned(size, used, ASM_ALIGN_MATERIALIZE)
+    }
+
+    /// [`Self::allocate`] with the caller's alignment in place of
+    /// `ALIGN_MATERIALIZE`.
+    pub fn allocate_aligned(
+        self: &Arc<Self>,
+        size: usize,
+        used: usize,
+        align: usize,
+    ) -> io::Result<AsmMemoryBlock> {
         if used > size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "JIT used size exceeds requested allocation",
             ));
         }
-        let page_size = region::page::size();
-        let capacity = size
-            .max(1)
-            .checked_add(page_size - 1)
-            .map(|value| value / page_size * page_size)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "JIT block size overflow")
-            })?;
+        if !align.is_power_of_two() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "JIT alignment must be a power of two",
+            ));
+        }
+        let length = size.max(1).checked_add(align - 1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "JIT block size overflow")
+        })?;
         let total = PROCESS_ASM_MEMORY_STATS
             .total_memory_allocated
             .load(Ordering::Relaxed);
-        let (start, stop, mapped) = self.inner.lock().allocate_block(capacity, total)?;
+        let (start, stop, mapped) = self.inner.lock().allocate_block(length, total)?;
         if let Some(mapped) = mapped {
             self.stats
                 .total_memory_allocated
@@ -2316,18 +2443,8 @@ impl AsmMemoryManager {
                 .total_memory_allocated
                 .fetch_add(mapped, Ordering::Relaxed);
         }
-        let protection_result = unsafe {
-            region::protect(
-                start as *const u8,
-                stop - start,
-                region::Protection::READ_WRITE,
-            )
-            .map_err(io::Error::other)
-        };
-        if let Err(error) = protection_result {
-            self.inner.lock().add_free_block(start, stop);
-            return Err(error);
-        }
+        // `materialize`: `rawstart = (rawstart + align - 1) & (-align)`.
+        let pad = start.next_multiple_of(align) - start;
         self.stats.total_mallocs.fetch_add(used, Ordering::Relaxed);
         PROCESS_ASM_MEMORY_STATS
             .total_mallocs
@@ -2339,6 +2456,7 @@ impl AsmMemoryManager {
                 manager: Arc::clone(self),
                 start,
                 stop,
+                pad,
             },
         })
     }
@@ -2353,8 +2471,10 @@ enum AsmMemoryBlockStorage {
     #[cfg(not(target_arch = "wasm32"))]
     Arena {
         manager: Arc<AsmMemoryManager>,
+        /// The range handed back to the free list; code starts `pad` bytes in.
         start: usize,
         stop: usize,
+        pad: usize,
     },
 }
 
@@ -2371,7 +2491,7 @@ impl AsmMemoryBlock {
     pub fn ptr(&self) -> *const u8 {
         match self.storage {
             AsmMemoryBlockStorage::AccountingOnly => std::ptr::null(),
-            AsmMemoryBlockStorage::Arena { start, .. } => start as *const u8,
+            AsmMemoryBlockStorage::Arena { start, pad, .. } => (start + pad) as *const u8,
         }
     }
 
@@ -2387,7 +2507,9 @@ impl AsmMemoryBlock {
         match self.storage {
             AsmMemoryBlockStorage::AccountingOnly => self.used,
             #[cfg(not(target_arch = "wasm32"))]
-            AsmMemoryBlockStorage::Arena { start, stop, .. } => stop - start,
+            AsmMemoryBlockStorage::Arena {
+                start, stop, pad, ..
+            } => stop - start - pad,
         }
     }
 
@@ -2396,41 +2518,41 @@ impl AsmMemoryBlock {
         let address = ptr as usize;
         match self.storage {
             AsmMemoryBlockStorage::AccountingOnly => false,
-            AsmMemoryBlockStorage::Arena { start, stop, .. } => start <= address && address < stop,
+            AsmMemoryBlockStorage::Arena {
+                start, stop, pad, ..
+            } => start + pad <= address && address < stop,
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        let AsmMemoryBlockStorage::Arena { start, stop, .. } = self.storage else {
+        let AsmMemoryBlockStorage::Arena { .. } = self.storage else {
             panic!("accounting-only assembler block has no storage")
         };
-        unsafe { std::slice::from_raw_parts_mut(start as *mut u8, stop - start) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr() as *mut u8, self.capacity()) }
     }
 
+    /// The mapping is RWX for its whole life (`rmmap.py` `alloc_hinted`);
+    /// there is no per-block protection to change.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn make_read_only(&mut self) -> io::Result<()> {
-        self.protect(region::Protection::READ)
+        Ok(())
     }
 
+    /// See [`Self::make_read_only`]; writing is bracketed per thread by
+    /// [`enter_assembler_writing`], not per block.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn make_writable(&mut self) -> io::Result<()> {
-        self.protect(region::Protection::READ_WRITE)
+        Ok(())
     }
 
+    /// The block is executable already; what a finished write needs is the
+    /// instruction cache flushed (`aarch64/codebuilder.py` `copy_to_raw_memory`
+    /// `clear_cache`).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn make_executable(&mut self) -> io::Result<()> {
         flush_instruction_cache(self.ptr(), self.capacity());
-        self.protect(region::Protection::READ_EXECUTE)
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn protect(&mut self, protection: region::Protection) -> io::Result<()> {
-        let AsmMemoryBlockStorage::Arena { start, stop, .. } = self.storage else {
-            return Ok(());
-        };
-        unsafe { region::protect(start as *const u8, stop - start, protection) }
-            .map_err(io::Error::other)
+        Ok(())
     }
 }
 
@@ -2447,6 +2569,7 @@ impl Drop for AsmMemoryBlock {
             ref manager,
             start,
             stop,
+            ..
         } = self.storage
         {
             manager.free(start, stop);
@@ -2454,8 +2577,10 @@ impl Drop for AsmMemoryBlock {
     }
 }
 
+/// `clear_cache` after writing machine code: the instruction cache on aarch64
+/// and Windows; a no-op where x86 keeps the caches coherent itself.
 #[cfg(not(target_arch = "wasm32"))]
-fn flush_instruction_cache(ptr: *const u8, len: usize) {
+pub fn flush_instruction_cache(ptr: *const u8, len: usize) {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     unsafe {
         unsafe extern "C" {
@@ -2723,12 +2848,6 @@ pub trait Backend: Send {
     /// no-op — bridges are attached to the guard's machine code directly.
     fn migrate_bridges(&self, _old_token: &JitCellToken, _new_token: &JitCellToken) {}
 
-    /// compile.py store_hash: assign jitcounter hashes to guards.
-    /// Called after compile_loop/compile_bridge with hashes from
-    /// jitcounter.fetch_next_hash(). Skips guards that already have
-    /// status set by make_a_counter_per_value (GUARD_VALUE).
-    fn store_guard_hashes(&self, _token: &JitCellToken, _hashes: &[u64]) {}
-
     /// compile.py / resume.py:1143 plumbing: publish the shared
     /// `CallInfoCollection` so the backend can resolve OS_STR_CONCAT
     /// etc. function pointers when materializing VStr/VUni
@@ -2745,16 +2864,18 @@ pub trait Backend: Send {
     ) {
     }
 
-    /// store_hash for bridge guards — same as store_guard_hashes but for
-    /// the most recently compiled bridge on the given guard.
-    /// Uses (trace_id, fail_index) for recursive descriptor lookup.
-    fn store_bridge_guard_hashes(
+    /// Whether a bridge is attached to the guard `(source_trace_id,
+    /// source_fail_index)` of `token`'s trace family. `compile.py
+    /// compile_trace` hands its caller the attached target or `None`; pyre's
+    /// trace can run on past the attach, so the caller asks afterwards.
+    fn bridge_was_compiled(
         &self,
-        _token: &JitCellToken,
-        _source_trace_id: u64,
-        _source_fail_index: u32,
-        _hashes: &[u64],
-    ) {
+        token: &JitCellToken,
+        source_trace_id: u64,
+        source_fail_index: u32,
+    ) -> bool {
+        self.compiled_bridge_fail_descr_layouts(token, source_trace_id, source_fail_index)
+            .is_some()
     }
 
     /// Execute compiled code starting at the given token.
@@ -2960,10 +3081,7 @@ pub trait Backend: Send {
             is_exception_exit: descr.is_exit_frame_with_exception(),
             recovery_layout: None,
             frame_stack: None,
-            rd_numb: None,
-            rd_consts: None,
-            rd_virtuals: None,
-            rd_pendingfields: None,
+            descr: None,
         })
     }
 
