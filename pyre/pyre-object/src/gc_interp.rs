@@ -16,7 +16,7 @@
 //!
 //! This module is the safe stepping stone: route the interpreter's int/float
 //! allocations through the *non-moving* old-gen (`try_gc_alloc_stable`, the same
-//! path dict/set/list/instances already use), so they become GC-tracked without
+//! path set/type/instance boxes already use), so they become GC-tracked without
 //! the move hazard, and trigger a full mark-sweep at a bytecode-dispatch
 //! safepoint (loop top, where the only live refs are in the frame and reachable
 //! through the registered `pyframe` root walker). When to collect is not

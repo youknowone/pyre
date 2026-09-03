@@ -4847,7 +4847,11 @@ fn update_bases(
     };
     match new_slots {
         None => Ok((
-            read(&(0..base_args.len()).map(|i| args_base + i).collect::<Vec<_>>()),
+            read(
+                &(0..base_args.len())
+                    .map(|i| args_base + i)
+                    .collect::<Vec<_>>(),
+            ),
             false,
         )),
         Some(nb) => Ok((read(&nb), true)),
