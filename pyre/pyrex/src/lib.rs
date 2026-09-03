@@ -1517,8 +1517,24 @@ pub(crate) fn import_site(
     // `run_command_line` installs it ahead of its own `import site`, so a
     // crash inside `site` itself is already covered.
     init_faulthandler(w_main_globals, ec_ptr);
+    // Through the `builtins.__import__` binding, the way the `import site`
+    // statement this stands in for reaches the importer -- a replacement of
+    // that binding sees this import.  Behind it, `dunder_import` hands the
+    // name to the installed `_bootstrap.__import__`.  The native `importhook`
+    // this called before resolves a name by its own filesystem search, so
+    // reaching `site` through it consults no `sys.path_hooks` entry and parses
+    // the source instead of reading the module's bytecode cache, leaving
+    // `__cached__` as `None`.
     if !no_site
-        && importing::importhook("site", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr).is_err()
+        && importing::call_dunder_import(
+            "site",
+            w_main_globals,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+            0,
+            ec_ptr,
+        )
+        .is_err()
     {
         eprintln!("'import site' failed");
     }

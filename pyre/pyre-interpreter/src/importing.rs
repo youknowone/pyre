@@ -5588,7 +5588,108 @@ pub fn dunder_import(
     )
 }
 
-/// Invoke the app-level `_bootstrap.__import__`.  A null `w_fromlist` means the
+/// `builtins.__import__` as the binding rather than as the function it starts
+/// out holding: the attribute is read off the builtins module at the call, and
+/// whatever it names is what runs.  This is how interpreter-level code reaches
+/// the importer upstream -- `_lookup_codec_loop`'s
+/// `space.getattr(space.builtin, '__import__')`, and `interp_warnings`'s
+/// `space.call_method(w_builtins, '__import__', ...)` for `linecache` -- so a
+/// program that replaces `builtins.__import__` observes these imports too.
+///
+/// [`dunder_import`] is what that binding holds until something replaces it,
+/// and it is what runs when there is no binding to read: before the builtins
+/// module exists, or once the name has been deleted from it.  Nothing can have
+/// replaced an attribute that is not there.
+pub fn call_dunder_import(
+    name: &str,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    level: i64,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    // Pinned before the binding is read: reading it is a `getattr` on a module,
+    // which can run a module-level `__getattr__`, and the caller's raw
+    // references do not survive a collection there.
+    let globals_slot = shadow_stack_len();
+    let _ = pin_root(if w_globals.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_globals
+    });
+    let locals_slot = shadow_stack_len();
+    let _ = pin_root(if w_locals.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_locals
+    });
+    let fromlist_slot = shadow_stack_len();
+    let _ = pin_root(if w_fromlist.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_fromlist
+    });
+
+    // `space.builtin` — the one Module every frame uses for its LOAD_GLOBAL
+    // fallback, and the object `import builtins` publishes.
+    let w_builtin = if execution_context.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        unsafe { (*execution_context).get_builtin() }
+    };
+    let w_import = if !w_builtin.is_null() && unsafe { is_module(w_builtin) } {
+        let builtin_slot = shadow_stack_len();
+        let _ = pin_root(w_builtin);
+        crate::baseobjspace::findattr_result(shadow_stack_get(builtin_slot), "__import__")?
+    } else {
+        None
+    };
+    let Some(w_import) = w_import else {
+        return dunder_import(
+            name,
+            if w_globals.is_null() {
+                pyre_object::PY_NULL
+            } else {
+                shadow_stack_get(globals_slot)
+            },
+            if w_locals.is_null() {
+                pyre_object::PY_NULL
+            } else {
+                shadow_stack_get(locals_slot)
+            },
+            if w_fromlist.is_null() {
+                pyre_object::PY_NULL
+            } else {
+                shadow_stack_get(fromlist_slot)
+            },
+            level,
+            execution_context,
+        );
+    };
+    let import_slot = shadow_stack_len();
+    let _ = pin_root(w_import);
+    // Minted before any slot is read back: the allocation can move what the
+    // slots hold, and an argument read ahead of it would be a stale address.
+    let w_name = pyre_object::w_str_new(name);
+    call_bootstrap_import(
+        shadow_stack_get(import_slot),
+        w_name,
+        shadow_stack_get(globals_slot),
+        shadow_stack_get(locals_slot),
+        if w_fromlist.is_null() {
+            pyre_object::PY_NULL
+        } else {
+            shadow_stack_get(fromlist_slot)
+        },
+        level,
+    )
+}
+
+/// Invoke an app-level `__import__` -- `_bootstrap`'s, or whatever the
+/// `builtins.__import__` binding names.  A null `w_fromlist` means the
 /// argument was omitted, which reaches `__import__` as its `()` default rather
 /// than as `None` (interp_import.py `WrappedDefault(())`).
 fn call_bootstrap_import(

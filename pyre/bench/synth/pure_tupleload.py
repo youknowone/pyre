@@ -16,22 +16,22 @@
 # Case C builds a fresh arity-2 pair per iteration and reads both halves. This
 # is the shape `subscr_tuple_descent` serves by descending `w_tuple_getitem`;
 # the hand-written `subscr_specialised_pair` reader it replaced measured 46.3x
-# here when suppressed (0.092s -> 4.257s), the largest single-fold effect in the
-# corpus, so this loop is what keeps the ceiling below honest.
+# here when suppressed, the largest single-fold effect in the corpus, so this
+# loop is what keeps the ceiling below honest.
 
 
 def main():
     # Case A: canonical array-backed tuple (arity 5 > 2).
     t = (10, 20, 30, 40, 50)
     s = 0
-    for _ in range(200000):
+    for _ in range(1600000):
         s += t[0] + t[1] + t[2] + t[3] + t[4]
     print(s)
 
     # Case B: 2-element tuple (specialised-tuple path must be safe + correct).
     t2 = (1, 2)
     s2 = 0
-    for _ in range(200000):
+    for _ in range(1600000):
         s2 += t2[0] + t2[1]
     print(s2)
 
@@ -50,4 +50,4 @@ def hot_specialised_pair(n):
     return s
 
 
-print(hot_specialised_pair(20000000))
+print(hot_specialised_pair(160000000))
