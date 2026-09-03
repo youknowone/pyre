@@ -184,13 +184,52 @@ fn init_mutexes() {
 /// publishing that the GIL may now be waited on. Until then
 /// [`acquire_slow_path`] is a fatal error, exactly as upstream: a program which
 /// never set threads up can only ever take the compare-and-swap.
+///
+/// The other half of `RPyGilAllocate` is the `pthread_atfork` registration —
+/// see [`register_atfork_child_handler`].
 pub fn allocate() {
-    let _ = RPY_WAITING_THREADS.compare_exchange(
-        GIL_NOT_INITIALIZED,
-        0,
-        Ordering::SeqCst,
-        Ordering::Relaxed,
-    );
+    if RPY_WAITING_THREADS
+        .compare_exchange(GIL_NOT_INITIALIZED, 0, Ordering::SeqCst, Ordering::Relaxed)
+        .is_ok()
+    {
+        register_atfork_child_handler();
+    }
+}
+
+/// thread_gil.c:105-107 `pthread_atfork(NULL, NULL, rpy_init_mutexes)`, guarded
+/// upstream by `HAVE_PTHREAD_ATFORK`.
+///
+/// This is what makes a `fork()` taken while another thread held one of these
+/// mutexes survivable at all: the child arm runs on the surviving thread before
+/// any other code in the child, so nothing can block on a claim whose owner did
+/// not survive.  Registering only once is upstream's shape too — the
+/// `rpy_waiting_threads < 0` test guards both statements.
+#[cfg(unix)]
+fn register_atfork_child_handler() {
+    // SAFETY: `pthread_atfork` only records the handler.
+    unsafe { libc::pthread_atfork(None, None, Some(atfork_child_reinit_mutexes)) };
+}
+
+#[cfg(not(unix))]
+fn register_atfork_child_handler() {}
+
+/// thread_gil.c:93-98 `rpy_init_mutexes`, reached as the `pthread_atfork` child
+/// arm.
+///
+/// Runs before any pyre code in the child — including `StwGuard::drop`, which
+/// locks `gc_sync`'s quiescence mutex on the way out of the very STW window the
+/// `os.fork()` was taken inside, and so would block there long before any
+/// after-fork hook could repair anything.  Writes only: an atfork handler must
+/// take no lock and allocate nothing.
+#[cfg(unix)]
+unsafe extern "C" fn atfork_child_reinit_mutexes() {
+    init_mutexes();
+    RPY_WAITING_THREADS.store(0, Ordering::SeqCst);
+    // pyre-only, and here for upstream's reason rather than by analogy:
+    // `gc_sync`'s quiescence mutex is taken outside the GIL by `register_thread`,
+    // by `unregister_thread`, and by the park/unpark pair around every external
+    // call, so a fork can copy it locked exactly as it can these two.
+    crate::gc_sync::init_quiesce_mutex();
 }
 
 /// Whether [`allocate`] has run, i.e. whether this process has a GIL at all.

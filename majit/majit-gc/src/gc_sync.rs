@@ -130,7 +130,7 @@ fn quiesce() -> &'static Mutex<QuiesceState> {
 /// `rgil::acquire_maybe_in_new_thread`, `unregister_thread` releases the GIL
 /// first, and the park/unpark pair around every external call is the GIL
 /// release itself.
-fn init_quiesce_mutex() {
+pub(crate) fn init_quiesce_mutex() {
     // SAFETY: reached only from the surviving thread of a `fork()`, which is
     // the child's only thread, so no reference into the old value is live.
     unsafe {
@@ -572,9 +572,10 @@ pub fn after_fork_child() {
     // `fork()` runs inside `request_stw`, so this thread held the GIL across
     // it and still does; only the queue behind it has to be rebuilt.
     crate::rgil::after_fork_child();
-    // The other half of what `thread_gil.c` hands `pthread_atfork`'s child
-    // handler.  Both mutexes are replaced before anything locks them, because
-    // the thread whose claim the child inherited does not exist here.
+    // `rgil`'s `pthread_atfork` child arm has already done both of these on
+    // the way out of `fork()`.  Repeat them for the process that never reached
+    // `rgil::allocate` and so registered no handler; the child is still its own
+    // only thread, and `running` is set from this thread's census bits below.
     init_quiesce_mutex();
     STW_OWNER.store(0, Ordering::SeqCst);
     STW_DEPTH.store(0, Ordering::SeqCst);
@@ -1436,75 +1437,126 @@ mod tests {
     /// `thread_gil.c:105-107` hands `rpy_init_mutexes` to `pthread_atfork` as
     /// the CHILD handler precisely because a mutex can be copied LOCKED by a
     /// thread that does not exist in the child.  `quiesce` needs the same
-    /// treatment: `quiesce_mutators` drops its own guard before `collect_fn`
-    /// runs — which is where `os.fork()` sits — and eight lockers take it
-    /// outside the GIL, so the STW bracket does not exclude them.
+    /// treatment: `quiesce_mutators` releases it before `collect_fn` runs —
+    /// which is where `os.fork()` sits — and eight lockers take it outside the
+    /// GIL, so the STW bracket does not exclude them.
     ///
-    /// Without [`init_quiesce_mutex`], `after_fork_child`'s own
-    /// `quiesce().lock()` never returns in the child and every `os.fork()`
-    /// taken from a worker thread can wedge the child process.
+    /// The fork is taken INSIDE `request_stw`, as production does, because the
+    /// first thing the child touches is not an after-fork hook: it is
+    /// `StwGuard::drop`, which locks `quiesce` on the way out of that same
+    /// window.  A test that forks with no live guard passes without the
+    /// `pthread_atfork` registration and proves nothing.
     #[test]
     #[cfg(unix)]
-    #[ignore = "requires exclusive process — forks, and registers a process-global mutator"]
-    fn a_quiesce_mutex_inherited_locked_does_not_wedge_the_forked_child() {
+    #[ignore = "requires exclusive process — forks, and registers process-global mutators"]
+    fn a_quiesce_mutex_taken_during_stw_does_not_wedge_the_forked_child() {
         use std::sync::atomic::AtomicBool;
 
+        static PARKED: AtomicBool = AtomicBool::new(false);
+        static PARK_DONE: AtomicBool = AtomicBool::new(false);
+        static TAKE: AtomicBool = AtomicBool::new(false);
         static HELD: AtomicBool = AtomicBool::new(false);
         static RELEASE: AtomicBool = AtomicBool::new(false);
+        static RELEASED: AtomicBool = AtomicBool::new(false);
 
-        // The forking thread holds the GIL across `fork()` in production, and
-        // `rgil::after_fork_child` asserts exactly that.
+        ensure_gc();
+        // `RPyGilAllocate` is what registers the child handler.
+        crate::rgil::allocate();
         register_test_mutator();
 
+        // A second registered mutator, parked.  Without it `stw_required()` is
+        // false, `quiesce_mutators` hands back an inactive guard, and
+        // `StwGuard::drop` locks nothing — the ordering under test disappears.
+        let parked = std::thread::spawn(|| {
+            register_test_mutator();
+            let blocked = before_external_block();
+            PARKED.store(true, Ordering::Release);
+            while !PARK_DONE.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            drop(blocked);
+            unregister_test_mutator();
+        });
+        // Releasing the GIL is not optional: `register_thread` takes it, and
+        // this thread has held it since its own `register_test_mutator`.
+        blocking(|| {
+            while !PARKED.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        });
+
+        // Unregistered, and that is the point: it stands for any thread that
+        // locks `quiesce` outside the GIL while the collector owns STW.
         let holder = std::thread::spawn(|| {
-            let _guard = quiesce().lock().unwrap();
+            while !TAKE.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            let guard = quiesce().lock().unwrap();
             HELD.store(true, Ordering::Release);
             while !RELEASE.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
+            drop(guard);
+            RELEASED.store(true, Ordering::Release);
         });
-        while !HELD.load(Ordering::Acquire) {
-            std::thread::yield_now();
-        }
 
-        // SAFETY: the child runs only the after-fork reinit and `_exit`.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork() failed");
-        if pid == 0 {
+        let mut child_pid = -1;
+        let mut in_child = false;
+        request_stw(|_| {
+            TAKE.store(true, Ordering::Release);
+            while !HELD.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // SAFETY: the child only returns from this closure and `_exit`s.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork() failed");
+            if pid == 0 {
+                in_child = true;
+                return;
+            }
+            child_pid = pid;
+            RELEASE.store(true, Ordering::Release);
+            while !RELEASED.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        });
+
+        // Reaching here in the child means `StwGuard::drop` got `quiesce` back.
+        if in_child {
             after_fork_child();
-            // Reached only if the mutex was rebuilt; a `lock()` on the
-            // inherited claim never returns.
+            // SAFETY: the child must not run the harness's own teardown.
             unsafe { libc::_exit(0) };
         }
 
-        RELEASE.store(true, Ordering::Release);
+        PARK_DONE.store(true, Ordering::Release);
         holder.join().unwrap();
+        blocking(|| parked.join()).unwrap();
 
         let mut status: libc::c_int = 0;
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut reaped = false;
         while std::time::Instant::now() < deadline {
-            // SAFETY: `pid` is this process's own child.
-            let seen = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if seen == pid {
+            // SAFETY: `child_pid` is this process's own child.
+            let seen = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+            if seen == child_pid {
                 reaped = true;
                 break;
             }
-            assert!(seen == 0, "waitpid failed for child {pid}");
-            std::thread::sleep(Duration::from_millis(10));
+            assert!(seen == 0, "waitpid failed for child {child_pid}");
+            blocking(|| std::thread::sleep(Duration::from_millis(10)));
         }
         if !reaped {
-            // SAFETY: `pid` is this process's own child, still alive.
+            // SAFETY: `child_pid` is this process's own child, still alive.
             unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, &mut status, 0);
+                libc::kill(child_pid, libc::SIGKILL);
+                libc::waitpid(child_pid, &mut status, 0);
             }
         }
         unregister_test_mutator();
         assert!(
             reaped,
-            "the child never returned from after_fork_child(): it inherited `quiesce` locked \
-             by a thread that does not exist here"
+            "the forked child never came back out of the STW window: it inherited \
+             `quiesce` locked by a thread that does not exist there"
         );
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
