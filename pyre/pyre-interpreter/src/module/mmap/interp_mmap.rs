@@ -400,6 +400,78 @@ fn mmap_index_w(
     Ok(index)
 }
 
+/// The search pattern of `find` and `rfind`, held the way the `view: Py_buffer`
+/// converter holds it: the export is acquired before `start` and `end` are
+/// converted and released once the search is over.
+///
+/// `mmap_gfind_lock_held` reads `view->buf` and `view->len` after
+/// `_As_Py_ssize_t` has run both conversions, so a `bytearray` pattern that one
+/// of their `__index__` hooks edits in place is what the search compares
+/// against, and one such a hook resizes is refused with `BufferError`.  Reading
+/// the bytes back out of the object is what makes the edit visible; the export
+/// is what makes the resize impossible, so the address cannot go stale between
+/// the two.
+#[cfg(any(unix, windows))]
+struct MmapPattern {
+    /// Shadow-stack slot the pattern is pinned in.  The bytes live in storage
+    /// the object owns, so the object has to outlive every read of them.
+    slot: usize,
+    /// Whether the acquisition took an export to pair with a release; an
+    /// immutable `bytes` pattern has no count to keep.
+    held: bool,
+}
+
+#[cfg(any(unix, windows))]
+impl MmapPattern {
+    /// The root scope the pin lands in belongs to the caller, as it does for
+    /// `SocketWritableBuffer::acquire`.
+    ///
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and
+    /// lifetime invariant required by the object arguments for the entire call.
+    unsafe fn acquire(
+        obj: pyre_object::PyObjectRef,
+        who: &str,
+    ) -> Result<Self, crate::PyError> {
+        if !unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
+            return Err(crate::PyError::type_error(format!(
+                "{who}: pattern must be bytes-like"
+            )));
+        }
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let held = unsafe {
+            crate::builtins::buffer_export_incref(pyre_object::gc_roots::shadow_stack_get(slot))
+        };
+        Ok(Self { slot, held })
+    }
+
+    /// The pattern's bytes as they stand now.  Read this after everything that
+    /// can run Python: the export refuses a resize, but an in-place edit is
+    /// allowed and the search has to see it.
+    ///
+    /// # Safety
+    /// The caller must uphold every validity, runtime-type, aliasing, and
+    /// lifetime invariant required by the object arguments for the entire call.
+    unsafe fn data(&self) -> &'static [u8] {
+        unsafe {
+            pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(
+                self.slot,
+            ))
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for MmapPattern {
+    fn drop(&mut self) {
+        if self.held {
+            let obj = pyre_object::gc_roots::shadow_stack_get(self.slot);
+            unsafe { crate::builtins::buffer_export_decref(obj) };
+        }
+    }
+}
+
 /// Sweep-time counterpart of PyPy `W_MMap.__del__` / `rmmap.MMap.close`.
 #[cfg(any(unix, windows))]
 pub unsafe fn w_mmap_dealloc(obj: pyre_object::PyObjectRef) {
@@ -901,19 +973,14 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let (_, len_at_entry) = mmap_ptr(obj)?;
-            // `interp_mmap.py find` is handed `space.bufferstr_w(w_tofind)`, a
-            // copy.  The pattern's own storage is not held across the
-            // `getindex_w` calls below: a `bytearray` pattern reallocated by
-            // one of their `__index__` hooks would leave a borrowed slice
-            // naming freed memory.
-            let needle = unsafe {
-                if !pyre_object::bytesobject::is_bytes_like(args[1]) {
-                    return Err(crate::PyError::type_error(
-                        "find: pattern must be bytes-like",
-                    ));
-                }
-                pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
-            };
+            let _roots = pyre_object::gc_roots::push_roots();
+            // Taken before the conversions below, which run `__index__`, and
+            // released when this returns — `mmap.mmap.find` reaches its pattern
+            // through the `Py_buffer` converter, whose export brackets the
+            // whole call.  `interp_mmap.py find` snapshots
+            // `space.bufferstr_w(w_tofind)` here instead, which neither sees an
+            // in-place edit made by one of those hooks nor refuses a resize.
+            let pattern = unsafe { MmapPattern::acquire(args[1], "find") }?;
             // `interp_mmap.py find(w_tofind, w_start=None,
             // w_end=None)` defaults w_start to `self.mmap.pos` then
             // routes through rmmap.find which handles negative start /
@@ -950,6 +1017,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             if start > end {
                 return Ok(pyre_object::w_int_new(-1));
             }
+            let needle = unsafe { pattern.data() };
             if needle.is_empty() {
                 return Ok(pyre_object::w_int_new(start as i64));
             }
@@ -958,7 +1026,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 return Ok(pyre_object::w_int_new(-1));
             }
             let pos = (0..=hay.len().saturating_sub(needle.len()))
-                .find(|&i| &hay[i..i + needle.len()] == needle.as_slice())
+                .find(|&i| &hay[i..i + needle.len()] == needle)
                 .map(|i| (start + i) as i64)
                 .unwrap_or(-1);
             Ok(pyre_object::w_int_new(pos))
@@ -974,19 +1042,14 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             }
             let obj = args[0];
             let (_, len_at_entry) = mmap_ptr(obj)?;
-            // `interp_mmap.py rfind` is handed `space.bufferstr_w(w_tofind)`, a
-            // copy.  The pattern's own storage is not held across the
-            // `getindex_w` calls below: a `bytearray` pattern reallocated by
-            // one of their `__index__` hooks would leave a borrowed slice
-            // naming freed memory.
-            let needle = unsafe {
-                if !pyre_object::bytesobject::is_bytes_like(args[1]) {
-                    return Err(crate::PyError::type_error(
-                        "rfind: pattern must be bytes-like",
-                    ));
-                }
-                pyre_object::bytesobject::bytes_like_data(args[1]).to_vec()
-            };
+            let _roots = pyre_object::gc_roots::push_roots();
+            // Taken before the conversions below, which run `__index__`, and
+            // released when this returns — `mmap.mmap.rfind` reaches its pattern
+            // through the `Py_buffer` converter, whose export brackets the
+            // whole call.  `interp_mmap.py rfind` snapshots
+            // `space.bufferstr_w(w_tofind)` here instead, which neither sees an
+            // in-place edit made by one of those hooks nor refuses a resize.
+            let pattern = unsafe { MmapPattern::acquire(args[1], "rfind") }?;
             // `interp_mmap.py rfind(w_tofind, w_start=None,
             // w_end=None)` defaults w_start to `self.mmap.pos`, not 0.
             // Negative args run through rmmap.find which adds `size`
@@ -1016,6 +1079,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             if start > end {
                 return Ok(pyre_object::w_int_new(-1));
             }
+            let needle = unsafe { pattern.data() };
             if needle.is_empty() {
                 return Ok(pyre_object::w_int_new(end as i64));
             }
@@ -1025,7 +1089,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             }
             let pos = (0..=hay.len().saturating_sub(needle.len()))
                 .rev()
-                .find(|&i| &hay[i..i + needle.len()] == needle.as_slice())
+                .find(|&i| &hay[i..i + needle.len()] == needle)
                 .map(|i| (start + i) as i64)
                 .unwrap_or(-1);
             Ok(pyre_object::w_int_new(pos))
