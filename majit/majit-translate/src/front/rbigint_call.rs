@@ -286,6 +286,40 @@ pub(crate) fn lshift_count_residual_path(segments: &[String]) -> Option<Vec<Stri
     )
 }
 
+/// The `_make_ovf2long` seams (intobject.py:509-514): a machine-int add,
+/// subtract, or multiply that overflowed recovers the exact result from the
+/// two Signed words in one elidable call.  Both operands are already machine
+/// words at source level, so the target swap only supplies the
+/// one-GC-reference result ABI.
+pub(crate) fn ovf2long_residual_path(segments: &[String]) -> Option<Vec<String>> {
+    let residual = match segments.last().map(String::as_str) {
+        Some("bigint_add_int_int") => "jit_bigint_add_int_int",
+        Some("bigint_sub_int_int") => "jit_bigint_sub_int_int",
+        Some("bigint_mul_int_int") => "jit_bigint_mul_int_int",
+        _ => return None,
+    };
+    if !segments
+        .iter()
+        .rev()
+        .skip(1)
+        .take(2)
+        .eq(["descroperation", "objspace"])
+    {
+        return None;
+    }
+    Some(
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            residual,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    )
+}
+
 /// RustPython's compiler exposes integer constants as an opaque foreign
 /// BigInt.  Retarget the one sanctioned conversion seam to a pointer-returning
 /// pure residual so Malachite never enters the translated arithmetic graph.
@@ -340,14 +374,10 @@ pub(crate) fn unop_wrapper_residual_path(segments: &[String]) -> Option<Vec<Stri
 }
 
 /// Zero-checked interpreter seams for the two projections of
-/// `rbigint.divmod`, and the `rbigint.add`/`sub`/`mul` seams the machine-int
-/// overflow arms call. Each returns a direct RBigInt handle at source level,
+/// `rbigint.divmod`. Each returns a direct RBigInt handle at source level,
 /// so the target swap is ABI-identical to the other pointer residual mappings.
 pub(crate) fn divmod_projection_residual_path(segments: &[String]) -> Option<Vec<String>> {
     let residual = match segments.last().map(String::as_str) {
-        Some("bigint_add") => "jit_bigint_add",
-        Some("bigint_sub") => "jit_bigint_sub",
-        Some("bigint_mul") => "jit_bigint_mul",
         Some("bigint_floordiv_nonzero") => "jit_bigint_div_floor",
         Some("bigint_modulo_nonzero") => "jit_bigint_mod_floor",
         // Machine-int-divisor quotient leg (`_int_floordiv`): the divisor is
@@ -677,9 +707,6 @@ mod tests {
     #[test]
     fn maps_zero_checked_divmod_projections() {
         for (source, residual) in [
-            ("bigint_add", "jit_bigint_add"),
-            ("bigint_sub", "jit_bigint_sub"),
-            ("bigint_mul", "jit_bigint_mul"),
             ("bigint_floordiv_nonzero", "jit_bigint_div_floor"),
             ("bigint_modulo_nonzero", "jit_bigint_mod_floor"),
             ("bigint_int_floordiv_nonzero", "jit_bigint_int_div_floor"),
@@ -699,5 +726,47 @@ mod tests {
                 ]))
             );
         }
+    }
+
+    #[test]
+    fn maps_the_ovf2long_seams_and_nothing_else() {
+        for (source, residual) in [
+            ("bigint_add_int_int", "jit_bigint_add_int_int"),
+            ("bigint_sub_int_int", "jit_bigint_sub_int_int"),
+            ("bigint_mul_int_int", "jit_bigint_mul_int_int"),
+        ] {
+            assert_eq!(
+                ovf2long_residual_path(&segs(&[
+                    crate::runtime_names::crates::INTERPRETER,
+                    "objspace",
+                    "descroperation",
+                    source,
+                ])),
+                Some(segs(&[
+                    crate::runtime_names::crates::INTERPRETER,
+                    "objspace",
+                    "descroperation",
+                    residual,
+                ]))
+            );
+        }
+        // The owner is load-bearing, as it is for the unary wrappers.
+        assert_eq!(
+            ovf2long_residual_path(&segs(&[
+                crate::runtime_names::crates::OBJECT,
+                "longobject",
+                "bigint_mul_int_int",
+            ])),
+            None,
+        );
+        assert_eq!(
+            ovf2long_residual_path(&segs(&[
+                crate::runtime_names::crates::INTERPRETER,
+                "objspace",
+                "descroperation",
+                "bigint_mul",
+            ])),
+            None,
+        );
     }
 }
