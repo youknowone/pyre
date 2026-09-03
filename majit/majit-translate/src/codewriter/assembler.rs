@@ -1951,6 +1951,15 @@ impl Assembler {
             // `OpKind::GuardClass`.
             OpKind::GuardClass { base } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                // The base is the object whose header word is read, so it is a
+                // ref register; `bhimpl_guard_class` takes `"r"` and both
+                // registered keys (`guard_class/r>i`, `guard_class/r>r`) spell
+                // it that way.  An Int-banked base would form a key nothing
+                // registers, so fail loud at emit time.
+                assert_eq!(
+                    kc, 'r',
+                    "guard_class base must be ref-kind ('r'), got '{kc}'"
+                );
                 state.code.push(reg);
                 argcodes.push(kc);
                 let result = op
