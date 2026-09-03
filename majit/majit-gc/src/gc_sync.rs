@@ -712,6 +712,32 @@ pub fn request_stw(collect_fn: impl FnOnce(&mut MiniMarkGC)) {
     });
 }
 
+/// Fork under stop-the-world, leaving the child a lock state it can unwind.
+///
+/// `fork()` gives the child one thread and every mutex the process had.  A
+/// [`Mutex`] held by a thread that did not survive stays locked with no owner,
+/// and the first thing the child does on its way out of STW is
+/// [`StwGuard::drop`], which takes [`GcSync::quiesce`] unconditionally — so a
+/// child that inherits it held never reaches [`after_fork_child`], which is
+/// what would have repaired the census.
+///
+/// The drain does not close that window.  A thread leaving an external block
+/// re-takes `quiesce` while STW is still in force ([`BlockingGuard::drop`]),
+/// and it left the RUNNING census when it blocked, so nothing waited for it;
+/// [`enter_external_callback`] and [`register_thread`] hold it across the same
+/// gate.  Taking the mutex here is the prepare half of the discipline
+/// `pthread_atfork` exists for: the one thread that survives owns it on both
+/// sides of the fork and releases it on both sides.
+pub fn fork_under_stw<R>(fork_fn: impl FnOnce() -> R) -> R {
+    gc_op(|_| {
+        let _stw = quiesce_mutators();
+        let held = GC_SYNC.quiesce.lock().unwrap();
+        let result = fork_fn();
+        drop(held);
+        result
+    })
+}
+
 /// Run a GC operation whose object argument is a translated livevar.
 ///
 /// Publish the argument on the per-mutator shadow stack first, so that a
@@ -855,6 +881,59 @@ mod tests {
         let addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
         assert_ne!(addr, 0);
         unsafe { &*(addr as *const AtomicUsize) }.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "requires exclusive process — drives process-global STW state and forks"]
+    fn fork_under_stw_holds_the_quiesce_mutex_across_the_fork() {
+        ensure_gc();
+        register_test_mutator();
+
+        // A second registered mutator makes `stw_required()` true, so the fork
+        // runs under an owning `StwGuard` whose drop takes the mutex. It parks
+        // outside the RUNNING census — the population the drain never waits
+        // for, and so the one that can hold `quiesce` while STW is in force.
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let other = std::thread::spawn(move || {
+            register_thread();
+            let blocked = before_external_block();
+            parked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(blocked);
+            unregister_thread();
+        });
+        // `register_thread` takes the GIL, which this thread holds.
+        blocking(|| parked_rx.recv().unwrap());
+
+        let child = fork_under_stw(|| {
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                let mut code = 0;
+                if GC_SYNC.quiesce.try_lock().is_err() {
+                    code |= 1;
+                }
+                if mutators_quiesced() {
+                    code |= 2;
+                }
+                unsafe { libc::_exit(code) };
+            }
+            pid
+        });
+
+        assert!(child > 0, "fork failed");
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        release_tx.send(()).unwrap();
+        blocking(|| other.join().unwrap());
+        unregister_test_mutator();
+        assert_eq!(
+            (status >> 8) & 0xff,
+            3,
+            "the child must inherit `quiesce` from the thread that survived \
+             (bit0), under a live owning guard whose drop retakes it (bit1)"
+        );
     }
 
     #[test]
