@@ -870,7 +870,12 @@ impl OptVirtualize {
                         // (jtransform.py:908-911 parity in helpers.rs), so this
                         // branch should not observe a typeptr op. Defensively
                         // capture known_class if a typeptr setfield still arrives.
-                        if is_typeptr {
+                        // `is_typeptr` matches on the field's NAME, and
+                        // `CPyObject.ob_type` carries that name at offset 24
+                        // while the class word this seeds answers for is the
+                        // header at offset 0.  Seeding from the mirror's field
+                        // would hand a later header read the wrong class.
+                        if is_typeptr && field_descr.offset() == 0 {
                             if vinfo.known_class.is_none()
                                 && let Some(class_val) = value_as_constant {
                                     vinfo.known_class = Some(class_val as i64);
@@ -1215,7 +1220,12 @@ impl OptVirtualize {
             // virtual fields but can be resolved from the SizeDescr vtable.
             // RPython doesn't need this because GUARD_CLASS reads the class
             // directly from the object, not via a separate field read.
-            let is_typeptr = op.with_field_descr(|fd| fd.is_typeptr()).unwrap_or(false);
+            // The vtable answers for the header word at offset 0.  `is_typeptr`
+            // matches on the field's NAME, which `CPyObject.ob_type` also
+            // carries at offset 24, so the offset decides which read this is.
+            let is_typeptr = op
+                .with_field_descr(|fd| fd.is_typeptr() && fd.offset() == 0)
+                .unwrap_or(false);
             if field_val.is_none()
                 && matches!(op.opcode, majit_ir::OpCode::GetfieldGcI)
                 && is_typeptr
