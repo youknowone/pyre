@@ -22757,11 +22757,11 @@ fn builtin_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // subclass's) or, for a plain builtin, the shared spec parser; the same
     // path f-string `{v:spec}` and `"{:spec}".format(v)` use.
     let spec = if args.len() > 1 {
-        crate::type_methods::read_format_spec(args[1], "format() argument 2")?
+        crate::type_methods::check_format_spec(args[1], "format() argument 2")?
     } else {
-        rustpython_wtf8::Wtf8Buf::new()
+        pyre_object::PY_NULL
     };
-    crate::type_methods::format_value_dispatch_w(value, &spec)
+    crate::type_methods::format_w(value, spec)
 }
 
 /// `__import__(name, globals=None, locals=None, fromlist=(), level=0)`
