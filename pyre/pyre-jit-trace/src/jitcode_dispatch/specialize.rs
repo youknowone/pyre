@@ -7188,9 +7188,21 @@ pub(crate) fn try_walker_fold_newbool_call<Sym: WalkSym>(
 /// (`bytesobject.py:25`), `str` (`unicodeobject.py:101`) and `frozenset`
 /// (`setobject.py:592`).  Every other class keeps the default pointer
 /// identity (`baseobjspace.py:246`).
+///
+/// Those gates read `w_class`, this list reads `ob_type`, and the two do not
+/// stand in one-to-one correspondence, so a class costs one row per layout
+/// that can carry it.  `int` costs two: a machine-word `W_IntObject` is
+/// `INT_TYPE`, a BigInt-backed `W_LongObject` is `LONG_TYPE`
+/// (`longobject.rs`), and both are born with `int`'s `w_class`, so both
+/// reach the bigint comparison.  The specialised arity-2 tuples also carry
+/// `tuple`'s `w_class` under their own `ob_type`, but they need no row:
+/// `is_w`'s tuple branch answers true only for two *empty* tuples, and a
+/// length-2 layout is never empty, so `ptr_eq` already agrees for every
+/// object that layout can hold.
 fn is_w_compares_by_value(tp: *const pyre_object::pyobject::PyType) -> bool {
     [
         &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType,
+        &pyre_object::pyobject::LONG_TYPE as *const pyre_object::pyobject::PyType,
         &pyre_object::pyobject::FLOAT_TYPE as *const pyre_object::pyobject::PyType,
         &pyre_object::pyobject::COMPLEX_TYPE as *const pyre_object::pyobject::PyType,
         &pyre_object::pyobject::TUPLE_TYPE as *const pyre_object::pyobject::PyType,
