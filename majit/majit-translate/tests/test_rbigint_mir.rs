@@ -1295,7 +1295,7 @@ const UNARY_RESIDUAL_CALLERS: &[(&str, &str)] = &[
 
 /// Graphs the test reaches for one at a time rather than through a table.
 const SINGLE_GRAPHS: &[&str] = &[
-    "bigint_add",
+    "bigint_and",
     "long_int_compare",
     "long_pow",
     "long_lshift",
@@ -1401,10 +1401,10 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         .functions
         .iter()
         .find(|function| {
-            function.name == "bigint_add"
+            function.name == "bigint_and"
                 && function.module_path.ends_with("objspace::descroperation")
         })
-        .expect("descroperation::bigint_add graph");
+        .expect("descroperation::bigint_and graph");
 
     let calls: Vec<Vec<String>> = helper
         .graph
@@ -1444,7 +1444,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
                     "pyre_interpreter",
                     "objspace",
                     "descroperation",
-                    "jit_bigint_add",
+                    "jit_bigint_and",
                 ]
         })
         .count();
