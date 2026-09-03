@@ -1,17 +1,17 @@
 {
   "darwin": {
-    "base": "78501667f5409cec286599d8d25813e879432ed6",
+    "base": "e75174702af51d97b166e0ed9765cc85ebb51057",
     "brackets_reaching_no_collection": 3,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 10,
     "frames_across_collecting_fns": 4,
-    "tier15_calls": 131,
-    "tier15_calls_fns": 61,
+    "tier15_calls": 102,
+    "tier15_calls_fns": 56,
     "tier1_calls": 0,
     "tier1_calls_fns": 0,
-    "unbracketed_calls": 2069,
-    "unbracketed_calls_fns": 836,
+    "unbracketed_calls": 2064,
+    "unbracketed_calls_fns": 835,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
