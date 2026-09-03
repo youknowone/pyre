@@ -483,6 +483,19 @@ pub fn capture_fbw_finish_concrete_root_area() -> *const () {
     FBW_FINISH_CONCRETE.with(|value| value as *const _ as *const ())
 }
 
+/// `history.py ConstPtr` parity for the symbolic FINISH payload.  RPython's
+/// box remains in the translated GC graph while compilation allocates; pyre's
+/// inline `GcRef` lives in this TLS cell instead, so it must be registered as
+/// an explicit root and updated when the collector forwards it.
+pub fn fbw_finish_payload_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let data = capture_fbw_finish_payload_root_area();
+    unsafe { fbw_finish_payload_root_walker_area(data, visitor) };
+}
+
+pub fn capture_fbw_finish_payload_root_area() -> *const () {
+    FBW_FINISH_PAYLOAD.with(|value| value as *const _ as *const ())
+}
+
 /// Record that `op` is a walker-built inline exception (construction fold).
 pub(crate) fn fbw_built_exc_insert(op: OpRef) {
     FBW_BUILT_EXC.with(|s| {
@@ -4125,6 +4138,15 @@ pub(crate) fn fbw_callee_body_replay_scan(
             let Some(&dst) = body_code.get(d.next_pc.saturating_sub(1)) else {
                 replay_unscannable!("ResultRegisterByteMissing", d.pc, d.opname);
             };
+            // `vable_reg` proves the identity of the value in this register,
+            // not permanent ownership of the register number.  RPython keeps
+            // the virtualizable on the live MIFrame box; when this SSA bank
+            // slot is overwritten, the replacement cannot inherit that
+            // identity (the freshness lattices below are invalidated here for
+            // the same reason).
+            if vable_reg == Some(dst) {
+                vable_reg = None;
+            }
             fresh_ref_regs[dst as usize] = d.key == "new_with_vtable/d>r"
                 || d.opname.starts_with("new_array")
                 || (d.key == "ref_copy/r>r"

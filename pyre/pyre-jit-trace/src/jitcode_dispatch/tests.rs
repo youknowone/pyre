@@ -6,6 +6,23 @@ use majit_metainterp::{JitCodeSym, TraceAction, VableArrayStore, make_fail_descr
 static STATIC_REFUSAL_PREFIX_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[test]
+fn finish_payload_root_walker_writes_back_forwarded_const_ptr() {
+    fbw_finish_payload_reset();
+    fbw_terminate_with_raise(
+        OpRef::const_ptr(majit_ir::GcRef(0x1000)),
+        ConcreteValue::Ref(std::ptr::null_mut()),
+    );
+
+    fbw_finish_payload_root_walker(&mut |gcref| gcref.0 = 0x2000);
+
+    assert_eq!(
+        fbw_finish_payload_take(),
+        Some((OpRef::const_ptr(majit_ir::GcRef(0x2000)), Type::Ref))
+    );
+    fbw_finish_payload_reset();
+}
+
 extern "C" fn count_static_refusal_prefix() {
     STATIC_REFUSAL_PREFIX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -588,6 +605,106 @@ fn exact_py_pc_preserves_a_later_disjoint_emission_region() {
 fn fresh_trace_ctx() -> TraceCtx {
     let _ = test_outer_resume_jitcode_index();
     TraceCtx::for_test_types(&[Type::Ref])
+}
+
+#[test]
+fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
+    use crate::state::PyreSym;
+    use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
+
+    // Give the callee a real, permanently-live CodeObject and a populated
+    // `-live-`-anchored JitCode.  This deliberately crosses the old
+    // `code_ptr.is_null()` fixture bail: the assertion is about the publish
+    // path, not merely its parent-count predicate.
+    let code = compile_exec("None").expect("test code should compile");
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let raw_code = unsafe {
+        w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
+    };
+    let mut builder = majit_metainterp::JitCodeBuilder::default();
+    let live_patch = builder.live_placeholder();
+    builder.patch_live_offset(live_patch, 0);
+    let mut insns = indexmap::IndexMap::new();
+    insns.insert(
+        "live/".to_string(),
+        majit_metainterp::jitcode::insns::BC_LIVE,
+    );
+    crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(builder.finish());
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    assert!(!installed.is_null());
+
+    let mut tc = fresh_trace_ctx();
+    let cond = tc.const_int(1);
+    tc.record_guard(majit_ir::OpCode::GuardTrue, &[cond], 0);
+    let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.inline_subwalk = true;
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().framestack.push(InlineFrame {
+        w_code: w_code as usize,
+        // What `InlineFrameGuard::new` stamps on the first Python portal frame
+        // pushed onto an empty framestack: `MetaInterp.newframe` consumes
+        // `call_id` 0, no `DEBUG_MERGE_POINT` has been emitted yet, and a
+        // forward inline call carries the portal greenkey.
+        recursion_greenkey: true,
+        call_id: 0,
+        debug_merge_point_py_pc: None,
+        parents: Vec::new(),
+        entry_executed_effects: 0,
+    });
+    let mut regs_r = Vec::new();
+    let mut regs_i = Vec::new();
+    let mut regs_f = Vec::new();
+    let mut concrete_r = Vec::new();
+    let mut concrete_i = Vec::new();
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut regs_f,
+        concrete_registers_r: &mut concrete_r,
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    assert_eq!(
+        super::resume_snapshot::walker_capture_inline_nonstandard_vable_guard(&mut wc, 0, 0, None,),
+        Err(DispatchError::GuardResumeCoordinateUnavailable { pc: 0 }),
+        "a callee-only image would make frames[0] disagree between the two resume decoders",
+    );
+    // Keep the pointer live through the call; PyCode itself is intentionally
+    // permanent, matching the production `w_code_new` ownership contract.
+    std::hint::black_box(&mut snapshot_sym);
 }
 
 /// The `ec` recovery every unseeded portal red falls back on
@@ -3809,6 +3926,31 @@ fn replay_scan_treats_callee_frame_bookkeeping_as_call_owned() {
     let scan = fbw_callee_body_replay_scan(&code, &[], 0, &[0], 6, &[], &descrs, false);
     assert_eq!(scan.verdict(), CalleeReplaySafety::Clean);
     assert!(scan.poison.is_empty());
+}
+
+#[test]
+fn replay_scan_does_not_transfer_frame_identity_across_register_overwrite() {
+    let get_vable = *insns_opname_to_byte()
+        .get("getarrayitem_vable_r/ridd>r")
+        .unwrap();
+    let copy = *insns_opname_to_byte().get("ref_copy/r>r").unwrap();
+    let setfield = *insns_opname_to_byte().get("setfield_gc_i/rid").unwrap();
+    let ret = *insns_opname_to_byte().get("ref_return/r").unwrap();
+    // r4 initially names the callee frame.  Loading a slot into r5 and then
+    // overwriting r4 with r5 must revoke that identity before the mutable
+    // store; the new value is an arbitrary non-fresh heap reference.
+    let code = [
+        get_vable, 4, 0, 0, 0, 1, 0, 5, copy, 5, 4, setfield, 4, 0, 2, 0, ret, 5,
+    ];
+    let descrs = vec![
+        make_fail_descr(0),
+        make_fail_descr(1),
+        field_descr_with_index(2),
+    ];
+
+    let scan = fbw_callee_body_replay_scan(&code, &[], 0, &[0], 6, &[], &descrs, false);
+
+    assert_eq!(scan.poison, vec![11]);
 }
 
 #[test]

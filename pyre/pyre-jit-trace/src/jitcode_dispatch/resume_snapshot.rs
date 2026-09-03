@@ -249,9 +249,11 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
     // `generate_guard(GUARD_VALUE, resumepc=orgpc)` (pyjitpl.py),
     // and `capture_resumedata(resumepc)` (pyjitpl.py) walking the full MIFrame chain
     // (opencoder.py:819). Publish the callee's own coordinate when the inline
-    // chain is either the single callee frame or is fully covered by paused
-    // callers; both shapes are directly represented by the frame list.  Stamp
-    // the last *guard* op, not the last op: `emit_force_virtualizable` records
+    // chain is fully covered by paused callers.  `resume.py`
+    // `rebuild_from_resumedata` rebuilds every encoded jitcode header and
+    // `pyjitpl.py capture_resumedata` starts from the portal MIFrame; a lone
+    // callee with no captured parent is therefore not a complete resume chain.
+    // Stamp the last *guard* op, not the last op: `emit_force_virtualizable` records
     // GETFIELD_GC / PTR_NE / COND_CALL after the promote.  A chain that skips an
     // intermediate inline frame still falls through to the sentinel below:
     // never a wrong resume.
@@ -271,8 +273,7 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
                 .collect::<Vec<_>>(),
         )
     };
-    let publish_inline_frames =
-        (n_parents == 0 && n_callees == 1) || (n_parents > 0 && n_parents == n_callees);
+    let publish_inline_frames = inline_snapshot_has_complete_parent_chain(n_parents, n_callees);
     if publish_inline_frames {
         for from_end in (0..minted).rev() {
             walker_capture_multi_frame_inline_snapshot(
@@ -325,6 +326,10 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
     Ok(())
 }
 
+fn inline_snapshot_has_complete_parent_chain(n_parents: usize, n_callees: usize) -> bool {
+    n_parents > 0 && n_parents == n_callees
+}
+
 /// Whether a guard emitted at the current inline depth resumes at its own
 /// callee coordinate instead of collapsing to the caller's CALL boundary.
 ///
@@ -343,7 +348,7 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
         .iter()
         .filter(|frame| !frame.parents.is_empty())
         .count();
-    n_parents > 0 && n_parents == session.framestack.len()
+    inline_snapshot_has_complete_parent_chain(n_parents, session.framestack.len())
 }
 
 pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(

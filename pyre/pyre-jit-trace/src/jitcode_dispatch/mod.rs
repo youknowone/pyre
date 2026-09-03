@@ -6817,6 +6817,23 @@ pub unsafe fn fbw_finish_concrete_root_walker_area(
     }
 }
 
+/// # Safety
+/// `data` must come from [`capture_fbw_finish_payload_root_area`], and the
+/// owning thread must be quiesced.
+pub unsafe fn fbw_finish_payload_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let cell = unsafe { &*(data as *const std::cell::Cell<Option<(OpRef, Type)>>) };
+    let Some((payload, ty)) = cell.get() else {
+        return;
+    };
+    if let OpRef::ConstPtr(mut gcref) = payload {
+        visitor(&mut gcref);
+        cell.set(Some((OpRef::ConstPtr(gcref), ty)));
+    }
+}
+
 /// One in-flight FOR_ITER continuation entry (#57 Option C): the item the
 /// FOR_ITER `for_iter_next` residual consumed on the authoritative walk, the
 /// body coordinate to resume at (the FOR_ITER `py_pc + 1` continue-arm

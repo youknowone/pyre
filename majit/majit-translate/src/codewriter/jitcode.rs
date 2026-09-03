@@ -2118,7 +2118,10 @@ impl BhDescr {
     /// `:348-378` structural identity).  A `_cache_size`/`_cache_array` hit
     /// maps a `cache_key` back to the allocated tid (`gc.py:536-542`); a
     /// miss means the value was already the dense tid (a real tid never keys
-    /// a struct/array cache slot).  Backends call this instead of
+    /// a struct/array cache slot). A cache hit whose payload size disagrees
+    /// with this descr fails loudly: using that tid would make the collector
+    /// trace the cached struct's fields past this allocation. Backends call
+    /// this instead of
     /// `get_type_id() as u32` so a materialized object carries a header the
     /// collector can trace.
     ///
@@ -2130,22 +2133,28 @@ impl BhDescr {
     /// descr — and the collector then walks the foreign type's GC offsets
     /// straight off the end of the block.
     pub fn resolve_gc_tid(&self) -> u32 {
-        if let BhDescr::Array { gc_type_id, .. } = self
-            && *gc_type_id != 0
-        {
-            return *gc_type_id;
-        }
-        let raw = self.get_type_id();
-        let resolved = if raw == 0 {
-            None
-        } else {
-            match self {
-                BhDescr::Size { .. } => majit_ir::descr::gc_cache().lock().resolve_struct_tid(raw),
-                BhDescr::Array { .. } => majit_ir::descr::gc_cache().lock().resolve_array_tid(raw),
-                _ => None,
+        if let BhDescr::Size { size, .. } = self {
+            let raw = self.get_type_id();
+            if raw == 0 {
+                return 0;
             }
-        };
-        resolved.unwrap_or(raw as u32)
+            // Keep the cache lookup and size decision under one lock.  The
+            // registry is process-global (as upstream's GcCache is), so two
+            // independent lookups would allow a concurrent publication to
+            // turn a checked hit into an unchecked truncated-key fallback.
+            match majit_ir::descr::gc_cache()
+                .lock()
+                .resolve_struct_layout(raw)
+            {
+                Some((tid, cached_size)) if cached_size == *size => return tid,
+                Some((_tid, _cached_size)) => {
+                    panic!("BhDescr GC identity resolves to a foreign allocation layout: {self:?}");
+                }
+                None => return raw as u32,
+            }
+        }
+        self.resolved_gc_tid_checked()
+            .unwrap_or_else(|| self.get_type_id() as u32)
     }
 
     /// Resolve the GC type id without truncating an unresolved serialized
@@ -2163,7 +2172,22 @@ impl BhDescr {
             None
         } else {
             match self {
-                BhDescr::Size { .. } => majit_ir::descr::gc_cache().lock().resolve_struct_tid(raw),
+                BhDescr::Size { size, .. } => {
+                    let resolved = majit_ir::descr::gc_cache()
+                        .lock()
+                        .resolve_struct_layout(raw);
+                    match resolved {
+                        Some((tid, cached_size)) if cached_size == *size => Some(tid),
+                        // `descr.py get_size_descr` returns one descriptor
+                        // object for STRUCT, so allocation size and tid are
+                        // inseparable upstream.  A disagreement here means
+                        // pyre's serialized key named a foreign cache entry;
+                        // adopting its tid makes the collector scan that
+                        // entry's fields past this allocation.
+                        Some((_tid, _cached_size)) => return None,
+                        None => None,
+                    }
+                }
                 BhDescr::Array { .. } => majit_ir::descr::gc_cache().lock().resolve_array_tid(raw),
                 _ => None,
             }
@@ -2678,5 +2702,20 @@ mod tests {
         };
 
         assert_eq!(bh.resolved_gc_tid_checked(), Some(17));
+    }
+
+    #[test]
+    fn checked_gc_tid_rejects_a_foreign_sized_struct_cache_entry() {
+        let key = 0xd15a_6eed_5a1e_0001;
+        let foreign = majit_ir::descr::make_size_descr_full(0, 328, 31);
+        majit_ir::descr::gc_cache()
+            .lock()
+            .register_keyed_size(majit_ir::descr::LLType::Struct(key), foreign);
+
+        let bh = size_descr_with_key(24, key);
+        assert_eq!(bh.resolved_gc_tid_checked(), None);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bh.resolve_gc_tid())).is_err()
+        );
     }
 }
