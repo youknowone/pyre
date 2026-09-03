@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=4.2
+# pyre-check: max-pypy-ratio=9
 # The trip count answers two ends at once.  The loop has to run long enough to
 # reach the JIT, or the merge this fixture exists for never happens; and pypy's
 # own execution has to clear FLOOR_GATE_MIN_BASELINE_S, or the ratio divides

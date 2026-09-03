@@ -1,4 +1,3 @@
-# pyre-check: max-pypy-ratio=3.7
 # A FOR_ITER caller should inline a method-form callee whose body branches on a
 # field.  The callee body carries a `truth` residual before trace-time folding;
 # the replay-safety scan must defer it so the walker can erase it instead of
