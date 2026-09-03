@@ -11519,6 +11519,7 @@ fn handler_getfield_vable_i_intbase(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[p] as usize];
+    bh_vable_intbase_report(bh, struct_ptr, "getfield_vable_i");
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
@@ -11575,12 +11576,43 @@ fn handler_setfield_vable_i(
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)
 }
+/// `MAJIT_BH_VABLE_INTBASE`: report a vable base read out of the int bank that
+/// disagrees with the frame's forwarded virtualizable address.
+///
+/// The `*_vable_*_intbase` handlers take their struct operand from
+/// `registers_i`, and no walker forwards the int banks — only `registers_r`,
+/// the packed resume roots, and `virtualizable_ptr` are.  So a collection
+/// between the write of that int register and the handler leaves the address
+/// pointing where the object used to be, and the store lands in memory the
+/// collector has already reused.
+///
+/// `virtualizable_ptr` names the same object and IS forwarded (the drivers root
+/// it beside the Ref bank, precisely because a `-live-` clear can drop it from
+/// the bank), so the two disagreeing is the observable form of that staleness.
+/// Reported rather than repaired: the vable bytecodes are operand-addressed by
+/// design and substituting the rooted address would change which object a
+/// multi-virtualizable chain writes to.  Off unless armed.
+fn bh_vable_intbase_report(bh: &BlackholeInterpreter, struct_ptr: i64, opname: &str) {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ARMED.get_or_init(|| std::env::var_os("MAJIT_BH_VABLE_INTBASE").is_some()) {
+        return;
+    }
+    if bh.virtualizable_ptr != 0 && struct_ptr != bh.virtualizable_ptr {
+        eprintln!(
+            "[bh-vable-intbase] {opname}: int-bank base {struct_ptr:#x} != \
+             forwarded virtualizable {:#x} (jitcode {:?} pos {} last {})",
+            bh.virtualizable_ptr, bh.jitcode.name, bh.position, bh.last_opcode_position,
+        );
+    }
+}
+
 fn handler_setfield_vable_i_intbase(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[p] as usize];
+    bh_vable_intbase_report(bh, struct_ptr, "setfield_vable_i");
     let value = bh.registers_i[code[p + 1] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };
@@ -11613,6 +11645,7 @@ fn handler_setfield_vable_r_intbase(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[p] as usize];
+    bh_vable_intbase_report(bh, struct_ptr, "setfield_vable_r");
     let value = bh.registers_r[code[p + 1] as usize];
     if !bh.virtualizable_info.is_null() {
         let vinfo = unsafe { &*bh.virtualizable_info };

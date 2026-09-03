@@ -190,6 +190,36 @@ fn seed_deopt_vinfo_ptr(
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
 )]
+/// `MAJIT_BH_ENTRY_EXC`: report a `BH_LAST_EXC_VALUE` that survived into a
+/// blackhole drive the caller did not describe as raising.
+///
+/// The clear-before / check-after protocol brackets every call-shaped opcode
+/// inside a drive, so within one drive the channel cannot go stale.  What no
+/// bracket covers is the window between phases: the value a residual raise left
+/// behind is still in TLS when the next drive starts, and a drive entered with
+/// `raising_exception == false` seeds `exception_last_value` from its own
+/// `last_exc_value` argument instead.  The two can disagree.
+///
+/// Clearing the channel unconditionally on entry is NOT the fix — `call_jit.rs`
+/// deliberately keeps a pending value across its decline path so the blackhole
+/// can deliver it — so this reports the disagreement rather than repairing it,
+/// and stays off unless armed.  What it is for: deciding whether the window is
+/// ever actually observed, which no reading of the code settles.
+fn bh_entry_stale_exc_report(last_exc_value: i64, raising_exception: bool, arm: &str) {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ARMED.get_or_init(|| std::env::var_os("MAJIT_BH_ENTRY_EXC").is_some()) {
+        return;
+    }
+    let live = crate::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.get());
+    if live != 0 && live != last_exc_value {
+        eprintln!(
+            "[bh-entry-exc] {arm}: BH_LAST_EXC_VALUE={live:#x} survives into a \
+             drive carrying last_exc_value={last_exc_value:#x} \
+             (raising_exception={raising_exception})"
+        );
+    }
+}
+
 pub fn drive_single_frame_blackhole(
     miframe: &mut crate::pyjitpl::MIFrame,
     cpu: &dyn majit_backend::Backend,
@@ -201,6 +231,7 @@ pub fn drive_single_frame_blackhole(
     mut last_exc_value: i64,
     raising_exception: bool,
 ) -> SingleFrameBlackholeResult {
+    bh_entry_stale_exc_report(last_exc_value, raising_exception, "single-frame");
     // The MIFrame is handed here from a force-time TLS latch.  Publish its Ref
     // values before leasing/building the interpreter because first use of the
     // pooled builder may allocate.  Option<i64> is not a contiguous root area,
@@ -382,6 +413,7 @@ pub fn drive_multi_frame_blackhole(
     on_enter_level: Option<&dyn Fn(i64)>,
     on_leave_level: Option<&dyn Fn(i64)>,
 ) -> MultiFrameBlackholeResult {
+    bh_entry_stale_exc_report(last_exc_value, raising_exception, "multi-frame");
     let mut ref_locations = Vec::new();
     let mut packed_ref_roots = Vec::new();
     for (frame_index, frame) in framestack.frames.iter().enumerate() {
