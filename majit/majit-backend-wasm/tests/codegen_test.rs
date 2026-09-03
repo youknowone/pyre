@@ -6257,3 +6257,24 @@ fn cond_call_n_emits_predicate_and_trampoline() {
         "CondCallN uses the residual trampoline"
     );
 }
+
+/// The two metadata opcodes both native backends skip must compile here too.
+///
+/// An opcode with no arm reaches the catch-all, and a void op's `pos` is
+/// `OpRef::NONE`, which `raw_is_constant` rejects — so the catch-all declines
+/// the whole trace rather than emitting nothing. `consider_jit_debug` is
+/// `pass`, and `RECORD_KNOWN_RESULT` has no backend arm upstream at all
+/// (`optimize_RECORD_KNOWN_RESULT` and simplify consume it), so neither owes
+/// code and neither may cost the trace its compile.
+#[test]
+fn debug_and_record_metadata_opcodes_compile_instead_of_declining() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    for opcode in [OpCode::JitDebug, OpCode::RecordKnownResult] {
+        let ops = vec![
+            make_op(opcode, &[OpRef::input_arg_int(0)], OpRef::NONE),
+            Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+        ];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+    }
+}
