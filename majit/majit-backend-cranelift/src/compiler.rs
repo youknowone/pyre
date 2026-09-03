@@ -7779,13 +7779,10 @@ fn emit_guard_exit(
     //
     // Both stores sit ahead of the closing-jump and attached-bridge dispatches
     // below, which tail-call and never come back. Those paths still publish the
-    // Ref fail-args above, and the frame is allocated in the old generation
-    // (`jitframe_prefer_oldgen`), so a publish that skipped this pair left an
-    // old object holding young pointers with neither a map that describes them
-    // nor a place in the remembered set: the next minor collection walked past
-    // the frame and its slots kept addresses the collection had already moved.
-    // `llmodel.py realloc_frame` fires the same barrier for the same
-    // reason after copying `jf_frame` into a fresh frame.
+    // Ref fail-args above, so this pair is what the next collection walks.
+    // A frame that spilled old (`alloc_nursery_no_collect_typed`) also needs
+    // the barrier `llmodel.py realloc_frame` fires after copying `jf_frame`,
+    // or the remembered set never sees the young fail-args.
     let gcmap_val = if info.gcmap != 0 {
         builder.ins().iconst(cl_types::I64, info.gcmap)
     } else {

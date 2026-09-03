@@ -282,15 +282,38 @@ pub(crate) unsafe fn dealloc_off_gc_block(base: *mut u8, total: usize) {
 
 // ── The descr's frame allocation ────────────────────────────────────
 
-/// Zero-fill a frame the nursery handed back.
+/// Zero-fill a frame the collector handed back.
 ///
 /// RPython's nursery is zeroed once per reset, so `lltype.malloc(JITFRAME)`
 /// returns cleared memory and `GuardNotForced` can read `jf_descr != 0`.
-/// Ours is not, so a fresh frame is cleared here.
-fn zeroed_nursery_frame(gcref: majit_ir::GcRef, size_bytes: usize) -> *mut JitFrame {
-    assert!(!gcref.is_null(), "JITFRAME nursery allocation failed");
+/// Ours is not, so a fresh frame is cleared here. Old-gen arenas recycle
+/// bytes the same way.
+fn zeroed_gc_frame(gcref: majit_ir::GcRef, size_bytes: usize) -> *mut JitFrame {
+    assert!(!gcref.is_null(), "JITFRAME allocation failed");
     unsafe { std::ptr::write_bytes(gcref.0 as *mut u8, 0, size_bytes) };
     gcref.0 as *mut JitFrame
+}
+
+/// Place a GC-managed JITFRAME according to [`jitframe_prefer_oldgen`].
+///
+/// `collect` is the nursery arm of [`malloc_jitframe`]; the no-collect
+/// sibling asks for `alloc_nursery_no_collect_typed` instead, matching
+/// `llmodel.py:140`'s realloc slow path. The old-gen arm is already
+/// non-collecting (`alloc_oldgen_typed`).
+fn alloc_gc_jitframe(
+    gc: &mut dyn majit_gc::GcAllocator,
+    type_id: u32,
+    size_bytes: usize,
+    collect: bool,
+) -> *mut JitFrame {
+    let gcref = if jitframe_prefer_oldgen() {
+        gc.alloc_oldgen_typed(type_id, size_bytes)
+    } else if collect {
+        gc.alloc_nursery_typed(type_id, size_bytes)
+    } else {
+        gc.alloc_nursery_no_collect_typed(type_id, size_bytes)
+    };
+    zeroed_gc_frame(gcref, size_bytes)
 }
 
 /// `llmodel.py:298` `frame = self.gc_ll_descr.malloc_jitframe(frame_info)`,
@@ -298,21 +321,20 @@ fn zeroed_nursery_frame(gcref: majit_ir::GcRef, size_bytes: usize) -> *mut JitFr
 /// `jitframe_allocate` (`jitframe.py:48`).
 ///
 /// The descr decides where the frame lives: under its `JITFRAME` type id it
-/// is a nursery object the collector traces through `jitframe_trace` and may
-/// move; without one — an allocator with no type table, or [`HostHeapGc`]
-/// when nothing is installed — it is a host block the libc-jitframe tracer
-/// walks in place. The caller sees one frame pointer either way; what
-/// differs is only whether the deadframe that later owns it takes a root
-/// slot ([`jitframe_is_gc_object`]) and whether a store into it needs a
-/// barrier ([`jitframe_write_barrier`]).
+/// is a collector object [`jitframe_prefer_oldgen`] places — nursery, like
+/// `lltype.malloc(JITFRAME)`, unless that flag asks for old-gen — traced
+/// through `jitframe_trace`; without one — an allocator with no type table,
+/// or [`HostHeapGc`] when nothing is installed — it is a host block the
+/// libc-jitframe tracer walks in place. The caller sees one frame pointer
+/// either way; what differs is only whether the deadframe that later owns
+/// it takes a root slot ([`jitframe_is_gc_object`]) and whether a store
+/// into it needs a barrier ([`jitframe_write_barrier`]).
 ///
 /// The nursery arm may collect, so the caller must have its inputs rooted.
 /// `size_bytes` is the payload size ([`JitFrame::alloc_size`]).
 pub fn malloc_jitframe(gc: &mut dyn majit_gc::GcAllocator, size_bytes: usize) -> *mut JitFrame {
     match gc.jitframe_type_id() {
-        Some(type_id) => {
-            zeroed_nursery_frame(gc.alloc_nursery_typed(type_id, size_bytes), size_bytes)
-        }
+        Some(type_id) => alloc_gc_jitframe(gc, type_id, size_bytes, true),
         None => malloc_host_jitframe(size_bytes),
     }
 }
@@ -326,10 +348,7 @@ pub fn malloc_jitframe_no_collect(
     size_bytes: usize,
 ) -> *mut JitFrame {
     match gc.jitframe_type_id() {
-        Some(type_id) => zeroed_nursery_frame(
-            gc.alloc_nursery_no_collect_typed(type_id, size_bytes),
-            size_bytes,
-        ),
+        Some(type_id) => alloc_gc_jitframe(gc, type_id, size_bytes, false),
         None => malloc_host_jitframe(size_bytes),
     }
 }
@@ -689,12 +708,16 @@ pub fn jitframe_type_info() -> majit_gc::trace::TypeInfo {
     )
 }
 
-/// Allocate-in-oldgen flag: jitframe should NOT be nursery-allocated
-/// when possible, to avoid the cost of copying the (potentially large)
-/// trailing array during minor collection. When this returns true,
-/// the allocator should use `alloc_external` or similar.
+/// Whether a GC-managed JITFRAME should be born in the old generation.
+///
+/// `jitframe_allocate` is `lltype.malloc(JITFRAME, depth)` — a regular
+/// GcStruct malloc. Framework GC puts that in the nursery unless the
+/// request is large enough for `external_malloc`. There is no
+/// prefer-oldgen switch upstream, so this is false and
+/// [`malloc_jitframe`] reads it: a true here that the allocator ignored
+/// was a dead flag claiming the opposite of `lltype.malloc`.
 pub fn jitframe_prefer_oldgen() -> bool {
-    true
+    false
 }
 
 // ── realloc_frame (llmodel.py) ──────────────────────────────
@@ -782,6 +805,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_gc::GcAllocator;
 
     /// The emitted write-barrier fast path loads one byte at
     /// `jit_wb_if_flag_byteofs` from the frame pointer, and that offset is
@@ -810,5 +834,24 @@ mod tests {
             "a fresh off-GC frame must not look like it tracks young pointers"
         );
         unsafe { free_off_gc_jitframe(frame) };
+    }
+
+    /// `jitframe_allocate` is `lltype.malloc(JITFRAME)`; a true flag that
+    /// [`malloc_jitframe`] ignored was a dead prefer-oldgen claim.
+    #[test]
+    fn malloc_jitframe_reads_prefer_oldgen() {
+        assert!(
+            !jitframe_prefer_oldgen(),
+            "lltype.malloc(JITFRAME) is a nursery GcStruct malloc"
+        );
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let tid = gc.register_type(jitframe_type_info());
+        gc.set_jitframe_type_id(tid);
+        let frame = malloc_jitframe(&mut gc, JitFrame::alloc_size(8));
+        assert!(!frame.is_null());
+        assert!(
+            gc.is_in_nursery(frame as usize),
+            "a false prefer-oldgen flag must not land the frame in mark-sweep old-gen"
+        );
     }
 }

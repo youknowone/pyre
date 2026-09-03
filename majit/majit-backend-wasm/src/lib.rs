@@ -5772,7 +5772,9 @@ mod tests {
         let payload_tid = gc.register_type(TypeInfo::simple(16));
 
         let depth = 2usize;
-        // Non-moving old-gen JitFrame (jitframe_prefer_oldgen()).
+        // Pin the frame in old-gen so only the young item moves. Production
+        // `malloc_jitframe` follows `jitframe_allocate` (`lltype.malloc`)
+        // and is born in the nursery; this test is the old→young gcmap walk.
         let frame = gc.alloc_oldgen_typed(jf_tid, JitFrame::alloc_size(depth));
         assert_ne!(frame.0, 0, "old-gen JitFrame alloc failed");
         let frame_ptr = frame.0 as *mut JitFrame;
