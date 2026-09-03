@@ -2078,8 +2078,8 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
 ///    rejects two keys claiming one byte within this builder and nothing
 ///    checks the byte against the generated table, so (2) is silent.
 ///
-/// Both were pinned by tests alone (`production_bh_builder_covers_every_\
-/// build_emitted_opname`, `production_bh_builder_bytes_match_canonical_table`),
+/// Both were pinned by tests alone — `production_bh_builder_covers_every_build_emitted_opname`
+/// and `production_bh_builder_bytes_match_canonical_table` —
 /// which read the generated tables of whatever tree ran them; the failure they
 /// describe belongs to the binary that dispatches, so it is raised where that
 /// binary assembles its builder.  Both production call sites build once per
