@@ -11,6 +11,41 @@
 
 use super::*;
 
+/// The live pointer a ref operand carries, or `None` where the walk holds no
+/// executable one.
+///
+/// RPython's MIFrame register contains the FrontendOp itself, whose `.value`
+/// is the concrete pointer `executor.do_getfield_gc_*` reads.  Pyre also has a
+/// typed register shadow, because some canonical and inlined helper arguments
+/// are OpRefs allocated outside the active recorder and cannot be stamped
+/// there; that shadow holds the same MIFrame box value, so it answers after
+/// the ordinary OpRef carrier rather than instead of it.
+///
+/// A null and an all-ones word are both rejected: null is no object, and
+/// all-ones is the `vable_setfield` storage placeholder, which says "no
+/// concrete known" rather than naming one.
+fn concrete_ref_operand_ptr<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    obj: OpRef,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<i64> {
+    ctx.trace_ctx
+        .box_value(obj)
+        .and_then(|value| match value {
+            majit_ir::Value::Ref(reference) => Some(reference.0 as i64),
+            _ => None,
+        })
+        .or_else(
+            || match read_ref_reg_concrete(code, op, operand_offset, ctx) {
+                ConcreteValue::Ref(reference) => Some(reference as usize as i64),
+                _ => None,
+            },
+        )
+        .filter(|&ptr| ptr != 0 && ptr != usize::MAX as i64)
+}
+
 /// `getarrayitem_gc_<i|r|f>/rid>X` handler. Operand layout `rid>X`:
 /// 1B r-reg(array) + 1B i-reg(index) + 2B descr + 1B X-dst.
 ///
@@ -485,24 +520,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     let obj = read_ref_reg(code, op, 0, ctx)?;
     let descr = read_descr(code, op, 1, ctx)?;
     let descr_index = descr.index();
-    // RPython's MIFrame register contains the FrontendOp itself, whose
-    // `.value` is the concrete pointer used by executor.do_getfield_gc_*.
-    // Pyre also has a typed register shadow because some canonical/inlined
-    // helper args are OpRefs allocated outside the active recorder and cannot
-    // be stamped there.  Treat that shadow as the same MIFrame box value,
-    // after preferring the ordinary OpRef carrier.
-    let concrete_obj_ptr = ctx
-        .trace_ctx
-        .box_value(obj)
-        .and_then(|value| match value {
-            majit_ir::Value::Ref(reference) => Some(reference.0 as i64),
-            _ => None,
-        })
-        .or_else(|| match read_ref_reg_concrete(code, op, 0, ctx) {
-            ConcreteValue::Ref(reference) => Some(reference as usize as i64),
-            _ => None,
-        })
-        .filter(|&ptr| ptr != 0 && ptr != usize::MAX as i64);
+    let concrete_obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
 
     // ConstPtr + always-pure fast path (pyjitpl.py): a constant
     // source through an immutable descr loads the field now and
@@ -711,18 +729,7 @@ pub(crate) fn guard_class_record<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let obj = read_ref_reg(code, op, 0, ctx)?;
     let dst = code[op.pc + 2] as usize;
-    let concrete_obj_ptr = ctx
-        .trace_ctx
-        .box_value(obj)
-        .and_then(|value| match value {
-            majit_ir::Value::Ref(reference) => Some(reference.0 as i64),
-            _ => None,
-        })
-        .or_else(|| match read_ref_reg_concrete(code, op, 0, ctx) {
-            ConcreteValue::Ref(reference) => Some(reference as usize as i64),
-            _ => None,
-        })
-        .filter(|&ptr| ptr != 0 && ptr != usize::MAX as i64);
+    let concrete_obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
     let Some(obj_ptr) = concrete_obj_ptr else {
         if fbw_debug_abort_enabled() {
             eprintln!("[fbw-abort] GuardClassReceiverNotConcrete pc={}", op.pc);
