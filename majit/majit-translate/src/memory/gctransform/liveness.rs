@@ -216,8 +216,16 @@ pub const MOVABLE_GC_MARKERS: &[&str] = &[
     // `PyObjectRef`, so no GC-pointer local is ever an argument of one.  The
     // same reading rules out the items-block and JITFRAME allocators, whose
     // arguments are a capacity and a type id.
+    // `w_method_` is spelled at the accessors rather than at the family
+    // prefix, because `w_method_new` takes the new method's three members --
+    // not a `Method` -- and roots and re-reads them itself.  Under the family
+    // prefix every argument of that constructor counted, so an unrelated local
+    // passed as a member was reported as addressed through a method it is only
+    // stored in.  `w_tuple_new` needs no such split: it takes a slice, so no
+    // `PyObjectRef` local is ever one of its arguments.
     "w_tuple_",
-    "w_method_",
+    "w_method_get_",
+    "w_method_set_",
     "w_gc_weakref_box_",
     "w_weakref_new",
 ];
@@ -638,13 +646,19 @@ pub fn scan(
                         }
                         continue;
                     }
+                    // Truncated rather than removed, for the same reason the
+                    // push above is a push: `RootScope::drop` truncates the
+                    // shadow stack to the length the dropped guard saved, so
+                    // dropping an outer guard retires every guard opened after
+                    // it.  Removing only the named scope would leave the stack
+                    // claiming a guard the runtime has already released.
                     TermKind::Drop { place, .. } => {
                         if let Some(scope) = place_local(place) {
                             if let Some(i) = normal.iter().position(|&s| s == scope) {
-                                normal.remove(i);
+                                normal.truncate(i);
                             }
                             if let Some(i) = unwind.iter().position(|&s| s == scope) {
-                                unwind.remove(i);
+                                unwind.truncate(i);
                             }
                         }
                     }
