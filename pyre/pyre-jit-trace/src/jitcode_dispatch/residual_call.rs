@@ -1880,6 +1880,38 @@ fn proxy_viewed_frame(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyOb
     viewed_frame(receiver)
 }
 
+/// Whether a residual's Ref-bank operands may hold something other than an
+/// object, so reading a type off one is not sound.
+///
+/// The operand list carries one word per `arg_types()` entry, which is a list
+/// of objects only where every parameter is one machine word wide.  Two
+/// families break that, and neither call is executed by the walk:
+///
+/// * a helper published with a parameter wider than a slot, which
+///   [`pyre_interpreter::is_abi_unsound_argument_residual`] names;
+/// * an un-lowered helper, whose funcbox is a symbolic hash rather than an
+///   address and whose Rust signature nothing checked — `get_and_call_function`
+///   takes `args_w: &[PyObjectRef]`, so its fourth Ref slot holds half of a
+///   slice rather than an object.
+///
+/// [`try_execute_residual_call_via_executor`] declines both on the same test,
+/// but it runs after this write-back, so the scan cannot wait for its answer.
+fn residual_operands_are_not_all_objects<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) -> bool {
+    let Some(&funcbox) = allboxes.first() else {
+        return false;
+    };
+    let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcbox) else {
+        // A funcbox the walk cannot read is one it cannot classify, and the
+        // executor declines on the same condition.
+        return true;
+    };
+    majit_translate::codewriter::call::is_symbolic_fnaddr(addr)
+        || pyre_interpreter::is_abi_unsound_argument_residual(addr as usize)
+}
+
 /// Write the traced frame's locals region out before a residual that reads it
 /// through a live `FrameLocalsProxy`.
 ///
@@ -1932,6 +1964,9 @@ fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
     ) else {
         return;
     };
+    if residual_operands_are_not_all_objects(ctx, allboxes) {
+        return;
+    }
     let mut reads_traced_frame = false;
     for &arg in allboxes {
         let Some(obj) = walker_concrete_ref_object(ctx, arg) else {
