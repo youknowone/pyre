@@ -1027,6 +1027,16 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // name path or header alone, so they run first and a filtered-out
         // declaration never pays for the parse.
         let Some(body) = fd.unstructured() else {
+            // A declaration with no unstructured body never becomes a
+            // `SemanticFunction`, so it never reaches `function_graphs` and
+            // every callsite resolves it as an unregistered path.  The
+            // lowering errors below are already surfaced by `skipped`; this
+            // arm was the one membership drop that left no trace at all.
+            crate::decline::record_named(
+                crate::decline::gate::SEMANTIC_FN_LOOP,
+                "declaration-has-no-unstructured-body",
+                &fn_path,
+            );
             continue;
         };
         // A single function whose body the driver does not yet handle
@@ -7089,12 +7099,26 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_size_const_global(id))
                     .or_else(|| self.fold_named_const_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
-                    .or_else(|| code_flags_const(&segments))
-                    .unwrap_or_else(|| OpKind::Call {
+                    .or_else(|| code_flags_const(&segments));
+                // No lane produced a value for this static.  The synthetic
+                // nullary call below targets the static's own path, which is
+                // not a function, so the failure only becomes visible two
+                // stages later as `not registered in CallRegistry` against
+                // that path — indistinguishable from a genuinely unregistered
+                // callee.  Record the lane failure here, where the reason
+                // still exists, so the census can tell the two apart.
+                let op = op.unwrap_or_else(|| {
+                    crate::decline::record_named(
+                        crate::decline::gate::GLOBAL_PLACE,
+                        "no-lane-produced-a-value",
+                        &segments.join("::"),
+                    );
+                    OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
                         args: vec![],
                         result_ty: tyref_to_value_type(&place_ty, self.llbc),
-                    });
+                    }
+                });
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
