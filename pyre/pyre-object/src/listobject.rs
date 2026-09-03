@@ -319,8 +319,8 @@ impl W_ListObject {
             // valid pointer.
             ListStrategy::Integer | ListStrategy::IntOrFloat => ll_list_int_length(self),
             ListStrategy::Float => ll_list_float_length(self),
-            ListStrategy::Bytes => self.bytes_items.len,
-            ListStrategy::Ascii => self.ascii_items.len,
+            ListStrategy::Bytes => self.bytes_items.len(),
+            ListStrategy::Ascii => self.ascii_items.len(),
         }
     }
 
@@ -2912,13 +2912,16 @@ pub unsafe fn w_list_int_or_float_setitem(
 /// field read (`listobject.py EmptyListStrategy.length` returns 0).
 ///
 /// Read without the list's lock, the way `PyList_GET_SIZE` reads `ob_size`
-/// and the way every compiled read of it already did: the `builtin_len`
-/// fold records `guard_value(strategy)` + `getfield(length)` and the walked
-/// `w_list_*_inner` bodies hold no guard.  The value only ever becomes an
-/// int, so a read that races a strategy switch yields a stale length, never
-/// an out-of-bounds access.  With no lock there is no collection point, so
-/// `obj` needs no root here.  Taking the lock instead made the acquire an
-/// opaque residual (`w_list_lock` is `dont_look_inside`) on every traced
+/// and the way the walked `w_list_*_inner` bodies already read it.  What
+/// makes that sound is the GIL (`majit-gc` `rgil`), which serialises every
+/// mutator against this read: the lock is a narrower scope inside it, not
+/// the thing keeping a strategy switch from being observed half-applied.
+/// The distinction matters because a half-applied switch is not merely a
+/// stale length — the two range strategies answer through `list.items`, and
+/// `switch_range_to_integer_strategy` nulls that pointer before it stores
+/// the new strategy.  With no lock there is no collection point, so `obj`
+/// needs no root here.  Taking the lock instead made the acquire an opaque
+/// residual (`w_list_lock` is `dont_look_inside`) on every traced
 /// `len(list)`, which is what kept the generic builtin descent out of `len`.
 ///
 /// # Safety
