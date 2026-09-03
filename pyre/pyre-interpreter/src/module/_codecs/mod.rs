@@ -867,10 +867,15 @@ pub(crate) fn encode_text_codec(
     // Python while `w_obj` is still whatever the caller handed over.
     let _roots = pyre_object::gc_roots::push_roots();
     let w_obj = pyre_object::gc_roots::pin_root(w_obj);
-    let w_codec_info = lookup_text_codec("encode", encoding)?;
+    // The codec-info tuple relocates, and the handler check below reaches
+    // the codec state's lazy construction, which allocates.  Pin it and read
+    // it back rather than indexing the word the lookup answered.
+    let info_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lookup_text_codec("encode", encoding)?);
     if crate::importing::dev_mode_flag() {
         validate_error_handler(errors)?;
     }
+    let w_codec_info = pyre_object::gc_roots::shadow_stack_get(info_slot);
     let w_encfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 0).unwrap_or_else(w_none) };
     let w_retval = call_codec(w_encfunc, w_obj, "encoding", encoding, Some(errors))?;
     if !unsafe { pyre_object::bytesobject::is_bytes_like(w_retval) } {
@@ -896,10 +901,15 @@ pub(crate) fn decode_text_codec(
     // move, so the pin is for liveness alone and the value is used as it is.
     let _roots = pyre_object::gc_roots::push_roots();
     let w_obj = pyre_object::gc_roots::pin_root(w_obj);
-    let w_codec_info = lookup_text_codec("decode", encoding)?;
+    // The codec-info tuple relocates, and the handler check below reaches
+    // the codec state's lazy construction, which allocates.  Pin it and read
+    // it back rather than indexing the word the lookup answered.
+    let info_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lookup_text_codec("decode", encoding)?);
     if crate::importing::dev_mode_flag() {
         validate_error_handler(errors)?;
     }
+    let w_codec_info = pyre_object::gc_roots::shadow_stack_get(info_slot);
     let w_decfunc = unsafe { pyre_object::w_tuple_getitem(w_codec_info, 1).unwrap_or_else(w_none) };
     let w_retval = call_codec(w_decfunc, w_obj, "decoding", encoding, Some(errors))?;
     if !unsafe { pyre_object::is_str(w_retval) } {

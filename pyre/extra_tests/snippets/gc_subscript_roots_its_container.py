@@ -30,11 +30,6 @@ class Idx:
         return self.n
 
 
-class Named:
-    def __str__(self):
-        return "abcd"
-
-
 # Temporaries: nothing but the operand stack ever held these containers.
 assert [10, 20, 30][Idx(1)] == 20
 assert (10, 20, 30)[Idx(1)] == 20
@@ -48,11 +43,13 @@ assert bytearray(b"abcdefgh")[Idx(2) : Idx(6)] == bytearray(b"cdef")
 # A tuple or str *literal* is a prebuilt constant and never relocates, so the
 # two lines above exercise liveness and not staleness.  The relocating shapes
 # are the ones a program builds: `tuple()` allocates in the nursery, and
-# `str()` is the one caller of the collecting string constructor.
+# `int.__repr__` mints its digits through the collecting string constructor.
+# A user `__str__` does not qualify -- `str()` hands that result object back
+# unchanged, so a `__str__` returning a literal subscripts the code constant.
 assert tuple(range(10, 40, 10))[Idx(1)] == 20
 assert tuple(range(8))[Idx(2) :] == (2, 3, 4, 5, 6, 7)
-assert str(Named())[Idx(1)] == "b"
-assert str(Named())[Idx(1) : Idx(3)] == "bc"
+assert str(1234)[Idx(1)] == "2"
+assert str(123456)[Idx(1) : Idx(3)] == "23"
 
 # The assigned value is read after the key's `__index__` has already run.
 target = bytearray(b"abcd")

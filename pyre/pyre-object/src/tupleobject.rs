@@ -241,7 +241,7 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
 /// boxed. Other arities use the array-backed `W_TupleObject`.
 ///
 /// Residualized: tuple construction drives the moving collector through
-/// `push_roots` / `pin_root` / `try_gc_alloc_stable` shadow-stack
+/// `push_roots` / `pin_root` / `try_gc_alloc_nursery_raw` shadow-stack
 /// plumbing the tracer cannot model. The JIT leaves the call as a
 /// residual returning the fresh object pointer.
 #[majit_macros::dont_look_inside]

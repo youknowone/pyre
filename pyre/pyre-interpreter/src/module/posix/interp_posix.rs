@@ -7823,12 +7823,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // A free-threaded fork must snapshot native/Python lock
                     // state while every other mutator is parked.  Enter
                     // through the collector's full request path so no GC
-                    // operation can overlap the STW window.
-                    let mut fork_result = None;
-                    majit_gc::gc_sync::request_stw(|_| {
-                        fork_result = Some(host_posix::fork());
-                    });
-                    match fork_result.expect("fork STW closure must run") {
+                    // operation can overlap the STW window, and so the child
+                    // inherits the quiesce mutex from the thread that survives
+                    // rather than from one that vanished.
+                    match majit_gc::gc_sync::fork_under_stw(host_posix::fork) {
                         Ok(0) => {
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
@@ -7890,8 +7888,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     drop(blocked);
                     run_fork_callbacks("before");
                     let mut master_fd = -1;
-                    let mut fork_result = None;
-                    majit_gc::gc_sync::request_stw(|_| {
+                    let fork_result = majit_gc::gc_sync::fork_under_stw(|| {
                         let pid = unsafe {
                             libc::forkpty(
                                 &mut master_fd,
@@ -7900,13 +7897,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 std::ptr::null_mut(),
                             )
                         };
-                        fork_result = Some(if pid == -1 {
+                        if pid == -1 {
                             Err(std::io::Error::last_os_error())
                         } else {
                             Ok(pid)
-                        });
+                        }
                     });
-                    match fork_result.expect("forkpty STW closure must run") {
+                    match fork_result {
                         Ok(0) => {
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");

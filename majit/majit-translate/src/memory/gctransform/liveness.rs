@@ -216,8 +216,16 @@ pub const MOVABLE_GC_MARKERS: &[&str] = &[
     // `PyObjectRef`, so no GC-pointer local is ever an argument of one.  The
     // same reading rules out the items-block and JITFRAME allocators, whose
     // arguments are a capacity and a type id.
+    // `w_method_` is spelled at the accessors rather than at the family
+    // prefix, because `w_method_new` takes the new method's three members --
+    // not a `Method` -- and roots and re-reads them itself.  Under the family
+    // prefix every argument of that constructor counted, so an unrelated local
+    // passed as a member was reported as addressed through a method it is only
+    // stored in.  `w_tuple_new` needs no such split: it takes a slice, so no
+    // `PyObjectRef` local is ever one of its arguments.
     "w_tuple_",
-    "w_method_",
+    "w_method_get_",
+    "w_method_set_",
     "w_gc_weakref_box_",
     "w_weakref_new",
 ];
@@ -638,13 +646,19 @@ pub fn scan(
                         }
                         continue;
                     }
+                    // Truncated rather than removed, for the same reason the
+                    // push above is a push: `RootScope::drop` truncates the
+                    // shadow stack to the length the dropped guard saved, so
+                    // dropping an outer guard retires every guard opened after
+                    // it.  Removing only the named scope would leave the stack
+                    // claiming a guard the runtime has already released.
                     TermKind::Drop { place, .. } => {
                         if let Some(scope) = place_local(place) {
                             if let Some(i) = normal.iter().position(|&s| s == scope) {
-                                normal.remove(i);
+                                normal.truncate(i);
                             }
                             if let Some(i) = unwind.iter().position(|&s| s == scope) {
-                                unwind.remove(i);
+                                unwind.truncate(i);
                             }
                         }
                     }
@@ -909,74 +923,174 @@ pub fn scan(
             .flat_map(HashSet::iter)
             .flat_map(|a| a.iter().copied())
             .collect();
-        let universe: HashSet<(u64, u64)> = gc_locals
-            .keys()
-            .flat_map(|l| all_scopes.iter().map(move |s| (*l, *s)))
+        // The element is a subset of `locals x scopes` and the entry value is
+        // that whole product, so a `HashSet` of pairs per block costs
+        // `blocks * locals * scopes` hash entries -- for the largest
+        // interpreter bodies, gigabytes, three times over per round because
+        // each round rebuilt both block-indexed vectors.  The same answer is
+        // `blocks * locals * scopes` **bits**.
+        //
+        // Bit `l * scopes.len() + s`, so one local's owners are contiguous:
+        // clearing every owner of a local is what a kill and a call
+        // destination each do, while retiring a scope is rarer and takes a
+        // strided mask built once.
+        let mut scopes: Vec<u64> = all_scopes.iter().copied().collect();
+        scopes.sort_unstable();
+        // The domain carries every local a pin *names*, not only the GC ones:
+        // a terminator adds `(local, owner)` for whatever it pinned.  Only the
+        // GC locals seed the entry value, which is what starting from
+        // `gc_locals x scopes` meant.
+        let mut locals: Vec<u64> = gc_locals.keys().copied().collect();
+        for pins in &term_pins {
+            locals.extend(pins.iter().copied());
+        }
+        locals.sort_unstable();
+        locals.dedup();
+        let local_at: HashMap<u64, usize> =
+            locals.iter().enumerate().map(|(i, &l)| (l, i)).collect();
+        let scope_at: HashMap<u64, usize> =
+            scopes.iter().enumerate().map(|(i, &x)| (x, i)).collect();
+        let nscopes = scopes.len();
+        let words = (locals.len() * nscopes).div_ceil(64);
+        let bit_set = |v: &mut [u64], i: usize| v[i / 64] |= 1u64 << (i % 64);
+        let bit_get = |v: &[u64], i: usize| v[i / 64] >> (i % 64) & 1 == 1;
+        // One scope's pairs, which are strided and so need a mask; a local's
+        // are a run and are cleared in place.
+        let scope_masks: Vec<Vec<u64>> = (0..nscopes)
+            .map(|si| {
+                let mut m = vec![0u64; words];
+                for li in 0..locals.len() {
+                    bit_set(&mut m, li * nscopes + si);
+                }
+                m
+            })
             .collect();
-        let out_of = |b: usize, pin: &[HashSet<(u64, u64)>]| -> HashSet<(u64, u64)> {
-            let mut s: HashSet<(u64, u64)> = pin[b]
-                .iter()
-                .filter(|(l, _)| !stmt_kills[b].contains(l))
-                .copied()
-                .collect();
-            if term_closes_root_scope[b] {
-                // `RootScope::drop` truncates the shadow stack to the length it
-                // saved, so a guard takes its own pins *and* those of every
-                // guard opened after it -- dropping out of order takes more
-                // than one scope's worth.  An enclosing guard keeps its own.
-                match (closed_scope[b], stack_at[b].as_ref()) {
-                    (Some(scope), Some(stack)) => {
-                        let retired: HashSet<u64> = match stack.iter().position(|&x| x == scope) {
-                            Some(i) => stack[i..].iter().copied().collect(),
-                            None => stack.iter().copied().collect(),
-                        };
-                        s.retain(|(_, owner)| !retired.contains(owner));
-                    }
-                    // A Drop this reader cannot place retires an unknown set.
-                    _ => s.clear(),
-                }
-            }
-            if let Some(TermKind::Call { call, .. }) = &terms[b] {
-                if let Some(d) = bare_local(&call.dest) {
-                    s.retain(|(l, _)| *l != d);
-                }
-            }
-            if let Some(owner) = owner_at[b] {
-                s.extend(term_pins[b].iter().map(|l| (*l, owner)));
-            }
-            s
-        };
-        let mut pinned_in: Vec<HashSet<(u64, u64)>> = (0..n)
+        // What each block does to the set, resolved once so the rounds below
+        // are word operations: the pairs it clears by local, the owners it
+        // retires, and the pairs its terminator adds.  Clears commute, so the
+        // call destination joins the statement kills rather than taking a
+        // pass of its own.
+        struct BlockEdit {
+            kill_locals: Vec<usize>,
+            retire_scopes: Vec<usize>,
+            retire_all: bool,
+            add_bits: Vec<usize>,
+        }
+        let edits: Vec<BlockEdit> = (0..n)
             .map(|b| {
-                if b == 0 || !reachable.contains(&b) {
-                    HashSet::new()
-                } else {
-                    universe.clone()
+                let mut kill_locals: Vec<usize> = stmt_kills[b]
+                    .iter()
+                    .filter_map(|l| local_at.get(l).copied())
+                    .collect();
+                let mut retire_scopes: Vec<usize> = Vec::new();
+                let mut retire_all = false;
+                if term_closes_root_scope[b] {
+                    // `RootScope::drop` truncates the shadow stack to the
+                    // length it saved, so a guard takes its own pins *and*
+                    // those of every guard opened after it -- dropping out of
+                    // order takes more than one scope's worth.  An enclosing
+                    // guard keeps its own.
+                    match (closed_scope[b], stack_at[b].as_ref()) {
+                        (Some(scope), Some(stack)) => {
+                            let from = stack.iter().position(|&x| x == scope).unwrap_or(0);
+                            retire_scopes = stack[from..]
+                                .iter()
+                                .filter_map(|x| scope_at.get(x).copied())
+                                .collect();
+                        }
+                        // A Drop this reader cannot place retires an unknown
+                        // set.
+                        _ => retire_all = true,
+                    }
+                }
+                if let Some(TermKind::Call { call, .. }) = &terms[b]
+                    && let Some(d) = bare_local(&call.dest)
+                    && let Some(&di) = local_at.get(&d)
+                {
+                    kill_locals.push(di);
+                }
+                let add_bits = match owner_at[b].and_then(|o| scope_at.get(&o).copied()) {
+                    Some(si) => term_pins[b]
+                        .iter()
+                        .filter_map(|l| local_at.get(l).map(|&li| li * nscopes + si))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                BlockEdit {
+                    kill_locals,
+                    retire_scopes,
+                    retire_all,
+                    add_bits,
                 }
             })
             .collect();
-        for _round in 0..n + 8 {
-            let outs: Vec<HashSet<(u64, u64)>> = (0..n).map(|b| out_of(b, &pinned_in)).collect();
-            let mut changed = false;
-            let mut next: Vec<HashSet<(u64, u64)>> = Vec::with_capacity(n);
-            for b in 0..n {
-                if b == 0 || !reachable.contains(&b) {
-                    next.push(HashSet::new());
+        // Block-indexed buffers, allocated once rather than per round.
+        let mut pinned_in = vec![0u64; n * words];
+        for b in 0..n {
+            if b == 0 || !reachable.contains(&b) {
+                continue;
+            }
+            let blk = &mut pinned_in[b * words..(b + 1) * words];
+            for (li, l) in locals.iter().enumerate() {
+                if !gc_locals.contains_key(l) {
                     continue;
                 }
-                let mut acc = match preds[b].first() {
-                    Some(&p) => outs[p].clone(),
-                    None => HashSet::new(),
-                };
-                for &p in preds[b].iter().skip(1) {
-                    acc.retain(|l| outs[p].contains(l));
+                for si in 0..nscopes {
+                    bit_set(blk, li * nscopes + si);
                 }
-                if acc != pinned_in[b] {
+            }
+        }
+        let mut outs = vec![0u64; n * words];
+        let mut next = vec![0u64; n * words];
+        for _round in 0..n + 8 {
+            for b in 0..n {
+                let at = b * words;
+                outs[at..at + words].copy_from_slice(&pinned_in[at..at + words]);
+                let e = &edits[b];
+                let o = &mut outs[at..at + words];
+                for &li in &e.kill_locals {
+                    for si in 0..nscopes {
+                        let i = li * nscopes + si;
+                        o[i / 64] &= !(1u64 << (i % 64));
+                    }
+                }
+                if e.retire_all {
+                    o.fill(0);
+                } else {
+                    for &si in &e.retire_scopes {
+                        for (w, m) in o.iter_mut().zip(&scope_masks[si]) {
+                            *w &= !m;
+                        }
+                    }
+                }
+                for &i in &e.add_bits {
+                    bit_set(o, i);
+                }
+            }
+            let mut changed = false;
+            for b in 0..n {
+                let at = b * words;
+                if b == 0 || !reachable.contains(&b) {
+                    next[at..at + words].fill(0);
+                } else if let Some(&first) = preds[b].first() {
+                    let src = first * words;
+                    for w in 0..words {
+                        next[at + w] = outs[src + w];
+                    }
+                    for &p in preds[b].iter().skip(1) {
+                        let src = p * words;
+                        for w in 0..words {
+                            next[at + w] &= outs[src + w];
+                        }
+                    }
+                } else {
+                    next[at..at + words].fill(0);
+                }
+                if next[at..at + words] != pinned_in[at..at + words] {
                     changed = true;
                 }
-                next.push(acc);
             }
-            pinned_in = next;
+            std::mem::swap(&mut pinned_in, &mut next);
             if !changed {
                 break;
             }
@@ -1159,10 +1273,15 @@ pub fn scan(
                 }
                 // Drop the owner here: coverage asks only whether the local
                 // is pinned by *some* live guard.
-                let held: HashSet<u64> = pinned_in[b]
+                let blk = &pinned_in[b * words..(b + 1) * words];
+                let held: HashSet<u64> = locals
                     .iter()
-                    .map(|(l, _)| *l)
-                    .filter(|l| !stmt_kills[b].contains(l))
+                    .enumerate()
+                    .filter(|(li, l)| {
+                        !stmt_kills[b].contains(l)
+                            && (0..nscopes).any(|si| bit_get(blk, li * nscopes + si))
+                    })
+                    .map(|(_, l)| *l)
                     .collect();
                 let mut missing: Vec<String> = after
                     .iter()

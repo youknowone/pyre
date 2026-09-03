@@ -4779,18 +4779,26 @@ fn update_bases(
     let _entry_roots = pyre_object::gc_roots::push_roots();
     let orig_bases_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_orig_bases);
-    let mut new_bases: Option<Vec<PyObjectRef>> = None;
-    for (i, &w_base) in base_args.iter().enumerate() {
+    // The originals go on the shadow stack for the same reason `w_orig_bases`
+    // does: `getattr_str` and the `__mro_entries__` call both run Python, so a
+    // base the walk has not reached yet is a pre-move word by the time it is
+    // read.  The accumulation is a list of slot indices rather than of words,
+    // so an entry already appended is re-read at the end instead of being
+    // frozen at the address it had when it was appended.
+    let args_base = pyre_object::gc_roots::pin_roots(base_args);
+    let mut new_slots: Option<Vec<usize>> = None;
+    for i in 0..base_args.len() {
+        let w_base = pyre_object::gc_roots::shadow_stack_get(args_base + i);
         if unsafe { pyre_object::is_type(w_base) } {
-            if let Some(nb) = new_bases.as_mut() {
-                nb.push(w_base);
+            if let Some(nb) = new_slots.as_mut() {
+                nb.push(args_base + i);
             }
             continue;
         }
         match crate::baseobjspace::getattr_str(w_base, "__mro_entries__") {
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-                if let Some(nb) = new_bases.as_mut() {
-                    nb.push(w_base);
+                if let Some(nb) = new_slots.as_mut() {
+                    nb.push(args_base + i);
                 }
             }
             Err(e) => return Err(e),
@@ -4813,24 +4821,40 @@ fn update_bases(
                     ));
                 }
                 let w_new_base = pyre_object::gc_roots::pin_root(w_new_base);
-                if new_bases.is_none() {
-                    new_bases = Some(base_args[..i].to_vec());
+                if new_slots.is_none() {
+                    new_slots = Some((0..i).map(|k| args_base + k).collect());
                 }
-                let nb = new_bases.as_mut().unwrap();
+                let nb = new_slots.as_mut().unwrap();
                 let n = unsafe { pyre_object::w_tuple_len(w_new_base) };
                 for j in 0..n {
                     if let Some(item) =
                         unsafe { pyre_object::w_tuple_getitem(w_new_base, j as i64) }
                     {
-                        nb.push(item);
+                        nb.push(pyre_object::gc_roots::shadow_stack_len());
+                        let _ = pyre_object::gc_roots::pin_root(item);
                     }
                 }
             }
         }
     }
-    match new_bases {
-        None => Ok((base_args.to_vec(), false)),
-        Some(nb) => Ok((nb, true)),
+    // Read back at the return, where the words are current: the caller pins
+    // them again before its own `w_tuple_new` allocates.
+    let read = |slots: &[usize]| -> Vec<PyObjectRef> {
+        slots
+            .iter()
+            .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+            .collect()
+    };
+    match new_slots {
+        None => Ok((
+            read(
+                &(0..base_args.len())
+                    .map(|i| args_base + i)
+                    .collect::<Vec<_>>(),
+            ),
+            false,
+        )),
+        Some(nb) => Ok((read(&nb), true)),
     }
 }
 
