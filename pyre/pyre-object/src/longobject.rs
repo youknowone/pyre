@@ -577,15 +577,6 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
     }
 }
 
-/// `rbigint.add_int_int_bigint_result` (`rpython/rlib/rbigint.py`,
-/// `@jit.elidable`) — exact bigint sum of two machine ints. Allocates the
-/// result via the COLLECTING nursery, matching [`jit_bigint_add`], and returns
-/// a freshly heap-allocated `*mut BigInt` payload (as i64).
-#[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_add_int_int(a: i64, b: i64) -> i64 {
-    alloc_bigint_nursery_collecting(BigInt::add_int_int_bigint_result(a, b)) as i64
-}
-
 /// `rbigint.sub` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
@@ -600,27 +591,11 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
     }
 }
 
-/// `rbigint.sub_int_int_bigint_result` (`rpython/rlib/rbigint.py`,
-/// `@jit.elidable`) — exact bigint difference of two machine ints. See
-/// [`jit_bigint_add_int_int`].
-#[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_sub_int_int(a: i64, b: i64) -> i64 {
-    alloc_bigint_nursery_collecting(BigInt::sub_int_int_bigint_result(a, b)) as i64
-}
-
 /// `rbigint.mul` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe { alloc_bigint_nursery_collecting(&*a * &*b) as i64 }
-}
-
-/// `rbigint.mul_int_int_bigint_result` (`rpython/rlib/rbigint.py`,
-/// `@jit.elidable`) — exact bigint product of two machine ints. See
-/// [`jit_bigint_add_int_int`].
-#[majit_macros::elidable_or_memerror]
-pub extern "C" fn jit_bigint_mul_int_int(a: i64, b: i64) -> i64 {
-    alloc_bigint_nursery_collecting(BigInt::mul_int_int_bigint_result(a, b)) as i64
 }
 
 /// `rbigint.and_` on bare payloads (collecting). See [`jit_bigint_add`].
