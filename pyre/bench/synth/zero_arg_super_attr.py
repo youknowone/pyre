@@ -34,12 +34,28 @@
 # 1.7x on cranelift, carried with room for a slower host.
 # `load_super_attr.py` carries the same 3 for the same family.
 #
-# `load_super_attr_descent` is not among them.  The descent walks the MRO
-# suffix and reaches `wtf8_key_is_utf8`, whose `&Wtf8` argument is two machine
-# words against the residual ABI's one, so the sub-walk declines at that call
-# rather than run it: the fold is consulted once per trace and fires zero
-# times.  Naming it here would gate on a fold that cannot fire until the
-# wtf8-keyed dict family takes a key that is one word wide.
+# `load_super_attr_descent` is not among them, and adding it is not the
+# improvement it looks like.  The descent walks the MRO suffix and declines at
+# `pyre_object::function::w_method_new`, the unpublished descriptor bind that
+# ends the walk, so it is consulted once per trace and fires zero times.  The
+# earlier `wtf8_key_is_utf8` wall this comment used to name is gone; that one
+# moved rather than resolved anything.
+#
+# The wall has since been lifted experimentally, and what is behind it is a
+# regression.  With the descent firing on this body it read 7.71s against
+# 0.06s for the hand-written `load_super_attr` fold at N=2,000,000 -- 128x,
+# A/B'd on ONE binary with `PYRE_FBW_NO_SPECIALIZE=load_super_attr_descent`,
+# with identical output and with both arms reporting `loops_compiled=2
+# loops_aborted=0`.  No abort, no bailout, no compile failure: the compiled
+# trace itself is what is worse, and nothing explains why yet.
+#
+# The preference is what makes that reachable.
+# `try_walker_specialize_load_super_attr` consults the descent first and
+# returns on success, so a firing descent takes a site AWAY from the fold
+# rather than adding one.  On
+# `extra_tests/snippets/class_super_zero_arg_inlined_callee.py` the fold alone
+# covers 5 of 5 super sites; with the descent firing, coverage splits 3+2,
+# `loops_compiled` drops 6 -> 4 and `loops_aborted` rises 0 -> 6.
 #
 try:
     import pypyjit

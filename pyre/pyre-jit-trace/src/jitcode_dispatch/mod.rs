@@ -10928,7 +10928,35 @@ fn guarded_branch_core<Sym: WalkSym>(
             let n_callees = session.framestack.len();
             !(n_parents > 0 && n_parents == n_callees)
         };
-        let gate_frame = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym);
+        // A canonical helper body (`run_sub_jitcode_walk`) walks its OWN
+        // jitcode over its OWN register bank and pushes no `InlineFrame`, so
+        // `current()` resolves to the Python frame BELOW it instead -- the
+        // innermost inlined callee, or the portal.  Every read taken through
+        // that frame is then cross-bank: `other_target` is a helper offset,
+        // and `depth_trivia` / `pcdep_trivia` answer a foreign offset through
+        // a predecessor scan rather than failing, so the depth and the color
+        // list come back plausible and wrong.  `kept_stack_has_boxed_int_hazard`
+        // finishes the sequence by dereferencing whatever word the foreign
+        // color lands on in `ctx.concrete_registers_r` as a `PyObjectRef`,
+        // which is an unmapped address rather than a wrong answer.
+        //
+        // Depth 0 is the right answer, not merely the safe one: a helper frame
+        // owns no Python operand stack, and its guards resume at the paused
+        // parents' CALL coordinates
+        // (`walker_capture_transparent_helper_snapshot`), re-executing the call
+        // -- exactly the reasoning `single_frame_collapse` above already
+        // applies to the helper walk whose framestack is empty.  This closes
+        // the same case when it is not.
+        //
+        // `transparent_helper_subwalk` and not `inline_subwalk`: the latter is
+        // also set for a Python-callee sub-walk, where the bank and the target
+        // DO belong to the frame `current()` returns and the gate must keep
+        // working.
+        let gate_frame = if ctx.fbw_mode.transparent_helper_subwalk {
+            None
+        } else {
+            ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym)
+        };
         let resume_depth = if single_frame_collapse {
             None
         } else {

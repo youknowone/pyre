@@ -5904,7 +5904,9 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
     // builtin slot is handled in the generic dispatch below.
     unsafe {
         if pyre_object::is_exact_type(obj, &pyre_object::descriptor::SUPER_TYPE) {
-            return super_getattribute_str(obj, name);
+            // Only the unwrapped name here, so the walk takes the raw
+            // dict probe rather than the elidable (see `w_type_getdictvalue`).
+            return super_getattribute_str(obj, name, PY_NULL);
         }
     }
 
@@ -6347,7 +6349,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                     // `object_getattr_miss` would skip the post-starttype MRO
                     // walk, while re-entering `getattr` would recurse.
                     if pyre_object::descriptor::is_super(obj) {
-                        return match super_getattribute_str(obj, name) {
+                        return match super_getattribute_str(obj, name, PY_NULL) {
                             Ok(value) => Ok(value),
                             Err(err) if call_getattr && err.kind == PyErrorKind::AttributeError => {
                                 instance_getattr_hook_or_err(w_type, obj, name, err)
@@ -6540,6 +6542,7 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
 unsafe fn super_getattribute_wtf8(
     obj: PyObjectRef,
     name: &Wtf8,
+    w_name: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
         if !pyre_object::descriptor::is_super(obj)
@@ -6578,9 +6581,13 @@ unsafe fn super_getattribute_wtf8(
             if !past_super || !is_type(t) {
                 continue;
             }
-            // This class's own dict only — the full MRO is already being
-            // walked here.
-            if let Some(attr) = crate::type_dict_lookup_wtf8(t, name) {
+            // `lookup_starting_at`'s `w_value = w_class.getdictvalue(space,
+            // name)` — this class's own namespace only, since the walk above
+            // is the MRO traversal.  `getdictvalue` and not the raw dict probe: the
+            // former routes the read through an `@elidable` keyed on the
+            // version tag, which both folds it and keeps every argument inside
+            // the residual call ABI's one machine word.
+            if let Some(attr) = w_type_getdictvalue(t, name, w_name) {
                 // W_Super.getattribute binds every descriptor rather than only
                 // the three builtin method-wrapper shapes, which also covers
                 // property, getset, member and user-defined descriptors.
@@ -6608,10 +6615,10 @@ unsafe fn super_getattribute_wtf8(
 /// is what that selected builtin slot executes.  Keeping the two levels apart
 /// lets a `super` subclass override the slot without making an inherited or
 /// explicit `super.__getattribute__(obj, name)` call recurse.
-fn super_getattribute_str(obj: PyObjectRef, name: &str) -> PyResult {
+fn super_getattribute_str(obj: PyObjectRef, name: &str, w_name: PyObjectRef) -> PyResult {
     unsafe {
         if name != "__class__"
-            && let Some(value) = super_getattribute_wtf8(obj, Wtf8::new(name))?
+            && let Some(value) = super_getattribute_wtf8(obj, Wtf8::new(name), w_name)?
         {
             return Ok(value);
         }
@@ -6632,13 +6639,15 @@ pub(crate) fn super_getattribute(obj: PyObjectRef, w_name: PyObjectRef) -> PyRes
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
-        super_getattribute_str(obj, unsafe {
-            pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
-        })
+        super_getattribute_str(
+            obj,
+            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
+            w_name,
+        )
     } else {
         unsafe {
             if name.as_str() != Ok("__class__")
-                && let Some(value) = super_getattribute_wtf8(obj, name)?
+                && let Some(value) = super_getattribute_wtf8(obj, name, w_name)?
             {
                 return Ok(value);
             }
@@ -6662,9 +6671,11 @@ pub(crate) unsafe fn super_getattribute_code_name(
     w_name: PyObjectRef,
 ) -> PyResult {
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    super_getattribute_str(obj, unsafe {
-        pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
-    })
+    super_getattribute_str(
+        obj,
+        unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
+        w_name,
+    )
 }
 
 // ─── `w_name`-taking attribute API ───
@@ -10216,6 +10227,43 @@ pub unsafe fn _pure_lookup_class_with_method_cache(
     _cached_lookup_where(w_type, w_name, version_tag).0
 }
 
+/// `typeobject.py _pure_getdictvalue_no_unwrapping` — the `@elidable` read of
+/// a type's *own* namespace, keyed on `(version_tag, name)`.  `getdictvalue`
+/// consults it whenever the type carries a version tag
+/// (`W_TypeObject.getdictvalue`), so the trace records a `CALL_PURE_R` and
+/// folds repeated same-key reads instead of probing the dict storage per
+/// iteration.
+///
+/// Elidability rests on the version tag: a namespace write runs `mutated()`
+/// before it stores, so a tag that is still current witnesses a namespace that
+/// has not changed since the folded read.  Unlike
+/// [`_pure_lookup_where_with_method_cache`] this consults one type rather than
+/// the MRO, which is what `typeobject.py lookup_starting_at` needs: it
+/// walks `mro_w` itself and reads each class past `w_starttype` with
+/// `w_class.getdictvalue(space, name)`.
+///
+/// `name` arrives as `w_name`, an interned immortal str object
+/// (`box_str_constant`), for the reason it does on that sibling: the residual
+/// call ABI carries one machine word per argument and a `&Wtf8` is two.  The
+/// result is a raw pointer because the same ABI cannot carry an `Option`; null
+/// is the absent attribute.  The `is_type` / `version_tag == 0` guards live in
+/// the front door, so this is only entered with a valid promoted tag.
+#[majit_macros::elidable]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn _pure_getdictvalue_no_unwrapping(
+    w_type: *mut PyObject,
+    w_name: *mut PyObject,
+    version_tag: u64,
+) -> *mut PyObject {
+    // The tag is the elidable's key, not an input its body reads — upstream's
+    // body is likewise just `self._getdictvalue_no_unwrapping(space, attr)`.
+    let _ = version_tag;
+    let name = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) };
+    crate::type_dict_lookup_wtf8(w_type, name).unwrap_or(PY_NULL)
+}
+
 /// The `MethodCache` probe/fill shared by the `@elidable` JIT surface
 /// and the interpreter front door.  Probes the `(version_tag, name)`
 /// slot; on a miss runs the raw MRO walk (`typeobject.py:478-489
@@ -10391,6 +10439,65 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     } else {
         let w_class = _pure_lookup_class_with_method_cache(w_type, w_name, version_tag);
         Some((w_class, w_value))
+    }
+}
+
+/// `typeobject.py W_TypeObject.getdictvalue` — the read of a type's own
+/// namespace.  One path for interpreter and JIT (upstream branches only on
+/// `version_tag is None`, never on `we_are_jitted()`): promote the type and
+/// its `version_tag`, then read through the `@elidable`
+/// [`_pure_getdictvalue_no_unwrapping`].  Without a tag the read is
+/// uncacheable and runs raw, through `_getdictvalue_no_unwrapping`.
+///
+/// The raw probe this replaces on the traced path reaches `w_dict_getitem_wtf8`
+/// with a `&Wtf8`, whose two machine words exceed the residual call ABI's one,
+/// so a sub-walk declines at that call rather than run it.  Routing the read
+/// through an elidable whose every argument is one word keeps the descent
+/// going, and folds the probe besides.
+///
+/// pyre's type namespaces hold plain values (no `MutableCell` strategy yet), so
+/// the `unwrap_cell` boundary either side of the elidable has nothing to
+/// unwrap.
+pub(crate) unsafe fn w_type_getdictvalue(
+    w_type: PyObjectRef,
+    name: &Wtf8,
+    w_name: PyObjectRef,
+) -> Option<PyObjectRef> {
+    if w_type.is_null() || !is_type(w_type) {
+        return None;
+    }
+    // No `promote(self)` here: `lookup_where_with_method_cache` promotes
+    // because it keys a shared cache on the pair, whereas `getdictvalue` reads
+    // the one type it was handed (`W_TypeObject.getdictvalue` opens with just
+    // `version_tag = self.version_tag()`).
+    let version_tag = w_type_version_tag(w_type);
+    if version_tag == 0 || w_name.is_null() {
+        // No tag means uncacheable: `W_TypeObject.getdictvalue`'s untagged
+        // arm reads raw.  A caller that reached this walk holding only the
+        // unwrapped name takes that same arm, because the elidable's ABI needs
+        // the wrapper -- see the `w_name` note below.
+        //
+        // Both are tests on what this call was handed, not on
+        // `we_are_jitted()`: the tagged read has one owner for interpreter and
+        // JIT alike, which is what the doc above claims and what upstream
+        // does.  Nothing is lost by routing the interpreter through the
+        // elidable, whose body is the same `type_dict_lookup_wtf8` this arm
+        // calls directly.
+        return crate::type_dict_lookup_wtf8(w_type, name);
+    }
+    // `w_name` is the caller's own wrapped name, not a fresh
+    // `box_str_constant`.  `LOAD_SUPER_ATTR` already carries it
+    // (`super_getattribute_code_name`), and boxing it again would put a
+    // `box_str_constant` residual on the traced path -- which is a symbolic
+    // fnaddr the sub-walk cannot name, so the descent declines there instead.
+    // Threading the wrapper down also spares the ordinary interpreter the
+    // process-global `STRING_INTERN_TABLE` mutex once per lookup, which is the
+    // cost `lookup_in_type_where_wtf8` documents paying for the same ABI.
+    let w_value = _pure_getdictvalue_no_unwrapping(w_type, w_name, version_tag);
+    if w_value.is_null() {
+        None
+    } else {
+        Some(w_value)
     }
 }
 
@@ -11033,6 +11140,57 @@ pub unsafe fn bound_method_attr_fast_path(
         return None;
     }
     Some((w_type, version_tag, w_descr, owes_shadow_guard))
+}
+
+/// `_super_check`'s third arm (pypy/module/__builtin__/descriptor.py), for a
+/// receiver whose `__class__` read settles without running Python.
+///
+/// [`crate::builtins::super_check_python_free`] answers the first two arms,
+/// which consult installed MROs alone.  The third asks the receiver itself for
+/// `__class__`, and a property answers that with arbitrary code, which is why
+/// that function stops before it.  A mapdict instance whose type installs the
+/// default `__getattribute__` and whose map does not shadow the name is the
+/// case where the read is instead a plain class-attribute fetch:
+/// `class_attr_fast_path` both proves that and reports the three pins holding
+/// the proof -- the receiver's type, that type's version tag, and its map.
+///
+/// The tracer consults this rather than recomputing the arm, for the reason
+/// [`super_attr_fast_path`] gives: the interpreter and the tracer must agree on
+/// which receivers take the reduced shape, or the recorded and the concrete
+/// stacks desync.
+///
+/// Returns `class_attr_fast_path`'s own tuple,
+/// `(receiver_type, receiver_version_tag, receiver_map, objtype)`, with
+/// `objtype` the apparent class the arm yields.
+///
+/// # Safety
+/// `start_type` and `obj` must be valid object pointers (null tolerated).
+pub unsafe fn super_check_apparent_fast_path(
+    start_type: PyObjectRef,
+    obj: PyObjectRef,
+) -> Option<(
+    PyObjectRef,
+    u64,
+    crate::objspace::std::mapdict::MapRef,
+    PyObjectRef,
+)> {
+    if start_type.is_null() || obj.is_null() || !is_type(start_type) {
+        return None;
+    }
+    // `None` is a singleton with no mapdict, and the two arms above have
+    // already answered for it; keep the map read off it entirely.
+    if pyre_object::is_none(obj) {
+        return None;
+    }
+    let (receiver_type, receiver_version_tag, receiver_map, objtype) =
+        crate::objspace::std::mapdict::class_attr_fast_path(obj, "__class__")?;
+    // `_super_check`'s `if space.issubtype_w(w_type, w_starttype)`.  The arm
+    // yields the apparent class only when that holds; otherwise `_super_check`
+    // raises, which is not an answer this predicate offers.
+    if !is_type(objtype) || !issubtype_w(objtype, start_type) {
+        return None;
+    }
+    Some((receiver_type, receiver_version_tag, receiver_map, objtype))
 }
 
 /// The Python-free prefix of `super(C, self).name`: validate the pair and find
