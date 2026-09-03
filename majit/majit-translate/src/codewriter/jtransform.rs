@@ -2620,7 +2620,13 @@ impl<'a> Transformer<'a> {
             // + `_is_rclass_instance` → `instance_ptr_eq`/`instance_ptr_ne`.
             // Pyre's front-end emits a unified `BinOp { op: "eq"/"ne" }`
             // because Rust's `==`/`!=` is one AST node regardless of operand type;
-            // this arm is that rewrite. Mixed/Int operands stay as `int_eq`.
+            // the jtransform layer is where RPython branches on operand kind.
+            // Both operands Ref → rewrite to `ptr_eq`/`ptr_ne`. Mixed/Int operands
+            // stay as `int_eq`/`int_ne`.  `rptr.py` `pairtype(PtrRepr, Repr).rtype_eq/ne`
+            // calls `hop.inputargs(r_ptr, r_ptr)` — both operands are already
+            // ptr-typed here, so there is no cast — and pyre's blackhole wires
+            // `bhimpl_ptr_eq` / `bhimpl_ptr_ne` at `bh_binop_r_to_i`, so the
+            // `ptr_eq/rr>i` opname dispatches without `cast_ptr_to_int`.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -2636,6 +2642,15 @@ impl<'a> Transformer<'a> {
                 {
                     return rewritten;
                 }
+                // The comparison answers an integer, so the result banks as
+                // one; without the stamp it keeps the `'r'` kind the unified
+                // `BinOp` carried in and `op_kind_to_opname_with_kinds` spells
+                // an opname no blackhole handler registers.
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::Signed,
+                );
                 let new_op = self.ptr_equality_opname(binop_name, lhs, rhs);
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -3127,14 +3142,18 @@ impl<'a> Transformer<'a> {
             // `BoolRepr` is the identity, `IntegerRepr.rtype_bool` is
             // `int_is_true` (`rint.py`), a nullable `PtrRepr` is
             // `ptr_nonzero` (`rmodel.py`).  Naming the op here, ahead
-            // of `optimize_goto_if_not`, is what lets the fusion see it: that
-            // gate matches opnames, and `bool` is not one of them.  The
-            // identity arm is what fuses an `is_null` test -- its `ptr_iszero`
-            // result is Bool -- into `goto_if_not_ptr_iszero`, which the
-            // walker answers from the heap cache without recording once the
-            // nullity is known.  Left as `bool`, every null test of a traced
-            // operand cost `ptr_eq` + `int_is_true` + `guard_false`: six of
-            // them per `int + int` descent.
+            // of `optimize_goto_if_not`, is half of what lets the fusion see
+            // it: that gate matches opnames, and `bool` is not one of them --
+            // but it reads the exitswitch variable's `concretetype` FIRST, so
+            // the result also has to carry the `lltype.Bool` those two
+            // opnames return, which is why the rewrite stamps it exactly as
+            // `null_test_rewrite` does for the same pair.  The identity arm
+            // is what fuses an `is_null` test -- its `ptr_iszero` result is
+            // already Bool -- into `goto_if_not_ptr_iszero`, which the walker
+            // answers from the heap cache without recording once the nullity
+            // is known.  Left as `bool`, every null test of a traced operand
+            // cost `ptr_eq` + `int_is_true` + `guard_false`: six of them per
+            // `int + int` descent.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -3149,6 +3168,13 @@ impl<'a> Transformer<'a> {
                     } else {
                         "int_is_true"
                     };
+                    // `getkind(Bool)` is `Signed`, so the value-kind channel
+                    // keeps banking the result as an int; the stamp only tells
+                    // `optimize_goto_if_not` that this is the Bool its gate
+                    // asks for.
+                    if let Some(result) = &op.result {
+                        result.set_concretetype(Some(LowLevelType::Bool));
+                    }
                     RewriteResult::Replace(vec![SpaceOperation {
                         result: op.result.clone(),
                         kind: OpKind::UnaryOp {
@@ -10801,6 +10827,87 @@ mod tests {
                 assert_eq!(args, &vec![x]);
             }
             other => panic!("expected Fused exitswitch, got {other:?}"),
+        }
+    }
+
+    /// The `bool` hop `set_branch` puts before every exitswitch has to come out
+    /// of the rewrite fusable.  `optimize_goto_if_not` reads the exitswitch
+    /// variable's `concretetype` before it reads any opname, so naming the op
+    /// `int_is_true` is not on its own enough — nothing in the value-kind
+    /// channel can produce `Bool` (`concrete_to_canonical_lltype` has no such
+    /// case), so the rewrite is the only place that stamp can come from.
+    #[test]
+    fn transform_graph_leaves_the_bool_hop_fusable() {
+        use crate::model::ExitSwitch;
+
+        let mut graph = FunctionGraph::new("bool_hop_fusable");
+        let start = graph.startblock;
+        let a = graph
+            .push_op_var(
+                start,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&a, ConcreteType::Signed);
+        let if_true = graph.create_block();
+        let if_false = graph.create_block();
+        graph.set_return(if_true, None);
+        graph.set_return(if_false, None);
+        graph.set_branch(start, a.clone(), if_true, vec![], if_false, vec![]);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        match &transformed.graph.blocks[start.0].exitswitch {
+            Some(ExitSwitch::Fused { opname, args }) => {
+                assert_eq!(opname, "int_is_true");
+                assert_eq!(args, &vec![a]);
+            }
+            other => panic!("expected a fused int_is_true exitswitch, got {other:?}"),
+        }
+    }
+
+    /// The Ref-kind sibling of [`transform_graph_leaves_the_bool_hop_fusable`].
+    /// A `bool` hop over a Ref operand rewrites to `ptr_nonzero`, which
+    /// `optimize_goto_if_not` also fuses, and it reaches that gate through the
+    /// same `Bool` stamp — the value-kind channel banks the result as an int
+    /// either way.
+    #[test]
+    fn transform_graph_leaves_the_ref_bool_hop_fusable() {
+        use crate::model::ExitSwitch;
+
+        let mut graph = FunctionGraph::new("ref_bool_hop_fusable");
+        let start = graph.startblock;
+        let a = graph
+            .push_op_var(
+                start,
+                OpKind::Input {
+                    name: "a".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&a, ConcreteType::GcRef);
+        let if_true = graph.create_block();
+        let if_false = graph.create_block();
+        graph.set_return(if_true, None);
+        graph.set_return(if_false, None);
+        graph.set_branch(start, a.clone(), if_true, vec![], if_false, vec![]);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        match &transformed.graph.blocks[start.0].exitswitch {
+            Some(ExitSwitch::Fused { opname, args }) => {
+                assert_eq!(opname, "ptr_nonzero");
+                assert_eq!(args, &vec![a]);
+            }
+            other => panic!("expected a fused ptr_nonzero exitswitch, got {other:?}"),
         }
     }
 
