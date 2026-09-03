@@ -7919,7 +7919,7 @@ fn emit_walker_instance<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     w_type: pyre_object::PyObjectRef,
     type_const: OpRef,
-    terminator: *mut pyre_object::PyObject,
+    terminator: *const u8,
 ) -> (OpRef, pyre_object::PyObjectRef) {
     let concrete_instance = pyre_object::w_instance_new(w_type);
     let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
