@@ -13,6 +13,7 @@ foo = Foo()
 assert_raises(RecursionError, str, foo)
 
 
+
 # A comparison override implemented natively re-enters the comparison operator
 # without pushing a Python frame, so the frame-count limit never sees the
 # cycle: binding `_operator.eq` as a bound method makes `c == c` call
@@ -38,3 +39,4 @@ class Ne(object):
 
 
 assert_raises(RecursionError, lambda: Ne() == Ne())
+
