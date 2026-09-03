@@ -233,55 +233,11 @@ pub struct ResumeGuardDescr {
     /// `CraneliftFailDescr::external_jump_target_cell` so the meta Arc
     /// is the single source of truth.
     pub external_jump_target: OnceLock<DescrRef>,
-    /// Bridge code-pointer cache (cranelift-only TODO: PyPy patches
-    /// guard JMP targets in place).  PyPy's `assembler.py:987 patch_jump_for_descr`
-    /// rewrites the guard JMP target in place when a bridge is
-    /// attached; cranelift cannot patch finalised code, so the
-    /// JIT-baked dispatch loads the bridge code-pointer from this
-    /// cell at runtime.  Migrated here from
-    /// `CraneliftFailDescr::bridge_code_ptr_cache` so the meta Arc is
-    /// the single source of truth.
-    ///
-    /// `Box` gives the `AtomicUsize` a heap-pinned address that
-    /// survives `Arc::clone` of the meta descr; cranelift's
-    /// `emit_attached_bridge_dispatch` (compiler.rs:5347) embeds this
-    /// address as an immediate.  `0` = no bridge attached.
-    pub bridge_code_ptr_cache: Box<AtomicUsize>,
-    /// Bridge body-pointer cache.  Same shape as
-    /// `bridge_code_ptr_cache`, but holds the bridge's `CallConv::Tail`
-    /// body entry (not the host-ABI wrapper).  The in-code dispatch
-    /// (`emit_attached_bridge_dispatch`) tail-calls this so a guard
-    /// failure transfers into the bridge without leaving a return frame
-    /// on the machine stack — the cranelift analogue of PyPy's
-    /// `patch_jump_for_descr` raw JMP.  The wrapper in
-    /// `bridge_code_ptr_cache` stays for the host-loop fallback dispatch.
-    pub bridge_body_ptr_cache: Box<AtomicUsize>,
-    /// Bridge dispatch cell (cranelift-only TODO: PyPy patches guard
-    /// JMP targets in place).  PyPy's `assembler.py:987 patch_jump_for_descr`
-    /// rewrites the guard JMP target in place; cranelift cannot patch
-    /// finalised code, so the runtime guard-failure dispatch loads
-    /// the published `Arc<BridgeData>` raw pointer from this cell
-    /// (via `bridge_dispatch_load` below) and reconstructs the Arc
-    /// via `Arc::increment_strong_count + Arc::from_raw`.
-    ///
-    /// Type-erased to `*mut ()` because `BridgeData` lives in
-    /// `majit-backend-cranelift` (downstream crate) and majit-backend
-    /// must not depend on it.  The matching cleanup is registered by
-    /// the backend on first `bridge_dispatch_swap` so `Drop` can
-    /// reclaim the published Arc without knowing its concrete type.
-    ///
-    /// The cell's address is not JIT-baked (runtime reads only), so a
-    /// plain `AtomicPtr<()>` suffices — `Arc::new(self)` pins the
-    /// surrounding `ResumeGuardDescr`, and the field address is then
-    /// stable across `Arc::clone` calls.  Null on construction (no
-    /// bridge attached).
-    pub bridge_dispatch_cell: AtomicPtr<()>,
-    /// Type-aware cleanup function the backend registers on first
-    /// `bridge_dispatch_swap`.  `Drop` invokes this with the cell's
-    /// final non-null payload so the published `Arc<BridgeData>` is
-    /// reclaimed by the owning crate.  `OnceLock` so the registration
-    /// is idempotent across re-attach.
-    pub bridge_dispatch_drop_fn: OnceLock<unsafe fn(*mut ())>,
+    /// `history.py AbstractFailDescr.adr_jump_offset` for cranelift, which
+    /// cannot patch a finalised jump: the cells its guard dispatch reads the
+    /// attached bridge from.  Empty until codegen asks for the cell
+    /// addresses or a bridge is attached.
+    pub bridge: OnceLock<Box<BridgeDispatchCells>>,
     /// Pyre-only: FOR_ITER green key protected by a walker-native range
     /// class guard.  `handle_fail` reads it off the failing descr
     /// (`Descr::range_foriter_green_key`) to demote the range
@@ -294,6 +250,98 @@ pub struct ResumeGuardDescr {
     /// the generic `jit_next` conversion path when it re-enters FOR_ITER.
     /// `0` means this descr did not originate in that inline route.
     pub instance_next_foriter_key: AtomicU64,
+}
+
+/// The backend's patch point for a guard that may grow a bridge.
+/// `history.py AbstractFailDescr._attrs_` gives it one word,
+/// `adr_jump_offset`, and `assembler.py patch_jump_for_descr` rewrites the
+/// guard's jump through it.  Cranelift cannot patch finalised code: its guard
+/// dispatch reads the bridge entry from cells whose addresses it baked into
+/// the guard at codegen (`emit_attached_bridge_dispatch`), and the published
+/// bridge payload from a third cell.  The cells are allocated on first use,
+/// so a descr the native backends compiled carries only the empty slot.
+#[derive(Debug)]
+pub struct BridgeDispatchCells {
+    /// Bridge host-ABI entry; `0` while no bridge is attached.
+    code: AtomicUsize,
+    /// Bridge `CallConv::Tail` body entry the in-code dispatch tail-calls.
+    body: AtomicUsize,
+    /// Published bridge payload, type-erased: the concrete type lives in
+    /// majit-backend-cranelift.  Null while no bridge is attached.
+    dispatch: AtomicPtr<()>,
+    /// Cleanup the backend registers with its first `dispatch_swap`; `Drop`
+    /// hands it the surviving payload.
+    drop_fn: OnceLock<unsafe fn(*mut ())>,
+}
+
+impl BridgeDispatchCells {
+    pub fn new() -> Box<Self> {
+        Box::new(Self {
+            code: AtomicUsize::new(0),
+            body: AtomicUsize::new(0),
+            dispatch: AtomicPtr::new(std::ptr::null_mut()),
+            drop_fn: OnceLock::new(),
+        })
+    }
+
+    /// `(code_ptr_addr, body_ptr_addr)`: the cell addresses codegen bakes
+    /// into the guard as immediates.  The `Box` keeps them stable for the
+    /// life of the descr.
+    pub fn cache_addrs(&self) -> (usize, usize) {
+        (
+            &self.code as *const AtomicUsize as usize,
+            &self.body as *const AtomicUsize as usize,
+        )
+    }
+
+    pub fn code_ptr(&self) -> usize {
+        self.code.load(Ordering::Acquire)
+    }
+
+    /// The body cell is written first so a dispatch that observes a non-zero
+    /// code pointer also sees the body it tail-calls.
+    pub fn store_caches(&self, code_ptr: usize, body_ptr: usize) {
+        self.body.store(body_ptr, Ordering::Release);
+        self.code.store(code_ptr, Ordering::Release);
+    }
+
+    pub fn dispatch_load(&self) -> *mut () {
+        self.dispatch.load(Ordering::Acquire)
+    }
+
+    /// Publish a payload and return the previous one.  A re-attach must
+    /// register the cleanup the first attach registered: `Drop` reclaims the
+    /// survivor through it, and a different destructor would type-pun the
+    /// payload.
+    pub fn dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
+        if let Some(existing) = self.drop_fn.get() {
+            assert_eq!(
+                *existing as usize, drop_fn as usize,
+                "bridge_dispatch_swap re-attach registered a different cleanup fn \
+                 for the same descr — payload type-shape must be stable across \
+                 re-attach (otherwise Drop would type-pun the survivor)",
+            );
+        } else {
+            let _ = self.drop_fn.set(drop_fn);
+        }
+        self.dispatch.swap(new_ptr, Ordering::AcqRel)
+    }
+}
+
+impl Drop for BridgeDispatchCells {
+    fn drop(&mut self) {
+        let ptr = self.dispatch.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !ptr.is_null()
+            && let Some(drop_fn) = self.drop_fn.get()
+        {
+            // Safety: `drop_fn` was registered by the `dispatch_swap` that
+            // published `ptr`, and reclaims a payload of the shape it
+            // published.
+            unsafe { drop_fn(ptr) };
+        }
+        // else: a payload published with no cleanup registered is a backend
+        // bug; leak it rather than guess its type.
+    }
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -347,10 +395,7 @@ impl Descr for ResumeGuardDescr {
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
-            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
-            bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
-            bridge_dispatch_drop_fn: OnceLock::new(),
+            bridge: OnceLock::new(),
             // The clone guards the same FOR_ITER site; preserve either tag so
             // guard-failure routing survives guard copying.
             range_foriter_key: AtomicU64::new(self.range_foriter_key.load(Ordering::Relaxed)),
@@ -553,26 +598,18 @@ impl FailDescr for ResumeGuardDescr {
         }
     }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
-        Some((
-            self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
-            self.bridge_body_ptr_cache.as_ref() as *const _ as usize,
-        ))
+        Some(ResumeGuardDescr::bridge_cache_addrs(self))
     }
     fn bridge_code_ptr(&self) -> usize {
-        self.bridge_code_ptr_cache.load(Ordering::Acquire)
+        ResumeGuardDescr::bridge_code_ptr(self)
     }
     fn store_bridge_caches(&self, code_ptr: usize, body_ptr: usize) {
-        self.bridge_body_ptr_cache
-            .store(body_ptr, Ordering::Release);
-        self.bridge_code_ptr_cache
-            .store(code_ptr, Ordering::Release);
+        ResumeGuardDescr::store_bridge_caches(self, code_ptr, body_ptr)
     }
     fn bridge_dispatch_load(&self) -> *mut () {
-        self.bridge_dispatch_cell.load(Ordering::Acquire)
+        ResumeGuardDescr::bridge_dispatch_load(self)
     }
     fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
-        // Forward to the inherent method so the re-attach cleanup-fn
-        // identity assertion lives in one place.
         ResumeGuardDescr::bridge_dispatch_swap(self, new_ptr, drop_fn)
     }
 
@@ -623,10 +660,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
-        bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
-        bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
-        bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
-        bridge_dispatch_drop_fn: OnceLock::new(),
+        bridge: OnceLock::new(),
         range_foriter_key: AtomicU64::new(0),
         instance_next_foriter_key: AtomicU64::new(0),
     })
@@ -724,66 +758,38 @@ impl ResumeGuardDescr {
         self.external_jump_target.get().is_some()
     }
 
-    /// Heap-pinned addresses of the two bridge-cache atomic cells
-    /// suitable for baking into JIT machine code as
-    /// immediates.  Returns `(code_ptr_addr, body_ptr_addr)`.
+    /// The cranelift bridge cells, allocated on first use.
+    pub fn bridge_cells(&self) -> &BridgeDispatchCells {
+        self.bridge.get_or_init(BridgeDispatchCells::new)
+    }
+
+    /// Cell addresses for codegen to bake as immediates
+    /// (`emit_attached_bridge_dispatch`).
     pub fn bridge_cache_addrs(&self) -> (usize, usize) {
-        (
-            self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
-            self.bridge_body_ptr_cache.as_ref() as *const _ as usize,
-        )
+        self.bridge_cells().cache_addrs()
     }
 
-    /// Atomically store the bridge code-pointer + frame-depth caches
-    /// Called from cranelift `attach_bridge` after
-    /// the bridge has been compiled.
+    /// Called from cranelift `attach_bridge` once the bridge is compiled.
     pub fn store_bridge_caches(&self, code_ptr: usize, body_ptr: usize) {
-        self.bridge_body_ptr_cache
-            .store(body_ptr, Ordering::Release);
-        self.bridge_code_ptr_cache
-            .store(code_ptr, Ordering::Release);
+        self.bridge_cells().store_caches(code_ptr, body_ptr)
     }
 
-    /// Read the cached bridge code-pointer.  `0` when
-    /// no bridge is attached.
+    /// `0` while no bridge is attached.
     pub fn bridge_code_ptr(&self) -> usize {
-        self.bridge_code_ptr_cache.load(Ordering::Acquire)
+        self.bridge.get().map_or(0, |cells| cells.code_ptr())
     }
 
-    /// Read the type-erased bridge dispatch cell.
-    /// Returns the published raw pointer for the backend to
-    /// reconstruct its concrete `Arc<BridgeData>` via
-    /// `Arc::increment_strong_count + Arc::from_raw`.  Null when no
-    /// bridge has been attached.
+    /// The published bridge payload; null while no bridge is attached.
     pub fn bridge_dispatch_load(&self) -> *mut () {
-        self.bridge_dispatch_cell.load(Ordering::Acquire)
+        self.bridge
+            .get()
+            .map_or(std::ptr::null_mut(), |cells| cells.dispatch_load())
     }
 
-    /// Atomic-swap a new bridge dispatch payload into the cell and
-    /// register the backend-supplied cleanup function.
-    /// Returns the previous payload so the backend can reclaim its
-    /// owned `Arc`.  The cleanup function is registered once
-    /// (idempotent) and invoked by `Drop` on any payload still in the
-    /// cell at descr teardown.
+    /// Publish a bridge payload; returns the previous one for the backend
+    /// to reclaim.
     pub fn bridge_dispatch_swap(&self, new_ptr: *mut (), drop_fn: unsafe fn(*mut ())) -> *mut () {
-        // Re-attach must use the same cleanup function the first
-        // attach registered: `Drop` reclaims the surviving payload via
-        // the stored `drop_fn`, so a mismatched destructor on a later
-        // re-attach would type-pun the payload and corrupt the
-        // backend's owned Arc.  Compare function pointers by raw
-        // address — `fn` is `Copy` and equality on raw fn-pointers is
-        // well-defined for monomorphised functions baked at codegen.
-        if let Some(existing) = self.bridge_dispatch_drop_fn.get() {
-            assert_eq!(
-                *existing as usize, drop_fn as usize,
-                "bridge_dispatch_swap re-attach registered a different cleanup fn \
-                 for the same descr — payload type-shape must be stable across \
-                 re-attach (otherwise Drop would type-pun the survivor)",
-            );
-        } else {
-            let _ = self.bridge_dispatch_drop_fn.set(drop_fn);
-        }
-        self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
+        self.bridge_cells().dispatch_swap(new_ptr, drop_fn)
     }
 }
 
@@ -798,24 +804,5 @@ impl Drop for ResumeGuardDescr {
             // `set_trace_info`.
             unsafe { drop(Arc::from_raw(ptr as *const CompiledTraceInfo)) };
         }
-        // Reclaim any published bridge dispatch payload
-        // via the backend-registered cleanup function.  Swap-to-null
-        // first so a concurrent reader either sees the still-live
-        // pointer (and bumps the strong count) or null (and skips).
-        let bridge_ptr = self
-            .bridge_dispatch_cell
-            .swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !bridge_ptr.is_null()
-            && let Some(drop_fn) = self.bridge_dispatch_drop_fn.get()
-        {
-            // Safety: `drop_fn` was registered via `bridge_dispatch_swap`
-            // alongside the payload at `bridge_ptr`; the publisher's
-            // safety contract is that the function reclaims a value of
-            // the same shape the publisher published.
-            unsafe { drop_fn(bridge_ptr) };
-        }
-        // else: payload published with no cleanup registered — a
-        // backend bug.  Leaks rather than risks reading the wrong
-        // concrete type.
     }
 }

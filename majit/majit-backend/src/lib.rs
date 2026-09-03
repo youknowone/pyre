@@ -87,9 +87,9 @@ pub use finish_descrs::{
 pub use jitframe::JitFrameInfo;
 pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{
-    ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK, STATUS_TY_FLOAT,
-    STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, STATUS_TYPE_MASK, alloc_fail_index,
-    build_vector_info_chain, flatten_vector_info, guard_value_counter_slot,
+    BridgeDispatchCells, ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK,
+    STATUS_TY_FLOAT, STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, STATUS_TYPE_MASK,
+    alloc_fail_index, build_vector_info_chain, flatten_vector_info, guard_value_counter_slot,
     make_resume_guard_descr_typed, push_vector_info, reset_fail_index_counter,
 };
 pub use resume_value::{
