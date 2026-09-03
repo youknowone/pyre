@@ -1135,10 +1135,16 @@ fn real_main() {
         static_pytype_addrs.len(),
         registry_rows.len(),
     );
+    // The same singletons keyed by their owning type's path, for the
+    // `PyreClassPyTypeOf::PYTYPE` reads whose Charon path names every
+    // trait impl in their module at once. See
+    // `HostStaticAddrs::pytypes_by_struct`.
+    let static_pytype_by_struct = pyre_interpreter::pyre_class_pytype_by_struct_addrs();
     let static_ref_addrs = pyre_interpreter::jit_static_ref_addrs();
     let static_int_values = pyre_interpreter::jit_static_int_values();
     let static_addrs = majit_translate::HostStaticAddrs {
         pytypes: &static_pytype_addrs,
+        pytypes_by_struct: &static_pytype_by_struct,
         refs: &static_ref_addrs,
         int_values: &static_int_values,
         error_carrier: PYRE_ERROR_CARRIER,

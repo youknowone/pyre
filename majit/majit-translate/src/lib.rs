@@ -516,6 +516,27 @@ pub struct ScalarFieldStore<'a> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HostStaticAddrs<'a> {
     pub pytypes: &'a [(&'a str, i64)],
+    /// The same class singletons as [`Self::pytypes`], keyed by the Rust
+    /// path of the TYPE that owns each one rather than by the path of the
+    /// static holding it.
+    ///
+    /// `#[pyre_class]` emits one `PyType` address under two names: the
+    /// static, and the `PyreClassPyTypeOf::PYTYPE` associated const.
+    /// Charon renders the second `<module>::<Impl>::PYTYPE`, and that
+    /// rendering is not injective — every trait impl in a module flattens
+    /// onto it — so no key in `pytypes` can name one of them without also
+    /// naming its siblings. The reader resolves that family through the
+    /// impl's identity instead (`ItemMeta::trait_impl_id` -> the impl's
+    /// `Self` type -> that ADT's path) and looks the answer up here, which
+    /// is why this bucket exists rather than more `pytypes` rows.
+    ///
+    /// This key is injective: a Rust type has one path. That matters
+    /// beyond this lookup, because it is also the linkage symbol
+    /// `runtime_fnaddr_patch::patch_static_addr_constants` re-pairs across
+    /// the build/run boundary — the one place a name is unavoidable, and
+    /// where `rpython/translator/gensupp.py`'s `NameManager.uniquename`
+    /// holds upstream to the same requirement by numbering collisions.
+    pub pytypes_by_struct: &'a [(&'a str, i64)],
     pub refs: &'a [(&'a str, i64)],
     /// Immutable size `const`s baked as their compile-time value
     /// (`ValueType::Int` `ConstInt`), keyed by crate-stripped

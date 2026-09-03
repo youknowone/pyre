@@ -1398,6 +1398,11 @@ fn expand_pyre_class(
                     "::",
                     ::core::stringify!(#pytype_static),
                 ),
+                struct_path: ::core::concat!(
+                    ::core::module_path!(),
+                    "::",
+                    ::core::stringify!(#st_name),
+                ),
             };
 
         /// Registration of this class's descriptor into the whole-program

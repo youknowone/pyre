@@ -406,9 +406,35 @@ pub struct ItemMeta {
 }
 
 impl ItemMeta {
+    /// The `TraitImplId` of the trait impl block this item lives in, or
+    /// `None` for an item that is not in one.
+    ///
+    /// [`Self::name_path`] renders that segment `"<Impl>"` and drops the
+    /// id, so every trait impl in one module flattens onto a single
+    /// spelling: `pyre_object::functional::<Impl>::DESCRIPTOR` is one path
+    /// standing for ten distinct types' associated consts.  The id is what
+    /// tells them apart, and it is the item's identity rather than a label
+    /// for it — `rpython/annotator/bookkeeper.py` resolves a prebuilt
+    /// through `Constant(pyobj)` (identity, per `rpython/tool/uid.py`
+    /// `Hashable`) and never through a qualified name, and
+    /// `rpython/rtyper/rclass.py` caches one prebuilt structure per object
+    /// in an `identity_dict`.  A consumer that must distinguish siblings
+    /// reads this; `name_path` stays the human-facing label.
+    ///
+    /// The last such segment wins: an item nested inside a trait impl
+    /// belongs to the innermost one.
+    pub fn trait_impl_id(&self) -> Option<u64> {
+        self.name.iter().rev().find_map(|seg| match seg {
+            NameSeg::Other(v) => v.get("Impl")?.get("Trait")?.as_u64(),
+            NameSeg::Ident { .. } => None,
+        })
+    }
+
     /// `"crate::module::item"`-style flattened name. Trait-impl
     /// segments and other non-ident segments are rendered as
-    /// `"<Variant>"`.
+    /// `"<Variant>"` — a label, not an identity: the rendering is not
+    /// injective, and [`Self::trait_impl_id`] is what recovers what it
+    /// dropped.
     pub fn name_path(&self) -> String {
         let mut out = String::new();
         for (i, seg) in self.name.iter().enumerate() {
