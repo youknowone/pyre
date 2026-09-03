@@ -3152,32 +3152,8 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
     }
 }
 
-/// `PyObject_Format` returning the formatted object rather than its bytes.
-///
-/// `format_string` (newformat.py) hands the receiver's own utf8
-/// storage to `self.wrap(...)` once `_parse_spec("s", "<")` reports the
-/// defaults — which only an empty spec does — so `format(s, "")` shares its
-/// operand's storage and `is_w` (unicodeobject.py) reports the result
-/// identical to `s`.  An exact `str` is the whole of that case: a subclass is
-/// converted by `space.str(w_string)` (newformat.py) to a fresh base
-/// `str` first, and `is_w` rejects a `user_overridden_class` operand anyway
-/// (unicodeobject.py:106).  Any other receiver, or any non-empty spec, builds
-/// a new string through [`format_value_dispatch`].
-pub fn format_value_dispatch_w(
-    val: PyObjectRef,
-    spec: &Wtf8,
-) -> Result<PyObjectRef, crate::PyError> {
-    if spec.is_empty() && unsafe { pyre_object::is_exact_type(val, &pyre_object::STR_TYPE) } {
-        return Ok(val);
-    }
-    Ok(pyre_object::w_str_from_wtf8_managed(format_value_dispatch(
-        val, spec,
-    )?))
-}
-
-/// `space.format(w_obj, w_format_spec)` (descroperation.py:399) — the
-/// object-to-object form of [`format_value_dispatch_w`], for the callers that
-/// already hold the spec as an object.
+/// `space.format(w_obj, w_format_spec)` (descroperation.py:399) — `PyObject_Format`
+/// returning the formatted object rather than its bytes.
 ///
 /// Upstream threads the spec from the caller to `__format__` and returns
 /// `w_res` unchanged, so nothing is rebuilt at either end.  Going through a
@@ -3196,6 +3172,14 @@ pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, cr
 
     // The empty-spec fast paths of `format_value_dispatch`: an exact `str` or
     // `int` cannot carry a `__format__` override, so resolve and call nothing.
+    // `format_string` (newformat.py) hands the receiver's own utf8 storage to
+    // `self.wrap(...)` once `_parse_spec("s", "<")` reports the defaults —
+    // which only an empty spec does — so `format(s, "")` shares its operand's
+    // storage and `is_w` (unicodeobject.py) reports the result identical to
+    // `s`.  An exact `str` is the whole of that case: a subclass is converted
+    // by `space.str(w_string)` (newformat.py) to a fresh base `str` first, and
+    // `is_w` rejects a `user_overridden_class` operand anyway
+    // (unicodeobject.py:106).
     if spec_is_empty {
         if unsafe { pyre_object::is_exact_type(val, &pyre_object::STR_TYPE) } {
             return Ok(val);
@@ -3302,7 +3286,7 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     if spec.is_empty() {
         // `format_string` (newformat.py) wraps the receiver's own utf8
         // storage when the spec parses to the defaults, so an exact `str`
-        // comes back identical (see [`format_value_dispatch_w`]).
+        // comes back identical (see [`format_w`]).
         if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::STR_TYPE) } {
             return Ok(args[0]);
         }
