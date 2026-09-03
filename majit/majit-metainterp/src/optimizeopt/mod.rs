@@ -5096,7 +5096,18 @@ impl OptContext {
         // `unroll.py:497 source.set_forwarded(target)` unifies the label arg
         // with the value the preamble jumps with, and those name one runtime
         // value only at loop entry.
-        (imported.is_constant() || imported.is_inputarg()).then_some(imported)
+        //
+        // Another input arg does not qualify either, though it is fixed for
+        // the whole loop: substituting one label arg for another says the two
+        // slots hold the same value on EVERY entry, which is a claim about the
+        // loop rather than about this iteration. A slot a residual writes
+        // behind the trace's back — a frame local reached through the running
+        // frame's `f_locals` — then reads as loop-invariant, and the label arg
+        // and the reload after the call both fall away, so the loop keeps
+        // answering the value it was compiled with. Only a constant is fixed
+        // in the sense this rejoin needs, and a preamble-proved constant is
+        // the case it exists for.
+        imported.is_constant().then_some(imported)
     }
 
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
@@ -10294,6 +10305,55 @@ mod boxref_forwarding_tests {
             resolved.same_box(&body_arg),
             "a body operand must keep its own label arg when the import names a \
              value the loop redefines, not the body's own result"
+        );
+    }
+
+    /// A slot whose import forwards to another input arg must keep naming the
+    /// label arg.
+    ///
+    /// An input arg is fixed for the whole loop, so it is tempting to let one
+    /// stand for another. It cannot: substituting one label arg for another
+    /// says the two slots hold the same value on *every* entry, which is a
+    /// claim about the loop rather than about this iteration. A slot a
+    /// residual writes behind the trace's back — a frame local reached through
+    /// the running frame's `f_locals` — then reads as loop-invariant, and both
+    /// the label arg and the reload after the call fall away, so the loop
+    /// keeps answering the value it was compiled with.
+    #[test]
+    fn a_peeled_body_keeps_its_label_arg_when_the_import_is_another_input_arg() {
+        use majit_ir::operand::Operand;
+        const BASE: u32 = 71;
+        const SLOT: u32 = 5;
+        const OTHER: u32 = 7;
+        const NUM_INPUTS: usize = 11;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(
+            8,
+            NUM_INPUTS,
+            BASE,
+            BASE + NUM_INPUTS as u32,
+        );
+        let recorder = majit_ir::InputArg::from_type_rc(Type::Ref, SLOT);
+        let host = majit_ir::InputArg::from_type_rc(Type::Ref, BASE + SLOT);
+        let host_arg = Operand::from_bound_inputarg(&host);
+        let other = majit_ir::InputArg::from_type_rc(Type::Ref, BASE + OTHER);
+        let other_arg = Operand::from_bound_inputarg(&other);
+        ctx.register_carried_host(&Operand::from_bound_inputarg(&recorder));
+        ctx.register_carried_host(&host_arg);
+        ctx.register_carried_host(&other_arg);
+
+        // The import lands on a sibling label arg, in place of the constant
+        // `a_peeled_body_reads_the_slot_the_import_forwarded` proves is
+        // honoured.
+        ctx.make_equal_to(&host_arg, &other_arg);
+
+        let body_arg = Operand::from_bound_inputarg(&recorder);
+        let resolved = ctx
+            .resolve_operand_operand_opt(&body_arg)
+            .expect("the body arg resolves");
+        assert!(
+            resolved.same_box(&body_arg),
+            "a body operand must keep its own label arg when the import names \
+             another slot, which agrees with it only on entry"
         );
     }
 
