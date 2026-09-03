@@ -196,7 +196,7 @@ pub fn allocate() {
     }
 }
 
-/// thread_gil.c:105-107 `pthread_atfork(NULL, NULL, rpy_init_mutexes)`, guarded
+/// `RPyGilAllocate`'s `pthread_atfork(NULL, NULL, rpy_init_mutexes)`, guarded
 /// upstream by `HAVE_PTHREAD_ATFORK`.
 ///
 /// This is what makes a `fork()` taken while another thread held one of these
@@ -213,8 +213,7 @@ fn register_atfork_child_handler() {
 #[cfg(not(unix))]
 fn register_atfork_child_handler() {}
 
-/// thread_gil.c:93-98 `rpy_init_mutexes`, reached as the `pthread_atfork` child
-/// arm.
+/// `rpy_init_mutexes`, reached as the `pthread_atfork` child arm.
 ///
 /// Runs before any pyre code in the child — including `StwGuard::drop`, which
 /// locks `gc_sync`'s quiescence mutex on the way out of the very STW window the

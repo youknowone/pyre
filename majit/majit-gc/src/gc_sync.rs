@@ -116,7 +116,7 @@ fn quiesce() -> &'static Mutex<QuiesceState> {
     unsafe { &*GC_SYNC.quiesce.0.get() }
 }
 
-/// `thread_gil.c:92-98 rpy_init_mutexes`, for the quiescence mutex.
+/// `rpy_init_mutexes`, for the quiescence mutex.
 ///
 /// `mutex1_init` is a `pthread_mutex_init` call, which resets an already-locked
 /// mutex and abandons whatever state it held; replacing the whole `Mutex` is
@@ -1434,9 +1434,9 @@ mod tests {
         assert_eq!(registered_threads(), 0);
     }
 
-    /// `thread_gil.c:105-107` hands `rpy_init_mutexes` to `pthread_atfork` as
-    /// the CHILD handler precisely because a mutex can be copied LOCKED by a
-    /// thread that does not exist in the child.  `quiesce` needs the same
+    /// `RPyGilAllocate` hands `rpy_init_mutexes` to `pthread_atfork` as the
+    /// CHILD handler precisely because a mutex can be copied LOCKED by a thread
+    /// that does not exist in the child.  `quiesce` needs the same
     /// treatment: `quiesce_mutators` releases it before `collect_fn` runs —
     /// which is where `os.fork()` sits — and eight lockers take it outside the
     /// GIL, so the STW bracket does not exclude them.

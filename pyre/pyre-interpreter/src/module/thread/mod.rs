@@ -638,7 +638,7 @@ pub(crate) fn after_fork_child() {
     let ident = current_ident();
     // Before anything below, which reaches Python objects and can therefore
     // collect.  The mutex rebuild is already done — `rgil::allocate` hands it
-    // to `pthread_atfork`'s child arm, as `thread_gil.c:105-107` does — but the
+    // to `pthread_atfork`'s child arm, as `RPyGilAllocate` does — but the
     // collector's *census* is not something upstream has to repair, so nothing
     // in `reinit_threads` covers it: until these two run, `REGISTERED_THREADS`
     // and the RUNNING count still describe threads that did not survive, so a
