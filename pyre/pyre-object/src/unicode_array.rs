@@ -181,7 +181,9 @@ impl UnicodeArray {
         let _ = crate::gc_roots::pin_root(value as PyObjectRef);
         self.assert_room(1);
         self.barrier();
-        unsafe { *self.base().add(self.len_relaxed()) = crate::gc_roots::shadow_stack_get(value_slot) };
+        unsafe {
+            *self.base().add(self.len_relaxed()) = crate::gc_roots::shadow_stack_get(value_slot)
+        };
         self.set_len_relaxed(self.len_relaxed() + 1);
     }
 
@@ -196,11 +198,15 @@ impl UnicodeArray {
     }
 
     pub fn as_slice(&self) -> &[*const Wtf8Buf] {
-        unsafe { std::slice::from_raw_parts(self.base() as *const *const Wtf8Buf, self.len_relaxed()) }
+        unsafe {
+            std::slice::from_raw_parts(self.base() as *const *const Wtf8Buf, self.len_relaxed())
+        }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [*const Wtf8Buf] {
-        unsafe { std::slice::from_raw_parts_mut(self.base() as *mut *const Wtf8Buf, self.len_relaxed()) }
+        unsafe {
+            std::slice::from_raw_parts_mut(self.base() as *mut *const Wtf8Buf, self.len_relaxed())
+        }
     }
 
     pub fn to_vec(&self) -> Vec<*const Wtf8Buf> {

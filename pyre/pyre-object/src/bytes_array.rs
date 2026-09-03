@@ -181,7 +181,9 @@ impl BytesArray {
         let _ = crate::gc_roots::pin_root(value as PyObjectRef);
         self.assert_room(1);
         self.barrier();
-        unsafe { *self.base().add(self.len_relaxed()) = crate::gc_roots::shadow_stack_get(value_slot) };
+        unsafe {
+            *self.base().add(self.len_relaxed()) = crate::gc_roots::shadow_stack_get(value_slot)
+        };
         self.set_len_relaxed(self.len_relaxed() + 1);
     }
 
@@ -196,11 +198,18 @@ impl BytesArray {
     }
 
     pub fn as_slice(&self) -> &[*const BytesBlock] {
-        unsafe { std::slice::from_raw_parts(self.base() as *const *const BytesBlock, self.len_relaxed()) }
+        unsafe {
+            std::slice::from_raw_parts(self.base() as *const *const BytesBlock, self.len_relaxed())
+        }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [*const BytesBlock] {
-        unsafe { std::slice::from_raw_parts_mut(self.base() as *mut *const BytesBlock, self.len_relaxed()) }
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.base() as *mut *const BytesBlock,
+                self.len_relaxed(),
+            )
+        }
     }
 
     pub fn to_vec(&self) -> Vec<*const BytesBlock> {
