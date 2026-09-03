@@ -6050,6 +6050,13 @@ fn emit_dynamic_offset_addr(
     offset_arg: OpRef,
 ) -> CValue {
     let base = resolve_opref(builder, constants, base_arg);
+    // A zero offset addresses the base itself. `emit_scaled_index_addr`
+    // already skips its own `base_offset == 0`; this path emitted
+    // `iadd base, 0` instead, which every load of a fixed address carries —
+    // the back-edge poll in each compiled loop among them.
+    if offset_arg.is_none() || lookup_const_i64(constants, offset_arg) == Some(0) {
+        return base;
+    }
     let offset = resolve_opref_or_imm(builder, constants, known_values, offset_arg);
     builder.ins().iadd(base, offset)
 }
