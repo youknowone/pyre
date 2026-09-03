@@ -797,7 +797,11 @@ impl<'a> AssemblerARM64<'a> {
     /// (`patch_gcref_table`; `GcTable::in_code`). Must run before any
     /// instruction is emitted.
     pub(crate) fn reserve_gcref_table(&mut self, n: usize) {
-        assert_eq!(self.mc.offset().0, 0, "the gcref table opens the code block");
+        assert_eq!(
+            self.mc.offset().0,
+            0,
+            "the gcref table opens the code block"
+        );
         for _ in 0..n {
             let slot = self.mc.new_dynamic_label();
             dynasm!(self.mc ; =>slot ; .u64 0);

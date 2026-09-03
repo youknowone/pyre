@@ -279,7 +279,7 @@ impl Op {
         self.args.borrow().iter().cloned().collect()
     }
 
-    /// `resoperation.py:281 AbstractResOp.getarglist` parity for a reader
+    /// `resoperation.py AbstractResOp.getarglist` parity for a reader
     /// that only walks the arguments: upstream returns `self._args` itself,
     /// and only `getarglist_copy` (`N_aryOp`) returns `self._args[:]`.
     /// [`getarglist`](Self::getarglist) has to copy so the `RefCell` borrow

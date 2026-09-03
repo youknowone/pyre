@@ -247,10 +247,7 @@ impl NumberingState {
             num_virtuals: 0,
             // At most one entry per numbered box, and `size` counts the
             // boxes, so the table never rehashes mid-guard.
-            livebox_types: indexmap::IndexMap::with_capacity_and_hasher(
-                size,
-                FxBuildHasher,
-            ),
+            livebox_types: indexmap::IndexMap::with_capacity_and_hasher(size, FxBuildHasher),
         }
     }
     pub fn append_short(&mut self, item: i16) {
@@ -740,8 +737,9 @@ pub fn exit_pending_field_layout(
 /// `resume.py` tag decoding of one `fieldnums` / `rd_pendingfields` entry
 /// into the exit-slot source the recovery readers consume: TAGBOX names a
 /// deadframe slot (negative counts from the end), TAGVIRTUAL an
-/// `rd_virtuals` entry (negative for the nested virtuals `resume.py:278-284`
-/// numbers that way, resolved as `resume.py:951-954` does), TAGINT an inline
+/// `rd_virtuals` entry (negative for the nested virtuals
+/// `resume.py assign_number_to_virtual` numbers that way, resolved as
+/// `resume.py AbstractResumeDataReader.getvirtual_ptr` does), TAGINT an inline
 /// int and TAGCONST an `rd_consts` entry (`resume.py` `self.consts[num -
 /// TAG_CONST_OFFSET]`).
 pub fn exit_source_from_tagged(

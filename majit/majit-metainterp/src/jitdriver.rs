@@ -6479,7 +6479,10 @@ impl<S: JitState> JitDriver<S> {
             if crate::callee_rca_enabled() {
                 eprintln!(
                     "[callee-rca][guard-fail] fail_index={} trace_id={} raw_values={:?} exit_types={:?}",
-                    fail_index, trace_id, raw_values, fd.fail_arg_types(),
+                    fail_index,
+                    trace_id,
+                    raw_values,
+                    fd.fail_arg_types(),
                 );
                 if let Some(dump) = state.debug_state_fields(&compiled_meta) {
                     eprintln!("[callee-rca][post-execute-token-state]\n{dump}");

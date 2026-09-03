@@ -3337,7 +3337,7 @@ impl<M: Clone> MetaInterp<M> {
                     layout.fail_arg_types
                 });
                 CompiledExitLayout {
-                    rd_loop_token: owning_key, // compile.py:186
+                    rd_loop_token: owning_key, // compile.py record_loop_or_bridge
                     trace_id,
                     fail_index: layout.fail_index,
                     source_op_index: layout.source_op_index,
@@ -3360,7 +3360,7 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<CompiledExitLayout> {
         self.backend_terminal_exit_layout(compiled, trace_id, op_index)
             .map(|layout| CompiledExitLayout {
-                rd_loop_token: owning_key, // compile.py:186
+                rd_loop_token: owning_key, // compile.py record_loop_or_bridge
                 trace_id,
                 fail_index: layout.fail_index,
                 source_op_index: Some(layout.op_index),
@@ -3405,7 +3405,7 @@ impl<M: Clone> MetaInterp<M> {
                 merged.insert(
                     layout.fail_index,
                     CompiledExitLayout {
-                        rd_loop_token: owning_key, // compile.py:186
+                        rd_loop_token: owning_key, // compile.py record_loop_or_bridge
                         trace_id,
                         fail_index: layout.fail_index,
                         source_op_index: layout.source_op_index,
@@ -3459,7 +3459,7 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledTerminalExitLayout {
                         op_index: layout.op_index,
                         exit_layout: CompiledExitLayout {
-                            rd_loop_token: owning_key, // compile.py:186
+                            rd_loop_token: owning_key, // compile.py record_loop_or_bridge
                             trace_id,
                             fail_index: layout.fail_index,
                             source_op_index: Some(layout.op_index),
@@ -10085,7 +10085,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // Dumped before the call, not after: `Optimizer::propagate_from_pass_range`
         // resolves each argument in place on the op it is handed
-        // (`optimizer.py:650-652 _emit_operation`), so once the call returns
+        // (`optimizer.py _emit_operation`), so once the call returns
         // these ops carry resolved arguments rather than the recorded ones.
         // `compile_simple_loop` dumps at the same point for the same reason.
         if crate::majit_log_enabled() {
@@ -11622,8 +11622,11 @@ impl<M: Clone> MetaInterp<M> {
             let descr = descr_arc
                 .as_fail_descr()
                 .expect("a guard exit carries a FailDescr");
-            result.exit_layout =
-                Some(Box::new(self.guard_exit_layout(green_key, descr, result.rd_loop_token)));
+            result.exit_layout = Some(Box::new(self.guard_exit_layout(
+                green_key,
+                descr,
+                result.rd_loop_token,
+            )));
         }
         Some(result)
     }
@@ -11674,12 +11677,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
             .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
             .and_then(|(owning_key, resolved_id, trace)| {
-                Self::compiled_exit_layout_from_trace(
-                    trace,
-                    owning_key,
-                    resolved_id,
-                    fail_index,
-                )
+                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
             })
             .unwrap_or_else(|| CompiledExitLayout {
                 rd_loop_token: green_key,
@@ -12131,7 +12129,7 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<CompiledExitLayout> {
         let storage = crate::resume::ResumeStorage::from_fail_descr(descr)?;
         Some(CompiledExitLayout {
-            rd_loop_token: owning_key, // compile.py:186
+            rd_loop_token: owning_key, // compile.py record_loop_or_bridge
             trace_id,
             fail_index,
             source_op_index: descr.source_op_index(),

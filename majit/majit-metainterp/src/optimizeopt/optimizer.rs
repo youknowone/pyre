@@ -2400,7 +2400,7 @@ impl Optimizer {
     ///
     /// The caller transfers its argument slots: emission resolves each
     /// argument in place through its forwarding chain
-    /// (`optimizer.py:650-652 _emit_operation`), so on return an op's
+    /// (`optimizer.py _emit_operation`), so on return an op's
     /// `getarglist` reads the resolved operands, not the recorded ones. A
     /// caller that still needs the recorded arguments must read them before
     /// the call.
@@ -4786,7 +4786,7 @@ impl Optimizer {
         // op.arg(i) — matching RPython where get_box_replacement returns the
         // Box object itself. A from_opref box is unbound and drops the chain.
         //
-        // `optimizer.py:650-652 _emit_operation` writes the resolution back
+        // `optimizer.py _emit_operation` writes the resolution back
         // with `op.setarg(i, arg)` — into the operation's own slot, because
         // upstream's operation IS the box the passes forward. Written back
         // onto `op_rc` here for the same reason. Two things make that sound:
@@ -5174,7 +5174,7 @@ impl Optimizer {
                 op.getarglist()
             );
         }
-        // `optimizer.py:626 _newoperations.append(op)` appends the operation
+        // `optimizer.py _emit_operation`'s `_newoperations.append(op)` appends the operation
         // itself. Captured up front so the emit can move `op` in rather than
         // hand it a copy; everything the post-emit block reads off `op` is
         // this opcode and the result type it implies (asserted equal by

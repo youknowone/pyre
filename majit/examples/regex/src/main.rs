@@ -93,8 +93,9 @@ fn row_selected(index: usize) -> bool {
                 .map(str::trim)
                 .filter(|part| !part.is_empty())
                 .map(|part| {
-                    part.parse::<usize>()
-                        .unwrap_or_else(|_| panic!("PYRE_REGEX_ROWS contains a non-usize: {part:?}"))
+                    part.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("PYRE_REGEX_ROWS contains a non-usize: {part:?}")
+                    })
                 })
                 .collect(),
         )

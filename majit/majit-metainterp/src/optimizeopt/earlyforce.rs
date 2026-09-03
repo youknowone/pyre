@@ -247,8 +247,11 @@ mod tests {
 
             let mut opt = Optimizer::new();
             opt.add_pass(Box::new(OptEarlyForce::new()));
-            let result =
-                opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
+            let result = opt.optimize_with_constants_and_inputs(
+                &ops,
+                &mut majit_ir::ConstMap::default(),
+                1024,
+            );
             assert_eq!(result.len(), 1, "{opcode:?} should be handled");
         }
     }
