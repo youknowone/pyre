@@ -6467,6 +6467,15 @@ fn type_descr_new_with_metaclass(
                 crate::error::type_name_of(w_namespace_dict)
             )));
         }
+        // `bases` is the caller's tuple and a tuple relocates.  Everything
+        // from here down dispatches through user code -- the namespace
+        // backing's `keys`, the `__mro_entries__` lookups, the namespace copy,
+        // `__set_name__`, `__init_subclass__` -- so the word taken out of
+        // `args` is published once and re-read at each region below instead of
+        // carried across them.
+        let _bases_roots = pyre_object::gc_roots::push_roots();
+        let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(bases);
         let w_ns_backing = unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
         // typeobject.py `_check_surrogate(space, name)` — reject a lone
         // surrogate in the name before it is read as UTF-8 below.
@@ -6485,6 +6494,7 @@ fn type_descr_new_with_metaclass(
         // advertising `__mro_entries__` gets the dedicated diagnostic before
         // metaclass calculation; class statements resolve it earlier in
         // `__build_class__` and therefore never reach this branch.
+        let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
         let n_bases = unsafe { w_tuple_len(bases) };
         for index in 0..n_bases {
             let Some(base) = (unsafe { pyre_object::w_tuple_getitem(bases, index as i64) }) else {
@@ -6501,6 +6511,7 @@ fn type_descr_new_with_metaclass(
 
         // CPython: calculate_metaclass — if bases have a custom metaclass,
         // delegate to that metaclass instead of using type.__new__ directly.
+        let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
         if w_metaclass.is_null() && !bases.is_null() && unsafe { is_tuple(bases) } {
             let n = unsafe { w_tuple_len(bases) };
             for i in 0..n {
@@ -6677,6 +6688,7 @@ fn type_descr_new_with_metaclass(
         // it.  A tuple is nursery-allocated and every one of those collects,
         // so each use below reads the slot back instead of carrying the word.
         let _effective_bases_roots = pyre_object::gc_roots::push_roots();
+        let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
         let w_effective_bases =
             if bases.is_null() || !unsafe { is_tuple(bases) } || unsafe { w_tuple_len(bases) } == 0
             {
@@ -6707,6 +6719,7 @@ fn type_descr_new_with_metaclass(
         // after the winner is settled — supplying it here would weigh an
         // explicit metatype against `type(object)` and report a conflict where
         // the metatype itself is what upstream goes on to refuse.
+        let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
         let w_winner = crate::call::calculate_metaclass(default_meta, bases)?;
         if !std::ptr::eq(w_winner, default_meta) {
             // Winner is a different metaclass — delegate to its __new__
@@ -6723,6 +6736,7 @@ fn type_descr_new_with_metaclass(
                     }
                 };
                 let w_namespace_dict = pyre_object::gc_roots::shadow_stack_get(namespace_root);
+                let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
                 let mut new_args = vec![w_winner, name_obj, bases, w_namespace_dict];
                 if args.len() > 3 {
                     new_args.extend_from_slice(&args[3..]);
@@ -16327,6 +16341,15 @@ pub(crate) fn exec_or_eval(
         let _ = ns_roots.pin_root(w_globals);
         slot
     });
+    // The validated closure is the caller's tuple, and it is consumed last of
+    // all -- after `ensure_*_builtins`, the two namespace pins and the
+    // snapshot allocation.  It goes on the same scope as they do rather than
+    // on `_closure_root`, which opens after those calls have already run.
+    let closure_slot = inject_closure.then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = ns_roots.pin_root(closure);
+        slot
+    });
     // pyopcode.py:773-774 `space.call_method(w_globals, 'setdefault', ...)`
     // (exec) and compiling.py:109-110 `space.setitem_str(w_globals, ...)`
     // (eval) dispatch on the ORIGINAL `w_globals` object so a dict-subclass
@@ -16413,7 +16436,7 @@ pub(crate) fn exec_or_eval(
             pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
             name,
             pyre_object::PY_NULL,
-            closure,
+            closure_slot.map_or(closure, pyre_object::gc_roots::shadow_stack_get),
         );
         let f = pyre_object::gc_roots::pin_root(f);
         Some(f)

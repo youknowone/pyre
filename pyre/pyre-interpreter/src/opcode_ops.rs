@@ -334,6 +334,10 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
     let _roots = pyre_object::gc_roots::push_roots();
     let subject_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(subject);
+    let keys_base = pyre_object::gc_roots::shadow_stack_len();
+    for &key in &key_items {
+        let _ = pyre_object::gc_roots::pin_root(key);
+    }
     // pyopcode.py:1797-1818 — a key repeated in the pattern is rejected
     // before it binds anything; track keys already looked up and raise on
     // a duplicate. Each key is looked up with `map.get(key, sentinel)`
@@ -348,10 +352,6 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(
         crate::typedef::gettypeobject(&pyre_object::pyobject::INSTANCE_TYPE),
     ));
-    let keys_base = pyre_object::gc_roots::shadow_stack_len();
-    for &key in &key_items {
-        let _ = pyre_object::gc_roots::pin_root(key);
-    }
     let values_base = pyre_object::gc_roots::shadow_stack_len();
     let mut value_count = 0usize;
     let mut all_match = true;

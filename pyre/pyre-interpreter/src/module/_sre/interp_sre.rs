@@ -854,39 +854,39 @@ unsafe fn readbuf_obj(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// The raw bytes of [`readbuf_obj`] — `BufMatchContext` matches against these.
-unsafe fn readbuf_bytes(obj: PyObjectRef) -> Option<&'static [u8]> {
-    let buf = unsafe { readbuf_obj(obj) };
-    if buf.is_null() {
-        None
-    } else {
-        Some(unsafe { pyre_object::bytesobject::bytes_like_data(buf) })
-    }
-}
-
 /// `make_ctx` (interp_sre.py) — resolve the subject and reject a
 /// pattern/subject type mismatch (a bytes pattern on a str, or a str
 /// pattern on a bytes-like object).  A `str` (or subclass) becomes a
 /// character subject; `bytes`/`bytearray` (or subclass) a byte subject; any
 /// other read-buffer object (a `memoryview`) a `BufMatchContext`-style byte
 /// subject.
-fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate::PyError> {
+///
+/// Returned with the `_buffer` object the subject borrows: a `memoryview` or
+/// other exporter is gathered into a fresh `bytes`, and the `Subject::Bytes`
+/// slice points into it, so it is the caller — not a second `readbuf_obj`
+/// call, which would materialize a *different* object — that roots the one the
+/// slice actually reads.  `PY_NULL` where the subject is its own storage.
+fn make_subject(
+    pat: PyObjectRef,
+    string: PyObjectRef,
+) -> Result<(Subject, PyObjectRef), crate::PyError> {
     if unsafe { is_str(string) } {
         if pattern_is_known_bytes(pat) {
             return Err(crate::PyError::type_error(
                 "cannot use a bytes pattern on a string-like object",
             ));
         }
-        Ok(unsafe { str_subject(string) })
+        Ok((unsafe { str_subject(string) }, pyre_object::PY_NULL))
     } else if unsafe { pyre_object::bytesobject::is_bytes_like(string) } {
         if pattern_is_known_unicode(pat) {
             return Err(crate::PyError::type_error(
                 "cannot use a string pattern on a bytes-like object",
             ));
         }
-        Ok(Subject::Bytes(unsafe {
-            pyre_object::bytesobject::bytes_like_data(string)
-        }))
+        Ok((
+            Subject::Bytes(unsafe { pyre_object::bytesobject::bytes_like_data(string) }),
+            pyre_object::PY_NULL,
+        ))
     } else {
         // `make_ctx` acquires any other readable-buffer subject through
         // `readbuf_w` → `buffer_w` (a `memoryview`, or any buffer exporter such
@@ -899,18 +899,22 @@ fn make_subject(pat: PyObjectRef, string: PyObjectRef) -> Result<Subject, crate:
         // *before* the pattern/subject-type check — a non-buffer object raises
         // "expected string or bytes-like object", a real buffer (memoryview /
         // array) raises the "string pattern on a bytes-like object" mismatch.
-        let Some(buf) = (unsafe { readbuf_bytes(string) }) else {
+        let w_buffer = unsafe { readbuf_obj(string) };
+        if w_buffer.is_null() {
             return Err(crate::PyError::type_error(format!(
                 "expected string or bytes-like object, got '{}'",
                 crate::baseobjspace::object_functionstr_type_name(string)
             )));
-        };
+        }
         if pattern_is_known_unicode(pat) {
             return Err(crate::PyError::type_error(
                 "cannot use a string pattern on a bytes-like object",
             ));
         }
-        Ok(Subject::Bytes(buf))
+        Ok((
+            Subject::Bytes(unsafe { pyre_object::bytesobject::bytes_like_data(w_buffer) }),
+            w_buffer,
+        ))
     }
 }
 
@@ -1144,8 +1148,7 @@ fn do_match(
         .copied()
         .ok_or_else(|| crate::PyError::type_error(format!("{name} requires self and string")))?;
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
-    let subj = make_subject(pat, string)?;
-    let w_buffer = unsafe { readbuf_obj(string) };
+    let (subj, w_buffer) = make_subject(pat, string)?;
 
     let (pos, endpos) = normalize_bounds(
         subj.len(),
@@ -1300,7 +1303,8 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         .ok_or_else(|| crate::PyError::type_error("findall requires self and string"))?;
     let string = required_arg_kw(args, 1, kwargs, "string", "findall")?;
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no code"))?;
-    let subj = make_subject(pat, string)?;
+    let (subj, w_buffer) = make_subject(pat, string)?;
+    let _ = pyre_object::gc_roots::pin_root(w_buffer);
     let (pos, endpos) = normalize_bounds(
         subj.len(),
         arg_int_kw(args, 2, kwargs, "pos", 0)?,
@@ -1352,8 +1356,7 @@ fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     // Validate the compiled code is present (matches do_match's guard).
     get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
-    let subj = make_subject(pat, string)?;
-    let w_buffer = unsafe { readbuf_obj(string) };
+    let (subj, w_buffer) = make_subject(pat, string)?;
     let (pos, endpos) = normalize_bounds(
         subj.len(),
         arg_int_kw(args, 2, kwargs, "pos", 0)?,
@@ -1414,9 +1417,9 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     // The subject borrows the string's value box, which is `try_gc_alloc_stable`
     // and so keeps its address; the pin above is what keeps that box allocated
     // for the length of the walk.
-    let subj = make_subject(pat, string())?;
+    let (subj, w_buffer_obj) = make_subject(pat, string())?;
     let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(unsafe { readbuf_obj(string()) });
+    let _ = pyre_object::gc_roots::pin_root(w_buffer_obj);
     let w_buffer = || pyre_object::gc_roots::shadow_stack_get(buffer_slot);
     let count = arg_int_kw(args, 3, kwargs, "count", 0)?;
 
@@ -1557,7 +1560,8 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         .ok_or_else(|| crate::PyError::type_error("split requires self and string"))?;
     let string = required_arg_kw(args, 1, kwargs, "string", "split")?;
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
-    let subj = make_subject(pat, string)?;
+    let (subj, w_buffer) = make_subject(pat, string)?;
+    let _ = pyre_object::gc_roots::pin_root(w_buffer);
     let maxsplit = arg_int_kw(args, 2, kwargs, "maxsplit", 0)?;
     let num_groups = unsafe { (*(pat as *const W_SRE_Pattern)).num_groups }.max(0) as usize;
     let w_empty = empty_subject(subj);

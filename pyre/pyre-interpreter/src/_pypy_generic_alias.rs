@@ -815,17 +815,25 @@ fn subs_tvars(
             Some(idx) => unsafe { w_tuple_getitem(argitems(), idx as i64) }.unwrap_or(param()),
             None => param(),
         };
+        // `arg` is published here rather than in the branch below, because
+        // the test that picks the branch reads `__module__` off the
+        // parameter's type: `is_typevartuple` is a collecting call, and the
+        // word `w_tuple_getitem` just returned is a pre-move address on the
+        // other side of it.
+        let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(arg);
         // `if isinstance(param, TypeVarTuple): subargs.extend(arg)` — a
         // `TypeVarTuple` captures a sequence, so its bound `arg` is spliced.
         if is_typevartuple(param()) {
-            let members = crate::builtins::collect_iterable(arg)?;
+            let members = crate::builtins::collect_iterable(
+                pyre_object::gc_roots::shadow_stack_get(arg_slot),
+            )?;
             let member_base = pyre_object::gc_roots::pin_roots(&members);
             for index in 0..members.len() {
                 subarg_slots.push(member_base + index);
             }
         } else {
-            subarg_slots.push(pyre_object::gc_roots::shadow_stack_len());
-            let _ = pyre_object::gc_roots::pin_root(arg);
+            subarg_slots.push(arg_slot);
         }
     }
     let subargs: Vec<PyObjectRef> = subarg_slots
