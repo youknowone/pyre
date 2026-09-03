@@ -93,10 +93,11 @@ pub(crate) fn resolve_branch_target_through_trampoline(code: &[u8], target: usiz
 /// capture rather than a mis-decode — the `Err("notgoto")` below propagates as
 /// `NO_JITCODE_PC`, and the encode self-cert refuses to tag a word whose
 /// reconstruction fails.
-/// The `L` label operand sits at index 1 (`iL`: 1B int reg, then 2B label) —
-/// the same index the `goto_if_not/iL` handler reads `target` from — re-read
-/// here from the re-derived `goto` so the arm-select is genuinely reconstructed
-/// from `orgpc` alone rather than reusing the capture-site op.
+/// The `L` label operand is the LAST one in every member of the family
+/// (`iL`, `iiL`, `rL`, `rrL`, `ffL`), so its index is one less than the
+/// argcode count — the same index the matching handler reads `target` from —
+/// re-read here from the re-derived `goto` so the arm-select is genuinely
+/// reconstructed from `orgpc` alone rather than reusing the capture-site op.
 pub(crate) fn decode_side_other_target(
     code: &[u8],
     orgpc: usize,
@@ -107,10 +108,10 @@ pub(crate) fn decode_side_other_target(
         return Err("notlive");
     }
     let goto = decode_op_at(code, live.next_pc).ok_or("notgoto")?;
-    if goto.opname != "goto_if_not" {
+    if !goto.opname.starts_with("goto_if_not") || !goto.argcodes.ends_with('L') {
         return Err("notgoto");
     }
-    let target = read_label(code, &goto, 1);
+    let target = read_label(code, &goto, goto.argcodes.len() - 1);
     let raw = if flavor_guard_true {
         target
     } else {
@@ -463,7 +464,14 @@ pub(crate) fn branch_arm_reads_unrestorable_ref(
             // arm's straight-line resume region.  A Ref read past such a
             // boundary belongs to a different resume coordinate that gets its
             // own guard check, so nothing unrestorable was found here.
-            "goto_if_not" | "jit_merge_point" | "loop_header" | "finish" | "leave_frame"
+            // Every `goto_if_not*` is a guard, and so a boundary: naming only
+            // the unfused spelling let a fused branch fall through to the
+            // operand walk below and carried the scan past the guard into a
+            // block that answers to a different resume coordinate.
+            name if name.starts_with("goto_if_not") => {
+                return false;
+            }
+            "jit_merge_point" | "loop_header" | "finish" | "leave_frame"
             | "rvmprof_code"
             // Return / raise terminators: the arm exits the jitcode entirely.
             // No further Ref reads to check.
