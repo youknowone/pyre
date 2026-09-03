@@ -142,7 +142,9 @@ fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
     let Some(llbc) = object_llbc() else { return };
     let mut bodies = 0usize;
     for fd in llbc.iter_local_fns() {
-        let Some(body) = fd.unstructured() else { continue };
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
         let erased = erased_root_bracket_guards(llbc, &body);
         let moved = moved_out_locals(&body);
         let opens = opener_blocks(llbc, &body);
@@ -155,7 +157,9 @@ fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
             continue;
         }
         bodies += 1;
-        let Ok(graph) = lower_fun_decl(llbc, fd) else { continue };
+        let Ok(graph) = lower_fun_decl(llbc, fd) else {
+            continue;
+        };
         assert!(
             reachable_closes(&graph) > 0,
             "{} drops a surviving guard in a block that does not bind it and              lowers no close",
@@ -210,12 +214,16 @@ fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
     let mut left_open: Vec<String> = Vec::new();
     let mut moved_out = 0usize;
     for fd in llbc.iter_local_fns() {
-        let Some(body) = fd.unstructured() else { continue };
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
         if guard_drop_sites(llbc, &body).next().is_none() {
             continue;
         }
         dropping += 1;
-        let Ok(graph) = lower_fun_decl(llbc, fd) else { continue };
+        let Ok(graph) = lower_fun_decl(llbc, fd) else {
+            continue;
+        };
         if calls_to(&graph, "root_scope_close") > 0 {
             continue;
         }
@@ -277,7 +285,9 @@ fn moved_out_locals(body: &Unstructured) -> std::collections::HashSet<u64> {
 
 /// Whether `ty` resolves to the root-bracket guard's own ADT.
 fn ty_is_root_scope(llbc: &Llbc, ty: &TyRef) -> bool {
-    let TyRef::Dedup { id } = ty else { return false };
+    let TyRef::Dedup { id } = ty else {
+        return false;
+    };
     llbc.dedup_to_adt_def_id(*id)
         .and_then(|def_id| llbc.type_by_id(def_id))
         .is_some_and(|decl| decl.item_meta.name_path().ends_with("gc_roots::RootScope"))
@@ -300,13 +310,17 @@ fn nearly_every_dropped_bracket_closes() {
     let mut short: Vec<String> = Vec::new();
     for llbc in [object_llbc(), interpreter_llbc()].into_iter().flatten() {
         for fd in llbc.iter_local_fns() {
-            let Some(body) = fd.unstructured() else { continue };
+            let Some(body) = fd.unstructured() else {
+                continue;
+            };
             let want = owed_closes(llbc, &body);
             if want == 0 {
                 continue;
             }
             bodies += 1;
-            let Ok(graph) = lower_fun_decl(llbc, fd) else { continue };
+            let Ok(graph) = lower_fun_decl(llbc, fd) else {
+                continue;
+            };
             if reachable_closes(&graph) >= want {
                 closed += 1;
             } else {
