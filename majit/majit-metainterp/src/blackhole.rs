@@ -5016,6 +5016,9 @@ mod tests {
                         registers_f: vec![333],
                         position: TERMINAL_POSITION,
                         last_opcode_position: 17,
+                        // The resumable bail: a consumer that checks the flag
+                        // before adopting this image accepts it.
+                        abort_permanent_bail: true,
                     },
                 ))
             };
