@@ -65,6 +65,30 @@ pub fn get_vtable_for_gcstruct<V: Clone>(
         .cloned()
 }
 
+/// `heaptracker.py` `setup_cache_gcstruct2vtable`.
+///
+/// Upstream fills `_cache_gcstruct2vtable` by walking
+/// `rtyper.instance_reprs` and calling `rinstance.rclass.getvtable()` for
+/// each.  Pyre keeps the call site and the lookup order so
+/// [`get_vtable_for_gcstruct`] reads as upstream does, but the population is
+/// deliberately empty, for two reasons that must both change before it is
+/// worth writing:
+///
+/// * [`GcStructVTableCache`] is generic over the vtable representation and
+///   holds no `RPythonTyper` handle, so there is nothing here to walk.  The
+///   `instance_reprs` map exists (`RPythonTyper::instance_reprs`), so
+///   populating means threading the rtyper in — a signature change on every
+///   holder of this cache.
+/// * [`get_vtable_for_gcstruct`] has no non-test caller.  Pyre resolves an
+///   instance's class word through `new_with_vtable` at rewrite time
+///   instead of asking the struct for its vtable after the fact, so the
+///   upstream consumer (`rewrite_op_malloc`'s vtable argument) never
+///   reaches this path.
+///
+/// The consequence of the stub is that a caller which did appear would read
+/// `None` for a struct that has a vtable, so the empty body is only sound
+/// while the testing map is the sole source — which is what
+/// [`set_testing_vtable_for_gcstruct`] provides today.
 pub fn setup_cache_gcstruct2vtable<V>(_gccache: &mut GcStructVTableCache<V>) {}
 
 pub fn set_testing_vtable_for_gcstruct<V>(

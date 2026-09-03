@@ -661,6 +661,124 @@ fn is_source_constant_variable(
     })
 }
 
+/// jtransform.py `_rewrite_equality`'s `not arg.value` test.
+///
+/// Upstream reads the value straight off the `Constant`; pyre's front end
+/// materialises source constants as SSA Variables produced by a `Const*`
+/// operation, so the value has to be fetched from that producer.  The zeros
+/// are one per register class: `Signed` / `Unsigned` / `Bool` for `'i'` and
+/// the null pointer for `'r'`.  `ConstNone` is deliberately absent — it is a
+/// `lltype.Void` constant, not a null pointer, and never reaches an operand
+/// position.
+fn is_falsy_source_constant(
+    graph: &FunctionGraph,
+    variable: &crate::flowspace::model::Variable,
+) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(variable)
+                && matches!(
+                    op.kind,
+                    OpKind::ConstInt(0)
+                        | OpKind::ConstUInt(0)
+                        | OpKind::ConstBool(false)
+                        | OpKind::ConstRefNull
+                )
+        })
+    })
+}
+
+/// jtransform.py `_rewrite_symmetric` — "rewrite 'c1+v2' into 'v2+c1' in an
+/// attempt to avoid generating too many variants of the bytecode".
+///
+/// Upstream binds it as `rewrite_op_<name>` for the symmetric arithmetic and
+/// bitwise ops and for every ordered comparison, and reaches it again as
+/// `_rewrite_equality`'s fallthrough for `int_eq` / `int_ne` / `ptr_eq` /
+/// `ptr_ne`.  Because it is a whole-operation rewrite rather than one arm of
+/// a dispatch, pyre runs it as a normalisation over the operation on its way
+/// into `rewrite_operation`; the arms that follow therefore never have to
+/// consider a constant left-hand operand.
+///
+/// The opnames are pyre's front-end labels (`front::mir::canonical_binop_label`
+/// leaves comparisons bare and prefixes nothing), plus the already-typed
+/// `uint_*` comparisons `front::checked_arith_uint` emits directly.  Ordered
+/// comparisons are renamed to their mirror when the operands swap; the
+/// symmetric ops keep their name, which is upstream's
+/// `.get(op.opname, op.opname)` default.
+fn rewrite_symmetric(graph: &FunctionGraph, op: SpaceOperation) -> SpaceOperation {
+    let OpKind::BinOp {
+        op: binop_name,
+        lhs,
+        rhs,
+        result_ty,
+    } = &op.kind
+    else {
+        return op;
+    };
+    if !is_symmetric_binop(binop_name) {
+        return op;
+    }
+    // `isinstance(op.args[0], Constant) and isinstance(op.args[1], Variable)`
+    if !is_source_constant_variable(graph, lhs) || is_source_constant_variable(graph, rhs) {
+        return op;
+    }
+    SpaceOperation {
+        result: op.result.clone(),
+        kind: OpKind::BinOp {
+            op: reversed_comparison_binop(binop_name).to_string(),
+            lhs: rhs.clone(),
+            rhs: lhs.clone(),
+            result_ty: result_ty.clone(),
+        },
+    }
+}
+
+/// The opnames upstream binds to `_rewrite_symmetric`, in pyre's spelling.
+///
+/// `add` / `mul` cover both `int_add` / `int_mul` and `float_add` /
+/// `float_mul`, and the bare comparisons cover the `int_`, `uint_` and
+/// `float_` families at once, because the register kind is not yet part of
+/// the name at this point.  `sub`, the divisions, the shifts and the
+/// `*_assign` spellings are absent for the same reason they are absent
+/// upstream: they are not symmetric.
+fn is_symmetric_binop(name: &str) -> bool {
+    matches!(
+        name,
+        "add"
+            | "mul"
+            | "bitand"
+            | "bitor"
+            | "bitxor"
+            | "eq"
+            | "ne"
+            | "lt"
+            | "le"
+            | "gt"
+            | "ge"
+            | "uint_lt"
+            | "uint_le"
+            | "uint_gt"
+            | "uint_ge"
+    )
+}
+
+/// jtransform.py `_rewrite_symmetric`'s `reversename` table: swapping the
+/// operands of an ordered comparison mirrors it.  Everything else keeps its
+/// name (upstream's `.get(op.opname, op.opname)` default).
+fn reversed_comparison_binop(name: &str) -> &str {
+    match name {
+        "lt" => "gt",
+        "le" => "ge",
+        "gt" => "lt",
+        "ge" => "le",
+        "uint_lt" => "uint_gt",
+        "uint_le" => "uint_ge",
+        "uint_gt" => "uint_lt",
+        "uint_ge" => "uint_le",
+        other => other,
+    }
+}
+
 /// RPython: `support.autodetect_jit_markers_redvars` (support.py).
 /// Compute the Variables live across the portal's `jit_merge_point`, remove
 /// its greens, filter Constants/Void, and return INT/REF/FLOAT order.
@@ -894,6 +1012,27 @@ impl<'a> Transformer<'a> {
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
 
+        // `jtransform.py transform_graph` opens with
+        // `constant_fold_ll_issubclass(graph, cpu)`, which folds a
+        // `direct_call` to `exceptiondata.fn_exception_match` whose
+        // arguments are all `Constant`.  It has no counterpart here, and
+        // cannot acquire one without two upstream pieces pyre does not
+        // have:
+        //
+        // * The calls it folds are the ones `inline.py`'s
+        //   `rewire_exceptblock_with_guard` / `generic_exception_matching`
+        //   insert.  `Inliner::inline_once` refuses that whole path with
+        //   `CannotInline`, so no such call is ever inserted.
+        // * `rclass::ll_issubclass`, `ll_issubclass_const` and
+        //   `ll_isinstance` are not lifted at all — `cutover` skips their
+        //   bodies (`skip-issubclass-helper-body`) because
+        //   `flowspace_adapter::translate_op` has already rewritten every
+        //   call site into the high-level `issubtype` / `isinstance` op,
+        //   which the rtyper lowers to an `int_between`-over-
+        //   `subclassrange` helper graph.  A constant-argument class check
+        //   therefore reaches this pass as a range test on constants, not
+        //   as a call to fold.
+
         // RPython `rtyper/rpbc.py::SingleFrozenPBCRepr` resolves
         // zero-arg unit-variant PBC ctors to a singleton
         // `Constant(prebuilt_instance_ptr)` before jtransform runs.
@@ -991,6 +1130,10 @@ impl<'a> Transformer<'a> {
         let mut count_before_last_operation = None;
         for original_op in &original_ops {
             let op = remap_op(original_op, &self.aliases);
+            // `jtransform.py` binds `_rewrite_symmetric` as the whole
+            // `rewrite_op_<name>` for the symmetric ops, so it runs before
+            // any other rewriting can look at the operands.
+            let op = rewrite_symmetric(graph, op);
             let rewritten = self.rewrite_operation(&op, graph_name, graph);
             count_before_last_operation = Some(new_ops.len());
             match rewritten {
@@ -1835,6 +1978,88 @@ impl<'a> Transformer<'a> {
                         op: "cast_int_to_float".into(),
                         operand: operand.clone(),
                         result_ty: ValueType::Float,
+                    },
+                }])
+            }
+            // jtransform.py `_rewrite_equality`, reached through
+            // `rewrite_op_int_eq` / `rewrite_op_int_ne`: a comparison whose
+            // other operand is the zero constant is the unary test
+            // `int_is_zero` / `int_is_true`.  The unary form is what
+            // `goto_if_not_fusable` can fold into the exitswitch, so the
+            // pair collapses to a single `goto_if_not_int_is_zero/iL`
+            // instead of a compare plus a generic `goto_if_not`.
+            //
+            // Upstream tests `arg0` first and keeps `arg1`; the constant is
+            // already on the right here because `rewrite_symmetric` ran
+            // over the operation before this match (`optimize_block`), so
+            // both spellings arrive as `<var> <op> 0`.  `0 == 0` keeps the
+            // right-hand operand exactly as upstream does.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if matches!(binop_name.as_str(), "eq" | "ne")
+                && self.get_value_kind_var(lhs) == 'i'
+                && self.get_value_kind_var(rhs) == 'i'
+                && (is_falsy_source_constant(graph, lhs)
+                    || is_falsy_source_constant(graph, rhs)) =>
+            {
+                let operand = if is_falsy_source_constant(graph, lhs) {
+                    rhs
+                } else {
+                    lhs
+                };
+                let unop = if binop_name == "eq" {
+                    "int_is_zero"
+                } else {
+                    "int_is_true"
+                };
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::UnaryOp {
+                        op: unop.into(),
+                        operand: operand.clone(),
+                        result_ty: result_ty.clone(),
+                    },
+                }])
+            }
+            // jtransform.py `rewrite_op_ptr_eq` / `rewrite_op_ptr_ne`: the
+            // same `_rewrite_equality` fold over Ref operands, whose zero is
+            // the null pointer and whose unary tests are `ptr_iszero` /
+            // `ptr_nonzero`.  Upstream then runs the result through
+            // `_rewrite_cmp_ptrs`, which downgrades a non-GC pointer to
+            // `int_is_zero` / `int_is_true`; every Ref reaching pyre's
+            // codewriter is a GC ref (`GcKind` does not survive the MIR
+            // front end), so the GC branch is the only one, matching the
+            // binary `ptr_eq` / `ptr_ne` arm below.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                result_ty,
+            } if matches!(binop_name.as_str(), "eq" | "ne")
+                && self.get_value_kind_var(lhs) == 'r'
+                && self.get_value_kind_var(rhs) == 'r'
+                && (is_falsy_source_constant(graph, lhs)
+                    || is_falsy_source_constant(graph, rhs)) =>
+            {
+                let operand = if is_falsy_source_constant(graph, lhs) {
+                    rhs
+                } else {
+                    lhs
+                };
+                let unop = if binop_name == "eq" {
+                    "ptr_iszero"
+                } else {
+                    "ptr_nonzero"
+                };
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::UnaryOp {
+                        op: unop.into(),
+                        operand: operand.clone(),
+                        result_ty: result_ty.clone(),
                     },
                 }])
             }
@@ -3163,6 +3388,26 @@ impl<'a> Transformer<'a> {
     /// * `IR_QUASIIMMUTABLE[_ARRAY]` → emit `[-live-, record_quasiimmut_field,
     ///   getfield_*_pure]` — `jtransform.py:895-903`.
     /// * mutable                  → keep as-is.
+    ///
+    /// Three upstream branches of `rewrite_op_getfield` are absent because
+    /// nothing in pyre produces the op shape they test for:
+    ///
+    /// * `is_typeptr_getset` → `handle_getfield_typeptr`, which replaces the
+    ///   read with `[-live-, guard_class]`.  Pyre never reads the class word
+    ///   through a field access — the header words are folded into
+    ///   `new_with_vtable` on the store side, and `heaptracker::is_header_word`
+    ///   keeps `typeptr` / `ob_type` / `PyObject::w_class` out of the
+    ///   field-descriptor census entirely, so no descriptor exists to match.
+    /// * the `rstr.STR` / `rstr.UNICODE` hash check that rewrites to
+    ///   `strhash` / `unicodehash`.  Those are not pyre opcodes: the
+    ///   `bh_strhash` / `bh_unicodehash` helpers exist at the backend layer
+    ///   for dict lookups, but there is no `OpCode` for either, and a string
+    ///   constant's hash is precomputed into the jitcode's `str_consts`
+    ///   rather than read from the object at run time.
+    /// * the `_greenfield` variant, gated on
+    ///   `CallControl::could_be_green_field`.  The query is implemented as a
+    ///   structural predicate, but `pyjitpl` has no greenfield mechanism to
+    ///   answer it against, so the rank is never `_greenfield`.
     fn rewrite_op_getfield(
         &mut self,
         op: &SpaceOperation,
@@ -7245,6 +7490,29 @@ fn goto_if_not_fusable(kind: &OpKind) -> Option<(String, Vec<crate::flowspace::m
             ) =>
         {
             Some((op.clone(), vec![lhs.clone(), rhs.clone()]))
+        }
+        // The same integer comparisons under the spelling that actually
+        // reaches here.  `front::mir::canonical_binop_label` leaves a
+        // comparison bare and the `int_` prefix is added by
+        // `assembler::op_kind_to_opname_with_kinds`, which runs after
+        // flatten -- so the `int_lt` arm above matches nothing the front end
+        // produces, while `float_lt` and `ptr_eq` do match because
+        // `rewrite_operation` renamed them.  The fused exitswitch has to
+        // name the opcode the assembler will look up
+        // (`goto_if_not_int_lt/iiL`), so the prefix is applied here.
+        //
+        // Both operands must be `'i'`: the argcodes come from the register
+        // kinds, and there is no `goto_if_not_int_lt/rrL` entry.  A ref or
+        // float comparison that still reads bare never had its operands
+        // rewritten and so is not one of these.
+        OpKind::BinOp { op, lhs, rhs, .. }
+            if matches!(op.as_str(), "lt" | "le" | "eq" | "ne" | "gt" | "ge")
+                && FunctionGraph::concretetype_of(lhs)
+                    == crate::codewriter::type_state::ConcreteType::Signed
+                && FunctionGraph::concretetype_of(rhs)
+                    == crate::codewriter::type_state::ConcreteType::Signed =>
+        {
+            Some((format!("int_{op}"), vec![lhs.clone(), rhs.clone()]))
         }
         OpKind::UnaryOp { op, operand, .. }
             if matches!(
@@ -16064,6 +16332,361 @@ mod tests {
             transformer
                 ._handle_list_call("list.append", &op, &[l], &mut graph, "list_unhandled")
                 .is_none()
+        );
+    }
+
+    /// `_rewrite_equality` / `_rewrite_symmetric`: pyre's front end spells
+    /// every comparison bare (`eq`, `lt`) and materialises each source
+    /// constant as its own SSA operation, so both upstream rewrites have to
+    /// read the constant back out of the graph.
+    mod equality_and_symmetry_tests {
+        use super::*;
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::flowspace::model::Variable;
+        use crate::model::{FunctionGraph, OpKind, ValueType};
+
+        /// One `Input` of the given kind and one constant, then `op` over
+        /// them in `(lhs, rhs)` order; returns the transformed startblock's
+        /// operations plus the input variable.
+        fn transform_binop(
+            op: &str,
+            constant: OpKind,
+            constant_kind: ConcreteType,
+            input_kind: ConcreteType,
+            input_ty: ValueType,
+            constant_first: bool,
+        ) -> (Vec<crate::model::SpaceOperation>, Variable) {
+            let mut graph = FunctionGraph::new("binop_under_test");
+            let input_var = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "x".into(),
+                        ty: input_ty,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let const_var = graph.push_op_var(graph.startblock, constant, true).unwrap();
+            let (lhs, rhs) = if constant_first {
+                (const_var.clone(), input_var.clone())
+            } else {
+                (input_var.clone(), const_var.clone())
+            };
+            let result_var = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: op.into(),
+                        lhs,
+                        rhs,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result_var.clone()));
+
+            FunctionGraph::set_concretetype_of_inline(&input_var, input_kind);
+            FunctionGraph::set_concretetype_of_inline(&const_var, constant_kind);
+            FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+
+            let config = GraphTransformConfig::default();
+            let transformed = Transformer::new(&config).transform(&graph);
+            let ops = transformed.graph.block(graph.startblock).operations.clone();
+            (ops, input_var)
+        }
+
+        fn unary_op(ops: &[crate::model::SpaceOperation]) -> Option<(String, Variable)> {
+            ops.iter().find_map(|op| match &op.kind {
+                OpKind::UnaryOp { op, operand, .. } => Some((op.clone(), operand.clone())),
+                _ => None,
+            })
+        }
+
+        fn binary_op(ops: &[crate::model::SpaceOperation]) -> Option<(String, Variable, Variable)> {
+            ops.iter().find_map(|op| match &op.kind {
+                OpKind::BinOp { op, lhs, rhs, .. } => Some((op.clone(), lhs.clone(), rhs.clone())),
+                _ => None,
+            })
+        }
+
+        #[test]
+        fn an_int_equality_against_zero_becomes_int_is_zero() {
+            let (ops, x) = transform_binop(
+                "eq",
+                OpKind::ConstInt(0),
+                ConcreteType::Signed,
+                ConcreteType::Signed,
+                ValueType::Int,
+                false,
+            );
+            assert_eq!(
+                unary_op(&ops),
+                Some(("int_is_zero".to_string(), x)),
+                "`x == 0` must fold to the unary test: {ops:?}"
+            );
+            assert!(
+                binary_op(&ops).is_none(),
+                "the binary compare must be gone: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn an_int_inequality_against_zero_becomes_int_is_true() {
+            let (ops, x) = transform_binop(
+                "ne",
+                OpKind::ConstInt(0),
+                ConcreteType::Signed,
+                ConcreteType::Signed,
+                ValueType::Int,
+                false,
+            );
+            assert_eq!(
+                unary_op(&ops),
+                Some(("int_is_true".to_string(), x)),
+                "`x != 0` must fold to the unary test: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn a_zero_on_the_left_folds_the_same_way() {
+            let (ops, x) = transform_binop(
+                "eq",
+                OpKind::ConstInt(0),
+                ConcreteType::Signed,
+                ConcreteType::Signed,
+                ValueType::Int,
+                true,
+            );
+            assert_eq!(
+                unary_op(&ops),
+                Some(("int_is_zero".to_string(), x)),
+                "`0 == x` is `_rewrite_symmetric` then the same fold: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn a_ref_equality_against_null_becomes_ptr_iszero() {
+            let (ops, x) = transform_binop(
+                "eq",
+                OpKind::ConstRefNull,
+                ConcreteType::GcRef,
+                ConcreteType::GcRef,
+                ValueType::Ref(None),
+                false,
+            );
+            assert_eq!(
+                unary_op(&ops),
+                Some(("ptr_iszero".to_string(), x)),
+                "`p == NULL` must fold to the unary pointer test: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn a_ref_inequality_against_null_becomes_ptr_nonzero() {
+            let (ops, x) = transform_binop(
+                "ne",
+                OpKind::ConstRefNull,
+                ConcreteType::GcRef,
+                ConcreteType::GcRef,
+                ValueType::Ref(None),
+                false,
+            );
+            assert_eq!(
+                unary_op(&ops),
+                Some(("ptr_nonzero".to_string(), x)),
+                "`p != NULL` must fold to the unary pointer test: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn a_constant_left_operand_of_an_ordered_compare_mirrors_the_opname() {
+            let (ops, x) = transform_binop(
+                "lt",
+                OpKind::ConstInt(5),
+                ConcreteType::Signed,
+                ConcreteType::Signed,
+                ValueType::Int,
+                true,
+            );
+            let (op, lhs, _) = binary_op(&ops).expect("the compare must survive");
+            assert_eq!(op, "gt", "`5 < x` must become `x > 5`: {ops:?}");
+            assert_eq!(lhs, x, "the variable must move to the left: {ops:?}");
+        }
+
+        #[test]
+        fn a_constant_left_operand_of_a_symmetric_op_keeps_the_opname() {
+            let (ops, x) = transform_binop(
+                "add",
+                OpKind::ConstInt(5),
+                ConcreteType::Signed,
+                ConcreteType::Signed,
+                ValueType::Int,
+                true,
+            );
+            let (op, lhs, _) = binary_op(&ops).expect("the addition must survive");
+            assert_eq!(op, "add", "`add` has no mirror: {ops:?}");
+            assert_eq!(lhs, x, "the variable must move to the left: {ops:?}");
+        }
+
+        #[test]
+        fn a_subtraction_is_not_symmetric_and_keeps_its_operand_order() {
+            let (ops, _x) = transform_binop(
+                "sub",
+                OpKind::ConstInt(5),
+                ConcreteType::Signed,
+                ConcreteType::Signed,
+                ValueType::Int,
+                true,
+            );
+            let (op, lhs, _) = binary_op(&ops).expect("the subtraction must survive");
+            assert_eq!(op, "sub");
+            assert!(
+                matches!(
+                    ops.iter()
+                        .find(|o| o.result.as_ref() == Some(&lhs))
+                        .map(|o| &o.kind),
+                    Some(OpKind::ConstInt(5))
+                ),
+                "`5 - x` must keep the constant on the left: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn a_nonzero_constant_does_not_fold_an_equality() {
+            let (ops, _x) = transform_binop(
+                "eq",
+                OpKind::ConstInt(5),
+                ConcreteType::Signed,
+                ConcreteType::Signed,
+                ValueType::Int,
+                false,
+            );
+            assert!(
+                unary_op(&ops).is_none(),
+                "only the zero constant folds to a unary test: {ops:?}"
+            );
+            assert_eq!(
+                binary_op(&ops).map(|(op, _, _)| op),
+                Some("eq".to_string()),
+                "`x == 5` stays a binary compare: {ops:?}"
+            );
+        }
+    }
+
+    /// `goto_if_not_fusable` names the RPython opnames (`int_lt`), but the
+    /// front end spells a comparison bare (`front::mir::canonical_binop_label`)
+    /// and only the assembler adds the `int_` prefix -- after flatten.  A
+    /// production integer compare therefore reaches the exitswitch under the
+    /// bare name.
+    #[test]
+    fn a_bare_int_compare_fuses_into_the_exitswitch() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = FunctionGraph::new("bare_compare_fuse");
+        let a = graph.alloc_value_var();
+        let b = graph.alloc_value_var();
+        a.set_concretetype(Some(LowLevelType::Signed));
+        b.set_concretetype(Some(LowLevelType::Signed));
+        let t = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "lt".to_string(),
+                    lhs: a.clone(),
+                    rhs: b.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        t.set_concretetype(Some(LowLevelType::Bool));
+
+        let if_false = graph.create_block();
+        let if_true = graph.create_block();
+        let true_iarg = graph.alloc_value_var();
+        graph.push_inputarg_var(if_true, true_iarg);
+        let start = graph.startblock.0;
+        graph.set_control_flow_metadata(
+            graph.startblock,
+            Some(ExitSwitch::Value(t.clone())),
+            vec![
+                Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
+                Link::new_mixed(
+                    vec![LinkArg::Value(t.clone())],
+                    if_true,
+                    Some(ExitCase::Bool(true)),
+                ),
+            ],
+        );
+
+        assert!(
+            super::optimize_goto_if_not(&mut graph, start),
+            "a bare `lt` is the spelling production emits and must fuse",
+        );
+        match &graph.blocks[start].exitswitch {
+            Some(ExitSwitch::Fused { opname, args }) => {
+                assert_eq!(
+                    opname, "int_lt",
+                    "the fused exitswitch must name the opcode the assembler \
+                     looks up (`goto_if_not_int_lt/iiL`)",
+                );
+                assert_eq!(args, &vec![a, b]);
+            }
+            other => panic!("expected a fused exitswitch, got {other:?}"),
+        }
+    }
+
+    /// The bare arm is guarded on `Signed` operands because the argcodes
+    /// follow the register kinds and `insns.rs` registers no
+    /// `goto_if_not_int_eq/rrL`.  A ref comparison that still reads bare
+    /// never went through the `ptr_eq` rewrite, so it must not fuse.
+    #[test]
+    fn a_bare_compare_over_ref_operands_does_not_fuse() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let mut graph = FunctionGraph::new("bare_ref_compare");
+        let a = graph.alloc_value_var();
+        let b = graph.alloc_value_var();
+        let t = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "eq".to_string(),
+                    lhs: a.clone(),
+                    rhs: b.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        t.set_concretetype(Some(LowLevelType::Bool));
+
+        let if_false = graph.create_block();
+        let if_true = graph.create_block();
+        let true_iarg = graph.alloc_value_var();
+        graph.push_inputarg_var(if_true, true_iarg);
+        let start = graph.startblock.0;
+        graph.set_control_flow_metadata(
+            graph.startblock,
+            Some(ExitSwitch::Value(t.clone())),
+            vec![
+                Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false))),
+                Link::new_mixed(
+                    vec![LinkArg::Value(t.clone())],
+                    if_true,
+                    Some(ExitCase::Bool(true)),
+                ),
+            ],
+        );
+
+        assert!(
+            !super::optimize_goto_if_not(&mut graph, start),
+            "an unstamped operand pair has no `iiL` opcode to fuse into",
         );
     }
 }

@@ -314,6 +314,14 @@ pub const BC_FLOAT_TRUEDIV: u8 = 136;
 pub const BC_FLOAT_NEG: u8 = 139;
 pub const BC_FLOAT_ABS: u8 = 140;
 pub const BC_INT_INVERT: u8 = 141;
+/// `blackhole.py` `bhimpl_int_is_zero(a) -> !a` — the sibling of
+/// [`BC_INT_IS_TRUE`], produced by `jtransform.py` `_rewrite_equality`
+/// when an `int_eq` has the zero constant as one operand and the result
+/// is read rather than fused into `goto_if_not_int_is_zero`.  The
+/// handler was already wired in `wire_bhimpl_handlers`, but with no
+/// byte here `insn_byte` panicked on the key instead.  Takes the next
+/// byte above `BC_RAW_STORE_F` (235).
+pub const BC_INT_IS_ZERO: u8 = 236;
 pub const BC_UINT_RSHIFT: u8 = 142;
 pub const BC_UINT_MUL_HIGH: u8 = 143;
 pub const BC_UINT_LT: u8 = 144;
@@ -907,6 +915,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("int_neg/i>i", BC_INT_NEG);
     m.insert("int_invert/i>i", BC_INT_INVERT);
     m.insert("int_is_true/i>i", BC_INT_IS_TRUE);
+    m.insert("int_is_zero/i>i", BC_INT_IS_ZERO);
     m.insert("uint_rshift/ii>i", BC_UINT_RSHIFT);
     m.insert("uint_mul_high/ii>i", BC_UINT_MUL_HIGH);
     m.insert("uint_lt/ii>i", BC_UINT_LT);

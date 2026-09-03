@@ -5537,6 +5537,7 @@ where
             jitcode::insns::BC_INT_NEG => self.trace_unary_i(ctx, OpCode::IntNeg),
             jitcode::insns::BC_INT_INVERT => self.trace_unary_i(ctx, OpCode::IntInvert),
             jitcode::insns::BC_INT_IS_TRUE => self.trace_unary_i(ctx, OpCode::IntIsTrue),
+            jitcode::insns::BC_INT_IS_ZERO => self.trace_unary_i(ctx, OpCode::IntIsZero),
             jitcode::insns::BC_PTR_EQ => self.trace_binop_r_to_i(ctx, OpCode::PtrEq),
             jitcode::insns::BC_PTR_NE => self.trace_binop_r_to_i(ctx, OpCode::PtrNe),
             jitcode::insns::BC_INSTANCE_PTR_EQ => {

@@ -241,11 +241,39 @@ impl<'c> Lowerer<'c> {
                 if let Expr::Return(ret) = expr {
                     return self.lower_return_stmt(ret, is_arm_tail);
                 }
-                if matches!(expr, Expr::Continue(_)) {
-                    if let Some(label) = self.dispatch_loop_label.clone() {
-                        self.emit_jump(&label);
+                if let Expr::Continue(cont) = expr {
+                    // The only `continue` this lowering can honour is the one
+                    // that means the dispatch back-edge, because the jump it
+                    // emits targets `dispatch_loop_label` and there is no other
+                    // label in scope here.  Two spellings reach this arm naming
+                    // a different loop, and both used to be answered with that
+                    // same jump -- or, with no dispatch label at all, with a
+                    // bare `Some(())` that emitted nothing and dropped the
+                    // transfer:
+                    //
+                    //   * a `continue` inside a loop written in the arm body.
+                    //     Its direct and `if`-branch spellings are taken by
+                    //     `lower_loop_stmt` / `lower_loop_if` with that loop's
+                    //     own labels, so what arrives here came through a
+                    //     `match` arm or a nested block.  `lower_loop_body_block`
+                    //     clears the dispatch label for exactly this reason, so
+                    //     the `None` below is what such a `continue` sees.
+                    //   * a labelled `continue 'l`, which crosses nested loops
+                    //     and names a loop this lowering has no label for.
+                    //
+                    // Both are refused instead of mistargeted.  The refusal
+                    // declines the whole body, so the arm keeps running in the
+                    // interpreter rather than jumping to the wrong head or
+                    // falling through with the transfer gone.
+                    if cont.label.is_none() {
+                        if let Some(label) = self.dispatch_loop_label.clone() {
+                            self.emit_jump(&label);
+                            return Some(());
+                        }
                     }
-                    return Some(());
+                    // `stmt_contains_loop_control` fires on a bare `continue`,
+                    // so the fallback refuses and records the reason.
+                    return self.lower_stmt_fallback(stmt, "expr");
                 }
                 if let Some(()) = self.lower_expr_stmt(expr) {
                     return Some(());
@@ -431,6 +459,37 @@ impl<'c> Lowerer<'c> {
             }
             self.record_body_failure(
                 "encloses a `break`/`continue` that cannot be lowered in place",
+                stmt,
+            );
+            return None;
+        }
+        // `hint_fresh_virtualizable` is the fourth member, and the purity test
+        // is blind to it in the same way: the hint reads nothing, writes
+        // nothing and calls nothing, so a statement whose only content is the
+        // hint is scored inert and dropped.  Dropping it is what the previous
+        // lowering did on purpose -- and that is the defect, because the hint
+        // is not inert.  Upstream records `fresh_virtualizable` in
+        // `Transformer.vable_flags` and reads it back in `is_vable_getfield` /
+        // `is_vable_setfield`, which then answer `False` so the following field
+        // accesses stay off the `getfield_vable_*` / `setfield_vable_*` path.
+        // This lowering has no carrier for that flag, so it cannot honour the
+        // hint; suppressing it leaves every following access on the vable path,
+        // which is the opposite of what was asked and is invisible in the
+        // emitted jitcode.  Refuse the statement rather than answer it wrongly.
+        //
+        // `hint_access_directly` is deliberately not covered: upstream drops it
+        // at the same site, and the flag it records is consulted for
+        // `fresh_virtualizable` alone.
+        if stmt_contains_fresh_virtualizable_hint(stmt) {
+            if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
+                eprintln!(
+                    "[majit-macro] lower_stmt rejected ({what}): statement encloses a \
+                     `hint_fresh_virtualizable` this lowering has no flag to carry: {}",
+                    quote!(#stmt)
+                );
+            }
+            self.record_body_failure(
+                "encloses a `hint_fresh_virtualizable` this lowering has no flag to carry",
                 stmt,
             );
             return None;
@@ -1156,6 +1215,19 @@ impl<'c> Lowerer<'c> {
         }
         let green_reads: Vec<Register> =
             green_bindings.iter().map(Register::from_binding).collect();
+        // jtransform.py `handle_recursive_call` opens with `promote_greens`:
+        // every green Variable is pinned by a `-live-` + `<kind>_guard_value`
+        // pair before the call is emitted.  The dispatcher picks the callee by
+        // hashing the green key it reads out of these registers, so a green the
+        // trace never guarded lets a recorded loop replay with a different key
+        // and enter the portal at a pc it was not compiled for.  The merge
+        // point promotes its greens for the same reason
+        // (`dispatch::emit_promote_greens`); this is the other `promote_greens`
+        // call site.  Upstream skips Constants and Voids; every green here is a
+        // register a value expression just produced, so none is skipped.
+        for binding in &green_bindings {
+            self.emit_live_and_guard_value(binding.kind, binding.reg);
+        }
         let green_tokens: Vec<proc_macro2::TokenStream> = green_bindings
             .iter()
             .map(|b| {
@@ -2562,4 +2634,125 @@ fn stmt_contains_loop_control(stmt: &Stmt) -> bool {
     };
     probe.visit_stmt(stmt);
     probe.hit
+}
+
+/// Whether `stmt` encloses a `hint_fresh_virtualizable` in either spelling.
+///
+/// The hint reaches the lowerer two ways: as a call
+/// (`lower_vable_hint_identity_call` matches `Expr::Call`) and as a macro
+/// (`lower_vable_hint_suppress` matches `Expr::Macro`).  Both are refused, so
+/// the probe has to see both -- and it has to see them anywhere in the
+/// statement, because the call form appears in value position
+/// (`let f = hint_fresh_virtualizable(frame);`) where the statement that gets
+/// refused is the `let`.
+///
+/// Closures and nested items are not skipped the way `stmt_contains_return`
+/// skips them: a hint inside a closure still names this body's virtualizable.
+fn stmt_contains_fresh_virtualizable_hint(stmt: &Stmt) -> bool {
+    use syn::visit::Visit;
+    struct Probe {
+        hit: bool,
+    }
+    impl<'ast> Visit<'ast> for Probe {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let Expr::Path(p) = &*node.func
+                && classify_virtualizable_hint_syn_path(&p.path)
+                    == Some(VirtualizableHintKind::FreshVirtualizable)
+            {
+                self.hit = true;
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+            if classify_virtualizable_hint_syn_path(&node.mac.path)
+                == Some(VirtualizableHintKind::FreshVirtualizable)
+            {
+                self.hit = true;
+            }
+            syn::visit::visit_expr_macro(self, node);
+        }
+        fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+            if classify_virtualizable_hint_syn_path(&node.mac.path)
+                == Some(VirtualizableHintKind::FreshVirtualizable)
+            {
+                self.hit = true;
+            }
+            syn::visit::visit_stmt_macro(self, node);
+        }
+    }
+    let mut probe = Probe { hit: false };
+    probe.visit_stmt(stmt);
+    probe.hit
+}
+
+#[cfg(test)]
+mod continue_target_tests {
+    use super::*;
+
+    const DISPATCH_LABEL: &str = "__l_dispatch";
+
+    fn dispatch_lowerer() -> Lowerer<'static> {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.dispatch_loop_label = Some(syn::Ident::new(
+            DISPATCH_LABEL,
+            proc_macro2::Span::call_site(),
+        ));
+        lowerer
+    }
+
+    fn emitted(lowerer: &Lowerer<'_>) -> String {
+        lowerer
+            .statements
+            .iter()
+            .map(|tokens| tokens.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The spelling this lowering exists for: a `continue` in a dispatch arm
+    /// body is the interpreter's back-edge and lowers to a jump to the loop
+    /// head the dispatch JitCode marked.
+    #[test]
+    fn an_arm_body_continue_lowers_to_the_dispatch_back_edge() {
+        let mut lowerer = dispatch_lowerer();
+        let stmt: Stmt = syn::parse_quote! { continue; };
+
+        assert!(lowerer.lower_stmt(&stmt).is_some());
+        let body = emitted(&lowerer);
+        assert!(
+            body.contains(DISPATCH_LABEL),
+            "an arm-body `continue` must jump to the dispatch head:\n{body}"
+        );
+    }
+
+    /// With no dispatch label there is no loop head to jump to, so the old
+    /// `Some(())` emitted nothing and reported success — the transfer was
+    /// silently deleted and the caller ran on to the next statement.
+    #[test]
+    fn a_continue_with_no_dispatch_label_refuses_instead_of_vanishing() {
+        let mut lowerer = Lowerer::new(None);
+        let stmt: Stmt = syn::parse_quote! { continue; };
+
+        assert!(
+            lowerer.lower_stmt(&stmt).is_none(),
+            "a `continue` with no loop head to name must refuse"
+        );
+        assert!(lowerer.statements.is_empty());
+        assert!(lowerer.op_metadata.is_empty());
+    }
+
+    /// A labelled `continue` crosses nested loops to a loop this lowering
+    /// holds no label for; the dispatch head is not it.
+    #[test]
+    fn a_labelled_continue_refuses() {
+        let mut lowerer = dispatch_lowerer();
+        let stmt: Stmt = syn::parse_quote! { continue 'outer; };
+
+        assert!(
+            lowerer.lower_stmt(&stmt).is_none(),
+            "`continue 'outer` names a loop the dispatch label is not"
+        );
+        assert!(lowerer.statements.is_empty());
+        assert!(lowerer.op_metadata.is_empty());
+    }
 }

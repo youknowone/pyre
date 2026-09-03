@@ -742,12 +742,24 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
-    /// RPython jtransform.py:655 — suppress identity hint function calls.
+    /// RPython jtransform.py `rewrite_op_hint` — suppress the identity hint
+    /// function call.
     ///
-    /// `hint_access_directly(frame)` and `hint_fresh_virtualizable(frame)`
-    /// are identity functions that return their argument unchanged.
-    /// The Lowerer recognizes these calls and lowers the argument directly,
-    /// effectively eliminating the hint call.
+    /// `hint_access_directly(frame)` is an identity function whose whole
+    /// effect at this layer is to be dropped: upstream's hint arm answers
+    /// `access_directly` with a bare `return`, and the flag it records is
+    /// consulted only for `fresh_virtualizable` (`is_vable_getfield` reads
+    /// `'fresh_virtualizable' in flags`).  So lowering the argument directly
+    /// is the whole port.
+    ///
+    /// `hint_fresh_virtualizable` is NOT dropped here.  It asks the following
+    /// field accesses to stay OFF the `getfield_vable_*` / `setfield_vable_*`
+    /// path, which upstream arranges by recording the flag and reading it back
+    /// in `is_vable_getfield` / `is_vable_setfield`.  This lowering has no
+    /// carrier for the flag, so the identity answer keeps every following
+    /// access on the vable path -- the opposite of what the hint asks, with no
+    /// diagnostic.  Refuse instead: `stmt_contains_fresh_virtualizable_hint`
+    /// turns that refusal into a declined body, and the arm runs interpreted.
     pub(super) fn lower_vable_hint_identity_call(&mut self, expr: &Expr) -> Option<Binding> {
         let call = match expr {
             Expr::Call(c) => c,
@@ -758,9 +770,7 @@ impl<'c> Lowerer<'c> {
             _ => return None,
         };
         match func_name {
-            Some(
-                VirtualizableHintKind::AccessDirectly | VirtualizableHintKind::FreshVirtualizable,
-            ) => {
+            Some(VirtualizableHintKind::AccessDirectly) => {
                 let arg = call.args.first()?;
                 self.lower_value_expr(arg)
             }
@@ -807,10 +817,11 @@ impl<'c> Lowerer<'c> {
             Expr::Macro(m) => m,
             _ => return None,
         };
+        // Only `access_directly`.  `fresh_virtualizable` is refused by
+        // `stmt_contains_fresh_virtualizable_hint` rather than suppressed --
+        // see `lower_vable_hint_identity_call` for why dropping it is wrong.
         match classify_virtualizable_hint_syn_path(&mac.mac.path) {
-            Some(
-                VirtualizableHintKind::AccessDirectly | VirtualizableHintKind::FreshVirtualizable,
-            ) => Some(()),
+            Some(VirtualizableHintKind::AccessDirectly) => Some(()),
             _ => None,
         }
     }
@@ -2235,6 +2246,95 @@ mod tests {
     /// A declared ref field admits the three spellings the lowering can
     /// actually receive, and no others. The pointee is named once per pointer
     /// spelling, which is what turns a drifted declaration into a type error.
+    /// The control: `hint_access_directly` is still answered as the identity
+    /// it is.  Upstream drops it at the same site, and the flag it records is
+    /// read back for `fresh_virtualizable` alone, so nothing is lost.
+    #[test]
+    fn an_access_directly_hint_still_lowers_to_its_argument() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("state".to_string());
+        config.vable_input_ref_reg = Some(4);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.install_vable_input_binding();
+        let expr: Expr = syn::parse_quote! { hint_access_directly(state) };
+
+        let binding = lowerer
+            .lower_value_expr(&expr)
+            .expect("the access_directly hint lowers to its argument");
+
+        assert_eq!(binding.reg, 4);
+        assert_eq!(binding.kind, BindingKind::Ref);
+    }
+
+    /// `hint_fresh_virtualizable` asks the following field accesses to stay
+    /// off the vable path, and this lowering holds no flag that could carry
+    /// that.  Answering it as an identity — which is what the suppression did
+    /// — leaves every access on the vable path with nothing emitted to say
+    /// so, so the statement is refused instead.
+    ///
+    /// The statement is built as `Stmt::Expr(Expr::Macro, semi)` rather than
+    /// parsed from `hint_fresh_virtualizable!(state);`, because syn parses
+    /// that spelling as `Stmt::Macro`, whose arm in `lower_stmt_dispatch`
+    /// recognises `can_enter_jit` / `jit_loop_header` and answers `None` for
+    /// everything else — so it never reaches `lower_vable_hint_suppress` and
+    /// the test would pass without exercising anything.  Expression position
+    /// is the only spelling that does reach it.
+    #[test]
+    fn a_fresh_virtualizable_hint_refuses_in_expression_position() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("state".to_string());
+        config.vable_input_ref_reg = Some(4);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.install_vable_input_binding();
+        let mac: syn::ExprMacro = syn::parse_quote! { hint_fresh_virtualizable!(state) };
+        let stmt = Stmt::Expr(Expr::Macro(mac), Some(Default::default()));
+
+        assert!(
+            lowerer.lower_stmt(&stmt).is_none(),
+            "the fresh_virtualizable hint must refuse, not be suppressed"
+        );
+        assert!(lowerer.statements.is_empty());
+    }
+
+    /// The control for the test above: the same expression-position spelling
+    /// with `hint_access_directly` is still suppressed, which is what proves
+    /// the refusal is about the hint and not about the statement shape.
+    #[test]
+    fn an_access_directly_hint_is_still_suppressed_in_expression_position() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("state".to_string());
+        config.vable_input_ref_reg = Some(4);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.install_vable_input_binding();
+        let mac: syn::ExprMacro = syn::parse_quote! { hint_access_directly!(state) };
+        let stmt = Stmt::Expr(Expr::Macro(mac), Some(Default::default()));
+
+        assert!(
+            lowerer.lower_stmt(&stmt).is_some(),
+            "the access_directly hint is dropped, as upstream drops it"
+        );
+        assert!(lowerer.statements.is_empty());
+    }
+
+    /// The same hint in value position.  The refusal has to reach the `let`,
+    /// because that is the statement the purity test would otherwise score
+    /// inert and drop.
+    #[test]
+    fn a_fresh_virtualizable_hint_in_a_let_refuses() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("state".to_string());
+        config.vable_input_ref_reg = Some(4);
+        let mut lowerer = Lowerer::new(Some(&config));
+        lowerer.install_vable_input_binding();
+        let stmt: Stmt = syn::parse_quote! { let fresh = hint_fresh_virtualizable(state); };
+
+        assert!(
+            lowerer.lower_stmt(&stmt).is_none(),
+            "the hint in value position must refuse the enclosing `let`"
+        );
+        assert!(!lowerer.bindings.contains_key("fresh"));
+    }
+
     #[test]
     fn a_declared_ref_field_witnesses_its_pointee() {
         let tokens = witness_for("Stack::head");

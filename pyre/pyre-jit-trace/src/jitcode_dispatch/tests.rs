@@ -7359,6 +7359,21 @@ fn int_invert_records_intinvert() {
 }
 
 #[test]
+fn int_is_true_records_intistrue() {
+    drive_int_unop("int_is_true/i>i", majit_ir::OpCode::IntIsTrue);
+}
+
+/// `int_is_zero` is the `not a` sibling `pyjitpl.py` generates beside
+/// `int_is_true`; `jtransform.py` `_rewrite_equality` is what puts it in a
+/// body, by folding `int_eq(x, 0)`. Without an arm the walker answers
+/// `DispatchError::UnsupportedOpname` and aborts the trace, so this asserts
+/// the arm exists rather than only that the recorded op is right.
+#[test]
+fn int_is_zero_records_intiszero() {
+    drive_int_unop("int_is_zero/i>i", majit_ir::OpCode::IntIsZero);
+}
+
+#[test]
 fn int_same_as_is_eliminated_from_generated_insns_table() {
     // RPython `jtransform.py rewrite_op_same_as` removes
     // `same_as` before assembly. The walker keeps a handler arm for
@@ -7917,15 +7932,24 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
 
 #[test]
 fn unsupported_opname_surfaces_typed_error() {
-    // Stable choice for exercising the catch-all `UnsupportedOpname`
-    // error path.  `vtable_method_ptr/rd>i` is a pyre-only backend
-    // adaptation (emitted by `OpKind::VtableMethodPtr` /
-    // `assembler.rs`) without a PyPy analog: Python dispatch
-    // resolves through `cpu.bh_call_*` at runtime rather than
-    // reifying a method pointer into the bytecode stream.  Zero
-    // JitCode hits in production traces (per
-    // `t3_audit_opname_gap_inventory`), so it's a durable choice
-    // for the "still unsupported" slot.
+    // The only remaining opname with no arm, so the only one that can
+    // exercise the catch-all `UnsupportedOpname` error path.
+    // `vtable_method_ptr/rd>i` is a pyre-only backend adaptation
+    // (emitted by `OpKind::VtableMethodPtr` / `assembler.rs`) without a
+    // PyPy analog: Python dispatch resolves through `cpu.bh_call_*` at
+    // runtime rather than reifying a method pointer into the bytecode
+    // stream, and its blackhole side is a deliberate bail
+    // (`handler_vtable_method_ptr_bail`).
+    //
+    // It is NOT unreachable, and an earlier note here saying it had zero
+    // JitCode hits was wrong.  Counting `body.code[pos]` over every
+    // `pos in body.startpoints` of the shipped `jit_metadata.json`
+    // (3459 bodies, 152888 instructions, 114 distinct opnames -- the
+    // whole `insns` table, so no opname is dead) puts one occurrence in
+    // `view_as_kwargs`, between a `live/` and an `int_guard_value` +
+    // `residual_call_r_r`.  A `f(**d)` probe did not reach it, so
+    // whether a walk gets there is unproven; the byte is chosen here
+    // because nothing else can reach this arm, not because it is dead.
     let opname = "vtable_method_ptr/rd>i";
     let unsupported_byte = *insns_opname_to_byte()
         .get(opname)
