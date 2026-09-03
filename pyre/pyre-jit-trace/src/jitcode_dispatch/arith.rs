@@ -1082,14 +1082,23 @@ regular_record_table! {
     // Int-bank unary ops: `pyjitpl.py` (int_neg / int_invert) +
     // 371-375 (int_same_as, which records `rop.SAME_AS_I` via
     // `_record_helper` — same shape, treated as a regular
-    // record-and-writeback). `int_is_true` (`pyjitpl.py`) is
-    // Int-typed on the bank though semantically bool (matches the `>i`
-    // destination shape).
+    // record-and-writeback). `int_is_true` / `int_is_zero`
+    // (`pyjitpl.py`) are Int-typed on the bank though semantically
+    // bool (matches the `>i` destination shape).
+    //
+    // `int_is_zero` sits beside `int_is_true` in the generated unary
+    // loop and answers `not a` (`blackhole.py` `bhimpl_int_is_zero`).
+    // It reaches a body only once `jtransform.py` `_rewrite_equality`
+    // folds `int_eq(x, 0)`, so before that rewrite existed here no
+    // jitcode carried the opname and this arm's absence was invisible:
+    // an unlisted key falls through to `DispatchError::UnsupportedOpname`,
+    // which aborts the trace mid-walk.
     unop_int_record {
         "int_neg/i>i" => IntNeg,
         "int_invert/i>i" => IntInvert,
         "int_same_as/i>i" => SameAsI,
         "int_is_true/i>i" => IntIsTrue,
+        "int_is_zero/i>i" => IntIsZero,
     }
     unop_float_record {
         "float_neg/f>f" => FloatNeg,

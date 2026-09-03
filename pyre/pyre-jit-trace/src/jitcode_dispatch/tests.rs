@@ -7217,6 +7217,21 @@ fn int_invert_records_intinvert() {
 }
 
 #[test]
+fn int_is_true_records_intistrue() {
+    drive_int_unop("int_is_true/i>i", majit_ir::OpCode::IntIsTrue);
+}
+
+/// `int_is_zero` is the `not a` sibling `pyjitpl.py` generates beside
+/// `int_is_true`; `jtransform.py` `_rewrite_equality` is what puts it in a
+/// body, by folding `int_eq(x, 0)`. Without an arm the walker answers
+/// `DispatchError::UnsupportedOpname` and aborts the trace, so this asserts
+/// the arm exists rather than only that the recorded op is right.
+#[test]
+fn int_is_zero_records_intiszero() {
+    drive_int_unop("int_is_zero/i>i", majit_ir::OpCode::IntIsZero);
+}
+
+#[test]
 fn int_same_as_is_eliminated_from_generated_insns_table() {
     // RPython `jtransform.py rewrite_op_same_as` removes
     // `same_as` before assembly. The walker keeps a handler arm for
