@@ -58,12 +58,33 @@ cover the condition they diagnose.
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_BH_ENTRY_EXC`
+
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
+- Accessor: `bh_entry_stale_exc_report()`, called from both single- and multi-frame drivers
+- What it does: `MAJIT_BH_ENTRY_EXC`: report a `BH_LAST_EXC_VALUE` that survived into a blackhole drive the caller did not describe as raising.  The clear-before / check-after protocol brackets every call-shaped opcode inside a drive, so the channel cannot go stale within one; what no bracket covers is the window between phases, where a residual raise's leftover value is still in TLS when the next drive starts and a drive entered with `raising_exception == false` seeds `exception_last_value` from its own argument instead.  Clearing the channel on entry is not the fix — `call_jit.rs` deliberately keeps a pending value across its decline path — so this reports the disagreement rather than repairing it.
+- Retirement condition: Remove once the inter-phase window is either measured to be unobservable, or closed by a bracket that spans it, so the disagreement has no producer left.
+
 ### `MAJIT_BH_NULL_ARG`
 
 - Read sites: 1 — `majit/majit-metainterp/src/blackhole.rs`
 - Accessor: `bh_null_arg_report()`
 - What it does: `MAJIT_BH_NULL_ARG`: report a null ref argument about to be handed to a residual call, with the jitcode coordinate, before the callee can dereference it.  Some ABIs pass a legitimate null sentinel (e.g. the CallFn `null_or_self` slot), so this reports rather than aborts.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
+
+### `MAJIT_BH_PORTAL_SUBST`
+
+- Read sites: 1 — `majit/majit-metainterp/src/blackhole.rs`
+- Accessor: `portal_substitution_report()`, called from `portal_dispatch_for()`
+- What it does: `MAJIT_BH_PORTAL_SUBST`: name each recursive portal level that re-enters through a runner its own driver did not register.  `pyre_portal_runner` reads `all_r[1]` as a `PyFrame*`, so a substituted runner reached with another driver's reds is a type confusion that would surface as a bug in the substituted driver.  It is not reported as a fault because pyre registers one runner for many drivers by construction, so this makes the substitutions countable — separating the set that actually re-enters a portal from the set that merely resolves a hook it never calls.
+- Retirement condition: Remove when every portal driver index registers its own runner, so a substitution becomes a fault the dispatch path can refuse outright rather than a counted norm.
+
+### `MAJIT_BH_VABLE_INTBASE`
+
+- Read sites: 1 — `majit/majit-metainterp/src/blackhole.rs`
+- Accessor: `bh_vable_intbase_report()`, called from the `getfield_vable_i` / `setfield_vable_i` / `setfield_vable_r` intbase handlers
+- What it does: `MAJIT_BH_VABLE_INTBASE`: report a vable base read out of the int bank that disagrees with the rooted `virtualizable_ptr`.  The `*_vable_*_intbase` handlers take their struct operand from `registers_i`, and no walker forwards the int banks — only `registers_r`, the packed resume roots, and `virtualizable_ptr` are — so a collection between the write of that int register and the handler leaves the address pointing where the object used to be.  `virtualizable_ptr` names the same object and is forwarded, so the two disagreeing is the observable form of that staleness.  Reported rather than repaired: the vable bytecodes are operand-addressed by design, and substituting the rooted address would change which object a multi-virtualizable chain writes to.
+- Retirement condition: Remove when the int banks are forwarded by the walkers, or the vable handlers take their base from a rooted operand, so a stale intbase cannot be produced.
 
 ### `MAJIT_BRIDGE_BAIL`
 

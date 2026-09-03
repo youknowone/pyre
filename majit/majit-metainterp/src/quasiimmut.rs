@@ -56,9 +56,18 @@ pub fn do_force_quasi_immutable(
         return;
     }
     let hook = FORCE_QUASI_IMMUTABLE.load(Ordering::Acquire);
-    if hook == 0 {
-        return;
-    }
+    // Reaching here means the codewriter emitted `jit_force_quasi_immutable`
+    // and the blackhole executed it, so the frontend is one that needs the
+    // hook.  Returning quietly would skip the invalidation upstream always
+    // performs, leaving every loop that folded a read of this field compiled
+    // against a value the store just changed — a wrong answer with nothing to
+    // trace it back to.
+    assert!(
+        hook != 0,
+        "jit_force_quasi_immutable executed with no host invalidation routine: \
+         call `set_force_quasi_immutable_hook` before running a jitcode that \
+         emits it",
+    );
     let field_addr = struct_ptr.wrapping_add(mutatefielddescr.as_offset() as i64);
     // Safety: the only stored values come from a `ForceQuasiImmutable`
     // function pointer in `set_force_quasi_immutable_hook`.

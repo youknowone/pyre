@@ -7737,10 +7737,24 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // the collector, so forward every populated color until the walk-end
     // handler takes the latch. The adopters bridge the pre-drive publication
     // window and the blackhole drivers then install their own packed roots.
+    //
+    // A `MIFrame` stores each Ref register twice — the `OpRef` box and the
+    // `ref_values` concrete mirror — and the two are kept fresh by two
+    // different walkers.  `MetaInterp::walk_active_trace_refs` forwards the
+    // boxes while a trace is being recorded; once the frames are latched here
+    // that walker no longer reaches them, so both halves are forwarded below.
+    // Forwarding only the mirror leaves whichever half a future reader picks
+    // deciding whether it sees a moved object, which is not a property a
+    // reader can check.
     let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
     if let Some(latched) = single_frame_blackhole.as_mut() {
         for value in latched.miframe.ref_values.iter_mut().flatten() {
             visitor(unsafe { &mut *(value as *mut i64).cast() });
+        }
+        for slot in latched.miframe.ref_regs.iter_mut() {
+            if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
+                visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
+            }
         }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
@@ -7762,6 +7776,12 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         for frame in latched.framestack.frames.iter_mut() {
             for value in frame.ref_values.iter_mut().flatten() {
                 visitor(unsafe { &mut *(value as *mut i64).cast() });
+            }
+            // Both halves, for the reason the single-frame arm gives.
+            for slot in frame.ref_regs.iter_mut() {
+                if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
+                    visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
+                }
             }
         }
         if latched.last_exc_value != 0 {
