@@ -215,20 +215,19 @@ fn register_atfork_child_handler() {}
 
 /// `rpy_init_mutexes`, reached as the `pthread_atfork` child arm.
 ///
-/// Runs before any pyre code in the child — including `StwGuard::drop`, which
-/// locks `gc_sync`'s quiescence mutex on the way out of the very STW window the
-/// `os.fork()` was taken inside, and so would block there long before any
-/// after-fork hook could repair anything.  Writes only: an atfork handler must
-/// take no lock and allocate nothing.
+/// Runs before any pyre code in the child, which is what [`after_fork_child`]
+/// cannot do: that one is reached from `reinit_threads`, and a fork taken
+/// anywhere else — `_posixsubprocess.fork_exec`, or a library that forks on its
+/// own — never reaches it at all.  Writes only: an atfork handler must take no
+/// lock and allocate nothing.
+///
+/// Scope is upstream's: the two GIL mutexes.  `gc_sync`'s quiescence mutex is
+/// not in it, because `fork_under_stw` already holds that one across the fork,
+/// so the child inherits it owned by the one thread that survived.
 #[cfg(unix)]
 unsafe extern "C" fn atfork_child_reinit_mutexes() {
     init_mutexes();
     RPY_WAITING_THREADS.store(0, Ordering::SeqCst);
-    // pyre-only, and here for upstream's reason rather than by analogy:
-    // `gc_sync`'s quiescence mutex is taken outside the GIL by `register_thread`,
-    // by `unregister_thread`, and by the park/unpark pair around every external
-    // call, so a fork can copy it locked exactly as it can these two.
-    crate::gc_sync::init_quiesce_mutex();
 }
 
 /// Whether [`allocate`] has run, i.e. whether this process has a GIL at all.

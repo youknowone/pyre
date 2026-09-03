@@ -74,11 +74,7 @@ pub struct GcSync {
     /// RUNNING registered-mutator count. A thread waiting for the GIL removes
     /// itself for the wait, so a collector — which holds the GIL — can drain
     /// every other mutator while remaining counted itself.
-    ///
-    /// Behind a cell for the same reason `rgil`'s `GilMutexCell` is: the child
-    /// of a `fork()` has to be able to REPLACE this mutex.  See
-    /// [`init_quiesce_mutex`].
-    quiesce: QuiesceCell,
+    quiesce: Mutex<QuiesceState>,
     /// Signalled whenever RUNNING decreases toward the collector-inclusive
     /// drain target (one when the collector is counted, otherwise zero).
     quiesced: Condvar,
@@ -93,53 +89,14 @@ struct QuiesceState {
     running: usize,
 }
 
-struct QuiesceCell(UnsafeCell<Mutex<QuiesceState>>);
-
-// SAFETY: the contents are `Sync`; the cell exists only so that
-// `init_quiesce_mutex` can replace them in a forked child, where the calling
-// thread is the only one alive.
-unsafe impl Sync for QuiesceCell {}
-
 static GC_SYNC: GcSync = GcSync {
     install_mutex: Mutex::new(()),
     stw_requested: AtomicBool::new(false),
-    quiesce: QuiesceCell(UnsafeCell::new(Mutex::new(QuiesceState { running: 0 }))),
+    quiesce: Mutex::new(QuiesceState { running: 0 }),
     quiesced: Condvar::new(),
     resumed: Condvar::new(),
     stw_generation: AtomicUsize::new(0),
 };
-
-#[inline]
-fn quiesce() -> &'static Mutex<QuiesceState> {
-    // SAFETY: only `init_quiesce_mutex` ever writes, and only in a forked
-    // child before any other thread exists.
-    unsafe { &*GC_SYNC.quiesce.0.get() }
-}
-
-/// `rpy_init_mutexes`, for the quiescence mutex.
-///
-/// `mutex1_init` is a `pthread_mutex_init` call, which resets an already-locked
-/// mutex and abandons whatever state it held; replacing the whole `Mutex` is
-/// the same act.  Nothing is lost: [`after_fork_child`] overwrites `running`
-/// from the surviving thread's own census bits anyway.
-///
-/// This is needed because a `fork()` can copy the mutex LOCKED.  The forking
-/// thread does not hold it — `quiesce_mutators` drops its guard before
-/// `collect_fn` runs — but eight lockers take it OUTSIDE the GIL, so the STW
-/// bracket does not exclude them: `register_thread` locks before
-/// `rgil::acquire_maybe_in_new_thread`, `unregister_thread` releases the GIL
-/// first, and the park/unpark pair around every external call is the GIL
-/// release itself.
-pub(crate) fn init_quiesce_mutex() {
-    // SAFETY: reached only from the surviving thread of a `fork()`, which is
-    // the child's only thread, so no reference into the old value is live.
-    unsafe {
-        std::ptr::write(
-            GC_SYNC.quiesce.0.get(),
-            Mutex::new(QuiesceState { running: 0 }),
-        )
-    };
-}
 
 // ──────────────────────────────────────────────────────────────
 // Singleton management
@@ -303,7 +260,7 @@ pub fn register_thread() {
         FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
     }
 
-    let mut state = quiesce().lock().unwrap();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     state = GC_SYNC
         .resumed
         .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
@@ -353,7 +310,7 @@ pub fn unregister_thread() {
     if crate::rgil::am_i_holding_the_gil() {
         crate::rgil::release();
     }
-    let mut state = quiesce().lock().unwrap();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     // A thread that came in through `register_thread_parked` sits outside the
     // census between callbacks, so there is nothing to subtract for it.
     if GC_THREAD.with(|t| t.running.replace(false)) {
@@ -413,7 +370,7 @@ impl Drop for BlockingGuard {
         if !self.left_census {
             return;
         }
-        let mut state = quiesce().lock().unwrap();
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
         state = GC_SYNC
             .resumed
             .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
@@ -443,7 +400,7 @@ pub fn before_external_block() -> BlockingGuard {
     // leave, and nothing to rejoin when it ends.
     let left_census = GC_THREAD.with(|t| t.registered.get() && t.running.get());
     if left_census {
-        let mut state = quiesce().lock().unwrap();
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
         GC_THREAD.with(|t| t.running.set(false));
         state.running = state
             .running
@@ -461,7 +418,7 @@ pub fn before_external_block() -> BlockingGuard {
 impl Drop for CallbackGuard {
     fn drop(&mut self) {
         if self.rejoined {
-            let mut state = quiesce().lock().unwrap();
+            let mut state = GC_SYNC.quiesce.lock().unwrap();
             assert!(
                 GC_THREAD.with(|t| t.running.replace(false)),
                 "GC mutator left an external callback twice"
@@ -488,7 +445,7 @@ pub fn enter_external_callback() -> CallbackGuard {
     let running = GC_THREAD.with(|t| t.running.get());
     let mut rejoined = false;
     if registered && !running {
-        let mut state = quiesce().lock().unwrap();
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
         state = GC_SYNC
             .resumed
             .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
@@ -514,7 +471,7 @@ pub(crate) fn leave_running_for_gil() -> GilCensus {
     if !GC_THREAD.with(|t| t.registered.get() && t.running.get()) {
         return GilCensus { rejoin: false };
     }
-    let mut state = quiesce().lock().unwrap();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     GC_THREAD.with(|t| t.running.set(false));
     state.running = state
         .running
@@ -531,7 +488,7 @@ pub(crate) fn rejoin_running_after_gil(census: GilCensus) {
     if !census.rejoin {
         return;
     }
-    let mut state = quiesce().lock().unwrap();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     debug_assert!(
         !GC_SYNC.stw_requested.load(Ordering::Acquire),
         "the GIL was acquired while a collector was draining mutators"
@@ -572,11 +529,6 @@ pub fn after_fork_child() {
     // `fork()` runs inside `request_stw`, so this thread held the GIL across
     // it and still does; only the queue behind it has to be rebuilt.
     crate::rgil::after_fork_child();
-    // `rgil`'s `pthread_atfork` child arm has already done both of these on
-    // the way out of `fork()`.  Repeat them for the process that never reached
-    // `rgil::allocate` and so registered no handler; the child is still its own
-    // only thread, and `running` is set from this thread's census bits below.
-    init_quiesce_mutex();
     STW_OWNER.store(0, Ordering::SeqCst);
     STW_DEPTH.store(0, Ordering::SeqCst);
     GC_SYNC.stw_requested.store(false, Ordering::Release);
@@ -585,7 +537,7 @@ pub fn after_fork_child() {
     // that did not survive the fork has no dispatch loop left to raise it in
     // the child.
     majit_ir::eval_breaker_word::memory_error_after_fork_child();
-    let mut state = quiesce().lock().unwrap();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     state.running = usize::from(registered && running);
     GC_SYNC.stw_generation.fetch_add(1, Ordering::SeqCst);
     GC_SYNC.resumed.notify_all();
@@ -698,7 +650,7 @@ pub fn quiesce_mutators() -> StwGuard {
         };
     }
 
-    let mut state = quiesce().lock().unwrap();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     GC_SYNC.stw_requested.store(true, Ordering::Release);
     majit_ir::eval_breaker_word::set_stw();
 
@@ -739,7 +691,7 @@ impl Drop for StwGuard {
         assert_eq!(remaining, 0, "outer STW guard dropped before nested guard");
         STW_OWNER.store(0, Ordering::Release);
 
-        let _state = quiesce().lock().unwrap();
+        let _state = GC_SYNC.quiesce.lock().unwrap();
         GC_SYNC.stw_requested.store(false, Ordering::Release);
         majit_ir::eval_breaker_word::clear_stw();
         GC_SYNC.stw_generation.fetch_add(1, Ordering::Release);
@@ -846,7 +798,7 @@ fn park_until_stw_done() {
         return;
     }
 
-    let mut state = quiesce().lock().unwrap();
+    let mut state = GC_SYNC.quiesce.lock().unwrap();
     if !GC_SYNC.stw_requested.load(Ordering::Acquire) {
         return;
     }
@@ -1449,139 +1401,5 @@ mod tests {
         blocking(|| worker.join()).unwrap();
         unregister_test_mutator();
         assert_eq!(registered_threads(), 0);
-    }
-
-    /// `RPyGilAllocate` hands `rpy_init_mutexes` to `pthread_atfork` as the
-    /// CHILD handler precisely because a mutex can be copied LOCKED by a thread
-    /// that does not exist in the child.  `quiesce` needs the same
-    /// treatment: `quiesce_mutators` releases it before `collect_fn` runs —
-    /// which is where `os.fork()` sits — and eight lockers take it outside the
-    /// GIL, so the STW bracket does not exclude them.
-    ///
-    /// The fork is taken INSIDE `request_stw`, as production does, because the
-    /// first thing the child touches is not an after-fork hook: it is
-    /// `StwGuard::drop`, which locks `quiesce` on the way out of that same
-    /// window.  A test that forks with no live guard passes without the
-    /// `pthread_atfork` registration and proves nothing.
-    ///
-    /// The name must not sort ahead of [`entry_only_safepoint_preserves_fresh_gc_op_return`]:
-    /// see [`ensure_gc`] for the ordering contract this whole `--ignored` set
-    /// runs under.
-    #[test]
-    #[cfg(unix)]
-    #[ignore = "requires exclusive process — forks, and registers process-global mutators"]
-    fn quiesce_mutex_taken_during_stw_does_not_wedge_the_forked_child() {
-        use std::sync::atomic::AtomicBool;
-
-        static PARKED: AtomicBool = AtomicBool::new(false);
-        static PARK_DONE: AtomicBool = AtomicBool::new(false);
-        static TAKE: AtomicBool = AtomicBool::new(false);
-        static HELD: AtomicBool = AtomicBool::new(false);
-        static RELEASE: AtomicBool = AtomicBool::new(false);
-        static RELEASED: AtomicBool = AtomicBool::new(false);
-
-        ensure_gc();
-        // `RPyGilAllocate` is what registers the child handler.
-        crate::rgil::allocate();
-        register_test_mutator();
-
-        // A second registered mutator, parked.  Without it `stw_required()` is
-        // false, `quiesce_mutators` hands back an inactive guard, and
-        // `StwGuard::drop` locks nothing — the ordering under test disappears.
-        let parked = std::thread::spawn(|| {
-            register_test_mutator();
-            let blocked = before_external_block();
-            PARKED.store(true, Ordering::Release);
-            while !PARK_DONE.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            drop(blocked);
-            unregister_test_mutator();
-        });
-        // Releasing the GIL is not optional: `register_thread` takes it, and
-        // this thread has held it since its own `register_test_mutator`.
-        blocking(|| {
-            while !PARKED.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-        });
-
-        // Unregistered, and that is the point: it stands for any thread that
-        // locks `quiesce` outside the GIL while the collector owns STW.
-        let holder = std::thread::spawn(|| {
-            while !TAKE.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            let guard = quiesce().lock().unwrap();
-            HELD.store(true, Ordering::Release);
-            while !RELEASE.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            drop(guard);
-            RELEASED.store(true, Ordering::Release);
-        });
-
-        let mut child_pid = -1;
-        let mut in_child = false;
-        request_stw(|_| {
-            TAKE.store(true, Ordering::Release);
-            while !HELD.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            // SAFETY: the child only returns from this closure and `_exit`s.
-            let pid = unsafe { libc::fork() };
-            assert!(pid >= 0, "fork() failed");
-            if pid == 0 {
-                in_child = true;
-                return;
-            }
-            child_pid = pid;
-            RELEASE.store(true, Ordering::Release);
-            while !RELEASED.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-        });
-
-        // Reaching here in the child means `StwGuard::drop` got `quiesce` back.
-        if in_child {
-            after_fork_child();
-            // SAFETY: the child must not run the harness's own teardown.
-            unsafe { libc::_exit(0) };
-        }
-
-        PARK_DONE.store(true, Ordering::Release);
-        holder.join().unwrap();
-        blocking(|| parked.join()).unwrap();
-
-        let mut status: libc::c_int = 0;
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        let mut reaped = false;
-        while std::time::Instant::now() < deadline {
-            // SAFETY: `child_pid` is this process's own child.
-            let seen = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
-            if seen == child_pid {
-                reaped = true;
-                break;
-            }
-            assert!(seen == 0, "waitpid failed for child {child_pid}");
-            blocking(|| std::thread::sleep(Duration::from_millis(10)));
-        }
-        if !reaped {
-            // SAFETY: `child_pid` is this process's own child, still alive.
-            unsafe {
-                libc::kill(child_pid, libc::SIGKILL);
-                libc::waitpid(child_pid, &mut status, 0);
-            }
-        }
-        unregister_test_mutator();
-        assert!(
-            reaped,
-            "the forked child never came back out of the STW window: it inherited \
-             `quiesce` locked by a thread that does not exist there"
-        );
-        assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "child exited abnormally: status {status}"
-        );
     }
 }
