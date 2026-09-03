@@ -156,6 +156,22 @@ pub fn field_offset_from_bh(descr: &crate::blackhole::BhDescr, site: &str) -> us
     }
 }
 
+/// The heapcache's field key, or `None` for a descr that has none.
+///
+/// `heapcache.get_field_updater(box, fielddescr)` keys the per-box field
+/// cache on the descr object itself, so two fields of one struct can never
+/// share an entry.  The key here is `DescrRef::index()`, a `u32` whose
+/// unassigned answer is the `u32::MAX` sentinel (`descr.rs`) — one key
+/// standing for every field of every struct, which is an alias and not a
+/// cache.  The production codewriter numbers every field descr it mints
+/// (`call.rs get_field_descr`, on the parent-list hit and on the mint
+/// alike), so only a hand-assembled jitcode reaches the sentinel; those go
+/// uncached rather than sharing a slot.
+fn heapcache_field_key(fielddescr: &majit_ir::DescrRef) -> Option<u32> {
+    let index = fielddescr.index();
+    (index != u32::MAX).then_some(index)
+}
+
 pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_ir::DescrRef) {
     match descr {
         crate::blackhole::BhDescr::Field {
@@ -4214,7 +4230,7 @@ where
                     }
                     _ => self.read_int_reg(value_reg),
                 };
-                let field_index = fielddescr.index();
+                let field_key = heapcache_field_key(&fielddescr);
                 // `_record_helper` runs `heapcache.invalidate_caches` before it
                 // appends. `clear_caches_not_necessary` lists SETFIELD_GC, so
                 // only the mark-escaped half runs: a ref written into an
@@ -4237,7 +4253,9 @@ where
                 // `execute_setfield_gc`'s trailing `heapcache.setfield`, which
                 // `_opimpl_setfield_gc_any` spells `upd.setfield(valuebox)`.
                 // The cache stores the Box identity, not the value word.
-                ctx.heapcache_setfield_cached(struct_opref, field_index, value_opref);
+                if let Some(field_key) = field_key {
+                    ctx.heapcache_setfield_cached(struct_opref, field_key, value_opref);
+                }
                 if struct_ptr != 0 {
                     // blackhole.py:1471-1483 stores through the fielddescr,
                     // which carries the field's byte width, and the getfield
@@ -4548,18 +4566,75 @@ where
                 // real load, and `llmodel.py protect_speculative_field` rejects
                 // a null gcptr before any fold — the executor row would
                 // dereference it.
-                let op = ctx.execute_and_record(
-                    Some(self.cpu.as_ref()),
-                    kind,
-                    Some(fielddescr),
-                    &[struct_opref],
-                    (struct_ptr != 0).then_some(value),
-                    self.last_exception_value,
-                );
-                if is_ref {
-                    self.set_ref_reg(dest, Some(op), Some(loaded));
+                // `_opimpl_getfield_gc_any_pureornot` opens on
+                // `upd = heapcache.get_field_updater(box, fielddescr)` and
+                // returns `upd.currfieldbox` without recording when the cache
+                // answers; only the miss path reaches `execute_with_descr`,
+                // and it stores the result back with
+                // `upd.getfield_now_known(resbox)`.  The sibling
+                // `BC_GETARRAYITEM_GC_*` arms carry both halves already, and
+                // `BC_SETFIELD_GC` fills this very cache — without the two
+                // halves here that cache is written and never read.
+                //
+                // The `is_always_pure() and isinstance(box, ConstPtr)` bypass
+                // `opimpl_getfield_gc_{i,r}` runs ahead of the updater is not
+                // spelled separately: the fold it performs lives inside
+                // `execute_and_record` (`is_pure_with_descr` admits
+                // GETFIELD_GC only through `descr.is_always_pure()`), which
+                // the miss path below routes through.  A cached const-struct
+                // pure field answers from the cache instead of re-folding —
+                // same value, and neither spelling records an operation.
+                let field_key = heapcache_field_key(&fielddescr);
+                let cached =
+                    field_key.and_then(|key| ctx.heapcache_getfield_cached(struct_opref, key));
+                let (op, reg_concrete) = if let Some(cached) = cached {
+                    // `profiler.count_ops(rop.GETFIELD_GC_I,
+                    // Counters.HEAPCACHED_OPS)` — folded-away op
+                    // accounting on the cache hit.
+                    ctx.profiler()
+                        .count_ops(kind, crate::pyjitpl::counters::HEAPCACHED_OPS);
+                    // The sanity check compares the freshly executed load
+                    // against the cached box's own payload
+                    // (`currfieldbox.getint()` / `.getref_base()`), read
+                    // here through `box_value` — the const pool,
+                    // standard-virtualizable shadow and frontend value
+                    // slot composed into one answer.  A `None` payload is
+                    // an entry seeded without a live concrete and skips
+                    // the check.  A null struct fabricated `loaded` rather
+                    // than reading, so it has nothing to compare either.
+                    let expected = match ctx.box_value(cached) {
+                        Some(Value::Int(n)) => Some(n),
+                        Some(Value::Ref(r)) => Some(r.0 as i64),
+                        _ => None,
+                    };
+                    debug_assert!(
+                        struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
+                        "_opimpl_getfield_gc_any_pureornot sanity check ({}): \
+                             loaded {loaded} != cached {expected:?} \
+                             (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
+                        if is_ref { "ref" } else { "int" },
+                    );
+                    // The cached box is returned even on a mismatch, so
+                    // the register takes its payload, not the fresh load.
+                    (cached, expected.unwrap_or(loaded))
                 } else {
-                    self.set_int_reg(dest, Some(op), Some(loaded));
+                    let op = ctx.execute_and_record(
+                        Some(self.cpu.as_ref()),
+                        kind,
+                        Some(fielddescr),
+                        &[struct_opref],
+                        (struct_ptr != 0).then_some(value),
+                        self.last_exception_value,
+                    );
+                    if let Some(field_key) = field_key {
+                        ctx.heapcache_getfield_now_known(struct_opref, field_key, op);
+                    }
+                    (op, loaded)
+                };
+                if is_ref {
+                    self.set_ref_reg(dest, Some(op), Some(reg_concrete));
+                } else {
+                    self.set_int_reg(dest, Some(op), Some(reg_concrete));
                 }
             }
             jitcode::insns::BC_GETFIELD_GC_F | jitcode::insns::BC_GETFIELD_GC_F_PURE => {
@@ -4589,17 +4664,48 @@ where
                 } else {
                     0
                 };
-                // See the `BC_GETFIELD_GC_I` arm on the descr gate and the
-                // null case.
-                let op = ctx.execute_and_record(
-                    Some(self.cpu.as_ref()),
-                    OpCode::GetfieldGcF,
-                    Some(fielddescr),
-                    &[struct_opref],
-                    (struct_ptr != 0).then_some(Value::Float(f64::from_bits(loaded as u64))),
-                    self.last_exception_value,
-                );
-                self.set_float_reg(dest, Some(op), Some(loaded));
+                // See the `BC_GETFIELD_GC_I` arm on the descr gate, the null
+                // case, and the two heapcache halves
+                // `_opimpl_getfield_gc_any_pureornot` brackets the load with.
+                // The float sanity check is the one upstream spells
+                // `ConstFloat(resvalue).same_constant(upd.currfieldbox
+                // .constbox())` rather than `==`, so that two NaNs compare
+                // equal; comparing the raw bit patterns is that same
+                // predicate, and `loaded` is already the bits.
+                let field_key = heapcache_field_key(&fielddescr);
+                let cached =
+                    field_key.and_then(|key| ctx.heapcache_getfield_cached(struct_opref, key));
+                let (op, reg_concrete) = if let Some(cached) = cached {
+                    ctx.profiler().count_ops(
+                        OpCode::GetfieldGcF,
+                        crate::pyjitpl::counters::HEAPCACHED_OPS,
+                    );
+                    let expected = match ctx.box_value(cached) {
+                        Some(Value::Float(f)) => Some(f.to_bits() as i64),
+                        _ => None,
+                    };
+                    debug_assert!(
+                        struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
+                        "_opimpl_getfield_gc_any_pureornot sanity check (float): \
+                             loaded {loaded:#x} != cached {expected:?} \
+                             (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
+                    );
+                    (cached, expected.unwrap_or(loaded))
+                } else {
+                    let op = ctx.execute_and_record(
+                        Some(self.cpu.as_ref()),
+                        OpCode::GetfieldGcF,
+                        Some(fielddescr),
+                        &[struct_opref],
+                        (struct_ptr != 0).then_some(Value::Float(f64::from_bits(loaded as u64))),
+                        self.last_exception_value,
+                    );
+                    if let Some(field_key) = field_key {
+                        ctx.heapcache_getfield_now_known(struct_opref, field_key, op);
+                    }
+                    (op, loaded)
+                };
+                self.set_float_reg(dest, Some(op), Some(reg_concrete));
             }
             jitcode::insns::BC_SETFIELD_VABLE_I => {
                 let (opcode_pc, vable_reg, field_idx, src) = {
@@ -13419,6 +13525,76 @@ mod tests {
         });
         assert_eq!(sf_i, Some((0, true)));
         assert_eq!(sf_r, Some((1, true)));
+    }
+
+    /// Stamp each descr-pool entry with its own slot number, the way the
+    /// production codewriter numbers every field descr it mints
+    /// (`call.rs get_field_descr`).
+    ///
+    /// `add_bh_descr` already dedups structurally, so a field named by both a
+    /// store and a load shares one pool entry and therefore one number —
+    /// which is the property `heapcache.get_field_updater(box, fielddescr)`
+    /// gets for free by keying on the descr object itself.  Without this a
+    /// hand-assembled jitcode leaves every descr at the `u32::MAX` sentinel
+    /// and `heapcache_field_key` declines, so nothing caches.
+    fn number_the_descrs(jitcode: &JitCode) {
+        for (slot, entry) in jitcode.exec.descrs.iter().enumerate() {
+            if let Some(descr) = entry.as_optimizer_descr() {
+                descr.set_index(slot as u32);
+            }
+        }
+    }
+
+    /// A field the trace has already stored answers from the heapcache.
+    ///
+    /// `_opimpl_getfield_gc_any_pureornot` returns `upd.currfieldbox` and
+    /// records nothing when the updater has a value, and
+    /// `_opimpl_setfield_gc_any`'s `upd.setfield(valuebox)` is what puts one
+    /// there.  Same jitcode as
+    /// `jitcode_new_then_field_round_trip_records_setfield_getfield` above,
+    /// which holds the shape an unnumbered descr pool gets: there both reads
+    /// record, here both are folded away.  The registers still answer, and
+    /// they answer with the stored box rather than a second load.
+    #[test]
+    fn a_stored_field_answers_from_the_heapcache_and_records_no_getfield() {
+        // Its own type id and field names: `field_descr_ref_from_bh` answers
+        // out of `gc_cache()._cache_field`, which is process-wide and keyed by
+        // `(LLType::Struct(type_id), fieldname)`.  Numbering the descrs of a
+        // struct a sibling test also names would number that test's descrs
+        // too, and the sibling above exists precisely to hold the unnumbered
+        // shape.
+        let mut builder = JitCodeBuilder::new();
+        builder.new_struct(
+            0,
+            16,
+            0xCE,
+            false,
+            &[
+                (0, false, "cached_value", 8, true),
+                (8, true, "cached_next", 8, false),
+            ],
+            "",
+        );
+        builder.load_const_i_value(0, 99);
+        builder.setfield_gc_i(0, 0, 0, 0xCE, "cached_value");
+        builder.setfield_gc_r(0, 0, 8, 0xCE, "cached_next");
+        builder.getfield_gc_i(1, 0, 0, 0xCE, "cached_value");
+        builder.getfield_gc_r(1, 0, 8, 0xCE, "cached_next");
+        let jitcode = builder.finish();
+        number_the_descrs(&jitcode);
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
+        assert!(matches!(action, TraceAction::Continue));
+
+        let recorder = ctx.into_recorder();
+        let opcodes: Vec<_> = recorder.ops().iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![OpCode::New, OpCode::SetfieldGc, OpCode::SetfieldGc],
+            "both GETFIELD_GC reads should have come from the heapcache",
+        );
     }
 
     /// `_record_helper` counts what it appends and `execute_and_record`
