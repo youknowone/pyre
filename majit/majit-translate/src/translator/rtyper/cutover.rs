@@ -1038,14 +1038,14 @@ fn switch_discriminant_read_vars(graph: &LegacyGraph) -> std::collections::HashS
 /// Results of a variant-payload `FieldRead` whose *only* op consumer is the
 /// value position of a `FieldWrite` — the extract-then-repack of an
 /// identity `match` re-wrap (`match step { Return(v) => Ok(Return(v)),
-/// CloseLoop { jump_args, loop_header_pc } => Ok(CloseLoop { .. }), … }`,
-/// `pyopcode.rs:1945`).  Each arm reads the incoming variant's payload
+/// CloseLoop { loop_header_pc } => Ok(CloseLoop { .. }), … }`,
+/// `pyopcode.rs`).  Each arm reads the incoming variant's payload
 /// (`FieldRead("__pos_0" | "loop_header_pc", owner = StepResult::Variant)`)
 /// and immediately writes it into a freshly-built outgoing variant
-/// (`FieldWrite(_, owner = StepResult<…>::Variant)`).  Rust tuple variants
-/// can rename the storage field while preserving the value — notably
-/// `Option::Some.__pos_0` → `StepResult::CloseLoop.jump_args` — so field-name
-/// equality is not part of the identity relation.
+/// (`FieldWrite(_, owner = StepResult<…>::Variant)`).  A tuple variant names
+/// its storage by position, so a re-wrap that carries a value between
+/// differently-shaped variants does not preserve the field name; field-name
+/// equality is therefore not part of the identity relation.
 ///
 /// The real path lowers the enclosing `Result` through the uniform
 /// exception-transform (`front/result_exc.rs`), which recognises the `Ok(step)`
@@ -5497,7 +5497,7 @@ mod tests {
     }
 
     /// Build a single block that reads `base.field` into `pay` and, when
-    /// `repack` is set, writes `pay` into `dst.jump_args` (the extract→repack
+    /// `repack` is set, writes `pay` into `dst.payload` (the extract→repack
     /// of an identity `match` re-wrap).  With `repack=false` the read result
     /// is instead fed to a `Call` (a genuine consumer), so it is NOT a repack
     /// payload.
@@ -5531,7 +5531,7 @@ mod tests {
                 kind: crate::model::OpKind::FieldWrite {
                     base: dst.clone(),
                     field: crate::model::FieldDescriptor {
-                        name: "jump_args".to_string(),
+                        name: "payload".to_string(),
                         owner_root: Some(
                             "pyre_interpreter::pyopcode::StepResult<*mut PyObject>::CloseLoop"
                                 .to_string(),

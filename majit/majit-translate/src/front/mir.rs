@@ -1845,10 +1845,10 @@ fn derive_program_metadata(
                 // every such enum instead of the two that were noticed.
                 //
                 // `pyre_interpreter::pyopcode::StepResult` — what every opcode
-                // handler returns — is one of them.  Charon gives
-                // `CloseLoop.jump_args` and `Return.__pos_0` offset 0, the tag's
-                // own offset, so `close_loop`'s jitcode stamped discriminant 2
-                // and then overwrote it with `jump_args`; `execute_jump_backward`
+                // handler returns — is one of them.  Charon gave `CloseLoop`'s
+                // payload field and `Return.__pos_0` offset 0, the tag's own
+                // offset, so `close_loop`'s jitcode stamped discriminant 2 and
+                // then overwrote it with the payload; `execute_jump_backward`
                 // read the null back as tag 0 and reported `Continue`, and the
                 // portal took its `Continue` arm on every back edge.  A walk of
                 // the portal could therefore never reach `loop_header`, and no

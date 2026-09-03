@@ -2598,11 +2598,7 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
         // Mirrors interp_jit.py dispatch (`set_last_instr_from_next_instr`).
         frame.set_last_instr_from_next_instr(fallthrough);
         match execute_opcode_step(frame, code, instruction, op_arg, fallthrough) {
-            Ok(StepResult::Continue)
-            | Ok(StepResult::CloseLoop {
-                jump_args: _,
-                loop_header_pc: _,
-            }) => {
+            Ok(StepResult::Continue) | Ok(StepResult::CloseLoop { loop_header_pc: _ }) => {
                 next_instr = frame.next_instr();
             }
             Ok(StepResult::Return(result)) => return Ok(result),
@@ -3696,7 +3692,6 @@ impl ControlFlowOpcodeHandler for PyFrame {
         // Signal a back-edge to the main eval_loop, which handles
         // JIT counting and compiled code execution via try_back_edge_jit.
         Ok(StepResult::CloseLoop {
-            jump_args: None,
             loop_header_pc: target,
         })
     }
