@@ -224,28 +224,29 @@ tempfile = "3"
 walkdir = "2"
 insta = "1"
 
-# xz-core 0.1.0-rc.0 files its `lzma12_optmap` static initializer in the MSVC
-# `.CRT$XIB` group.  `_initterm_e` walks that table as `int (__cdecl *)(void)`
-# and `__scrt_common_main_seh` returns 255 when an entry reports non-zero, but
-# the initializer's Rust signature returns `()`, so nothing defines the value
-# that is read.  Every pyre invocation on windows-latest exited 255 with empty
-# stdout and stderr.  The fork moves the table to `.CRT$XCU`, which `_initterm`
-# walks as `_PVFV` and whose result is discarded; the change is
-# simnalamburt/xz-rs#20 and this pin drops when it is released.
+# xz-core 0.1.0-rc.0 as published carries two defects.
 #
-# A second defect lives at this rev and is worth fixing before the pin drops:
-# `alone_decoder.rs` validates a picky LZMA-alone dictionary size by smearing
-# `dict_size - 1` down and then adding 1 back.  When the smear saturates to
-# `0xFFFF_FFFF` — `dict_size == 0` is the reachable case — that `+ 1` is an
-# overflow.  The C it ports from wraps, and so does a release build, but a
-# DEBUG build panics "attempt to add with overflow", which takes the whole
+# It files its `lzma12_optmap` static initializer in the MSVC `.CRT$XIB`
+# group.  `_initterm_e` walks that table as `int (__cdecl *)(void)` and
+# `__scrt_common_main_seh` returns 255 when an entry reports non-zero, but the
+# initializer's Rust signature returns `()`, so nothing defines the value that
+# is read: every pyre invocation on windows-latest exited 255 with empty stdout
+# and stderr.
+#
+# And `alone_decoder.rs` validates a picky LZMA-alone dictionary size by
+# smearing `dict_size - 1` down and then adding 1 back.  When the smear
+# saturates to `0xFFFF_FFFF` -- `dict_size == 0` is the reachable case -- that
+# `+ 1` overflows.  The C it ports from wraps, and so does a release build, but
+# a debug build panics "attempt to add with overflow" and takes the whole
 # process down: `test.test_tarfile` dies before its first Lzma test on a debug
-# `pyre`, identically with the JIT on and off, and so do any tarfile classes
-# whose module setup builds an lzma archive.  Release CI never sees it.  The
-# fix is to spell the add as wrapping, matching the surrounding ported
-# arithmetic.
+# `pyre`, identically with the JIT on and off.  Release CI never sees it.
+#
+# simnalamburt/xz-rs#21 fixes both -- the option map is now a compile-time
+# constant, so there is no runtime initializer to place, and the add is
+# spelled wrapping -- and is merged, so the pin follows upstream main until a
+# release carrying it reaches crates.io.
 [patch.crates-io]
-xz-core = { git = "https://github.com/youknowone/xz-rs-simnalamburt", rev = "9c5cc27154e90b48348f713e28ab02bb2c5b52b4" }
+xz-core = { git = "https://github.com/simnalamburt/xz-rs", rev = "5bf95411d0307e052ca2aeb06f0d75565c9a7362" }
 
 # `cargo run --release` is the benchmark/developer performance surface too.
 # Give it the same cross-crate optimization used by distributable binaries;
