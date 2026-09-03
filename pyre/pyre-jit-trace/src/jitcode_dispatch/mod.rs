@@ -11603,8 +11603,26 @@ fn record_portal_debugdata_guard<Sym: WalkSym>(
         // `f_trace` being armed on it afterwards (measured: 6 `line` events
         // for a 10 000-iteration tail).  Guard the slot itself.  The profiling
         // route is why that guard is gated on `ec.w_tracefunc` below rather
-        // than emitted here; what bounds profiling's own event count is a
-        // separate open defect and is not this arm.
+        // than emitted here.  What bounds profiling's own event count is not
+        // this arm, and is no longer open.  Three mechanisms bound it:
+        // `is_being_profiled` is a portal green (`interp_jit.py greens`), so a
+        // profiled activation names a different cell from the one an
+        // unprofiled warm-up filled; `walker_foldable_runtime_helper`
+        // (`residual_call.rs`) answers `RuntimeHelperKind::None` under that
+        // green, so every CALL-family helper stays a residual instead of
+        // folding past its report; and `residual_call_c_profile_frame`
+        // (`call_jit.rs`) reads the PER-FRAME flag live, so a frame
+        // `force_all_frames` marks mid-loop reports from its next residual on
+        // rather than waiting for a re-entry.
+        //
+        // `a_profiler_installed_from_a_call_event_keeps_c_events`
+        // (`pyre/bench/synth`) pins the result as an EXACT per-tail count, not
+        // a floor: `c_call` and `c_return` must each equal the tail and must
+        // grow by the whole difference between two tails, which is what
+        // separates a live bound from a green read once at entry.  Nine
+        // further `setprofile` fixtures beside it cover the frame-identity,
+        // inlined-callee, portal-resume, force-all-frames and call-free-loop
+        // shapes.
         //
         // The non-null half stays a decline rather than a guard, and it is
         // reached: `PYRE_FBW_DEBUG_ABORT` names four `PortalFrameTracerArmed`
