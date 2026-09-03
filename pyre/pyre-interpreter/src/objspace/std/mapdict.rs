@@ -1818,7 +1818,7 @@ unsafe fn load_attr_slowpath(
 pub unsafe fn load_attr_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, MapRef, usize)> {
+) -> Option<(PyObjectRef, u64, MapRef, usize, MapRef)> {
     // mapdict.py:1495 `if map is not None:` — also filters non-instances.
     let map = unsafe { mapdict_map_or_null(w_obj) };
     if map.is_null() {
@@ -1856,7 +1856,31 @@ pub unsafe fn load_attr_fast_path(
     if p.unboxed.is_some() {
         return None;
     }
-    Some((w_type, version_tag, map, p.storageindex))
+    Some((w_type, version_tag, map, p.storageindex, attr))
+}
+
+/// mapdict.py `AbstractAttribute.read`:
+///
+/// ```python
+/// if (jit.isconstant(attr) and jit.isconstant(obj) and not attr.ever_mutated):
+///     return attr._pure_direct_read(obj)
+/// else:
+///     return attr._direct_read(obj)
+/// ```
+///
+/// The `jit.isconstant(obj)` half is the caller's to answer — it holds the
+/// receiver operand.  `attr` is constant on every path that resolved it against
+/// a pinned map.  This answers the remaining half and hands back the
+/// `PlainAttribute` whose `ever_mutated?` quasi-immutable licenses the elidable
+/// read, so the caller can record the field before baking the value in.
+/// `None` means the attribute has been written or deleted since it was added
+/// and only `_direct_read` is sound.
+///
+/// # Safety
+/// `attr` must point to a live `PlainAttribute` map node.
+pub unsafe fn pure_direct_read_attr(attr: MapRef) -> Option<*const PlainAttribute> {
+    let p = unsafe { (*attr).as_plain() };
+    (!p.ever_mutated.get()).then_some(p as *const PlainAttribute)
 }
 
 /// A class attribute that `object.__getattribute__` returns unchanged:
@@ -2314,7 +2338,7 @@ pub unsafe fn property_set_fast_path(
 pub unsafe fn load_attr_unboxed_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, MapRef, usize, usize, UnboxType)> {
+) -> Option<(PyObjectRef, u64, MapRef, usize, usize, UnboxType, MapRef)> {
     // mapdict.py:1495 `if map is not None:` — also filters non-instances.
     let map = unsafe { mapdict_map_or_null(w_obj) };
     if map.is_null() {
@@ -2358,7 +2382,7 @@ pub unsafe fn load_attr_unboxed_fast_path(
     {
         return None;
     }
-    Some((w_type, version_tag, map, p.storageindex, u.listindex, u.typ))
+    Some((w_type, version_tag, map, p.storageindex, u.listindex, u.typ, attr))
 }
 
 /// The STORE_ATTR counterpart of [`load_attr_unboxed_fast_path`].  An

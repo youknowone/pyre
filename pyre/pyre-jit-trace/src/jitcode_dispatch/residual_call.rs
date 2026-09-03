@@ -6107,7 +6107,7 @@ pub(crate) fn try_walker_read_deref_cell<Sym: WalkSym>(
     Ok(Some(value))
 }
 
-fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
+pub(crate) fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     plain: *const pyre_interpreter::objspace::std::mapdict::PlainAttribute,

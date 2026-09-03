@@ -3504,7 +3504,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     }
     // `mapdict.py` resolution, returning the fold ingredients (the
     // read is left to the caller so it can be folded to a guarded inline read).
-    if let Some((w_type, version_tag, map, storageindex)) =
+    if let Some((w_type, version_tag, map, storageindex, attr)) =
         unsafe { pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_obj, name) }
     {
         walker_guard_mapdict_instance_shape(
@@ -3516,6 +3516,39 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             version_tag,
             map,
         )?;
+
+        // mapdict.py `PlainAttribute._pure_direct_read`, the `@jit.elidable`
+        // read `AbstractAttribute.read` picks when the attribute has never been
+        // written since it was added and both it and the receiver are green.
+        // Without it the two loads below stay in the trace and are carried
+        // around the loop as label arguments; the elidable read answers from
+        // the recorded value under the `ever_mutated?` quasi-immutable alone,
+        // which `write` and `delete` both set and whose sweep invalidates the
+        // trace.
+        if obj.is_constant()
+            && let Some(()) = spec_gate(SpecFold::LoadAttrPureRead, || {
+                let Some(plain) =
+                    (unsafe { pyre_interpreter::objspace::std::mapdict::pure_direct_read_attr(attr) })
+                else {
+                    return Ok(None);
+                };
+                walker_pin_plain_ever_mutated(ctx, op_pc, plain)?;
+                let w_value = unsafe {
+                    pyre_interpreter::objspace::std::mapdict::read_boxed_storage(
+                        concrete_obj,
+                        storageindex,
+                    )
+                };
+                // The same forwarding the class-attribute arm below relies on:
+                // `remove_constptrs_in` rewrites the recorded `ConstPtr` to a
+                // `LoadFromGcTable` at emit, so a nursery value folds too.
+                let value = ctx.trace_ctx.const_ref(w_value as i64);
+                write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+                Ok(Some(()))
+            })?
+        {
+            return Ok(Some(()));
+        }
 
         // getfield_gc_r(obj, storage) + getarrayitem_gc_r(block, C_storageindex):
         // the inline value read (`mapdict.py`).  `storageindex` is a green
@@ -4046,7 +4079,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = (unsafe {
+    let Some((w_type, version_tag, map, storageindex, listindex, unbox_type, attr)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(concrete_obj, name)
     }) else {
         return Ok(None);
@@ -4055,6 +4088,22 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     let terminator = unsafe { (*map).terminator() };
     let term = unsafe { (*terminator).as_terminator() as *const _ };
     walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
+
+    // mapdict.py `UnboxedPlainAttribute._pure_direct_read`:
+    // `self._box(self._pure_unboxed_read(obj))` — only the raw longlong read is
+    // `@jit.elidable`, and the boxing stays visible to the trace, so an
+    // immediate numeric consumer still unwraps the constant. Taken when the
+    // attribute has never been written since it was added and the receiver is
+    // green, under the `ever_mutated?` quasi-immutable the elidable read owes.
+    let pure_raw = if obj.is_constant() {
+        spec_gate(SpecFold::LoadAttrPureRead, || {
+            Ok::<_, DispatchError>(unsafe {
+                pyre_interpreter::objspace::std::mapdict::pure_direct_read_attr(attr)
+            })
+        })?
+    } else {
+        None
+    };
 
     // `_prim_direct_read` (mapdict.py) as the three loads it is: the
     // instance's storage block, the slot holding this attribute's raw list,
@@ -4073,15 +4122,35 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             listindex,
         )
     };
-    let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
-        crate::descr::mapdict_storage_descr(concrete_obj)
-    });
-    let slot =
-        crate::state::trace_mapdict_storage_getitem(ctx.trace_ctx, block, storageindex_const);
+    let raw_read = |ctx: &mut WalkContext<'_, '_, Sym>| -> Result<OpRef, DispatchError> {
+        if let Some(plain) = pure_raw {
+            walker_pin_plain_ever_mutated(ctx, op_pc, plain)?;
+            return Ok(match unbox_type {
+                pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
+                    ctx.trace_ctx.const_int(live)
+                }
+                pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
+                    ctx.trace_ctx.const_float(live)
+                }
+            });
+        }
+        let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
+            crate::descr::mapdict_storage_descr(concrete_obj)
+        });
+        let slot =
+            crate::state::trace_mapdict_storage_getitem(ctx.trace_ctx, block, storageindex_const);
+        Ok(match unbox_type {
+            pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
+                crate::state::trace_int_block_getitem_value(ctx.trace_ctx, slot, listindex_const)
+            }
+            pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
+                crate::state::trace_float_block_getitem_value(ctx.trace_ctx, slot, listindex_const)
+            }
+        })
+    };
+    let raw = raw_read(ctx)?;
     let boxed = match unbox_type {
         pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
-            let raw =
-                crate::state::trace_int_block_getitem_value(ctx.trace_ctx, slot, listindex_const);
             ctx.trace_ctx
                 .set_opref_concrete(raw, majit_ir::Value::Int(live));
             let boxed = walker_box_int(ctx, op_pc, raw, live)?;
@@ -4098,8 +4167,6 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             boxed
         }
         pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
-            let raw =
-                crate::state::trace_float_block_getitem_value(ctx.trace_ctx, slot, listindex_const);
             let live_f = f64::from_bits(live as u64);
             ctx.trace_ctx
                 .set_opref_concrete(raw, majit_ir::Value::Float(live_f));

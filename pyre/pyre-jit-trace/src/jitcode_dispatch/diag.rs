@@ -415,6 +415,7 @@ spec_folds! {
     StoreAttrResidual    => ("store_attr_residual",      "residual_call", "store_attr_direct"),
     LoadAttr             => ("load_attr",                "residual_call", "-"),
     LoadAttrCffiLib      => ("load_attr_cffi_lib",       "specialize",    "load_attr"),
+    LoadAttrPureRead     => ("load_attr_pure_read",      "specialize",    "load_attr"),
     LoadTypeNameAttr     => ("load_type_name_attr",      "residual_call", "-"),
     LoadTypeAttr         => ("load_type_attr",           "residual_call", "-"),
     LoadMethodAttr       => ("load_method_attr",         "residual_call", "-"),
