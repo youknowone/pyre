@@ -1489,11 +1489,18 @@ impl ExecutionContext {
     /// `jit.virtual_ref`, so `getnextframe_nohidden`'s `frame.f_backref()` is a
     /// `jit_force_virtual`, and `virtualref.force_virtual` runs
     /// `ResumeGuardForcedDescr.force_now` on a token that still names a live
-    /// JIT frame.  Pyre's walk calls [`force_vref`] at the same points, but
-    /// nothing stores a `JitVirtualRef` in the chain yet, so it is the identity
-    /// and the walk forces nothing.  Until the tracer emits `VIRTUAL_REF` at
-    /// the inline push, this consumer — whose whole purpose is the force —
-    /// states it directly.
+    /// JIT frame.  Pyre's walk calls [`force_vref`] at the same points, and for
+    /// an inlined callee that is now the whole story: `walker_ec_enter`
+    /// (`jitcode_dispatch/inline_call.rs`) records the `Self::enter` body
+    /// verbatim, so `opimpl_virtual_ref` mints a real `JitVirtualRef` and the
+    /// `topframeref` store publishes it into the chain this walk reads.
+    ///
+    /// What the walk still cannot reach is the frame the portal itself runs.
+    /// Tracing starts at that frame's own merge point, so its [`Self::enter`]
+    /// was executed by the interpreter rather than recorded, and `topframeref`
+    /// names the frame directly instead of a vref — the identity force again,
+    /// on precisely the frame "running in assembler" that this consumer exists
+    /// for.  Hence the direct call.
     pub fn force_all_frames(&mut self, is_being_profiled: bool) {
         let mut frame = self.gettopframe_nohidden();
         while !frame.is_null() {
