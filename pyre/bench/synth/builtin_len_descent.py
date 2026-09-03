@@ -32,6 +32,9 @@ def main():
     objects = (
         [1, 2, 3, 4],
         [1.25, 2.5],
+        # Mixed numbers take the IntOrFloat strategy, whose length read is the
+        # Integer strategy's own.
+        [1, 2.5],
         [marker],
         [],
         (1, 2, 3),
