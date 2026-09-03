@@ -1,4 +1,21 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=9
+# The ceiling moves for the startup-subtraction reason recorded on fib_recursive
+# in `check.py`: a pyre backend subtracts pypy's startup rather than its own, so
+# what a pyre process spends above pypy to reach the first bytecode stays inside
+# every pyre reading.  This fixture was not among the 41 that commit lengthened,
+# and its pypy execution is 0.01s-0.05s, so that fixed deficit is several times
+# the baseline it divides.  Over the twelve CI runs created after 6aabe927ce1 the
+# cranelift leg tripped three times -- runs 33691104038 and 33702184169 on
+# ubuntu and 33704998320 on macos, at (exec, pypy) of (0.150, 0.0175),
+# (0.140, 0.0145) and (0.100, 0.0107) -- and the widest needs 6.92 to pass.  9
+# covers it with 30% headroom.  The floor it derives is capped at parity and is
+# inert here either way: every reading is marked `?` or `~`, so no leg has a
+# baseline the floor gate will act on.
+#
+# Lengthening is the fix this does not take.  Tripling the trip count would put
+# pypy's execution over FLOOR_GATE_MIN_BASELINE_S and make the ratio a
+# measurement rather than a quantisation of a 0.01s denominator, but it also
+# re-records three jit-stats baselines, one of them wasm.
 # The ceiling sits between the two measured states: served this runs 2.6x pypy,
 # and with the arity-2 reader off the loop pays the opaque residual (about 198x
 # when the retired `subscr_specialised_pair` fold was the only reader).
