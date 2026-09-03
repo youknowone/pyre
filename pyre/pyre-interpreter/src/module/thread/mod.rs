@@ -636,6 +636,16 @@ pub(crate) fn current_exceptions() -> PyObjectRef {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn after_fork_child() {
     let ident = current_ident();
+    // Before anything below, which reaches Python objects and can therefore
+    // collect.  `thread_gil.c` hands the mutex rebuild to `pthread_atfork`'s
+    // child handler, so upstream has it done before `reinit_threads` runs at
+    // all; pyre registers no `pthread_atfork`, and until these two run the
+    // collector's world still describes the parent — `REGISTERED_THREADS` and
+    // the RUNNING census count threads that did not survive, so a collection
+    // taken here would wait in `quiesce_mutators` for them to park, and an STW
+    // root walk would read their vanished root areas.
+    majit_gc::shadow_stack::after_fork_child();
+    majit_gc::gc_sync::after_fork_child();
     {
         let mut contexts = EXECUTION_CONTEXTS.lock();
         // threadlocals.py `reinit_threads`: a fork can leave a worker
@@ -685,8 +695,6 @@ pub(crate) fn after_fork_child() {
         any(target_os = "macos", target_os = "linux")
     ))]
     crate::cpyext::after_fork_child();
-    majit_gc::shadow_stack::after_fork_child();
-    majit_gc::gc_sync::after_fork_child();
 }
 
 // os_lock.py `RPY_LOCK_FAILURE, RPY_LOCK_ACQUIRED, RPY_LOCK_INTR`.
