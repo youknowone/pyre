@@ -2055,7 +2055,88 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// `_pyre/P` adapter handlers (registered by `insns.rs`'s
 /// `wellknown_bh_insns`, payload decoder at `pyre_p_payload_len` below).
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
-    majit_metainterp::blackhole::build_inline_call_only_bh_builder()
+    let builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder();
+    assert_production_builder_spans_the_emitted_universe(&builder);
+    builder
+}
+
+/// The two coverage properties `blackhole.py setup_insns` holds by
+/// construction, checked here because pyre's production builder cannot get
+/// them that way.
+///
+/// Upstream calls `setup_insns(asm.insns)`, so its dispatch table spans exactly
+/// the opnames the assembler emitted, each resolved through `_get_method`.
+/// `build_inline_call_only_bh_builder` instead hand-curates its registered set
+/// family by family and spells each byte as a `BC_*` constant, which admits two
+/// drifts upstream cannot have:
+///
+/// 1. an emitted opname it never registered — reached only when a forward
+///    resume happens to land on that byte, as `dispatch_step`'s unwired-opcode
+///    panic;
+/// 2. a key bound to a byte the canonical table gives to a *different* opname,
+///    which decodes every occurrence as the wrong instruction.  `setup_insns`
+///    rejects two keys claiming one byte within this builder and nothing
+///    checks the byte against the generated table, so (2) is silent.
+///
+/// Both were pinned by tests alone (`production_bh_builder_covers_every_\
+/// build_emitted_opname`, `production_bh_builder_bytes_match_canonical_table`),
+/// which read the generated tables of whatever tree ran them; the failure they
+/// describe belongs to the binary that dispatches, so it is raised where that
+/// binary assembles its builder.  Both production call sites build once per
+/// thread behind a `thread_local!`, so this walks a few hundred keys per
+/// thread, not per resume.
+///
+/// The universe is `build_emitted_insns()` — pyre's `asm.insns`, the serialised
+/// build-time `pipeline.insns` before the canonical overlay — and deliberately
+/// not `insns_opname_to_byte()`, which also carries `wellknown_bh_insns` /
+/// `extension_insns` keys this build never emitted.  Their bytes cannot appear
+/// in any jitcode here, so leaving them unregistered is the state upstream is
+/// in too.
+fn assert_production_builder_spans_the_emitted_universe(
+    builder: &majit_metainterp::blackhole::BlackholeInterpBuilder,
+) {
+    let mut unregistered: Vec<&str> = build_emitted_insns()
+        .iter()
+        .filter(|(_key, byte)| {
+            builder
+                ._insns
+                .get(**byte as usize)
+                .is_none_or(|name| name.is_empty())
+        })
+        .map(|(key, _)| key.as_str())
+        .collect();
+    unregistered.sort_unstable();
+    assert!(
+        unregistered.is_empty(),
+        "the production blackhole cannot dispatch {} opname(s) this build's \
+         jitcodes can carry: {unregistered:?} — register them in \
+         `build_inline_call_only_bh_builder`, confirming the emit-side operand \
+         shape matches the wired handler's decoder",
+        unregistered.len(),
+    );
+
+    let mut mismatched: Vec<String> = Vec::new();
+    for (byte, key) in builder._insns.iter().enumerate() {
+        if key.is_empty() {
+            continue;
+        }
+        match insns_opname_to_byte().get(key) {
+            Some(&canonical) if canonical as usize == byte => {}
+            Some(&canonical) => mismatched.push(format!(
+                "{key:?} registered at byte {byte}, canonical byte is {canonical}"
+            )),
+            None => mismatched.push(format!(
+                "{key:?} registered at byte {byte} but is not a canonical opname"
+            )),
+        }
+    }
+    mismatched.sort();
+    assert!(
+        mismatched.is_empty(),
+        "the production blackhole's hand-spelled bytes disagree with the \
+         canonical opname table, so each listed byte decodes as the wrong \
+         instruction: {mismatched:?}",
+    );
 }
 
 /// Strict-coverage variant of [`build_default_bh_builder_with_unwired_report`]
