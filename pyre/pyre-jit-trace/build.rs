@@ -20,6 +20,19 @@ mod prepass;
 
 fn main() {
     println!("cargo::rerun-if-env-changed=MAJIT_LLBC_EXTRACTION");
+    // The prepass runs inside this script, so its census switches only take
+    // effect when the script itself reruns. Without these, setting one and
+    // rebuilding replays a cached script and prints nothing — a reading that
+    // is indistinguishable from a run with no declines. Declaring them means
+    // a census is requested by setting the variable, not by first touching
+    // this file.
+    for census_switch in [
+        "MAJIT_DECLINE_LOG",
+        "MAJIT_MIR_FRONTEND_DEBUG",
+        "MAJIT_RTYPER_VERBOSE",
+    ] {
+        println!("cargo::rerun-if-env-changed={census_switch}");
+    }
     let extracting =
         std::env::var_os("MAJIT_LLBC_EXTRACTION").as_deref() == Some(std::ffi::OsStr::new("1"));
     #[cfg(not(feature = "prepass"))]
