@@ -3674,21 +3674,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::stack_check::drain_jit_pending_exception",
         crate::stack_check::drain_jit_pending_exception_jit_abi,
     );
-    // The two halves of `execute_frame`'s activation seam, for the fold that
-    // mints a callee activation inside compiled code and records
-    // `executioncontext.enter` / `leave` for it.  Both touch the recursion
-    // counter thread-local, so they are residual Calls like the rest of this
-    // block rather than anything the optimizer may fold.
-    cp2(
-        &mut entries,
-        "pyre_interpreter::stack_check::jit_activation_enter",
-        crate::stack_check::jit_activation_enter_abi,
-    );
-    cp2(
-        &mut entries,
-        "pyre_interpreter::stack_check::jit_activation_leave",
-        crate::stack_check::jit_activation_leave_abi,
-    );
 
     // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
     // carry `#[elidable_cannot_raise]`.  `call.rs:has_cannot_raise_assertion`

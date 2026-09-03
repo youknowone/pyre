@@ -8,7 +8,7 @@
 //! the `sys` module (not to the stack-check subsystem) so the data
 //! structure lives in the same namespace as its upstream owner.
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 /// Default recursion limit, matching CPython / PyPy. `Module.__init__`
 /// sets `self.recursionlimit = 1000` in the PyPy tree
@@ -24,7 +24,18 @@ pub const MAX_RECURSION_LIMIT: i32 = 1_000_000;
 /// subsystem (`crate::stack_check`) consults this value when the user
 /// raises/lowers the budget, but otherwise keeps its own derived
 /// byte-budget (`PYRE_STACKTOOBIG.length`) hot in L1.
-static RECURSION_LIMIT: AtomicI32 = AtomicI32::new(DEFAULT_RECURSION_LIMIT);
+///
+/// Stored a word wide rather than as an `i32` so a compiled trace can read it
+/// with the word-sized raw load it uses for the eval-breaker word, instead of
+/// residualizing a call to reach it.  `set_recursion_limit` clamps its
+/// argument at zero, so the stored value is always a non-negative `i32`.
+static RECURSION_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_RECURSION_LIMIT as usize);
+
+/// Width of that word, in bytes.  The activation seam's load descriptor must
+/// use exactly this size: a narrower load truncates the limit and a wider one
+/// reads past it into the adjacent static, and either way the compiled
+/// recursion answers to a bound the interpreter never set.
+pub const RECURSION_LIMIT_WORD_SIZE: usize = std::mem::size_of::<AtomicUsize>();
 
 /// PyPy `pypy/module/sys/system.py:15-18`.
 pub const DEFAULT_MAX_STR_DIGITS: i32 = 4300;
@@ -42,14 +53,21 @@ static INT_MAX_STR_DIGITS: AtomicI32 = AtomicI32::new(DEFAULT_MAX_STR_DIGITS);
 /// rather than bake the build process's atomic value into a JitCode.
 #[majit_macros::dont_look_inside]
 pub fn recursion_limit() -> i32 {
-    RECURSION_LIMIT.load(Ordering::Relaxed)
+    RECURSION_LIMIT.load(Ordering::Relaxed) as i32
+}
+
+/// Address of the word [`recursion_limit`] reads, for the activation seam's
+/// raw load.  Traces do not outlive the process, so the address a recording
+/// observes is the one its compiled form runs against.
+pub fn recursion_limit_addr() -> usize {
+    std::ptr::addr_of!(RECURSION_LIMIT) as usize
 }
 
 /// `space.sys.recursionlimit = new_limit` parity
 /// (`pypy/module/sys/vm.py:96`).
 #[inline]
 pub fn set_recursion_limit(new_limit: i32) {
-    RECURSION_LIMIT.store(new_limit, Ordering::Relaxed);
+    RECURSION_LIMIT.store(new_limit.max(0) as usize, Ordering::Relaxed);
 }
 
 #[inline]
@@ -74,5 +92,5 @@ pub fn set_int_max_str_digits(maxdigits: i32) -> Result<(), crate::PyError> {
 /// recursion-limit state between runs.
 #[cfg(test)]
 pub fn reset_recursion_limit_for_tests() {
-    RECURSION_LIMIT.store(DEFAULT_RECURSION_LIMIT, Ordering::Relaxed);
+    RECURSION_LIMIT.store(DEFAULT_RECURSION_LIMIT as usize, Ordering::Relaxed);
 }

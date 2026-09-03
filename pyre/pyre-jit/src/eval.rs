@@ -7006,8 +7006,10 @@ fn init_callbacks() {
 }
 
 /// Read the Python recursion depth from pyre-interpreter's
-/// `RECURSION_STATE` TLS — the single source of truth for both crates.
-// dont_look_inside: reads a TLS; no registry-resolvable accessor.
+/// `ExecutionContext::py_recursion_depth` — the single source of truth for
+/// both crates.
+// dont_look_inside: reaches the context through the `LAST_EXEC_CTX` TLS; no
+// registry-resolvable accessor.
 #[majit_macros::dont_look_inside]
 pub(crate) fn call_depth() -> u32 {
     pyre_interpreter::call::py_recursion_depth()
@@ -7031,7 +7033,7 @@ pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -
     pyre_jit_trace::driver::make_green_key(code_ptr, pc, is_being_profiled)
 }
 
-// JIT_CALL_DEPTH removed — pyre-interpreter::call::RECURSION_STATE is the
+// JIT_CALL_DEPTH removed — ExecutionContext::py_recursion_depth is the
 // single source of truth. call_depth() reads it.
 
 /// RPython compile.py (record_loop_or_bridge) parity:

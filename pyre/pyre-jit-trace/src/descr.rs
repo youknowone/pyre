@@ -5754,14 +5754,35 @@ fn ec_field_descr(offset: usize) -> DescrRef {
     majit_ir::descr::field_descr_from_parent_by_offset(&parent, offset)
 }
 
+/// Field descr for `ExecutionContext::py_recursion_depth`, the slot the
+/// activation seam charges and gives back around a minted callee activation.
+/// `pyframe.py` (`execute_frame.insert_stack_check_here`) puts the matching
+/// test at the same place in the plain evaluator.
+pub fn ec_py_recursion_depth_descr() -> DescrRef {
+    ec_field_descr(pyre_interpreter::EC_PY_RECURSION_DEPTH_OFFSET)
+}
+
+/// Field descr for `ExecutionContext::accounted_activation`, read and restored
+/// by the same seam so a frame that reaches a portal door after the charge
+/// does not pay a second unit.
+pub fn ec_accounted_activation_descr() -> DescrRef {
+    ec_field_descr(pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET)
+}
+
 /// The `ExecutionContext` field group.  `type_id 0 + vtable 0` →
 /// `SimpleSizeDescr::is_object() == false`, so the optimizer builds a
-/// StructPtrInfo for the (non-GC) EC pointer.  Every field is Ref-typed
+/// StructPtrInfo for the (non-GC) EC pointer.  The object slots are Ref-typed
 /// (ref value tracking) but Unsigned-flagged (`is_pointer_field()` is false →
-/// no write barrier), which is correct because each slot is forwarded
-/// directly as a GC root every collection (`eval::walk_pyframe_roots` for the
-/// running context, `module::thread`'s per-context walk for the rest), so the
+/// no write barrier), which is correct because each is forwarded directly as
+/// a GC root every collection (`eval::walk_pyframe_roots` for the running
+/// context, `module::thread`'s per-context walk for the rest), so the
 /// generational remembered-set barrier is unnecessary.
+///
+/// The two activation-accounting slots are Int-typed instead.  That walk
+/// visits the context's object slots by name and never reaches them, which is
+/// what makes an integer sound here: `accounted_activation` is a bare
+/// identity token that may name an already-freed frame, so forwarding it as a
+/// root would be wrong rather than merely unnecessary.
 ///
 /// The group is minted with `is_gc_managed = false`: `ExecutionContext` is a
 /// plain Rust struct reached through a raw pointer (`EC_SIZE` is
@@ -5793,6 +5814,23 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         // Stamped below, once the specs are in offset order.
         index_in_parent: 0,
     };
+    // The activation counters.  `field_size` is derived from the field's own
+    // type rather than spelled, so the 32-bit target reads the same four bytes
+    // the struct actually stores there.
+    let int_field = |index: u32, field_key: &str, offset: usize| SimpleFieldDescrSpec {
+        index,
+        field_key: field_key.to_string(),
+        name: format!("ExecutionContext.{field_key}"),
+        offset,
+        field_size: std::mem::size_of::<usize>(),
+        field_type: Type::Int,
+        is_immutable: false,
+        is_quasi_immutable: false,
+        flag: ArrayFlag::Unsigned,
+        virtualizable: false,
+        is_class_word: Some(false),
+        index_in_parent: 0,
+    };
     let mut specs = vec![
         field(
             0,
@@ -5801,6 +5839,16 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         ),
         field(1, "topframeref", pyre_interpreter::EC_TOPFRAMEREF_OFFSET),
         field(2, "w_tracefunc", pyre_interpreter::EC_W_TRACEFUNC_OFFSET),
+        int_field(
+            3,
+            "py_recursion_depth",
+            pyre_interpreter::EC_PY_RECURSION_DEPTH_OFFSET,
+        ),
+        int_field(
+            4,
+            "accounted_activation",
+            pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET,
+        ),
     ];
     // `index_in_parent` is the field's rank by byte offset
     // (`jitcode/assembler.rs`'s `field_specs_from_layout`), and once a parent

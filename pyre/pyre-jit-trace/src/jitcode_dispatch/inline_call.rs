@@ -1988,30 +1988,18 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // over: without it the activation the CALL_ASSEMBLER runs never reaches
     // `topframeref`, so `sys._getframe().f_back` walks straight from the
     // callee's callee to this caller and every level in between is missing.
-    // Ahead of it stands `execute_frame`'s operation 0, which
-    // `insert_ll_stackcheck` (`rpython/translator/transform.py`) puts in front
-    // of the `enter` the next line records.  Upstream keeps it out of jitcodes
-    // and lets the backend's per-fragment SP probe stand for it; that probe
-    // answers the native half only, and `jit_activation_enter_abi` documents
-    // why the logical half has to be recorded here instead.
-    //
-    // It pays for the inlined levels above it as well.  This fold re-enters
-    // the fragment that inlined them, so charging one unit here would count
-    // one activation per fragment and divide the recursion's depth by the
-    // inline width; `open_inline_activations` is that width, and it is
-    // charged here because this is the seam a guard cannot leave unbalanced.
+    // `record_activation_charge` records the stack check that stands in front
+    // of that `enter`, and documents why.  It pays for the inlined levels
+    // above it as well: this fold re-enters the fragment that inlined them, so
+    // charging one unit here would count one activation per fragment and
+    // divide the recursion's depth by the inline width.
+    // `open_inline_activations` is that width, and it is charged here because
+    // this is the seam a guard cannot leave unbalanced.
     let units = ctx
         .trace_ctx
         .const_int(i64::from(open_inline_activations() + 1));
-    let displaced_activation = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallI,
-        pyre_interpreter::stack_check::jit_activation_enter_abi as *const (),
-        &[callee_frame, units],
-        &[Type::Ref, Type::Int],
-        Type::Int,
-        majit_metainterp::can_raise_effect_info(),
-    );
-    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+    let (saved_depth, displaced_activation) =
+        record_activation_charge(ctx, op.pc, ec, callee_frame, units)?;
     record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, ec);
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
@@ -2201,14 +2189,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // `execute_frame`'s `finally` half of the same seam: the unit the enter
     // spent, given back where the frame chain is given back.  It takes the
     // enter's own result, so the two are one dataflow edge apart.
-    ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallI,
-        pyre_interpreter::stack_check::jit_activation_leave_abi as *const (),
-        &[displaced_activation, units],
-        &[Type::Int, Type::Int],
-        Type::Int,
-        majit_metainterp::cannot_raise_effect_info(),
-    );
+    record_activation_release(ctx.trace_ctx, ec, saved_depth, displaced_activation);
     // pyjitpl.py `handle_possible_exception`.
     if exec_raised {
         // Raising branch (pyjitpl.py): `GUARD_EXCEPTION` with
@@ -3245,6 +3226,135 @@ fn open_inline_activations() -> u32 {
 
 thread_local! {
     static OPEN_INLINE_ACTIVATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Descriptor for the activation seam's load of the recursion-limit word.
+///
+/// The twin of `eval_breaker_word_descr`: the load is exactly as wide as the
+/// word it reads, taking the width from the word itself rather than restating
+/// it.  Non-pure like that one, and for the same reason -- a pure load is a
+/// candidate for CSE against the value the recording observed, which would
+/// bake the limit in force at trace time into the fragment and leave
+/// `sys.setrecursionlimit` unable to reach it.
+fn recursion_limit_word_descr() -> DescrRef {
+    static DESCR: std::sync::OnceLock<DescrRef> = std::sync::OnceLock::new();
+    DESCR
+        .get_or_init(|| {
+            majit_ir::descr::make_array_descr_signed(
+                0,
+                pyre_interpreter::module::sys::state::RECURSION_LIMIT_WORD_SIZE,
+                Type::Int,
+                true,
+            )
+        })
+        .clone()
+}
+
+/// `pyframe.py execute_frame`'s activation entry, in the form a trace carries.
+///
+/// Ahead of `ec.enter` stands `execute_frame`'s operation 0, which
+/// `insert_ll_stackcheck` (`rpython/translator/transform.py`) puts there.
+/// Upstream keeps it out of jitcodes -- `driver.py`'s `pyjitpl_lltype` task
+/// depends on `rtype` alone while `stackcheckinsertion_lltype` runs after
+/// `backendopt` -- and lets the backend's per-fragment SP probe stand for it.
+/// That probe answers the native half only.  The logical half, the test
+/// against `sys.getrecursionlimit()`, has `execute_frame`'s entry as its only
+/// home, so a fold that mints a callee activation inside compiled code has to
+/// run it here or the limit binds nothing for as long as the recursion stays
+/// compiled -- the shape `insert_ll_stackcheck` names when it sets
+/// `inhibit_tail_call`, a recursion that consumes no stack and so answers no
+/// stack probe.
+///
+/// The counters live on the `ExecutionContext`, which this seam already holds
+/// and already reads a field of one line further down, so the charge is the
+/// same GETFIELD_GC/SETFIELD_GC pair rather than a residual call into a
+/// thread-local.  The limit is read the way the back-edge poll reads the
+/// eval-breaker word, a raw load of a published word, so lowering the limit
+/// reaches compiled code without invalidating it.
+///
+/// Claim and charge both land before the guard, and neither is given back on
+/// it.  That is the state a deopt wants: the guard exit resumes the very frame
+/// the claim names, so the interpreter's own entry finds it already accounted,
+/// spends nothing, and raises off the depth this charge produced.
+///
+/// Returns the depth to restore and the claim to put back -- the two words the
+/// release takes, threaded to it as dataflow rather than respelled there.
+fn record_activation_charge<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    ec: OpRef,
+    callee_frame: OpRef,
+    units: OpRef,
+) -> Result<(OpRef, OpRef), DispatchError> {
+    let saved_depth = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcI,
+        &[ec],
+        crate::descr::ec_py_recursion_depth_descr(),
+    );
+    let charged = ctx
+        .trace_ctx
+        .record_op(OpCode::IntAdd, &[saved_depth, units]);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[ec, charged],
+        crate::descr::ec_py_recursion_depth_descr(),
+    );
+
+    let displaced_activation = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcI,
+        &[ec],
+        crate::descr::ec_accounted_activation_descr(),
+    );
+    // The claim is an identity token, never dereferenced, so it is banked as
+    // an integer rather than as the reference the frame arrives in.
+    let claim = ctx
+        .trace_ctx
+        .record_op(OpCode::CastPtrToInt, &[callee_frame]);
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[ec, claim],
+        crate::descr::ec_accounted_activation_descr(),
+    );
+
+    let limit_addr = ctx
+        .trace_ctx
+        .const_int(pyre_interpreter::module::sys::state::recursion_limit_addr() as i64);
+    let zero = ctx.trace_ctx.const_int(0);
+    let limit = ctx.trace_ctx.record_op_with_descr(
+        OpCode::RawLoadI,
+        &[limit_addr, zero],
+        recursion_limit_word_descr(),
+    );
+    let over_limit = ctx.trace_ctx.record_op(OpCode::UintGe, &[charged, limit]);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[over_limit])?;
+
+    Ok((saved_depth, displaced_activation))
+}
+
+/// The `finally` half of the same seam, where the frame chain is given back.
+///
+/// It restores the depth the activation was entered with rather than
+/// subtracting the units it spent, matching `RecursionDepthGuard`: an exit
+/// that leaves compiled code between the charge and here -- a guard failure, a
+/// raise -- skips this store the same way it skips the `ec.topframeref`
+/// restore, and an absolute restore at the next activation boundary is what
+/// absorbs the drift.
+fn record_activation_release(
+    ctx: &mut TraceCtx,
+    ec: OpRef,
+    saved_depth: OpRef,
+    displaced_activation: OpRef,
+) {
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[ec, saved_depth],
+        crate::descr::ec_py_recursion_depth_descr(),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[ec, displaced_activation],
+        crate::descr::ec_accounted_activation_descr(),
+    );
 }
 
 /// Holds one inlined level open for as long as the walk is inside its body.

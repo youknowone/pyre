@@ -804,58 +804,6 @@ fn recursion_depth_check(depth: u32) -> Result<(), PyError> {
     Ok(())
 }
 
-/// `pyframe.py execute_frame`'s activation entry, in the form a trace can
-/// record.
-///
-/// `insert_ll_stackcheck` (`rpython/translator/transform.py`) puts
-/// `stack_check()` at operation 0 of the start block of every graph carrying
-/// `insert_stack_check_here`, and `pyframe.py` puts that marker on
-/// `execute_frame` — so the check runs ahead of that function's own
-/// `executioncontext.enter(self)`.
-///
-/// Traces upstream never carry it: `driver.py`'s `pyjitpl_lltype` task depends
-/// on `rtype` alone while `stackcheckinsertion_lltype` runs after
-/// `backendopt`, so the jitcodes are built before the operation exists.  What
-/// covers compiled code there is the native SP probe the backend emits once
-/// per fragment entry (`_call_header_with_stack_check`), and that is the whole
-/// of `rstack.stack_check`, which tests nothing but the stack.
-///
-/// [`stack_check`] here tests logical depth against `sys.getrecursionlimit()`
-/// as well, and `execute_frame`'s entry is that half's only home.  A fold that
-/// mints a callee activation inside compiled code has to run it there or the
-/// limit binds nothing for as long as the recursion stays compiled — the
-/// shape `insert_ll_stackcheck` names when it sets `inhibit_tail_call`, a
-/// recursion that consumes no stack and so answers no stack probe.
-///
-/// `units` counts the activations the fragment reaching this call has minted,
-/// so the check runs against the depth they all add up to rather than against
-/// the one this call names.  The charge goes first for that reason — it also
-/// hands back the depth it produced, which is what keeps this whole call to a
-/// single thread-local lookup — and is given back when the check refuses: an
-/// activation that never begins owes no unit.
-///
-/// Returns the word [`jit_activation_leave_abi`] takes back, which the trace
-/// threads from the one call to the other.  The error travels on the published
-/// -exception channel the following guard reads, not in this result, so the
-/// result is free to carry the pairing.
-pub extern "C" fn jit_activation_enter_abi(callee_frame: i64, units: i64) -> i64 {
-    let units = units as u32;
-    let (displaced, depth) =
-        crate::call::jit_charge_recursion_unit(callee_frame as *const crate::PyFrame, units);
-    if let Err(error) = recursion_depth_check(depth) {
-        crate::call::jit_release_recursion_unit(displaced, units);
-        return crate::runtime_ops::jit_publish_residual_error(error);
-    }
-    displaced as i64
-}
-
-/// The `finally` half of the same seam — `executioncontext.leave`'s position
-/// in `execute_frame` — giving back what [`jit_activation_enter_abi`] spent.
-pub extern "C" fn jit_activation_leave_abi(displaced_activation: i64, units: i64) -> i64 {
-    crate::call::jit_release_recursion_unit(displaced_activation as usize, units as u32);
-    0
-}
-
 /// rpython/rlib/rstack.py `stack_almost_full` parity.
 ///
 /// ```python
