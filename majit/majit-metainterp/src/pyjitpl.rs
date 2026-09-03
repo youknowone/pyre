@@ -545,6 +545,18 @@ fn cross_loop_cut_label_jump_null_guard_slot(ops: &[majit_ir::OpRc]) -> Option<u
     None
 }
 
+/// The frontend's view of a compiled root loop, indexed by trace id on
+/// its `CompiledEntry`.
+///
+/// Bridges are not entered here.  `compile.py send_bridge_to_backend`
+/// hands the bridge to the CPU and keeps nothing in the frontend: every
+/// later reader — `AbstractResumeGuardDescr.handle_fail`,
+/// `ResumeGuardDescr.get_resumestorage`, `compile.py` bridge retrace —
+/// reads off the guard's own `ResumeGuardDescr` (`_attrs_ = rd_numb,
+/// rd_consts, rd_virtuals, rd_pendingfields, status`), which the backend's
+/// `asmmemmgr_gcreftracers` keeps alive for the loop token's lifetime.  A
+/// per-bridge frontend record made retention grow with the bridge count
+/// and never shrink.
 pub(crate) struct CompiledTrace {
     /// Inputargs for this trace, used to recover typed exit layouts during blackhole replay.
     pub(crate) inputargs: Vec<InputArg>,
@@ -2603,6 +2615,44 @@ impl<M: Clone> MetaInterp<M> {
                         visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
                     }
                 }
+                // `compile.py:ResumeGuardDescr._attrs_` traces `rd_consts` on
+                // every guard descr, and a bridge's descrs are reachable only
+                // through the backend: `assembler.py gcreftracers.append(tracer)`
+                // pins them on the loop token's `asmmemmgr_gcreftracers`
+                // (`model.py CompiledLoopToken`).  Walk those tracers so a
+                // bridge guard's pool is a root for the token's lifetime,
+                // the same way the root loop's descrs are reached above.
+                // Dynasm registers `Vec<Arc<FailDescrCell>>`, cranelift and
+                // wasm `Vec<DescrRef>`; the other tracer kinds (GcTables)
+                // are rooted through the gcreftracer registry.
+                let tokens = entry.live_token().into_iter().chain(
+                    entry
+                        .previous_tokens
+                        .iter()
+                        .filter_map(std::sync::Weak::upgrade),
+                );
+                for token in tokens {
+                    let Some(clt) = token.compiled_loop_token() else {
+                        continue;
+                    };
+                    for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
+                        let mut visit_descr = |descr: &dyn majit_ir::Descr| {
+                            let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_arc());
+                            visit_pool(pool.as_ref(), generation, is_minor, &mut visitor);
+                        };
+                        if let Some(cells) =
+                            tracer.downcast_ref::<Vec<Arc<majit_ir::FailDescrCell>>>()
+                        {
+                            for cell in cells {
+                                visit_descr(&*cell.descr);
+                            }
+                        } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
+                            for descr in descrs {
+                                visit_descr(&**descr);
+                            }
+                        }
+                    }
+                }
                 for tt in entry.front_target_tokens.iter_mut() {
                     // `history.TargetToken` is a GC object upstream. MiniMark
                     // visits it in a minor only while its write barrier is
@@ -3147,8 +3197,15 @@ impl<M: Clone> MetaInterp<M> {
         if is_finish {
             return default_layout();
         }
+        // A guard with no frontend record — every bridge guard
+        // (`compile.py send_bridge_to_backend`) — answers off its own
+        // `ResumeGuardDescr` payload.
+        let from_descr = || {
+            Self::compiled_exit_layout_from_descr(descr, green_key, trace_id, fail_index)
+                .unwrap_or_else(default_layout)
+        };
         let Some(compiled) = self.compiled_loops.get(&green_key) else {
-            return default_layout();
+            return from_descr();
         };
         Self::trace_for_exit(compiled, trace_id)
             .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
@@ -3156,7 +3213,7 @@ impl<M: Clone> MetaInterp<M> {
             .and_then(|(owning_key, resolved_id, trace)| {
                 Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
             })
-            .unwrap_or_else(default_layout)
+            .unwrap_or_else(from_descr)
     }
 
     /// `compile.py ResumeGuardDescr._attrs_` parity: per-guard exit
@@ -9712,7 +9769,6 @@ impl<M: Clone> MetaInterp<M> {
                         inputargs.len()
                     );
                 }
-                let fvc = self.active_frame_value_count_fn();
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
                     // `unroll.py finalize_short_preamble` appends the
                     // newly minted TargetToken to `jitcelltoken.target_tokens`
@@ -9729,64 +9785,16 @@ impl<M: Clone> MetaInterp<M> {
                                 Self::front_entry_index_for(&compiled.front_target_tokens);
                         }
                     }
-                    let (mut resume_data, mut exit_layouts) =
-                        compile::build_guard_metadata(&inputargs, &combined_ops, green_key, fvc);
-                    let mut terminal_exit_layouts =
-                        compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
-                    if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
-                        source_jct.as_ref(),
-                        source_trace_id,
-                        fail_index,
-                    ) {
-                        compile::merge_backend_exit_layouts(
-                            &mut exit_layouts,
-                            &backend_layouts,
-                            &combined_ops,
-                        );
-                    }
-                    if let Some(backend_layouts) =
-                        self.backend.compiled_bridge_terminal_exit_layouts(
-                            source_jct.as_ref(),
-                            source_trace_id,
-                            fail_index,
-                        )
-                    {
-                        compile::merge_backend_terminal_exit_layouts(
-                            &mut terminal_exit_layouts,
-                            &backend_layouts,
-                            &combined_ops,
-                        );
-                    }
-                    let bridge_trace_info = self
-                        .backend
-                        .compiled_trace_info(source_jct.as_ref(), bridge_trace_id);
-                    compile::enrich_guard_resume_layouts_for_trace(
-                        &mut resume_data,
-                        &mut exit_layouts,
-                        bridge_trace_id,
-                        &inputargs,
-                        bridge_trace_info.as_ref(),
-                    );
-                    compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
-                    compile::patch_backend_terminal_recovery_layouts_for_trace(
-                        &mut self.backend,
-                        source_jct.as_ref(),
-                        bridge_trace_id,
-                        &mut terminal_exit_layouts,
-                    );
+                    // `compile.py send_bridge_to_backend`: the bridge is
+                    // handed to the CPU and nothing is indexed in the
+                    // frontend — its guards answer later failures off
+                    // their own `ResumeGuardDescr`.  Only the per-trace
+                    // `(fail_index, op index)` stamp the pyre readers key
+                    // on is applied here.
+                    compile::stamp_guard_descr_trace_positions(&combined_ops);
                     // Box Identity Phase E.2b parity: see compile_loop site.
                     let new_high_water = compute_next_global_opref(&inputargs, &combined_ops);
                     compiled.next_global_opref = compiled.next_global_opref.max(new_high_water);
-                    compiled.traces.insert(
-                        bridge_trace_id,
-                        CompiledTrace {
-                            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
-                            ops: combined_ops,
-                            constants: compiled_constants_typed,
-                            exit_layouts,
-                            terminal_exit_layouts,
-                        },
-                    );
                 }
                 self.remember_compiled_graph_write();
                 self.warm_state.log_bridge_compile(fail_index);
@@ -11373,7 +11381,13 @@ impl<M: Clone> MetaInterp<M> {
                     fail_index: layout.fail_index,
                     source_op_index: layout
                         .source_op_index
-                        .or_else(|| trace_layout_ref.and_then(|layout| layout.source_op_index)),
+                        .or_else(|| trace_layout_ref.and_then(|layout| layout.source_op_index))
+                        .or_else(|| {
+                            result
+                                .descr_arc
+                                .as_fail_descr()
+                                .and_then(|fd| fd.source_op_index())
+                        }),
                     exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
@@ -11381,24 +11395,38 @@ impl<M: Clone> MetaInterp<M> {
                         || trace_layout_ref.and_then(|layout| layout.recovery_layout.clone()),
                     ),
                     resume_layout: resume_layout.map(std::sync::Arc::new),
-                    storage: trace_layout_ref.and_then(|layout| layout.storage.clone()),
+                    // A bridge guard has no frontend record
+                    // (`send_bridge_to_backend`); its pool is the descr's
+                    // own (`ResumeGuardDescr.get_resumestorage`).
+                    storage: trace_layout_ref
+                        .and_then(|layout| layout.storage.clone())
+                        .or_else(|| {
+                            result
+                                .descr_arc
+                                .as_fail_descr()
+                                .and_then(crate::resume::ResumeStorage::from_fail_descr)
+                                .map(Arc::new)
+                        }),
                 }
             })
             .or(trace_layout)
             .unwrap_or_else(|| {
                 let exit_types: ExitTypes =
                     result.typed_outputs.iter().map(Value::get_type).collect();
+                let fd = result.descr_arc.as_fail_descr();
                 CompiledExitLayout {
                     rd_loop_token: green_key, // from trace context
                     trace_id,
                     fail_index,
-                    source_op_index: None,
+                    source_op_index: fd.and_then(|fd| fd.source_op_index()),
                     exit_types,
                     is_finish: result.is_finish,
                     is_exception_exit: result.is_exit_frame_with_exception,
                     recovery_layout: None,
                     resume_layout: None,
-                    storage: None,
+                    storage: fd
+                        .and_then(crate::resume::ResumeStorage::from_fail_descr)
+                        .map(Arc::new),
                 }
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
@@ -11541,7 +11569,7 @@ impl<M: Clone> MetaInterp<M> {
                         rd_loop_token: green_key,
                         trace_id,
                         fail_index,
-                        source_op_index: None,
+                        source_op_index: descr.source_op_index(),
                         exit_types: ExitTypes::from_slice(exit_types),
                         is_finish,
                         is_exception_exit: is_exit_frame_with_exception,
@@ -11900,7 +11928,7 @@ impl<M: Clone> MetaInterp<M> {
                     rd_loop_token: green_key,
                     trace_id,
                     fail_index,
-                    source_op_index: None,
+                    source_op_index: descr.source_op_index(),
                     exit_types: ExitTypes::from_slice(exit_types),
                     is_finish,
                     is_exception_exit: is_exit_frame_with_exception,
@@ -12071,6 +12099,69 @@ impl<M: Clone> MetaInterp<M> {
             return Some(layout);
         }
         self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index)
+    }
+
+    /// `AbstractResumeGuardDescr.handle_fail(self, deadframe)`: the failing
+    /// guard's exit metadata read off the descr the deadframe named.  The
+    /// root loop's frontend record is consulted first (it carries the
+    /// enriched `resume_layout` the cranelift recovery path reads); a
+    /// bridge guard has no such record (`send_bridge_to_backend`), so its
+    /// layout is assembled from the descr's own `rd_*` pool, types and
+    /// stamped trace positions.  No backend scan.
+    pub fn get_compiled_exit_layout_for_descr(
+        &self,
+        descr: &dyn majit_ir::FailDescr,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<CompiledExitLayout> {
+        if let Some(compiled) = self.compiled_loops.get(&green_key)
+            && let Some((resolved_trace_id, trace)) = Self::trace_for_exit(compiled, trace_id)
+            && let Some(layout) = Self::compiled_exit_layout_from_trace(
+                trace,
+                green_key,
+                resolved_trace_id,
+                fail_index,
+            )
+        {
+            return Some(layout);
+        }
+        if let Some(layout) =
+            Self::compiled_exit_layout_from_descr(descr, green_key, trace_id, fail_index)
+        {
+            return Some(layout);
+        }
+        // A descr that carries no resume payload of its own: only the test
+        // scaffolds mint such guards (codegen fills in the backend-side
+        // copy), so the backend index is the last place to ask.  Production
+        // guards answer above.
+        let compiled = self.compiled_loops.get(&green_key)?;
+        self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index)
+    }
+
+    /// `ResumeGuardDescr` read into the exit-layout shape: `rd_numb` /
+    /// `rd_consts` / `rd_virtuals` / `rd_pendingfields` become the shared
+    /// `ResumeStorage`, `fail_arg_types` the slot types.  `None` when the
+    /// descr carries no resume payload (a non-resume FailDescr).
+    fn compiled_exit_layout_from_descr(
+        descr: &dyn majit_ir::FailDescr,
+        owning_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<CompiledExitLayout> {
+        let storage = crate::resume::ResumeStorage::from_fail_descr(descr)?;
+        Some(CompiledExitLayout {
+            rd_loop_token: owning_key, // compile.py:186
+            trace_id,
+            fail_index,
+            source_op_index: descr.source_op_index(),
+            exit_types: ExitTypes::from_slice(descr.fail_arg_types()),
+            is_finish: descr.is_finish(),
+            is_exception_exit: descr.is_exit_frame_with_exception(),
+            recovery_layout: None,
+            resume_layout: None,
+            storage: Some(Arc::new(storage)),
+        })
     }
 
     /// Get the full static layout for a terminal FINISH/JUMP op in a specific trace.
@@ -13435,6 +13526,32 @@ impl<M: Clone> MetaInterp<M> {
         ))
     }
 
+    /// [`Self::get_resume_storage_with_slot_types`] answered off the
+    /// failing descr (`ResumeGuardDescr.get_resumestorage`), so a bridge
+    /// guard with no frontend record resolves without a backend scan.
+    pub fn get_resume_storage_with_slot_types_for_descr(
+        &self,
+        descr: &dyn majit_ir::FailDescr,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<(Arc<ResumeStorage>, Vec<Type>)> {
+        let layout = self
+            .get_compiled_exit_layout_for_descr(descr, green_key, trace_id, fail_index)
+            .filter(|layout| layout.storage.is_some())
+            .or_else(|| {
+                Self::compiled_exit_layout_from_descr(descr, green_key, trace_id, fail_index)
+            })?;
+        let storage = layout.storage.clone()?;
+        Some((
+            storage,
+            Self::recovery_slot_types_from_exit_types_and_layout(
+                &layout.exit_types,
+                layout.recovery_layout.as_deref(),
+            ),
+        ))
+    }
+
     /// Get exit_types for a guard (for decode_ref type dispatch).
     pub fn get_exit_types(
         &self,
@@ -14141,17 +14258,13 @@ impl<M: Clone> MetaInterp<M> {
                 source_trace_id, 0,
                 "compile_bridge expects bridge origin descr.trace_id() to be a real allocated id, not the FINISH-singleton sentinel"
             );
-            let pending = compiled.traces.get(&source_trace_id).and_then(|trace| {
-                // Route guard identity through
-                // `exit_layouts.descr` instead of `guard_op_indices →
-                // trace.ops[idx]`. The descr Arc already carries
-                // `fail_arg_types` (resume.py:467 / history.py:307 parity),
-                // so the indexed op lookup is redundant.
-                let exit_layout = trace.exit_layouts.get(&fail_index)?;
-                // compile.py `ResumeGuardDescr` storage — every
-                // guard's rd_* pool lives behind a shared Arc; the
-                // bridge deserializer borrows that same Arc.
-                let storage = exit_layout.storage.clone()?;
+            // `compile.py compile_trace` reads `resumekey.get_resumestorage()`:
+            // the source guard's rd_* pool is the descr's own, whether the
+            // guard sits in the root loop or in a bridge the frontend never
+            // indexed (`send_bridge_to_backend`).  The pool Arcs are the ones
+            // the descr holds, so the deserializer shares them.
+            let pending = crate::resume::ResumeStorage::from_fail_descr(fail_descr).and_then(|storage| {
+                let storage = Arc::new(storage);
                 // Each bridge inputarg carries its `box.type`
                 // (resoperation.py:719/727/739 InputArg{Int,Ref,Float});
                 // mint the typed `OpRef::input_arg_*` variant via
@@ -14174,11 +14287,7 @@ impl<M: Clone> MetaInterp<M> {
                 // parent guard's saved types instead so the deserializer
                 // matches the types the serializer used at memo.finish()
                 // time.
-                let positional_livebox_types: Vec<Type> = exit_layout
-                    .descr
-                    .as_ref()
-                    .and_then(|descr| descr.as_fail_descr())
-                    .map(|fd| fd.fail_arg_types().to_vec())
+                let positional_livebox_types: Vec<Type> = Some(fail_descr.fail_arg_types().to_vec())
                     .filter(|types| !types.is_empty())
                     .unwrap_or_else(|| bridge_inputargs.iter().map(|ia| ia.tp).collect());
                 // pyjitpl.py `initialize_state_from_guard_failure` removes
@@ -14693,80 +14802,15 @@ impl<M: Clone> MetaInterp<M> {
                 self.last_quasi_immutable_deps =
                     std::mem::take(&mut optimizer.quasi_immutable_deps);
                 self.record_loop_or_bridge(&source_jct, &optimized_ops, bridge_trace_id);
-                // Read before the `compiled_loops` mutable borrow below.
-                let fvc = self.active_frame_value_count_fn();
                 // Mark the bridge as compiled
                 if let Some(compiled) = self.compiled_loops.get_mut(&green_key) {
-                    // pyjitpl.py:1049 — `fail_descr.trace_id()` is the
-                    // bridge origin's allocated id (`alloc_trace_id`
-                    // starts at 1).  No `0 → root_trace_id` sentinel;
-                    // RPython resolves the source via descr identity.
-                    let source_trace_id = fail_descr.trace_id();
-                    let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
-                        bridge_inputargs,
-                        &optimized_ops,
-                        green_key,
-                        fvc,
-                    );
-                    let mut terminal_exit_layouts =
-                        compile::build_terminal_exit_layouts(bridge_inputargs, &optimized_ops);
-                    if let Some(backend_layouts) = self.backend.compiled_bridge_fail_descr_layouts(
-                        source_jct.as_ref(),
-                        source_trace_id,
-                        fail_index,
-                    ) {
-                        compile::merge_backend_exit_layouts(
-                            &mut exit_layouts,
-                            &backend_layouts,
-                            &optimized_ops,
-                        );
-                    }
-                    if let Some(backend_layouts) =
-                        self.backend.compiled_bridge_terminal_exit_layouts(
-                            source_jct.as_ref(),
-                            source_trace_id,
-                            fail_index,
-                        )
-                    {
-                        compile::merge_backend_terminal_exit_layouts(
-                            &mut terminal_exit_layouts,
-                            &backend_layouts,
-                            &optimized_ops,
-                        );
-                    }
-                    let bridge_trace_info = self
-                        .backend
-                        .compiled_trace_info(source_jct.as_ref(), bridge_trace_id);
-                    compile::enrich_guard_resume_layouts_for_trace(
-                        &mut resume_data,
-                        &mut exit_layouts,
-                        bridge_trace_id,
-                        bridge_inputargs,
-                        bridge_trace_info.as_ref(),
-                    );
-                    compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
-                    compile::patch_backend_terminal_recovery_layouts_for_trace(
-                        &mut self.backend,
-                        source_jct.as_ref(),
-                        bridge_trace_id,
-                        &mut terminal_exit_layouts,
-                    );
+                    // `compile.py send_bridge_to_backend`: nothing is
+                    // indexed in the frontend for a bridge — see the
+                    // retrace site.
+                    compile::stamp_guard_descr_trace_positions(&optimized_ops);
                     let new_high_water =
                         compute_next_global_opref(bridge_inputargs, &optimized_ops);
                     compiled.next_global_opref = compiled.next_global_opref.max(new_high_water);
-                    compiled.traces.insert(
-                        bridge_trace_id,
-                        CompiledTrace {
-                            inputargs: bridge_inputargs
-                                .iter()
-                                .map(InputArg::fresh_value_copy)
-                                .collect(),
-                            ops: optimized_ops,
-                            constants: compiled_constants_typed,
-                            exit_layouts,
-                            terminal_exit_layouts,
-                        },
-                    );
                 }
                 self.remember_compiled_graph_write();
                 self.warm_state.log_bridge_compile(fail_index);
@@ -14986,7 +15030,7 @@ impl<M: Clone> MetaInterp<M> {
         // at trace start, mirroring ResumeDataBoxReader.consume_boxes
         // → rd_virtuals[i].allocate (resume.py getvirtual_ptr).
         let storage = self
-            .get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)
+            .get_compiled_exit_layout_for_descr(fail_descr, green_key, norm_tid, fail_index)
             .and_then(|layout| layout.storage);
 
         let fail_types = bridge_input_types.to_vec();
@@ -15034,6 +15078,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_values: &[i64],
     ) -> Option<(Vec<i64>, Vec<i64>)> {
         self.handle_async_forcing_with_allocator(
+            None,
             green_key,
             trace_id,
             fail_index,
@@ -15042,8 +15087,13 @@ impl<M: Clone> MetaInterp<M> {
         )
     }
 
+    /// `descr` is the forced guard's own `ResumeGuardDescr`
+    /// (`compile.py handle_async_forcing(self, deadframe)` is a method on
+    /// it); the test entry passes `None` and resolves through the root
+    /// loop's frontend record.
     fn handle_async_forcing_with_allocator(
         &mut self,
+        descr: Option<&dyn majit_ir::FailDescr>,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
@@ -15062,8 +15112,12 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:988-991: resolve metainterp_sd, vinfo, ginfo
         let _compiled = self.compiled_loops.get(&green_key)?;
         let norm_tid = trace_id;
-        let exit_layout =
-            self.get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)?;
+        let exit_layout = match descr {
+            Some(descr) => {
+                self.get_compiled_exit_layout_for_descr(descr, green_key, norm_tid, fail_index)?
+            }
+            None => self.get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)?,
+        };
 
         // compile.py:973-985 don't interrupt me! If the stack runs out
         // in force_from_resumedata() then we have seen cpu.force() but
@@ -15197,6 +15251,7 @@ impl<M: Clone> MetaInterp<M> {
             .collect::<Vec<_>>();
         // compile.py: faildescr.handle_async_forcing(deadframe)
         self.handle_async_forcing_with_allocator(
+            Some(descr),
             green_key,
             trace_id,
             fail_index,

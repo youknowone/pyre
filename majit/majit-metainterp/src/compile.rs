@@ -531,6 +531,42 @@ impl<'a> UnrolledLoopData<'a> {
     }
 }
 
+/// Pyre-only: stamp the per-trace `fail_index` and the trace-op index onto
+/// every guard's metainterp `ResumeGuardDescr`, so `(trace_id, fail_index)`
+/// readers resolve through the descr Arc directly.  The counter walks guards
+/// and FINISH in trace order — the numbering `find_fail_index_for_exit_op`
+/// and the assemblers' `fail_descrs` position share.  Readers compare
+/// against `fail_index_per_trace()` (this slot), not `fail_index()` (the
+/// global `alloc_fail_index()` id).
+///
+/// `ops` is the optimized frontend trace.  The backend GC rewriter inserts
+/// operations before code generation, so the assembler's prepared-op index
+/// is not an index into this slice; the descr is stamped from the frontend
+/// op, matching RPython where the `ResumeGuardDescr` stays attached to the
+/// live ResOperation rather than carrying an index into a rewritten array.
+///
+/// Non-resume FailDescrs are skipped: their `set_fail_index_per_trace`
+/// panics by default.
+pub(crate) fn stamp_guard_descr_trace_positions<T: AsRef<majit_ir::Op>>(ops: &[T]) {
+    let mut fail_index = 0u32;
+    for (op_idx, op) in ops.iter().enumerate() {
+        let op = op.as_ref();
+        let is_guard = op.opcode.is_guard();
+        if !is_guard && op.opcode != OpCode::Finish {
+            continue;
+        }
+        if is_guard
+            && let Some(descr) = op.getdescr()
+            && (descr.is_resume_guard() || descr.is_resume_guard_copied())
+            && let Some(fd) = descr.as_fail_descr()
+        {
+            fd.set_fail_index_per_trace(fail_index);
+            fd.set_source_op_index(op_idx);
+        }
+        fail_index += 1;
+    }
+}
+
 /// Build guard metadata for a compiled trace.
 ///
 /// The backend numbers every guard and finish in a single exit table, so this
@@ -561,6 +597,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
     let fvc = frame_value_count_fn.or_else(majit_ir::resumedata::get_frame_value_count_fn);
     let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
         fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
+    stamp_guard_descr_trace_positions(ops);
     // history.py:220/261/307 — each fail-arg's type is intrinsic on the Box
     // (the OpRef variant tag, `ty()`); a fail_arg carries its own type
     // regardless of trace position, so no position-keyed side table is needed.
@@ -570,46 +607,6 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         let is_finish = op.opcode == OpCode::Finish;
         if !is_guard && !is_finish {
             continue;
-        }
-
-        if is_guard {
-            // Drop the `guard_op_indices` HashMap.
-            // Every reader is now routed through descr-side identity
-            // (`op.descr.as_fail_descr().fail_index_per_trace()`
-            // forward; op-position lookup
-            // `trace.ops[guard_index].descr.as_fail_descr()
-            // .fail_index_per_trace()` reverse).  Mirrors RPython's
-            // `compile.py:184 op.getdescr()` predicate where the descr
-            // identity replaces the side table entirely.
-            //
-            // The readers compare against `fail_index_per_trace()`
-            // (this slot, set by `set_fail_index_per_trace` below),
-            // not `fail_index()` (which is the global
-            // `alloc_fail_index()` id — a separate
-            // structural slot the readers do not consult).
-            //
-            // Pyre-only: stamp the per-trace `fail_index` onto the
-            // metainterp ResumeGuardDescr so `(trace_id, fail_index)`
-            // lookups can resolve through the descr Arc directly.
-            // Skip non-resume FailDescrs (whose
-            // `set_fail_index_per_trace` panics by default).
-            let __descr_arc = op.getdescr();
-            if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_fail_descr())
-                && op
-                    .getdescr()
-                    .is_some_and(|d| d.is_resume_guard() || d.is_resume_guard_copied())
-            {
-                fd.set_fail_index_per_trace(fail_index);
-                // `ops` is the optimized frontend trace retained by
-                // `CompiledTrace`.  The backend GC rewriter inserts
-                // operations before code generation, so the assembler's
-                // prepared-op index is not a valid index into this slice.
-                // Re-stamp the canonical descr from the frontend op,
-                // matching RPython where the ResumeGuardDescr remains
-                // attached to the live ResOperation rather than carrying
-                // an index into a separate rewritten array.
-                fd.set_source_op_index(op_idx);
-            }
         }
 
         // RPython Box.type parity: each fail-arg's type is `livebox.type`,
@@ -895,37 +892,12 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 rd_consts_arc.as_deref().map_or(&[], |pool| pool.as_slice());
             let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len()) as i32;
             let resolve_tagged_source = |tagged: i16| -> ExitValueSourceLayout {
-                let (val, tagbits) = majit_ir::resumedata::untag(tagged);
-                match tagbits {
-                    majit_ir::resumedata::TAGBOX => {
-                        let idx = if val >= 0 {
-                            val as usize
-                        } else {
-                            (num_failargs + val) as usize
-                        };
-                        ExitValueSourceLayout::ExitValue(idx)
-                    }
-                    majit_ir::resumedata::TAGVIRTUAL => {
-                        // resume.py:278-284 nested virtuals are numbered
-                        // negatively; resolve via negative indexing into
-                        // rd_virtuals (resume.py:951-954).
-                        let idx = if val >= 0 {
-                            val as usize
-                        } else {
-                            (num_virtuals + val) as usize
-                        };
-                        ExitValueSourceLayout::Virtual(idx)
-                    }
-                    majit_ir::resumedata::TAGINT => {
-                        ExitValueSourceLayout::Constant(val as i64, Type::Int)
-                    }
-                    majit_ir::resumedata::TAGCONST => {
-                        let idx = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
-                        let c = rd_consts_ref.get(idx).copied().unwrap_or(Const::Int(0));
-                        ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
-                    }
-                    _ => ExitValueSourceLayout::Constant(0, Type::Int),
-                }
+                crate::resume::exit_source_from_tagged(
+                    tagged,
+                    num_failargs,
+                    rd_consts_ref,
+                    num_virtuals,
+                )
             };
             let resolve_fieldnums = |fieldnums: &[i16],
                                      fielddescr_indices: &[u32]|
@@ -1158,39 +1130,12 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     entries
                         .iter()
                         .map(|pf| {
-                            // resume.py PENDINGFIELDSTRUCT.lldescr is
-                            // always present in RPython — the descr is
-                            // captured directly off the Setfield_gc /
-                            // Setarrayitem_gc op that produced the pending
-                            // field (heap.py force_lazy_sets_for_guard).
-                            // Pyre's producer in `optimizer.rs`'s
-                            // `emit_guard_operation` mirrors
-                            // this: `pf.descr = pf_op.descr.clone()` where
-                            // pf_op is always a descr-bearing setfield op.
-                            let descr = pf
-                                .descr
-                                .clone()
-                                .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
-                            // resume.py: itemindex >= 0 → setarrayitem.
-                            let item_index = if descr.as_array_descr().is_some() {
-                                Some(usize::try_from(pf.item_index).expect(
-                                    "resume.py:1003 setarrayitem pending field requires non-negative item_index",
-                                ))
-                            } else if descr.as_field_descr().is_some() {
-                                None
-                            } else {
-                                panic!(
-                                    "pending field descr must be FieldDescr or ArrayDescr (descr={:?})",
-                                    descr,
-                                );
-                            };
-                            majit_backend::ExitPendingFieldLayout {
-                                descr: pf.descr.clone(),
-                                is_array_item: item_index.is_some(),
-                                item_index,
-                                target: resolve_tagged_source(pf.target_tagged),
-                                value: resolve_tagged_source(pf.value_tagged),
-                            }
+                            crate::resume::exit_pending_field_layout(
+                                pf,
+                                num_failargs,
+                                rd_consts_ref,
+                                num_virtuals,
+                            )
                         })
                         .collect()
                 })

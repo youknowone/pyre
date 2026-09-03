@@ -2600,6 +2600,22 @@ impl WasmBackend {
     /// per-loop table alive for as long as the compiled trace that bakes its
     /// base address. `LIVE_GC_TABLES` holds only a `Weak`, so this strong
     /// reference is what keeps the slots rooted and forwardable.
+    /// `assembler.py gcreftracers.append(tracer)`: pin the metainterp descr
+    /// Arcs this compiled code's guards dereference onto the owning
+    /// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py`), the same
+    /// `Vec<DescrRef>` tracer shape cranelift registers.  The frontend
+    /// keeps no per-bridge record (`compile.py send_bridge_to_backend`), so
+    /// this tracer is where the GC root walker reaches a bridge guard's
+    /// `rd_consts`, and what keeps the descr alive for the token's lifetime.
+    fn register_meta_descrs(token: &JitCellToken, descrs: &[Arc<WasmFailDescr>]) {
+        if let Some(clt) = token.compiled_loop_token() {
+            let meta: Vec<majit_ir::descr::DescrRef> =
+                descrs.iter().filter_map(|d| d.meta_descr.clone()).collect();
+            let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(meta);
+            clt.asmmemmgr_gcreftracers.lock().push(tracer);
+        }
+    }
+
     fn register_gc_table(token: &JitCellToken, table: Arc<majit_gc::GcTable>) {
         if let Some(clt) = token.compiled_loop_token() {
             let tracer: Arc<dyn std::any::Any + Send + Sync> = table;
@@ -2899,6 +2915,7 @@ impl WasmBackend {
         replacement_descrs.extend(chained_descrs);
         *compiled.fail_descrs.borrow_mut() = replacement_descrs;
         register_fail_descrs(&descrs);
+        Self::register_meta_descrs(token, &descrs);
         let guard_growth = guard_exits.len().saturating_sub(old_guard_count);
         if guard_growth != 0 {
             for (_, _, start, _) in compiled.bridge_descr_ranges.borrow_mut().iter_mut() {
@@ -3838,6 +3855,7 @@ impl majit_backend::Backend for WasmBackend {
             })
             .collect();
         register_fail_descrs(&fail_descrs);
+        Self::register_meta_descrs(token, &fail_descrs);
         if let Some(table) = gc_table {
             Self::register_gc_table(token, table);
         }

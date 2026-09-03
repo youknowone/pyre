@@ -2223,9 +2223,12 @@ fn jit_blackhole_resume_from_guard(
     // unboxed ints are treated as pointers → SIGSEGV. Both come out of one
     // layout resolution so the storage and the types cannot describe
     // different deadframes.
-    if let Some((storage, deadframe_types)) =
-        driver.get_resume_storage_with_slot_types(actual_green_key, trace_id, fail_index)
-    {
+    if let Some((storage, deadframe_types)) = driver.get_resume_storage_with_slot_types_for_descr(
+        descr_fd,
+        actual_green_key,
+        trace_id,
+        fail_index,
+    ) {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
@@ -4514,13 +4517,18 @@ fn jit_ca_handle_guard_failure(
     // compile.py: get exit_layout from the compiled trace.
     // Use owning_key (not green_key) — after retrace the descriptor
     // may belong to a different compiled entry than green_key.
+    // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
+    // descr's own; a bridge guard has no frontend record.
     let exit_layout = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp().get_compiled_exit_layout_in_trace(
-            owning_key,
-            source_trace_id,
-            source_fail_index,
-        )
+        descr_arc.as_fail_descr().and_then(|fd| {
+            driver.meta_interp().get_compiled_exit_layout_for_descr(
+                fd,
+                owning_key,
+                source_trace_id,
+                source_fail_index,
+            )
+        })
     };
     let Some(exit_layout) = exit_layout else {
         return false;
@@ -4630,13 +4638,18 @@ fn try_compile_ca_bridge(
         };
         return CaBridgeAttempt { terminal_declined };
     }
+    // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
+    // descr's own; a bridge guard has no frontend record.
     let exit_layout = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp().get_compiled_exit_layout_in_trace(
-            owning_key,
-            source_trace_id,
-            source_fail_index,
-        )
+        descr_arc.as_fail_descr().and_then(|fd| {
+            driver.meta_interp().get_compiled_exit_layout_for_descr(
+                fd,
+                owning_key,
+                source_trace_id,
+                source_fail_index,
+            )
+        })
     };
     let Some(exit_layout) = exit_layout else {
         return CaBridgeAttempt {

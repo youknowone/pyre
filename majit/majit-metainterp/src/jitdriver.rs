@@ -2649,6 +2649,20 @@ impl<S: JitState> JitDriver<S> {
             .get_resume_storage_with_slot_types(green_key, trace_id, fail_index)
     }
 
+    /// Descr-first form of [`Self::get_resume_storage_with_slot_types`]
+    /// (`ResumeGuardDescr.get_resumestorage`): a bridge guard has no
+    /// frontend record, so the storage is read off the descr itself.
+    pub fn get_resume_storage_with_slot_types_for_descr(
+        &self,
+        descr: &dyn majit_ir::FailDescr,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<(std::sync::Arc<crate::resume::ResumeStorage>, Vec<Type>)> {
+        self.meta
+            .get_resume_storage_with_slot_types_for_descr(descr, green_key, trace_id, fail_index)
+    }
+
     pub fn get_exit_types(
         &self,
         green_key: u64,
@@ -7051,11 +7065,24 @@ impl<S: JitState> JitDriver<S> {
             // which resumes at the loop entry against state the recovery has
             // already rewound. The failing guard's own layout carries the same
             // header pc, so reading it first also answers without a lookup.
+            // A bridge guard carries no frontend recovery layout
+            // (`compile.py send_bridge_to_backend`); the backend stamped
+            // its trace's header pc on the descr (`CompiledTraceInfo`), so
+            // that is read next.
             let guard_resume_pc = exit_layout
                 .recovery_layout
                 .as_ref()
                 .and_then(|recovery| recovery.frames.first())
                 .and_then(|frame| frame.header_pc)
+                .or_else(|| {
+                    descr_arc
+                        .as_fail_descr()
+                        .and_then(|fd| fd.trace_info_any())
+                        .and_then(|info| {
+                            info.downcast_ref::<majit_backend::CompiledTraceInfo>()
+                                .map(|info| info.header_pc)
+                        })
+                })
                 .or_else(|| self.get_merge_point_pc(owning_key, trace_id, fail_index))
                 .map(|pc| pc as usize)
                 .unwrap_or(target_pc);

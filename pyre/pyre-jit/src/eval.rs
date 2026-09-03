@@ -14629,10 +14629,23 @@ fn replay_pending_fields(
     exit_layout: &CompiledExitLayout,
     virtuals_cache: &mut HashMap<usize, Value>,
 ) {
-    let Some(ref recovery) = exit_layout.recovery_layout else {
-        return;
-    };
-    if recovery.pending_field_layouts.is_empty() {
+    let num_failargs = exit_layout.exit_types.len() as i32;
+    // `resume.py _prepare_pendingfields` reads the list off the guard's
+    // `rd_pendingfields`.  The root loop's frontend record carries it
+    // pre-resolved in `recovery_layout`; a bridge guard has no such record
+    // (`compile.py send_bridge_to_backend`), so it is resolved off the
+    // descr-owned storage here.
+    let pending: std::borrow::Cow<'_, [majit_backend::ExitPendingFieldLayout]> =
+        match exit_layout.recovery_layout.as_deref() {
+            Some(recovery) => std::borrow::Cow::Borrowed(&recovery.pending_field_layouts),
+            None => match exit_layout.storage.as_deref() {
+                Some(storage) => {
+                    std::borrow::Cow::Owned(storage.exit_pending_field_layouts(num_failargs))
+                }
+                None => return,
+            },
+        };
+    if pending.is_empty() {
         return;
     }
 
@@ -14646,7 +14659,6 @@ fn replay_pending_fields(
         .storage
         .as_deref()
         .map(|s| s.rd_virtuals.as_slice());
-    let num_failargs = exit_layout.exit_types.len() as i32;
     let value_to_raw_bits = |value: Value| match value {
         Value::Int(i) => i,
         Value::Float(f) => f.to_bits() as i64,
@@ -14674,7 +14686,7 @@ fn replay_pending_fields(
         }
     };
 
-    for pf in &recovery.pending_field_layouts {
+    for pf in pending.iter() {
         let Some(target_ptr) = resolve_value(&pf.target) else {
             continue;
         };
