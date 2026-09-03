@@ -3030,43 +3030,6 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&green_key).map(|c| c.root_trace_id)
     }
 
-    /// On-demand `ExitRecoveryLayout` reconstruction for
-    /// the cranelift overlay path.  Returns the `ExitRecoveryLayout` that
-    /// would be cached on `ResumeGuardDescr.recovery_layout` for a given
-    /// production guard, computed from the metainterp-side
-    /// `StoredExitLayout.resume_layout` (the canonical store).  Caller
-    /// supplies `caller_prefix` for CALL_ASSEMBLER overlay framing.
-    ///
-    /// Lookup path: descr → `rd_loop_token_clt()` → `CompiledLoopToken`
-    /// → `loop_token_wref.upgrade()` → `JitCellToken.green_key` →
-    /// `compiled_loops[green_key].traces[trace_id].exit_layouts[fail_index]`.
-    ///
-    /// Returns `None` for non-`ResumeDescr` descrs (synthetic FINISH /
-    /// external-JUMP / Done* / overlay synthetics with no `rd_loop_token`),
-    /// or when the descr's compiled entry has been evicted, or when the
-    /// `resume_layout` summary hasn't been built yet (codegen-time read
-    /// before metainterp publishes resume payload).
-    pub fn compute_recovery_layout_for_descr(
-        &self,
-        descr: &dyn FailDescr,
-        caller_prefix: Option<&majit_backend::ExitRecoveryLayout>,
-    ) -> Option<majit_backend::ExitRecoveryLayout> {
-        let trace_id = descr.trace_id();
-        let fail_index = descr.fail_index_per_trace();
-        let clt_any = descr.rd_loop_token_clt()?;
-        let clt = clt_any.downcast_ref::<majit_backend::CompiledLoopToken>()?;
-        let token_arc = clt.loop_token_wref.lock().upgrade()?;
-        let green_key = token_arc.green_key();
-        let compiled = self.compiled_loops.get(&green_key)?;
-        let exit_layout = compiled
-            .traces
-            .get(&trace_id)?
-            .exit_layouts
-            .get(&fail_index)?;
-        let resume_layout = exit_layout.resume_layout.as_ref()?;
-        Some(resume_layout.to_exit_recovery_layout_with_caller_prefix(caller_prefix))
-    }
-
     /// Salvage the evicted entry's per-trace metadata into the new
     /// CompiledEntry being built for the same `green_key`, and return the
     /// list of `Arc<JitCellToken>` to seed the new entry's

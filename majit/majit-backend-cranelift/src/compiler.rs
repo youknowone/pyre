@@ -2163,46 +2163,6 @@ pub fn register_resumedata_deopt(f: ResumeDataDeoptFn) {
     let _ = RESUMEDATA_DEOPT_FN.set(f);
 }
 
-/// On-demand layout reconstruction callback.  Returns
-/// an `ExitRecoveryLayout` for the descr at `descr_addr`, optionally
-/// prefixed by `caller_prefix`.  Implementation looks up the
-/// metainterp's `StoredExitLayout` cache (keyed by trace_id /
-/// fail_index_per_trace) and converts the cached `resume_layout` via
-/// `ResumeLayout::to_exit_recovery_layout_with_caller_prefix`.
-///
-/// Sibling of [`RESUMEDATA_DEOPT_FN`] but returns layout structure
-/// instead of replaying deopt — used by `recovery_layout_ref()` to
-/// produce `ExitRecoveryLayout` without depending on the meta-side
-/// `ResumeGuardDescr.recovery_layout` cache.
-///
-/// Returns `None` for descrs without a `ResumeGuardDescr` meta_descr
-/// (synthetic FINISH / external-JUMP) or when the StoredExitLayout
-/// lookup fails (descr not in metainterp cache, e.g. overlay
-/// synthetics).  Callers must handle `None`.
-type RecoveryLayoutFn = fn(usize, Option<&ExitRecoveryLayout>) -> Option<ExitRecoveryLayout>;
-static RECOVERY_LAYOUT_FN: OnceLock<RecoveryLayoutFn> = OnceLock::new();
-
-/// Register the on-demand layout reconstruction callback for the
-/// Path 1 epic.  pyre-jit calls this during JIT boot alongside
-/// `register_resumedata_deopt`.
-pub fn register_recovery_layout(f: RecoveryLayoutFn) {
-    let _ = RECOVERY_LAYOUT_FN.set(f);
-}
-
-/// Dispatch helper consulted by `fail_descr_recovery_layout`.
-/// Returns `None` if the callback hasn't been registered yet
-/// (cranelift in pure-backend tests without pyre-jit boot); production
-/// callers fall through to the metainterp's
-/// `trace_layout_ref.recovery_layout` fallback at
-/// `pyjitpl.rs`, matching dynasm parity.
-pub(crate) fn recovery_layout_via_callback(
-    descr_addr: usize,
-    caller_prefix: Option<&ExitRecoveryLayout>,
-) -> Option<ExitRecoveryLayout> {
-    let cb = RECOVERY_LAYOUT_FN.get().copied()?;
-    cb(descr_addr, caller_prefix)
-}
-
 /// Dispatch entry used by the four runtime-deopt callers
 /// (compiler.rs) — drives the on-demand
 /// `ResumeDataDirectReader` callback
@@ -8137,30 +8097,6 @@ impl CompiledLoop {
     }
 }
 
-/// Resolve the `ExitRecoveryLayout` for a fail descr via the on-demand
-/// callback.  The cranelift backend no longer caches a
-/// recovery layout — pyre-jit's
-/// `cranelift_recovery_layout_for_descr` reconstructs it from the
-/// metainterp's `StoredExitLayout.resume_layout` cache, matching
-/// dynasm's contract where `describe_deadframe` returns
-/// `recovery_layout: None` and consumers fall back to the metainterp's
-/// `trace_layout_ref.recovery_layout`.  Returns `None` when no
-/// callback is registered (test scaffolds without pyre-jit) or when
-/// the descr is synthetic (no `rd_loop_token_clt`).
-fn fail_descr_recovery_layout(descr: &DescrRef) -> Option<ExitRecoveryLayout> {
-    // The callback (`cranelift_recovery_layout_for_descr`) resolves the
-    // descr via `Backend::fail_descr_arc_from_addr` →
-    // `recover_fail_descr_cell`, which requires a `FailDescrCell` thin
-    // pointer.  Wrap in a fresh cell and bake its address; the local
-    // cell stays alive through the callback and the recovery bumps the
-    // refcount inside.
-    let cell = majit_ir::FailDescrCell::wrap(descr.clone());
-    let addr = Arc::as_ptr(&cell) as *const () as usize;
-    let result = recovery_layout_via_callback(addr, None);
-    drop(cell);
-    result
-}
-
 /// Read the per-trace `CompiledTraceInfo` from the meta-side
 /// per-emission slot.  Routes through the
 /// `FailDescr::trace_info_any` trait method so copied descrs return
@@ -8186,8 +8122,6 @@ fn fail_descr_layout(
         .as_fail_descr()
         .expect("fail_descr_layout requires a Descr that exposes the FailDescr trait");
     let fail_arg_types = fd.fail_arg_types();
-    let recovery = fail_descr_recovery_layout(descr);
-    let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
     majit_backend::FailDescrLayout {
         fail_index,
         source_op_index: fd.source_op_index(),
@@ -8196,8 +8130,8 @@ fn fail_descr_layout(
         fail_arg_types: fail_arg_types.to_vec(),
         is_finish: fd.is_finish(),
         is_exception_exit: fd.is_exit_frame_with_exception(),
-        recovery_layout: recovery,
-        frame_stack,
+        recovery_layout: None,
+        frame_stack: None,
         descr: Some(descr.clone()),
     }
 }
@@ -17594,10 +17528,6 @@ fn collect_guards(
             if descr.is_resume_guard() || descr.is_resume_guard_copied() {
                 as_fd(&descr).set_source_op_index(op_idx);
             }
-            // Backend no longer caches an `ExitRecoveryLayout` per descr;
-            // `fail_descr_recovery_layout` reads on demand via
-            // `recovery_layout_via_callback` (metainterp's
-            // `compute_recovery_layout_for_descr`).
             let _ = recovery_layout;
             if let Some(target) = external_jump_target {
                 fail_descr_set_external_jump_target(&descr, target);

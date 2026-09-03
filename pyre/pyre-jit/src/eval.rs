@@ -9453,10 +9453,6 @@ fn eval_with_jit_inner(
     init_callbacks();
     #[cfg(feature = "cranelift")]
     majit_backend_cranelift::register_resumedata_deopt(crate::call_jit::cranelift_resumedata_deopt);
-    #[cfg(feature = "cranelift")]
-    majit_backend_cranelift::register_recovery_layout(
-        crate::call_jit::cranelift_recovery_layout_for_descr,
-    );
     let jit_shape = cached_unsupported_jit_shape(code);
     // Every declining shape runs the frame in the plain interpreter, so the
     // tracer never sees it. Record the decline in the census — keyed by the
