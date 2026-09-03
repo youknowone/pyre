@@ -11960,12 +11960,15 @@ fn establish_nullity<Sym: WalkSym>(
     Ok(value)
 }
 
-/// The unary member of the fused-goto family. `pyjitpl.py`
-/// `opimpl_goto_if_not_int_is_zero` records the condition and hands it to
-/// `opimpl_goto_if_not` with `replace=False`:
+/// The unary members of the fused-goto family. `pyjitpl.py`
+/// `opimpl_goto_if_not_int_is_zero` and `opimpl_goto_if_not_int_is_true` record
+/// the condition and hand it to `opimpl_goto_if_not` with `replace=False`:
 ///
 ///   condbox = self.execute(rop.INT_IS_ZERO, box)
 ///   self.opimpl_goto_if_not(condbox, target, orgpc, replace=False)
+///
+/// `replace=False` is why the condition is recorded and then dropped: it names
+/// no register, so there is nothing for a later op to read it back from.
 ///
 /// Operand layout `iL`: 1B int reg + 2B label.
 fn fused_goto_if_not_int_unary<Sym: WalkSym>(
@@ -12197,6 +12200,10 @@ fn handle<Sym: WalkSym>(
         // over: the plain arm records no `int_is_true`, and its `replace`
         // rewrites the *value* box to a constant -- for the fused form that box
         // is `x`, not the boolean the branch tested.
+        //
+        // Both spellings reach the stream: `jtransform::optimize_goto_if_not`
+        // folds `int_is_true` and `int_is_zero` alike, and the assembler keys
+        // each on its own byte.
         "goto_if_not_int_is_true/iL" => {
             fused_goto_if_not_int_unary(code, op, ctx, OpCode::IntIsTrue)
         }
