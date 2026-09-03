@@ -5067,55 +5067,90 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
     // Tried before the hand-written fold below, and returning here takes the
     // site away from it rather than adding one.  That ordering is only
     // harmless while the descent declines, which it does today at
-    // `w_method_new`.  Publishing that address was measured twice, and the
-    // second time with the cause named, so the wall stays until the cause is
-    // gone rather than until the wall is inconvenient.
+    // `w_method_new`.  Publishing that address has now been measured three
+    // times; the third reading, on base `de7e1a70159`, found the cost is not
+    // a constant factor but quadratic in the iteration count, so the wall
+    // stays until the cause is gone rather than until the wall is
+    // inconvenient.
     //
-    // On `bench/synth/zero_arg_super_attr.py` at N=2,000,000, one binary
-    // A/B'd with `PYRE_FBW_NO_SPECIALIZE`, identical output, best of 3:
+    // Reading the firing arm means publishing `w_method_new`, which is the
+    // wall itself, so every figure below comes from a throwaway binary
+    // carrying that one extra registration.  `bench/synth/
+    // zero_arg_super_attr.py`, A/B'd with `PYRE_FBW_NO_SPECIALIZE`, identical
+    // output on every arm, best of 3.  Per ITERATION, so a flat column is
+    // linear and a rising one is not:
     //
-    //     fold on, descent declines .......  0.11s
-    //     every fold off, JIT on ..........  0.56s
-    //     `PYRE_NO_JIT=1` .................  1.94s
-    //     descent fires ................... 11.93s
+    //         N        descent      fold     `PYRE_NO_JIT=1`
+    //   250,000    2156 ns/it    284 ns/it    1900 ns/it
+    //   500,000    2464 ns/it      --          --
+    // 1,000,000    4781 ns/it     67 ns/it    2705 ns/it
+    // 2,000,000    9078 ns/it     33 ns/it    1420 ns/it
     //
-    // A firing descent is therefore 6x slower than not running the JIT at
-    // all, which makes it a pathology rather than a fold that loses.  It is
-    // not deopt: both arms report `loops_compiled=2 loops_aborted=0
-    // bridges_compiled=0 guard_failures=1`, and `MAJIT_GUARD_CENSUS` reads
-    // `distinct=1 total=1` on each.  The cost is entirely in the body the
-    // descent compiles, which `MAJIT_LOG_OPT` measures at 513 ops / 98 guards
-    // against the fold's 72 / 18:
+    // The descent's per-iteration cost roughly doubles as N doubles: its
+    // total is O(N^2) while both other arms are linear or better (the fold's
+    // TOTAL is flat at 0.067s from N=1,000,000 up, which is why its
+    // per-iteration column falls).  So "slower than not running the JIT at
+    // all" is not a fixed multiple -- it is 1.1x at N=250,000 and 6.4x at
+    // N=2,000,000.  Quoting one ratio without its N, as this comment used to,
+    // describes the fixture rather than the defect.
     //
-    //   * One `W_Super` per iteration is allocated for real.  The descent
-    //     does emit the proxy virtually --- `NewWithVtable` plus the three
-    //     `W_Super` setfields --- but the MRO walk it descends into then
-    //     hands that proxy to residual calls, so it escapes and the
-    //     allocation survives.  `PYPY_GC_NURSERY=512M` cuts the arm from
-    //     10.33s to 4.72s while leaving the fold arm at 0.10s: over half the
-    //     deficit is collector work driven by that one allocation.
-    //   * 50 residual calls per iteration against the fold's zero, of which
-    //     32 are `pyre_object::gc_roots` shadow-stack bookkeeping
-    //     (`pin_root` x10, `shadow_stack_get` x10, `shadow_stack_cell` x4,
-    //     `shadow_stack_cell_len` x4, `shadow_stack_len` x4).  Those cannot
-    //     be optimized out: `jtransform.rs` asserts in
+    // The cause is the GC root bracket, not the proxy allocation.  The
+    // descended body pins 10 roots per iteration and truncates none:
+    // `pin_root` grows the shadow stack (`stack.incr_stack()`,
+    // `gc_roots.rs`), and the only thing that shrinks it is
+    // `RootScope::drop`'s `shadow_stack_cell_truncate` -- a Rust `Drop`,
+    // which `mir.rs`'s `TermKind::Drop => set_goto` arm erases when it lowers
+    // the body (the `fn_ptr` naming the glue is discarded a layer earlier, in
+    // `majit-charon-reader`'s `ullbc.rs` `Drop` variant).  The bracket is
+    // therefore push-only in jitcode, the stack grows by 10 slots per
+    // iteration, and every collection walks all of it.  That is the shape the
+    // table shows.  `PYPY_GC_NURSERY=512M` moves N=2,000,000 from 18.2s to
+    // 10.0s but leaves the curve rising, which is what a change to the
+    // NUMBER of collections does when each one still walks a stack that keeps
+    // growing.
+    //
+    // It is not deopt: both arms report `loops_aborted=0 bridges_compiled=0
+    // guard_failures=1`, and `MAJIT_GUARD_CENSUS` reads `distinct=2 total=3`
+    // on the firing arm against `distinct=1 total=1` on the fold's -- three
+    // deopt events across two million iterations.  `MAJIT_LOG_OPT` puts the
+    // compiled body at 525 ops / 102 guards against the fold's 72 / 18, and
+    // that body carries:
+    //
+    //   * 48 residual calls per iteration against the fold's zero, 32 of them
+    //     `pyre_object::gc_roots` bookkeeping (`pin_root` x10,
+    //     `shadow_stack_get` x10, `shadow_stack_cell` x4,
+    //     `shadow_stack_cell_len` x4, `shadow_stack_len` x4).  These are the
+    //     open half of the same unclosed bracket, and they cannot be
+    //     optimized out while they stand alone: `jtransform.rs` asserts in
     //     `gc_root_pin_and_reload_keep_their_calls` that `pin_root` and
-    //     `reload_top_root` must survive as calls, because the slot a pin
-    //     publishes is what bound `shadow_stack_get` residuals read back and
-    //     nothing else forwards it across a move.
-    //   * The two `_pure_getdictvalue_no_unwrapping` calls are classified
-    //     `MayForce`, so each is wrapped in the virtualizable force protocol
-    //     (`ForceToken`, two setfields on the frame, `GuardNotForced`) and
-    //     splits the body into regions the optimizer cannot carry state
+    //     `reload_top_root` survive as calls, because the slot a pin
+    //     publishes is what bound `shadow_stack_get` residuals read back.
+    //   * One `W_Super` per iteration allocated for real.  The descent emits
+    //     the proxy virtually --- `NewWithVtable` plus three setfields ---
+    //     but the MRO walk hands it to those residual calls, so it escapes.
+    //     Real, and not what makes the curve rise: a per-iteration allocation
+    //     is a constant per-iteration cost.
+    //   * The two `_pure_getdictvalue_no_unwrapping` calls classified
+    //     `MayForce`, each wrapped in the virtualizable force protocol
+    //     (`ForceToken`, two setfields on the frame, `GuardNotForced`),
+    //     splitting the body into regions the optimizer cannot carry state
     //     across.
+    //   * `ll_issubclass` x4 and `w_type_issubtype` x4, where the opcode path
+    //     settles the same test with a single `GuardSubclass`: the descent
+    //     traces the helper's own call rather than the guard.
     //
-    // The first two are properties of descending into Rust helper code at
-    // all, not of this opcode: upstream can trace `W_Super.getattribute`
-    // because RPython's roots are invisible to the tracer and its proxy
-    // virtualizes, and neither holds here.  So the fold's advantage is not
-    // that it is a better fold, it is that it never enters helper code.  On
-    // `extra_tests/snippets/class_super_zero_arg_inlined_callee.py` the same
-    // binary took 2 of the fold's 5 sites while `loops_aborted` went 0 -> 6.
+    // None of this is specific to `super`.  It prices any descent into Rust
+    // helper code that opens a root bracket, which is most of it; upstream
+    // can trace `W_Super.getattribute` because RPython's roots are invisible
+    // to the tracer and its proxy virtualizes, and neither holds here.  The
+    // fold's advantage is not that it is a better fold, it is that it never
+    // enters helper code.
+    //
+    // On `extra_tests/snippets/class_super_zero_arg_inlined_callee.py` the
+    // descent fires at 1 of its 6 consulted sites while the hand-written fold
+    // fires at 5 in both arms, and `loops_compiled=8 loops_aborted=0` either
+    // way.  An earlier reading on base `9f81966a6eb` had `loops_aborted` go
+    // 0 -> 6 under the descent; that no longer reproduces.
     if spec_gate(SpecFold::LoadSuperAttrDescent, || {
         try_walker_orthodox_load_super_attr(
             ctx,

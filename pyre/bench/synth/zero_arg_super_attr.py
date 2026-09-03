@@ -42,35 +42,49 @@
 # moved rather than resolved anything.
 #
 # The wall has since been lifted experimentally, and what is behind it is a
-# regression.  A/B'd on ONE binary with
-# `PYRE_FBW_NO_SPECIALIZE=load_super_attr_descent`, identical output, best of
-# 3 at N=2,000,000:
+# regression that gets worse with N rather than a constant factor.  Reading
+# the firing arm means publishing `w_method_new`, which is the wall, so these
+# figures come from a throwaway binary carrying that one registration.  A/B'd
+# with `PYRE_FBW_NO_SPECIALIZE`, identical output on every arm, best of 3, on
+# base `de7e1a70159`.  Per ITERATION, so a flat column is linear:
 #
-#     fold on, descent declines .......  0.11s
-#     every fold off, JIT on ..........  0.56s
-#     `PYRE_NO_JIT=1` .................  1.94s
-#     descent fires ................... 11.93s
+#         N        descent      fold     `PYRE_NO_JIT=1`
+#   250,000    2156 ns/it    284 ns/it    1900 ns/it
+# 1,000,000    4781 ns/it     67 ns/it    2705 ns/it
+# 2,000,000    9078 ns/it     33 ns/it    1420 ns/it
 #
-# A firing descent is 6x slower than not running the JIT at all, so this is a
-# pathology and not a fold that loses.  It is not deopt: both arms report
-# `loops_compiled=2 loops_aborted=0 bridges_compiled=0 guard_failures=1`, and
-# `MAJIT_GUARD_CENSUS` reads `distinct=1 total=1` on each.  What differs is
-# the body: `MAJIT_LOG_OPT` measures 513 ops / 98 guards against the fold's
-# 72 / 18, carrying one real `W_Super` allocation and 50 residual calls per
-# iteration where the fold carries none.  32 of those 50 are
-# `pyre_object::gc_roots` shadow-stack bookkeeping, which the codewriter is
-# required to keep.  `PYPY_GC_NURSERY=512M` cuts the firing arm from 10.33s to
-# 4.72s and leaves the fold arm at 0.10s, so over half of it is collector work
-# driven by the proxy that failed to virtualize.  The gate comment above
+# The descent's total is O(N^2) while the others are linear or flat (the
+# fold's TOTAL is 0.067s at every N from 1,000,000 up).  "Slower than not
+# running the JIT at all" is therefore 1.1x at N=250,000 and 6.4x at
+# N=2,000,000 -- a property of this file's N, not of the descent.
+#
+# The cause is the GC root bracket.  The descended body pins 10 roots per
+# iteration and truncates none: `pin_root` grows the shadow stack, and only
+# `RootScope::drop` shrinks it -- a Rust `Drop`, which the MIR lowering's
+# `TermKind::Drop` arm erases.  The bracket is push-only in jitcode, so the
+# stack grows 10 slots per iteration and every collection walks all of it.
+# `PYPY_GC_NURSERY=512M` moves N=2,000,000 from 18.2s to 10.0s and leaves the
+# curve rising, which is what changing the NUMBER of collections does when
+# each one still walks a growing stack.  The one real `W_Super` allocation per
+# iteration is a constant per-iteration cost and is not what bends the curve.
+#
+# It is not deopt: both arms report `loops_aborted=0 bridges_compiled=0
+# guard_failures=1`, and `MAJIT_GUARD_CENSUS` reads `distinct=2 total=3` on
+# the firing arm against `distinct=1 total=1` on the fold's.  `MAJIT_LOG_OPT`
+# measures 525 ops / 102 guards against the fold's 72 / 18, with 48 residual
+# calls per iteration where the fold has none, 32 of them the open half of
+# that unclosed bracket.  The gate comment above
 # `try_walker_orthodox_load_super_attr` carries the full reading.
 #
-# The preference is what makes that reachable.
 # `try_walker_specialize_load_super_attr` consults the descent first and
-# returns on success, so a firing descent takes a site AWAY from the fold
-# rather than adding one.  On
-# `extra_tests/snippets/class_super_zero_arg_inlined_callee.py` the fold alone
-# covers 5 of 5 super sites; with the descent firing, coverage splits 3+2,
-# `loops_compiled` drops 6 -> 4 and `loops_aborted` rises 0 -> 6.
+# returns on success, so a firing descent can take a site away from the fold
+# rather than add one.  That is a property of the ordering, not something this
+# snippet currently exhibits: on
+# `extra_tests/snippets/class_super_zero_arg_inlined_callee.py` the fold fires
+# at 5 of its 6 consulted sites in BOTH arms, the descent takes the sixth, and
+# `loops_compiled=8 loops_aborted=0` either way.  An earlier reading on base
+# `9f81966a6eb` had coverage split 3+2 with `loops_aborted` rising 0 -> 6;
+# that no longer reproduces.
 #
 try:
     import pypyjit
