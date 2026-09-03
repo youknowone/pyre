@@ -245,7 +245,12 @@ impl NumberingState {
             liveboxes: LiveboxMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
-            livebox_types: indexmap::IndexMap::default(),
+            // At most one entry per numbered box, and `size` counts the
+            // boxes, so the table never rehashes mid-guard.
+            livebox_types: indexmap::IndexMap::with_capacity_and_hasher(
+                size,
+                FxBuildHasher,
+            ),
         }
     }
     pub fn append_short(&mut self, item: i16) {
@@ -8415,9 +8420,12 @@ pub fn blackhole_from_resumedata<'a>(
         // bank before filling it so a materialization collection during
         // `consume_one_section` forwards the refs already written here (the
         // Vec buffer is stable — `setarg_r` only indexes — and the frame
-        // itself is already boxed, so chaining it moves a pointer).
-        unsafe {
-            majit_gc::shadow_stack::push_resume_ref_roots(&mut nextbh.registers_r);
+        // itself is already boxed, so chaining it moves a pointer). A pooled
+        // interpreter is rooted for its whole life already.
+        if !nextbh.is_rooted() {
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut nextbh.registers_r);
+            }
         }
 
         // resume.py:1341

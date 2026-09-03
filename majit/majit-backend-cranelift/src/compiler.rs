@@ -9428,7 +9428,7 @@ impl CraneliftBackend {
             asm_memory_handle,
             module,
             func_ctx,
-            constants: majit_ir::ConstMap::new(),
+            constants: majit_ir::ConstMap::default(),
             callinfocollection: None,
             func_counter: 0,
             trace_counter: 1,
@@ -18249,6 +18249,12 @@ impl majit_backend::Backend for CraneliftBackend {
         )
         .and_then(|descr| fail_descr_bridge_ref(as_fd(&descr)))
         .is_some()
+    }
+
+    /// The guard's dispatch cell holds the `BridgeData` once a bridge is
+    /// attached; `patch_jump_for_descr` installs it.
+    fn bridge_attached(&self, descr: &dyn majit_ir::FailDescr) -> Option<bool> {
+        Some(fail_descr_bridge_ref(descr).is_some())
     }
 
     fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {

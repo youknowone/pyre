@@ -3582,7 +3582,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(OptRewrite::new()));
         opt.trace_inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Ref]);
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
@@ -4363,7 +4363,7 @@ mod tests {
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
         opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[majit_ir::Type::Int; 2]);
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -4389,7 +4389,7 @@ mod tests {
         // mul_minus_one lives in OptIntBounds (autogenintrules.py).
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
@@ -4414,7 +4414,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
@@ -4435,7 +4435,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)
@@ -4459,7 +4459,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
         opt.add_pass(Box::new(OptRewrite::new()));
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let num_inputs = inputs.len();
         let result = opt
             .optimize_with_constants_and_inputs_oprc(&ops, &mut constants, num_inputs)

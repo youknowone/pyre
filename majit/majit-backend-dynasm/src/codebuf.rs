@@ -1,8 +1,9 @@
 //! codebuf.py: Code buffer management.
 //!
 //! In RPython, MachineCodeBlockWrapper wraps rx86 code builders with block
-//! management. Here dynasm emits into a temporary mapping, which is copied
-//! into the CPU's `AsmMemoryManager` to return the final arena-owned buffer.
+//! management. Here dynasm emits into a byte vector (`VecAssembler`), which is
+//! copied into the CPU's `AsmMemoryManager` to return the final arena-owned
+//! buffer (`copy_to_raw_memory`).
 
 /// codebuf.py MachineCodeBlockWrapper
 /// The arena/free-list ownership below is the `MachineCodeBlockWrapper` role.
@@ -57,25 +58,22 @@ impl std::ops::Deref for ArenaExecutableBuffer {
 /// Copy the assembled code into an arena-owned RW block. The caller may patch
 /// backend placeholders before switching the block to RX.
 ///
-/// Relocating finalized code to a different address is only sound while no
-/// relocation encodes an address. dynasm keeps those (`RelToAbs`, `AbsToRel`)
-/// in a private `managed` list and re-applies them when it moves its own
-/// buffer; nothing outside that crate can re-apply them here. This backend
+/// Placing finalized code at an address other than the one it was assembled
+/// for (`VecAssembler::new(0)`) is only sound while no relocation encodes an
+/// address: dynasm resolves those (`RelToAbs`, `AbsToRel`) against the base
+/// address it was given, and nothing here re-applies them. This backend
 /// emits neither kind: aarch64 encodes every jump target PC-relative, and the
 /// x86 emitter uses no `extern` targets and no 8-byte label operands — the two
 /// forms that produce one. `tests/relocation_guard.rs` holds that in place.
 pub fn finalize_writable<R: Relocation>(
-    mut assembler: dynasmrt::Assembler<R>,
+    assembler: dynasmrt::VecAssembler<R>,
     arena: &Arc<AsmMemoryManager>,
 ) -> Result<ArenaExecutableBuffer, BackendError> {
     let len = assembler.offset().0;
-    // Surface relocation errors as an `Err`; `finalize` panics on them.
-    assembler
-        .commit()
+    // Surface relocation errors as an `Err`.
+    let source = assembler
+        .finalize()
         .map_err(|error| BackendError::CompilationFailed(error.to_string()))?;
-    let source = assembler.finalize().map_err(|_| {
-        BackendError::CompilationFailed("assembler is still borrowed by an Executor".to_string())
-    })?;
     let mut block = arena
         .allocate(len, len)
         .map_err(|error| BackendError::CompilationFailed(error.to_string()))?;
@@ -90,7 +88,7 @@ pub fn finalize_writable<R: Relocation>(
 }
 
 pub fn finalize_executable<R: Relocation>(
-    assembler: dynasmrt::Assembler<R>,
+    assembler: dynasmrt::VecAssembler<R>,
     arena: &Arc<AsmMemoryManager>,
 ) -> Result<ArenaExecutableBuffer, BackendError> {
     let mut buffer = finalize_writable(assembler, arena)?;

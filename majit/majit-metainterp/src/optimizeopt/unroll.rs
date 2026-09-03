@@ -6537,7 +6537,7 @@ mod tests {
                 .unwrap_or_default()
         });
         opt.snapshot_boxes = snapshots;
-        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024)
+        opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024)
     }
 
     #[test]
@@ -6731,7 +6731,7 @@ mod tests {
             Operand::from_opref(old_ref),
             OpInfo::ptr(PtrInfo::Constant(old)),
         );
-        let mut constants = majit_ir::ConstMap::new();
+        let mut constants = majit_ir::ConstMap::default();
         constants.insert(0, majit_ir::Const::Ref(old));
 
         let mut state = ExportedState::new(
@@ -7238,7 +7238,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
 
         // Expect: peeled_add, peeled_guard, Label, body_add, body_guard, Jump = 6
         assert_eq!(result.len(), 6);
@@ -7407,7 +7407,7 @@ mod tests {
             Op::new(OpCode::Jump, &[rooted_inputarg_operand(Type::Int, 0)]),
         ];
         assign_positions(&mut ops, 2);
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let (result, _) =
             unroll_opt.optimize_trace_with_constants_and_inputs(&ops, &mut constants, 2);
         // The optimizer processes the trace; result should not be empty
@@ -7433,7 +7433,7 @@ mod tests {
             Op::new(OpCode::Jump, &[rooted_inputarg_operand(Type::Int, 0)]),
         ];
         assign_positions(&mut ops, 1);
-        let mut constants = majit_ir::ConstMap::new();
+        let mut constants = majit_ir::ConstMap::default();
         let mut phase1_out = None;
 
         unroll_opt
@@ -8485,7 +8485,7 @@ mod tests {
                 same_as_source: rooted_resop_operand(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &majit_ir::ConstMap::new(),
+            &majit_ir::ConstMap::default(),
             None,
             None,
         );
@@ -8546,7 +8546,7 @@ mod tests {
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 11)]),
         ];
 
-        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
             &p1_ops,
@@ -8626,7 +8626,7 @@ mod tests {
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 19)]),
         ];
 
-        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
             &p1_ops,
@@ -8703,7 +8703,7 @@ mod tests {
                 same_as_source: rooted_resop_operand(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &majit_ir::ConstMap::new(),
+            &majit_ir::ConstMap::default(),
             None,
             None,
         );
@@ -8762,7 +8762,7 @@ mod tests {
             ),
         ];
         let constants =
-            majit_ir::ConstMap::from([(OpRef::void_op(857).raw(), majit_ir::Value::Int(2))]);
+            majit_ir::ConstMap::from_iter([(OpRef::void_op(857).raw(), majit_ir::Value::Int(2))]);
 
         let mut ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
         let p1_ops_rc: Vec<majit_ir::OpRc> = p1_ops
@@ -8871,7 +8871,7 @@ mod tests {
                 same_as_source: rooted_resop_operand(Type::Int, 10),
                 same_as_opcode: OpCode::SameAsI,
             }],
-            &majit_ir::ConstMap::new(),
+            &majit_ir::ConstMap::default(),
             None,
             None,
         );
@@ -8928,7 +8928,7 @@ mod tests {
             },
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 64)]),
         ];
-        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
             &[],
@@ -9008,7 +9008,7 @@ mod tests {
             5,
             false,
             &[],
-            &majit_ir::ConstMap::new(),
+            &majit_ir::ConstMap::default(),
             Some(start_descr),
             None,
         );
@@ -9074,7 +9074,7 @@ mod tests {
             2,
             false,
             &[],
-            &majit_ir::ConstMap::new(),
+            &majit_ir::ConstMap::default(),
             Some(start_descr),
             Some(loop_descr),
         );
@@ -9119,7 +9119,7 @@ mod tests {
                 jump
             },
         ];
-        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
             &[],
@@ -9180,7 +9180,7 @@ mod tests {
             ),
             Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)]),
         ];
-        let constants = majit_ir::ConstMap::from([
+        let constants = majit_ir::ConstMap::from_iter([
             (2_u32, majit_ir::Value::Int(606)),
             (4_u32, majit_ir::Value::Int(611)),
         ]);
@@ -9223,7 +9223,7 @@ mod tests {
             OpCode::Jump,
             &[rooted_resop_operand(Type::Int, 10)],
         )];
-        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let combined = assemble_peeled_trace(
             &[],
@@ -9259,7 +9259,7 @@ mod tests {
         // The assembler is therefore a passthrough for inputarg references
         // — no source_slot input_remap needed. This test verifies that
         // pre-resolved body args survive intact.
-        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
         let p2_ops = vec![
             {
@@ -9350,7 +9350,7 @@ mod tests {
             6,
             true,
             &[],
-            &majit_ir::ConstMap::new(),
+            &majit_ir::ConstMap::default(),
             None,
             Some(loop_descr),
         );

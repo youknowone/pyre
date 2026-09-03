@@ -126,7 +126,7 @@ mod tests {
         let num_inputs = inputs.len();
         opt.optimize_with_constants_and_inputs_oprc(
             &ops,
-            &mut majit_ir::ConstMap::new(),
+            &mut majit_ir::ConstMap::default(),
             num_inputs,
         )
         .expect("test: unexpected InvalidLoop")

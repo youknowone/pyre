@@ -57,17 +57,23 @@ use std::sync::{Arc, Weak};
 
 use majit_ir::GcRef;
 
+/// `llsupport/symbolic.py` `WORD`.
+const WORD: usize = core::mem::size_of::<usize>();
+
 /// A per-loop array of reference-constant slots.
 ///
 /// `gcreftracer.py` `GCREFTRACER` stores `array_base_addr` +
-/// `array_length`; here the `Box<[Cell<GcRef>]>` *is* that array:
-/// [`base_addr`](GcTable::base_addr) is `array_base_addr` and
-/// [`len`](GcTable::len) is `array_length`. The `Box` is a stable Rust
-/// heap allocation (never relocated by the moving GC), so its base
-/// address is valid for the table's whole life — that is what the
-/// backend bakes as the `LoadFromGcTable` base immediate.
+/// `array_length`. The array itself sits at the start of the loop's
+/// machine-code block (`assembler.py reserve_gcref_table`), where the
+/// `LoadFromGcTable` genop reaches it PC-relative; a backend that keeps the
+/// array on the Rust heap instead ([`from_gcrefs`](GcTable::from_gcrefs))
+/// hands out the heap address as `array_base_addr` and bakes it as an
+/// absolute immediate. Either address is stable for the table's whole life.
 pub struct GcTable {
-    slots: Box<[Cell<GcRef>]>,
+    array_base_addr: usize,
+    array_length: usize,
+    /// The heap-owned array, when the slots do not live in a code block.
+    _owned: Option<Box<[Cell<GcRef>]>>,
 }
 
 // SAFETY: a `GcTable`'s slots are only mutated through `trace`, which
@@ -112,6 +118,17 @@ static LIVE_GC_TABLES: RwLock<Vec<Weak<GcTable>>> = RwLock::new(Vec::new());
 #[cfg(test)]
 static GC_TABLE_WALK_LOCK: RwLock<()> = RwLock::new(());
 
+/// Tables built since the last minor collection. `GCREFTRACER` is an
+/// ordinary old object upstream: writing its slots at construction puts it
+/// in MiniMark's `old_objects_pointing_to_young` for exactly one minor
+/// collection, which promotes every referent it holds, and no later minor
+/// visits it again because its slots are never written afterwards. A major
+/// collection marks through every live tracer regardless. This list is that
+/// remembered set: [`walk_all_gc_tables_inner`] drains it on a minor walk and
+/// walks the whole registry on a major one.
+static PENDING_MINOR_TABLES: parking_lot::Mutex<Vec<Weak<GcTable>>> =
+    parking_lot::Mutex::new(Vec::new());
+
 impl GcTable {
     /// Build a per-loop table from the rewrite's gcref output list and
     /// register it for GC forwarding.
@@ -132,8 +149,43 @@ impl GcTable {
         // backend init without depending on a separate init call site.
         install_gc_table_walker();
         let slots: Box<[Cell<GcRef>]> = gcrefs.iter().map(|g| Cell::new(*g)).collect();
-        let table = Arc::new(GcTable { slots });
+        let table = GcTable {
+            array_base_addr: slots.as_ptr() as usize,
+            array_length: slots.len(),
+            _owned: Some(slots),
+        };
+        Self::register(table)
+    }
+
+    /// `gcreftracer.py` `make_framework_tracer`: write the gcrefs into the
+    /// raw array reserved at `array_base_addr` inside a machine-code block
+    /// (`assembler.py patch_gcref_table`) and register the tracer. The
+    /// block is written under the assembler-writing bracket
+    /// (`rmmap.enter_assembler_writing`).
+    ///
+    /// # Safety
+    /// `array_base_addr` must address `gcrefs.len()` word-aligned words
+    /// inside a JIT mapping that outlives the returned table.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub unsafe fn in_code(array_base_addr: usize, gcrefs: &[GcRef]) -> Arc<GcTable> {
+        install_gc_table_walker();
+        {
+            let _writing = crate::rmmap::AssemblerWriting::enter();
+            for (i, g) in gcrefs.iter().enumerate() {
+                unsafe { *((array_base_addr + i * WORD) as *mut GcRef) = *g };
+            }
+        }
+        Self::register(GcTable {
+            array_base_addr,
+            array_length: gcrefs.len(),
+            _owned: None,
+        })
+    }
+
+    fn register(table: GcTable) -> Arc<GcTable> {
+        let table = Arc::new(table);
         register_table(&table);
+        PENDING_MINOR_TABLES.lock().push(Arc::downgrade(&table));
         table
     }
 
@@ -141,17 +193,26 @@ impl GcTable {
     /// the `LoadFromGcTable` base immediate. `gcreftracer.py:9`
     /// `array_base_addr`.
     pub fn base_addr(&self) -> usize {
-        self.slots.as_ptr() as usize
+        self.array_base_addr
     }
 
     /// Number of reference-constant slots. `gcreftracer.py:10`
     /// `array_length`.
     pub fn len(&self) -> usize {
-        self.slots.len()
+        self.array_length
     }
 
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.array_length == 0
+    }
+
+    /// Read slot `i`.
+    pub fn slot(&self, i: usize) -> GcRef {
+        assert!(i < self.array_length);
+        // SAFETY: `array_base_addr + i*WORD` is a slot of a live array
+        // (see the struct invariant); slots are read outside a collection
+        // and written only by `trace` inside one.
+        unsafe { *((self.array_base_addr + i * WORD) as *const GcRef) }
     }
 
     /// Forward every slot in place. `gcreftracer.py:13-23`
@@ -159,10 +220,23 @@ impl GcTable {
     /// the GC as a root; writing back through the visitor forwards the
     /// constant if the moving GC relocated the referenced object.
     pub fn trace(&self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        for cell in self.slots.iter() {
-            let mut r = cell.get();
-            visitor(&mut r);
-            cell.set(r);
+        // `gcrefs_trace` brackets the walk with
+        // `rmmap.enter_assembler_writing()`: an in-code array is part of a
+        // JIT mapping.
+        #[cfg(not(target_arch = "wasm32"))]
+        let _writing = self
+            ._owned
+            .is_none()
+            .then(crate::rmmap::AssemblerWriting::enter);
+        for i in 0..self.array_length {
+            let p = (self.array_base_addr + i * WORD) as *mut GcRef;
+            // SAFETY: see `slot`; this runs inside a stop-the-world
+            // collection, the only writer.
+            unsafe {
+                let mut r = *p;
+                visitor(&mut r);
+                *p = r;
+            }
         }
     }
 }
@@ -193,6 +267,17 @@ fn walk_all_gc_tables(visitor: &mut dyn FnMut(&mut GcRef)) {
 /// already holds the write side observes the registry without re-entering
 /// the lock.
 fn walk_all_gc_tables_inner(visitor: &mut dyn FnMut(&mut GcRef)) {
+    // A minor collection reaches only the tables the remembered set names
+    // (see `PENDING_MINOR_TABLES`); every other live table already holds
+    // promoted referents, which a minor collection does not move.
+    if crate::shadow_stack::extra_root_walk_kind() == crate::shadow_stack::ExtraRootWalkKind::Minor
+    {
+        let pending = std::mem::take(&mut *PENDING_MINOR_TABLES.lock());
+        for table in pending.iter().filter_map(Weak::upgrade) {
+            table.trace(visitor);
+        }
+        return;
+    }
     // Snapshot the live tables under a read guard, then release the lock
     // before tracing (same snapshot-then-iterate discipline as
     // `walk_extra_roots`, `shadow_stack.rs`). Dead `Weak`s are
@@ -242,9 +327,12 @@ mod tests {
                 r.0 = 0x9000;
             }
         });
-        assert_eq!(table.slots[0].get(), GcRef(0x9000));
-        assert_eq!(table.slots[1].get(), GcRef(0x2000));
-        assert_eq!(table.base_addr(), table.slots.as_ptr() as usize);
+        assert_eq!(table.slot(0), GcRef(0x9000));
+        assert_eq!(table.slot(1), GcRef(0x2000));
+        assert_eq!(
+            table.base_addr(),
+            table._owned.as_ref().unwrap().as_ptr() as usize
+        );
         assert_eq!(table.len(), 2);
     }
 

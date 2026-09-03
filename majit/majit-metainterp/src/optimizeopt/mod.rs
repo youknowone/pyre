@@ -713,7 +713,7 @@ pub struct OptContext {
     /// by pointer address. PyPy uses `new_ref_dict()`; the house rule
     /// forbids hash containers, so pyre uses a Vec-backed associative
     /// container with linear-scan lookup.
-    pub const_infos: indexmap::IndexMap<usize, crate::optimizeopt::info::PtrInfo>,
+    pub const_infos: crate::FxIndexMap<usize, crate::optimizeopt::info::PtrInfo>,
     /// Dedup imported short fact uses so the builder stays in first-use
     /// order. PyPy uses dict-as-set; pyre uses a Vec with linear-scan
     /// dedup (small per trace).
@@ -1132,19 +1132,17 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         if opref.is_constant() {
             return true;
         }
-        if self
-            .ctx
-            .get_box_replacement_operand_opt(opref)
-            .and_then(|cb| cb.const_value())
-            .is_some()
-        {
+        // One chain walk answers both tests below; `get_box_replacement`
+        // materializes the terminal as an `Operand`, so walking twice built
+        // it twice for every live box in every guard.
+        let Some(replacement) = self.ctx.get_box_replacement_operand_opt(opref) else {
+            return false;
+        };
+        if replacement.const_value().is_some() {
             return true;
         }
         matches!(
-            self.ctx
-                .get_box_replacement_operand_opt(opref)
-                .as_ref()
-                .and_then(|b| self.ctx.peek_ptr_info(b)),
+            self.ctx.peek_ptr_info(&replacement),
             Some(crate::optimizeopt::info::PtrInfo::Constant(_))
         )
     }
@@ -1817,7 +1815,7 @@ impl OptContext {
             imported_virtual_args: None,
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
-            const_infos: indexmap::IndexMap::new(),
+            const_infos: crate::FxIndexMap::default(),
             imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: indexmap::IndexMap::new(),
@@ -2435,7 +2433,7 @@ impl OptContext {
             imported_virtual_args: None,
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
-            const_infos: indexmap::IndexMap::new(),
+            const_infos: crate::FxIndexMap::default(),
             imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: indexmap::IndexMap::new(),

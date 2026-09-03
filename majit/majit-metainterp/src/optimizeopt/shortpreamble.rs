@@ -113,7 +113,7 @@ impl ShortPreamble {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state: None,
-            constants: majit_ir::ConstMap::new(),
+            constants: majit_ir::ConstMap::default(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -286,7 +286,7 @@ impl CollectedShortPreambleBuilder {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
-            constants: majit_ir::ConstMap::new(),
+            constants: majit_ir::ConstMap::default(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -1267,7 +1267,7 @@ impl CollectedExtendedShortPreambleBuilder {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
-            constants: majit_ir::ConstMap::new(),
+            constants: majit_ir::ConstMap::default(),
             phase1_inputargs: None,
             inputarg_infos: Vec::new(),
         }
@@ -2262,7 +2262,7 @@ fn build_short_preamble_struct_from_ops(
     // RPython parity: `shortpreamble.py` keeps no `loop_constants` side
     // table — `arg` IS the `Const` box, so `_map_args(mapping, args)`
     // (`unroll.py:364`) passes it through unchanged.
-    let constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
+    let constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::default();
     ShortPreamble {
         ops: entries,
         inputargs: short_inputargs.to_vec(),
@@ -3458,7 +3458,7 @@ pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
         used_boxes: Vec::new(),
         jump_args: Vec::new(),
         exported_state: None,
-        constants: majit_ir::ConstMap::new(),
+        constants: majit_ir::ConstMap::default(),
         phase1_inputargs: None,
         inputarg_infos: Vec::new(),
     }
@@ -4669,7 +4669,7 @@ mod tests {
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state: None,
-            constants: majit_ir::ConstMap::new(),
+            constants: majit_ir::ConstMap::default(),
             inputarg_infos: Vec::new(),
             phase1_inputargs: None,
         };

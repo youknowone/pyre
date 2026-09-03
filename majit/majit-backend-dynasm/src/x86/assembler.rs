@@ -14,7 +14,10 @@ use indexmap::IndexMap;
 use std::sync::Arc;
 
 // x86/assembler.py parity: x86_64-only backend.
-use dynasmrt::x64::Assembler;
+/// `codebuf.py MachineCodeBlockWrapper`: code is assembled into a plain byte
+/// vector (every relocation is PC-relative) and copied into the arena block
+/// at `materialize`; no per-trace executable mapping.
+pub(crate) type Assembler = dynasmrt::VecAssembler<dynasmrt::x64::X64Relocation>;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
@@ -370,7 +373,7 @@ pub(crate) fn build_propagate_exception_path(
     cpu_handle: &crate::guard::CpuDescrHandle,
     arena: &Arc<AsmMemoryManager>,
 ) -> (codebuf::ArenaExecutableBuffer, usize) {
-    let mut asm = Assembler::new().expect("propagate_exception_path: new Assembler");
+    let mut asm = Assembler::new(0);
     let propagate_descr = cpu_handle.read().descr_ptrs().propagate_exception_descr as i64;
     assert!(
         propagate_descr != 0,
@@ -453,7 +456,7 @@ pub(crate) fn build_malloc_slowpath_fixed(
     // attrs).  The propagate descr itself is now baked once into the
     // standalone propagate trampoline, not re-baked here.
     let _ = cpu_handle;
-    let mut asm = Assembler::new().expect("malloc_slowpath: new Assembler");
+    let mut asm = Assembler::new(0);
 
     // assembler.py:264 `SUB_rr(edx, ecx)` — recover total_size at
     // runtime.  Both `malloc_cond` and `malloc_cond_varsize_frame`
@@ -477,7 +480,7 @@ pub(crate) fn build_malloc_slowpath_headerless(
     arena: &Arc<AsmMemoryManager>,
 ) -> (codebuf::ArenaExecutableBuffer, usize) {
     let _ = cpu_handle;
-    let mut asm = Assembler::new().expect("malloc_slowpath_headerless: new Assembler");
+    let mut asm = Assembler::new(0);
 
     dynasm!(asm ; .arch x64 ; sub rdx, rcx);
 
@@ -943,12 +946,11 @@ pub struct Assembler386<'a> {
     malloc_slowpath_fixed: usize,
     /// Headerless fixed-size nursery malloc slowpath trampoline.
     malloc_slowpath_headerless: usize,
-    /// `assembler.py` `genop_load_from_gc_table`: base address of
-    /// this loop's per-loop `GcTable` slot array. Baked as a 64-bit
-    /// immediate by the `LoadFromGcTable` genop; 0 when the trace
-    /// references no reference constants. Set before `assemble_loop` /
-    /// `assemble_bridge` via [`set_gc_table_base`](Self::set_gc_table_base).
-    gc_table_base: usize,
+    /// `assembler.py reserve_gcref_table`: one label per slot of the
+    /// reference-constant table reserved at the start of this code block,
+    /// which the `LoadFromGcTable` genop reads PC-relative. Empty when the
+    /// trace references no reference constants.
+    gcref_table: Vec<dynasmrt::DynamicLabel>,
     /// Address of the owning `JitCellToken.invalidated` `AtomicBool`
     /// (`history.py:443`). `GUARD_NOT_INVALIDATED` bakes it as a 64-bit
     /// immediate and loads the byte at runtime, branching to its recovery
@@ -1019,6 +1021,14 @@ pub struct CompiledCode {
     pub source_guard: Option<(u64, u32)>,
 }
 
+impl CompiledCode {
+    /// `looptoken._ll_function_addr = rawstart + functionpos`: the first
+    /// instruction, past the reserved gcref table.
+    pub fn entry_ptr(&self) -> *const u8 {
+        self.buffer.ptr(self.entry_offset)
+    }
+}
+
 /// The `genop_*` methods here are line-by-line ports of the RPython emitters
 /// (`x86/assembler.py` `genop_*`).  Emission runs through `regalloc_perform`,
 /// which works from regalloc `arglocs`, so the ports whose opcode that
@@ -1073,7 +1083,7 @@ impl<'a> Assembler386<'a> {
         let inputarg_pos = OpTypeIndex::<Op>::build_inputarg_pos(inputargs);
         let op_pos = OpTypeIndex::build_op_pos(operations);
         Assembler386 {
-            mc: Assembler::new().unwrap(),
+            mc: Assembler::new(0),
             asm_memory_manager,
             pending_guard_tokens: Vec::new(),
             pending_malloc_nursery_gcmap: None,
@@ -1114,17 +1124,27 @@ impl<'a> Assembler386<'a> {
             jump_target_frame_depth: 0,
             malloc_slowpath_fixed,
             malloc_slowpath_headerless,
-            gc_table_base: 0,
+            gcref_table: Vec::new(),
             invalidated_flag_addr: 0,
         }
     }
 
-    /// `assembler.py:793-824` parity: hand the per-loop `GcTable`'s base
-    /// address to the assembler before emission, so `LoadFromGcTable`
-    /// genops bake it as the slot-array base immediate. 0 leaves the
-    /// trace with no reference constants (no `LoadFromGcTable` emitted).
-    pub(crate) fn set_gc_table_base(&mut self, base: usize) {
-        self.gc_table_base = base;
+    /// `assembler.py reserve_gcref_table`: reserve `n` zeroed words,
+    /// padded to a multiple of 16 bytes, at the start of the machine code,
+    /// so the `LoadFromGcTable` genop can address them PC-relative. The
+    /// runner writes the gcrefs into them once the block is materialized
+    /// (`patch_gcref_table`; `GcTable::in_code`). Must run before any
+    /// instruction is emitted.
+    pub(crate) fn reserve_gcref_table(&mut self, n: usize) {
+        assert_eq!(self.mc.offset().0, 0, "the gcref table opens the code block");
+        for _ in 0..n {
+            let slot = self.mc.new_dynamic_label();
+            dynasm!(self.mc ; =>slot ; .u64 0);
+            self.gcref_table.push(slot);
+        }
+        if n % 2 == 1 {
+            dynasm!(self.mc ; .u64 0);
+        }
     }
 
     /// `compile.py:665` parity: heap-pinned address of `self.cpu`'s
@@ -3305,14 +3325,11 @@ impl<'a> Assembler386<'a> {
                     self.regalloc_mov(src, dst);
                 }
             }
-            // `assembler.py:1545` `genop_load_from_gc_table`: load the
-            // reference constant at `gc_table_base + index*WORD`. The
-            // index arrives as an immediate (the `ConstInt(index)` arg
-            // produced by `remove_constptr`); the table base is baked
-            // absolute (x86-32 `MOV_rj` model, `assembler.py:1551-1552`)
-            // because dynasm has no code-buffer-start reservation seam.
-            // The slot value is GC-forwarded in place by the gc_table
-            // root walker, so each load observes the relocated object.
+            // `assembler.py genop_load_from_gc_table`: load the reference
+            // constant from slot `index` of the table reserved at the start
+            // of this code block (`reserve_gcref_table`), PC-relative. The
+            // gc_table root walker forwards the slot in place, so each load
+            // observes the relocated object.
             OpCode::LoadFromGcTable => {
                 let (Some(Loc::Immed(idx)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc)
                 else {
@@ -3321,15 +3338,11 @@ impl<'a> Assembler386<'a> {
                          got arglocs={arglocs:?} result={result_loc:?}"
                     );
                 };
-                debug_assert_ne!(
-                    self.gc_table_base, 0,
-                    "LoadFromGcTable emitted without a GcTable base"
-                );
-                let slot_addr = self.gc_table_base + (idx.value as usize) * WORD;
-                dynasm!(self.mc ; .arch x64
-                    ; mov Rq(dst.value), QWORD slot_addr as i64
-                    ; mov Rq(dst.value), [Rq(dst.value)]
-                );
+                let slot = *self
+                    .gcref_table
+                    .get(idx.value as usize)
+                    .expect("LoadFromGcTable index inside the reserved gcref table");
+                dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [=>slot]);
             }
             // `assembler.py genop_cast_ptr_to_int = _genop_same_as`
             // / `:1529 genop_cast_int_to_ptr = _genop_same_as`.  PyPy's

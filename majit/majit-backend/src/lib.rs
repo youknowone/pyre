@@ -2162,65 +2162,11 @@ impl AsmLargeBlock {
     }
 }
 
-// `rmmap.py` `Nester`: the depth of `enter_assembler_writing` brackets on
-// this thread. `pthread_jit_write_protect_np` is per-thread state, so the
-// counter is too.
+/// `rmmap.py` `enter_assembler_writing` / `leave_assembler_writing` and the
+/// bracket guard live in `majit_gc::rmmap`, shared with the reference-constant
+/// tracer (`gcreftracer.py` `gcrefs_trace`).
 #[cfg(not(target_arch = "wasm32"))]
-thread_local! {
-    static ASSEMBLER_WRITING_DEPTH: Cell<usize> = const { Cell::new(0) };
-}
-
-/// `rmmap.py` `enter_assembler_writing`: on darwin/arm64 switch this thread's
-/// `MAP_JIT` pages from executable to writable; elsewhere the JIT mapping is
-/// RWX and this only counts the bracket.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn enter_assembler_writing() {
-    ASSEMBLER_WRITING_DEPTH.with(|depth| {
-        if depth.get() == 0 {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            unsafe {
-                libc::pthread_jit_write_protect_np(0);
-            }
-        }
-        depth.set(depth.get() + 1);
-    });
-}
-
-/// `rmmap.py` `leave_assembler_writing`.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn leave_assembler_writing() {
-    ASSEMBLER_WRITING_DEPTH.with(|depth| {
-        depth.set(depth.get() - 1);
-        if depth.get() == 0 {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            unsafe {
-                libc::pthread_jit_write_protect_np(1);
-            }
-        }
-    });
-}
-
-/// The `try: ... finally: rmmap.leave_assembler_writing()` bracket
-/// (`aarch64/assembler.py` `assemble_loop`, `assemble_bridge`,
-/// `redirect_call_assembler`; `aarch64/runner.py` `invalidate_loop`) as a
-/// guard, so every return path leaves.
-#[cfg(not(target_arch = "wasm32"))]
-pub struct AssemblerWriting(());
-
-#[cfg(not(target_arch = "wasm32"))]
-impl AssemblerWriting {
-    pub fn enter() -> Self {
-        enter_assembler_writing();
-        Self(())
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for AssemblerWriting {
-    fn drop(&mut self) {
-        leave_assembler_writing();
-    }
-}
+pub use majit_gc::rmmap::{AssemblerWriting, enter_assembler_writing, leave_assembler_writing};
 
 /// `rpython/jit/backend/llsupport/asmmemmgr.py:10-145`.
 ///
@@ -2876,6 +2822,15 @@ pub trait Backend: Send {
     ) -> bool {
         self.compiled_bridge_fail_descr_layouts(token, source_trace_id, source_fail_index)
             .is_some()
+    }
+
+    /// The same question asked of the guard's own descr, which is where the
+    /// backend records the attach: `patch_jump_for_descr` leaves
+    /// `faildescr.adr_jump_offset = 0` ("patched") on a guard whose jump now
+    /// targets a bridge. `None` when this backend keeps no per-descr mark, in
+    /// which case the caller falls back to [`Backend::bridge_was_compiled`].
+    fn bridge_attached(&self, _descr: &dyn majit_ir::FailDescr) -> Option<bool> {
+        None
     }
 
     /// Execute compiled code starting at the given token.

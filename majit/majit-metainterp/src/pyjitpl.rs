@@ -570,7 +570,7 @@ pub(crate) struct CompiledTrace {
     #[allow(dead_code)]
     pub(crate) constants: majit_ir::ConstMap<majit_ir::Const>,
     /// Static exit metadata for each guard/finish in this trace.
-    pub(crate) exit_layouts: indexmap::IndexMap<u32, StoredExitLayout>,
+    pub(crate) exit_layouts: crate::FxIndexMap<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
     pub(crate) terminal_exit_layouts: indexmap::IndexMap<usize, StoredExitLayout>,
 }
@@ -1301,7 +1301,7 @@ pub(crate) struct CompiledEntry<M> {
     /// entry installed by any path other than a loop close.
     pub(crate) loop_header_pc: Option<usize>,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
-    pub(crate) traces: indexmap::IndexMap<u64, CompiledTrace>,
+    pub(crate) traces: crate::FxIndexMap<u64, CompiledTrace>,
     /// RPython parity: previous compiled entries for this green_key.
     /// In RPython, JitCellToken keeps all target_tokens' code alive.
     /// In majit, each retrace produces a new Cranelift function;
@@ -1606,7 +1606,7 @@ pub struct ActiveTraceSession<M: Clone> {
 pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
-    pub(crate) compiled_loops: indexmap::IndexMap<u64, CompiledEntry<M>>,
+    pub(crate) compiled_loops: crate::FxIndexMap<u64, CompiledEntry<M>>,
     /// Bumped by every insertion into and removal from `compiled_loops`, in
     /// this file's non-test code. One input of [`Self::runnable_generation`].
     compiled_loops_generation: u64,
@@ -3048,7 +3048,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         _owning_key: u64,
         entry: CompiledEntry<M>,
-        merged_traces: &mut indexmap::IndexMap<u64, CompiledTrace>,
+        merged_traces: &mut crate::FxIndexMap<u64, CompiledTrace>,
     ) -> Vec<std::sync::Weak<JitCellToken>> {
         // `entry.token` is already `Weak<JitCellToken>`; push it directly.
         let mut previous_tokens = Vec::with_capacity(1 + entry.previous_tokens.len());
@@ -3495,7 +3495,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut this = MetaInterp {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
-            compiled_loops: indexmap::IndexMap::new(),
+            compiled_loops: crate::FxIndexMap::default(),
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
             loop_header_greens: indexmap::IndexMap::new(),
@@ -7005,7 +7005,7 @@ impl<M: Clone> MetaInterp<M> {
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to drain — this backend typed-constant egress map
         // starts fresh.
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         // Materialize Vec<Op> from the trace's `Vec<OpRc>` so the
         // optimizer's `&[Op]` surface gets owned data. The deep-clone
@@ -7996,7 +7996,7 @@ impl<M: Clone> MetaInterp<M> {
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &compiled_ops));
-                let mut traces = indexmap::IndexMap::new();
+                let mut traces = crate::FxIndexMap::default();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -8596,7 +8596,7 @@ impl<M: Clone> MetaInterp<M> {
         // The recorder carries Const values inline on the OpRef variants
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to snapshot — this typed-constant map starts fresh.
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let call_pure_results = ctx.call_pure_results.clone();
         let trace_snapshots = ctx.snapshots().to_vec();
         let (
@@ -8911,7 +8911,7 @@ impl<M: Clone> MetaInterp<M> {
             // The recorder carries Const values inline on the OpRef variants
             // (history.py:227/268/314), so there is no legacy TraceCtx
             // ConstantPool to snapshot — this typed-constant map starts fresh.
-            let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+            let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
             let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
             let call_pure_results = ctx.take_call_pure_results();
 
@@ -9433,7 +9433,7 @@ impl<M: Clone> MetaInterp<M> {
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &combined_ops));
-                let mut traces = indexmap::IndexMap::new();
+                let mut traces = crate::FxIndexMap::default();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -10034,7 +10034,7 @@ impl<M: Clone> MetaInterp<M> {
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to drain — this backend typed-constant egress map
         // starts fresh.
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let num_ops_before = trace_ops.len();
         let mut optimizer = if let Some(config) = vable_config {
@@ -10340,7 +10340,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &optimized_ops);
-                let mut traces = indexmap::IndexMap::new();
+                let mut traces = crate::FxIndexMap::default();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -10522,7 +10522,7 @@ impl<M: Clone> MetaInterp<M> {
         // (history.py:227/268/314), so there is no legacy TraceCtx
         // ConstantPool to drain — this backend typed-constant egress map
         // starts fresh.
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         if crate::majit_log_enabled() {
             eprintln!("--- simple loop trace (before opt) ---");
@@ -10797,7 +10797,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &compiled_ops);
-                let mut traces = indexmap::IndexMap::new();
+                let mut traces = crate::FxIndexMap::default();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -11609,13 +11609,23 @@ impl<M: Clone> MetaInterp<M> {
         // gated on the token holds it and calls the run directly.
         let token = self.warm_state.get_procedure_token(green_key)?;
         let meta = self.compiled_loops.get(&green_key)?.meta.clone();
-        Some(self.execute_assembler_at_dispatch_key(
+        let mut result = self.execute_assembler_at_dispatch_key(
             &token,
             green_key,
             Some(meta),
             live_values,
             dispatch_key,
-        ))
+        );
+        if let Some(descr_arc) = &result.descr_arc
+            && !Self::is_jump_exit(result.is_finish, result.fail_index)
+        {
+            let descr = descr_arc
+                .as_fail_descr()
+                .expect("a guard exit carries a FailDescr");
+            result.exit_layout =
+                Some(Box::new(self.guard_exit_layout(green_key, descr, result.rd_loop_token)));
+        }
+        Some(result)
     }
 
     /// `compile.py must_compile` reads the failing GUARD_VALUE's operand off the
@@ -11631,6 +11641,71 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<i64> {
         majit_backend::guard_value_counter_slot(descr)
             .map(|slot| self.backend.get_value_direct(frame, slot))
+    }
+
+    /// `handle_fail`'s frontend view of a guard exit, for the detailed
+    /// runners whose callers open it (`eval.rs handle_fail`,
+    /// `DetailedDriverRunOutcome::GuardFailure`). The steady compiled entry
+    /// (`execute_assembler_at_dispatch_key`) builds none: `compile.py
+    /// handle_fail` reads the failing descr's own `rd_*` payload, and the
+    /// driver's guard arm reads the same descr.
+    fn guard_exit_layout(
+        &self,
+        green_key: u64,
+        descr: &dyn majit_ir::FailDescr,
+        rd_loop_token: Option<u64>,
+    ) -> CompiledExitLayout {
+        let fail_index = descr.fail_index();
+        let trace_id = descr.trace_id();
+        let is_finish = descr.is_finish();
+        let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
+        let exit_types: &[Type] = descr.fail_arg_types();
+        // Fresh lookup, and fallible: the run can re-enter the driver
+        // through a residual call and drop this green key (`jitdriver.rs`'s
+        // `remove_compiled_loop` on the unrecoverable-resume path), in
+        // which case the exit falls through to the `rd_loop_token` lookup
+        // and then to the synthesized default layout below.
+        let compiled = self.compiled_loops.get(&green_key);
+        // The layout comes from the failing guard's own trace, and falls
+        // back to a synthesized one per `run_compiled_detailed` when the
+        // green key no longer holds it.
+        let mut exit_layout = compiled
+            .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
+            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+            .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
+            .and_then(|(owning_key, resolved_id, trace)| {
+                Self::compiled_exit_layout_from_trace(
+                    trace,
+                    owning_key,
+                    resolved_id,
+                    fail_index,
+                )
+            })
+            .unwrap_or_else(|| CompiledExitLayout {
+                rd_loop_token: green_key,
+                trace_id,
+                fail_index,
+                source_op_index: descr.source_op_index(),
+                exit_types: ExitTypes::from_slice(exit_types),
+                is_finish,
+                is_exception_exit: is_exit_frame_with_exception,
+                recovery_layout: None,
+                resume_layout: None,
+                // The green-key index no longer holds this trace, but the
+                // failing descr still carries the resume payload it was
+                // compiled with (`compile.py get_resumestorage`), so a
+                // blackhole resume off this layout stays possible.
+                storage: crate::resume::ResumeStorage::from_fail_descr(descr)
+                    .map(std::sync::Arc::new),
+            });
+        // RPython: deadframe has ALL jitframe slots accessible.
+        // If the backend's descr covers more slots than the trace layout,
+        // extend exit_layout.exit_types to match (conservative Int for
+        // extras).
+        if exit_types.len() > exit_layout.exit_types.len() {
+            exit_layout.exit_types.resize(exit_types.len(), Type::Int);
+        }
+        exit_layout
     }
 
     /// `compile.py _DoneWithThisFrameDescr.get_result` and
@@ -11852,59 +11927,9 @@ impl<M: Clone> MetaInterp<M> {
             self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
-        // Built for a guard exit only. Every reader of this field opens it past
-        // its own back-edge arm, because a JUMP exit is answered by restoring
-        // the loop-carried state and re-entering — so a layout built for one is
-        // a type-vector copy, three refcount pairs and a heap box that nothing
-        // reads.
-        let exit_layout = (!is_jump_exit).then(|| {
-            // Fresh lookup, and fallible: the run can re-enter the driver
-            // through a residual call and drop this green key (`jitdriver.rs`'s
-            // `remove_compiled_loop` on the unrecoverable-resume path), in
-            // which case the exit falls through to the `rd_loop_token` lookup
-            // and then to the synthesized default layout below.
-            let compiled = self.compiled_loops.get(&green_key);
-            // The layout comes from the failing guard's own trace, and falls
-            // back to a synthesized one per `run_compiled_detailed` when the
-            // green key no longer holds it.
-            let mut exit_layout = compiled
-                .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
-                .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
-                .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
-                .and_then(|(owning_key, resolved_id, trace)| {
-                    Self::compiled_exit_layout_from_trace(
-                        trace,
-                        owning_key,
-                        resolved_id,
-                        fail_index,
-                    )
-                })
-                .unwrap_or_else(|| CompiledExitLayout {
-                    rd_loop_token: green_key,
-                    trace_id,
-                    fail_index,
-                    source_op_index: descr.source_op_index(),
-                    exit_types: ExitTypes::from_slice(exit_types),
-                    is_finish,
-                    is_exception_exit: is_exit_frame_with_exception,
-                    recovery_layout: None,
-                    resume_layout: None,
-                    // The green-key index no longer holds this trace, but the
-                    // failing descr still carries the resume payload it was
-                    // compiled with (`compile.py get_resumestorage`), so a
-                    // blackhole resume off this layout stays possible.
-                    storage: crate::resume::ResumeStorage::from_fail_descr(descr)
-                        .map(std::sync::Arc::new),
-                });
-            // RPython: deadframe has ALL jitframe slots accessible.
-            // If the backend's descr covers more slots than the trace layout,
-            // extend exit_layout.exit_types to match (conservative Int for
-            // extras).
-            if exit_types.len() > exit_layout.exit_types.len() {
-                exit_layout.exit_types.resize(exit_types.len(), Type::Int);
-            }
-            Box::new(exit_layout)
-        });
+        // No layout on the steady entry: the guard arm in `jitdriver` reads
+        // the descr, as `compile.py handle_fail` does. The detailed runners
+        // attach one for their callers — see [`Self::guard_exit_layout`].
         let savedata = self.backend.get_savedata_ref(&frame);
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
         let exc_value_ref = self.backend.grab_exc_value(&frame);
@@ -11928,7 +11953,7 @@ impl<M: Clone> MetaInterp<M> {
             descr_arc: Some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
-            exit_layout,
+            exit_layout: None,
             rd_loop_token,
             savedata,
             exception,
@@ -13230,6 +13255,18 @@ impl<M: Clone> MetaInterp<M> {
     /// compilation may have attached to an earlier token that was replaced
     /// by a retrace/recompile.
     pub fn bridge_was_compiled(&self, green_key: u64, trace_id: u64, fail_index: u32) -> bool {
+        // The guard being asked about is the trace session's own origin, and
+        // its descr is in hand (`pyjitpl.py handle_guard_failure`'s
+        // `resumedescr`); the backend answers off that descr without a walk
+        // over the token's code blocks.
+        if let Some(info) = self.bridge_info()
+            && info.trace_id == trace_id
+            && info.fail_index == fail_index
+            && let Some(fd) = info.source_descr.as_fail_descr()
+            && let Some(attached) = self.backend.bridge_attached(fd)
+        {
+            return attached;
+        }
         if let Some(token) = self.warm_state.get_compiled(green_key)
             && self
                 .backend
@@ -13875,7 +13912,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 let mut next_global_opref =
                     compute_next_global_opref(&entry_inputargs, &optimized_ops);
-                let mut traces = indexmap::IndexMap::new();
+                let mut traces = crate::FxIndexMap::default();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -24086,7 +24123,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let mut exit_layouts = indexmap::IndexMap::new();
+        let mut exit_layouts = crate::FxIndexMap::default();
         exit_layouts.insert(
             0,
             StoredExitLayout {
@@ -24098,13 +24135,13 @@ mod tests {
                 op_arg_types_for_jump: None,
             },
         );
-        let mut traces = indexmap::IndexMap::new();
+        let mut traces = crate::FxIndexMap::default();
         traces.insert(
             1,
             CompiledTrace {
                 inputargs: Vec::new(),
                 ops: Vec::new(),
-                constants: majit_ir::ConstMap::new(),
+                constants: majit_ir::ConstMap::default(),
                 exit_layouts,
                 terminal_exit_layouts: indexmap::IndexMap::new(),
             },
@@ -24420,17 +24457,17 @@ mod tests {
                 start_descr,
             ),
         ];
-        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::default();
         constants.insert(100, majit_ir::Const::Int(1));
         constants.insert(101, majit_ir::Const::Int(2));
-        let mut traces = indexmap::IndexMap::new();
+        let mut traces = crate::FxIndexMap::default();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                 ops: ops.into_iter().map(std::rc::Rc::new).collect(),
                 constants,
-                exit_layouts: indexmap::IndexMap::new(),
+                exit_layouts: crate::FxIndexMap::default(),
                 terminal_exit_layouts: indexmap::IndexMap::new(),
             },
         );
@@ -24491,17 +24528,17 @@ mod tests {
                 start_descr,
             ),
         ];
-        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::default();
         constants.insert(100, majit_ir::Const::Int(1));
         constants.insert(101, majit_ir::Const::Int(2));
-        let mut traces = indexmap::IndexMap::new();
+        let mut traces = crate::FxIndexMap::default();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                 ops: ops.into_iter().map(std::rc::Rc::new).collect(),
                 constants,
-                exit_layouts: indexmap::IndexMap::new(),
+                exit_layouts: crate::FxIndexMap::default(),
                 terminal_exit_layouts: indexmap::IndexMap::new(),
             },
         );
@@ -24800,7 +24837,7 @@ mod tests {
             pending_field_layouts: vec![],
         };
 
-        let mut exit_layouts: indexmap::IndexMap<u32, StoredExitLayout> = indexmap::IndexMap::new();
+        let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -24818,13 +24855,13 @@ mod tests {
             },
         );
 
-        let mut traces = indexmap::IndexMap::new();
+        let mut traces = crate::FxIndexMap::default();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: majit_ir::ConstMap::new(),
+                constants: majit_ir::ConstMap::default(),
                 exit_layouts,
                 terminal_exit_layouts: indexmap::IndexMap::new(),
             },
@@ -24890,7 +24927,7 @@ mod tests {
         let trace_id = 67;
         let fail_index = 2;
 
-        let mut exit_layouts: indexmap::IndexMap<u32, StoredExitLayout> = indexmap::IndexMap::new();
+        let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -24903,13 +24940,13 @@ mod tests {
             },
         );
 
-        let mut traces = indexmap::IndexMap::new();
+        let mut traces = crate::FxIndexMap::default();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: majit_ir::ConstMap::new(),
+                constants: majit_ir::ConstMap::default(),
                 exit_layouts,
                 terminal_exit_layouts: indexmap::IndexMap::new(),
             },
@@ -24965,7 +25002,7 @@ mod tests {
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
-        let mut exit_layouts: indexmap::IndexMap<u32, StoredExitLayout> = indexmap::IndexMap::new();
+        let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -24989,13 +25026,13 @@ mod tests {
             },
         );
 
-        let mut traces = indexmap::IndexMap::new();
+        let mut traces = crate::FxIndexMap::default();
         traces.insert(
             trace_id,
             CompiledTrace {
                 inputargs: vec![],
                 ops: vec![],
-                constants: majit_ir::ConstMap::new(),
+                constants: majit_ir::ConstMap::default(),
                 exit_layouts,
                 terminal_exit_layouts: indexmap::IndexMap::new(),
             },
@@ -25122,7 +25159,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            majit_ir::ConstMap::new(),
+            majit_ir::ConstMap::default(),
         );
 
         let (trace_id, fail_index) = {
@@ -25293,7 +25330,7 @@ mod tests {
             trace_id,
             &mut terminal_exit_layouts,
         );
-        let mut traces = indexmap::IndexMap::new();
+        let mut traces = crate::FxIndexMap::default();
         traces.insert(
             trace_id,
             CompiledTrace {
@@ -25375,7 +25412,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            majit_ir::ConstMap::new(),
+            majit_ir::ConstMap::default(),
         );
 
         let (trace_id, fail_index) = {
@@ -25453,7 +25490,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            majit_ir::ConstMap::new(),
+            majit_ir::ConstMap::default(),
         );
 
         let (trace_id, fail_index, expected_source_op_index, expected_rd_numb, expected_exit_types) = {
@@ -25554,7 +25591,7 @@ mod tests {
             green_key,
             &inputargs,
             ops,
-            majit_ir::ConstMap::new(),
+            majit_ir::ConstMap::default(),
         );
 
         let (trace_id, fail_index, descr_arc) = {
@@ -25664,7 +25701,7 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(0)], OpRef::NONE.raw()),
         ];
-        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::default();
         constants.insert(
             100,
             majit_ir::Const::Int(maybe_force_and_return_void as *const () as usize as i64),
@@ -26164,7 +26201,7 @@ mod tests {
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 0,
-                traces: indexmap::IndexMap::new(),
+                traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
@@ -26528,7 +26565,7 @@ mod tests {
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 101,
-                traces: indexmap::IndexMap::new(),
+                traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
@@ -26580,7 +26617,7 @@ mod tests {
                 front_entry_index: Some(0),
                 front_target_source_positions: None,
                 root_trace_id: 1,
-                traces: indexmap::IndexMap::new(),
+                traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
                 loop_header_pc: Some(0),
                 next_global_opref: 0,
@@ -26649,7 +26686,7 @@ mod tests {
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: 102,
-                traces: indexmap::IndexMap::new(),
+                traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
@@ -26741,7 +26778,7 @@ mod tests {
             std::ptr::null(),
             &bridge_ops,
             &bridge_inputargs,
-            majit_ir::ConstMap::new(),
+            majit_ir::ConstMap::default(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -27186,7 +27223,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::default();
         constants.insert(100, majit_ir::Const::Int(1));
         constants.insert(101, majit_ir::Const::Int(0));
         attach_procedure_to_interp_entry(&mut meta, green_key, &inputargs, ops, constants);
@@ -27326,7 +27363,7 @@ mod bridge_cell_token_tests {
                 front_entry_index: None,
                 front_target_source_positions: None,
                 root_trace_id: green_key,
-                traces: indexmap::IndexMap::new(),
+                traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
@@ -27380,7 +27417,7 @@ mod loop_side_table_tests {
             front_entry_index: None,
             front_target_source_positions: None,
             root_trace_id,
-            traces: indexmap::IndexMap::new(),
+            traces: crate::FxIndexMap::default(),
             previous_tokens: Vec::new(),
             loop_header_pc: None,
             next_global_opref: 0,

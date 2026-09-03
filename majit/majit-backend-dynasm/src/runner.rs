@@ -1681,7 +1681,7 @@ impl DynasmBackend {
             asm_memory_manager: Arc::clone(&asm_memory_manager),
             next_trace_id: 1,
             next_header_pc: 0,
-            constants: majit_ir::ConstMap::new(),
+            constants: majit_ir::ConstMap::default(),
             vtable_offset: None,
             descr_attachments: Arc::new(crate::guard::CpuDescrCell::default()),
             arch_cpu_ext: ArchCpuExt::new(asm_memory_manager),
@@ -1710,7 +1710,7 @@ impl DynasmBackend {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>()
                 && bridge.source_guard == Some((source_trace_id, source_fail_index))
             {
-                return codebuf::buffer_ptr(&bridge.buffer) as usize;
+                return bridge.entry_ptr() as usize;
             }
         }
         0
@@ -2502,19 +2502,20 @@ impl Backend for DynasmBackend {
             inputargs,
             &prepared_ops,
         );
-        // assembler.py:793-824 parity: build the per-loop gc_table from
-        // the rewrite's reference-constant list and bake its base before
-        // emission, so `LoadFromGcTable` genops resolve their slot
-        // addresses. Empty list ⇒ no table, base stays 0.
-        let gc_table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
-        if let Some(table) = gc_table.as_ref() {
-            asm.set_gc_table_base(table.base_addr());
-        }
+        // `assembler.py assemble_loop`: `reserve_gcref_table(allgcrefs)`
+        // opens the code block with one word per reference constant, and
+        // `patch_gcref_table` fills them in once the block is materialized.
+        asm.reserve_gcref_table(gcrefs.len());
         asm.set_invalidated_flag_addr(std::sync::Arc::as_ptr(&token.invalidated) as usize);
         let compiled = asm.assemble_loop()?;
 
-        let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
+        let rawstart = codebuf::buffer_ptr(&compiled.buffer) as usize;
+        let code_addr = compiled.entry_ptr() as usize;
         let code_size = compiled.buffer.len();
+        // SAFETY: `reserve_gcref_table` reserved `gcrefs.len()` words at
+        // `rawstart`, in the arena block the token's CLT keeps alive.
+        let gc_table =
+            (!gcrefs.is_empty()).then(|| unsafe { majit_gc::GcTable::in_code(rawstart, &gcrefs) });
         let frame_depth = compiled.frame_depth.load(Ordering::Acquire) as i64;
         Self::register_call_assembler_target(token, code_addr);
         self.register_fail_descrs(token, &compiled.fail_descrs);
@@ -2748,13 +2749,9 @@ impl Backend for DynasmBackend {
             inputargs,
             &prepared_ops,
         );
-        // assembler.py:793-824 parity: build the per-loop gc_table from
-        // the rewrite's reference-constant list and bake its base before
-        // emission (same as compile_loop). A bridge gets its own table.
-        let gc_table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
-        if let Some(table) = gc_table.as_ref() {
-            asm.set_gc_table_base(table.base_addr());
-        }
+        // `assembler.py assemble_bridge`: `reserve_gcref_table(allgcrefs)`
+        // opens the bridge's own code block (same as compile_loop).
+        asm.reserve_gcref_table(gcrefs.len());
         let bridge_flag = original_token.mint_bridge_invalidation_flag();
         asm.set_invalidated_flag_addr(std::sync::Arc::as_ptr(&bridge_flag) as usize);
 
@@ -2777,8 +2774,12 @@ impl Backend for DynasmBackend {
         let arglocs = Asm::rebuild_faillocs_from_descr(fail_descr, inputargs);
         let compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
 
-        let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
+        let rawstart = codebuf::buffer_ptr(&compiled.buffer) as usize;
+        let bridge_addr = compiled.entry_ptr() as usize;
         let code_size = compiled.buffer.len();
+        // SAFETY: as in `compile_loop`.
+        let gc_table =
+            (!gcrefs.is_empty()).then(|| unsafe { majit_gc::GcTable::in_code(rawstart, &gcrefs) });
         if crate::dynasm_exec_diag_enabled() {
             eprintln!(
                 "[dynasm-bridge] trace={trace_id} source={}:{} addr={bridge_addr:#x} len={code_size}",
@@ -2887,7 +2888,7 @@ impl Backend for DynasmBackend {
         // call only guarded top-level entry and missed compiled-to-
         // compiled CALL_ASSEMBLER recursion.
         let compiled = Self::get_compiled(token);
-        let entry = codebuf::buffer_ptr(&compiled.buffer);
+        let entry = compiled.entry_ptr();
 
         // jitframe.py — every JITFRAME carries a non-null JITFRAMEINFO
         // so the bridge-entry `_check_frame_depth` realloc slowpath
@@ -3079,7 +3080,7 @@ impl Backend for DynasmBackend {
         // stack-overflow detection site, so no runner-level probe is
         // needed here.
         let compiled = Self::get_compiled(token);
-        let entry = codebuf::buffer_ptr(&compiled.buffer);
+        let entry = compiled.entry_ptr();
 
         // Same non-null JITFRAMEINFO + `jfi_frame_depth` sizing as
         // `execute_token` (jitframe.py) — the bridge realloc slowpath
@@ -3375,8 +3376,8 @@ impl Backend for DynasmBackend {
                 .frame_depth
                 .fetch_max(new_depth, Ordering::Release);
         }
-        let old_addr = codebuf::buffer_ptr(&old_compiled.buffer);
-        let new_addr = codebuf::buffer_ptr(&new_compiled.buffer);
+        let old_addr = old_compiled.entry_ptr();
+        let new_addr = new_compiled.entry_ptr();
         Asm::redirect_call_assembler(old_addr, new_addr);
         Self::redirect_call_assembler_target(old.number, new_addr as usize);
         Ok(())
@@ -3391,6 +3392,16 @@ impl Backend for DynasmBackend {
         source_fail_index: u32,
     ) -> bool {
         self.lookup_bridge_addr(token, source_trace_id, source_fail_index) != 0
+    }
+
+    /// `patch_pending_failure_recoveries` stamps every assembled guard's
+    /// recovery stub address into `adr_jump_offset`, and `patch_jump_for_descr`
+    /// zeroes it once the guard's jump has been redirected into a bridge. A
+    /// non-zero offset therefore still names the guard's own stub: no bridge.
+    /// Zero is left to the block scan, since a guard that never received a
+    /// stub reads the same way as a patched one.
+    fn bridge_attached(&self, descr: &dyn majit_ir::FailDescr) -> Option<bool> {
+        (descr.adr_jump_offset() != 0).then_some(false)
     }
 
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
@@ -3983,7 +3994,7 @@ impl Backend for DynasmBackend {
         let blocks = blocks_clt.asmmemmgr_blocks.lock();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
-                let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;
+                let addr = bridge.entry_ptr() as usize;
                 if addr == bridge_addr {
                     let bridge_trace_id = bridge.trace_id;
                     return Some(

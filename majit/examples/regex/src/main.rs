@@ -78,6 +78,31 @@ fn lengths() -> Vec<usize> {
     parsed
 }
 
+/// `PYRE_REGEX_ROWS=<comma-separated row indexes>` runs only those rows of
+/// [`NAMES`]; a deselected row reports `NaN`. A process-wide counter such as
+/// `/usr/bin/time -l`'s `instructions retired` then charges one row alone,
+/// which is the reading that survives a loaded machine.
+fn row_selected(index: usize) -> bool {
+    static ROWS: std::sync::OnceLock<Option<Vec<usize>>> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| {
+        let value = std::env::var_os("PYRE_REGEX_ROWS")?;
+        let value = value.to_string_lossy();
+        Some(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    part.parse::<usize>()
+                        .unwrap_or_else(|_| panic!("PYRE_REGEX_ROWS contains a non-usize: {part:?}"))
+                })
+                .collect(),
+        )
+    })
+    .as_ref()
+    .is_none_or(|rows| rows.contains(&index))
+}
+
 /// The `{N}` of the post's benchmark regex `(a|b)*a(a|b){20}a(a|b)*`.
 const N: usize = 20;
 
@@ -214,6 +239,21 @@ fn bench(
     counter: Option<&AtomicUsize>,
     mut run: impl FnMut(*mut NodeRec, &[u8]) -> bool,
 ) -> Row {
+    let index = NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .expect("every row is named in NAMES");
+    if !row_selected(index) {
+        return Row {
+            name,
+            rates: vec![f64::NAN],
+            compiles: 0,
+            #[cfg(feature = "alloc-census")]
+            alloc: alloc_census::read().since(alloc_census::read()),
+            #[cfg(feature = "alloc-census")]
+            alloc_sizes: Vec::new(),
+        };
+    }
     assert!(
         !run(root, s),
         "{name}: the benchmark input is supposed NOT to match"

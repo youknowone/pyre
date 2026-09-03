@@ -573,7 +573,7 @@ pub struct Optimizer {
 pub(crate) fn lower_typed_constants_to_const_pool(
     constants: &majit_ir::ConstMap<majit_ir::Value>,
 ) -> majit_ir::ConstMap<majit_ir::Const> {
-    let mut pool = majit_ir::ConstMap::new();
+    let mut pool = majit_ir::ConstMap::default();
     for (&k, v) in constants {
         pool.insert(k, v.to_const());
     }
@@ -2336,7 +2336,7 @@ impl Optimizer {
     /// Returns the optimized operation list.
     /// optimizer.py: propagate_all_forward(trace, call_pure_results, flush)
     pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
-        self.optimize_with_constants(ops, &mut majit_ir::ConstMap::new())
+        self.optimize_with_constants(ops, &mut majit_ir::ConstMap::default())
     }
 
     /// Run all optimization passes, with known constants pre-populated.
@@ -6344,7 +6344,7 @@ mod tests {
             ],
         )];
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
     }
@@ -6389,7 +6389,7 @@ mod tests {
         )];
         ops[0].pos.set(OpRef::int_op(2));
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 2);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 2);
 
         assert_eq!(
             hits.get(),
@@ -6474,7 +6474,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 3);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 3);
 
         let call_count = result
             .iter()
@@ -6685,7 +6685,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 3);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 3);
 
         let call_positions: indexmap::IndexSet<_> = result
             .iter()
@@ -6734,7 +6734,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::ConstMap::new(),
+                &mut majit_ir::ConstMap::default(),
                 num_inputs,
             )
             .expect("test: unexpected InvalidLoop");
@@ -6766,7 +6766,7 @@ mod tests {
         ops[1].pos.set(OpRef::int_op(4));
         ops[2].pos.set(OpRef::int_op(5));
         ops[3].pos.set(OpRef::int_op(6));
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
@@ -6809,7 +6809,7 @@ mod tests {
         ops[1].pos.set(OpRef::int_op(4));
         ops[2].pos.set(OpRef::int_op(5));
         ops[3].pos.set(OpRef::int_op(6));
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         constants.insert(1u32, majit_ir::Value::Int(27));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
@@ -6837,7 +6837,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
@@ -6859,7 +6859,7 @@ mod tests {
             ],
         )];
         ops[0].pos.set(OpRef::int_op(3));
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
         constants.insert(3u32, majit_ir::Value::Int(1));
@@ -6889,7 +6889,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         assert_eq!(result.len(), 1);
@@ -6937,7 +6937,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::ConstMap::new(),
+                &mut majit_ir::ConstMap::default(),
                 num_inputs,
             )
             .expect("test: unexpected InvalidLoop");
@@ -6965,7 +6965,7 @@ mod tests {
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 0);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 0);
 
         assert!(
             result.iter().any(|op| op.opcode == OpCode::GuardValue),
@@ -7021,7 +7021,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         // force_all_lazy_setfields emits lazy SetfieldGc before JUMP.
@@ -7108,7 +7108,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
@@ -7168,7 +7168,7 @@ mod tests {
         ops[0].pos.set(OpRef::int_op(2));
         ops[1].pos.set(OpRef::void_op(3));
 
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
         let new_positions: indexmap::IndexSet<_> = result
@@ -7240,7 +7240,7 @@ mod tests {
         }
 
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
         let guard = result
             .iter()
             .find(|op| op.opcode == OpCode::GuardTrue)
@@ -7306,7 +7306,7 @@ mod tests {
             &[rooted_resop_operand(Type::Int, 50)],
         )));
 
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let result = opt
             .optimize_with_constants_and_inputs_at(&[], &mut constants, 3, 0, 0, false)
             .expect("empty trace must not produce InvalidLoop");
@@ -7686,7 +7686,7 @@ mod tests {
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
-                &mut majit_ir::ConstMap::new(),
+                &mut majit_ir::ConstMap::default(),
                 num_inputs,
             )
             .expect("test: unexpected InvalidLoop");

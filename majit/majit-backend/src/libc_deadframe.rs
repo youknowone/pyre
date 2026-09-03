@@ -135,8 +135,9 @@ impl LibcJitFrameDeadFrame {
     /// bound, while a late failarg still maps to a valid live frame slot.
     fn slot_of(&self, index: usize) -> Option<usize> {
         let descr = self.fail_descr.as_fail_descr()?;
-        if index < descr.rd_locs().len() {
-            crate::llmodel::decode_rd_loc_slot(descr, index)
+        let locs = descr.rd_locs();
+        if let Some(&pos) = locs.get(index) {
+            (pos != 0xFFFF).then_some(pos as usize)
         } else if index < self.num_slots {
             Some(index)
         } else {

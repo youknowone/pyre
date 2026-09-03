@@ -4822,6 +4822,7 @@ impl majit_backend::Backend for WasmBackend {
             })
             .collect();
         register_fail_descrs(&bridge_descrs);
+        Self::register_meta_descrs(original_token, &bridge_descrs);
 
         // Register the bridge module into the shared table, then publish its
         // descrs and flip the source guard's cell. Order matters: the descrs

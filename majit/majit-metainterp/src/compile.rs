@@ -584,11 +584,11 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
     frame_value_count_fn: Option<fn(i32, i32) -> usize>,
 ) -> (
     indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
-    indexmap::IndexMap<u32, StoredExitLayout>,
+    crate::FxIndexMap<u32, StoredExitLayout>,
 ) {
     let mut result: indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary> =
         indexmap::IndexMap::new();
-    let mut exit_layouts: indexmap::IndexMap<u32, StoredExitLayout> = indexmap::IndexMap::new();
+    let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
     let mut fail_index = 0u32;
     let mut resume_memo = ResumeDataLoopMemo::new();
     // The driver-scoped override wins: a driver whose frames are numbered
@@ -1198,7 +1198,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
 }
 
 pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
-    exit_layouts: &mut indexmap::IndexMap<u32, StoredExitLayout>,
+    exit_layouts: &mut crate::FxIndexMap<u32, StoredExitLayout>,
     backend_layouts: &[FailDescrLayout],
     ops: &[T],
 ) {
@@ -1309,7 +1309,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
 /// Guards that HAVE recovery_layout (all production guards after backend
 /// merge) must satisfy the full invariant. Guards without (only possible
 /// in unit tests with mock backends) are warned but not fatal.
-pub(crate) fn validate_exit_layouts(exit_layouts: &indexmap::IndexMap<u32, StoredExitLayout>) {
+pub(crate) fn validate_exit_layouts(exit_layouts: &crate::FxIndexMap<u32, StoredExitLayout>) {
     for (&fail_index, layout) in exit_layouts {
         if layout.resolve_is_finish() {
             continue;
@@ -2295,7 +2295,7 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit
 
 pub(crate) fn enrich_guard_resume_layouts_for_trace(
     resume_layouts: &mut indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
-    exit_layouts: &mut indexmap::IndexMap<u32, StoredExitLayout>,
+    exit_layouts: &mut crate::FxIndexMap<u32, StoredExitLayout>,
     trace_id: u64,
     inputargs: &[InputArg],
     trace_info: Option<&CompiledTraceInfo>,
@@ -2318,7 +2318,7 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
 }
 
 pub(crate) fn patch_guard_recovery_layouts_for_trace(
-    exit_layouts: &mut indexmap::IndexMap<u32, StoredExitLayout>,
+    exit_layouts: &mut crate::FxIndexMap<u32, StoredExitLayout>,
 ) {
     // Backend no longer caches a per-descr recovery layout; the
     // metainterp's `StoredExitLayout.recovery_layout` cache is the
@@ -2692,7 +2692,7 @@ pub fn compile_tmp_callback(
     // Inline-Const carries each Const value directly on its OpRef
     // variant (history.py:227/268/314), so the backend pool is left
     // empty for `compile_tmp_callback`.
-    backend.set_constants_pool(majit_ir::ConstMap::new());
+    backend.set_constants_pool(majit_ir::ConstMap::default());
     // The backend boundary takes `&[InputArg]` by value (the flat OpRef
     // encoding survives past this point); identity ends here.
     let backend_inputargs: Vec<InputArg> =
@@ -2745,7 +2745,7 @@ mod tests {
         use crate::history::test_support::rooted_resop_operand;
         use majit_ir::OpRc;
 
-        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let build = |label_descr_index: u64, jump_descr_index: u64| {
             let mut label = Op::new(
                 OpCode::Label,
@@ -2980,7 +2980,7 @@ mod tests {
         };
         let mut ops: Vec<majit_ir::OpRc> = vec![op0, op1, op2];
         let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         patch_new_loop_to_load_virtualizable_fields(
             &mut ops,
@@ -3057,7 +3057,7 @@ mod tests {
             InputArg::new_ref(1),
             InputArg::new_ref(2),
         ];
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
         patch_new_loop_to_load_virtualizable_fields(
@@ -3135,7 +3135,7 @@ mod tests {
             InputArg::new_int(2),
             InputArg::new_int(3),
         ];
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
 
         patch_new_loop_to_load_virtualizable_fields(

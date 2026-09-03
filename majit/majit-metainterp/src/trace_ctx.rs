@@ -1311,7 +1311,7 @@ impl TraceCtx {
         effectinfo: Option<&majit_ir::EffectInfo>,
         argboxes: &[OpRef],
     ) {
-        if std::env::var_os("MAJIT_PROBE_SUBSCR").is_some() {
+        if probe_subscr_enabled() {
             let ei_summary = effectinfo.map(|ei| {
                 format!(
                     "extraeffect={:?} forces_vorv={} can_raise={} plain_call={} oopspec={:?}",
@@ -7397,4 +7397,11 @@ mod tests {
         );
         assert!(!len.is_constant());
     }
+}
+
+/// `MAJIT_PROBE_SUBSCR` diagnostic gate, read once: this sits on the path
+/// every recorded call takes, and `getenv` per operation was 4% of tracing.
+fn probe_subscr_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAJIT_PROBE_SUBSCR").is_some())
 }

@@ -241,6 +241,14 @@ thread_local! {
     /// by a blackhole register survive across collecting calls.
     static BH_REGS_STACK: RefCell<Vec<BhRegsEntry>> = RefCell::new(Vec::with_capacity(16));
 
+    /// Thread-local roots of every pooled blackhole interpreter, registered
+    /// once when the interpreter is built (`BlackholeInterpBuilder
+    /// .acquire_interp`) and dropped with it. `blackhole.py`'s interpreters
+    /// are GC objects: `registers_r`, `tmpreg_r`, `exception_last_value` and
+    /// `virtualizable_ptr` are traced fields for the object's whole life, not
+    /// only while `run()` is on the stack.
+    static BH_INTERP_ROOTS: RefCell<Vec<BhInterpEntry>> = RefCell::new(Vec::new());
+
     /// Thread-local stack of ref slices live only during blackhole resume
     /// construction (`resume.py blackhole_from_resumedata`).  The
     /// `virtuals_cache` and each frame's `registers_r` are filled by lazily
@@ -267,6 +275,7 @@ struct MutatorEntry {
     owner_roots: *const RefCell<Vec<Option<GcRef>>>,
     jf_root_stack: *const RefCell<JitFrameShadowStack>,
     bh_regs_stack: *const RefCell<Vec<BhRegsEntry>>,
+    bh_interp_roots: *const RefCell<Vec<BhInterpEntry>>,
     resume_ref_roots_stack: *const RefCell<Vec<(*mut i64, usize)>>,
     extra_areas: Vec<MutatorExtraArea>,
     pruners: Vec<MutatorPruner>,
@@ -359,6 +368,7 @@ pub fn register_mutator() {
     let owner_roots = OWNER_ROOTS.with(|roots| roots as *const _);
     let jf_root_stack = JF_ROOT_STACK.with(|stack| stack as *const _);
     let bh_regs_stack = BH_REGS_STACK.with(|stack| stack as *const _);
+    let bh_interp_roots = BH_INTERP_ROOTS.with(|roots| roots as *const _);
     let resume_ref_roots_stack = RESUME_REF_ROOTS_STACK.with(|stack| stack as *const _);
 
     let mut registry = MUTATOR_REGISTRY.lock();
@@ -372,6 +382,7 @@ pub fn register_mutator() {
         owner_roots,
         jf_root_stack,
         bh_regs_stack,
+        bh_interp_roots,
         resume_ref_roots_stack,
         extra_areas: Vec::new(),
         pruners: Vec::new(),
@@ -1132,6 +1143,21 @@ struct BhRegsEntry {
     exc_ptr: *mut i64,
 }
 
+/// The traced fields of one pooled blackhole interpreter (`blackhole.py
+/// BlackholeInterpreter`: `registers_r`, `tmpreg_r`, `exception_last_value`,
+/// `virtualizable_ptr`). `regs` names the `Vec` itself, so a `setposition`
+/// that regrows the bank is followed.
+#[derive(Clone, Copy)]
+struct BhInterpEntry {
+    regs: *mut Vec<i64>,
+    tmpreg_ptr: *mut i64,
+    exc_ptr: *mut i64,
+    vable_ptr: *mut i64,
+}
+
+// Same thread-local discipline as `BhRegsEntry`.
+unsafe impl Send for BhInterpEntry {}
+
 // `*mut i64` is not `Send` by default. The thread-local storage means we
 // only ever access entries from the thread that pushed them, so this
 // `unsafe impl` is sound.
@@ -1160,6 +1186,56 @@ pub unsafe fn push_bh_regs(regs: &mut [i64], tmpreg: &mut i64, exc: &mut i64) ->
         });
         depth
     })
+}
+
+/// Register a pooled blackhole interpreter's traced fields as GC roots for
+/// its whole life; the counterpart of the interpreter being a GC object
+/// upstream. Paired with [`unregister_bh_interp`] from the interpreter's
+/// `Drop`.
+///
+/// # Safety
+/// Every pointer must stay valid, at a fixed address, until
+/// `unregister_bh_interp(regs)` runs on this thread.
+pub unsafe fn register_bh_interp(
+    regs: *mut Vec<i64>,
+    tmpreg: *mut i64,
+    exc: *mut i64,
+    vable: *mut i64,
+) {
+    BH_INTERP_ROOTS.with(|roots| {
+        roots.borrow_mut().push(BhInterpEntry {
+            regs,
+            tmpreg_ptr: tmpreg,
+            exc_ptr: exc,
+            vable_ptr: vable,
+        });
+    });
+}
+
+/// Drop the registration made by [`register_bh_interp`] for `regs`.
+pub fn unregister_bh_interp(regs: *const Vec<i64>) {
+    let _ = BH_INTERP_ROOTS.try_with(|roots| {
+        let mut roots = roots.borrow_mut();
+        if let Some(pos) = roots.iter().position(|e| std::ptr::eq(e.regs, regs)) {
+            roots.swap_remove(pos);
+        }
+    });
+}
+
+/// Visit one pooled interpreter's traced fields.
+///
+/// # Safety
+/// `entry` must have been registered by `register_bh_interp` and not yet
+/// unregistered.
+unsafe fn visit_bh_interp_entry(entry: &BhInterpEntry, visitor: &mut dyn FnMut(&mut GcRef)) {
+    let regs = unsafe { &mut *entry.regs };
+    for slot in regs.iter_mut() {
+        let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
+        visitor(gcref);
+    }
+    visitor(unsafe { &mut *(entry.tmpreg_ptr as *mut GcRef) });
+    visitor(unsafe { &mut *(entry.exc_ptr as *mut GcRef) });
+    visitor(unsafe { &mut *(entry.vable_ptr as *mut GcRef) });
 }
 
 /// Pop blackhole register entries back to the given depth.
@@ -1206,6 +1282,12 @@ pub fn walk_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
             visitor(exc);
         }
     });
+    BH_INTERP_ROOTS.with(|roots| {
+        for entry in roots.borrow().iter() {
+            // SAFETY: registered interpreters unregister from their `Drop`.
+            unsafe { visit_bh_interp_entry(entry, &mut visitor) };
+        }
+    });
 }
 
 /// Walk every registered mutator's blackhole register roots during STW.
@@ -1229,6 +1311,12 @@ pub fn walk_all_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
             visitor(tmp);
             let exc = unsafe { &mut *(entry.exc_ptr as *mut GcRef) };
             visitor(exc);
+        }
+        let interps = unsafe { &*(*mutator.bh_interp_roots).as_ptr() };
+        for entry in interps.iter() {
+            // SAFETY: as above; a registered interpreter unregisters from
+            // its `Drop`, which runs on the owning (quiesced) thread.
+            unsafe { visit_bh_interp_entry(entry, &mut visitor) };
         }
     }
 }

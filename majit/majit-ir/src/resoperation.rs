@@ -1750,7 +1750,7 @@ impl<V> ConstLookup<V> for std::collections::HashMap<u32, V> {
     }
 }
 
-impl<V> ConstLookup<V> for indexmap::IndexMap<u32, V> {
+impl<V, S: std::hash::BuildHasher> ConstLookup<V> for indexmap::IndexMap<u32, V, S> {
     fn lookup(&self, key: u32) -> Option<&V> {
         self.get(&key)
     }

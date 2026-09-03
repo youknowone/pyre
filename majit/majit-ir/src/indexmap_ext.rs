@@ -5,7 +5,7 @@
 /// Backed by [`indexmap::IndexMap`] rather than a linear-scan Vec because the
 /// pool is built by inserting one entry per const-folded position (up to the
 /// full trace length) and read back by keyed lookup and in-order iteration.
-pub type ConstMap<V> = indexmap::IndexMap<u32, V>;
+pub type ConstMap<V> = indexmap::IndexMap<u32, V, rustc_hash::FxBuildHasher>;
 
 /// `entry().or_insert_with(...)` / `entry().or_default()` shortcuts.
 pub trait IndexMapExt<K, V> {

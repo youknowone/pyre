@@ -4,7 +4,7 @@
 /// the trace/op lowering in `assembler.py`.  The dynasm backend still stores
 /// the dynasm assembler inside `AssemblerARM64`, but the codebuilder-shaped
 /// helpers live here so PyPy backend patches have the same file boundary.
-use dynasmrt::aarch64::Assembler;
+use super::assembler::Assembler;
 use dynasmrt::{DynasmApi, dynasm};
 
 use super::assembler::AssemblerARM64;
@@ -107,7 +107,7 @@ impl<'a> AssemblerARM64<'a> {
 
 #[cfg(test)]
 mod tests {
-    use dynasmrt::aarch64::Assembler;
+    use super::super::assembler::Assembler;
     use dynasmrt::{DynasmApi, dynasm};
 
     use super::*;
@@ -133,7 +133,7 @@ mod tests {
             (17, 0x0001_0000_0001_0000),
         ];
         for &(rd, val) in cases {
-            let mut mc = Assembler::new().unwrap();
+            let mut mc = Assembler::new(0);
             let r = rd as u8;
             let v = val as u64;
             dynasm!(mc ; .arch aarch64
