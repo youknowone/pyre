@@ -1233,11 +1233,22 @@ fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> O
 }
 
 /// Whether the residual call behind `descr_index` applies no effect the walk
-/// would have to undo, by the call's own effectinfo: an elidable or
-/// loop-invariant callee writes no live heap, and a `not_in_trace` callee runs
-/// at trace time under the contract that what it does is invisible to the
-/// program (`do_not_in_trace_call`).  Anything else keeps the scan's
-/// conservative reading of an executed residual call as effectful.
+/// would have to undo, by the call's own effectinfo.
+///
+/// An elidable or loop-invariant callee writes no live heap.  A
+/// `not_in_trace` callee is exempt for a different reason: what has to hold
+/// is not that the call left nothing behind, but that calling it again is
+/// harmless, because a rolled-back walk is another trace attempt and the
+/// region will be walked again.  `rlib/jit.py not_in_trace` states the
+/// contract that makes that true — the call is still made "by the jit tracing
+/// and blackholing, but not by the final assembler", so a callee already owes
+/// the same answer once per attempt whether or not any attempt is undone, and
+/// the tracer alone decides how many attempts there are.  pyre's one such
+/// callee, `ensure_object_subclass_ranges_initialized`, is a `OnceLock`
+/// initializer, which is that property in its strongest form.
+///
+/// Anything else keeps the scan's conservative reading of an executed
+/// residual call as effectful.
 fn residual_call_is_effect_free(descr_index: usize) -> bool {
     let descrs = crate::jitcode_runtime::descr_ref_table();
     let Some(descr) = descrs.at(descr_index) else {
