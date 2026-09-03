@@ -298,8 +298,25 @@ def main() -> int:
 
     flat_got = {(c, s) for c, subjects in got.items() for s in subjects}
     flat_want = {(c, s) for c, subjects in want.items() for s in subjects}
-    added = sorted(flat_got - flat_want)
-    gone = sorted(flat_want - flat_got)
+    # Split the pair-level diff by NAME, because the name is what the
+    # invariant is stated over.  A graph that lands in a different Skip
+    # class shows up as one removal and one addition, and calling that
+    # addition "newly Skipped" is false -- the name never left the set.
+    # Relocation is the ordinary shape of progress here: a graph that
+    # stops declining on its first blocker reaches a later one and is
+    # categorised by that instead.
+    pair_added = flat_got - flat_want
+    pair_gone = flat_want - flat_got
+    gone_names = {s for _, s in pair_gone}
+    added_names = {s for _, s in pair_added}
+    added = sorted((c, s) for c, s in pair_added if s not in gone_names)
+    gone = sorted((c, s) for c, s in pair_gone if s not in added_names)
+    relocated = sorted(
+        (s, before, now)
+        for s in gone_names & added_names
+        for before in (c for c, t in pair_gone if t == s)
+        for now in (c for c, t in pair_added if t == s)
+    )
 
     print(f"rtyper skip-subject ratchet [{header['platform']}]: "
           f"{len(flat_got)} subjects, baseline {len(flat_want)}")
@@ -325,6 +342,14 @@ def main() -> int:
             f" baseline never saw are in this set; attribute an addition"
             f" before paying it down."
         )
+
+    if relocated:
+        print(f"\n{len(relocated)} subject(s) changed Skip class — still "
+              f"skipped, so not an addition; record with --update:")
+        for subject, before, now in relocated[:20]:
+            print(f"  - {subject}: {before} -> {now}")
+        if len(relocated) > 20:
+            print(f"  ... and {len(relocated) - 20} more")
 
     if gone:
         print(f"\n{len(gone)} subject(s) no longer skipped — pay the baseline "
