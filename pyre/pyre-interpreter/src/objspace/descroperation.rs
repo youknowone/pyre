@@ -5440,8 +5440,22 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // for such a pair, because `bool` is a proper subclass of `int` and
         // both are exact builtin instances.
         let pair_can_override = !both_exact_builtin_instances_promoted(a, b);
-        if pair_can_override && let Some(result) = try_compare_override(a, b, op)? {
-            return Ok(result);
+        if pair_can_override {
+            // `transform.py insert_ll_stackcheck` puts a stack check on a block
+            // of every call-graph cycle.  An override implemented natively
+            // re-enters `compare` without pushing a Python frame, so the frame
+            // limit never fires: `C.__eq__ = types.MethodType(_operator.eq, c)`
+            // closes the cycle through `call_function_impl_result`, which runs
+            // no check of its own.  The guard sits on the arm that can reach
+            // one rather than at the head, because an exact-builtin pair
+            // answers `false` above on a promoted decision, so a traced
+            // `int < int` records neither the probe nor this check.  The
+            // by-layout container cycle is covered separately, by the check in
+            // [`compare_slot_rest`].
+            crate::stack_check::stack_check()?;
+            if let Some(result) = try_compare_override(a, b, op)? {
+                return Ok(result);
+            }
         }
         // PyPy `descroperation.py:_make_comparison_impl` swaps the operands
         // whenever the right-hand type is a proper subtype, before invoking
