@@ -17,7 +17,7 @@ cover the condition they diagnose.
 | `MAJIT_CALLEE_CENSUS` | OFF | Reports resolved and unresolved translation callees; remove when every supported callee is classified. |
 | `MAJIT_CALLEE_CENSUS_ROWS` | value | Limits rows printed by `MAJIT_CALLEE_CENSUS`; remove with that census. |
 | `MAJIT_CALLEE_RCA` | OFF | Reports metainterpreter callee-resolution decisions; remove when those decisions are covered by focused tests. |
-| `MAJIT_CL_BRIDGE_MERGE` | OFF | Re-emits a bridge that closes onto its owner loop into that loop's own Cranelift function, so the guard reaches it by a block jump instead of a recovery stub and an indirect call; measured faster on every branching row, but it miscompiles (16 `pyre/check.py` checks separate the two arms), so it stays off until that is found and the route can become the default. |
+| `MAJIT_CL_BRIDGE_MERGE` | OFF | Re-emits a bridge that closes onto its owner loop into that loop's own Cranelift function, so the guard reaches it by a block jump instead of a recovery stub and an indirect call; every `pyre/bench/synth` fixture now reads the same with the gate set and unset, and 103 of the 203 that request a merge take one, so it stays off until the route is measured against the out-of-line one. |
 | `MAJIT_CL_BRIDGE_MERGE_LOG` | OFF | Prints one line per merge attempt — merged, or the reason it was declined — for the gate above; remove it with that gate. |
 | `MAJIT_CL_NO_CLOSING_JUMP` | OFF | Disables Cranelift's in-code closing jump to exercise external jump dispatch; remove when that fallback no longer needs comparison coverage. |
 | `MAJIT_DESCR_POOL_CENSUS` | OFF | Reports descriptor interning and duplication; remove when descriptor identity is covered by ordinary tests. |

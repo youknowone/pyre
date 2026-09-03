@@ -4809,6 +4809,7 @@ fn validate_oprefs_for_compile(
     inputargs: &[InputArg],
     ops: &[Op],
     constants: &majit_ir::ConstMap<majit_ir::Const>,
+    region_entries: &[MergedRegionEntry],
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     // RPython rewrite.py:397 + regalloc invariant: at the current op,
@@ -4824,6 +4825,16 @@ fn validate_oprefs_for_compile(
         seen.insert(input.index);
     }
     for (op_idx, op) in ops.iter().enumerate() {
+        // A merged region's ops are the tail of the stream and take their
+        // entry values from the block its owner guard branches to, so its
+        // inputargs are bound where the region opens — the same point
+        // `emit_body` declares them at.
+        if let Some(entry) = region_entries
+            .iter()
+            .find(|entry| entry.ops_start == op_idx)
+        {
+            seen.extend(entry.inputargs.iter().map(|ia| ia.index));
+        }
         if op.opcode == majit_ir::OpCode::Label {
             // LABEL params are introduced at the label block.
             // Const operands (history.py) are not body-namespace
@@ -5472,6 +5483,7 @@ fn build_ref_root_slots(
     type_index: &OpTypeIndex<'_>,
     overrides: &IndexMap<u32, Type>,
     force_tokens: &IndexSet<u32>,
+    region_entries: &[MergedRegionEntry],
 ) -> Result<Vec<(u32, usize)>, BackendError> {
     let mut seen = IndexSet::new();
     let mut slots = Vec::new();
@@ -5494,7 +5506,19 @@ fn build_ref_root_slots(
     // line-by-line analog is `arg.0 == inputargs[i].index`. Key
     // `used_inputargs` by the InputArg's raw OpRef value so the downstream
     // loop's `contains(&input.index)` checks line up with the keys inserted.
-    let inputarg_oprefs: IndexSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
+    // A merged region is entered on block parameters rather than through the
+    // entry prologue, so its inputargs stay out of `inputargs` — but its ops
+    // read them, and a Ref among them needs the root slot the bridge's own
+    // compile gave it. Without one the collector never sees the value and
+    // never forwards it across the allocations the region itself makes.
+    let entry_args = || {
+        inputargs.iter().chain(
+            region_entries
+                .iter()
+                .flat_map(|entry| entry.inputargs.iter()),
+        )
+    };
+    let inputarg_oprefs: IndexSet<u32> = entry_args().map(|ia| ia.index).collect();
 
     // The one JUMP whose target *is* part of this trace does have to line up
     // type-for-type with the LABEL it writes into. RPython cannot express a
@@ -5527,7 +5551,7 @@ fn build_ref_root_slots(
             }
         }
     }
-    for input in inputargs {
+    for input in entry_args() {
         if input.tp == Type::Ref
             && !force_tokens.contains(&input.index)
             && used_inputargs.contains(&input.index)
@@ -7294,8 +7318,10 @@ struct MergedRegionEntry {
     source_fail_index: u32,
     /// Index in the merged `ops` of the region's first operation.
     ops_start: usize,
-    /// Value ids the region's inputargs occupy after the rebase, in order.
-    inputarg_ids: Vec<u32>,
+    /// The region's inputargs after the rebase, in order: the value ids its
+    /// entry block's parameters bind, and the types that say which of them is
+    /// a GC root.
+    inputargs: Vec<InputArg>,
 }
 
 /// The owner's stream with every region appended to it.
@@ -7314,30 +7340,57 @@ const MAX_MERGED_REGIONS: usize = 8;
 /// Operations the merged stream may reach before further merges are declined.
 const MAX_MERGED_OPS: usize = 4096;
 
-/// Whether `bridge` leaves through a LABEL that `owner` publishes, with the
-/// arity that LABEL was compiled at.
+/// Whether `bridge` leaves through the same LABEL `owner`'s own closing JUMP
+/// names, with the arity that LABEL was compiled at.
 ///
 /// That is what makes the merge worth taking: `do_compile`'s Jump lowering
 /// resolves such a target to a local block and emits a plain `jump`, so the
 /// region's exit becomes a branch. A JUMP naming a LABEL of another loop, or
-/// naming one of these with a different arg count, still lowers as an external
-/// jump — a tail call through the frame — and merging buys nothing.
+/// naming one with a different arg count, still lowers as an external jump — a
+/// tail call through the frame — and merging buys nothing.
+///
+/// Owning the label is not enough; it has to be the one the owner already
+/// branches to. A trace can publish more labels than that — an unrolled loop
+/// keeps the peeled entry label beside the body header — and an external JUMP
+/// naming one of those is served by `lookup_loop_target`, which resolves the
+/// TargetToken at the moment the exit is taken and can name a different
+/// compiled loop than the one holding the label. A local branch fixes the
+/// target at compile time; only the label the owner's own back edge already
+/// fixes carries no redirect a merge would drop.
 fn bridge_closes_onto(owner_ops: &[Op], bridge_ops: &[Op]) -> bool {
-    let label_arity: IndexMap<u32, usize> = owner_ops
+    // The label the owner's own closing JUMP names, keyed by
+    // `descr_identity` for the reason `collect_guards` keys by it: `d.index()`
+    // is not unique across the TargetTokens of one trace.
+    let Some(header) = owner_ops
         .iter()
-        .filter(|op| op.opcode == OpCode::Label)
-        .filter_map(|op| op.getdescr().map(|d| (d.index(), op.num_args())))
-        .collect();
-    if label_arity.is_empty() {
+        .rev()
+        .find(|op| op.opcode == OpCode::Jump)
+        .and_then(|op| op.getdescr())
+        .as_ref()
+        .map(majit_ir::descr_identity)
+    else {
         return false;
-    }
+    };
+    let Some(arity) = owner_ops
+        .iter()
+        .find(|op| {
+            op.opcode == OpCode::Label
+                && op
+                    .getdescr()
+                    .as_ref()
+                    .is_some_and(|d| majit_ir::descr_identity(d) == header)
+        })
+        .map(Op::num_args)
+    else {
+        return false;
+    };
     bridge_ops.iter().any(|op| {
         op.opcode == OpCode::Jump
-            && op.getdescr().is_some_and(|d| {
-                label_arity
-                    .get(&d.index())
-                    .is_some_and(|&arity| arity == op.num_args())
-            })
+            && op.num_args() == arity
+            && op
+                .getdescr()
+                .as_ref()
+                .is_some_and(|d| majit_ir::descr_identity(d) == header)
     })
 }
 
@@ -7469,6 +7522,55 @@ fn rebase_merged_region(
     Ok((inputargs, ops, width))
 }
 
+/// The identity a re-emission stamps onto a guard descr, taken before the
+/// attempt so a declined one can put it back.
+///
+/// `collect_guards` restamps every guard it walks with the trace id and the
+/// fail index of the stream being compiled. For the owner's own guards that is
+/// a no-op — the merge is append-only, so they keep the numbers their first
+/// compile gave them — but a region's guards belong to a bridge that was
+/// compiled out of line, and until the merged body is published that bridge is
+/// still installed and still keyed by its own numbering. Leaving the merged
+/// numbers on a declined attempt sends every later lookup of one of those
+/// descrs, `find_fail_descr_in_fail_descrs` included, to the wrong guard.
+struct StampedGuardIdentity {
+    descr: DescrRef,
+    trace_id: u64,
+    fail_index_per_trace: u32,
+    source_op_index: Option<usize>,
+}
+
+fn snapshot_guard_identities(streams: &[&[Op]]) -> Vec<StampedGuardIdentity> {
+    let mut saved = Vec::new();
+    for ops in streams {
+        for op in ops.iter() {
+            let Some(descr) = op.getdescr() else { continue };
+            if !(descr.is_resume_guard() || descr.is_resume_guard_copied()) {
+                continue;
+            }
+            let fd = as_fd(&descr);
+            saved.push(StampedGuardIdentity {
+                trace_id: fd.trace_id(),
+                fail_index_per_trace: fd.fail_index_per_trace(),
+                source_op_index: fd.source_op_index(),
+                descr,
+            });
+        }
+    }
+    saved
+}
+
+fn restore_guard_identities(saved: &[StampedGuardIdentity]) {
+    for entry in saved {
+        let fd = as_fd(&entry.descr);
+        fd.set_trace_id(entry.trace_id);
+        fd.set_fail_index_per_trace(entry.fail_index_per_trace);
+        if let Some(source_op_index) = entry.source_op_index {
+            fd.set_source_op_index(source_op_index);
+        }
+    }
+}
+
 /// Refuse a merge whose region cannot be entered on block parameters.
 ///
 /// The out-of-line bridge takes its inputargs out of jitframe slots, so a slot
@@ -7482,7 +7584,7 @@ fn check_region_entry_slots(
     guard_infos: &[GuardInfo],
 ) -> Result<(), BackendError> {
     for entry in region_entries {
-        let arity = entry.inputarg_ids.len();
+        let arity = entry.inputargs.len();
         let decline = |why: &str| {
             Err(BackendError::Unsupported(format!(
                 "cranelift backend: merged region off guard {} {why}",
@@ -7552,13 +7654,13 @@ fn merge_regions(
         entries.push(MergedRegionEntry {
             source_fail_index: region.source_fail_index,
             ops_start: merged_ops.len(),
-            inputarg_ids: region_inputargs.iter().map(|ia| ia.index).collect(),
+            inputargs: region_inputargs,
         });
         // The region's own inputargs deliberately stay out of `merged_inputargs`:
         // a region is entered on block parameters, so counting them into
         // `num_inputs` would grow the entry layout every caller of this loop
         // passes and every `input_types` check made against it. `do_compile`
-        // declares their variables off `MergedRegionEntry::inputarg_ids`.
+        // declares their variables off `MergedRegionEntry::inputargs`.
         merged_ops.extend(region_ops);
     }
     Ok(MergedStream {
@@ -9970,6 +10072,7 @@ impl CraneliftBackend {
     fn merge_bridge_into_owner(
         &mut self,
         original_token: &JitCellToken,
+        source_trace_id: u64,
         source_fail_index: u32,
         inputargs: &[InputArg],
         ops: &[Op],
@@ -10007,12 +10110,29 @@ impl CraneliftBackend {
         let Some(mut seed) = owner.reemit.borrow_mut().take() else {
             return Err("owner has no retained stream");
         };
-        let declined = if ops.iter().any(|op| op.opcode == OpCode::Label) {
+        let declined = if source_trace_id != owner.trace_id {
+            // `source_fail_index` numbers the guards of the trace the failing
+            // guard belongs to, and a region is entered through the owner guard
+            // that number names. A guard inside an out-of-line bridge numbers
+            // its own trace, so merging one here would hand the region whatever
+            // owner guard shares the number and that guard's live values.
+            Some("guard belongs to another trace")
+        } else if ops.iter().any(|op| op.opcode == OpCode::Label) {
             // A region is entered through the block its owner guard branches
             // to, never through a header of its own. A LABEL inside one would
             // take over `loop_block`, the preamble split and the entry
             // `br_table` — all of which belong to the owner loop.
             Some("region carries a LABEL")
+        } else if seed
+            .regions
+            .iter()
+            .any(|r| r.source_fail_index == source_fail_index)
+        {
+            // The block a region is entered through is looked up by this index
+            // alone, so a second region off the same guard would take the
+            // first's entry block and leave the first bound to parameters the
+            // guard never passes.
+            Some("guard already carries a region")
         } else if seed.regions.len() >= MAX_MERGED_REGIONS {
             Some("region budget spent")
         } else if seed.ops.len()
@@ -10037,6 +10157,12 @@ impl CraneliftBackend {
             constants,
             gc_table_base: 0,
         });
+        // Every guard the re-emission walks, the new region's included.
+        let stamped = snapshot_guard_identities(
+            &std::iter::once(seed.ops.as_slice())
+                .chain(seed.regions.iter().map(|region| region.ops.as_slice()))
+                .collect::<Vec<_>>(),
+        );
         self.constants = seed.constants.clone();
         // A re-emission is the same trace, not a new one. Its identity is what
         // every descr the merged stream re-stamps carries, and what the
@@ -10058,10 +10184,20 @@ impl CraneliftBackend {
         self.next_trace_id = None;
         self.next_header_pc = None;
         self.next_frame_value_count_fn = None;
-        let Ok(mut compiled) = compiled else {
-            seed.regions.pop();
-            *owner.reemit.borrow_mut() = Some(seed);
-            return Err("merged stream did not compile");
+        let mut compiled = match compiled {
+            Ok(compiled) => compiled,
+            Err(err) => {
+                if std::env::var_os("MAJIT_CL_BRIDGE_MERGE_LOG").is_some() {
+                    eprintln!(
+                        "[cl-merge] loop {} guard {source_fail_index}: compile error: {err:?}",
+                        original_token.number
+                    );
+                }
+                restore_guard_identities(&stamped);
+                seed.regions.pop();
+                *owner.reemit.borrow_mut() = Some(seed);
+                return Err("merged stream did not compile");
+            }
         };
         compiled.green_key = original_token.green_key();
         if register_call_assembler_target(original_token, &compiled, self.attached_descr_ptrs())
@@ -10074,6 +10210,7 @@ impl CraneliftBackend {
         {
             // The owner's own registration still names the superseded body,
             // which is live and correct; nothing was published for the new one.
+            restore_guard_identities(&stamped);
             seed.regions.pop();
             *owner.reemit.borrow_mut() = Some(seed);
             return Err("merged stream could not be published");
@@ -10103,6 +10240,9 @@ impl CraneliftBackend {
         // The re-emission carries the retained stream forward: the next merge
         // replays the owner plus every region taken so far.
         *compiled.reemit.borrow_mut() = Some(seed);
+        // No restore past this point: the merged body is registered and its
+        // fail descrs already name its own loop token, so the numbering the
+        // re-emission stamped is the one live code is looked up by.
         match owner.superseded_by.set(Box::new(compiled)) {
             Ok(()) => Ok(()),
             Err(_) => Err("owner already superseded"),
@@ -10223,7 +10363,7 @@ impl CraneliftBackend {
         // back to the blackhole resume path. This pre-pass replaces
         // the silent `iconst(0)` fallback that previously turned
         // undefined OpRefs into runtime SIGSEGVs.
-        validate_oprefs_for_compile(inputargs, ops, &self.constants)?;
+        validate_oprefs_for_compile(inputargs, ops, &self.constants, region_entries)?;
         let trace_id = self.next_trace_id.take().unwrap_or_else(|| {
             let trace_id = self.trace_counter;
             self.trace_counter += 1;
@@ -10352,8 +10492,14 @@ impl CraneliftBackend {
         let used_vars = build_used_vars_set(ops);
         let type_index = OpTypeIndex::new(inputargs, ops);
         let (type_overrides, _op_def_positions) = build_type_overrides(ops, &type_index);
-        let ref_root_slots =
-            build_ref_root_slots(inputargs, ops, &type_index, &type_overrides, &force_tokens)?;
+        let ref_root_slots = build_ref_root_slots(
+            inputargs,
+            ops,
+            &type_index,
+            &type_overrides,
+            &force_tokens,
+            region_entries,
+        )?;
 
         // Hoisted before the entry-prologue frame sizing so the reserved frame
         // tail (`reserved_tail`) accounts for demoted non-ref homes.
@@ -10868,9 +11014,9 @@ impl CraneliftBackend {
         // word, and this must run before the op-argument loop below, which
         // would otherwise type them off their OpRef variant.
         for entry in region_entries {
-            for &id in &entry.inputarg_ids {
-                var_types.insert(id, cl_types::I64);
-                declared_vars.insert(id);
+            for ia in &entry.inputargs {
+                var_types.insert(ia.index, cl_types::I64);
+                declared_vars.insert(ia.index);
             }
         }
         // Declare variables for op results
@@ -11169,7 +11315,7 @@ impl CraneliftBackend {
             .iter()
             .map(|entry| {
                 let block = builder.create_block();
-                for _ in 0..entry.inputarg_ids.len() {
+                for _ in 0..entry.inputargs.len() {
                     builder.append_block_param(block, cl_types::I64);
                 }
                 // A region runs only when its guard fails, which is why the
@@ -11390,9 +11536,40 @@ impl CraneliftBackend {
                 let block = region_blocks[&entry.source_fail_index];
                 builder.switch_to_block(block);
                 builder.seal_block(block);
-                for (i, &value_id) in entry.inputarg_ids.iter().enumerate() {
+                // Nothing the owner or an earlier region defined is live here:
+                // the rebase leaves a region reading only its own namespace,
+                // and the branch its guard takes hands it exactly these
+                // values. Carrying the walk's ref-root bookkeeping across the
+                // boundary would spill and reload variables the region never
+                // reads, and the reload's `def_var` on an edge that ends at
+                // the owner's LABEL is what makes Cranelift carry them around
+                // the loop as parameters the trace entry has no value for.
+                defined_ref_vars.clear();
+                stale_ref_vars.clear();
+                // Same reason the standalone compile of this bridge starts
+                // with no flag: the op that set one is the owner's, and the
+                // region's own overflow guards follow their own producer.
+                last_ovf_flag = None;
+                let mut region_root_jf_ptr = None;
+                for (i, ia) in entry.inputargs.iter().enumerate() {
                     let param = builder.block_params(block)[i];
-                    builder.def_var(var(value_id), param);
+                    builder.def_var(var(ia.index), param);
+                    if ia.tp == Type::Ref && !force_tokens.contains(&ia.index) {
+                        defined_ref_vars.insert(ia.index);
+                        // Seeded here for the reason the entry prologue seeds
+                        // an inputarg's root slot: a guard can publish, or a
+                        // call can collect, before anything has spilled it.
+                        sync_ref_root_var(
+                            &mut builder,
+                            ptr_type,
+                            &mut region_root_jf_ptr,
+                            &ref_root_slots,
+                            ia.index,
+                            param,
+                            ref_root_base_ofs,
+                            &mut synced_ref_vars,
+                        );
+                    }
                 }
                 preamble_phase = false;
             }
@@ -18091,6 +18268,7 @@ impl majit_backend::Backend for CraneliftBackend {
             let fail_index = fail_descr.fail_index_per_trace();
             let merged = self.merge_bridge_into_owner(
                 original_token,
+                source_trace_id,
                 fail_index,
                 inputargs,
                 ops,
@@ -18102,7 +18280,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     Err(why) => format!("declined: {why}"),
                 };
                 eprintln!(
-                    "[cl-merge] loop {} guard {fail_index}: {outcome}",
+                    "[cl-merge] loop {} trace {source_trace_id} guard {fail_index}: {outcome}",
                     original_token.number
                 );
             }
