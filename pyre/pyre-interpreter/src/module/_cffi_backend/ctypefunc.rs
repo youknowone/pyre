@@ -208,12 +208,17 @@ fn do_call(
     // A conversion can run arbitrary Python, and the argument array a builtin
     // receives is a native copy no collector rewrites, so the arguments are
     // read back out of the shadow stack rather than out of `args_w`.
-    let roots = pyre_object::gc_roots::push_roots();
-    let fargs_slot = roots.base();
-    let _ = roots.pin_root(w_fargs);
-    let args_slot = fargs_slot + 1;
+    // Two brackets rather than one.  The function type is a single pin whose
+    // read-backs all name its own bracket's first slot, which is the shape a
+    // jitcode can answer without consulting the shadow stack; numbering the
+    // argument slots off the same `base()` put both halves outside it.
+    let fargs_roots = pyre_object::gc_roots::push_roots();
+    let fargs_slot = fargs_roots.base();
+    let _ = fargs_roots.pin_root(w_fargs);
+    let args_roots = pyre_object::gc_roots::push_roots();
+    let args_slot = args_roots.base();
     for &w_arg in args_w {
-        let _ = roots.pin_root(w_arg);
+        let _ = args_roots.pin_root(w_arg);
     }
     let size = unsafe { exchange_size(cif) };
     let buffer = cdataobj::raw_malloc_varsize_char(size);
@@ -235,13 +240,13 @@ fn do_call(
             // every object-strategy list, so the element read cannot carry
             // that purity; promoting the element hands the trace the same
             // constant behind one guard.
-            let w_argtype = majit_metainterp::jit::promote(farg(roots.get(fargs_slot), i));
+            let w_argtype = majit_metainterp::jit::promote(farg(fargs_roots.get(fargs_slot), i));
             let argtype = match ctypeobj::ctype_arg(w_argtype) {
                 Ok(argtype) => argtype,
                 Err(e) => break 'body Err(e),
             };
             match unsafe {
-                ctypeobj::convert_argument_from_object(argtype, data, roots.get(args_slot + i))
+                ctypeobj::convert_argument_from_object(argtype, data, args_roots.get(args_slot + i))
             } {
                 Ok(true) => mustfree_max_plus_1 = i + 1,
                 Ok(false) => {}
@@ -260,11 +265,11 @@ fn do_call(
     };
     match called {
         Ok(w_res) => {
-            release_arguments(roots.get(fargs_slot), cif, buffer, mustfree_max_plus_1);
+            release_arguments(fargs_roots.get(fargs_slot), cif, buffer, mustfree_max_plus_1);
             Ok(w_res)
         }
         Err(e) => {
-            release_arguments(roots.get(fargs_slot), cif, buffer, mustfree_max_plus_1);
+            release_arguments(fargs_roots.get(fargs_slot), cif, buffer, mustfree_max_plus_1);
             Err(e)
         }
     }
