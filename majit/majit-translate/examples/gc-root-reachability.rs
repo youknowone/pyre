@@ -36,8 +36,34 @@ fn write_rows(
     opts.open(path)?.write_all(rows.as_bytes())
 }
 
+/// Resident set size in MB, or `None` where the platform has no cheap answer.
+///
+/// A phase trace, not a budget: this run holds a multi-hundred-megabyte
+/// artefact and builds several indexes over it, and which of those the peak
+/// belongs to is not inferable from the total.  Off unless `GC_RSS_TRACE` is
+/// set, and written to stderr, so the gate's stdout stays exactly what it was.
+fn rss_mb() -> Option<u64> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()?;
+    let kb: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some(kb / 1024)
+}
+
+fn mark(label: &str) {
+    if std::env::var_os("GC_RSS_TRACE").is_none() {
+        return;
+    }
+    match rss_mb() {
+        Some(mb) => eprintln!("[rss] {mb:6} MB  {label}"),
+        None => eprintln!("[rss]      ?     {label}"),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    mark("start");
     // A run that says it wrote and did not must not exit 0: the file it
     // named is what a consumer reads, and an absent one reads as no findings.
     let mut write_failed = false;
@@ -100,9 +126,13 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            (path.clone(), framework::build(&llbc))
+            mark(&format!("donor loaded  {path}"));
+            let g = framework::build(&llbc);
+            mark(&format!("donor graphed {path}"));
+            (path.clone(), g)
         })
         .collect();
+    mark("all donors graphed");
 
     for path in &args {
         let llbc = match majit_charon_reader::Llbc::load(path) {
@@ -112,7 +142,9 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        mark(&format!("subject loaded  {path}"));
         let cg = framework::build(&llbc);
+        mark(&format!("subject graphed {path}"));
         let total = cg.names.len();
         println!("== {} ({} fun_decls) ==", llbc.crate_name(), total);
         // Which crates this artefact actually carries bodies for.  Charon
@@ -145,6 +177,7 @@ fn main() {
         let mut parts: Vec<&framework::CallGraph> = vec![&cg];
         parts.extend(donor_graphs.iter().map(|(_, g)| g));
         let joined = framework::Joined::build(&parts);
+        mark("joined graph built");
         for (donor, g) in &donor_graphs {
             println!(
                 "   joined with          : {} ({} fun_decls)",
@@ -212,6 +245,7 @@ fn main() {
         let mut joined_seeds = jpy;
         joined_seeds.extend(jcol);
         let reach = joined.project(0, &joined.graph.reaching(&joined_seeds));
+        mark("reachability closure done");
         // The seeds as *this* artefact spells them.  The tiering below compares
         // a finding's `callee_id`, which is an id in this artefact, so it needs
         // the local set; the closure above needs the joined one.
@@ -387,6 +421,7 @@ fn main() {
             &gc_tys,
             &movable_callees,
         );
+        mark("scan 1/4 (resolved, gc locals)");
         println!(
             "   liveness scan: {} bodies; {} with a terminator this reader could not parse; \
              {} call(s) withheld as dominated by a push_roots",
@@ -580,6 +615,7 @@ fn main() {
             &gc_tys,
             &movable_callees,
         );
+        mark("scan 2/4 (opaque-folded, gc locals)");
         let conservative_fns: std::collections::BTreeSet<&str> = found_conservative
             .iter()
             .map(|f| f.func_name.as_str())
@@ -753,6 +789,7 @@ fn main() {
         let no_movable: std::collections::HashSet<u64> = Default::default();
         let (frames, frame_stats) =
             liveness::scan(&llbc, &cg, &reach, &no_bracket, &frame_tys, &no_movable);
+        mark("scan 3/4 (resolved, frame locals)");
         let (frames_conservative, _) = liveness::scan(
             &llbc,
             &cg,
@@ -761,6 +798,7 @@ fn main() {
             &frame_tys,
             &no_movable,
         );
+        mark("scan 4/4 (opaque-folded, frame locals)");
         let frame_fns: std::collections::BTreeSet<&str> =
             frames.iter().map(|f| f.func_name.as_str()).collect();
         println!(
