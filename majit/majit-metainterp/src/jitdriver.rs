@@ -150,7 +150,7 @@ fn build_bh_jitdrivers_sd(
                 result_type,
                 portal_runner_ptr,
                 mainjitcode_calldescr,
-                // warmspot.py:921 `jd.mainjitcode`; `portal_runner_for` matches
+                // warmspot.py:921 `jd.mainjitcode`; `portal_jd_for` matches
                 // it against the raising portal frame's own jitcode.
                 mainjitcode: jd.mainjitcode.clone(),
             }
