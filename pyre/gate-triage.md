@@ -270,11 +270,12 @@ defaults to zero. Both are measurement inputs, not runtime experiments.
 
 `PYRE_FBW_NO_SPECIALIZE` is the one entry here that changes behaviour rather
 than reporting it: its comma-separated selectors (or the reserved `all`) turn
-off that many of the 84 trace-time specialization rows (the `spec_folds!`
+off that many of the 91 trace-time specialization rows (the `spec_folds!`
 invocation in `jitcode_dispatch/diag.rs`; count its complete symbol body rather
 than trusting this sentence), and an unset variable suppresses none.  Not all
-84 are hand-written: `subscr_tuple_descent`, `binary_op_descent`,
-`compare_op_descent` and `builtin_len_descent` name orthodox sub-walks of the
+91 are hand-written: `subscr_tuple_descent`, `binary_op_descent`,
+`compare_op_descent`, `builtin_len_descent` and `load_super_attr_descent`
+name orthodox sub-walks of the
 interpreter's own body, and a row is what lets one be suppressed and A/B'd
 like any other. It is a measurement instrument — suppressing a fold is how the descent
 wall behind it is made to print — so it retires with the folds it selects,
