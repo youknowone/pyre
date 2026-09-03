@@ -42,12 +42,27 @@
 # moved rather than resolved anything.
 #
 # The wall has since been lifted experimentally, and what is behind it is a
-# regression.  With the descent firing on this body it read 7.71s against
-# 0.06s for the hand-written `load_super_attr` fold at N=2,000,000 -- 128x,
-# A/B'd on ONE binary with `PYRE_FBW_NO_SPECIALIZE=load_super_attr_descent`,
-# with identical output and with both arms reporting `loops_compiled=2
-# loops_aborted=0`.  No abort, no bailout, no compile failure: the compiled
-# trace itself is what is worse, and nothing explains why yet.
+# regression.  A/B'd on ONE binary with
+# `PYRE_FBW_NO_SPECIALIZE=load_super_attr_descent`, identical output, best of
+# 3 at N=2,000,000:
+#
+#     fold on, descent declines .......  0.11s
+#     every fold off, JIT on ..........  0.56s
+#     `PYRE_NO_JIT=1` .................  1.94s
+#     descent fires ................... 11.93s
+#
+# A firing descent is 6x slower than not running the JIT at all, so this is a
+# pathology and not a fold that loses.  It is not deopt: both arms report
+# `loops_compiled=2 loops_aborted=0 bridges_compiled=0 guard_failures=1`, and
+# `MAJIT_GUARD_CENSUS` reads `distinct=1 total=1` on each.  What differs is
+# the body: `MAJIT_LOG_OPT` measures 513 ops / 98 guards against the fold's
+# 72 / 18, carrying one real `W_Super` allocation and 50 residual calls per
+# iteration where the fold carries none.  32 of those 50 are
+# `pyre_object::gc_roots` shadow-stack bookkeeping, which the codewriter is
+# required to keep.  `PYPY_GC_NURSERY=512M` cuts the firing arm from 10.33s to
+# 4.72s and leaves the fold arm at 0.10s, so over half of it is collector work
+# driven by the proxy that failed to virtualize.  The gate comment above
+# `try_walker_orthodox_load_super_attr` carries the full reading.
 #
 # The preference is what makes that reachable.
 # `try_walker_specialize_load_super_attr` consults the descent first and

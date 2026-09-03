@@ -5067,15 +5067,55 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
     // Tried before the hand-written fold below, and returning here takes the
     // site away from it rather than adding one.  That ordering is only
     // harmless while the descent declines, which it does today at
-    // `w_method_new`.  Lifting that wall was measured: the descent then
-    // compiled `bench/synth/zero_arg_super_attr.py` 128x slower than the fold
-    // (7.71s against 0.06s at N=2,000,000, one binary A/B'd with
-    // `PYRE_FBW_NO_SPECIALIZE`, identical output, both arms
-    // `loops_compiled=2 loops_aborted=0`), and on
-    // `extra_tests/snippets/class_super_zero_arg_inlined_callee.py` it took 2
-    // of the fold's 5 sites while `loops_aborted` went 0 -> 6.  Publishing
-    // `w_method_new` therefore needs that deficit explained and this
-    // preference reconsidered, not just the wall removed.
+    // `w_method_new`.  Publishing that address was measured twice, and the
+    // second time with the cause named, so the wall stays until the cause is
+    // gone rather than until the wall is inconvenient.
+    //
+    // On `bench/synth/zero_arg_super_attr.py` at N=2,000,000, one binary
+    // A/B'd with `PYRE_FBW_NO_SPECIALIZE`, identical output, best of 3:
+    //
+    //     fold on, descent declines .......  0.11s
+    //     every fold off, JIT on ..........  0.56s
+    //     `PYRE_NO_JIT=1` .................  1.94s
+    //     descent fires ................... 11.93s
+    //
+    // A firing descent is therefore 6x slower than not running the JIT at
+    // all, which makes it a pathology rather than a fold that loses.  It is
+    // not deopt: both arms report `loops_compiled=2 loops_aborted=0
+    // bridges_compiled=0 guard_failures=1`, and `MAJIT_GUARD_CENSUS` reads
+    // `distinct=1 total=1` on each.  The cost is entirely in the body the
+    // descent compiles, which `MAJIT_LOG_OPT` measures at 513 ops / 98 guards
+    // against the fold's 72 / 18:
+    //
+    //   * One `W_Super` per iteration is allocated for real.  The descent
+    //     does emit the proxy virtually --- `NewWithVtable` plus the three
+    //     `W_Super` setfields --- but the MRO walk it descends into then
+    //     hands that proxy to residual calls, so it escapes and the
+    //     allocation survives.  `PYPY_GC_NURSERY=512M` cuts the arm from
+    //     10.33s to 4.72s while leaving the fold arm at 0.10s: over half the
+    //     deficit is collector work driven by that one allocation.
+    //   * 50 residual calls per iteration against the fold's zero, of which
+    //     32 are `pyre_object::gc_roots` shadow-stack bookkeeping
+    //     (`pin_root` x10, `shadow_stack_get` x10, `shadow_stack_cell` x4,
+    //     `shadow_stack_cell_len` x4, `shadow_stack_len` x4).  Those cannot
+    //     be optimized out: `jtransform.rs` asserts in
+    //     `gc_root_pin_and_reload_keep_their_calls` that `pin_root` and
+    //     `reload_top_root` must survive as calls, because the slot a pin
+    //     publishes is what bound `shadow_stack_get` residuals read back and
+    //     nothing else forwards it across a move.
+    //   * The two `_pure_getdictvalue_no_unwrapping` calls are classified
+    //     `MayForce`, so each is wrapped in the virtualizable force protocol
+    //     (`ForceToken`, two setfields on the frame, `GuardNotForced`) and
+    //     splits the body into regions the optimizer cannot carry state
+    //     across.
+    //
+    // The first two are properties of descending into Rust helper code at
+    // all, not of this opcode: upstream can trace `W_Super.getattribute`
+    // because RPython's roots are invisible to the tracer and its proxy
+    // virtualizes, and neither holds here.  So the fold's advantage is not
+    // that it is a better fold, it is that it never enters helper code.  On
+    // `extra_tests/snippets/class_super_zero_arg_inlined_callee.py` the same
+    // binary took 2 of the fold's 5 sites while `loops_aborted` went 0 -> 6.
     if spec_gate(SpecFold::LoadSuperAttrDescent, || {
         try_walker_orthodox_load_super_attr(
             ctx,
