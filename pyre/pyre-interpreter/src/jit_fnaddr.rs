@@ -2567,6 +2567,23 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::jit_bigint_lshift_int_int_result",
         crate::objspace::descroperation::jit_bigint_lshift_int_int_result,
     );
+    // `_make_ovf2long`: the overflowed add, subtract, and multiply recover
+    // their exact result from the two machine words directly.
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_add_int_int",
+        crate::objspace::descroperation::jit_bigint_add_int_int,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_sub_int_int",
+        crate::objspace::descroperation::jit_bigint_sub_int_int,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_mul_int_int",
+        crate::objspace::descroperation::jit_bigint_mul_int_int,
+    );
     // Unary rbigint operations each take one payload pointer.
     cp1(
         &mut entries,

@@ -72,27 +72,27 @@ fn bigint_mod_inverse(base: &BigInt, modulus: &BigInt) -> Result<BigInt, PyError
         .map_err(|_| PyError::value_error("pow() 3rd argument cannot be 0"))
 }
 
-/// Host spelling of `rbigint.add`, retargeted by the MIR front to
-/// `jit_bigint_add` the way [`bigint_floordiv_nonzero`] is to
-/// `jit_bigint_div_floor`: the operands are handles and the result is a
-/// direct RBigInt handle, so the swap is ABI-identical.  A by-value
-/// `elidable` wrapper here was an unrepresentable residual, and the traced
-/// overflow arm of `int_add` / `int_sub` / `int_mul` aborted on it.
+/// `rbigint.add_int_int_bigint_result`, the sum half of `_make_ovf2long`
+/// (intobject.py:509-514).  The overflow recovery takes two Signed words and
+/// reaches the exact bigint sum in one elidable call, with no rbigint
+/// allocated for either operand; the MIR front retargets this seam to
+/// `jit_bigint_add_int_int` the way [`bigint_lshift_int_int_result`] is
+/// retargeted for the shift arm.
 #[majit_macros::jit_elidable]
-fn bigint_add(a: &BigInt, b: &BigInt) -> BigInt {
-    a + b
+fn bigint_add_int_int(a: i64, b: i64) -> BigInt {
+    BigInt::add_int_int_bigint_result(a, b)
 }
 
-/// `rbigint.sub`; see [`bigint_add`].
+/// `rbigint.sub_int_int_bigint_result`; see [`bigint_add_int_int`].
 #[majit_macros::jit_elidable]
-fn bigint_sub(a: &BigInt, b: &BigInt) -> BigInt {
-    a - b
+fn bigint_sub_int_int(a: i64, b: i64) -> BigInt {
+    BigInt::sub_int_int_bigint_result(a, b)
 }
 
-/// `rbigint.mul`; see [`bigint_add`].
+/// `rbigint.mul_int_int_bigint_result`; see [`bigint_add_int_int`].
 #[majit_macros::jit_elidable]
-fn bigint_mul(a: &BigInt, b: &BigInt) -> BigInt {
-    a * b
+fn bigint_mul_int_int(a: i64, b: i64) -> BigInt {
+    BigInt::mul_int_int_bigint_result(a, b)
 }
 
 /// Host spelling of the already-zero-checked quotient half of
@@ -459,6 +459,47 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> pyre_object::longobject::Jit
             pyre_object::longobject::alloc_bigint_nursery_collecting(&*a + &*b),
         )
     }
+}
+
+/// `rbigint.add_int_int_bigint_result` payload — the exact bigint sum of two
+/// machine ints, with no rbigint built for either operand. Pointer-ABI form of
+/// [`bigint_add_int_int`]; see [`jit_bigint_and`] for the result encoding.
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_add_int_int(
+    a: i64,
+    b: i64,
+) -> pyre_object::longobject::JitBigIntResult {
+    pyre_object::longobject::encode_jit_bigint_result(
+        pyre_object::longobject::alloc_bigint_nursery_collecting(
+            BigInt::add_int_int_bigint_result(a, b),
+        ),
+    )
+}
+
+/// `rbigint.sub_int_int_bigint_result` payload. See [`jit_bigint_add_int_int`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_sub_int_int(
+    a: i64,
+    b: i64,
+) -> pyre_object::longobject::JitBigIntResult {
+    pyre_object::longobject::encode_jit_bigint_result(
+        pyre_object::longobject::alloc_bigint_nursery_collecting(
+            BigInt::sub_int_int_bigint_result(a, b),
+        ),
+    )
+}
+
+/// `rbigint.mul_int_int_bigint_result` payload. See [`jit_bigint_add_int_int`].
+#[majit_macros::elidable_or_memerror]
+pub extern "C" fn jit_bigint_mul_int_int(
+    a: i64,
+    b: i64,
+) -> pyre_object::longobject::JitBigIntResult {
+    pyre_object::longobject::encode_jit_bigint_result(
+        pyre_object::longobject::alloc_bigint_nursery_collecting(
+            BigInt::mul_int_int_bigint_result(a, b),
+        ),
+    )
 }
 
 // ── BigInt/machine-int arithmetic residuals ─────────────────────────
@@ -836,7 +877,7 @@ unsafe fn int_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = int_value(b);
     match va.checked_add(vb) {
         Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(bigint_add(&BigInt::from(va), &BigInt::from(vb)))),
+        None => Ok(w_long_new(bigint_add_int_int(va, vb))),
     }
 }
 
@@ -845,7 +886,7 @@ unsafe fn int_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = int_value(b);
     match va.checked_sub(vb) {
         Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(bigint_sub(&BigInt::from(va), &BigInt::from(vb)))),
+        None => Ok(w_long_new(bigint_sub_int_int(va, vb))),
     }
 }
 
@@ -854,7 +895,7 @@ unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = int_value(b);
     match va.checked_mul(vb) {
         Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(bigint_mul(&BigInt::from(va), &BigInt::from(vb)))),
+        None => Ok(w_long_new(bigint_mul_int_int(va, vb))),
     }
 }
 

@@ -11763,7 +11763,8 @@ impl<'a> Lowering<'a> {
         // `Result<RBigInt, PyError>`. RPython has a direct GCREF result plus
         // an implicit MemoryError edge, so retarget the validated
         // machine-count helper to that pointer ABI before `result_exc` erases
-        // the Result diamond.
+        // the Result diamond.  The `_make_ovf2long` seams take the same shape
+        // with both operands already machine words.
         let op_kind = if let OpKind::Call {
             target: CallTarget::FunctionPath { segments },
             args,
@@ -11779,7 +11780,12 @@ impl<'a> Lowering<'a> {
                             .as_ref()
                             .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
                 }
-                Some("bigint_lshift_int_int_result") => {
+                Some(
+                    "bigint_lshift_int_int_result"
+                    | "bigint_add_int_int"
+                    | "bigint_sub_int_int"
+                    | "bigint_mul_int_int",
+                ) => {
                     first_arg_ty
                         .as_ref()
                         .is_some_and(|ty| tyref_to_value_type(ty, self.llbc) == ValueType::Int)
@@ -11790,6 +11796,7 @@ impl<'a> Lowering<'a> {
                 _ => false,
             }
             && let Some(residual) = crate::front::rbigint_call::lshift_count_residual_path(segments)
+                .or_else(|| crate::front::rbigint_call::ovf2long_residual_path(segments))
         {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments: residual },
