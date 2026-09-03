@@ -22,7 +22,7 @@ use crate::function::is_function;
 pub use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::unicodeobject::is_str;
 use pyre_object::*;
-use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 // ── Re-exports from split-out modules ────────────────────────────────
 pub use crate::objspace::descroperation::*;
@@ -1887,19 +1887,24 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 #[inline(never)]
 unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let mut obj = obj;
     if is_slice(index) {
         // tupleobject.py descr_getslice → slice.indices.
         let len = w_tuple_len(obj) as i64;
         let (rs, rp, st) = {
-            // `slice_unpack` runs each component's `__index__`; the tuple is
-            // rooted for that window and does not move.
+            // `slice_unpack` runs each component's `__index__`, so this runs
+            // Python.  A tuple is nursery-allocated, so read the address back:
+            // a minor collection during the call moves it.  The length is
+            // read before, as `indices4` takes it — a tuple cannot be resized.
             let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            crate::sliceobject::slice_unpack(
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let unpacked = crate::sliceobject::slice_unpack(
                 w_slice_get_start(index),
                 w_slice_get_stop(index),
                 w_slice_get_step(index),
-            )?
+            )?;
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            unpacked
         };
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -1923,11 +1928,13 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         let indexed = {
             // `__index__` is user code: `BINARY_SUBSCR` pops the receiver
             // before dispatching here, so nothing else roots it across the
-            // call. A tuple never moves, so the root is for liveness alone
-            // and the address in hand stays correct.
+            // call. A tuple is nursery-allocated, so read the address back —
+            // a minor collection during the call moves it.
             let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            space_index(index)?
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let indexed = space_index(index)?;
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            indexed
         };
         if is_int(indexed) {
             w_int_get_value(indexed)
@@ -1967,23 +1974,28 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // at the code point index; a wide or surrogate-bearing one resolves the
     // position through the string's cached `rutf8` index table, so a read is
     // O(1) either way and nothing here has to materialise the code points.
+    let mut obj = obj;
     let len = w_str_len(obj);
-    let at = |i: usize| -> Option<CodePoint> { pyre_object::w_str_codepoint_at(obj, i) };
     if is_slice(index) {
         // `pypy/objspace/std/unicodeobject.py W_UnicodeObject._getitem_slice`
         // → `slice.indices(len)` (`pypy/objspace/std/sliceobject.py`).
         // Use the shared adjusted slice count so very large steps do not
         // overflow the index loop.
         let (rs, rp, st) = {
-            // `slice_unpack` runs each component's `__index__`; the string is
-            // rooted for that window and does not move.
+            // `slice_unpack` runs each component's `__index__`, so this runs
+            // Python.  `space.str` answers a nursery header, so read the
+            // address back: a minor collection during the call moves it.  The
+            // length is read before, as `slice.indices` takes it — a string
+            // cannot be resized.
             let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            crate::sliceobject::slice_unpack(
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let unpacked = crate::sliceobject::slice_unpack(
                 w_slice_get_start(index),
                 w_slice_get_stop(index),
                 w_slice_get_step(index),
-            )?
+            )?;
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            unpacked
         };
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len as i64);
@@ -2017,11 +2029,13 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         let indexed = {
             // `__index__` is user code: `BINARY_SUBSCR` pops the receiver
             // before dispatching here, so nothing else roots it across the
-            // call. A str never moves, so the root is for liveness alone
-            // and the address in hand stays correct.
+            // call. `space.str` answers a nursery header, so read the address
+            // back — a minor collection during the call moves it.
             let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            space_index(index)?
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let indexed = space_index(index)?;
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            indexed
         };
         if is_int(indexed) {
             w_int_get_value(indexed)
@@ -2048,7 +2062,7 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // past `usize::MAX` alike: an `as` cast would truncate `2**32` to `0`
     // and answer `s[0]` where this owes an `IndexError`.
     if let Ok(actual_idx) = usize::try_from(actual_idx)
-        && let Some(cp) = at(actual_idx)
+        && let Some(cp) = pyre_object::w_str_codepoint_at(obj, actual_idx)
     {
         return Ok(pyre_object::unicodeobject::w_str_from_codepoint(
             cp.to_u32(),

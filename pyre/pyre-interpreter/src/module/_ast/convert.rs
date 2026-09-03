@@ -4014,9 +4014,9 @@ impl Converter<'_> {
                     .iter()
                     .map(|v| self.constant_value(v))
                     .collect::<Result<Vec<_>, _>>()?;
-                // A tuple header never moves, but it is untraced until it is
-                // pinned, so its members are read only once there is nothing
-                // left to allocate before the store.
+                // A tuple header is untraced until it is pinned, so its members
+                // are read only once there is nothing left to allocate before
+                // the store, and the pin's returned word is what is kept.
                 self.pin(pyre_object::w_tuple_new(
                     values.into_iter().map(Rooted::get).collect(),
                 ))

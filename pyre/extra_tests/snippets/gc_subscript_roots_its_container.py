@@ -4,8 +4,9 @@
 `BINARY_SUBSCR` / `STORE_SUBSCR` / `DELETE_SUBSCR` pop every operand before
 the dispatch reaches the by-layout arm, so a container the operand stack was
 the only holder of has nothing rooting it while `__index__` runs Python.  A
-list is nursery-allocated on top of that: a collection there moves it, and the
-address the arm started with is the pre-move one.
+list, a built tuple and a `str()` result are nursery-allocated on top of that:
+a collection there moves them, and the address the arm started with is the
+pre-move one.
 """
 
 import gc
@@ -29,6 +30,11 @@ class Idx:
         return self.n
 
 
+class Named:
+    def __str__(self):
+        return "abcd"
+
+
 # Temporaries: nothing but the operand stack ever held these containers.
 assert [10, 20, 30][Idx(1)] == 20
 assert (10, 20, 30)[Idx(1)] == 20
@@ -38,6 +44,15 @@ assert bytearray(b"abcd")[Idx(1)] == 98
 assert range(10, 20)[Idx(1)] == 11
 assert list(range(8))[Idx(2) :] == [2, 3, 4, 5, 6, 7]
 assert bytearray(b"abcdefgh")[Idx(2) : Idx(6)] == bytearray(b"cdef")
+
+# A tuple or str *literal* is a prebuilt constant and never relocates, so the
+# two lines above exercise liveness and not staleness.  The relocating shapes
+# are the ones a program builds: `tuple()` allocates in the nursery, and
+# `str()` is the one caller of the collecting string constructor.
+assert tuple(range(10, 40, 10))[Idx(1)] == 20
+assert tuple(range(8))[Idx(2) :] == (2, 3, 4, 5, 6, 7)
+assert str(Named())[Idx(1)] == "b"
+assert str(Named())[Idx(1) : Idx(3)] == "bc"
 
 # The assigned value is read after the key's `__index__` has already run.
 target = bytearray(b"abcd")

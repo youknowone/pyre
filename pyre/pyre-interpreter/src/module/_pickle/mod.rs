@@ -362,8 +362,8 @@ pub(crate) fn compat_map(
     // through `getitem`, which can run Python and drive a collection. Pin the
     // freshly built key so a collection there cannot sweep it mid-lookup — the
     // Rust counterpart of the RPython GC transform auto-rooting `w_key` across
-    // `space.finditem`. The key is a born-old-stable (non-moving) tuple over
-    // immortal element strings, so keeping it alive is sufficient (no re-read).
+    // `space.finditem`. The tuple is nursery-allocated, so the local below is
+    // the word the pin handed back rather than the one it was handed.
     // The cached real-dict tables take the native `w_dict_lookup_checked` path
     // and never collect, so this only guards a user-replaced mapping.
     let _key_root = pyre_object::gc_roots::push_roots();

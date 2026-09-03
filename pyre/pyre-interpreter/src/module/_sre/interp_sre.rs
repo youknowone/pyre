@@ -1400,32 +1400,45 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         return Err(crate::PyError::type_error("sub requires self, repl, string"));
     }
     let pat = args[0];
-    let w_repl = args[1];
-    let string = args[2];
+    // `pat` is `malloc_typed` and held in the process-wide pattern table, so it
+    // is immortal and needs no root of its own.  The replacement and the
+    // subject are ordinary objects, and everything below runs Python -- an
+    // `__index__` on `count`, the template parse, and the filter once per
+    // match.  A match object stamps the subject and its buffer into traced
+    // fields, so a stale word here is one the collector follows on its next
+    // walk rather than one that is merely read back wrong.
+    let base = pyre_object::gc_roots::pin_roots(&[args[1], args[2]]);
+    let w_repl = || pyre_object::gc_roots::shadow_stack_get(base);
+    let string = || pyre_object::gc_roots::shadow_stack_get(base + 1);
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
-    let subj = make_subject(pat, string)?;
-    let w_buffer = unsafe { readbuf_obj(string) };
+    // The subject borrows the string's value box, which is `try_gc_alloc_stable`
+    // and so keeps its address; the pin above is what keeps that box allocated
+    // for the length of the walk.
+    let subj = make_subject(pat, string())?;
+    let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(unsafe { readbuf_obj(string()) });
+    let w_buffer = || pyre_object::gc_roots::shadow_stack_get(buffer_slot);
     let count = arg_int_kw(args, 3, kwargs, "count", 0)?;
 
     // interp_sre.py:437-472 — a callable filter is applied per match; a
     // literal (no backslash) is inserted verbatim; otherwise the template
     // is compiled into a literal/group reference list.  The replacement's
     // type must match the subject's (str↔str, bytes↔bytes).
-    let filter_is_callable = crate::baseobjspace::callable_w(w_repl);
+    let filter_is_callable = crate::baseobjspace::callable_w(w_repl());
     let template = if filter_is_callable {
         None
     } else {
         let (repl_bytes, is_bytes) = match subj {
             Subject::AsciiStr(_) | Subject::Str(_) => {
-                if !unsafe { is_str(w_repl) } {
+                if !unsafe { is_str(w_repl()) } {
                     return Err(crate::PyError::type_error(
                         "sub: replacement must be str or callable",
                     ));
                 }
-                (unsafe { w_str_get_wtf8(w_repl) }.as_bytes(), false)
+                (unsafe { w_str_get_wtf8(w_repl()) }.as_bytes(), false)
             }
             Subject::Bytes(_) => {
-                let Some(w_bytes) = crate::typedef::buffer_as_bytes_like(w_repl)? else {
+                let Some(w_bytes) = crate::typedef::buffer_as_bytes_like(w_repl())? else {
                     return Err(crate::PyError::type_error(
                         "sub: replacement must be bytes-like or callable",
                     ));
@@ -1437,7 +1450,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
                 )
             }
         };
-        Some(parse_replacement_template(w_repl, repl_bytes, pat, is_bytes)?)
+        Some(parse_replacement_template(w_repl(), repl_bytes, pat, is_bytes)?)
     };
 
     let endpos = subj.len();
@@ -1454,13 +1467,13 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         }
         last = mend;
         if let Some(items) = &template {
-            let m = make_match_from_snapshot(pat, string, w_buffer, snap, 0, endpos as i64);
+            let m = make_match_from_snapshot(pat, string(), w_buffer(), snap, 0, endpos as i64);
             expand_into(&mut out, items, m as *const W_SRE_Match, subj);
         } else {
             // interp_sre.py:505-513 — callable filter; None means "no
             // piece" (treated as empty), otherwise the returned string.
-            let m = make_match_from_snapshot(pat, string, w_buffer, snap, 0, endpos as i64);
-            let w_piece = crate::call::call_function_impl_result(w_repl, &[m])?;
+            let m = make_match_from_snapshot(pat, string(), w_buffer(), snap, 0, endpos as i64);
+            let w_piece = crate::call::call_function_impl_result(w_repl(), &[m])?;
             if !unsafe { is_none(w_piece) } {
                 match subj {
                     Subject::AsciiStr(_) | Subject::Str(_) => {
@@ -1501,8 +1514,8 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     // (`str`/`bytes` subclass or buffer input) is normalized to a base-type
     // slice of the whole subject.
     if n == 0 {
-        let w_result = if is_exact_str_or_bytes(string) {
-            string
+        let w_result = if is_exact_str_or_bytes(string()) {
+            string()
         } else {
             slice_subject(subj, (0, endpos as i64), empty_subject(subj))
         };

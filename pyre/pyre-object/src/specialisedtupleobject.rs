@@ -109,9 +109,9 @@ pub static SPECIALISED_TUPLE_OO_TYPE: PyType = new_pytype("tuple");
 /// init. The variant carries no GC-pointer fields
 /// (`gc_ptr_offsets = []`, `eval.rs`), so mark-sweep traversal
 /// has nothing to follow and routing through the GC stays
-/// correctness-safe. Unrelated to W_TupleObject canonical allocations
-/// (those depend on ItemsBlock migration before they can
-/// move).
+/// correctness-safe. The canonical `W_TupleObject` is on the other side of
+/// this split: `w_tuple_new` allocates in the nursery, so two objects that
+/// answer `tuple` to `type()` differ in whether a minor collection moves them.
 pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
     let header = PyObject {
         ob_type: &SPECIALISED_TUPLE_II_TYPE as *const PyType,
