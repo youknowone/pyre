@@ -5594,18 +5594,69 @@ pub fn dunder_import(
     )
 }
 
-/// `builtins.__import__` as the binding rather than as the function it starts
-/// out holding: the attribute is read off the builtins module at the call, and
-/// whatever it names is what runs.  This is how interpreter-level code reaches
-/// the importer upstream -- `_lookup_codec_loop`'s
-/// `space.getattr(space.builtin, '__import__')`, and `interp_warnings`'s
-/// `space.call_method(w_builtins, '__import__', ...)` for `linecache` -- so a
-/// program that replaces `builtins.__import__` observes these imports too.
+/// The `builtins.__import__` binding, or the error a missing one raises.
 ///
-/// [`dunder_import`] is what that binding holds until something replaces it,
-/// and it is what runs when there is no binding to read: before the builtins
-/// module exists, or once the name has been deleted from it.  Nothing can have
-/// replaced an attribute that is not there.
+/// `space.getattr(space.builtin, '__import__')`, the way `_lookup_codec_loop`
+/// reads it: off the space-wide builtins module, at the call, so whatever the
+/// name holds by then is what runs.  [`lookup_dunder_import`] answers the same
+/// question for IMPORT_NAME against the frame's own builtins, and raises the
+/// same error, because a name that is not there is a missing importer and not
+/// a licence to run the one the binding would have replaced.
+fn dunder_import_binding(
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    // `space.builtin` -- the one Module every frame uses for its LOAD_GLOBAL
+    // fallback, and the object `import builtins` publishes.
+    let w_builtin = if execution_context.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        unsafe { (*execution_context).get_builtin() }
+    };
+    let w_import = if !w_builtin.is_null() && unsafe { is_module(w_builtin) } {
+        // Pinned before the read: it is a `getattr` on a module, which can run
+        // a module-level `__getattr__` and collect underneath the receiver.
+        let _roots = push_roots();
+        let builtin_slot = shadow_stack_len();
+        let _ = pin_root(w_builtin);
+        crate::baseobjspace::findattr_result(shadow_stack_get(builtin_slot), "__import__")?
+    } else {
+        None
+    };
+    w_import
+        .ok_or_else(|| crate::PyError::new(crate::PyErrorKind::ImportError, "__import__ not found"))
+}
+
+/// The binding called with the name alone, which is how `_lookup_codec_loop`
+/// spells its two imports: `space.call_function(w_import, w_name)`.  A
+/// replacement is user code with a signature of its own, so a call carrying
+/// arguments the site upstream never passes is a call it can reject.
+pub fn call_dunder_import_name_only(
+    name: &str,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let import_slot = shadow_stack_len();
+    let _ = pin_root(dunder_import_binding(execution_context)?);
+    // Minted before the slot is read back: the allocation can move what the
+    // slot holds, and an argument read ahead of it would be a stale address.
+    let name_slot = shadow_stack_len();
+    let _ = pin_root(pyre_object::w_str_new(name));
+    crate::call::call_function_impl_result(
+        shadow_stack_get(import_slot),
+        &[shadow_stack_get(name_slot)],
+    )
+    .map_err(strip_bootstrap_traceback_frames)
+}
+
+/// `builtins.__import__` as the binding rather than as the function it starts
+/// out holding, called the way an `import` statement calls it: with the name,
+/// the two namespaces, the fromlist and the level, which is what IMPORT_NAME
+/// passes.  A program that replaces `builtins.__import__` observes the imports
+/// the interpreter makes on its behalf through here.
 pub fn call_dunder_import(
     name: &str,
     w_globals: PyObjectRef,
@@ -5639,44 +5690,8 @@ pub fn call_dunder_import(
         w_fromlist
     });
 
-    // `space.builtin` — the one Module every frame uses for its LOAD_GLOBAL
-    // fallback, and the object `import builtins` publishes.
-    let w_builtin = if execution_context.is_null() {
-        pyre_object::PY_NULL
-    } else {
-        unsafe { (*execution_context).get_builtin() }
-    };
-    let w_import = if !w_builtin.is_null() && unsafe { is_module(w_builtin) } {
-        let builtin_slot = shadow_stack_len();
-        let _ = pin_root(w_builtin);
-        crate::baseobjspace::findattr_result(shadow_stack_get(builtin_slot), "__import__")?
-    } else {
-        None
-    };
-    let Some(w_import) = w_import else {
-        return dunder_import(
-            name,
-            if w_globals.is_null() {
-                pyre_object::PY_NULL
-            } else {
-                shadow_stack_get(globals_slot)
-            },
-            if w_locals.is_null() {
-                pyre_object::PY_NULL
-            } else {
-                shadow_stack_get(locals_slot)
-            },
-            if w_fromlist.is_null() {
-                pyre_object::PY_NULL
-            } else {
-                shadow_stack_get(fromlist_slot)
-            },
-            level,
-            execution_context,
-        );
-    };
     let import_slot = shadow_stack_len();
-    let _ = pin_root(w_import);
+    let _ = pin_root(dunder_import_binding(execution_context)?);
     // Minted before any slot is read back: the allocation can move what the
     // slots hold, and an argument read ahead of it would be a stale address.
     let w_name = pyre_object::w_str_new(name);
