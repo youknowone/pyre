@@ -5547,10 +5547,17 @@ fn build_function(
                 guard_idx += 1;
             }
             OpCode::GuardNotInvalidated => {
-                // x86/assembler.py:4618-4637 parity: the guard site observes
-                // the owning loop token's invalidation flag on every entry.
-                // On wasm32 the Arc allocation lives in shared linear memory,
-                // so its stable pointer is directly addressable by the trace.
+                // PRE-EXISTING-ADAPTATION.  `opassembler.py
+                // emit_op_guard_not_invalidated` leaves a same-width no-op that
+                // `aarch64/runner.py invalidate_loop` overwrites with a branch, so
+                // the guard costs nothing per iteration; the dynasm backends do
+                // that.  A wasm module is code the host engine compiles, and
+                // nothing in the guest can rewrite an instruction of it, so the
+                // guard site observes the owning loop token's invalidation flag
+                // on every entry instead.  On wasm32 the Arc allocation lives
+                // in shared linear memory, so its pointer is addressable by the
+                // trace.  There is no convergence path while the module is the
+                // unit of compilation.
                 if invalidated_flag_addr != 0 {
                     sink.i32_const(invalidated_flag_addr as i32);
                     // The flag byte is the test: `emit_guard_if_exit` opens

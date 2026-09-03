@@ -1193,16 +1193,29 @@ pub struct JitCellToken {
     /// A recompile mints a fresh token, so the refusal never outlives the
     /// compiled loop that earned it.
     call_assembler_refused: AtomicBool,
-    /// Invalidation flags minted for bridges attached to this token. Each
-    /// bridge's `GUARD_NOT_INVALIDATED` reads its own generation's flag, so a
-    /// bridge compiled after an invalidation starts valid and only a later
-    /// invalidation can fail it. `rpython/jit/backend/model.py:145` requires a
-    /// repeated `invalidate_loop()` to invalidate newer guards, but not an old
-    /// guard that already has a bridge attached. The token owns the Arcs so
-    /// addresses baked into compiled artifacts remain valid for its lifetime.
-    /// Shared with [`Self::quasi_immut_handle`], which is what the
-    /// interpreter's `QuasiImmut` registry holds a weak reference to.
+    /// Invalidation flags minted for bridges attached to this token, by the
+    /// backends that answer `GUARD_NOT_INVALIDATED` with a runtime flag test
+    /// rather than a patched branch — cranelift and wasm, which cannot rewrite
+    /// an instruction of already-generated code. Each such bridge's guard reads
+    /// its own generation's flag, so a bridge compiled after an invalidation
+    /// starts valid and only a later invalidation can fail it, which is what
+    /// [`Self::invalidate_sites`] gets from being emptied instead.
+    /// `rpython/jit/backend/model.py invalidate_loop` requires a repeated
+    /// `invalidate_loop()` to invalidate newer guards, but not an old guard
+    /// that already has a bridge attached. The token owns the Arcs so addresses
+    /// baked into compiled artifacts remain valid for its lifetime. Shared with
+    /// [`Self::quasi_immut_handle`], which is what the interpreter's
+    /// `QuasiImmut` registry holds a weak reference to.
     bridge_invalidation_flags: Arc<parking_lot::Mutex<Vec<Arc<AtomicBool>>>>,
+    /// `model.py CompiledLoopToken.__init__`'s `self.invalidate_positions = []`
+    /// — the compiled `GUARD_NOT_INVALIDATED` sites of this loop and of every
+    /// bridge attached to it, which `invalidate_loop` branches to their
+    /// recovery stubs.
+    /// Upstream hangs the list off the `CompiledLoopToken`; pyre hangs it here
+    /// so it can be shared with [`Self::quasi_immut_handle`], for the same
+    /// reason the bridge flags are — the mutator performing an invalidation
+    /// names that value, and may not name the token.
+    invalidate_sites: Arc<parking_lot::Mutex<InvalidateSites>>,
     /// The projection of this token that `quasiimmut.py register_loop_token`
     /// records.  Upstream registers the loop token itself, and can, because
     /// its `QuasiImmut.invalidate` runs under the GIL on the one thread that
@@ -1392,6 +1405,7 @@ impl JitCellToken {
     pub fn new(number: u64) -> Self {
         let invalidated = Arc::new(AtomicBool::new(false));
         let bridge_invalidation_flags = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let invalidate_sites = Arc::new(parking_lot::Mutex::new(InvalidateSites::default()));
         JitCellToken {
             number,
             green_key: Cell::new(0),
@@ -1402,10 +1416,12 @@ impl JitCellToken {
             quasi_immut_handle: Arc::new(LoopInvalidation {
                 invalidated: invalidated.clone(),
                 bridge_flags: bridge_invalidation_flags.clone(),
+                sites: invalidate_sites.clone(),
             }),
             invalidated,
             call_assembler_refused: AtomicBool::new(false),
             bridge_invalidation_flags,
+            invalidate_sites,
             version_info: None,
             keepalive_tokens: parking_lot::Mutex::new(Vec::new()),
             // `rpython/jit/backend/x86/assembler.py:514` creates the
@@ -1599,6 +1615,33 @@ impl JitCellToken {
         self.quasi_immut_handle.clone()
     }
 
+    /// `assembler.py patch_pending_failure_recoveries`'s
+    /// `clt.invalidate_positions.append(...)` — record the
+    /// `GUARD_NOT_INVALIDATED` sites a just-materialised trace left behind,
+    /// together with the writer that activates them.
+    ///
+    /// A bridge records against the loop it attaches to, because
+    /// `llsupport/assembler.py assemble_bridge` sets `self.current_clt =
+    /// original_loop_token.compiled_loop_token` for the whole emission.
+    pub fn record_invalidate_positions(
+        &self,
+        write: fn(&[InvalidatePosition]),
+        positions: Vec<InvalidatePosition>,
+    ) {
+        if positions.is_empty() {
+            return;
+        }
+        let mut sites = self.invalidate_sites.lock();
+        sites.write = Some(write);
+        sites.positions.extend(positions);
+    }
+
+    /// The sites recorded for this loop that no invalidation has written yet.
+    #[cfg(test)]
+    pub(crate) fn pending_invalidate_positions(&self) -> Vec<InvalidatePosition> {
+        self.invalidate_sites.lock().positions.clone()
+    }
+
     /// Mint the clear invalidation flag owned by a newly compiled bridge.
     pub fn mint_bridge_invalidation_flag(&self) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
@@ -1694,6 +1737,41 @@ impl std::fmt::Debug for JitCellToken {
     }
 }
 
+/// One entry of `model.py CompiledLoopToken.__init__`'s
+/// `clt.invalidate_positions`: a compiled `GUARD_NOT_INVALIDATED` site, and the
+/// branch that activates it.
+///
+/// Upstream records `(addr-in-the-code-of-the-not-yet-written-jump-target,
+/// relative-target-to-use)` and lets `cpu.invalidate_loop` assemble the branch
+/// (`x86/runner.py invalidate_loop`, `aarch64/runner.py invalidate_loop`),
+/// because it reaches invalidation through the CPU.  pyre reaches it from
+/// whichever mutator wrote the watched field, which holds no backend, so the
+/// branch is encoded by the backend that emitted the site and travels with the
+/// address.
+#[derive(Debug, Clone, Copy)]
+pub struct InvalidatePosition {
+    /// The placeholder the emitter left at the guard site.
+    pub addr: usize,
+    /// The word to store there: a `JMP rel32` displacement on x86-64, a whole
+    /// `B imm26` instruction on aarch64.  One naturally-aligned word, so a
+    /// thread executing the loop while this store lands fetches either the
+    /// placeholder or the branch and never a half-written instruction.
+    pub word: u32,
+}
+
+/// `clt.invalidate_positions`, together with the backend writer that turns one
+/// into a branch in already-executable code.
+///
+/// The writer is a property of the backend that compiled the sites, not of the
+/// generation being invalidated, so it survives the list being emptied.
+/// `None` is the state of a backend that emits a runtime flag test instead of
+/// a patchable site and therefore records nothing.
+#[derive(Debug, Default)]
+pub struct InvalidateSites {
+    positions: Vec<InvalidatePosition>,
+    write: Option<fn(&[InvalidatePosition])>,
+}
+
 /// Everything `quasiimmut.py QuasiImmut.invalidate` touches on a loop token,
 /// held apart from the token so the registry can name it without naming the
 /// token.
@@ -1710,6 +1788,8 @@ pub struct LoopInvalidation {
     invalidated: Arc<AtomicBool>,
     /// `JitCellToken.bridge_invalidation_flags`.
     bridge_flags: Arc<parking_lot::Mutex<Vec<Arc<AtomicBool>>>>,
+    /// `JitCellToken.invalidate_sites`.
+    sites: Arc<parking_lot::Mutex<InvalidateSites>>,
 }
 
 /// How many loop invalidations this process has performed, over every
@@ -1731,14 +1811,30 @@ pub fn token_invalidation_generation() -> u64 {
 
 impl LoopInvalidation {
     /// quasiimmut.py `QuasiImmut.invalidate`: `looptoken.invalidated = True`
-    /// followed by `cpu.invalidate_loop(looptoken)`.  Both projections happen
-    /// here in pyre: the root flag makes the warm cell stop returning the
-    /// token, and every bridge-generation flag activates its still-unpatched
-    /// GUARD_NOT_INVALIDATED sites.
+    /// followed by `cpu.invalidate_loop(looptoken)`.  Both happen here: the
+    /// root flag makes the warm cell stop returning the token, and
+    /// `cpu.invalidate_loop` activates every `GUARD_NOT_INVALIDATED` this
+    /// token still owns — by writing the branch at each recorded site for the
+    /// backends that can patch their own code, and by setting the
+    /// bridge-generation flags for the ones that instead test one.
     fn invalidate(&self) {
         self.invalidated.store(true, Ordering::Release);
         for flag in self.bridge_flags.lock().iter() {
             flag.store(true, Ordering::Release);
+        }
+        // `model.py invalidate_loop`: write the branch into every recorded
+        // site, then empty the list.  Emptying is what makes a bridge
+        // compiled afterwards start valid, so that a repeated invalidation
+        // "must invalidate all newer GUARD_NOT_INVALIDATED, but not the old one
+        // that already has a bridge attached to it".  The lock is released
+        // first: the writer flips page protections, and holding a mutex across
+        // that would serialise it against a compile that only wants to append.
+        let (write, positions) = {
+            let mut sites = self.sites.lock();
+            (sites.write, std::mem::take(&mut sites.positions))
+        };
+        if let Some(write) = write {
+            write(&positions);
         }
         // After the flags, not before: a reader that keys a cache on the
         // generation pairs the value it read with the answer it computed, so
@@ -4511,6 +4607,52 @@ mod tests {
             &token.latest_bridge_invalidation_flag().unwrap(),
             &bridge_flag
         ));
+    }
+
+    /// `x86/runner.py invalidate_loop` / `aarch64/runner.py invalidate_loop`
+    /// state the same generation rule for the backends that record a patchable
+    /// site instead of reading a flag: the walk writes every recorded position
+    /// and then empties the list,
+    /// so a trace compiled afterwards records into an empty one and starts
+    /// valid — "must invalidate all newer GUARD_NOT_INVALIDATED, but not the
+    /// old one that already has a bridge attached to it".
+    #[test]
+    fn recorded_invalidate_positions_are_written_once_and_then_consumed() {
+        static WRITTEN: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
+        fn write(positions: &[InvalidatePosition]) {
+            WRITTEN.lock().extend(positions.iter().map(|p| p.addr));
+        }
+
+        let token = JitCellToken::new(42);
+        token.record_invalidate_positions(
+            write,
+            vec![InvalidatePosition {
+                addr: 0x1000,
+                word: 1,
+            }],
+        );
+        assert_eq!(token.pending_invalidate_positions().len(), 1);
+
+        token.invalidate();
+        assert_eq!(*WRITTEN.lock(), vec![0x1000]);
+        assert!(token.pending_invalidate_positions().is_empty());
+
+        // `invalidate_loop` empties the list, so a second call has nothing left to
+        // write.
+        token.invalidate();
+        assert_eq!(*WRITTEN.lock(), vec![0x1000]);
+
+        // The bridge compiled after the invalidation joins the same list, and
+        // is activated by the next one.
+        token.record_invalidate_positions(
+            write,
+            vec![InvalidatePosition {
+                addr: 0x2000,
+                word: 2,
+            }],
+        );
+        token.invalidate();
+        assert_eq!(*WRITTEN.lock(), vec![0x1000, 0x2000]);
     }
 
     #[test]

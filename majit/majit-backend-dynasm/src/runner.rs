@@ -2549,8 +2549,14 @@ impl Backend for DynasmBackend {
         // opens the code block with one word per reference constant, and
         // `patch_gcref_table` fills them in once the block is materialized.
         asm.reserve_gcref_table(gcrefs.len());
-        asm.set_invalidated_flag_addr(std::sync::Arc::as_ptr(&token.invalidated) as usize);
         let compiled = asm.assemble_loop()?;
+        // `assembler.py patch_pending_failure_recoveries`'s
+        // `clt.invalidate_positions.append(...)`, deferred to here because the
+        // addresses are only absolute once the buffer is materialised.
+        token.record_invalidate_positions(
+            codebuf::write_invalidate_positions,
+            compiled.invalidate_positions.clone(),
+        );
 
         let rawstart = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_addr = compiled.entry_ptr() as usize;
@@ -2795,8 +2801,6 @@ impl Backend for DynasmBackend {
         // `assembler.py assemble_bridge`: `reserve_gcref_table(allgcrefs)`
         // opens the bridge's own code block (same as compile_loop).
         asm.reserve_gcref_table(gcrefs.len());
-        let bridge_flag = original_token.mint_bridge_invalidation_flag();
-        asm.set_invalidated_flag_addr(std::sync::Arc::as_ptr(&bridge_flag) as usize);
 
         let _orig_compiled = Self::get_compiled(original_token);
 
@@ -2816,6 +2820,15 @@ impl Backend for DynasmBackend {
         // found`).
         let arglocs = Asm::rebuild_faillocs_from_descr(fail_descr, inputargs);
         let compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
+        // `llsupport/assembler.py assemble_bridge` keeps `self.current_clt =
+        // original_loop_token.compiled_loop_token` for the whole emission, so a
+        // bridge's guards join the loop's list.  The list was emptied by any
+        // invalidation that already happened, which is what makes this bridge
+        // start valid.
+        original_token.record_invalidate_positions(
+            codebuf::write_invalidate_positions,
+            compiled.invalidate_positions.clone(),
+        );
 
         let rawstart = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let bridge_addr = compiled.entry_ptr() as usize;
@@ -3377,9 +3390,8 @@ impl Backend for DynasmBackend {
     fn invalidate_loop(&self, token: &JitCellToken) {
         let _writing = majit_backend::AssemblerWriting::enter();
         // `model.py:145` activates the guards in the loop AND in its attached
-        // bridges. Each bridge's GUARD_NOT_INVALIDATED reads its own
-        // generation flag, so storing to the root flag alone would leave every
-        // bridge guard a no-op; `invalidate` walks both.
+        // bridges. Both compile against the loop's `invalidate_positions`, and
+        // `invalidate` is what writes the branch into each of them.
         token.invalidate();
     }
 

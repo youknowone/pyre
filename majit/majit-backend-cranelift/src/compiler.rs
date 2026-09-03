@@ -12582,6 +12582,20 @@ impl CraneliftBackend {
                     guard_idx += 1;
 
                     if let Some(flag_addr) = invalidation_flag_ptr {
+                        // PRE-EXISTING-ADAPTATION.  `opassembler.py
+                        // emit_op_guard_not_invalidated` leaves a same-width
+                        // no-op that `aarch64/runner.py invalidate_loop` overwrites
+                        // with a branch, so the guard costs nothing per
+                        // iteration; the dynasm backends do that.  Cranelift
+                        // chooses its own branch encodings and elides
+                        // fallthrough jumps, so no CLIF construct reserves a
+                        // patchable branch slot of a known width, and the only
+                        // thing that does leave one -- a call, whose relocation
+                        // names its own offset -- makes the register allocator
+                        // spill everything live across the loop body.
+                        // Convergence needs a Cranelift-side way to reserve
+                        // bytes at a recorded offset without a call.
+                        //
                         // Load the invalidation flag (AtomicBool, 1 byte) from
                         // the known address baked into the generated code.
                         let addr_val = builder.ins().iconst(cl_types::I64, flag_addr as i64);

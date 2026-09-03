@@ -617,24 +617,15 @@ pub struct AssemblerARM64<'a> {
     /// which the `LoadFromGcTable` genop reads PC-relative. Empty when the
     /// trace references no reference constants.
     gcref_table: Vec<dynasmrt::DynamicLabel>,
-    /// Address of the owning `JitCellToken.invalidated` `AtomicBool`
-    /// (`history.py:443`). `GUARD_NOT_INVALIDATED` bakes it as a 64-bit
-    /// immediate and loads the byte at runtime, branching to its recovery
-    /// stub when set — the shape `llgraph/runner.py:375` uses, where
-    /// `invalidate_loop` sets a per-trace `invalid` flag that the guard
-    /// reads live at execution. The machine backends instead emit no
-    /// runtime code and patch the recorded guard sites
-    /// (`clt.invalidate_positions`) on invalidation; reading the flag live
-    /// makes re-entry through any path (warm entry, CALL_ASSEMBLER,
-    /// resume) observe it without a second code-patching channel, and is
-    /// the only formulation cranelift and wasm can express at all. 0
-    /// leaves the guard a no-op (bridges / tests with no owning token).
-    invalidated_flag_addr: usize,
     /// `AssemblerARM64.malloc_slowpath`: per-CPU shared slowpath built by
     /// `_build_malloc_slowpath('fixed')` and used by both fixed-size and
     /// varsize-frame nursery probes.
     malloc_slowpath_fixed: usize,
 }
+
+/// `NOP` (`HINT #0`), the placeholder `_emit_guard` leaves at a
+/// `GUARD_NOT_INVALIDATED` site until `invalidate_loop` writes a `B` over it.
+const NOP_INSN: u32 = 0xD503_201F;
 
 /// assembler.py GuardToken — represents a pending guard needing
 /// a recovery stub to be written after the main loop body.
@@ -652,11 +643,30 @@ struct GuardToken {
     const_stores: Vec<(usize, i64)>,
     /// opassembler.py:515 GuardToken.gcmap.
     gcmap: *mut usize,
+    /// `opassembler.py _emit_guard`'s `token.offset = pos` — the instruction
+    /// word this guard's branch is patched into.  `Some` only for
+    /// `GUARD_NOT_INVALIDATED`, the one guard whose branch is written after the
+    /// buffer is materialised; every other guard reaches its recovery stub
+    /// through a `fail_label` dynasm resolves at finalize.
+    pos_jump_offset: Option<usize>,
     /// llsupport/assembler.py must_save_exception: true for
     /// GUARD_EXCEPTION / GUARD_NO_EXCEPTION / GUARD_NOT_FORCED.  Selects the
     /// exc=True failure-recovery variant that stages pos_exc_value into
     /// jf_guard_exc (store_info_on_descr:236) so grab_exc_value can read it.
     must_save_exception: bool,
+}
+
+/// What `assembler.py process_pending_guards` reads off a guard token once the
+/// buffer has been materialised.  Upstream still has the tokens there;
+/// `write_pending_failure_recoveries` consumes pyre's, so the three fields the
+/// walk needs survive it as this.
+struct RecoveryStub {
+    /// `tok.faildescr`.
+    fail_descr: std::sync::Arc<majit_ir::FailDescrCell>,
+    /// `tok.pos_recovery_stub`.
+    pos_recovery_stub: usize,
+    /// `tok.offset`, present only for `GUARD_NOT_INVALIDATED`.
+    pos_jump_offset: Option<usize>,
 }
 
 /// Compiled output from assemble_loop/assemble_bridge.
@@ -689,6 +699,9 @@ pub struct CompiledCode {
     pub frame_depth: std::sync::atomic::AtomicUsize,
     /// `None` for root loops; bridges set `(source_trace_id, source_fail_index_per_trace)`.
     pub source_guard: Option<(u64, u32)>,
+    /// `assembler.py process_pending_guards` — the `GUARD_NOT_INVALIDATED`
+    /// sites this trace left for `clt.invalidate_positions`.
+    pub invalidate_positions: Vec<majit_backend::InvalidatePosition>,
 }
 
 impl CompiledCode {
@@ -785,7 +798,6 @@ impl<'a> AssemblerARM64<'a> {
             attached_descrs,
             cpu_handle,
             gcref_table: Vec::new(),
-            invalidated_flag_addr: 0,
             malloc_slowpath_fixed,
         }
     }
@@ -1866,6 +1878,7 @@ impl<'a> AssemblerARM64<'a> {
         // assembler.py:849 patch_pending_failure_recoveries
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
+        let invalidate_positions = Self::collect_invalidate_positions(rawstart, &stub_offsets);
 
         // assembler.py:556 patch_stack_checks — rewrite any
         // `_check_frame_depth` depth placeholders with the loop's final
@@ -1898,13 +1911,8 @@ impl<'a> AssemblerARM64<'a> {
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
             source_guard: None,
+            invalidate_positions,
         })
-    }
-
-    /// Bake the owning token's `invalidated` flag address so
-    /// `GUARD_NOT_INVALIDATED` reads it live at runtime.
-    pub(crate) fn set_invalidated_flag_addr(&mut self, addr: usize) {
-        self.invalidated_flag_addr = addr;
     }
 
     fn resolve_call_assembler_target_addr(
@@ -2004,6 +2012,7 @@ impl<'a> AssemblerARM64<'a> {
 
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
+        let invalidate_positions = Self::collect_invalidate_positions(rawstart, &stub_offsets);
 
         // assembler.py:556 patch_stack_checks — rewrite the bridge's
         // `_check_frame_depth` depth placeholder with the final absolute
@@ -2054,6 +2063,7 @@ impl<'a> AssemblerARM64<'a> {
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
             source_guard: Some((fail_descr.trace_id(), fail_descr.fail_index_per_trace())),
+            invalidate_positions,
         })
     }
 
@@ -4387,12 +4397,16 @@ impl<'a> AssemblerARM64<'a> {
         );
     }
 
-    /// `GUARD_NOT_INVALIDATED`: load the owning token's `invalidated` byte
-    /// and branch to the recovery stub when it is set.  This sits at the
-    /// head of the peeled loop body, so every iteration — reached by any
-    /// entry path (warm entry, CALL_ASSEMBLER, blackhole resume) — observes
-    /// a quasi-immutable mutation that flipped the flag and bails out to the
-    /// bridge / interpreter instead of running the stale, const-folded body.
+    /// `opassembler.py emit_op_guard_not_invalidated` — the guard tests
+    /// nothing.  It is a position, recorded now and turned into a branch to
+    /// its recovery stub by `cpu.invalidate_loop` if the loop is ever
+    /// invalidated, so a loop that keeps its quasi-immutable assumptions pays
+    /// nothing per iteration for holding them.
+    ///
+    /// `_emit_guard` leaves a `NOP` where every other guard leaves a `BRK`,
+    /// "because it is only eventually patched at a later point"; one aligned
+    /// word, which is also what lets the patch land while another thread runs
+    /// the loop.
     fn implement_guard_not_invalidated_with_faillocs(
         &mut self,
         op: &Op,
@@ -4401,16 +4415,12 @@ impl<'a> AssemblerARM64<'a> {
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
+        // `_emit_guard`: `pos = self.mc.currpos()`, `token.offset = pos`.
+        let pos = self.mc.offset().0;
+        dynasm!(self.mc ; .arch aarch64 ; .u32 NOP_INSN);
         let fail_label = self.mc.new_dynamic_label();
-        if self.invalidated_flag_addr != 0 {
-            self.emit_mov_imm64(16, self.invalidated_flag_addr as i64);
-            dynasm!(self.mc ; .arch aarch64 ; ldrb w17, [x16]);
-            // The recovery stub is emitted after the whole trace body, so a
-            // bare `cbnz` (19-bit, ±1MB) cannot reach it once the body passes
-            // 1MB — the same reach the other guards route around via
-            // `emit_bcond_to_label`.
-            self.emit_cbnz_w_to_label(17, fail_label);
-        }
+        // The label is bound at the recovery stub like any other guard's;
+        // under an unpatched `NOP` nothing branches to it.
         self.append_guard_token_with_faillocs(
             op,
             op_index,
@@ -4419,6 +4429,10 @@ impl<'a> AssemblerARM64<'a> {
             guard_argloc,
             faillocs,
         );
+        self.pending_guard_tokens
+            .last_mut()
+            .expect("guard token appended")
+            .pos_jump_offset = Some(pos);
     }
 
     /// Append guard token with regalloc faillocs instead of opref_to_slot snapshot.
@@ -4570,6 +4584,7 @@ impl<'a> AssemblerARM64<'a> {
             fail_descr: cell.clone(),
             const_stores,
             gcmap,
+            pos_jump_offset: None,
             must_save_exception: matches!(
                 op.opcode,
                 OpCode::GuardException | OpCode::GuardNoException | OpCode::GuardNotForced
@@ -4620,7 +4635,7 @@ impl<'a> AssemblerARM64<'a> {
         &mut self,
         guard_token: GuardToken,
         save_regs_label: DynamicLabel,
-    ) -> (std::sync::Arc<majit_ir::FailDescrCell>, usize) {
+    ) -> RecoveryStub {
         let stub_start = self.mc.offset();
 
         let fail_label = guard_token.fail_label;
@@ -4689,14 +4704,16 @@ impl<'a> AssemblerARM64<'a> {
         }
 
         self._call_footer();
-        (guard_token.fail_descr, stub_start.0)
+        RecoveryStub {
+            fail_descr: guard_token.fail_descr,
+            pos_recovery_stub: stub_start.0,
+            pos_jump_offset: guard_token.pos_jump_offset,
+        }
     }
 
     /// assembler.py:1005 write_pending_failure_recoveries.
     /// Returns recovery stub offsets for post-finalize address fixup.
-    fn write_pending_failure_recoveries(
-        &mut self,
-    ) -> Vec<(std::sync::Arc<majit_ir::FailDescrCell>, usize)> {
+    fn write_pending_failure_recoveries(&mut self) -> Vec<RecoveryStub> {
         // Emit a shared _push_all_regs_to_frame routine once, then let each
         // generate_quick_failure() stub call it.
         let save_regs_label = self.mc.new_dynamic_label();
@@ -4728,9 +4745,10 @@ impl<'a> AssemblerARM64<'a> {
             // The stub is bound here, so this is the first point at which the
             // displacement each `b.cond` to that label has to encode is known.
             if let Some(&branch) = self.short_guard_branch_offsets.get(&fail_label)
-                && entry.1 >= branch + BCOND_FORWARD_RANGE
+                && entry.pos_recovery_stub >= branch + BCOND_FORWARD_RANGE
             {
-                self.guard_reach_violations.push((branch, entry.1));
+                self.guard_reach_violations
+                    .push((branch, entry.pos_recovery_stub));
             }
             stub_offsets.push(entry);
         }
@@ -4745,16 +4763,43 @@ impl<'a> AssemblerARM64<'a> {
 
     /// assembler.py:849 patch_pending_failure_recoveries — convert
     /// buffer-relative offsets to absolute addresses after finalize.
-    fn patch_pending_failure_recoveries(
-        rawstart: usize,
-        stub_offsets: &[(std::sync::Arc<majit_ir::FailDescrCell>, usize)],
-    ) {
-        for (cell, stub_offset) in stub_offsets {
-            let abs_addr = rawstart + stub_offset;
-            if let Some(fd) = cell.as_fail_descr() {
+    fn patch_pending_failure_recoveries(rawstart: usize, stubs: &[RecoveryStub]) {
+        for stub in stubs {
+            let abs_addr = rawstart + stub.pos_recovery_stub;
+            if let Some(fd) = stub.fail_descr.as_fail_descr() {
                 fd.set_adr_jump_offset(abs_addr);
             }
         }
+    }
+
+    /// `assembler.py process_pending_guards` — the `GUARD_NOT_INVALIDATED` arm
+    /// of the same walk.  Rather than patching the guard now, record
+    /// `(guard_pos, relative_offset)` for `clt.invalidate_positions`, already
+    /// encoded as the `B imm26` the store will write.
+    fn collect_invalidate_positions(
+        rawstart: usize,
+        stubs: &[RecoveryStub],
+    ) -> Vec<majit_backend::InvalidatePosition> {
+        stubs
+            .iter()
+            .filter_map(|stub| {
+                let pos_jump_offset = stub.pos_jump_offset?;
+                // `relative_offset = tok.pos_recovery_stub - tok.offset`
+                let relative_offset = stub.pos_recovery_stub as i64 - pos_jump_offset as i64;
+                // B imm26: signed, scaled by 4 — the same +-128 MB reach
+                // `write_redirect_branch` encodes against.
+                const B_REACH: i64 = 1 << 27;
+                assert!(
+                    (-B_REACH..B_REACH).contains(&relative_offset),
+                    "guard recovery stub out of B reach: {relative_offset:#x}"
+                );
+                let imm26 = ((relative_offset >> 2) & 0x03FF_FFFF) as u32;
+                Some(majit_backend::InvalidatePosition {
+                    addr: rawstart + pos_jump_offset,
+                    word: 0x1400_0000 | imm26,
+                })
+            })
+            .collect()
     }
 
     // ----------------------------------------------------------------
@@ -5155,18 +5200,6 @@ impl<'a> AssemblerARM64<'a> {
 
     fn emit_jcc_to_label(&mut self, fail_cc: u8, fail_label: DynamicLabel) {
         self.emit_bcond_to_label(fail_cc, fail_label);
-    }
-
-    /// `cbnz W(reg), =>label` for a `label` that may sit past the 19-bit /
-    /// ±1MB reach of `cbnz`, using the same inversion as
-    /// [`Self::emit_bcond_to_label`]: `cbz skip; b =>label; skip:`.
-    fn emit_cbnz_w_to_label(&mut self, reg: u8, label: DynamicLabel) {
-        let skip = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch aarch64
-            ; cbz W(reg), =>skip
-            ; b =>label
-            ; =>skip
-        );
     }
 
     /// Infer fail_arg_types from `op.type_` (via `opref_type`) or

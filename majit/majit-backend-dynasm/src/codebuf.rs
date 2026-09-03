@@ -108,6 +108,36 @@ pub fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
     majit_backend::flush_instruction_cache(addr as *const u8, len);
 }
 
+/// `x86/runner.py invalidate_loop` / `aarch64/runner.py invalidate_loop` —
+/// activate the `GUARD_NOT_INVALIDATED` sites recorded for a loop and its
+/// attached bridges by writing the branch to each guard's recovery stub over
+/// the placeholder the emitter left there.
+///
+/// Upstream aarch64 brackets the same walk with `rmmap.enter_assembler_writing()`
+/// / `leave_assembler_writing()`; [`with_writable`] is that bracket.  One
+/// naturally-aligned four-byte store per site and nothing else, so a thread
+/// executing the loop reads either the placeholder or the finished branch:
+/// on x86-64 the four bytes are the `JMP rel32` displacement, on aarch64 they
+/// are the whole `B imm26` instruction word, one of the encodings the
+/// architecture names as safe to modify while another PE executes it.
+///
+/// The store is what has to be indivisible; the page being RW around it is a
+/// property of [`with_writable`] itself, shared with the bridge attachment in
+/// `patch_jump_for_descr`, which patches live code the same way.
+pub fn write_invalidate_positions(positions: &[majit_backend::InvalidatePosition]) {
+    for position in positions {
+        debug_assert_eq!(
+            position.addr % 4,
+            0,
+            "invalidate position {:#x} is not word-aligned; the store would not be atomic",
+            position.addr
+        );
+        with_writable(position.addr as *mut u8, 4, || unsafe {
+            (position.addr as *mut u32).write(position.word);
+        });
+    }
+}
+
 /// Get the raw pointer to an arena buffer's code.
 pub fn buffer_ptr(buffer: &ArenaExecutableBuffer) -> *const u8 {
     buffer.ptr(dynasmrt::AssemblyOffset(0))
