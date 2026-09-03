@@ -330,10 +330,10 @@ pub fn execute_varargs<M: Clone>(
                 // `funcbox.2` as a hand-written or `#[jit_module]`-generated
                 // function pointer with i64-return ABI:
                 //   * `do_recursive_call` (`pyjitpl.rs`) sets funcbox.2
-                //     to `targetjitdriver_sd.portal_runner_adr`.  Pyre's
-                //     portal entry is `bh_portal_runner(all_i, all_r, all_f)
-                //     -> i64` (pyre-jit/src/call_jit.rs); it never
-                //     declares an f64 return.
+                //     to `targetjitdriver_sd.portal_runner_adr`, which is
+                //     `bh_portal_runner_c(i64, i64, i64, i64, i64) -> i64`
+                //     (pyre-jit/src/call_jit.rs); it never declares an f64
+                //     return.
                 //   * `#[jit_module]` (majit-macros/src/lib.rs) emits a
                 //     Float helper's `concrete_ptr` as `extern "C" fn(...)
                 //     -> i64` with the f64 result pre-packed via

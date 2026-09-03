@@ -2315,25 +2315,26 @@ where
         );
     }
 
-    /// Print one control-flow edge of the root jitcode frame under
-    /// `MAJIT_PCSEQ` (see `crate::pcseq_enabled`).
+    /// Print one control-flow edge under `MAJIT_PCSEQ`
+    /// (see `crate::pcseq_enabled`).
     ///
     /// `value` is the concrete word the edge was decided on and `target` the
-    /// cursor it moves to, so a run's lines read as the walk's own path
-    /// through the portal.  Silent for an inlined callee: the ops this exists
-    /// to follow are the portal's, and the callees run orders of magnitude
-    /// more of them.
+    /// cursor it moves to, so a run's lines read as the walk's own path.
+    /// `d=` is the frame depth and `jitcode=` the frame that owns the edge:
+    /// an inlined callee prints too, because the edge that diverts a portal
+    /// walk is routinely one of theirs.
     fn pcseq_branch(&mut self, kind: &str, opcode_pc: usize, value: i64, target: Option<usize>) {
-        if !crate::pcseq_enabled() || self.frames.len() != 1 {
+        if !crate::pcseq_enabled() {
             return;
         }
+        let depth = self.frames.len();
         let name = &self.frames.current_mut().jitcode.name;
         match target {
-            Some(t) => {
-                eprintln!("@@@PCSEQ {kind} jitcode={name} pc={opcode_pc} value={value} -> {t}")
-            }
+            Some(t) => eprintln!(
+                "@@@PCSEQ {kind} d={depth} jitcode={name} pc={opcode_pc} value={value} -> {t}"
+            ),
             None => eprintln!(
-                "@@@PCSEQ {kind} jitcode={name} pc={opcode_pc} value={value} -> fallthrough"
+                "@@@PCSEQ {kind} d={depth} jitcode={name} pc={opcode_pc} value={value} -> fallthrough"
             ),
         }
     }

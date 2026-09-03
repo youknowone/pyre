@@ -127,7 +127,14 @@ pub enum StepResult<V> {
     Continue,
     Return(V),
     CloseLoop {
-        jump_args: Vec<V>,
+        /// The arguments [`ControlFlowOpcodeHandler::close_loop_args`]
+        /// supplied, carried as an `Option` so a handler that has none does
+        /// not have to build an empty `Vec` for the field.  The distinction
+        /// costs nothing at the reader — the back edge is the report itself,
+        /// and no consumer reads these — while an owned empty `Vec` costs an
+        /// allocation on every back edge and, in a jitcode, a residual call to
+        /// `Vec::new` that the translator has no binding for.
+        jump_args: Option<Vec<V>>,
         loop_header_pc: usize,
     },
     Yield(V),
@@ -523,7 +530,7 @@ pub trait ControlFlowOpcodeHandler: SharedOpcodeHandler {
     fn close_loop(&mut self, target: usize) -> Result<StepResult<Self::Value>, PyError> {
         match self.close_loop_args(target)? {
             Some(args) => Ok(StepResult::CloseLoop {
-                jump_args: args,
+                jump_args: Some(args),
                 loop_header_pc: target,
             }),
             None => Ok(StepResult::Continue),

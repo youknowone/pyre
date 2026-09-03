@@ -1084,6 +1084,19 @@ fn maybe_print_jit_stats() {
         "[jit-stats] mc_diag {} all_descrs={all_descrs_len}",
         majit_metainterp::mc_diag_summary()
     );
+    // The portal's own decisions, joined against the labels declared beside
+    // the counters (`pyre_jit::eval::PORTAL_DIAG_LABELS`). Read from the same
+    // reader the wasm export calls, so the two backends' lines diff field by
+    // field. This is the only portal instrument that works on wasm at all: the
+    // rest are `std::env::var` reads, and the guest has no environment.
+    {
+        let portal: Vec<String> = pyre_jit::eval::PORTAL_DIAG_LABELS
+            .iter()
+            .enumerate()
+            .map(|(i, lbl)| format!("{lbl}={}", pyre_jit::eval::portal_diag(i)))
+            .collect();
+        eprintln!("[jit-stats] portal_diag {}", portal.join(" "));
+    }
     // How many of the rehydrated descr pool a run actually names, under
     // `PYRE_DESCR_DEMAND`. Off by default; `(0, pool)` means the probe is off.
     let (descr_demanded, descr_pool) = pyre_jit::descr_demand_summary();

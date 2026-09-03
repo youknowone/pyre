@@ -572,6 +572,33 @@ pub extern "C" fn pyre_jit_mc_diag(i: u32) -> u64 {
     majit_metainterp::mc_diag(i as usize)
 }
 
+/// Diagnostic-only: the portal's own decision tallies
+/// (`pyre_jit::eval::PORTAL_DIAG`, legend in `PORTAL_DIAG_LABELS`).
+///
+/// Every other portal instrument is an env-gated print — `PYRE_PORTAL_METATRACE`,
+/// `MAJIT_PCSEQ` — and the guest has no environment, so none of them can fire
+/// here.  This export is the only channel that says whether the wasm portal was
+/// entered, whether any back edge reached its `CloseLoop` arm, and which filter
+/// consumed the ones that did.  Exported rather than imported for the same
+/// reason as `pyre_jit_bridge_diag`: an import would shift the JIT's own
+/// function-index space.
+///
+/// `..._len` is exported beside the values so the runner can report a slot this
+/// crate added but its own legend does not name, instead of dropping it. The
+/// existing `bridge_diag` mirror has no such guard and relies on both sides
+/// being edited together.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_portal_diag(i: u32) -> u64 {
+    pyre_jit::eval::portal_diag(i as usize)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_portal_diag_len() -> u32 {
+    pyre_jit::eval::PORTAL_DIAG_LABELS.len() as u32
+}
+
 /// Diagnostic-only: the full-body-walk decline census
 /// (`pyre_jit_trace::jitcode_dispatch::census_entries`), which names the
 /// `DispatchError` variant behind every aborted walk. The map is always
