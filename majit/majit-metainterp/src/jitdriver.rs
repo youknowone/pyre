@@ -80,6 +80,12 @@ pub struct SingleFrameBlackholeResult {
     /// marker clears each Ref the live set omits, so the frame red reads 0
     /// whenever the run stopped past that register's last use.
     pub virtualizable_ptr: i64,
+    /// [`crate::blackhole::BlackholeInterpreter::abort_permanent_bail`] of the
+    /// frame the run stopped in, carried for the same reason
+    /// [`crate::blackhole::BlackholeTerminalImage`] carries it: `outcome`
+    /// alone cannot tell a bail that stamped a resume coordinate from one that
+    /// stopped mid-instruction.
+    pub abort_permanent_bail: bool,
 }
 
 /// The blackhole's view of `metainterp_sd.jitdrivers_sd`, cast once and shared.
@@ -296,6 +302,7 @@ pub fn drive_single_frame_blackhole(
         position: bh.position,
         last_opcode_position: bh.last_opcode_position,
         virtualizable_ptr,
+        abort_permanent_bail: bh.abort_permanent_bail,
     };
     builder.release_interp(bh);
     result

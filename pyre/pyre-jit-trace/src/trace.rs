@@ -3226,14 +3226,28 @@ fn try_adopt_single_frame_blackhole(
         // routing this through the void arm made the aborted statement's
         // result a Python-visible `None`.
         //
-        // Every abort that can reach a running blackhole stops on a Python
-        // opcode boundary with the frame's own resume coordinate already
-        // stamped (`call_jit.rs` states the same invariant for the
-        // guard-failure resume path), so the frame is resumable as it stands
-        // and the handoff is the CRN one with the coordinate read back out of
-        // the frame instead of out of the green list.  Declining is not
-        // available after the drive — see this path's note on post-drive
-        // declines.
+        // An abort that reaches a running blackhole is resumable only if it
+        // stopped on a Python opcode boundary with the frame's own resume
+        // coordinate already stamped; then the handoff is the CRN one with the
+        // coordinate read back out of the frame instead of out of the green
+        // list.  Declining is not available after the drive — see this path's
+        // note on post-drive declines — so the condition is asserted instead.
+        //
+        // `abort_permanent` is the abort that stamps such a coordinate, and
+        // `abort` itself never reaches dispatch (`PyJitCode::has_abort_opcode`
+        // gates the jitcode out at resolution).  `reject_unresolved_call` is
+        // the third producer and it stops wherever the declined call sat,
+        // which is a jitcode position inside an instruction, not at its
+        // boundary: whatever this run applied between the last stamped
+        // boundary and the reject — an earlier residual in the same span, or
+        // residuals inside an inlined callee subtree — is applied a second
+        // time when the interpreter re-runs from the stamped pc.  That is the
+        // cost #326 removed the rollback snapshot to stop paying.
+        //
+        // `call_jit.rs` already refuses this state on the guard-failure resume
+        // path.  Asserting it here puts both consumers of `aborted` on one
+        // contract; before this, the consumer that absorbed the abort cited
+        // the consumer that panics on it as its authority.
         majit_metainterp::jitexc::JitException::BailToInterpreter => {
             // Reported on the way through, alongside the multi-frame arm's
             // report of the same handoff: a census that speaks only when the
@@ -3243,6 +3257,14 @@ fn try_adopt_single_frame_blackhole(
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[blackhole-resume] single-frame bail");
             }
+            assert!(
+                terminal.abort_permanent_bail,
+                "single-frame blackhole bailed without an abort_permanent \
+                 marker at position {} (last opcode {}); the stamped resume \
+                 coordinate names an earlier boundary, so adopting it replays \
+                 whatever this run already applied past it",
+                terminal.position, terminal.last_opcode_position,
+            );
             let resume_py_pc = frame_resume_py_pc(forwarded_root_addr);
             adopt_blackhole_crn(cf_addr, forwarded_root_addr, resume_py_pc);
             sfdbg!("adopted bail with resume_py_pc={resume_py_pc}");
@@ -3856,14 +3878,28 @@ fn try_adopt_multi_frame_blackhole(
         // routing this through the void arm made the aborted statement's
         // result a Python-visible `None`.
         //
-        // Every abort that can reach a running blackhole stops on a Python
-        // opcode boundary with the frame's own resume coordinate already
-        // stamped (`call_jit.rs` states the same invariant for the
-        // guard-failure resume path), so the frame is resumable as it stands
-        // and the handoff is the CRN one with the coordinate read back out of
-        // the frame instead of out of the green list.  Declining is not
-        // available after the drive — see this path's note on post-drive
-        // declines.
+        // An abort that reaches a running blackhole is resumable only if it
+        // stopped on a Python opcode boundary with the frame's own resume
+        // coordinate already stamped; then the handoff is the CRN one with the
+        // coordinate read back out of the frame instead of out of the green
+        // list.  Declining is not available after the drive — see this path's
+        // note on post-drive declines — so the condition is asserted instead.
+        //
+        // `abort_permanent` is the abort that stamps such a coordinate, and
+        // `abort` itself never reaches dispatch (`PyJitCode::has_abort_opcode`
+        // gates the jitcode out at resolution).  `reject_unresolved_call` is
+        // the third producer and it stops wherever the declined call sat,
+        // which is a jitcode position inside an instruction, not at its
+        // boundary: whatever this run applied between the last stamped
+        // boundary and the reject — an earlier residual in the same span, or
+        // residuals inside an inlined callee subtree — is applied a second
+        // time when the interpreter re-runs from the stamped pc.  That is the
+        // cost #326 removed the rollback snapshot to stop paying.
+        //
+        // `call_jit.rs` already refuses this state on the guard-failure resume
+        // path.  Asserting it here puts both consumers of `aborted` on one
+        // contract; before this, the consumer that absorbed the abort cited
+        // the consumer that panics on it as its authority.
         //
         // The coordinate is the ROOT's.  Unlike the raise arm below, a bail
         // does not walk the chain to the portal before taking its terminal
@@ -3880,6 +3916,17 @@ fn try_adopt_multi_frame_blackhole(
             // never mismatches still says whether it ever got here.
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[blackhole-resume] multi-frame bail");
+            }
+            // An absent image is the chain reporting no terminal at all, which
+            // the arm below already treats as "nothing to check against the
+            // root"; there is no flag to read and nothing this assert can say.
+            if let Some(image) = mf_terminal.as_ref() {
+                assert!(
+                    image.abort_permanent_bail,
+                    "multi-frame blackhole bailed without an abort_permanent \
+                     marker: terminal jitcode={} position={} (last opcode {})",
+                    image.jitcode_index, image.position, image.last_opcode_position,
+                );
             }
             if majit_metainterp::majit_log_enabled()
                 && let Some(image) = mf_terminal.as_ref()

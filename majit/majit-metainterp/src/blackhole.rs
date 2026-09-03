@@ -1176,6 +1176,12 @@ impl BlackholeInterpreter {
             // propagates instead of being absorbed: `Ok(0)` would have popped
             // to the caller and resumed it right after the call whose callee
             // bailed, with the result register never written.
+            //
+            // One variant covers both aborts because only one of them is
+            // resumable, and which one it is travels beside the exception in
+            // `abort_permanent_bail` — on the frame here, and on the register
+            // image the drivers hand out.  Every consumer checks that flag
+            // before it treats the bailed frame as a resume point.
             return Err(JitException::BailToInterpreter);
         }
 
@@ -2996,6 +3002,12 @@ pub struct BlackholeTerminalImage {
     pub registers_f: Vec<i64>,
     pub position: usize,
     pub last_opcode_position: usize,
+    /// [`BlackholeInterpreter::abort_permanent_bail`] of the frame this image
+    /// was taken from, so a consumer of `BailToInterpreter` can tell the abort
+    /// that stamped a resume coordinate from the one that did not.  Without it
+    /// the exception says only *that* the chain bailed, and every consumer has
+    /// to assume the boundary it cannot check.
+    pub abort_permanent_bail: bool,
 }
 
 /// Result that escaped a recursive portal runner.
@@ -3037,6 +3049,7 @@ impl BlackholeTerminalImage {
             registers_f: std::mem::take(&mut bh.registers_f),
             position: bh.position,
             last_opcode_position: bh.last_opcode_position,
+            abort_permanent_bail: bh.abort_permanent_bail,
         }
     }
 }
