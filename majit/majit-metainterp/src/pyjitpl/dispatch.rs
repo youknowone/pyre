@@ -3391,7 +3391,17 @@ where
             // `begin_portal_op` / `commit_portal_op` / `abort_portal_op` seams
             // already have no implementor anywhere in the workspace, so a
             // fourth would leave every runtime's log as empty as it is now.
-            // The entry has to come from a host that owns the `MetaInterp`.
+            // The entry has to come from a host that owns the `MetaInterp`,
+            // and pyre's walker is such a host: `note_inline_subwalk_start`
+            // (`pyre-jit-trace/src/state.rs`, called from `inline_call.rs`)
+            // reaches the driver through `try_driver_pair()` and calls
+            // `push_portal_trace_position`, while the too-long handler beside
+            // it reads the result back through `find_biggest_function` before
+            // retiring the log.  So the omission does NOT mean the log is
+            // empty wherever a recursive portal overflows — on the walker path
+            // it is filled and consumed.  What this arm leaves out is confined
+            // to runtimes that inline through HERE, which in this workspace is
+            // the `dispatch.rs` fixtures alone.
             portal_frame.inline_frame = true;
             // pyjitpl.py:2461-2492 pairing: this push recorded ENTER_PORTAL_FRAME,
             // so the frame's normal-return / exception-return pop records the
