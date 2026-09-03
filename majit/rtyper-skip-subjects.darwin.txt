@@ -2,8 +2,11 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=1834f2776e879969 platform=darwin
+# corpus=c2cdd0bfc746a70b platform=darwin
 direct-skip (never reaches unported_category)	pyre_interpreter::gateway::builtin_code_get
+direct-skip (never reaches unported_category)	pyre_interpreter::module::gc::gcref::__majit_wrap___new__
+direct-skip (never reaches unported_category)	pyre_interpreter::module::gc::stats::__majit_wrap___new__
+direct-skip (never reaches unported_category)	pyre_interpreter::module::select::interp_select::__majit_wrap___new__
 direct-skip (never reaches unported_category)	pyre_interpreter::pyframe::<Impl>::get_or_create_w_locals
 direct-skip (never reaches unported_category)	pyre_interpreter::pyframe::<Impl>::getorcreate_debug_data
 two-phase-never-a-subject	ll_listslice_startonly__ref
@@ -1157,10 +1160,8 @@ two-phase-never-a-subject	pyre_interpreter::module::_tokenize::__majit_wrap___ne
 two-phase-never-a-subject	pyre_interpreter::module::_tokenize::__majit_wrap___next__
 two-phase-never-a-subject	pyre_interpreter::module::_warnings::do_warn
 two-phase-never-a-subject	pyre_interpreter::module::_warnings::setup_context
-two-phase-never-a-subject	pyre_interpreter::module::gc::gcref::__majit_wrap___new__
 two-phase-never-a-subject	pyre_interpreter::module::gc::hook::<Impl>::set
 two-phase-never-a-subject	pyre_interpreter::module::gc::hook::__majit_wrap_set
-two-phase-never-a-subject	pyre_interpreter::module::gc::stats::__majit_wrap___new__
 two-phase-never-a-subject	pyre_interpreter::module::mmap::interp_mmap::<Impl>::as_ptr
 two-phase-never-a-subject	pyre_interpreter::module::mmap::interp_mmap::<Impl>::len
 two-phase-never-a-subject	pyre_interpreter::module::mmap::interp_mmap::mmap_buffer_view
@@ -1193,7 +1194,6 @@ two-phase-never-a-subject	pyre_interpreter::module::select::interp_kqueue::__maj
 two-phase-never-a-subject	pyre_interpreter::module::select::interp_select::<Impl>::modify
 two-phase-never-a-subject	pyre_interpreter::module::select::interp_select::<Impl>::register
 two-phase-never-a-subject	pyre_interpreter::module::select::interp_select::<Impl>::unregister
-two-phase-never-a-subject	pyre_interpreter::module::select::interp_select::__majit_wrap___new__
 two-phase-never-a-subject	pyre_interpreter::module::select::interp_select::__majit_wrap_modify
 two-phase-never-a-subject	pyre_interpreter::module::select::interp_select::__majit_wrap_poll
 two-phase-never-a-subject	pyre_interpreter::module::select::interp_select::__majit_wrap_register
@@ -1382,8 +1382,6 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::has_mapdict_layout
 two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::has_mapdict_storage
 two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::is_lsprof_mapdict_layout
-two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::is_mmap_mapdict_layout
-two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::is_queue_mapdict_layout
 two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::is_ssl_mapdict_layout
 two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::is_zlib_mapdict_layout
 two-phase-never-a-subject	pyre_interpreter::opcode_ops::binary_value
