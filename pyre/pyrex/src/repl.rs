@@ -492,8 +492,18 @@ pub(crate) fn register_interactive_code(
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(w_code);
     let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let linecache =
-        importing::importhook("linecache", w_globals, pyre_object::PY_NULL, 0, ctx_ptr)?;
+    // Through the importer that backs `builtins.__import__` -- see the note
+    // on `import_site`: the native stand-in searches the filesystem itself,
+    // so it consults no `sys.path_hooks` entry and parses the source instead
+    // of reading the module's bytecode cache.
+    let linecache = importing::dunder_import(
+        "linecache",
+        w_globals,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        0,
+        ctx_ptr,
+    )?;
     let _ = pyre_object::gc_roots::pin_root(linecache);
     let linecache_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let register = pyre_interpreter::baseobjspace::getattr_str(
