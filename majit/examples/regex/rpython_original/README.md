@@ -404,6 +404,36 @@ the machine at all, reproduces to the digit: 11.4 allocations and 1,360.4
 bytes per input character. That is why the census is the instrument this gap
 is graded with.
 
+#### Re-measured 2026-09-03: 2.3-2.5x, after the per-bridge retention fixes
+
+With bridges on, majit's heap grew with the input -- 1,138 MiB peak RSS at
+1,048,576 characters against 15 MiB with `MAJIT_NO_BRIDGE=1` -- and the
+`and`/`or` row followed it: 10.5x slower per character at 1M than at 4K.
+Three causes, each a majit-only retention with no upstream counterpart: a
+`CompiledTrace` kept per bridge in the frontend (`send_bridge_to_backend`
+keeps nothing), a page per compiled block where `asmmemmgr.py` packs blocks
+into 1 MiB RWX mappings, and cranelift's per-descr bridge cells plus a
+recovery layout rebuilt per deopt. With those gone the peak is 124 MiB at 1M
+and the row no longer moves with length (448K / 473K / 416K chars/s at 4K /
+64K / 1M in one sitting).
+
+Three same-round pairs at 1,048,576 characters, `n = 20`, 1-minute load 4.1
+to 4.7, the two binaries back to back and each row the median of five timed
+runs:
+
+| round | RPython `--opt=jit` | majit | ratio |
+|---|---:|---:|---:|
+| 1 | 1,075,379 | 459,039 | 2.34x |
+| 2 | 1,092,345 | 463,868 | 2.35x |
+| 3 | 1,127,526 | 460,087 | 2.45x |
+
+The 3.0-4.1x above becomes 2.3-2.5x, at the same length and against a binary
+translated the same afternoon. What is left is length-independent: with
+bridges off majit reads 750K in the same sitting, so the compiled bridges
+still cost 1.5x over running none, and the deopt that every character takes
+on both sides runs 124 blackhole operations here against RPython's 82 (the
+table below). The heap is no longer in the ratio; the deopt is.
+
 ### Where majit's share of that gap goes
 
 Three theories about that gap were measured and two of them were wrong, so the
