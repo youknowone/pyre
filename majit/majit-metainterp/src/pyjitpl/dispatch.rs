@@ -3374,6 +3374,24 @@ where
             let jd_box = ctx.const_int(jd_index as i64);
             let uid_box = ctx.const_int(green_pc as i64);
             ctx.record_op(OpCode::EnterPortalFrame, &[jd_box, uid_box]);
+            // `newframe` records ENTER_PORTAL_FRAME and appends a
+            // `portal_trace_positions` entry on adjacent lines; this arm does
+            // only the first half.  `push_portal_trace_position` lives on
+            // `MetaInterp`, and a `JitCodeMachine` reaches its host only
+            // through the `Runtime` trait, which carries no channel to it.
+            // Both LEAVE pops (`pop_exception_frame` and the finished-frame
+            // pop in `run_one_step`) omit the closing entry symmetrically, so
+            // the log stays BALANCED — `find_biggest_function` pairs entries
+            // off a stack, and dropping one half alone would mis-size every
+            // frame after it.  What the omission costs is that a
+            // `TraceTooLong` taken inside an inlined portal finds no candidate
+            // to disable and falls to `prepare_trace_segmenting`.
+            //
+            // A defaulted `Runtime` hook would not close this: the trait's
+            // `begin_portal_op` / `commit_portal_op` / `abort_portal_op` seams
+            // already have no implementor anywhere in the workspace, so a
+            // fourth would leave every runtime's log as empty as it is now.
+            // The entry has to come from a host that owns the `MetaInterp`.
             portal_frame.inline_frame = true;
             // pyjitpl.py:2461-2492 pairing: this push recorded ENTER_PORTAL_FRAME,
             // so the frame's normal-return / exception-return pop records the
