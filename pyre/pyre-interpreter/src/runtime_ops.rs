@@ -710,17 +710,11 @@ pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate
 /// fallible); a `PY_NULL` or non-`str` `spec` reads as the empty spec
 /// (`str(value)`), matching `format_simple`.
 pub fn format_value(value: PyObjectRef, spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    // The spec is read as WTF-8: its fill may be any code point, so
-    // `f"{x:\ud800>4}"` pads with the lone surrogate it was given instead of
-    // dropping a spec that has no `&str` view.
-    let spec_str = unsafe {
-        if !spec.is_null() && pyre_object::is_str(spec) {
-            pyre_object::w_str_get_wtf8(spec).to_wtf8_buf()
-        } else {
-            rustpython_wtf8::Wtf8Buf::new()
-        }
-    };
-    crate::type_methods::format_value_dispatch_w(value, &spec_str)
+    // The spec crosses to `__format__` as the object the opcode pushed, the
+    // way `FORMAT_VALUE` hands `w_spec` to `space.format` (pyopcode.py:1712).
+    // Its fill may be any code point, and nothing here reads it, so
+    // `f"{x:\ud800>4}"` keeps the lone surrogate it was given.
+    crate::type_methods::format_w(value, spec)
 }
 
 /// STORE_SLICE evaluation (`obj[start:stop] = value`): builds a `slice`

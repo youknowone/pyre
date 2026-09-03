@@ -3031,11 +3031,11 @@ pub fn format_with_spec_public(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf,
 /// and binds a `@staticmethod` / `@classmethod` / other descriptor override
 /// through the descriptor protocol.  The spec is passed through untouched so
 /// the type's own `__format__` runs its validation.
-pub(crate) fn call_format_dispatch(
+pub(crate) fn call_format_dispatch_w(
     val: PyObjectRef,
     meth: PyObjectRef,
     spec_obj: PyObjectRef,
-) -> Result<Wtf8Buf, crate::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         let w_type = crate::typedef::r#type(val).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
         let result = crate::baseobjspace::get_and_call_function(meth, val, w_type, &[spec_obj])?;
@@ -3045,8 +3045,21 @@ pub(crate) fn call_format_dispatch(
                 arg_type_name(result)
             )));
         }
-        Ok(pyre_object::w_str_get_wtf8(result).to_wtf8_buf())
+        // Returned as it came back: `format` (descroperation.py:399) checks
+        // `isinstance_w(w_res, w_unicode)` and hands `w_res` itself on, so a
+        // `str` subclass keeps its type and the result keeps its identity.
+        Ok(result)
     }
+}
+
+/// [`call_format_dispatch_w`] for the callers that want the formatted bytes.
+pub(crate) fn call_format_dispatch(
+    val: PyObjectRef,
+    meth: PyObjectRef,
+    spec_obj: PyObjectRef,
+) -> Result<Wtf8Buf, crate::PyError> {
+    let result = call_format_dispatch_w(val, meth, spec_obj)?;
+    Ok(unsafe { pyre_object::w_str_get_wtf8(result) }.to_wtf8_buf())
 }
 
 /// Whether the type-level `__format__` in `meth` is the shared builtin body
@@ -3162,6 +3175,66 @@ pub fn format_value_dispatch_w(
     )?))
 }
 
+/// `space.format(w_obj, w_format_spec)` (descroperation.py:399) — the
+/// object-to-object form of [`format_value_dispatch_w`], for the callers that
+/// already hold the spec as an object.
+///
+/// Upstream threads the spec from the caller to `__format__` and returns
+/// `w_res` unchanged, so nothing is rebuilt at either end.  Going through a
+/// `Wtf8Buf` instead costs a copy and a fresh `str` on the way in and again on
+/// the way out, and the substitution is observable three ways: `spec is` the
+/// argument that was passed, `format(x, s) is` what `__format__` returned, and
+/// a `str` subclass result keeps its type.  Only a builtin `__format__` and
+/// the fast paths below read the bytes.
+///
+/// A `PY_NULL` or non-`str` spec reads as the empty spec, matching
+/// `format_simple`.  A user `__format__` reached that way is handed a real
+/// empty `str`, since its second parameter is a string.
+pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let spec_is_str = !w_spec.is_null() && unsafe { is_str(w_spec) };
+    let spec_is_empty = !spec_is_str || unsafe { pyre_object::w_str_get_wtf8(w_spec) }.is_empty();
+
+    // The empty-spec fast paths of `format_value_dispatch`: an exact `str` or
+    // `int` cannot carry a `__format__` override, so resolve and call nothing.
+    if spec_is_empty {
+        if unsafe { pyre_object::is_exact_type(val, &pyre_object::STR_TYPE) } {
+            return Ok(val);
+        }
+        if unsafe {
+            pyre_object::is_exact_type(val, &pyre_object::INT_TYPE)
+                || pyre_object::is_exact_type(val, &pyre_object::LONG_TYPE)
+        } {
+            return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+                crate::py_str_wtf8(val)?
+            }));
+        }
+    }
+
+    if let Some(meth) = unsafe { crate::baseobjspace::lookup(val, "__format__") }
+        && (unsafe { is_instance(val) } || !unsafe { is_shared_builtin_format(val, meth) })
+    {
+        let spec_obj = if spec_is_str {
+            w_spec
+        } else {
+            pyre_object::w_str_new("")
+        };
+        return call_format_dispatch_w(val, meth, spec_obj);
+    }
+
+    if spec_is_empty {
+        return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
+            crate::py_str_wtf8(val)?
+        }));
+    }
+    // The shared spec parser wants the bytes.  Copied out rather than
+    // borrowed: `format_with_spec_public` can run Python, and a borrow into
+    // `w_spec`'s storage would not survive the heap moving under it.
+    let spec = unsafe { pyre_object::w_str_get_wtf8(w_spec) }.to_wtf8_buf();
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        format_with_spec_public(val, &spec)?,
+    ))
+}
+
 /// The type name of `obj` for a TypeError message — the `w_class` name
 /// for instances, else the storage type name.
 /// `_PyArg_BadArgument`'s rendering of a rejected argument: `None` names
@@ -3194,11 +3267,21 @@ pub(crate) fn read_format_spec(
     spec_obj: PyObjectRef,
     arg_desc: &str,
 ) -> Result<Wtf8Buf, crate::PyError> {
+    let spec_obj = check_format_spec(spec_obj, arg_desc)?;
+    // Read through the raw buffer: the fill character may be any code
+    // point, so `format(x, '\ud800<6')` pads with the lone surrogate it
+    // was given rather than demanding a `&str` view of the buffer.
+    Ok(unsafe { pyre_object::w_str_get_wtf8(spec_obj) }.to_wtf8_buf())
+}
+
+/// [`read_format_spec`]'s check alone, returning the spec object itself for
+/// the callers that pass it onward rather than reading its bytes.
+pub(crate) fn check_format_spec(
+    spec_obj: PyObjectRef,
+    arg_desc: &str,
+) -> Result<PyObjectRef, crate::PyError> {
     if !spec_obj.is_null() && unsafe { is_str(spec_obj) } {
-        // Read through the raw buffer: the fill character may be any code
-        // point, so `format(x, '\ud800<6')` pads with the lone surrogate it
-        // was given rather than demanding a `&str` view of the buffer.
-        return Ok(unsafe { pyre_object::w_str_get_wtf8(spec_obj) }.to_wtf8_buf());
+        return Ok(spec_obj);
     }
     Err(crate::PyError::type_error(format!(
         "{arg_desc} must be str, not {}",

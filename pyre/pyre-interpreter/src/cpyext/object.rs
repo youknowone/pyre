@@ -444,11 +444,11 @@ pub unsafe extern "C" fn PyObject_Format(
     };
     let spec = unsafe { pyobject::from_ref(spec) };
     let spec = if spec.is_null() {
-        Ok(rustpython_wtf8::Wtf8Buf::new())
+        Ok(pyre_object::PY_NULL)
     } else {
-        crate::type_methods::read_format_spec(spec, "PyObject_Format() argument 2")
+        crate::type_methods::check_format_spec(spec, "PyObject_Format() argument 2")
     };
-    result(spec.and_then(|spec| crate::type_methods::format_value_dispatch_w(object, &spec)))
+    result(spec.and_then(|spec| crate::type_methods::format_w(object, spec)))
 }
 
 /// `PyObject_Dir(object)` — `dir(object)`, and the caller's own scope for a
