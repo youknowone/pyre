@@ -2874,15 +2874,23 @@ impl NamespaceOpcodeHandler for PyFrame {
         nameindex: usize,
         value: Self::Value,
     ) -> Result<(), PyError> {
-        let w_locals = self.get_or_create_w_locals();
+        // Three allocations sit between the opcode's `pop_value` and the store:
+        // `get_or_create_w_locals` when the frame has no mapping yet, and
+        // `named_key_hash` / `w_code_getname_w_or_new` when the `co_names_w`
+        // slot is not realized.  The popped value's only name is this word.
+        let roots = pyre_object::gc_roots::push_roots();
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(value);
+        let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(self.get_or_create_w_locals());
         let hash = crate::baseobjspace::named_key_hash(name, self.pycode as PyObjectRef, nameindex);
-        if store_name_into_dict(w_locals, name, hash, value) {
+        if store_name_into_dict(roots.get(locals_slot), name, hash, roots.get(value_slot)) {
             return Ok(());
         }
         let key = unsafe {
             crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
         };
-        crate::baseobjspace::setitem(w_locals, key, value)?;
+        crate::baseobjspace::setitem(roots.get(locals_slot), key, roots.get(value_slot))?;
         Ok(())
     }
 
@@ -3113,12 +3121,22 @@ pub unsafe fn store_name_value_w(
     w_name: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), PyError> {
+    // `get_or_create_w_locals` allocates a mapping for a frame that has none,
+    // so it collects; reach it before the key's payload is borrowed, because a
+    // `&str` into a moved object outlives nothing.
+    let roots = pyre_object::gc_roots::push_roots();
+    let name_slot = roots.base();
+    let _ = roots.pin_root(w_name);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(value);
+    let w_locals = frame.get_or_create_w_locals();
+    let w_name = roots.get(name_slot);
+    let value = roots.get(value_slot);
     let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
     // The trace's own `box_str_constant` names the key, so it is the same
     // string object on every execution — `rstr.py ll_strhash`'s memo
     // makes it hashed once rather than once per store.
     let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
-    let w_locals = frame.get_or_create_w_locals();
     if store_name_into_dict(w_locals, name, hash, value) {
         return Ok(());
     }
@@ -3133,10 +3151,16 @@ pub unsafe fn store_name_value_w(
 /// # Safety
 /// `w_name` must point to a valid `str` object.
 pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<(), PyError> {
+    // `get_or_create_w_locals` allocates for a frame with no mapping and
+    // `delitem` runs a mapping's `__delitem__`; both collect, and the key is
+    // read after each.
+    let roots = pyre_object::gc_roots::push_roots();
+    let name_slot = roots.base();
+    let _ = roots.pin_root(w_name);
     let w_locals = frame.get_or_create_w_locals();
-    crate::baseobjspace::delitem(w_locals, w_name).map_err(|err| {
+    crate::baseobjspace::delitem(w_locals, roots.get(name_slot)).map_err(|err| {
         if matches!(err.kind, PyErrorKind::KeyError) {
-            let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
+            let name = unsafe { pyre_object::unicodeobject::w_str_get_value(roots.get(name_slot)) };
             PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
         } else {
             err
@@ -4115,10 +4139,21 @@ impl OpcodeStepExecutor for PyFrame {
         // `if not self.space.finditem_str(w_locals, '__annotations__')`:
         // probe by item lookup, not membership — a custom mapping's
         // `__contains__` can disagree with `__getitem__`/KeyError.
-        let w_locals = self.get_or_create_w_locals();
-        if crate::baseobjspace::finditem_str(w_locals, "__annotations__")?.is_none() {
-            let key = unsafe { pyre_object::w_str_new("__annotations__") };
-            crate::baseobjspace::setitem(w_locals, key, pyre_object::w_dict_new())?;
+        // The probe can run a mapping's `__getitem__`, and the key and the empty
+        // dict are two more allocations; the mapping is read after every one of
+        // them and the key after the dict.
+        let roots = pyre_object::gc_roots::push_roots();
+        let locals_slot = roots.base();
+        let _ = roots.pin_root(self.get_or_create_w_locals());
+        if crate::baseobjspace::finditem_str(roots.get(locals_slot), "__annotations__")?.is_none() {
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(unsafe { pyre_object::w_str_new("__annotations__") });
+            let w_annotations = pyre_object::w_dict_new();
+            crate::baseobjspace::setitem(
+                roots.get(locals_slot),
+                roots.get(key_slot),
+                w_annotations,
+            )?;
         }
         Ok(())
     }
@@ -5119,11 +5154,15 @@ impl OpcodeStepExecutor for PyFrame {
         // `space.delitem(w_locals, w_name)`; at module scope `w_locals` is the
         // globals dict, so a module DELETE_NAME routes through the canonical
         // W_DictObject too.  KeyError → NameError.
-        let w_locals = self.get_or_create_w_locals();
+        // `w_code_getname_w_or_new` realizes the `co_names_w` slot on its first
+        // read, so the mapping crosses an allocation before the delete.
+        let roots = pyre_object::gc_roots::push_roots();
+        let locals_slot = roots.base();
+        let _ = roots.pin_root(self.get_or_create_w_locals());
         let key = unsafe {
             crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
         };
-        crate::baseobjspace::delitem(w_locals, key).map_err(|err| {
+        crate::baseobjspace::delitem(roots.get(locals_slot), key).map_err(|err| {
             if matches!(err.kind, PyErrorKind::KeyError) {
                 PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
             } else {
