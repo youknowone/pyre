@@ -227,7 +227,16 @@ fn do_call(
     let called = 'body: {
         for i in 0..args_w.len() {
             let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
-            let argtype = match ctypeobj::ctype_arg(farg(roots.get(fargs_slot), i)) {
+            // `self.fargs[i]` is read out of a list declared
+            // `_immutable_fields_ = ['fargs[*]']` (`ctypefunc.py:30`), so with
+            // the function type promoted the element is a trace constant and
+            // the `W_CType` dispatch below folds against it.  Here `fargs` is
+            // a tuple object whose items block shares one array identity with
+            // every object-strategy list, so the element read cannot carry
+            // that purity; promoting the element hands the trace the same
+            // constant behind one guard.
+            let w_argtype = majit_metainterp::jit::promote(farg(roots.get(fargs_slot), i));
+            let argtype = match ctypeobj::ctype_arg(w_argtype) {
                 Ok(argtype) => argtype,
                 Err(e) => break 'body Err(e),
             };
