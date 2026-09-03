@@ -648,6 +648,13 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
     let session = std::cell::RefCell::new(WalkSession::default());
     session.borrow_mut().framestack.push(InlineFrame {
         w_code: w_code as usize,
+        // What `InlineFrameGuard::new` stamps on the first Python portal frame
+        // pushed onto an empty framestack: `MetaInterp.newframe` consumes
+        // `call_id` 0, no `DEBUG_MERGE_POINT` has been emitted yet, and a
+        // forward inline call carries the portal greenkey.
+        recursion_greenkey: true,
+        call_id: 0,
+        debug_merge_point_py_pc: None,
         parents: Vec::new(),
         entry_executed_effects: 0,
     });

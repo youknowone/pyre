@@ -253,8 +253,7 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
     // `rebuild_from_resumedata` rebuilds every encoded jitcode header and
     // `pyjitpl.py capture_resumedata` starts from the portal MIFrame; a lone
     // callee with no captured parent is therefore not a complete resume chain.
-    // Stamp
-    // the last *guard* op, not the last op: `emit_force_virtualizable` records
+    // Stamp the last *guard* op, not the last op: `emit_force_virtualizable` records
     // GETFIELD_GC / PTR_NE / COND_CALL after the promote.  A chain that skips an
     // intermediate inline frame still falls through to the sentinel below:
     // never a wrong resume.
@@ -349,7 +348,7 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
         .iter()
         .filter(|frame| !frame.parents.is_empty())
         .count();
-    n_parents > 0 && n_parents == session.framestack.len()
+    inline_snapshot_has_complete_parent_chain(n_parents, session.framestack.len())
 }
 
 pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
