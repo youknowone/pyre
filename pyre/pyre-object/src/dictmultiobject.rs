@@ -1743,8 +1743,8 @@ impl W_DictMultiObject for W_ModuleDictObject {
 ///     return w_obj
 /// ```
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
-/// the body performs an unported `lltype::malloc_typed_stable` NewWithVtable
-/// (`W_ModuleDictObject`) that survives `fuse_boxing_alloc` unfused, so
+/// the body performs a `lltype::malloc_typed_stable` allocation
+/// (`W_ModuleDictObject`) that `fuse_boxing_alloc` leaves unfused, so
 /// the JIT residualises the whole call to a stable runtime fnaddr
 /// instead of tracing the allocation.  The `-> PyObjectRef` result is a
 /// plain GCREF with no discriminant to erase.
@@ -5703,12 +5703,15 @@ pub fn w_dict_view_reverse_iterator_new(w_dict: PyObjectRef, kind: DictViewKind)
 }
 
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
-/// `w_dict_new` twin: the body builds a `W_BaseDictMultiIterObject` and boxes
-/// it through the non-numeric `malloc_typed` (`fuse_boxing_alloc` fuses only
-/// the numeric boxes), so tracing into it carries the unported `malloc->new`
-/// lowering into the caller. Residualise the whole constructor — the JIT
-/// models it by signature as a plain `PyObjectRef` GCREF and emits a residual
-/// call.
+/// `w_dict_new` twin: the body picks the iterator's type word at runtime
+/// (`dict_view_iterator_type_for_kind(kind, reverse)`), and a cluster whose
+/// type word is not a constant address does not lower — the word rides on the
+/// allocation or not at all, since a `setfield_gc` whose descr `is_typeptr()`
+/// is removed downstream. The primary allocation is hand-rolled through
+/// `try_gc_alloc_nursery_raw` besides, which is not one of the
+/// `lltype::malloc*` spellings `fuse_boxing_alloc` recognises. Residualise the
+/// whole constructor — the JIT models it by signature as a plain
+/// `PyObjectRef` GCREF and emits a residual call.
 #[majit_macros::dont_look_inside]
 fn w_dict_view_iterator_new_direction(
     w_dict: PyObjectRef,
