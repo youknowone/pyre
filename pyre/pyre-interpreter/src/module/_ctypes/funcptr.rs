@@ -1544,13 +1544,24 @@ fn build_callargs(
     // every value already collected lives in a root slot across it; the list
     // is read back out of those slots once the loop is done.
     let _roots = pyre_object::gc_roots::push_roots();
+    // `paramflags` is the tuple the loop indexes on every turn, and the same
+    // arbitrary Python runs between two of those reads.  A tuple relocates, so
+    // it is pinned ahead of `base` -- the values below want a contiguous run
+    // starting there -- and read back at each index.
+    let paramflags_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(paramflags);
     let base = pyre_object::gc_roots::shadow_stack_len();
     let mut index = 0;
     for (i, &at) in argtypes.iter().enumerate() {
         let malformed =
             || crate::PyError::value_error("paramflags must have the same length as argtypes");
-        let item =
-            unsafe { pyre_object::w_tuple_getitem(paramflags, i as i64) }.ok_or_else(malformed)?;
+        let item = unsafe {
+            pyre_object::w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(paramflags_slot),
+                i as i64,
+            )
+        }
+        .ok_or_else(malformed)?;
         if !unsafe { pyre_object::is_tuple(item) } {
             return Err(malformed());
         }

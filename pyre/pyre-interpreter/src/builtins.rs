@@ -9718,6 +9718,16 @@ pub(crate) fn make_exc_type_with_init(
                                     "add_note() argument must be str, not {got}"
                                 )));
                             }
+                            // The note is appended last of all -- after the
+                            // attribute lookup, the list allocation and the
+                            // store, and both of those attribute operations
+                            // can run Python.  A `str` a program builds mints
+                            // through the collecting constructor and so
+                            // relocates, so it is pinned across that whole
+                            // window and read back at the append.
+                            let _roots = pyre_object::gc_roots::push_roots();
+                            let note_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(w_note);
                             // `interp_exceptions.py:240-254` — lazy
                             // list allocation on first call; if the
                             // attribute is already set but NOT a list,
@@ -9733,7 +9743,6 @@ pub(crate) fn make_exc_type_with_init(
                             // therefore read back out of a root slot after
                             // the store rather than reusing the word the
                             // constructor answered.
-                            let _roots = pyre_object::gc_roots::push_roots();
                             let notes_slot = pyre_object::gc_roots::shadow_stack_len();
                             let notes = match existing {
                                 Some(v) if unsafe { crate::baseobjspace::isinstance_list_w(v) } => {
@@ -9756,7 +9765,12 @@ pub(crate) fn make_exc_type_with_init(
                                     pyre_object::gc_roots::shadow_stack_get(notes_slot)
                                 }
                             };
-                            unsafe { pyre_object::w_list_append(notes, w_note) };
+                            unsafe {
+                                pyre_object::w_list_append(
+                                    notes,
+                                    pyre_object::gc_roots::shadow_stack_get(note_slot),
+                                )
+                            };
                             Ok(pyre_object::w_none())
                         },
                         2,
