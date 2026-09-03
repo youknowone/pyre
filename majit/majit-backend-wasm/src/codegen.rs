@@ -6213,8 +6213,12 @@ fn build_function(
             | OpCode::RecordExactClass
             | OpCode::RecordExactValueI
             | OpCode::RecordExactValueR
+            | OpCode::RecordKnownResult
             | OpCode::AssertNotNone => {
-                // Metadata-only ops, no codegen needed.
+                // Metadata-only ops, no codegen needed. `RecordKnownResult`
+                // is an optimizer hint with no backend arm upstream at all —
+                // `optimize_RECORD_KNOWN_RESULT` consumes it and simplify
+                // drops it — so one that still reaches here owes no code.
             }
 
             // ── The rstr IR family: declined, not lowered ──
@@ -7606,12 +7610,16 @@ fn build_function(
 
             // Debug / metadata / no-op
             OpCode::DebugMergePoint
+            | OpCode::JitDebug
             | OpCode::IncrementDebugCounter
             | OpCode::EnterPortalFrame
             | OpCode::LeavePortalFrame
             | OpCode::VirtualRefFinish
             | OpCode::ForceSpill
-            | OpCode::Keepalive => {}
+            | OpCode::Keepalive => {
+                // `JitDebug` realizes its effect in the recorded trace, not in
+                // emitted code: `consider_jit_debug` is `pass`.
+            }
 
             _ => {
                 // An opcode with no codegen arm declines the whole trace and
@@ -7630,7 +7638,7 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     return Err(BackendError::Unsupported(format!(
-                        "wasm codegen: unhandled value-producing opcode {:?}",
+                        "wasm codegen: unhandled opcode {:?}",
                         op.opcode
                     )));
                 }

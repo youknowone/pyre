@@ -3403,7 +3403,6 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         CallLoopinvariantI,
         CallReleaseGilI,
         SaveExcClass,
-        RecordExactValueI,
         IntAddOvf,
         IntSubOvf,
         IntMulOvf

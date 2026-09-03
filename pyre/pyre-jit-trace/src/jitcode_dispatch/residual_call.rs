@@ -6369,8 +6369,15 @@ fn walker_foldable_runtime_helper<Sym: WalkSym>(
 /// TODO: walker selects the IR opcode by EffectInfo
 /// branch (`CallMayForce*` for forces, `CallLoopinvariant*` for
 /// loop-invariant, `CallPure*` for elidable, otherwise `Call*`) via
-/// [`select_residual_call_opcode`]. Two sub-cases route through
+/// [`select_residual_call_opcode`]. Three sub-cases route through
 /// dedicated helpers before the selector:
+///   - **libffi** ([`direct_libffi_call`], `pyjitpl.py`) — checked ahead
+///     of release-gil when `ei.oopspecindex` is
+///     `OopSpecIndex::LibffiCall`, parses the `CIF_DESCRIPTION_P` the
+///     call's second argument points at, records one `GETARRAYITEM_RAW`
+///     per argument slot and then the `CALL_RELEASE_GIL_*`.  An
+///     unsupported argument or result kind declines to the same
+///     `resbox is None` fallthrough the two helpers below take.
 ///   - **release-gil** ([`direct_call_release_gil`], `pyjitpl.py-
 ///     3681`) — early-return when `ei.is_call_release_gil()`,
 ///     reshapes the arglist to `[savebox, funcbox] + argboxes[1:]`
@@ -6439,12 +6446,6 @@ fn walker_foldable_runtime_helper<Sym: WalkSym>(
 ///     fixtures reaching a nonzero count, maximum 7 pairs. Vable forces are
 ///     detected separately, by the residual-call execution path's heap-token
 ///     bracket.
-///   - `direct_libffi_call` (`pyjitpl.py`) — pyre's live
-///     tracer also returns `None` from this helper unless a
-///     `CIF_DESCRIPTION_P` parser + dynamic `calldescr` builder lands
-///     (`majit-metainterp/src/pyjitpl.rs` defers to
-///     direct_call_release_gil/may_force, which is the same fall-through
-///     the walker already takes).
 ///   - `direct_assembler_call` (`pyjitpl.py`) + KEEPALIVE
 ///     (`pyjitpl.py`) — only fire when `assembler_call=True`
 ///     in `do_residual_call`. Walker's residual_call dispatchers are
