@@ -57,11 +57,14 @@ unsafe fn exact_builtin_len_shortcut_receiver(obj: pyre_object::PyObjectRef) -> 
     }
     let ob_type = unsafe { (*obj).ob_type };
     let exact_w_class = if std::ptr::eq(ob_type, &pyre_object::pyobject::LIST_TYPE) {
-        // Keep the admission set equal to the retired direct emitter until a
-        // fixture proves each additional PyPy list strategy.  In particular,
-        // Bytes/Ascii and range strategies use different nested storage
-        // shapes; exact `list` alone does not prove their lowering.
+        // The admitted set is the strategies whose length read the generated
+        // body already lowers.  `IntOrFloat` is `Integer`'s own read —
+        // `live_len` sends both to `ll_list_int_length` — so it is admitted on
+        // the same proof.  Bytes/Ascii and the range strategies read a
+        // differently shaped nested storage, and exact `list` alone does not
+        // prove that lowering.
         if !(unsafe { pyre_object::w_list_uses_int_storage(obj) }
+            || unsafe { pyre_object::w_list_uses_int_or_float_storage(obj) }
             || unsafe { pyre_object::w_list_uses_float_storage(obj) }
             || unsafe { pyre_object::w_list_uses_object_storage(obj) }
             || unsafe { pyre_object::w_list_uses_empty_storage(obj) })
@@ -1465,6 +1468,11 @@ fn summarize_descent_blockers_with_entry(
 /// own summary, or `None` when that operand names no JitCode.  Splitting it out
 /// keeps the analysis testable on a hand-built body, which is the only way to
 /// state the two-kind split without an installed jitcode table.
+///
+/// Test-only: production reaches the same dataflow through
+/// [`summarize_body_blockers_with`], because every one of the hooks defaulted
+/// here has a real production answer.
+#[cfg(test)]
 pub(crate) fn summarize_body_blockers(
     code: &[u8],
     num_regs_i: usize,
