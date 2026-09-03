@@ -12,7 +12,7 @@ use majit_ir::operand::Operand;
 use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Type, Value};
 
 use crate::optimizeopt::info::{
-    ArrayStructInfo, PtrInfo, VirtualArrayInfo, VirtualInfo, VirtualStructInfo,
+    ArrayStructInfo, PtrInfo, PtrInfoExt, VirtualArrayInfo, VirtualInfo, VirtualStructInfo,
     VirtualizableFieldState, w_class_value_is_covered_by_alloc,
 };
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -1031,11 +1031,21 @@ impl OptVirtualize {
             // info.py getfield: return _fields[fielddescr.get_index()].
             // For Virtual, ob_type (typeptr) is not in fields — fold from
             // known_class (info.py get_known_class).
-            if let PtrInfo::Virtual(ref vinfo) = info
-                && is_typeptr
+            // `is_typeptr` matches on the field's NAME, and `CPyObject.ob_type`
+            // carries that name at offset 24 while every consumer here reads the
+            // header word at offset 0.  Require the offset the predicate's own
+            // doc states.
+            if is_typeptr
+                && field_descr.offset() == 0
+                // `get_known_class` answers for a virtual, for an allocation the
+                // trace has already forced, and for a constant — the three ways
+                // `info.py get_known_class` knows a class.  Restricting this to
+                // `PtrInfo::Virtual` left a forced allocation's typeptr read in
+                // the loop: `force_box_impl` carries `known_class` across the
+                // force, so the answer was in hand and nothing asked for it.
                 // A stored class of 0 means the allocation's vtable address was unavailable at
                 // build time, so the value reads as no known class while the flag stays valid.
-                && let Some(class_val) = vinfo.known_class.filter(|&c| c != 0)
+                && let Some(class_val) = info.get_known_class(ctx.cpu.as_ref())
             {
                 let b = ctx.materialize_operand_at(op.pos.get());
                 // PyPy's `handle_getfield_typeptr` removes this load before
