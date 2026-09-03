@@ -290,7 +290,7 @@ enters at pc 0 with the portal's declared arguments.  The numeric
 probe passes before firing; it defaults to zero.  Neither has an effect unless
 the probe in §6c is enabled.
 
-### §6c — Default-OFF diagnostics, censuses and probes (76): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (77): keep, cost nothing
 
 Deleting one of these environment reads does not change behavior when the
 variable is unset. They remain listed so diagnostics are not mistaken for dead
@@ -303,7 +303,7 @@ configuration.
 `PYRE_DEOPT_PROBE`, `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
 `MAJIT_DETERMINISM_TRACE`, `MAJIT_DTRACE_CONST_BT`,
 `MAJIT_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_DEPTH_CENSUS`,
-`PYRE_FBW_DESCENT_SCAN_OFF`, `PYRE_FBW_INLINE_DIAG`,
+`PYRE_FBW_DESCENT_DENY`, `PYRE_FBW_DESCENT_SCAN_STATIC`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
 `PYRE_FBW_MF_DIAG`, `PYRE_FBW_REPLAY_DIRTY_BODY`, `PYRE_FBW_SPEC_CENSUS`,
 `PYRE_FBW_STRICT_DIAG`,
@@ -337,13 +337,22 @@ compile that `compile_ms` and `compile_bytes` measure slower than it is in a
 production run; `nofuel` is how those two fields are read. `wasm_ops` is the
 fuel subtraction and reports -1 under it.
 
-`PYRE_FBW_DESCENT_SCAN_OFF` turns off the descent's un-lowered-helper scan
-(`descent_unlowered_helper_scan_enabled`), so the walker descends into a
-builtin body that holds a symbolic-fnaddr residual call and aborts at the call
-instead of declining before the descent starts. Same shape and same reason as
-`PYRE_WALKABORT_OFF`: the scan decides whether a descent happens at all and its
-cost is invisible in output, so weighing the conservatism against its price
-needs one binary and one variable. It retires when the scan does.
+`PYRE_FBW_DESCENT_DENY` makes a descent that aborted remember the body it
+aborted in, so the next call leaves a residual instead of descending again —
+`warmstate.py` `disable_noninlinable_function` for the builtin descent. It is
+off because the mixture it creates is not sound: with it,
+`synth/pickle_ctor_args` compiles a wrong loop and its `Unpickler.load` raises
+`EOFError: Ran out of input`, while both neighbouring answers (refuse every
+descent, attempt every descent) are correct. It retires when that is fixed, at
+which point it becomes the default and the scan retires with it.
+
+`PYRE_FBW_DESCENT_SCAN_STATIC` restores the descent's un-lowered-helper scan
+as a decline (`descent_static_decline_enabled`), so a builtin body holding a
+symbolic-fnaddr residual call is refused before the descent starts rather than
+attempted once and remembered by `descent_denied`. Same shape and same reason
+as `PYRE_WALKABORT_OFF`: which descents happen is invisible in output, so
+weighing a static answer against a learned one needs one binary and one
+variable. It retires when the scan does.
 
 `PYRE_GC_SIZE_AUDIT` makes `finish_alloc_in_oldgen` panic, with a captured
 backtrace, when the block it just carved is smaller than the declared size of
