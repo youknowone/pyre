@@ -661,15 +661,24 @@ fn ensure_encodings_imported(state: &mut CodecState) -> Result<(), crate::PyErro
     }
     // PyPy `_lookup_codec_loop`: import encodings once so it can register
     // `encodings.search_function` through this module's register().
-    // Through the importer that backs `builtins.__import__`: `dunder_import`
-    // hands the name to the installed `_bootstrap.__import__`, and stands in
-    // with the native `importhook` only while there is none.  `importhook`
-    // searches the filesystem itself, so a name reached through it consults
-    // no `sys.path_hooks` entry and is parsed from source rather than read
-    // from the module's bytecode cache.
+    // `space.getattr(space.builtin, '__import__')` and call it: the binding is
+    // read here, so replacing `builtins.__import__` redirects this import.
+    // Behind it stands `dunder_import`, which hands the name to the installed
+    // `_bootstrap.__import__`.  The native `importhook` -- which is what this
+    // called before, and what still stands in while there is no bootstrap --
+    // searches the filesystem itself, so a name reached through it consults no
+    // `sys.path_hooks` entry and is parsed from source rather than read from
+    // the module's bytecode cache.
     let ec = crate::call::getexecutioncontext();
-    crate::importing::dunder_import("encodings", w_none(), w_none(), w_none(), 0, ec)?;
-    let _ = crate::importing::dunder_import("encodings.utf_8", w_none(), w_none(), w_none(), 0, ec);
+    crate::importing::call_dunder_import("encodings", w_none(), w_none(), w_none(), 0, ec)?;
+    let _ = crate::importing::call_dunder_import(
+        "encodings.utf_8",
+        w_none(),
+        w_none(),
+        w_none(),
+        0,
+        ec,
+    );
     state.codec_need_encodings = false;
     if unsafe { pyre_object::w_list_len(state.codec_search_path) } == 0 {
         return Err(crate::PyError::new(
