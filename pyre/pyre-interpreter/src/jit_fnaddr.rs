@@ -984,6 +984,35 @@ pub fn is_shadow_stack_slot_overwrite(addr: usize) -> bool {
     addrs.contains(&(addr as i64))
 }
 
+/// True when `addr` names a helper whose only effect on the shadow stack is to
+/// rewind it to an earlier length.
+///
+/// This is the subset of [`is_shadow_stack_slot_overwrite`] that cannot change
+/// what a surviving slot holds: `shadow_stack_cell_truncate` and the bracket
+/// close spelled on top of it drop slots at and above a save point and leave
+/// every slot below untouched.  A reader that remembers pins and re-checks both
+/// that its slot is still within the live length and that the slot still holds
+/// the pointer it recorded already answers correctly across a rewind, so it has
+/// nothing to forget here.  An in-place writer -- `shadow_stack_set`,
+/// `publish_roots`, `normalize_roots` -- is not in this set.
+pub fn is_shadow_stack_truncate(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static TRUNCATE_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = TRUNCATE_ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.ends_with("::gc_roots::shadow_stack_cell_truncate")
+                    || *path == "pyre_object::shadow_stack_cell_truncate"
+                    || path.ends_with("::gc_roots::root_scope_close")
+                    || *path == "pyre_object::root_scope_close"
+            })
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
 /// Build-time equivalent of `#[jit_module]::__majit_helper_trace_fnaddrs()`.
 ///
 /// The registry includes both the module-qualified path produced by the

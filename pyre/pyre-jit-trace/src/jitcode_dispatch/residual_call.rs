@@ -6389,7 +6389,18 @@ fn walker_note_root_bracket_residual<Sym: WalkSym>(
         return;
     };
     let addr = addr as usize;
-    if pyre_interpreter::is_shadow_stack_slot_overwrite(addr) {
+    // A rewind is not an overwrite.  `root_scope_close` drops the slots at and
+    // above one save point and leaves every slot below it holding exactly what
+    // it held, so an inner bracket's close says nothing about an outer
+    // bracket's pins -- and `try_walker_fold_root_scope_get` re-checks both the
+    // live length and the recorded pointer, which is what covers a slot the
+    // rewind did drop.  Retiring the whole table here instead cost the outer
+    // read-back its fold: `do_call`'s `roots.get(fargs_slot)` before the
+    // argument conversion's bracket folded, and the same expression after that
+    // bracket's close did not.
+    if pyre_interpreter::is_shadow_stack_slot_overwrite(addr)
+        && !pyre_interpreter::is_shadow_stack_truncate(addr)
+    {
         ctx.session.borrow_mut().root_pins.clear();
         return;
     }
