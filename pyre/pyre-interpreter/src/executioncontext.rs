@@ -551,6 +551,33 @@ pub struct ExecutionContext {
     /// Recursive `__repr__` (e.g. `OrderedDict`) consults it to emit `...`
     /// instead of recursing.  Execution-context-owned like `contextvar_context`.
     pub py_repr: PyObjectRef,
+    /// Number of user Python frames currently executing bytecode on this
+    /// context.  Bumped once at every `eval_loop` / `eval_loop_jit` entry and
+    /// dropped when that activation returns, so the module-level frame, an
+    /// `exec`ed body and a resumed generator each cost one unit exactly like a
+    /// called function does.  `stack_check()` compares it against
+    /// `sys.getrecursionlimit()`.
+    ///
+    /// Context-owned rather than a Rust TLS side table because a compiled
+    /// trace already holds this context as a value -- it reads and writes
+    /// `topframeref` at every inlined call -- so the activation seam charges
+    /// the unit with the same GETFIELD_GC/SETFIELD_GC pair it already emits
+    /// there instead of residualizing a call to reach a thread-local.
+    pub py_recursion_depth: usize,
+    /// The innermost frame whose activation has already spent its
+    /// [`py_recursion_depth`](Self::py_recursion_depth) unit, as a bare
+    /// address.  A frame is executed through nested entry points -- the JIT
+    /// wrapper may run it as compiled code, hand it to the JIT eval loop, or
+    /// decline and re-enter the plain evaluator for the very same frame -- and
+    /// only the outermost of those pays.  Any frame reached from here is a
+    /// different, simultaneously-live frame, so its address cannot collide
+    /// with the one recorded.
+    ///
+    /// Never dereferenced and never a GC root: `eval.rs`'s `visit_ec_slots`
+    /// forwards the context's reference slots one named field at a time, and
+    /// this one is an identity token that may name a frame already freed, so
+    /// forwarding it would be wrong rather than merely unnecessary.
+    pub accounted_activation: usize,
 }
 
 pub type PyExecutionContext = ExecutionContext;
@@ -581,6 +608,19 @@ pub const EC_TOPFRAMEREF_OFFSET: usize = std::mem::offset_of!(ExecutionContext, 
 /// that with a guard, so installing a global trace function leaves compiled
 /// code instead of running on past the events it now owes.
 pub const EC_W_TRACEFUNC_OFFSET: usize = std::mem::offset_of!(ExecutionContext, w_tracefunc);
+
+/// Byte offset of `py_recursion_depth` within `ExecutionContext`, for the
+/// JIT's GETFIELD_GC_I/SETFIELD_GC lowering of the activation seam that
+/// `pyframe.py` (`execute_frame.insert_stack_check_here`) puts at the same
+/// place in the plain evaluator.
+pub const EC_PY_RECURSION_DEPTH_OFFSET: usize =
+    std::mem::offset_of!(ExecutionContext, py_recursion_depth);
+
+/// Byte offset of `accounted_activation` within `ExecutionContext`, read and
+/// restored by the same seam so a frame that reaches a portal door after the
+/// charge does not pay a second unit.
+pub const EC_ACCOUNTED_ACTIVATION_OFFSET: usize =
+    std::mem::offset_of!(ExecutionContext, accounted_activation);
 
 /// Size of `ExecutionContext`, for the JIT's StructPtrInfo SizeDescr
 /// describing the (non-GC) EC struct.  The EC is never JIT-allocated;
@@ -624,6 +664,8 @@ impl ExecutionContext {
             w_asyncgen_finalizer_fn: pyre_object::PY_NULL,
             contextvar_context: pyre_object::PY_NULL,
             py_repr: pyre_object::PY_NULL,
+            py_recursion_depth: 0,
+            accounted_activation: 0,
         }
     }
 
