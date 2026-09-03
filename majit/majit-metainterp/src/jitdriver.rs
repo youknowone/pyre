@@ -180,16 +180,6 @@ fn seed_deopt_vinfo_ptr(
     }
 }
 
-/// Run one tracing MIFrame forward in the already-ported blackhole.
-///
-/// This is the single-frame counterpart of the structured back-edge template
-/// at the call site below.  `copy_data_from_miframe` deliberately copies only
-/// the typed register values and pc, so all interpreter-global / frame-global
-/// state is supplied explicitly here.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
-)]
 /// `MAJIT_BH_ENTRY_EXC`: report a `BH_LAST_EXC_VALUE` that survived into a
 /// blackhole drive the caller did not describe as raising.
 ///
@@ -220,6 +210,16 @@ fn bh_entry_stale_exc_report(last_exc_value: i64, raising_exception: bool, arm: 
     }
 }
 
+/// Run one tracing MIFrame forward in the already-ported blackhole.
+///
+/// This is the single-frame counterpart of the structured back-edge template
+/// at the call site below.  `copy_data_from_miframe` deliberately copies only
+/// the typed register values and pc, so all interpreter-global / frame-global
+/// state is supplied explicitly here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
 pub fn drive_single_frame_blackhole(
     miframe: &mut crate::pyjitpl::MIFrame,
     cpu: &dyn majit_backend::Backend,
