@@ -4580,7 +4580,48 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             .into_iter()
             .filter(|(_, addr)| !hand_written.contains(addr)),
     );
+    rows.extend(pyre_class_pytype_impl_aliases());
     rows
+}
+
+/// The same addresses again, keyed by the `PyreClassPyTypeOf::PYTYPE`
+/// associated const rather than by the `PyType` static it points at.
+///
+/// `#[pyre_class]` emits both spellings of one address: the static
+/// [`pyre_class_pytype_addrs`] keys on, and `impl PyreClassPyTypeOf for T {
+/// const PYTYPE = &<static> }`.  A flowgraph that reads the trait const
+/// names the second, which Charon paths as `<module>::<Impl>::PYTYPE` —
+/// not a `::`-boundary suffix of `<module>::<STATIC>`, so
+/// `front::mir::static_key_matches` cannot bridge the two and the read
+/// falls off the `Global` lane chain.
+///
+/// Only a module holding exactly ONE `#[pyre_class]` gets an alias.
+/// Charon spells every impl block in a module `<Impl>`, with no ordinal:
+/// `pyre_object::functional::<Impl>::DESCRIPTOR` is one path standing for
+/// ten distinct types' consts.  An alias there would bind ten types to
+/// whichever address won, which is a wrong answer rather than a missed
+/// lowering — so a shared module contributes nothing and its reads keep
+/// being declined, visibly.
+fn pyre_class_pytype_impl_aliases() -> Vec<(&'static str, i64)> {
+    let mut by_module: std::collections::HashMap<&'static str, Vec<i64>> =
+        std::collections::HashMap::new();
+    for (path, addr) in pyre_class_pytype_addrs() {
+        let Some((module, _static_name)) = path.rsplit_once("::") else {
+            continue;
+        };
+        by_module.entry(module).or_default().push(addr);
+    }
+    by_module
+        .into_iter()
+        .filter(|(_, addrs)| addrs.len() == 1)
+        .map(|(module, addrs)| {
+            // Leaked because the row type is `&'static str` and this key is
+            // derived, not written.  One allocation per single-class module,
+            // in a table built once per process.
+            let key: &'static str = Box::leak(format!("{module}::<Impl>::PYTYPE").into_boxed_str());
+            (key, addrs[0])
+        })
+        .collect()
 }
 
 /// The `PyType` static of every `#[pyre_class]` type, keyed by the
@@ -4834,8 +4875,8 @@ mod tests {
     use super::{
         is_abi_unsound_argument_residual, is_list_write_barrier, is_pyframe_operand_stack_accessor,
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
-        jit_trace_fnaddrs, shadow_stack_get_word, shadow_stack_push_word,
-        shadow_stack_try_pop_to_word,
+        jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_impl_aliases,
+        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
     };
     use std::collections::HashMap;
 
@@ -5121,6 +5162,66 @@ mod tests {
             bindings["function::METHOD_WRAPPER_TYPE"],
             &crate::function::METHOD_WRAPPER_TYPE as *const _ as i64
         );
+    }
+
+    /// The `<Impl>::PYTYPE` alias binds the same address as the static it
+    /// aliases, and only where that spelling names one type.
+    ///
+    /// The second half is the one that matters: Charon gives every impl
+    /// block in a module the same `<Impl>` segment, so an alias minted for
+    /// a module holding several `#[pyre_class]` types would bind all of
+    /// them to one address.  A missing alias costs a lowering; a wrong one
+    /// costs an answer.
+    #[test]
+    fn the_pytype_impl_alias_is_minted_only_for_a_module_holding_one_class() {
+        let aliases: HashMap<&'static str, i64> =
+            pyre_class_pytype_impl_aliases().into_iter().collect();
+        let by_path: HashMap<&'static str, i64> = pyre_class_pytype_addrs().into_iter().collect();
+
+        assert!(
+            !aliases.is_empty(),
+            "no alias was minted at all; every module would have to hold two \
+             `#[pyre_class]` types for that to be right"
+        );
+
+        let mut per_module: HashMap<&str, usize> = HashMap::new();
+        for path in by_path.keys() {
+            if let Some((module, _)) = path.rsplit_once("::") {
+                *per_module.entry(module).or_default() += 1;
+            }
+        }
+        for (key, addr) in &aliases {
+            let module = key
+                .strip_suffix("::<Impl>::PYTYPE")
+                .expect("an alias key is a module plus the `<Impl>::PYTYPE` tail");
+            assert_eq!(
+                per_module.get(module).copied(),
+                Some(1),
+                "{key} aliases a module holding {:?} classes, so the path is \
+                 ambiguous and the alias binds the wrong one",
+                per_module.get(module)
+            );
+            let (_, want) = by_path
+                .iter()
+                .find(|(path, _)| path.rsplit_once("::").is_some_and(|(m, _)| m == module))
+                .expect("the module that produced the alias has a descriptor");
+            assert_eq!(addr, want, "{key} does not bind its own class's PyType");
+        }
+
+        // A module known to hold several classes must contribute none: this
+        // is the property a future `#[pyre_class]` landing beside an
+        // existing one would silently break.
+        let shared: Vec<&str> = per_module
+            .iter()
+            .filter(|(_, n)| **n > 1)
+            .map(|(m, _)| *m)
+            .collect();
+        for module in shared {
+            assert!(
+                !aliases.contains_key(&*format!("{module}::<Impl>::PYTYPE")),
+                "{module} holds several classes but an alias was minted for it"
+            );
+        }
     }
 
     #[test]
