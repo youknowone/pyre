@@ -897,6 +897,38 @@ fn user_binop_forward_dunder_covers_fraction_arithmetic_without_inplace_shortcut
     );
 }
 
+#[test]
+fn rewind_dunder_admits_only_terminal_nested_raise_shape() {
+    use crate::pyjitcode::InlineBodyFacts;
+
+    let facts = |contains_raise, straight_line, nested_call, has_exception_table| InlineBodyFacts {
+        contains_raise,
+        has_abort_permanent: false,
+        exc_override_straight_line: straight_line,
+        exc_override_sample_safe: false,
+        index_sample_safe: false,
+        exc_override_has_nested_call: nested_call,
+        owns_loop_header: false,
+        has_exception_table,
+    };
+
+    assert!(dunder_body_facts_admissible_on_rewind(facts(
+        false, true, false, false,
+    )));
+    assert!(dunder_body_facts_admissible_on_rewind(facts(
+        true, true, true, false,
+    )));
+    assert!(!dunder_body_facts_admissible_on_rewind(facts(
+        false, true, true, false,
+    )));
+    assert!(!dunder_body_facts_admissible_on_rewind(facts(
+        true, false, true, false,
+    )));
+    assert!(!dunder_body_facts_admissible_on_rewind(facts(
+        true, true, true, true,
+    )));
+}
+
 /// Build a `done_with_this_frame_descr_ref` for tests. Mirrors the
 /// production fallback at `pyjitpl.rs` (`make_fail_descr_typed`)
 /// when the staticdata singleton was never attached.

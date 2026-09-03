@@ -23,12 +23,12 @@
 #                     its `varnames` slot and its `varnames` name.
 #   `freevar`       - read through `COPY_FREE_VARS` from the enclosing scope.
 #
-# `param_cell` checks the answer, not the compiled path: a frame whose
-# PARAMETER is a cell does not enter the JIT at all today, `locals()` or no
-# `locals()` -- the same loop with the nested function deleted reports
-# `mc_entered=1` and this one reports `0`. That is a separate limit ahead of
-# this fold, so the probe holds the band's correctness until it lifts, and only
-# the other two say anything about compilation.
+# All three bands compile their loop. `param_cell`'s frame is the one that used
+# to be left out: a positional argument that is also a cellvar is the shape
+# `pycode.py _compute_flatcall` rejects, so the call falls back to
+# `Function.call_args`, and pyre gated that arm off the portal until the port
+# activated it. `PyCode.funcrun` reaches `PyFrame.run` on both arms, so the
+# band now says as much about compilation as the other two.
 
 N = 100000
 

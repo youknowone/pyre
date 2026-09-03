@@ -8,15 +8,12 @@
 N = 100000
 
 
-# Custom operands route the binary `+` and rich-compare `<` through the
-# residual value helpers (jit_binary_value_from_tag /
-# jit_compare_value_from_tag), each followed by a GuardNoException.  Both
-# operators raise every iteration, so the JIT deopts into the blackhole on
-# the top frame after the residual call.  The raising op sits in a
-# try-block, so the snapshot resumes at the call's own catch_exception; the
-# liveness read for the active boxes must use that SAME post-call `-live-`
-# as the snapshot pc, or the blackhole decoder consumes a different box
-# count than the encoder wrote.
+# Custom operands enter through the binary `+` and rich-compare `<` value
+# helpers.  The walker resolves each user dunder and gives it its own inlined
+# frame.  Both dunders finish that frame by raising every iteration, and the
+# caller catches the exception.  The three jit-stats baselines therefore gate
+# one caller loop with no separately compiled dunder portals or bridges, as on
+# the PyPy oracle, while the printed result checks both unwind paths.
 class Boom:
     def __add__(self, other):
         raise ValueError("add")

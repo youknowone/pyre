@@ -1,9 +1,16 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=<module>,root:_div
+# pyre-check: selfcheck-compiles=<module>,root:forward
 # The module loop inlines `forward`, whose Fraction division is a forcing call.
 # The following LOAD_DEREF must recover `adjust` from the inlined callee's own
 # frame shadow after that call invalidates heap-cache facts.  Losing the callee
 # frame makes the walk abort or resume with the wrong closure cell.
+#
+# The second entry was `root:_div` until `Fraction._div` stopped taking a
+# function-entry trace of its own and started being inlined into its caller
+# instead.  That is a different trace for the same code, not a lost one: the
+# division still forces -- the run emits more `ForceToken` than it did, not
+# fewer -- and `forward`, the callee this guard is actually about, compiles on
+# both sides of the change.
 from fractions import Fraction
 
 try:

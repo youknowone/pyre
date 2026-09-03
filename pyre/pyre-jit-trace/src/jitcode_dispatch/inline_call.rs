@@ -25,6 +25,18 @@ struct BoundMethodInline {
     receiver: pyre_object::PyObjectRef,
 }
 
+/// The receiver and attribute name an inlined `__getattribute__` /
+/// `__getattr__` call was resolved for, carried into the callee walk so an
+/// `AttributeError` the hook raises can be given the `name` / `obj` pair
+/// `enrich_attribute_error` (`error.rs`) fills in.
+#[derive(Clone, Copy)]
+struct AttributeErrorInlineContext {
+    obj: OpRef,
+    obj_concrete: pyre_object::PyObjectRef,
+    name: OpRef,
+    name_concrete: pyre_object::PyObjectRef,
+}
+
 /// Where an element of a `defs_w` tuple lives, and therefore what the trace
 /// emits to read one.  `w_tuple_new` routes EVERY arity-2 tuple through
 /// `makespecialisedtuple2` (`specialisedtupleobject.py`), so a callee
@@ -2886,18 +2898,29 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
 /// indistinguishable from `return self.v + o.v` over ints.
 ///
 /// What this filters is a shape that is admissible and still does not survive
-/// being recorded.  A body making a nested Python call inlines into a trace
-/// whose Phase 2 unroll then dies on `phase2 snapshot remap cache miss`
-/// (`unroll.rs`), measured on `synth/inline_freevar_after_mayforce` with a
-/// `Fraction.__gt__`-shaped body -- `return a._richcmp(b, operator.gt)`.  The
-/// same shape was measured once before, dropping five iterations through the
-/// unstaged-reason abort fallback.  Twice is enough to keep the filter and
-/// record what it costs: this entry does not admit a delegating dunder.
-fn dunder_body_admissible_on_rewind(w_code: *const ()) -> bool {
-    let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
-        return false;
-    };
+/// being recorded.  A body making a nested Python call and then returning
+/// inlines into a peeled loop whose Phase 2 can still die on `phase2 snapshot
+/// remap cache miss` (`unroll.rs`), measured on
+/// `synth/inline_freevar_after_mayforce` with a `Fraction.__gt__`-shaped body --
+/// `return a._richcmp(b, operator.gt)`.  Keep that returning shape declined.
+///
+/// A straight-line, handler-free body that raises is different: its nested
+/// call constructs the exception and `raise/r` finishes the inlined MIFrame;
+/// no callee continuation enters the peeled loop.  This is PyPy's ordinary
+/// `perform_call` -> `finishframe_exception` path.  Admit it so each dunder has
+/// its own live frame and exception state instead of compiling a second root
+/// portal.  `BinopRewindInlineGuard` still refuses a nested residual before it
+/// commits, and `has_exception_table == false` excludes a caught raise whose
+/// body could continue to a return.
+pub(crate) fn dunder_body_facts_admissible_on_rewind(
+    facts: crate::pyjitcode::InlineBodyFacts,
+) -> bool {
     !facts.exc_override_has_nested_call
+        || (facts.contains_raise && facts.exc_override_straight_line && !facts.has_exception_table)
+}
+
+fn dunder_body_admissible_on_rewind(w_code: *const ()) -> bool {
+    sub_jitcode_body_facts_for_code(w_code).is_some_and(dunder_body_facts_admissible_on_rewind)
 }
 
 fn callee_body_commits_nothing(w_code: *const ()) -> bool {
@@ -4418,6 +4441,108 @@ fn inline_caller_py_pc_from_snapshot<Sym: WalkSym>(
     )
 }
 
+/// Fill in the `name` / `obj` pair on an `AttributeError` raised out of an
+/// inlined attribute hook, reproducing `enrich_attribute_error` (`error.rs`).
+///
+/// `StdObjSpace.getattr` (`objspace/std/objspace.py:711-716`) performs it on the
+/// `__getattr__` fallback call, and pyre's `getattr_str` (`baseobjspace.rs`)
+/// wraps the whole dispatch in it, so the `load_attr_fn` residual the hook
+/// routes replace reached it either way.  Without this the compiled iterations
+/// answer `e.name is None` where both the interpreter and a deopt answer the
+/// attribute name.
+///
+/// The pair is written with `SetfieldGc` rather than by calling the enricher:
+/// a call takes the exception as an argument and so forces the allocation the
+/// optimizer had removed, the cost `record_inline_exception_context` records as
+/// doubling the loops that catch without touching the object.  Both slots sit at
+/// one offset for every kind (`W_BaseException` is a single flattened struct), so
+/// the recording kind names the right bytes; only the descr identity the
+/// optimizer aliases on is narrower, as in `record_prepend_application_traceback`.
+fn record_inline_attribute_error_context<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    exc: OpRef,
+    exc_concrete: ConcreteValue,
+    attr: &AttributeErrorInlineContext,
+) -> Result<(), DispatchError> {
+    use pyre_interpreter::baseobjspace::ExceptionAttrSlot as Slot;
+    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+        return Ok(());
+    };
+    if exc_ptr.is_null() || !unsafe { pyre_object::is_exception(exc_ptr) } {
+        return Ok(());
+    }
+    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
+    if kind != pyre_object::interp_exceptions::ExcKind::AttributeError {
+        return Ok(());
+    }
+    let current_name = unsafe { pyre_object::interp_exceptions::w_exception_get_name(exc_ptr) };
+    let current_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(exc_ptr) };
+    let fills = current_name.is_null() && current_obj.is_null();
+    // A `Const` exception box freezes the recording iteration's address
+    // (`walker_record_guard_exception` pins every raise after the first one in a
+    // walk), so a field op through it would reach a stale object on every later
+    // iteration -- the shape `record_prepend_application_traceback` declines for
+    // the same reason.  The concrete write below still runs: this walk is the
+    // authoritative execution path.
+    if !exc.is_none() && !exc.is_constant() {
+        // Pin the branch `enrich_attribute_error` takes.  Both reads answer
+        // statically for the virtual an inlined `raise` builds -- the shape every
+        // hook constructing its own `AttributeError` produces -- so the guards
+        // cost nothing there and are real only for an exception that reached the
+        // walk from outside.
+        let read_name = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            exc,
+            crate::descr::w_exception_attr_slot_descr(kind, Slot::Name),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            read_name,
+            majit_ir::Value::Ref(majit_ir::GcRef(current_name as usize)),
+        );
+        let read_obj = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            exc,
+            crate::descr::w_exception_attr_slot_descr(kind, Slot::AttrObj),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            read_obj,
+            majit_ir::Value::Ref(majit_ir::GcRef(current_obj as usize)),
+        );
+        for (read, is_null) in [
+            (read_name, current_name.is_null()),
+            (read_obj, current_obj.is_null()),
+        ] {
+            let guard = if is_null {
+                OpCode::GuardIsnull
+            } else {
+                OpCode::GuardNonnull
+            };
+            walker_emit_fold_guard_with_snapshot(ctx, op_pc, guard, &[read])?;
+        }
+        if fills {
+            for (slot, value) in [(Slot::Name, attr.name), (Slot::AttrObj, attr.obj)] {
+                let descr = crate::descr::w_exception_attr_slot_descr(kind, slot);
+                let descr_index = descr.index();
+                ctx.trace_ctx
+                    .record_op_with_descr(OpCode::SetfieldGc, &[exc, value], descr);
+                ctx.trace_ctx
+                    .heapcache_setfield_cached(exc, descr_index, value);
+            }
+        }
+    }
+    if fills {
+        // The setters carry the host-side remembered-set barrier themselves;
+        // compiled `SetfieldGc` reference stores get `CondCallGcWb` from
+        // majit-gc's rewrite pass.
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_name(exc_ptr, attr.name_concrete);
+            pyre_object::interp_exceptions::w_exception_set_attr_obj(exc_ptr, attr.obj_concrete);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -4472,6 +4597,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         None,
         false,
         None,
+        None,
     )
 }
 
@@ -4524,6 +4650,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     intermediate_result: Option<&mut Option<(OpRef, ConcreteValue)>>,
     require_exact_int_result: bool,
     instance_next_foriter_green_key: Option<u64>,
+    attribute_error_context: Option<AttributeErrorInlineContext>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
@@ -7323,6 +7450,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
+            // Ahead of the traceback nodes, matching the interpreter order:
+            // `getattr_str` enriches as the error leaves the attribute
+            // dispatch, before the caller frame's `handle_exception` records a
+            // node for the opcode that made the call.
+            if let Some(attr) = attribute_error_context.as_ref() {
+                record_inline_attribute_error_context(ctx, op.pc, exc, exc_concrete, attr)?;
+            }
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
                 // trace runs compiled it catches the exception itself and this
@@ -7422,6 +7556,14 @@ fn type_call_decline(reason: &str) -> Result<Option<(DispatchOutcome, usize)>, D
 /// The payoff is not the removed dispatch alone: an instance built by
 /// `new_with_vtable` is a virtual, so a constructor whose result never escapes
 /// the loop optimizes away entirely, as it does upstream.
+///
+/// This applies at every inline depth.  `MetaInterp.perform_call` gives each
+/// Python call its own `MIFrame`, and `capture_resumedata` preserves the whole
+/// framestack; being reached from another inlined Python frame is therefore not
+/// a reason to leave `type.__call__` residual.  Pyre's matching shape is the
+/// callee-owned frame plus the `descr_call` parent level installed by
+/// `ctor_continuation_parent_frame`, which keeps the instance (rather than
+/// `__init__`'s return) live across a guard resume.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -7433,8 +7575,8 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk || dst_bank != 'r' {
-        // These three reject far more calls than the instantiations this emit is
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        // These two reject far more calls than the instantiations this emit is
         // about, so name the reason only for a call that does resolve to a
         // class, and only while the reasons are being collected — the extra
         // resolution below is diagnostic cost, not tracing cost.
@@ -7446,8 +7588,6 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         {
             return type_call_decline(if !ctx.is_authoritative_executor {
                 "not the authoritative executor"
-            } else if ctx.fbw_mode.inline_subwalk {
-                "inline sub-walk"
             } else {
                 "destination is not a ref register"
             });
@@ -8507,6 +8647,7 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
 /// semantics).
 /// The leading argument `get_and_call_function` binds ahead of the attribute
 /// name, one variant per descriptor spelling of a `__getattr__` hook.
+#[derive(Clone, Copy)]
 enum HookLeading {
     /// Plain `Function`: `funccall(w_obj, w_name)` leads with the receiver.
     Receiver,
@@ -8519,6 +8660,7 @@ enum HookLeading {
 /// The wrapper slot a descriptor spelling of the hook unwrapped, so the fold
 /// can pin the value it read.  `function.py:673`/`:720`
 /// `_immutable_fields_ = ['w_function?']`.
+#[derive(Clone, Copy)]
 enum WrapperField {
     ClassMethod,
     StaticMethod,
@@ -8531,6 +8673,170 @@ impl WrapperField {
             Self::StaticMethod => crate::descr::staticmethod_w_function_quasi_descr(),
         }
     }
+}
+
+/// Resolve the three descriptor spellings `get_and_call_function` gives an
+/// attribute hook.  Shared by `__getattribute__` and `__getattr__`, which are
+/// dispatched identically in `descroperation.py:_handle_getattribute` once
+/// their respective lookup has selected a descriptor.
+unsafe fn resolve_attribute_hook(
+    w_hook: pyre_object::PyObjectRef,
+) -> Option<(pyre_object::PyObjectRef, HookLeading, Option<WrapperField>)> {
+    let resolved = unsafe {
+        if pyre_object::function::is_exact_classmethod(w_hook) {
+            (
+                pyre_object::function::w_classmethod_get_func(w_hook),
+                HookLeading::Class,
+                Some(WrapperField::ClassMethod),
+            )
+        } else if pyre_object::function::is_exact_staticmethod(w_hook) {
+            (
+                pyre_object::function::w_staticmethod_get_func(w_hook),
+                HookLeading::None,
+                Some(WrapperField::StaticMethod),
+            )
+        } else {
+            (w_hook, HookLeading::Receiver, None)
+        }
+    };
+    (!resolved.0.is_null()).then_some(resolved)
+}
+
+/// Inline a custom Python `__getattribute__` selected by LOAD_ATTR / the
+/// attribute half of LOAD_METHOD.
+///
+/// PyPy's `descroperation.py getattr` traces the receiver-type lookup and then
+/// enters `get_and_call_function(w_descr, w_obj, w_name)`.  The optimized
+/// trace therefore carries the same map promotion and type-version dependency
+/// as mapdict LOAD_ATTR, followed by a distinct inlined MIFrame for the hook.
+/// Pyre's fused `load_attr_fn` otherwise hides both stages in one
+/// `CALL_MAY_FORCE`, so a hot override executes in the blackhole interpreter
+/// on every iteration.
+///
+/// This is the hit-side predecessor of [`try_walker_inline_getattr_hook`].  It
+/// admits the same exact Function/classmethod/staticmethod spellings, pins the
+/// same wrapper fields, and uses the same per-frame resolved-call path.  A loop
+/// in the hook, a type whose `__getattr__` would have to catch AttributeError,
+/// or any shape the oracle cannot guard remains residual.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, map, w_getattribute)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::getattribute_hook_fast_path(concrete_obj)
+    }) else {
+        return Ok(None);
+    };
+    let Some((w_func, leading, wrapper_field)) =
+        (unsafe { resolve_attribute_hook(w_getattribute) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_func) }) else {
+        return Ok(None);
+    };
+    if nparams != usize::from(!matches!(leading, HookLeading::None)) + 1 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header {
+        return Ok(None);
+    }
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    if let Some(field) = wrapper_field {
+        walker_pin_descriptor_slot(ctx, op.pc, w_getattribute, field.quasi_descr())?;
+    }
+
+    let name_obj =
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name.as_str()))
+            as pyre_object::PyObjectRef;
+    let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
+    let leading_arg = match leading {
+        HookLeading::Receiver => Some((obj, concrete_obj)),
+        HookLeading::Class => Some((ctx.trace_ctx.const_ref(w_type as i64), w_type)),
+        HookLeading::None => None,
+    };
+    let mut arg_concretes = vec![ConcreteValue::Ref(w_func), ConcreteValue::Null];
+    let mut callee_args = Vec::with_capacity(2);
+    let mut callee_arg_concretes = Vec::with_capacity(2);
+    if let Some((arg, concrete)) = leading_arg {
+        arg_concretes.push(ConcreteValue::Ref(concrete));
+        callee_args.push(arg);
+        callee_arg_concretes.push(ConcreteValue::Ref(concrete));
+    }
+    arg_concretes.push(ConcreteValue::Ref(name_obj));
+    callee_args.push(name_const);
+    callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
+    let hook_const = ctx.trace_ctx.const_ref(w_func as i64);
+    let inlined = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        hook_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        w_func,
+        hook_const,
+        w_func,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        true,
+        false,
+        None,
+        None,
+        false,
+        None,
+        // pyre's `getattr_str` (`baseobjspace.rs`) enriches the whole
+        // `__getattribute__` / `__getattr__` chain, so the `load_attr_fn`
+        // residual this route replaces filled the pair in here as well.
+        // `StdObjSpace.getattr` (`objspace/std/objspace.py:668-670`) returns
+        // through `_handle_getattribute` without enriching, so the interpreter
+        // this trace has to agree with is ahead of upstream on this arm; the
+        // difference is the interpreter's to settle, not the trace's.
+        Some(AttributeErrorInlineContext {
+            obj,
+            obj_concrete: concrete_obj,
+            name: name_const,
+            name_concrete: name_obj,
+        }),
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8574,26 +8880,10 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     // through that override, so unwrapping `w_function` in its place calls the
     // wrong callable.  `wrapper_field` names the slot that unwrapping read, for
     // the guard below; the plain arm reads no field.
-    let (w_func, leading, wrapper_field) = unsafe {
-        if pyre_object::function::is_exact_classmethod(w_getattr) {
-            (
-                pyre_object::function::w_classmethod_get_func(w_getattr),
-                HookLeading::Class,
-                Some(WrapperField::ClassMethod),
-            )
-        } else if pyre_object::function::is_exact_staticmethod(w_getattr) {
-            (
-                pyre_object::function::w_staticmethod_get_func(w_getattr),
-                HookLeading::None,
-                Some(WrapperField::StaticMethod),
-            )
-        } else {
-            (w_getattr, HookLeading::Receiver, None)
-        }
-    };
-    if w_func.is_null() {
+    let Some((w_func, leading, wrapper_field)) = (unsafe { resolve_attribute_hook(w_getattr) })
+    else {
         return Ok(None);
-    }
+    };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_func) }) else {
         return Ok(None);
     };
@@ -8656,7 +8946,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     callee_args.push(name_const);
     callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
     let getattr_const = ctx.trace_ctx.const_ref(w_func as i64);
-    let inlined = try_walker_inline_resolved_user_call(
+    let inlined = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -8684,6 +8974,19 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         true,
         false,
         None,
+        None,
+        false,
+        None,
+        // `StdObjSpace.getattr` (`objspace/std/objspace.py:711-716`) wraps
+        // the `__getattr__` fallback call in `enrich_attribute_error`, which
+        // the `load_attr_fn` residual this route replaces reached through
+        // `getattr_str`.
+        Some(AttributeErrorInlineContext {
+            obj,
+            obj_concrete: concrete_obj,
+            name: name_const,
+            name_concrete: name_obj,
+        }),
     )?;
     if inlined.is_none() {
         ctx.trace_ctx.cut_trace(pre_fold_pos);
@@ -8994,6 +9297,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         Some(&mut result),
         true,
         None,
+        None,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -9238,6 +9542,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         None,
         false,
         Some(foriter_green_key),
+        None,
     );
     let inline_resume_pc = match inline {
         Ok(Some((DispatchOutcome::Continue, next))) => next,

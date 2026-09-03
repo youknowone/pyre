@@ -1,4 +1,11 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=3
+# The ceiling gates cranelift as well as dynasm, and `perf_gate_floor` derives
+# a floor from it as ceiling/6, so both ends of the reading spread pick it. Run
+# 33384229844 reads 0.7x (macos dynasm), 1.4x (macos cranelift), 1.6x and 2.3x
+# (ubuntu) on the four pairs where pypy's baseline was measurable -- wasm is
+# ungated and windows read a clamped baseline. 4x derived a floor of 0.67x,
+# 5% under the fast end and inside that reading's own rounding; 3x clears the
+# slow end by 30% and the fast end by 29%.
 # pyre-check: skip-cpython
 # cpython >5s (it already timed out) vs pyre 0.20s, and it is not gated on — only pypy is.
 # STORE_ATTR that ADDS an attribute not yet in the instance's map: the

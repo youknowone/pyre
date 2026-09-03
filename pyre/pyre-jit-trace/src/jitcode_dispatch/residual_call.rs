@@ -8283,16 +8283,15 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // rather than at the residual arm the `Residual` answer would
                 // eventually take.
                 //
-                // No shape reaches it today: a body carrying `STORE_ATTR`
-                // scans `Dirty`, which the admission at `inline_call.rs`
-                // refuses before the descent executes anything, and a body
-                // reaching one through a nested call is refused earlier still
-                // by `dunder_body_admissible_on_rewind`.  Both were measured
-                // (`[inline-foriter-gate] safety=Dirty legacy_admit=false`,
-                // `[binop-inline-decline] delegates through a nested call`).
-                // The refusal is here anyway because it is what the region
-                // PROMISES, and both of those gates are one widening away
-                // from not holding it.
+                // Reached from a `for` body since `store_attr` joined the
+                // deferred-helper list in `fbw_state.rs`: a callee that stores
+                // an attribute now descends there as it always did from a
+                // `while` body, and the `Direct` arm below is what erases its
+                // residual.  A body reaching one through a nested call is
+                // still refused earlier, by `dunder_body_admissible_on_rewind`
+                // (`[binop-inline-decline] delegates through a nested call`),
+                // so the rewind region is the one caller left that has to be
+                // asked here.
                 fbw_binop_rewind_refuse_commit(ctx, op.pc)?;
                 if let Some(specialization) = spec_gate_store_attr(|| {
                     try_walker_specialize_store_attr(
@@ -8698,6 +8697,26 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // same `space.getattr` but carries its name as a constant
                 // operand, so the lookup has to reach it already resolved.
                 let attr_name = walker_load_name_from_code(w_code_ptr, namei as usize);
+                // `descroperation.py getattr` selects a custom
+                // `__getattribute__` before it runs the ordinary descriptor
+                // protocol.  PyPy traces into that Python frame; do the same
+                // before every default-attribute fold below (all of which
+                // correctly decline the override but would otherwise leave
+                // it in the opaque residual).
+                if let Some(inlined) = try_walker_inline_getattribute_hook(
+                    ctx,
+                    op,
+                    code,
+                    &r_args,
+                    call_descr,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                }
                 if let Some(attr_name) = attr_name.as_deref()
                     && spec_gate(SpecFold::LoadAttr, || {
                         try_walker_specialize_load_attr(

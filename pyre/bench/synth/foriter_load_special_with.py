@@ -1,3 +1,6 @@
+# pyre-check: jitstats-band=guard_failures=1
+# Run 33384229844 reads 200 guard failures on every CI host while darwin-arm64
+# reads 201 from the same topology (2 loops, 1 bridge); only that counter moves.
 # A `with` block in a hot FOR_ITER body, whose handler runs every tenth
 # iteration. The whole-frame FOR_ITER gate declines LOAD_SPECIAL, so this frame
 # runs interpreted; the answer is recorded here for the day it is admitted.

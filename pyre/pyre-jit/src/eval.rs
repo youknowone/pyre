@@ -11670,22 +11670,12 @@ fn execute_assembler(
                             apply_blackhole_crn_handoff(frame_root.frame(), green_int);
                             Some(LoopResult::ContinueRunningNormally)
                         }
-                        crate::call_jit::BlackholeResult::DoneWithThisFrameRef(v) => {
-                            Some(LoopResult::Done(Ok(*v)))
-                        }
-                        crate::call_jit::BlackholeResult::DoneWithThisFrameInt(v) => {
-                            // warmspot.py:988-990: box Int to Ref for portal result_type=Ref
-                            Some(LoopResult::Done(Ok(
-                                pyre_object::intobject::w_int_new(*v) as pyre_object::PyObjectRef
-                            )))
-                        }
-                        crate::call_jit::BlackholeResult::ExitFrameWithExceptionRef(exc) => {
-                            // warmspot.py:998-1005 ExitFrameWithExceptionRef:
-                            // propagate the Python exception, don't swallow it.
-                            Some(LoopResult::Done(Err(exc.clone())))
-                        }
                         crate::call_jit::BlackholeResult::BailToInterpreter => None,
-                        _ => bh_result.to_pyresult().map(LoopResult::Done),
+                        // warmspot.py:988-1005 — box the typed DoneWithThisFrame*
+                        // result for the portal's `result_type=Ref`, or propagate
+                        // the ExitFrameWithExceptionRef exception rather than
+                        // swallowing it.  Spelled once, in `take_pyresult`.
+                        _ => bh_result.take_pyresult().map(LoopResult::Done),
                     }
                 }
             }
@@ -12051,7 +12041,7 @@ fn bound_reached(
                         }
                         crate::call_jit::BlackholeResult::BailToInterpreter => {}
                         _ => {
-                            if let Some(r) = bh_result.to_pyresult() {
+                            if let Some(r) = bh_result.take_pyresult() {
                                 return Some(LoopResult::Done(r));
                             }
                         }
@@ -12367,7 +12357,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                         }
                         crate::call_jit::BlackholeResult::BailToInterpreter => {}
                         _ => {
-                            if let Some(r) = bh_result.to_pyresult() {
+                            if let Some(r) = bh_result.take_pyresult() {
                                 if majit_metainterp::majit_log_enabled() {
                                     let returned_intval = match &r {
                                         Ok(obj)

@@ -4439,24 +4439,35 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
         },
     );
     frame.fix_array_ptrs();
-    // `pycode.py PyCode.funcrun` ends in `frame.run(...)`, the JIT-eligible
-    // entry, for every function it activates; `fast_natural_arity` decides only
-    // whether `Function.funccall` may take the flat-call shortcut.  Here it
-    // still decides the entry, and the shapes it answers HOPELESS for —
-    // `*args`, `**kwargs`, a keyword-only parameter, an argument that is also a
-    // cellvar — have no other route to the JIT at all, because the flat path is
-    // the one that carries the portal.  Route those; a normally-shaped function
-    // reaching this generic activation keeps the plain loop until the wider
-    // `Function.call_args` port lands, since giving every descriptor and
-    // protocol call the portal moves stdlib trace topology on its own.
-    let arity =
-        unsafe { crate::pycode::code_get_fast_natural_arity(w_code as pyre_object::PyObjectRef) };
-    let result = if arity as usize == crate::HOPELESS as usize {
-        let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
-        frame.run_with_jit()
-    } else {
-        frame.execute_frame(None, None)
-    };
+    // `function.py:79-83 Function.call_args` delegates every application-level
+    // function to `PyCode.funcrun` (`pycode.py:270-280`), which builds the
+    // frame and calls `PyFrame.run` (`pyframe.py:251-256`); that reaches
+    // `execute_frame`, whose dispatch loop carries `jit_merge_point`
+    // (`interp_jit.py:81-99`, `pypyjitdriver`, `is_recursive=True`).  Nothing
+    // on that chain is conditional.
+    //
+    // `_compute_flatcall` (`pycode.py:256-268`) decides only which of two
+    // arms fills the arguments: `fast_natural_arity` selects `_flat_pycall`,
+    // which writes the slots directly and returns `new_frame.run`
+    // (`function.py:206-214`), and the function it rejects — a positional
+    // argument that is also a cellvar among them — falls back to
+    // `self.call_args(args)` (`function.py:203`) and its
+    // `Arguments.parse_into_scope`.  Both arms end at the same
+    // `PyFrame.run`, so the shortcut buys argument matching and nothing else.
+    //
+    // pyre had already put the flat arm on `get_eval_fn`
+    // (`function.rs _flat_pycall`), while the gate that stood here left the
+    // fallback arm on the plain evaluator unless the code also named `super`.
+    // #1551 wrote it that way knowingly, to hold the stdlib's trace topology
+    // still "until the broader Function.call_args port is ready as one unit";
+    // this is that port.  `call_user_function_with_ctx` above is the same
+    // `Function.call_args` shape and has been routing to `get_eval_fn` all
+    // along.
+    //
+    // The callee root is installed and the caller root is not, for the reason
+    // `call_user_function_with_ctx` records: no caller `PyFrame` exists here.
+    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
+    let result = frame.run_with_jit();
     match result {
         Ok(v) => v,
         Err(e) => {
@@ -4501,7 +4512,11 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
             }
         };
     }
-    match frame.execute_frame(None, None) {
+    // Argument matching has already happened, but the activation is the same
+    // `PyCode.funcrun` -> `PyFrame.run` one, so this takes the portal on the
+    // terms the ordinary spelling above records.
+    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
+    match frame.run_with_jit() {
         Ok(v) => v,
         Err(e) => {
             set_call_error(e);
