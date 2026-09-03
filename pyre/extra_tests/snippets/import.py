@@ -59,6 +59,19 @@ with OverrideImportContext():
     assert test == 4
 
 
+with OverrideImportContext():
+    # A deleted binding names no importer, and the interpreter's own imports
+    # read the same binding an `import` statement reads -- neither falls back
+    # to the machinery the binding would otherwise have been holding.
+    del builtins.__import__
+    try:
+        import test
+    except ImportError as exc:
+        assert "__import__ not found" in str(exc), exc
+    else:
+        raise AssertionError("a deleted __import__ still imported")
+
+
 # TODO: Once we can determine current directory, use that to construct this
 # path:
 # import sys
