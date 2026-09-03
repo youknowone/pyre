@@ -29,3 +29,12 @@ class Cmp(object):
 cmp = Cmp()
 Cmp.__eq__ = types.MethodType(_operator.eq, cmp)
 assert_raises(RecursionError, lambda: cmp == cmp)
+
+
+# `object.__ne__` calls the receiver's live `__eq__`, so binding it as that
+# `__eq__` closes a cycle inside one native body, again without a Python frame.
+class Ne(object):
+    __eq__ = object.__ne__
+
+
+assert_raises(RecursionError, lambda: Ne() == Ne())
