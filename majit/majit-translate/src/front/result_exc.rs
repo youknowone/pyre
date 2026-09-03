@@ -3150,7 +3150,11 @@ fn err_shell_forward_hoist(
         if current != block {
             let b = &graph.blocks[current];
             if !b.operations.is_empty() {
-                if !b.operations.iter().all(|op| is_root_bracket_close(&op.kind)) {
+                if !b
+                    .operations
+                    .iter()
+                    .all(|op| is_root_bracket_close(&op.kind))
+                {
                     return Err(format!(
                         "forwarding block {current} carries {} operation(s), \
                          first {:?}, {} exit(s), exitswitch {}, {} predecessor(s)",
@@ -3162,7 +3166,12 @@ fn err_shell_forward_hoist(
                     ));
                 }
                 for op in &b.operations {
-                    let OpKind::Call { target, args, result_ty } = &op.kind else {
+                    let OpKind::Call {
+                        target,
+                        args,
+                        result_ty,
+                    } = &op.kind
+                    else {
                         unreachable!("checked by is_root_bracket_close");
                     };
                     let mut moved = Vec::with_capacity(args.len());

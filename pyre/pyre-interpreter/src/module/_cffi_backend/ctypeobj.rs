@@ -109,7 +109,14 @@ pub const F_WITH_PACKED_CHANGE: i64 = 1 << 15;
 // the first `size?` — and `flags` carries `_custom_field_pos` and
 // `_with_var_array`, the two that completion sets.
 #[majit_macros::jit_immutable_fields(
-    "kind", "name_position", "ctitem", "ctptr", "length", "fargs", "abi", "cif_descr"
+    "kind",
+    "name_position",
+    "ctitem",
+    "ctptr",
+    "length",
+    "fargs",
+    "abi",
+    "cif_descr"
 )]
 pub struct W_CType {
     /// `W_CType.size` — the size of an instance, or -1 when unknown.

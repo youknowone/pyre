@@ -4824,7 +4824,11 @@ impl<'a> Lowering<'a> {
         // has no reader left either, since every `get` it fed is answered by
         // the pinned value, so the temporary mints no Variable.
         if let PlaceKind::Local(index) = dest.kind
-            && let Some(scope) = self.root_bracket.base_results.get(&(index as usize)).copied()
+            && let Some(scope) = self
+                .root_bracket
+                .base_results
+                .get(&(index as usize))
+                .copied()
             && self.root_bracket.is_erased_scope(scope)
             && matches!(&rvalue, Rvalue::Use(_))
         {
@@ -8534,11 +8538,16 @@ impl<'a> Lowering<'a> {
                 let Some(scope) = receiver_scope else {
                     return Ok(false);
                 };
-                let value = self.root_bracket.pinned.get(&scope).copied().ok_or_else(|| {
-                    LowerError::Unsupported(format!(
-                        "bb{mir_bb}: erased root read has no pinned value for guard {scope}"
-                    ))
-                })?;
+                let value = self
+                    .root_bracket
+                    .pinned
+                    .get(&scope)
+                    .copied()
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased root read has no pinned value for guard {scope}"
+                        ))
+                    })?;
                 Some(self.local_var[value].clone().ok_or_else(|| {
                     LowerError::Unsupported(format!(
                         "bb{mir_bb}: erased root read answers with unbound MIR local {value}"
@@ -20055,7 +20064,11 @@ fn mentions_local(v: &serde_json::Value, wanted: &bit_set::BitSet) -> bool {
 /// Build the erasure plan for one body.  Everything it does not recognise
 /// leaves the bracket alone, so a body this returns nothing for lowers
 /// exactly as it did before.
-fn analyze_root_brackets(body: &Unstructured, llbc: &Llbc, moved: &bit_set::BitSet) -> RootBracketPlan {
+fn analyze_root_brackets(
+    body: &Unstructured,
+    llbc: &Llbc,
+    moved: &bit_set::BitSet,
+) -> RootBracketPlan {
     analyze_root_brackets_with(body, moved, |reg| regular_call_name_path(reg, llbc))
 }
 
@@ -20089,7 +20102,8 @@ fn analyze_root_brackets_with(
     }
     // (1) Candidate guards: the destination of a bracket opener.
     let mut candidates = bit_set::BitSet::new();
-    let mut opener_block: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut opener_block: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
         let Ok(TermKind::Call { call, .. }) = bb.term() else {
             continue;
@@ -20122,7 +20136,8 @@ fn analyze_root_brackets_with(
     let mut aliases: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for bb in &body.body {
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(place, Rvalue::Ref { place: src, .. })) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, Rvalue::Ref { place: src, .. })) = stmt.stmt_kind()
+            else {
                 continue;
             };
             let (PlaceKind::Local(dest), PlaceKind::Local(scope)) = (place.kind, src.kind) else {
@@ -20241,8 +20256,7 @@ fn analyze_root_brackets_with(
                     continue;
                 }
                 // `_t = copy _slot`, the argument temporary (2.5) recorded.
-                Ok(StmtKind::Assign(place, Rvalue::Use(operand)))
-                    if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == operand_local(Some(&operand))) =>
+                Ok(StmtKind::Assign(place, Rvalue::Use(operand))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == operand_local(Some(&operand))) =>
                 {
                     continue;
                 }
@@ -20255,19 +20269,21 @@ fn analyze_root_brackets_with(
         let term_kind = &body.body[bb_idx].terminator.kind;
         match bb.term() {
             Ok(TermKind::Drop {
-                place: Place {
-                    kind: PlaceKind::Local(local),
-                    ..
-                },
+                place:
+                    Place {
+                        kind: PlaceKind::Local(local),
+                        ..
+                    },
                 ..
             }) if candidates.contains(local as usize) => continue,
             Ok(TermKind::Call { call, .. }) => {
                 // The opener names its guard as the call destination, which is
                 // the one mention of a guard that is not a use of one.
                 let opens_candidate = matches!(call.dest.kind, PlaceKind::Local(d) if opener_block.get(&(d as usize)) == Some(&bb_idx))
-                    && !call.args.iter().any(|op| {
-                        operand_local(Some(op)).is_some_and(|l| guards.contains(l))
-                    });
+                    && !call
+                        .args
+                        .iter()
+                        .any(|op| operand_local(Some(op)).is_some_and(|l| guards.contains(l)));
                 if opens_candidate {
                     continue;
                 }
@@ -20295,29 +20311,29 @@ fn analyze_root_brackets_with(
                         if names_guard_elsewhere {
                             false
                         } else {
-                        match (leaf.as_str(), dest) {
-                            ("pin_root", Some(_)) => match operand_local(call.args.get(1)) {
-                                Some(value) if call.args.len() == 2 => {
-                                    pins.entry(*scope).or_default().push((bb_idx, value));
-                                    true
-                                }
-                                _ => false,
-                            },
-                            // (2.5) already recorded the slot this answers.
-                            ("base", Some(dest)) if call.args.len() == 1 => {
-                                bases.get(&dest) == Some(scope)
-                            }
-                            ("get", Some(_)) if call.args.len() == 2 => {
-                                match operand_local(call.args.get(1)) {
-                                    Some(index) => {
-                                        gets.push((bb_idx, *scope, index));
+                            match (leaf.as_str(), dest) {
+                                ("pin_root", Some(_)) => match operand_local(call.args.get(1)) {
+                                    Some(value) if call.args.len() == 2 => {
+                                        pins.entry(*scope).or_default().push((bb_idx, value));
                                         true
                                     }
-                                    None => false,
+                                    _ => false,
+                                },
+                                // (2.5) already recorded the slot this answers.
+                                ("base", Some(dest)) if call.args.len() == 1 => {
+                                    bases.get(&dest) == Some(scope)
                                 }
+                                ("get", Some(_)) if call.args.len() == 2 => {
+                                    match operand_local(call.args.get(1)) {
+                                        Some(index) => {
+                                            gets.push((bb_idx, *scope, index));
+                                            true
+                                        }
+                                        None => false,
+                                    }
+                                }
+                                _ => false,
                             }
-                            _ => false,
-                        }
                         }
                     }
                     _ => false,
@@ -20335,7 +20351,8 @@ fn analyze_root_brackets_with(
     }
     // (4) Keep only the guards whose reads this pass can answer.
     let dom = block_dominators(body);
-    let mut base_results: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut base_results: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
     let mut pinned: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut get_sites: Vec<(usize, usize)> = Vec::new();
     let surviving: Vec<usize> = candidates.iter().collect();
@@ -34352,9 +34369,7 @@ mod tests {
         let copy = |i: u64| serde_json::json!({"Copy": place(i)});
         let local =
             |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
-        let stmt = |kind: serde_json::Value| {
-            serde_json::json!({"kind": kind, "comments_before": [], "span": span()})
-        };
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
         let borrow = |dest: u64, src: u64| {
             stmt(serde_json::json!({
                 "Assign": [place(dest), {"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}]
@@ -34371,9 +34386,7 @@ mod tests {
                 "on_unwind": 99
             }})
         };
-        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| {
-            serde_json::json!({"statements": statements, "terminator": {"kind": terminator}})
-        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
         // Callee ids: 1 = push_roots, 2 = base, 3 = pin_root, 4 = get,
         // 5 = an unrelated function.
         let name_of = |reg: &RegularCall| -> Option<String> {
@@ -34438,7 +34451,8 @@ mod tests {
             ]
         }))
         .expect("fixture Unstructured parses");
-        let plan = super::analyze_root_brackets_with(&through_copy, &bit_set::BitSet::new(), name_of);
+        let plan =
+            super::analyze_root_brackets_with(&through_copy, &bit_set::BitSet::new(), name_of);
         assert!(
             plan.scopes.contains(2),
             "an index reached through a copy temporary must still pair"

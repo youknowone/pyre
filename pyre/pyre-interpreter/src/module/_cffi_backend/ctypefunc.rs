@@ -265,11 +265,21 @@ fn do_call(
     };
     match called {
         Ok(w_res) => {
-            release_arguments(fargs_roots.get(fargs_slot), cif, buffer, mustfree_max_plus_1);
+            release_arguments(
+                fargs_roots.get(fargs_slot),
+                cif,
+                buffer,
+                mustfree_max_plus_1,
+            );
             Ok(w_res)
         }
         Err(e) => {
-            release_arguments(fargs_roots.get(fargs_slot), cif, buffer, mustfree_max_plus_1);
+            release_arguments(
+                fargs_roots.get(fargs_slot),
+                cif,
+                buffer,
+                mustfree_max_plus_1,
+            );
             Err(e)
         }
     }
