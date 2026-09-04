@@ -620,9 +620,12 @@ fn lower_result_exc_returns_inner(
         // be dropped and the JIT would raise earlier than the interpreter.
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
-        // call otherwise.
+        // call otherwise.  The one admitted exception is the root bracket's
+        // close, which is the shared epilogue every return path crosses —
+        // see [`forwards_to_returnblock_past_bracket_closes`] for why
+        // bypassing it costs a published slot rather than an answer.
         let forward_err: Option<String> = if is_err {
-            forwards_to_returnblock(graph, bi, &ctor_var)
+            forwards_to_returnblock_past_bracket_closes(graph, bi, &ctor_var)
                 .err()
                 .map(|e| format!("Err shell: {e}"))
         } else {
@@ -2097,13 +2100,21 @@ fn verify_drain_reraise_returns_err_payload(
         "reraise",
         name,
     )?;
-    // The shell flows to `returnblock` by a STRICT tail forward: block `R`
-    // deletes this whole reraise tail and substitutes an unconditional
-    // `raise vb`, so the arm must be an unconditional `return Err(e)` — a single
-    // exit, no exitswitch, only empty alias-hop blocks en route.  The tolerant
-    // forwarder would license a conditional tail (`if flag { return Err(e) }
-    // else { … }`) whose non-reraise branch the substitution silently drops.
-    if forwards_to_returnblock(graph, reraise_target, &outer).is_ok() {
+    // The shell flows to `returnblock` by a tail forward: block `R` deletes this
+    // whole reraise tail and substitutes an unconditional `raise vb`, so the arm
+    // must be an unconditional `return Err(e)` — a single exit, no exitswitch,
+    // only alias-hop blocks en route.  Those two requirements are what the
+    // substitution rests on, and `forwards_to_returnblock_inner` enforces them
+    // whichever variant is asked: a conditional tail (`if flag { return Err(e) }
+    // else { … }`) is rejected by the `exitswitch` arm, not by the operations
+    // test.  So the tolerant variant is the right one here for the reason it
+    // documents — the drain's `return Err(e)` reaches `returnblock` only through
+    // the function's shared epilogue, the block that closes the `push_roots`
+    // bracket, and demanding that block be *empty* declines every drain in a
+    // bracketed function.  Bypassing the close leaves a root-stack slot
+    // published on the raise path until an enclosing bracket retires it; the
+    // strict property still holds for every other operation.
+    if forwards_to_returnblock_past_bracket_closes(graph, reraise_target, &outer).is_ok() {
         Ok(())
     } else {
         Err(format!(
@@ -2808,6 +2819,40 @@ fn forwards_to_returnblock(
     block: usize,
     var: &Variable,
 ) -> Result<(), String> {
+    forwards_to_returnblock_inner(graph, block, var, false)
+}
+
+/// [`forwards_to_returnblock`], additionally treating a block whose every
+/// operation is the root bracket's close as empty.
+///
+/// Such a block is the function's shared epilogue: the `Drop` that ends the
+/// `push_roots` bracket, reached from every return path (the declines this
+/// admits name 2 to 29 predecessors).  The `Err` rewrite bypasses it, so the
+/// close does not run on the raise path — which is exactly what happened
+/// before the lowering emitted one at all, and the block keeps running it for
+/// its other predecessors.  A missed close is a root-stack slot left
+/// published, not a wrong answer, and it is subsumed the moment an enclosing
+/// bracket closes: `RootScope::drop` truncates to a saved *length*, so an
+/// outer guard retires every slot pushed above its own save point.
+///
+/// Nothing else is admitted.  The strict property still holds for every other
+/// operation, for the reason the caller states: `set_raise_values` replaces
+/// the producer's exit, so an op left on a bypassed block is dropped and the
+/// JIT would raise before running it.
+fn forwards_to_returnblock_past_bracket_closes(
+    graph: &FunctionGraph,
+    block: usize,
+    var: &Variable,
+) -> Result<(), String> {
+    forwards_to_returnblock_inner(graph, block, var, true)
+}
+
+fn forwards_to_returnblock_inner(
+    graph: &FunctionGraph,
+    block: usize,
+    var: &Variable,
+    past_bracket_closes: bool,
+) -> Result<(), String> {
     let mut current = block;
     let mut tracked = var.clone();
     for _ in 0..graph.blocks.len() {
@@ -2817,7 +2862,14 @@ fn forwards_to_returnblock(
         // a tail forward.
         if current != block {
             let b = &graph.blocks[current];
-            if !b.operations.is_empty() {
+            let carries_work = if past_bracket_closes {
+                !b.operations
+                    .iter()
+                    .all(|op| crate::front::mir::is_root_scope_drop_glue_call(&op.kind))
+            } else {
+                !b.operations.is_empty()
+            };
+            if carries_work {
                 return Err(format!(
                     "forwarding block {current} carries {} operation(s), \
                      first {:?}, {} exit(s), exitswitch {}, {} predecessor(s)",
