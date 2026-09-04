@@ -407,8 +407,16 @@ impl Cpu for DefaultCpu {
     }
 
     fn bh_getfield_gc_r(&self, struct_ptr: usize, fd: &dyn FieldDescr) -> GcRef {
-        // llmodel.py read_ref_at_mem — pointer width.
         let addr = struct_ptr + fd.offset();
+        // `descr.py FLAG_STRUCT`: the field IS a substructure, laid out inline
+        // at `offset`, so what a reference to it names is that address.
+        // `rtyper` hands such a projection to `getsubstruct`, never to
+        // `getfield`, and reading a word there would return the substructure's
+        // first bytes as if they were its address.
+        if fd.field_flag() == majit_ir::descr::ArrayFlag::Struct {
+            return GcRef(addr);
+        }
+        // llmodel.py read_ref_at_mem — pointer width.
         GcRef(unsafe { *(addr as *const usize) })
     }
 

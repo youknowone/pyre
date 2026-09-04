@@ -3993,6 +3993,31 @@ pub(crate) fn bh_size_spec_from_callcontrol(
             field.index_in_parent = index;
         }
     }
+    // `rclass.py InstanceRepr._setup_repr` seats a sum-type variant subclass's
+    // own fields after the base's, and pyre registers that base carrying the
+    // enum's synthetic `__discriminant` row alone (`front/mir.rs`).
+    // `Rvalue::Discriminant`
+    // reads the tag through the base identity while the allocation is the
+    // variant, and `PtrInfo` indexes a virtual's fields by `index_in_parent`,
+    // so a variant list without the inherited row gives the tag and the first
+    // payload slot 0 alike: the payload store replaces the tag, and every
+    // later read of either resolves to a slot holding the other.  The explicit
+    // shell reconstructs that row above; a native enum's variant inherits the
+    // same row, at the tag's own recorded offset and width rather than the
+    // shell's word, and keeps it first the way the walk that counts through
+    // the embedded base does.
+    if !result_variant
+        && !all_fielddescrs
+            .iter()
+            .any(|field| field.field_key() == "__discriminant")
+        && let Some(tag) = inherited_enum_tag_spec(cc, template_owner)
+    {
+        for (index, field) in all_fielddescrs.iter_mut().enumerate() {
+            field.index = (index + 1) as u32;
+            field.index_in_parent = index + 1;
+        }
+        all_fielddescrs.insert(0, tag);
+    }
     let violating_fields = all_fielddescrs
         .iter()
         .filter(|field| field.offset + field.field_size > size)
@@ -4062,6 +4087,45 @@ pub(crate) fn bh_size_spec_from_callcontrol(
         vtable: 0,
         all_fielddescrs,
     })
+}
+
+/// The enum base's `__discriminant` row that `variant_owner` inherits, or
+/// `None` when `variant_owner` does not name a variant of a tag-carrying enum.
+///
+/// The evidence is the `__discriminant`-only base registration `front/mir.rs`
+/// writes for every payload enum whose tag width Charon spelled -- a plain
+/// struct whose path merely contains `::` registers its own rows under that
+/// key and fails the shape test, and an enum whose tag width was recorded but
+/// is unspellable registers no base at all, which is the state that wants a
+/// declining read rather than a reconstructed slot.
+///
+/// The row is named under the *variant*, the way the explicit shell's own tag
+/// row is: it is the variant's slot 0, and what identifies it as the base's
+/// field is the inheritance edge the read side resolves, not the spelling.
+fn inherited_enum_tag_spec(
+    cc: &CallControl,
+    variant_owner: &str,
+) -> Option<crate::jitcode::BhFieldSpec> {
+    let (base_owner, _variant) = variant_owner.rsplit_once("::")?;
+    let entries = cc.struct_field_entries(base_owner)?;
+    if entries.len() != 1 || entries[0].0 != "__discriminant" {
+        return None;
+    }
+    let tag = bh_all_field_specs_for_struct(cc, base_owner)
+        .into_iter()
+        .find(|spec| spec.field_key() == "__discriminant")?;
+    Some(bh_field_spec_from_parts(
+        0,
+        variant_owner,
+        "__discriminant",
+        tag.offset,
+        tag.field_size,
+        tag.field_type,
+        tag.field_flag,
+        tag.is_immutable,
+        tag.is_quasi_immutable,
+        0,
+    ))
 }
 
 fn bh_all_field_specs_for_struct(

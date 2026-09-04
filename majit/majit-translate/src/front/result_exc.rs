@@ -438,13 +438,26 @@ pub(crate) fn lower_result_exc_returns(
     // is the same here — this only records the reason before it is
     // discarded, so the refusal stays countable.
     let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns, spec);
-    if let Err(msg) = &outcome {
-        crate::decline::record_reason(
+    match &outcome {
+        Err(msg) => crate::decline::record_reason(
             RESULT_EXC_CALLEE_GATE,
             "callee-declined-to-residual",
             msg,
             &graph.name,
-        );
+        ),
+        // An accept that rewrote nothing is the third outcome, and the one a
+        // decline census cannot show: the callee keeps returning its shell
+        // while `rewire_result_exc_call_sites` has already rewired its call
+        // sites to the unwrapped value, so the two halves of the one decision
+        // disagree without either half saying so.
+        Ok(0) => crate::decline::observe_accept(
+            RESULT_EXC_CALLEE_GATE,
+            "callee-accepted-without-rewriting",
+            &graph.name,
+        ),
+        Ok(_) => {
+            crate::decline::observe_accept(RESULT_EXC_CALLEE_GATE, "callee-rewritten", &graph.name);
+        }
     }
     outcome
 }
@@ -600,6 +613,19 @@ fn lower_result_exc_returns_inner(
                     graph.name
                 ));
             }
+            crate::decline::record_reason(
+                RESULT_EXC_CALLEE_GATE,
+                "site-skipped-consumed-intermediate",
+                &format!(
+                    "{}: block {bi} conditional {} shell left materialised \
+                     (op_uses={}, link_uses={})",
+                    graph.name,
+                    if is_err { "Err" } else { "Ok" },
+                    consumers.op_uses,
+                    consumers.link_uses,
+                ),
+                &graph.name,
+            );
             continue;
         }
         // A ctor is one of this graph's return values only if its value
@@ -668,6 +694,23 @@ fn lower_result_exc_returns_inner(
                     graph.name
                 ));
             }
+            crate::decline::record_reason(
+                RESULT_EXC_CALLEE_GATE,
+                "site-skipped-consumed-intermediate",
+                &format!(
+                    "{}: block {bi} {} shell left materialised (op_uses={}, \
+                     link_uses={}{})",
+                    graph.name,
+                    if is_err { "Err" } else { "Ok" },
+                    consumers.op_uses,
+                    consumers.link_uses,
+                    forward_err
+                        .as_deref()
+                        .map(|e| format!("; {e}"))
+                        .unwrap_or_default(),
+                ),
+                &graph.name,
+            );
             continue;
         }
 

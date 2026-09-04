@@ -2593,8 +2593,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 static_addrs.error_carrier,
             )
         };
+        let mut result_exc_rewritten = 0usize;
         if result_exc_callee {
-            crate::front::result_exc::lower_result_exc_returns(
+            result_exc_rewritten = crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
                 tail_forwarded_returns,
                 static_addrs.error_carrier,
@@ -2694,6 +2695,24 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.checked_arith_uint_sites,
             )
         };
+        // `rewire_checked_arith_ok_or_else` rebuilds `Result::Ok(sum)` /
+        // `Result::Err(closure())` shells on the two edges it fuses, and it
+        // runs after the callee rule above.  A scoped callee whose return WAS
+        // that `checked_*(..).ok_or_else(..)` pair therefore had nothing for
+        // the callee rule to rewrite when it ran, and carries the fold's fresh
+        // shells into its returnblock afterwards — while
+        // `rewire_result_exc_call_sites` has already rewired this callee's
+        // call sites to receive the unwrapped value.  Lower what the fold
+        // produced, so the two halves of the one decision agree again.
+        if result_exc_callee && (checked_arith_rewritten > 0 || checked_arith_uint_rewritten > 0) {
+            crate::front::result_exc::lower_result_exc_returns(
+                &mut lo.graph,
+                tail_forwarded_returns + result_exc_rewritten,
+                static_addrs.error_carrier,
+            )
+            .map_err(LowerError::Unsupported)?;
+            crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
+        }
         // The `Layout::from_size_align(..).ok()` rewrite
         // (`front::from_size_align`) collapses the `from_size_align` + `ok`
         // residual pair into a native `uint_lt` bound test + a virtualized
@@ -8668,6 +8687,31 @@ impl<'a> Lowering<'a> {
                 // the conversion as identity too (Rust `String` and
                 // `&str` both lower to the immutable rpy_string), so
                 // it takes the same alias path.
+                // `core::mem::forget(x)` and `core::mem::drop(x)` leave
+                // nothing behind to record.  `forget` runs nothing by
+                // definition, and `drop` runs a destructor the trace model
+                // does not run either: `TermKind::Drop` above forwards
+                // unconditionally, so a value falling out of scope in traced
+                // code already leaves its destructor unrun, and spelling that
+                // same release as a call does not change what the model does.
+                //
+                // Their `FOREIGN_STDLIB_EXTERNALS` entries type the callsite
+                // but still leave a residual naming a `core` body the build
+                // has no address for, and one residual target a portal can
+                // reach whose address the build left unbound refuses every
+                // trace, arm taken or not.  Binding one instead is not open:
+                // the path key collapses every `T`, so a single address would
+                // serve monomorphisations that do not share a destructor.
+                if args.len() == 1 && self.is_mem_release(&reg) {
+                    let void = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                    self.local_var[dest_local] = Some(void);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 if args.len() == 1
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
                         || self.is_reflexive_from(&reg)
@@ -11856,28 +11900,34 @@ impl<'a> Lowering<'a> {
         {
             self.checked_arith_ok_or_else_sites.push(site);
         }
-        // Capture UNSIGNED `usize::checked_{add,mul}()` results
+        // Capture UNSIGNED `usize::checked_{add,sub,mul}()` results
         // (`Option<usize>`) for the native-overflow rewiring pass
         // (`front::checked_arith_uint`).  Signed arithmetic stays on
         // `front::checked_arith` (→ `*_ovf` + OverflowError); unsigned has no
         // signed-overflow op, so it lowers to `uint_mul_high` / `uint_lt`
         // overflow tests + a virtualized `Option`.  The operand-signedness
         // gate lives here because the operand types are only in hand at the
-        // call site; `checked_sub` is excluded (no `?`-shape census site).
+        // call site.
+        //
+        // Either operand answers for both: these are
+        // `fn(self, rhs: Self) -> Option<Self>`, so the two are one type.  A
+        // literal operand carries no `Place` to read a type from, which is
+        // what `n.checked_sub(1)` spells, so demanding that both resolve would
+        // leave the constant-operand form on the residual path for want of a
+        // type the callee's signature already fixes.
         if let OpKind::Call { target, .. } = &op_kind
             && let CallTarget::FunctionPath { segments } = target
             && matches!(
                 segments.last().map(String::as_str),
-                Some("checked_add" | "checked_mul")
+                Some("checked_add" | "checked_sub" | "checked_mul")
             )
             && crate::front::checked_arith::is_checked_arith_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
-            && first_arg_ty
+            && let Some(operand_ty) = first_arg_ty
                 .as_ref()
-                .is_some_and(|t| tyref_to_value_type(t, self.llbc) == ValueType::Unsigned)
-            && second_arg_ty
-                .as_ref()
-                .is_some_and(|t| tyref_to_value_type(t, self.llbc) == ValueType::Unsigned)
+                .or(second_arg_ty.as_ref())
+                .map(|t| tyref_to_value_type(t, self.llbc))
+            && operand_ty == ValueType::Unsigned
             && let Some(site) = self.recognize_checked_arith_uint_site(&call.dest.ty, &result_var)
         {
             self.checked_arith_uint_sites.push(site);
@@ -13896,6 +13946,22 @@ impl<'a> Lowering<'a> {
     /// returns its argument unchanged and `core` has no graph body for it
     /// (an unregistered callee), so the callsite aliases its argument
     /// instead of calling the missing identity body.
+    /// `core::mem::forget(value)` / `core::mem::drop(value)` — the two ways
+    /// to spell "this value is released here".  `core` has no graph body for
+    /// either, so a callsite that keeps the call carries a residual whose
+    /// target the build cannot address.
+    fn is_mem_release(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::mem::forget" | "core::mem::drop"
+            )
+        })
+    }
+
     fn is_hint_must_use(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
