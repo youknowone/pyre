@@ -218,29 +218,58 @@ fn rewire_one(
         // result_exc has already made the map_err call a can-raise site. Keep
         // that exact exceptional destination: a `?` site targets exceptblock,
         // while catch_and_rewrap targets its local Err-shell rebuilding arm.
-        // In both cases the edge carries a trace-level exception object, not
-        // the interpreter-specific error carrier returned by the mapper.
-        let exc = crate::front::result_exc::materialize_error_to_exc_object(
-            graph, err_block, mapped, spec,
-        );
         let exceptional = saved_exception_exit
             .as_ref()
             .expect("LastException form captured its exceptional edge");
-        let last_exception = exceptional
-            .last_exception
-            .as_ref()
-            .and_then(LinkArg::as_variable)
-            .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exception"))?;
-        let last_exc_value = exceptional
-            .last_exc_value
-            .as_ref()
-            .and_then(LinkArg::as_variable)
-            .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exc_value"))?;
-        let args = exceptional
-            .args
-            .iter()
-            .map(|arg| -> Result<LinkArg, String> {
-                Ok(match arg {
+        if exceptional.target != graph.exceptblock {
+            // `catch_and_rewrap` only converted the old call into an exception
+            // edge so its local handler could recreate the value-encoded
+            // Result.  The mapper has already produced the carrier that handler
+            // would reconstruct; build the Err shell here and bypass the
+            // carrier -> exception object -> carrier round trip.  Besides an
+            // avoidable allocation, PyError::from_exc_object cannot preserve
+            // carrier-only state such as attach_tb or reraise_lasti.
+            let err_result = emit_sum_variant(
+                graph,
+                err_block,
+                &site.result_owner,
+                "Err",
+                1,
+                Some((&site.result_err_owner, mapped, site.mapped_err_ty.clone())),
+            );
+            let (rewrap_target, rewrap_args) = bypass_rewrap_handler_args(
+                graph,
+                exceptional,
+                &err_result,
+                &err_sources,
+                &err_inputs,
+                &site.result_err_owner,
+                &name,
+            )?;
+            close_goto_mixed(graph, err_block, rewrap_target, rewrap_args);
+        } else {
+            // An actual propagation edge carries a trace-level exception
+            // object, not the interpreter-specific carrier returned by the
+            // mapper.
+            let exc = crate::front::result_exc::materialize_error_to_exc_object(
+                graph, err_block, mapped, spec,
+            );
+            let last_exception = exceptional
+                .last_exception
+                .as_ref()
+                .and_then(LinkArg::as_variable)
+                .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exception"))?;
+            let last_exc_value = exceptional
+                .last_exc_value
+                .as_ref()
+                .and_then(LinkArg::as_variable)
+                .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exc_value"))?;
+            let args =
+                exceptional
+                    .args
+                    .iter()
+                    .map(|arg| -> Result<LinkArg, String> {
+                        Ok(match arg {
                     LinkArg::Value(value) if value == last_exception || value == last_exc_value => {
                         LinkArg::Value(exc.clone())
                     }
@@ -251,9 +280,10 @@ fn rewire_one(
                     ),
                     LinkArg::Const(value) => LinkArg::Const(value.clone()),
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        close_goto_mixed(graph, err_block, exceptional.target, args);
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            close_goto_mixed(graph, err_block, exceptional.target, args);
+        }
     } else {
         let err_result = emit_sum_variant(
             graph,
@@ -294,6 +324,93 @@ fn rewire_one(
     });
     graph.set_branch(a_id, disc, err_block, err_sources, ok_block, ok_sources);
     Ok(())
+}
+
+/// Bypass the local handler installed by `result_exc::catch_and_rewrap`.
+///
+/// That handler receives the original non-result live values followed by the
+/// exception pair, converts `last_exc_value` back into the error carrier, and
+/// builds the Err shell consumed by the untouched custom match.  A lowered
+/// `map_err` Err arm already owns the mapped carrier, so route a shell built
+/// from that exact value to the handler's successor and remap the other live
+/// values through this arm's inputargs.
+fn bypass_rewrap_handler_args(
+    graph: &FunctionGraph,
+    exceptional: &crate::model::Link,
+    err_result: &Variable,
+    err_sources: &[Variable],
+    err_inputs: &[Variable],
+    result_err_owner: &str,
+    name: &str,
+) -> Result<(crate::model::BlockId, Vec<LinkArg>), String> {
+    let handler = &graph.blocks[exceptional.target.0];
+    if handler.exitswitch.is_some() || handler.exits.len() != 1 {
+        return Err(format!(
+            "{name}: map_err rewrap handler is not a single plain forwarding block"
+        ));
+    }
+    let exit = &handler.exits[0];
+    if exit.exitcase.is_some() || exit.last_exception.is_some() || exit.last_exc_value.is_some() {
+        return Err(format!(
+            "{name}: map_err rewrap handler exit is not a plain goto"
+        ));
+    }
+    let shell = handler
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Call { target, .. }
+                if crate::front::result_exc::result_ctor_kind(target) == Some(true)
+                    && op.result.as_ref().is_some_and(|result| {
+                        handler.operations.iter().any(|write| {
+                            matches!(
+                                &write.kind,
+                                OpKind::FieldWrite { base, field, .. }
+                                    if base == result
+                                        && field.name == "__pos_0"
+                                        && field.owner_root.as_deref() == Some(result_err_owner)
+                            )
+                        })
+                    }) =>
+            {
+                op.result.clone()
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{name}: map_err rewrap handler lacks its Err shell"))?;
+    if exceptional.args.len() != handler.inputargs.len() {
+        return Err(format!(
+            "{name}: map_err rewrap handler input arity does not match its exceptional edge"
+        ));
+    }
+    let mut args = Vec::with_capacity(exit.args.len());
+    for arg in &exit.args {
+        match arg {
+            LinkArg::Const(value) => args.push(LinkArg::Const(value.clone())),
+            LinkArg::Value(value) if *value == shell => {
+                args.push(LinkArg::Value(err_result.clone()))
+            }
+            LinkArg::Value(value) => {
+                let pos = handler
+                    .inputargs
+                    .iter()
+                    .position(|input| input == value)
+                    .ok_or_else(|| {
+                        format!("{name}: map_err rewrap handler forwards an unknown value")
+                    })?;
+                let LinkArg::Value(source) = &exceptional.args[pos] else {
+                    return Err(format!(
+                        "{name}: map_err rewrap handler input is sourced from a constant"
+                    ));
+                };
+                let remapped = map_source(err_sources, err_inputs, source).ok_or_else(|| {
+                    format!("{name}: map_err rewrap handler carries an unthreaded value")
+                })?;
+                args.push(LinkArg::Value(remapped));
+            }
+        }
+    }
+    Ok((exit.target, args))
 }
 
 fn read_payload(
@@ -421,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_lowered_map_err_materializes_and_keeps_the_catch_target() {
+    fn exception_lowered_map_err_bypasses_rewrap_without_carrier_round_trip() {
         let mut graph = FunctionGraph::new("map_err_catch_fixture");
         let entry = graph.startblock;
         let receiver = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
@@ -440,8 +557,29 @@ mod tests {
             .unwrap();
         let (normal, _) = graph.create_block_with_arg_vars(2);
         graph.set_return(normal, None);
-        let (catch, _) = graph.create_block_with_arg_vars(3);
-        graph.set_return(catch, None);
+        let (catch, catch_inputs) = graph.create_block_with_arg_vars(3);
+        let reconstructed = graph
+            .push_op_var(
+                catch,
+                OpKind::Call {
+                    target: CallTarget::method("from_exc_object", Some("Error".into())),
+                    args: vec![catch_inputs[2].clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let old_shell = crate::front::result_exc::build_shell(
+            &mut graph,
+            catch,
+            "Err",
+            reconstructed,
+            ValueType::Ref(None),
+            "<i64,Error>",
+        );
+        let (downstream, _) = graph.create_block_with_arg_vars(2);
+        graph.set_return(downstream, None);
+        graph.set_goto(catch, downstream, vec![catch_inputs[0].clone(), old_shell]);
         let etype = graph.alloc_value_var();
         let evalue = graph.alloc_value_var();
         let mut exceptional = crate::model::Link::new_mixed(
@@ -479,32 +617,114 @@ mod tests {
         };
         assert_eq!(rewire_result_map_err_sites(&mut graph, &[site], spec), 1);
 
-        let materializer_block = graph
+        let err_arm = graph
             .blocks
             .iter()
             .find(|block| {
                 block.operations.iter().any(|op| {
                     matches!(
                         &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
-                            ..
-                        } if segments == &["fixture".to_string(), "to_exc_object".to_string()]
+                        OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                            if name == "call_once"
                     )
                 })
             })
-            .expect("Err arm must materialize the mapped carrier");
-        assert_eq!(materializer_block.exits.len(), 1);
-        assert_eq!(materializer_block.exits[0].target, catch);
-        assert_ne!(materializer_block.exits[0].target, graph.exceptblock);
-        assert_eq!(materializer_block.exits[0].args.len(), 3);
-        let carried_alias = materializer_block.exits[0].args[0]
+            .expect("Err arm must call the mapper");
+        assert!(!err_arm.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["fixture".to_string(), "to_exc_object".to_string()]
+            )
+        }));
+        assert_eq!(err_arm.exits.len(), 1);
+        assert_eq!(err_arm.exits[0].target, downstream);
+        assert_ne!(err_arm.exits[0].target, catch);
+        assert_eq!(err_arm.exits[0].args.len(), 2);
+        let carried_alias = err_arm.exits[0].args[0]
             .as_variable()
             .expect("carried value stays a Variable");
-        assert!(materializer_block.inputargs.contains(carried_alias));
-        assert_eq!(
-            materializer_block.exits[0].args[1],
-            materializer_block.exits[0].args[2]
+        assert!(err_arm.inputargs.contains(carried_alias));
+        assert!(err_arm.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, value: LinkArg::Value(_), .. }
+                    if field.owner_root.as_deref()
+                        == Some("core::result::Result<i64,Error>::Err")
+            )
+        }));
+    }
+
+    #[test]
+    fn exception_lowered_map_err_materializes_an_actual_propagation() {
+        let mut graph = FunctionGraph::new("map_err_propagate_fixture");
+        let entry = graph.startblock;
+        let receiver = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let env = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method("map_err", Some("Result".into())),
+                    args: vec![receiver, env],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (normal, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(normal, None);
+        let etype = graph.alloc_value_var();
+        let evalue = graph.alloc_value_var();
+        let mut exceptional = crate::model::Link::new_mixed(
+            vec![
+                LinkArg::Value(etype.clone()),
+                LinkArg::Value(evalue.clone()),
+            ],
+            graph.exceptblock,
+            Some(crate::model::exception_exitcase()),
         );
+        exceptional.last_exception = Some(LinkArg::Value(etype));
+        exceptional.last_exc_value = Some(LinkArg::Value(evalue));
+        graph.set_control_flow_metadata(
+            entry,
+            Some(crate::model::ExitSwitch::LastException),
+            vec![
+                crate::model::Link::new_mixed(vec![LinkArg::Value(result.clone())], normal, None),
+                exceptional,
+            ],
+        );
+
+        let mut site = fixture_site(result);
+        site.closure_env_is_trivially_dropless = true;
+        let spec = crate::ErrorCarrierSpec {
+            to_exc_object: Some(&["fixture", "to_exc_object"]),
+            ..crate::ErrorCarrierSpec::default()
+        };
+        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site], spec), 1);
+
+        let err_arm = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                            if name == "call_once"
+                    )
+                })
+            })
+            .expect("Err arm must call the mapper");
+        assert!(err_arm.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["fixture".to_string(), "to_exc_object".to_string()]
+            )
+        }));
+        assert_eq!(err_arm.exits.len(), 1);
+        assert_eq!(err_arm.exits[0].target, graph.exceptblock);
+        assert_eq!(err_arm.exits[0].args[0], err_arm.exits[0].args[1]);
     }
 }
