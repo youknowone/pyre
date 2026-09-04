@@ -3856,35 +3856,29 @@ impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for NoStruc
 /// Whether `owner` names one of the three enum variants `front/mir` gives an
 /// explicit `[tag@0 | payload@8]` shell to.
 ///
-/// `front/mir` admits every spelling from the bare `Result::Ok` up to the fully
-/// qualified `std::result::Result::Ok`, and `canonical_struct_name` keeps
-/// whichever the call site used, so this accepts each of them -- but as a
-/// *suffix of the whole path*, matched segment by segment against a `core` or
-/// `std` root.  A plain `ends_with` also admits a user enum declared at
-/// `mycrate::option::Option::Some`, which `front::option_ctor` never gives a
-/// shell to; its payload would then be described at offset 8 behind an injected
-/// discriminant rather than at its registered native layout.  Anchoring at the
-/// root rejects that while keeping every real spelling, the same reason
-/// [`crate::front::option_ctor::option_variant_ctor_tag`] anchors its own head.
+/// `front/mir` admits aliases from the bare `Result::Ok` up to the fully
+/// qualified standard-library spelling. The spelling alone is insufficient:
+/// a crate root named `option` can define `option::Option::Some` too. Resolve
+/// the candidate and the fully-qualified `core`/`std` anchors through the
+/// StructId registry and require their defining identities to agree.
 ///
 /// A lone leaf (`Ok`) is not enough: the shortest form `front/mir` produces
 /// names the enum as well as the variant.
 fn is_explicit_shell_variant_owner(owner: &str) -> bool {
-    const SHELLED: [&[&str]; 6] = [
-        &["core", "result", "Result", "Ok"],
-        &["std", "result", "Result", "Ok"],
-        &["core", "result", "Result", "Err"],
-        &["std", "result", "Result", "Err"],
-        &["core", "option", "Option", "Some"],
-        &["std", "option", "Option", "Some"],
+    const SHELLED: [&str; 6] = [
+        "core::result::Result::Ok",
+        "std::result::Result::Ok",
+        "core::result::Result::Err",
+        "std::result::Result::Err",
+        "core::option::Option::Some",
+        "std::option::Option::Some",
     ];
-    let segments: Vec<&str> = owner.split("::").collect();
-    if segments.len() < 2 {
+    let Some(owner_id) = majit_ir::descr::struct_template_id_for_name(owner) else {
         return false;
-    }
+    };
     SHELLED
-        .iter()
-        .any(|path| segments.len() <= path.len() && segments == path[path.len() - segments.len()..])
+        .into_iter()
+        .any(|anchor| majit_ir::descr::struct_template_id_for_name(anchor) == Some(owner_id))
 }
 
 pub(crate) fn bh_size_spec_from_callcontrol(
@@ -6077,6 +6071,46 @@ mod tests {
 
     use crate::test_support::register_struct_ids_serialized;
 
+    fn standard_shell_struct_ids() -> HashMap<String, Option<majit_ir::descr::StructId>> {
+        let option_some = majit_ir::descr::StructId::from_canonical("core::option::Option::Some");
+        let result_ok = majit_ir::descr::StructId::from_canonical("core::result::Result::Ok");
+        let result_err = majit_ir::descr::StructId::from_canonical("core::result::Result::Err");
+        let mut ids = HashMap::new();
+        for name in [
+            "Option::Some",
+            "option::Option::Some",
+            "std::option::Option::Some",
+            "core::option::Option::Some",
+        ] {
+            ids.insert(name.to_string(), Some(option_some));
+        }
+        for (identity, names) in [
+            (
+                result_ok,
+                [
+                    "Result::Ok",
+                    "result::Result::Ok",
+                    "std::result::Result::Ok",
+                    "core::result::Result::Ok",
+                ],
+            ),
+            (
+                result_err,
+                [
+                    "Result::Err",
+                    "result::Result::Err",
+                    "std::result::Result::Err",
+                    "core::result::Result::Err",
+                ],
+            ),
+        ] {
+            for name in names {
+                ids.insert(name.to_string(), Some(identity));
+            }
+        }
+        ids
+    }
+
     #[test]
     fn fielddescrof_resolves_the_slot_when_the_offset_comes_from_the_layout_registry() {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
@@ -6273,6 +6307,7 @@ mod tests {
     fn explicit_result_variant_size_inherits_discriminant_slot() {
         use crate::call::CallControl;
 
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
         let mut cc = CallControl::new();
         let mut struct_fields = crate::front::StructFieldRegistry::default();
         struct_fields.fields.insert(
@@ -6296,6 +6331,7 @@ mod tests {
     fn instantiated_result_payload_follows_template_discriminant_slot() {
         use crate::call::CallControl;
 
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
         let owner = "core::result::Result<*mut PyObject,PyError>::Ok";
         let mut cc = CallControl::new();
         let mut struct_fields = crate::front::StructFieldRegistry::default();
@@ -6336,10 +6372,7 @@ mod tests {
         let template_name = "core::option::Option::Some";
         let template_id = majit_ir::descr::StructId::from_canonical(template_name);
         let concrete_id = template_id.instantiate("<i64>");
-        let _registry = register_struct_ids_serialized(HashMap::from([(
-            template_name.to_string(),
-            Some(template_id),
-        )]));
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
         let mut cc = CallControl::new();
         let mut struct_fields = crate::front::StructFieldRegistry::default();
         struct_fields.fields.insert(
@@ -6404,11 +6437,19 @@ mod tests {
     fn a_lookalike_variant_owner_keeps_its_native_layout() {
         use crate::call::CallControl;
 
-        let owner = "mycrate::option::Option<*mut PyObject>::Some";
+        let owner = "option::Option<*mut PyObject>::Some";
+        let mut ids = standard_shell_struct_ids();
+        ids.insert(
+            "option::Option::Some".to_string(),
+            Some(majit_ir::descr::StructId::from_canonical(
+                "user_crate::option::Option::Some",
+            )),
+        );
+        let _registry = register_struct_ids_serialized(ids);
         let mut cc = CallControl::new();
         let mut struct_fields = crate::front::StructFieldRegistry::default();
         struct_fields.fields.insert(
-            "mycrate::option::Option::Some".to_string(),
+            "option::Option::Some".to_string(),
             vec![("__pos_0".to_string(), "*mut PyObject".to_string())],
         );
         cc.set_struct_fields(struct_fields);
@@ -6427,6 +6468,7 @@ mod tests {
     /// pins the same list on the producer side.
     #[test]
     fn the_shelled_variant_owners_are_every_rooted_spelling() {
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
         for owner in [
             "Result::Ok",
             "result::Result::Ok",
@@ -6453,6 +6495,22 @@ mod tests {
         ] {
             assert!(!is_explicit_shell_variant_owner(owner), "{owner}");
         }
+    }
+
+    #[test]
+    fn a_short_standard_library_lookalike_is_not_a_shell_by_spelling() {
+        let mut ids = standard_shell_struct_ids();
+        ids.insert(
+            "option::Option::Some".to_string(),
+            Some(majit_ir::descr::StructId::from_canonical(
+                "user_crate::option::Option::Some",
+            )),
+        );
+        let _registry = register_struct_ids_serialized(ids);
+        assert!(!is_explicit_shell_variant_owner("option::Option::Some"));
+        assert!(is_explicit_shell_variant_owner(
+            "core::option::Option::Some"
+        ));
     }
 
     #[test]
