@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=70
+# pyre-check: max-pypy-ratio=20
 # The function-entry door reading its own cell took this off the 44 it needed
 # while the door read another cell's answer, asked to trace at every call and
 # never entered the compiled loop.
@@ -6,12 +6,11 @@
 # The ceiling is NOT the measured ratio.  pypy's execution-only time here lands
 # either side of EXEC_TIME_FLOOR_S, and check.py gates the ratio whenever it
 # lands above (`?`) and skips it whenever it is clamped to the floor (`~`), so
-# the same binary reads 14.6x on one runner and 45.3x on the next.  Size the
-# ceiling for the worst denominator in the gated band instead.  Over the 38 CI
-# jobs of 2026-09-03 the gated readings span 7.5x (windows) to 45.3x (ubuntu
-# cranelift); 70 clears the widest by 55%.  Lengthening the loop until pypy is
-# measurable everywhere is not open: pyre runs about 40x slower here, so a
-# baseline over FLOOR_GATE_MIN_BASELINE_S would put this fixture past 6s.
+# the same binary reads 17.7x on one runner and 27.9x on the next.  Size the
+# ceiling for the worst denominator in the gated band instead: dynasm's
+# execution-only time over `2 * EXEC_TIME_FLOOR_S` -- the floor plus the grace
+# `_compare_buffer` adds for a floor-sized baseline -- which is 0.14s / 0.01s,
+# plus room for the run-to-run spread of that numerator.
 # gh#495 guard: fbw_abort_nested_unjournaled_residual prevents the ForIterNext exemption double-advance.
 # branch-bearing callee with a SECOND FOR_ITER (nested), not the loop header.
 # Two shared generators; inner FOR_ITER advance is a non-header foriter (Finding #2).

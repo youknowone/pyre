@@ -1,11 +1,4 @@
-# pyre-check: max-pypy-ratio=17
-# pypy's execution-only time here sits in check.py's `?` band -- above
-# EXEC_TIME_FLOOR_S, under FLOOR_GATE_MIN_BASELINE_S -- so the ceiling is
-# applied to a denominator the floor gate declines as too small to judge.  Over
-# the 38 CI jobs of 2026-09-03 unchanged code read 2.2x-12.0x across the three
-# hosts and both native backends, crossing the old ceiling of 6 on two of them.
-# 17 clears the widest by 42%.
-#
+# pyre-check: max-pypy-ratio=6
 # A recursion deeper than the inline unroll bound, driven from a loop body.
 #
 # `step` recurses nine frames deep, two past `FBW_MAX_INLINE_RECURSION`, so the

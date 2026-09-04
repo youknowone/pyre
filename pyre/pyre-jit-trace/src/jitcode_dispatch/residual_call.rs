@@ -7306,6 +7306,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // PyPy traces through builtin `getattr` into a property's Python getter.
+    // The ordinary LOAD_ATTR spelling has the same inline route above; keep
+    // the builtin spelling on it too, including lone-surrogate names carried
+    // by PyPy's RPython-string representation.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && let Some(inlined) =
+            try_walker_inline_builtin_getattr_property(ctx, op, code, &r_args, call_descr, dst)?
+    {
+        return Ok(inlined);
+    }
+
     // `getattr(type, name)` whose class-MRO value is returned unchanged:
     // pin receiver, name, and the receiver version, then use the green value.
     // Non-matching shapes fall through to the generic residual.

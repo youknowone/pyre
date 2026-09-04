@@ -11028,11 +11028,11 @@ pub enum TypeAttrBinding {
 ///
 /// # Safety
 /// `w_obj` must be a valid, non-null object pointer.
-unsafe fn instance_dict_does_not_shadow(w_obj: PyObjectRef, name: &str) -> Option<()> {
+unsafe fn instance_dict_does_not_shadow_wtf8(w_obj: PyObjectRef, name: &Wtf8) -> Option<()> {
     if is_instance(w_obj) {
         // Mapdict side storage: the entry lookup reads the map chain and
         // allocates nothing.
-        return crate::objspace::std::mapdict::instance_node_getdictvalue(w_obj, Wtf8::new(name))
+        return crate::objspace::std::mapdict::instance_node_getdictvalue(w_obj, name)
             .is_none()
             .then_some(());
     }
@@ -11052,6 +11052,10 @@ unsafe fn instance_dict_does_not_shadow(w_obj: PyObjectRef, name: &str) -> Optio
     // Adding a layout means adding its non-allocating dictionary peek here and
     // the matching shadowing guard on the tracer side.
     None
+}
+
+unsafe fn instance_dict_does_not_shadow(w_obj: PyObjectRef, name: &str) -> Option<()> {
+    unsafe { instance_dict_does_not_shadow_wtf8(w_obj, Wtf8::new(name)) }
 }
 
 /// The `getattr(w_obj, name)` shape that reduces, purely, to
@@ -11085,6 +11089,19 @@ unsafe fn instance_dict_does_not_shadow(w_obj: PyObjectRef, name: &str) -> Optio
 pub unsafe fn bound_method_attr_fast_path(
     w_obj: PyObjectRef,
     name: &str,
+) -> Option<(PyObjectRef, u64, PyObjectRef, bool)> {
+    unsafe { bound_method_attr_fast_path_wtf8(w_obj, Wtf8::new(name)) }
+}
+
+/// WTF-8-preserving twin of [`bound_method_attr_fast_path`].  Attribute names
+/// in PyPy are RPython strings and may contain lone surrogates; the JIT must
+/// not turn that representational detail into an opaque-call boundary.
+///
+/// # Safety
+/// Same contract as [`bound_method_attr_fast_path`].
+pub unsafe fn bound_method_attr_fast_path_wtf8(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
 ) -> Option<(PyObjectRef, u64, PyObjectRef, bool)> {
     if w_obj.is_null() {
         return None;
@@ -11122,11 +11139,11 @@ pub unsafe fn bound_method_attr_fast_path(
     // only reachable one.
     let owes_shadow_guard = is_instance(w_obj);
     if owes_shadow_guard {
-        instance_dict_does_not_shadow(w_obj, name)?;
+        unsafe { instance_dict_does_not_shadow_wtf8(w_obj, name)? };
     } else if !getdict_backing_native(w_obj).is_null() {
         return None;
     }
-    let w_descr = lookup_in_type(w_type, name)?;
+    let w_descr = unsafe { lookup_in_type_where_wtf8(w_type, name)? };
     // The exact shape `get()` binds through `w_method_new`: a `function` or a
     // `method_descriptor`.  Both take the SAME arm there (the
     // `FUNCTION_TYPE || METHOD_DESCRIPTOR_TYPE` test above `w_method_new`),

@@ -1,11 +1,4 @@
-# pyre-check: max-pypy-ratio=14
-# pypy's execution-only time here lands between EXEC_TIME_FLOOR_S and
-# FLOOR_GATE_MIN_BASELINE_S on nearly every run, the band check.py marks `?`:
-# the ceiling is applied while the floor gate declines the same denominator as
-# too small to judge, and a denominator that size carries its own magnitude as
-# error.  Over the 38 CI jobs of 2026-09-03 unchanged code read 1.6x-9.5x
-# across the three hosts and both native backends, crossing the old ceiling of
-# 6 seven times.  14 clears the widest by 47%.
+# pyre-check: max-pypy-ratio=6
 # The ceiling sits between the two measured states: served this runs 2.6x pypy,
 # and with the arity-2 reader off the loop pays the opaque residual (about 198x
 # when the retired `subscr_specialised_pair` fold was the only reader).

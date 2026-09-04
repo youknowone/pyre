@@ -2228,6 +2228,13 @@ unsafe fn property_descr_fast_path(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    unsafe { property_descr_fast_path_wtf8(w_obj, Wtf8::new(name)) }
+}
+
+unsafe fn property_descr_fast_path_wtf8(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
     let map = unsafe { mapdict_map_or_null(w_obj) };
     if map.is_null() {
         return None;
@@ -2240,7 +2247,7 @@ unsafe fn property_descr_fast_path(
     if version_tag == 0 {
         return None;
     }
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }?;
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(w_type, name) }?;
     // Exact type: the fold calls `fget`/`fset` directly, which stands in for
     // `type(w_descr).__get__` only where that cannot have been overridden
     // (`descroperation.py:169-176`).  A `property` subclass keeps the base
@@ -2269,7 +2276,18 @@ pub unsafe fn property_get_fast_path(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
-    let (w_type, version_tag, w_descr) = unsafe { property_descr_fast_path(w_obj, name) }?;
+    unsafe { property_get_fast_path_wtf8(w_obj, Wtf8::new(name)) }
+}
+
+/// WTF-8-preserving twin of [`property_get_fast_path`].
+///
+/// # Safety
+/// Same contract as [`property_get_fast_path`].
+pub unsafe fn property_get_fast_path_wtf8(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
+    let (w_type, version_tag, w_descr) = unsafe { property_descr_fast_path_wtf8(w_obj, name) }?;
     if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
         return None;
     }

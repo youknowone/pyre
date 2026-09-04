@@ -10831,13 +10831,29 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     }
     // The name is rejected before any lookup unless it is a string, and the
     // resolved bytes below stay valid only while this exact string is the
-    // operand.  A name that is not valid UTF-8 cannot match an attribute the
-    // fold's `&str` lookups can find, so it declines with the rest.
+    // operand.  Keep the WTF-8 view: PyPy's RPython string carries lone
+    // surrogates through the same traced descriptor lookup as ASCII names.
     if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
         return Ok(None);
     }
-    let Ok(name) = (unsafe { pyre_object::w_str_get_wtf8(concrete_name) }).as_str() else {
-        return Ok(None);
+    let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+
+    // Resolve the descriptor case before emitting anything.  A function-valued
+    // class attribute is not a plain class-attribute read: getattr binds it to
+    // the receiver.  PyPy traces that Method allocation and virtualizes it into
+    // the following CALL, so reproduce the same guarded allocation here.
+    let bound_method = unsafe {
+        pyre_interpreter::baseobjspace::bound_method_attr_fast_path_wtf8(concrete_obj, name)
+    };
+    let bound_method = match bound_method {
+        Some((w_type, version_tag, w_descr, true)) => {
+            let Some(shadow) = (unsafe { walker_classify_shadow_guard(concrete_obj) }) else {
+                return Ok(None);
+            };
+            Some((w_type, version_tag, w_descr, Some(shadow)))
+        }
+        Some((w_type, version_tag, w_descr, false)) => Some((w_type, version_tag, w_descr, None)),
+        None => None,
     };
 
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
@@ -10864,6 +10880,27 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
             &[name_ref, name_const],
         )?;
     }
+
+    if let Some((w_type, _version_tag, w_descr, shadow)) = bound_method {
+        walker_emit_constant_descr_bound_method(
+            ctx,
+            op.pc,
+            r_args[2],
+            concrete_obj,
+            w_type,
+            w_descr,
+            shadow,
+            dst,
+            'r',
+        )?;
+        return Ok(Some(()));
+    }
+
+    let Ok(name) = name.as_str() else {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    };
 
     // Every shape the read declines has to leave the trace as it found it: the
     // two guards above are the premise of a fold that is no longer there, and
