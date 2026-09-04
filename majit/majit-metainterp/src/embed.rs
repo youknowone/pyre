@@ -80,6 +80,11 @@ static LAST_ALWAYS_FAILS: AtomicBool = AtomicBool::new(false);
 /// threads at once.
 static WINDOW_LOCK: Mutex<()> = Mutex::new(());
 
+/// The opcode list of every loop compiled since the last [`Census::begin`] or
+/// [`Census::reset`], in compile order. An RCA instrument: the counters above
+/// say HOW MANY ops a trace kept, this says WHICH.
+static COMPILED_OPCODE_LOG: Mutex<Vec<Vec<majit_ir::OpCode>>> = Mutex::new(Vec::new());
+
 /// One reading of what the JIT did.
 ///
 /// Every field except the two `last_*` ones is a count over the window it was
@@ -213,6 +218,7 @@ impl Census {
             TRACE_OPS_BEFORE.fetch_add(ops_before, Ordering::Relaxed);
             TRACE_OPS_AFTER.fetch_add(ops_after, Ordering::Relaxed);
             LAST_OPS_AFTER.store(ops_after, Ordering::Relaxed);
+            COMPILED_OPCODE_LOG.lock().push(opcodes.to_vec());
             let shape = LoopBodyShape::of(opcodes);
             LAST_HAS_JUMP.store(shape.has_jump, Ordering::Relaxed);
             LAST_ALWAYS_FAILS.store(shape.has_always_fails, Ordering::Relaxed);
@@ -245,6 +251,7 @@ impl Census {
         LAST_OPS_AFTER.store(0, Ordering::Relaxed);
         LAST_HAS_JUMP.store(false, Ordering::Relaxed);
         LAST_ALWAYS_FAILS.store(false, Ordering::Relaxed);
+        COMPILED_OPCODE_LOG.lock().clear();
         Self {
             base: RawCounts::read(),
             aborts_before: abort_reasons(),
@@ -328,6 +335,12 @@ impl Census {
         }
         LAST_HAS_JUMP.store(false, Ordering::Relaxed);
         LAST_ALWAYS_FAILS.store(false, Ordering::Relaxed);
+        COMPILED_OPCODE_LOG.lock().clear();
+    }
+
+    /// A copy of the opcode log -- see [`COMPILED_OPCODE_LOG`].
+    pub fn compiled_opcode_log() -> Vec<Vec<majit_ir::OpCode>> {
+        COMPILED_OPCODE_LOG.lock().clone()
     }
 }
 

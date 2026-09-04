@@ -284,10 +284,11 @@ pub(crate) unsafe fn dealloc_off_gc_block(base: *mut u8, total: usize) {
 
 /// Zero-fill a frame the collector handed back.
 ///
-/// RPython's nursery is zeroed once per reset, so `lltype.malloc(JITFRAME)`
-/// returns cleared memory and `GuardNotForced` can read `jf_descr != 0`.
-/// Ours is not, so a fresh frame is cleared here. Old-gen arenas recycle
-/// bytes the same way.
+/// RPython's `gen_malloc_frame` initializes the fixed fields itself; its
+/// native nursery reset uses `arena_reset(..., 0)` and does not clear recycled
+/// bytes. This conservative allocator remains for callers whose initialization
+/// contract has not yet been narrowed to those fields. Old-gen arenas recycle
+/// bytes too.
 fn zeroed_gc_frame(gcref: majit_ir::GcRef, size_bytes: usize) -> *mut JitFrame {
     assert!(!gcref.is_null(), "JITFRAME allocation failed");
     unsafe { std::ptr::write_bytes(gcref.0 as *mut u8, 0, size_bytes) };
@@ -314,6 +315,35 @@ fn alloc_gc_jitframe(
         gc.alloc_nursery_no_collect_typed(type_id, size_bytes)
     };
     zeroed_gc_frame(gcref, size_bytes)
+}
+
+fn entry_gc_frame(gcref: majit_ir::GcRef) -> *mut JitFrame {
+    assert!(!gcref.is_null(), "JITFRAME allocation failed");
+    let frame = gcref.0 as *mut JitFrame;
+    unsafe { std::ptr::write_bytes(frame, 0, 1) };
+    frame
+}
+
+/// Allocate a compiled-entry frame without clearing its trailing spill slots.
+///
+/// Entry code writes every live slot before reading it or publishing it through
+/// a GC map. [`JitFrame::init`] supplies the fixed-field initialization that
+/// RPython emits in `rewrite.py`'s `gen_malloc_frame`.
+pub fn malloc_entry_jitframe(
+    gc: &mut dyn majit_gc::GcAllocator,
+    size_bytes: usize,
+) -> *mut JitFrame {
+    match gc.jitframe_type_id() {
+        Some(type_id) => {
+            let gcref = if jitframe_prefer_oldgen() {
+                gc.alloc_oldgen_typed(type_id, size_bytes)
+            } else {
+                gc.alloc_nursery_typed(type_id, size_bytes)
+            };
+            entry_gc_frame(gcref)
+        }
+        None => malloc_host_jitframe(size_bytes),
+    }
 }
 
 /// `llmodel.py:298` `frame = self.gc_ll_descr.malloc_jitframe(frame_info)`,
@@ -518,15 +548,14 @@ impl JitFrame {
 
     /// jitframe.py — jitframe_allocate.
     ///
-    /// Initialize a freshly-allocated (zero-filled) JitFrame at `ptr`.
+    /// Initialize a freshly-allocated JitFrame at `ptr`.
     /// Caller is responsible for allocation (nursery or malloc).
     ///
     /// # Safety
-    /// `ptr` must point to at least `alloc_size(depth)` zero-filled bytes.
+    /// `ptr` must point to at least `alloc_size(depth)` writable bytes with a
+    /// zero-filled fixed header. Trailing slots need not be initialized yet.
     pub unsafe fn init(ptr: *mut JitFrame, info: *const JitFrameInfo, depth: usize) {
         unsafe {
-            // RPython: frame.jf_frame_info = frame_info
-            // (other fields are zero from malloc)
             (*ptr).jf_frame_info = info;
             // Write the jf_frame array length
             let len_ptr = (ptr as *mut u8).add(JF_FRAME_OFS) as *mut isize;
@@ -806,6 +835,33 @@ where
 mod tests {
     use super::*;
     use majit_gc::GcAllocator;
+
+    #[test]
+    fn entry_init_clears_the_header_without_touching_frame_slots() {
+        let depth = 4;
+        let words = JitFrame::alloc_size(depth) / std::mem::size_of::<usize>();
+        let mut storage = vec![usize::MAX; words];
+        let frame = entry_gc_frame(majit_ir::GcRef(storage.as_mut_ptr() as usize));
+        let info = JitFrameInfo::default();
+
+        unsafe { JitFrame::init(frame, &info, depth) };
+
+        unsafe {
+            assert_eq!((*frame).jf_frame_info, &info);
+            assert_eq!((*frame).jf_descr, 0);
+            assert_eq!((*frame).jf_force_descr, 0);
+            assert!((*frame).jf_gcmap.is_null());
+            assert_eq!((*frame).jf_savedata, 0);
+            assert_eq!((*frame).jf_guard_exc, 0);
+            assert!((*frame).jf_forward.is_null());
+            assert_eq!(JitFrame::frame_length(frame), depth as isize);
+            assert!(
+                JitFrame::frame_slots(frame, depth)
+                    .iter()
+                    .all(|&slot| slot == -1)
+            );
+        }
+    }
 
     /// The emitted write-barrier fast path loads one byte at
     /// `jit_wb_if_flag_byteofs` from the frame pointer, and that offset is

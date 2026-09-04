@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use majit_backend::deadframe::{ExitDescr, JitFrameDeadFrame};
 use majit_backend::jitframe::{
     HostHeapGc, check_jitframe_descr, jitframe_is_gc_object, jitframe_write_barrier,
-    malloc_jitframe, malloc_jitframe_no_collect,
+    malloc_entry_jitframe, malloc_jitframe, malloc_jitframe_no_collect,
 };
 use majit_backend::libc_deadframe::LibcJitFrameDeadFrame;
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
@@ -333,7 +333,7 @@ fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bo
         } else {
             EntryArgRoots::new()
         };
-        (malloc_jitframe(gc, size_bytes), gc_object, roots)
+        (malloc_entry_jitframe(gc, size_bytes), gc_object, roots)
     })
 }
 
