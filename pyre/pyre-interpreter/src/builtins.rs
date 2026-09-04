@@ -13515,9 +13515,14 @@ fn nonascii_bytes_literal_span(source: &str, raw_index: usize) -> Option<(usize,
 fn incompatible_string_prefix_error(
     source: &str,
     raw_index: usize,
+    tokenizer_stop: Option<usize>,
 ) -> Option<(String, usize, usize)> {
     let bytes = source.as_bytes();
-    first_string_prefix_pair_error(bytes, raw_index.min(bytes.len()))
+    first_string_prefix_pair_error(
+        bytes,
+        raw_index.min(bytes.len()),
+        tokenizer_stop.map(|stop| stop.min(bytes.len())),
+    )
 }
 
 /// The first string token in `bytes` whose prefix is an incompatible pair.
@@ -13534,23 +13539,44 @@ fn incompatible_string_prefix_error(
 /// that field rather than by the tokenizer, so it only stands where it
 /// precedes the error already reported at `anchor`: `s = f'{ub"y"}'; f() = 1`
 /// names the prefix and `f() = 1; s = f'{ub"y"}'` names the assignment.
-fn first_string_prefix_pair_error(bytes: &[u8], anchor: usize) -> Option<(String, usize, usize)> {
-    /// One literal the walk is inside, and how many braces are open in it --
-    /// a replacement field, and any display written within that field.
+fn first_string_prefix_pair_error(
+    bytes: &[u8],
+    anchor: usize,
+    tokenizer_stop: Option<usize>,
+) -> Option<(String, usize, usize)> {
+    /// One replacement field inside an interpolated literal.  Delimiters are
+    /// the expression's own displays/calls/subscripts; an empty stack is what
+    /// makes `:` enter the format specification rather than a slice or dict.
+    struct ReplacementField {
+        delimiters: Vec<u8>,
+        format_spec: bool,
+    }
+
+    /// One literal the walk is inside, plus the nested replacement fields the
+    /// tokenizer has entered.  A format specification is literal text until
+    /// another `{` opens its own replacement field.
     struct OpenLiteral {
         delimiter: u8,
         triple: bool,
         interpolated: bool,
-        braces: usize,
+        fields: Vec<ReplacementField>,
     }
 
     let mut open: Vec<OpenLiteral> = Vec::new();
     let mut cursor = 0;
     while cursor < bytes.len() {
+        if tokenizer_stop.is_some_and(|stop| cursor > stop) {
+            return None;
+        }
         let byte = bytes[cursor];
-        // The innermost literal's own text, unless a brace of it is open --
-        // inside one the walk is reading tokens again.
-        if let Some(literal) = open.last_mut().filter(|literal| literal.braces == 0) {
+        // The innermost literal's own text, or the literal format-spec text of
+        // its current field.  A nested replacement field switches back to
+        // token mode until its own `}`.
+        if let Some(literal) = open
+            .last_mut()
+            .filter(|literal| literal.fields.last().is_none_or(|field| field.format_spec))
+        {
+            let in_format_spec = !literal.fields.is_empty();
             match byte {
                 // A backslash closes no literal, raw included: `r'\''` keeps
                 // the escape in its text and the quote after it in the token.
@@ -13565,14 +13591,26 @@ fn first_string_prefix_pair_error(bytes: &[u8], anchor: usize) -> Option<(String
                 }
                 b'\\' => cursor += 2,
                 b'\n' if !literal.triple => return None,
-                // `{{` and `}}` each write one brace and open no field.
+                // `{{` in the outer literal writes one brace.  In a format
+                // specification every `{` starts the nested replacement field
+                // that makes its contents tokenized expression text.
                 b'{' if literal.interpolated => {
-                    let doubled = bytes.get(cursor + 1) == Some(&b'{');
+                    let doubled = !in_format_spec && bytes.get(cursor + 1) == Some(&b'{');
                     cursor += 1 + usize::from(doubled);
-                    literal.braces += usize::from(!doubled);
+                    if !doubled {
+                        literal.fields.push(ReplacementField {
+                            delimiters: Vec::new(),
+                            format_spec: false,
+                        });
+                    }
                 }
                 b'}' if literal.interpolated => {
-                    cursor += 1 + usize::from(bytes.get(cursor + 1) == Some(&b'}'));
+                    if in_format_spec {
+                        literal.fields.pop();
+                        cursor += 1;
+                    } else {
+                        cursor += 1 + usize::from(bytes.get(cursor + 1) == Some(&b'}'));
+                    }
                 }
                 _ if byte == literal.delimiter => {
                     if literal.triple && !bytes[cursor..].starts_with(&[byte; 3]) {
@@ -13587,21 +13625,48 @@ fn first_string_prefix_pair_error(bytes: &[u8], anchor: usize) -> Option<(String
             continue;
         }
         match byte {
-            // A comment runs to the end of its line.  Only outside a literal:
-            // what a replacement field writes is not one.
-            b'#' if open.is_empty() => {
+            // A comment runs to the end of its line both at module level and
+            // in a replacement expression.  Literal and format-spec text took
+            // the branch above and never reaches this token-mode arm.
+            b'#' => {
                 cursor = bytes[cursor..]
                     .iter()
                     .position(|byte| *byte == b'\n')
                     .map_or(bytes.len(), |newline| cursor + newline + 1);
             }
-            b'{' | b'}' => {
-                if let Some(literal) = open.last_mut() {
-                    literal.braces = if byte == b'{' {
-                        literal.braces + 1
-                    } else {
-                        literal.braces - 1
+            b'(' | b'[' | b'{' => {
+                if let Some(field) = open
+                    .last_mut()
+                    .and_then(|literal| literal.fields.last_mut())
+                {
+                    field.delimiters.push(byte);
+                }
+                cursor += 1;
+            }
+            b')' | b']' | b'}' => {
+                if let Some(literal) = open.last_mut()
+                    && let Some(field) = literal.fields.last_mut()
+                {
+                    let opening = match byte {
+                        b')' => b'(',
+                        b']' => b'[',
+                        _ => b'{',
                     };
+                    if field.delimiters.last() == Some(&opening) {
+                        field.delimiters.pop();
+                    } else if byte == b'}' && field.delimiters.is_empty() {
+                        literal.fields.pop();
+                    }
+                }
+                cursor += 1;
+            }
+            b':' => {
+                if let Some(field) = open
+                    .last_mut()
+                    .and_then(|literal| literal.fields.last_mut())
+                    && field.delimiters.is_empty()
+                {
+                    field.format_spec = true;
                 }
                 cursor += 1;
             }
@@ -13621,7 +13686,7 @@ fn first_string_prefix_pair_error(bytes: &[u8], anchor: usize) -> Option<(String
                     delimiter: byte,
                     triple,
                     interpolated,
-                    braces: 0,
+                    fields: Vec::new(),
                 });
                 cursor += if triple { 3 } else { 1 };
             }
@@ -15230,7 +15295,41 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     }
     let prefix_error = match &e {
         crate::compile::CompileError::Parse(parse_error) => {
-            incompatible_string_prefix_error(source, parse_error.raw_location.start().to_usize())
+            let raw_index = parse_error.raw_location.start().to_usize();
+            // A fatal tokenizer error means no later token exists.  Ruff still
+            // leaves the remaining source available to this diagnostic pass,
+            // so bound the recovery walk at the error it actually reported.
+            // Grammar errors are different: CPython tokenizes the whole input
+            // before parsing it, and a later incompatible prefix can therefore
+            // precede an earlier assignment error.
+            let tokenizer_stopped = parse_error.is_unclosed_bracket
+                || matches!(
+                    &parse_error.error,
+                    ParseErrorType::Lexical(_)
+                        | ParseErrorType::FStringError(_)
+                        | ParseErrorType::TStringError(_)
+                )
+                || matches!(
+                    &parse_error.error,
+                    ParseErrorType::OtherError(message)
+                        if message.starts_with("unmatched ")
+                            || message.starts_with("closing parenthesis ")
+                )
+                // Ruff recovers some malformed number tokens into an
+                // `OtherError` parser shape, but the CPython-shaped message
+                // above has already identified the tokenizer failure.
+                || matches!(
+                    msg.as_str(),
+                    "invalid decimal literal"
+                        | "invalid hexadecimal literal"
+                        | "invalid octal literal"
+                        | "invalid binary literal"
+                );
+            incompatible_string_prefix_error(
+                source,
+                raw_index,
+                tokenizer_stopped.then_some(raw_index),
+            )
         }
         _ => None,
     };

@@ -1289,15 +1289,22 @@ pub(super) fn make_at_address(
     inst
 }
 
-/// Whether a simple-code write has to retain the value it stored.
+/// The object a simple-code write has to retain for the bytes it stored.
 ///
 /// `"O"` writes the word `pyobj_container` hands back, and the container holds
-/// only a weakref, so the buffer is the sole reference to that object -- which
-/// is why `O_set` returns a new reference for `PyCData_set` to keep.  A CData
-/// value is retained for the same reason: the write copied its buffer out and
-/// left no other owner.
-pub(super) fn value_needs_keep(tc: &str, value: PyObjectRef) -> bool {
-    tc == "O" || is_cdata_instance(value)
+/// only a weakref where it can.  CPython's `O_set` returns the actual referent
+/// for `PyCData_set` to keep, including when the input was another `py_object`;
+/// retaining that wrapper would not retain the slot it copied.  `None` needs no
+/// entry because PyPy's `GlobalPyobjContainer.add` already stores it strongly
+/// and CPython leaves the destination's `_objects` unset.  Other CData values
+/// keep the existing behavior: the write copied their buffer out and left no
+/// other owner.
+pub(super) fn value_for_keep(tc: &str, value: PyObjectRef, stored: &[u8]) -> Option<PyObjectRef> {
+    if tc == "O" {
+        let referent = pyobj_container_get(host_ctypes::read_pointer_from_buffer(stored))?;
+        return (!unsafe { pyre_object::is_none(referent) }).then_some(referent);
+    }
+    is_cdata_instance(value).then_some(value)
 }
 
 /// Keep `obj` alive for the lifetime of the buffer that `anchor` views, by

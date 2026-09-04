@@ -336,6 +336,9 @@ for source, message, position in (
     # visible to f-string parsing.  CPython 3.14's tokenizer therefore reads
     # the first replacement field, while doubled braces below stay literal.
     ("f'\\{bu\"x\"}'", "'u' and 'b' prefixes are incompatible", (1, 5, 1, 7)),
+    # A nested replacement inside a format specification switches back from
+    # literal format text to tokenized expression text.
+    ("f'''{1:{bu\"x\"}}'''", "'u' and 'b' prefixes are incompatible", (1, 9, 1, 11)),
     # The tokenizer does not read a comment, so neither does the scan.
     ("x = = 1  # bu'z'", "invalid syntax", (1, 5, 1, 6)),
 ):
@@ -355,6 +358,32 @@ source = "f'\\{{ bu\"x\" }}'; 1=2"
 error = syntax_error(source)
 assert error.msg == "cannot assign to literal here. Maybe you meant '==' instead of '='?"
 assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (1, 18, 1, 19)
+
+# Format specifications are literal text, and comments disappear from the
+# token stream of a replacement expression.  Prefix-shaped text in either one
+# cannot override the later assignment diagnostic.
+for source, position in (
+    ("f'''{1:bu\"x\"}'''; 1 = 2", (1, 19, 1, 20)),
+    ("f'''{1 # bu\"x\"\n}'''; 1 = 2", (2, 7, 2, 8)),
+):
+    error = syntax_error(source)
+    assert error.msg == "cannot assign to literal here. Maybe you meant '==' instead of '='?"
+    assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == position
+
+# A fatal tokenizer error stops before the later prefix-shaped literal.  A
+# grammar error does not: its whole token stream was already read, as the
+# `f() = bu'x'` cases above demonstrate.
+for source, message, position in (
+    ("0x\nbu'x'", "invalid hexadecimal literal", (1, 2, 1, 2)),
+    (
+        "(]\nbu'x'",
+        "closing parenthesis ']' does not match opening parenthesis '('",
+        (1, 2, 1, 2),
+    ),
+):
+    error = syntax_error(source)
+    assert error.msg == message, (source, error.msg)
+    assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == position
 
 
 # `eval` is `expressions NEWLINE* ENDMARKER` and has no assignment rule at all,
