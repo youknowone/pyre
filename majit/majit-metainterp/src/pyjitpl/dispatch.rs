@@ -4474,73 +4474,26 @@ where
                     let frame = self.frames.current_mut();
                     frame.read_getfield_gc()
                 };
-                let (offset, field_size, is_field_signed, is_substruct, fielddescr) = {
+                let (offset, field_size, is_field_signed, fielddescr) = {
                     let frame = self.frames.current_mut();
                     let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                         panic!("BC_GETFIELD_GC: descrs[{descr_idx}] is not a BhDescr entry")
                     });
-                    let (field_size, is_field_signed, is_substruct) = match bh {
+                    let (field_size, is_field_signed) = match bh {
                         crate::blackhole::BhDescr::Field {
                             field_size,
                             is_field_signed,
-                            field_flag,
                             ..
-                        } => (
-                            *field_size,
-                            *is_field_signed,
-                            *field_flag == majit_ir::descr::ArrayFlag::Struct,
-                        ),
-                        _ => (8, false, false),
+                        } => (*field_size, *is_field_signed),
+                        _ => (8, false),
                     };
                     let offset = field_offset_from_bh(bh, "BC_GETFIELD_GC");
                     let fielddescr = frame
                         .runtime_optimizer_descr(descr_idx)
                         .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
-                    (
-                        offset,
-                        field_size,
-                        is_field_signed,
-                        is_substruct,
-                        fielddescr,
-                    )
+                    (offset, field_size, is_field_signed, fielddescr)
                 };
                 let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
-                // `descr.py FLAG_STRUCT`: the field IS a substructure laid out
-                // inline at `offset`, so a reference to it is that address and
-                // not the word stored there. `CpuModel::bh_getfield_gc_r`
-                // answers the same way; the arithmetic is recorded rather than
-                // folded into one op because no `getfield` an optimizer or a
-                // backend sees would then mean a load.
-                if is_ref && is_substruct {
-                    let addr = struct_ptr.wrapping_add(offset as i64);
-                    let base_int = ctx.execute_and_record(
-                        Some(self.cpu.as_ref()),
-                        OpCode::CastPtrToInt,
-                        None,
-                        &[struct_opref],
-                        Some(Value::Int(struct_ptr)),
-                        self.last_exception_value,
-                    );
-                    let offset_const = ctx.const_int(offset as i64);
-                    let sum = ctx.execute_and_record(
-                        Some(self.cpu.as_ref()),
-                        OpCode::IntAdd,
-                        None,
-                        &[base_int, offset_const],
-                        Some(Value::Int(addr)),
-                        self.last_exception_value,
-                    );
-                    let op = ctx.execute_and_record(
-                        Some(self.cpu.as_ref()),
-                        OpCode::CastIntToPtr,
-                        None,
-                        &[sum],
-                        Some(Value::Ref(majit_ir::GcRef(addr as usize))),
-                        self.last_exception_value,
-                    );
-                    self.set_ref_reg(dest, Some(op), Some(addr));
-                    return TraceAction::Continue;
-                }
                 // blackhole.py:1432-1443 reads the field through the fielddescr,
                 // which carries the field's byte width; a sub-word integer field
                 // (`Char`/`Bool`/`INT` narrower than a word) must be read at that

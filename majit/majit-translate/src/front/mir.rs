@@ -11947,11 +11947,11 @@ impl<'a> Lowering<'a> {
             )
             && crate::front::checked_arith::is_checked_arith_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
-            && let Some(operand_ty) = first_arg_ty
+            && let Some(operand_atom) = first_arg_ty
                 .as_ref()
                 .or(second_arg_ty.as_ref())
-                .map(|t| tyref_to_value_type(t, self.llbc))
-            && operand_ty == ValueType::Unsigned
+                .and_then(|t| self.tyref_literal_uint_atom(t))
+            && checked_arith_uint_atom_is_word_sized(operand_atom)
             && let Some(site) = self.recognize_checked_arith_uint_site(&call.dest.ty, &result_var)
         {
             self.checked_arith_uint_sites.push(site);
@@ -18031,6 +18031,14 @@ impl<'a> Lowering<'a> {
             self.block_entry_positional_aggregate_locals[target_bb].remove(&local_idx);
         }
     }
+}
+
+/// The unsigned checked-arithmetic pass uses one machine-word operation and
+/// its carry/borrow test.  Charon's flattened [`ValueType::Unsigned`] erases
+/// the source width, so retain the literal atom at the capture gate: a narrow
+/// `u8`/`u16`/`u32` overflow is not necessarily a word overflow.
+fn checked_arith_uint_atom_is_word_sized(atom: &str) -> bool {
+    matches!(atom, "U64") || (atom == "Usize" && crate::layout::target_word_size() == 8)
 }
 
 /// Which PBC family an `OpKind::IndirectCall` through a bare function
@@ -28220,12 +28228,25 @@ mod tests {
     use super::{
         DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
         cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
-        decode_literal, fn_ptr_family_for, json_ty_is_thin_pointer_element,
-        json_ty_scalar_element_spelling, push_ptr_to_unsigned_cast, shaped_array_parts,
-        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr, tyref_to_value_type,
+        checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
+        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
+        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
+        tyref_is_raw_byte_ptr, tyref_to_value_type,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
+
+    #[test]
+    fn checked_unsigned_capture_rejects_narrow_integer_atoms() {
+        for atom in ["U8", "U16", "U32", "U128"] {
+            assert!(!checked_arith_uint_atom_is_word_sized(atom));
+        }
+        assert!(checked_arith_uint_atom_is_word_sized("U64"));
+        assert_eq!(
+            checked_arith_uint_atom_is_word_sized("Usize"),
+            crate::layout::target_word_size() == 8
+        );
+    }
 
     #[test]
     fn numeric_bank_crossing_casts_preserve_the_builtin_owner() {

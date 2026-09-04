@@ -462,9 +462,6 @@ pub struct Transformer<'a> {
     /// RPython: DependencyTracker — caches transitive analysis results.
     /// Shared across all getcalldescr() calls within this transform pass.
     analysis_cache: crate::call::AnalysisCache,
-    /// Results consumed as explicit arguments by a direct or indirect call in
-    /// the graph before call lowering rewrites those operations.
-    call_argument_vars: Vec<crate::flowspace::model::Variable>,
 }
 
 /// RPython: jtransform.py vable_flags values
@@ -969,7 +966,6 @@ impl<'a> Transformer<'a> {
             vable_rewrites: 0,
             calls_classified: 0,
             analysis_cache: crate::call::AnalysisCache::default(),
-            call_argument_vars: Vec::new(),
         }
     }
 
@@ -1059,18 +1055,6 @@ impl<'a> Transformer<'a> {
         // this spine keeps them to the codewriter, where each is a
         // symbolic residual no host symbol backs.
         crate::codewriter::iter_lower::lower_iterators(&mut rewritten);
-
-        self.call_argument_vars = rewritten
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .filter_map(|op| match &op.kind {
-                OpKind::Call { args, .. } | OpKind::IndirectCall { args, .. } => Some(args),
-                _ => None,
-            })
-            .flatten()
-            .cloned()
-            .collect();
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
@@ -3441,16 +3425,14 @@ impl<'a> Transformer<'a> {
             };
             return RewriteResult::Identity(base.clone());
         }
-        if inline_substruct_offset.is_some()
-            && op
-                .result
-                .as_ref()
-                .is_some_and(|result| self.call_argument_vars.contains(result))
-        {
+        if inline_substruct_offset.is_some() {
             // `jtransform.py rewrite_op_getsubstruct` refuses GC
-            // substructures during translation. Pyre must still resolve the
-            // portal graph, so defer the same refusal to a result-less runtime
-            // abort; the enclosing call then remains residual.
+            // substructures during translation.  A nonzero-offset interior
+            // address cannot enter the Ref bank even when it is only carried
+            // across blocks: the GC map would treat it as an independently
+            // movable object and lose the owning allocation. Pyre must still
+            // resolve the portal graph, so defer the same refusal to a
+            // result-less runtime abort; the enclosing call remains residual.
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
