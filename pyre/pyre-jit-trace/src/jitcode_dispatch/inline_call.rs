@@ -830,6 +830,30 @@ impl std::fmt::Display for DescentDecline {
     }
 }
 
+/// Kill switch for the scan above: `PYRE_FBW_DESCENT_SCAN_OFF=1` lets the
+/// descent run into the symbolic call and abort there instead of declining
+/// before it starts.
+///
+/// The same shape and the same reason as `PYRE_WALKABORT_OFF` in
+/// `trace.rs`: the scan decides, for every builtin the walker might descend
+/// into, whether the descent happens at all, and its cost is invisible in
+/// output — a declined descent is a correct answer that is merely slower.
+/// One binary and one env var is the only way to weigh what the
+/// conservatism buys against what it costs.
+///
+/// Graded over the 561 `__pyre_wrap_*` gateway wrappers, 448 of the 487 the
+/// scan declines block on a call no complete path through the descent
+/// executes, so what this switch measures is mostly the price of a static
+/// answer to a dynamic question. It is a diagnostic, not a tuning knob:
+/// the scan is on unless it is explicitly turned off, because the rewind it
+/// prevents is a wrong answer and not a slow one. The attempted rollback
+/// compiles `test_pickle` writes to an empty payload and changes
+/// `test_hashlib`'s bytes argument into a string.
+fn descent_unlowered_helper_scan_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DESCENT_SCAN_OFF").is_none())
+}
+
 /// Print every un-lowered helper the descent into `jitcode_index` could reach,
 /// once per body, under `PYRE_FBW_INLINE_DIAG`.
 ///
@@ -5030,7 +5054,6 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             // ordinary residual, so it is not an abort and leaves the body
             // eligible.  Reaching here does not: the walk stops, and the next
             // attempt would rebuild the same shape and stop again.
-            deny_descent(jitcode.index());
             if let DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic } = &error {
                 if fbw_inline_diag_enabled() {
                     eprintln!(
