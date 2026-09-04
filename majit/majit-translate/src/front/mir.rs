@@ -13442,10 +13442,14 @@ impl<'a> Lowering<'a> {
     /// (`slice_first`'s payload note: the front has no pointer-to-slot op, so a
     /// `.first()` payload is already the element VALUE, and `Option<&T>` /
     /// `Option<T>` share the niche discriminant + one-word representation), so
-    /// all three are identities on the receiver.  `as_ref` is additionally
-    /// gated to a pointer-niche receiver and destination: an arbitrary
-    /// `Option<T>` can be wider than `Option<&T>` and must keep its real
-    /// projection.  Without the intercept the call keeps a
+    /// all three are identities on the receiver.  All three are gated to a
+    /// pointer-niche receiver and destination: an arbitrary `Option<T>` can be
+    /// wider than `Option<&T>` and must keep its real projection.  A nominal
+    /// `Copy`/`Clone` struct is what separates the two for `copied` / `cloned`
+    /// -- `Option<&Foo>` is one nullable word while `Option<Foo>` is a
+    /// discriminant plus the fields, so aliasing the destination to the
+    /// receiver would have later projections read the payload at the wrong
+    /// representation.  Without the intercept the call keeps a
     /// `CallTarget::Method` (`as_ref`/`copied`/`cloned`) getattr the rtyper
     /// cannot route on the classdef-less `Option` receiver (the `getattr
     /// (opt, "copied")` census wall — e.g. `_codecs::lookup_codec`'s
@@ -13453,11 +13457,15 @@ impl<'a> Lowering<'a> {
     /// `positional.first().copied()`).  Bind the destination to the receiver
     /// instead, the same alias shape as `to_string` / `NonNull::as_ptr`.
     ///
-    /// Gated on BOTH the receiver and the destination being `Option`: a
-    /// slice/iterator `.copied()` or a `Vec::clone` — a real copy, not an
-    /// identity — has a non-`Option` receiver/dest and keeps its ordinary
-    /// lowering.  (`Option::clone` on a `Copy` payload is itself an identity, so
-    /// the `cloned` arm is sound for the `Option` family.)
+    /// Gated on BOTH the receiver and the destination: a slice/iterator
+    /// `.copied()` or a `Vec::clone` — a real copy, not an identity — has a
+    /// non-`Option` receiver/dest, which the niche predicate rejects on its
+    /// first line, and keeps its ordinary lowering.  (`Option::clone` on a
+    /// `Copy` payload is itself an identity, so the `cloned` arm is sound for
+    /// the `Option` family.)  The receiver is peeled first because `as_ref`
+    /// takes `&Option<T>` while `copied` / `cloned` take the `Option<&T>` by
+    /// value; [`Self::tyref_peel_ref_to_pointee`] returns a non-reference
+    /// unchanged.
     fn is_option_value_identity(
         &self,
         reg: &RegularCall,
@@ -13483,9 +13491,6 @@ impl<'a> Lowering<'a> {
         });
         if !receiver_is_option {
             return false;
-        }
-        if leaf != "as_ref" {
-            return crate::front::result_exc::tyref_is_option(dest_ty, self.llbc);
         }
         let Some(receiver_ty) = first_arg_ty.and_then(|ty| self.tyref_peel_ref_to_pointee(ty))
         else {

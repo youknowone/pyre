@@ -4298,32 +4298,26 @@ pub(crate) fn fbw_binop_rewind_refuse_commit<Sym: WalkSym>(
         return Ok(());
     }
     // A write into an object the region itself allocated is not a write the
-    // cut has to undo — see [`WalkSession::binop_rewind_fresh`].  The
-    // heap-cache reading is asked as well as the membership: `new_object`
-    // raises `HF_IS_UNESCAPED` on the allocation and `escape_box` lowers it,
-    // so an entry that has since been handed to something outside the region
-    // stops answering here without the list having to track the handoff.
+    // cut has to undo — see [`WalkSession::binop_rewind_fresh_from`].  The
+    // position separates an allocation of this region from one the walk made
+    // before it; the heap cache answers the rest, since `new_object` raises
+    // `HF_IS_UNESCAPED` on the allocation and `escape_box` lowers it, so an
+    // object since handed to something outside the region stops answering
+    // here.  A constant or an input arg is neither; matching the `*Op`
+    // variants keeps `raw()` off the inline-`Const` variants it panics on.
     if let Some(obj) = receiver
-        && session.binop_rewind_fresh.contains(&obj)
+        && let Some(from) = session.binop_rewind_fresh_from
+        && matches!(
+            obj,
+            OpRef::IntOp(_) | OpRef::FloatOp(_) | OpRef::RefOp(_) | OpRef::VoidOp(_)
+        )
+        && obj.raw() >= from
         && ctx.trace_ctx.heap_cache().is_unescaped(obj)
     {
         return Ok(());
     }
     session.binop_rewind_refused = true;
     Err(DispatchError::callee_inline_unsupported(pc))
-}
-
-/// Record an allocation the standing `BINARY_OP` / `COMPARE_OP` rewind region
-/// minted, so a store into it is exempt from
-/// [`fbw_binop_rewind_refuse_commit`].  A no-op outside a region.
-pub(crate) fn fbw_binop_rewind_note_fresh<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    opref: OpRef,
-) {
-    let mut session = ctx.session.borrow_mut();
-    if session.binop_rewind_depth != 0 {
-        session.binop_rewind_fresh.push(opref);
-    }
 }
 
 /// Raises a [`fbw_binop_rewind_refuse_commit`] region for one descent.
@@ -4335,7 +4329,11 @@ pub(crate) struct BinopRewindInlineGuard<'s> {
 }
 
 impl<'s> BinopRewindInlineGuard<'s> {
-    pub(crate) fn enter(session: &'s std::cell::RefCell<WalkSession>) -> Self {
+    /// `from` is the recorder position the region starts at — see
+    /// [`WalkSession::binop_rewind_fresh_from`].  A nested entry keeps the
+    /// outermost one's, so an allocation of the enclosing region stays exempt
+    /// while the inner descent runs.
+    pub(crate) fn enter(session: &'s std::cell::RefCell<WalkSession>, from: u32) -> Self {
         let mut s = session.borrow_mut();
         let outermost = s.binop_rewind_depth == 0;
         // The outermost entry starts from a clean slate, so a flag left behind
@@ -4343,7 +4341,7 @@ impl<'s> BinopRewindInlineGuard<'s> {
         // this one's refusal.
         if outermost {
             s.binop_rewind_refused = false;
-            s.binop_rewind_fresh.clear();
+            s.binop_rewind_fresh_from = Some(from);
         }
         s.binop_rewind_depth += 1;
         drop(s);
@@ -4372,7 +4370,7 @@ impl Drop for BinopRewindInlineGuard<'_> {
         let mut s = self.session.borrow_mut();
         s.binop_rewind_depth -= 1;
         if s.binop_rewind_depth == 0 {
-            s.binop_rewind_fresh.clear();
+            s.binop_rewind_fresh_from = None;
         }
     }
 }

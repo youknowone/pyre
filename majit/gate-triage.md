@@ -223,7 +223,7 @@ cover the condition they diagnose.
 
 - Read sites: 1 — `majit/majit-gc/src/collector.rs`
 - Accessor: `read_uint_from_env("MAJIT_GC_BH_PROBE_CLASSES")`, default 10
-- What it does: How many distinct classes the probe above reports. Reached through a name-taking helper rather than a literal `env::var`, which is why the completeness brake in `pyre/pyrex/tests/gate_triage_complete.rs` does not see it — it is listed here because this document, not the brake, is what claims to hold every live gate.
+- What it does: How many distinct classes the probe above reports.
 - Retirement condition: with `MAJIT_GC_BH_PROBE`, whose report it shapes.
 
 ### `MAJIT_GC_BH_PROBE_MINOR`

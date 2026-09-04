@@ -2967,47 +2967,42 @@ fn binop_nested_filter_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_BINOP_NO_NESTED_INLINE").is_some())
 }
 
-/// Discard a declined inline sub-walk: the operations it recorded, and the
-/// heap cache they populated.
+/// Discard a declined inline sub-walk: the operations it recorded, the
+/// snapshots those operations named, and the heap cache they populated.
 ///
-/// The seven call sites all spelled this out as the same two statements.
+/// The eight call sites all spelled the operations and the cache out as the
+/// same two statements.
 ///
-/// `PYRE_SUBWALK_CUT_SNAPSHOTS` additionally truncates the snapshot side
-/// table, which [`majit_metainterp::history::TraceCtx::cut_trace`] leaves
-/// alone: a guard the speculative walk attached before it declined keeps
-/// naming positions the cut has since handed to other operations, and the
-/// unroll's Phase 2 remap reports such a position as a `phase2 snapshot remap
-/// cache miss`.  The `BINARY_OP` entry cuts that way at its own rewind.
+/// [`majit_metainterp::history::TraceCtx::cut_trace`] leaves the snapshot side
+/// table alone, and a guard the speculative walk attached before it declined
+/// then keeps naming positions the cut has since handed to other operations —
+/// the shape the unroll's Phase 2 remap reports as a `phase2 snapshot remap
+/// cache miss`.  So the cut here takes both.
 ///
-/// Not truncating is the ported behaviour, not a shortcut: `Trace.cut_point`
-/// returns the two snapshot lengths as the last elements of its five-tuple and
-/// `Trace.cut_at` restores only `_pos`, `_count` and `_index` from it, leaving
-/// `_snapshot_data` and `_snapshot_array_data` as they stand -- the same two
-/// elements `cut_trace_from` destructures and never reads.  Upstream is not
-/// exposed by that because its snapshots live inline in the trace byte stream,
-/// where anything past the restored `_pos` is unreachable and the next append
-/// overwrites it; pyre owns them in a `Vec<Snapshot>` beside the stream, where
-/// a stale entry keeps its index.  The exposure is that representation, whose
+/// Upstream restores neither: `Trace.cut_point` returns the two snapshot
+/// lengths as the last elements of its five-tuple and `Trace.cut_at` restores
+/// only `_pos`, `_count` and `_index` from it, leaving `_snapshot_data` and
+/// `_snapshot_array_data` as they stand -- the same two elements
+/// `cut_trace_from` destructures and never reads.  It is not exposed by that
+/// because its snapshots live inline in the trace byte stream, where anything
+/// past the restored `_pos` is unreachable and the next append overwrites it;
+/// pyre owns them in a `Vec<Snapshot>` beside the stream, where a stale entry
+/// keeps its index.  Truncating is what that representation costs, and it is
+/// already what every other speculative rewind in the walker does --
+/// `cut_trace_with_snapshots` has eighteen further call sites across this file
+/// and `specialize.rs`, the `BINARY_OP` entry's own rewind among them.  The
 /// migration to the byte-stream form `TraceRecordBuffer` already carries is
-/// recorded on `TraceCtx::snapshots` -- so this stays off, and truncating is
-/// the deviation held for the trace that needs it.  `cut_trace`'s own note
-/// records that truncating regressed a bench.
+/// recorded on `TraceCtx::snapshots`.
+///
+/// `cut_trace`'s own note records that truncating regressed a bench.  That is
+/// about `cut_trace` truncating for all of its callers, which this does not
+/// change: the seven outside this helper still take the operations alone.
 fn cut_declined_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
 ) {
-    if subwalk_cut_snapshots_enabled() {
-        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-    } else {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-    }
+    ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
     ctx.trace_ctx.heap_cache_mut().reset();
-}
-
-/// `PYRE_SUBWALK_CUT_SNAPSHOTS`: see [`cut_declined_subwalk`].
-fn subwalk_cut_snapshots_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_SUBWALK_CUT_SNAPSHOTS").is_some())
 }
 
 fn callee_body_commits_nothing(w_code: *const ()) -> bool {
@@ -8085,7 +8080,6 @@ fn emit_walker_instance<Sym: WalkSym>(
         instance,
         &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
     );
-    fbw_binop_rewind_note_fresh(ctx, instance);
     (instance, concrete_instance)
 }
 
@@ -9198,8 +9192,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
         }),
     )?;
     if inlined.is_none() {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
+        cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
 }
@@ -10636,8 +10629,10 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     // Copied out before the descent takes `ctx` mutably; the region state is
     // the session's, not this frame's.
+    let region_from = ctx.trace_ctx.get_trace_position()._count;
     let session = ctx.session;
-    let rewind_guard = admitted_on_rewind.then(|| BinopRewindInlineGuard::enter(session));
+    let rewind_guard =
+        admitted_on_rewind.then(|| BinopRewindInlineGuard::enter(session, region_from));
     let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,
@@ -10887,8 +10882,10 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     // Copied out before the descent takes `ctx` mutably; the region state is
     // the session's, not this frame's.
+    let region_from = ctx.trace_ctx.get_trace_position()._count;
     let session = ctx.session;
-    let rewind_guard = admitted_on_rewind.then(|| BinopRewindInlineGuard::enter(session));
+    let rewind_guard =
+        admitted_on_rewind.then(|| BinopRewindInlineGuard::enter(session, region_from));
     let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,

@@ -215,7 +215,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 | PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS | reading back the fastlocals a residual wrote to the frame, whether or not it forced, as a recorded `GETARRAYITEM_GC_R` off `locals_cells_stack_w` (`residual_call.rs adopt_residual_locals_writes`); setting it restores the walk that keeps the box it held before the call and so loses the write | when the walk reads a local through a channel a residual cannot leave stale; until then this is the one-binary control that keeps the defect demonstrable, and the parity fixture's two arms (a forcing call, and an inlined callee whose store forces nothing) are only separable with it |
 
-### §6a2 — Default-OFF experiments (10)
+### §6a2 — Default-OFF experiments (9)
 
 Kept as the switched-off arm of a one-binary comparison, not as latent
 defaults.  Bridge inlining reaches module replacement on its own, so
@@ -250,7 +250,6 @@ build.
 | PYRE_WASM_INLINE_TRIP_BYTES | `=N` prices a deferred inline merge at N bridge entries per byte of the module the merge re-emits (`lib.rs inline_trip_threshold_for`), the guest's flat `INLINE_TRIP_THRESHOLD` staying as the floor; unset leaves the built-in `DEFAULT_INLINE_TRIP_BYTES_FACTOR`, and `=0` restores the flat threshold as the whole rule.  A merge re-emits its owner whole, so its cranelift cost scales with the owner's size while the crossings it removes scale with the standing bridge's entries — the flat threshold reads only the second.  Exists so the conversion between the two rates can be re-swept on ONE binary, the guest having no environment to read it from | the corpus stops disagreeing about the value, or the merge decision stops being a single scalar |
 | PYRE_FBW_INLINE_POISON | admits a callee the replay scan declined and refuses at the scan's poisoned pcs during the walk (`diag.rs fbw_inline_poison_enabled`) | when a refusal that follows an executed effect has a resume leg that neither repeats it nor drops it |
 | PYRE_JD1 | arms the jd1 (`unpackiterable_driver`) compiled-loop experiment — `eval.rs jd1_experiment_enabled` is `PYRE_JD1 == "1"`, so nothing else turns it on.  `PYRE_NO_JD1`, `PYRE_JD1=0` and the master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) each force it back off | the jd1 experiment concludes |
-| PYRE_SUBWALK_CUT_SNAPSHOTS | truncates the snapshot side table when a declined inline sub-walk is cut, as well as the operations (`inline_call.rs cut_declined_subwalk`); unset leaves `cut_trace`, which discards the ops and leaves the snapshots naming positions the cut has handed on — the shape the unroll reports as a `phase2 snapshot remap cache miss`.  The `BINARY_OP` entry already cuts that way at its own rewind.  Off here because no trace has been found that needs it, while `cut_trace`'s own note records that truncating regressed a bench | a declined sub-walk is shown to leave a stale snapshot position, or the truncation is measured to cost nothing and becomes unconditional |
 
 ### §6b — VALUE knobs (17): config, not gates
 

@@ -647,32 +647,34 @@ pub struct WalkSession {
     /// that raised it knows the descent stopped for that reason and may take
     /// the cut.
     pub binop_rewind_refused: bool,
-    /// Allocations the region above minted, in the order they were emitted.
+    /// The recorder position the region above was raised at.
     ///
-    /// A store into one of these is not a commit the cut has to undo: the cut
-    /// discards the operations that built the object, and the concrete object
-    /// the walker allocated alongside them is unreachable from anything the
-    /// re-execution can name — the same reading
+    /// A store into an object the region itself allocated is not a commit the
+    /// cut has to undo: the cut discards the operations that built the object,
+    /// and the concrete object the walker allocated alongside them is
+    /// unreachable from anything the re-execution can name — the same reading
     /// [`inline_call::try_walker_inline_type_call`] already states for its own
     /// rewind ("the orphaned instance is unreachable and `__init__` has not
     /// run").  Every other route out of the region — a store into a
     /// pre-existing object, an unjournaled residual — is still refused, so an
-    /// entry here cannot escape while the region stands.
+    /// object that predates the region cannot escape while it stands.
     ///
-    /// Emptied by the outermost [`fbw_state::BinopRewindInlineGuard`], so it
-    /// never carries an entry from a region that has already unwound.
+    /// Which of the two an object is stays on the box, where the porting rules
+    /// ask for it: `new_object` raises `HF_SEEN_ALLOCATION` / `HF_IS_UNESCAPED`
+    /// on every allocation the walk records, and `escape_box` and every reset
+    /// of the cache lower them, so an object since handed to something outside
+    /// the region stops answering on its own. This position is only what tells
+    /// an allocation of this region from one the walk made before it:
+    /// `Trace::record_op` numbers each operation from the same `op_count` this
+    /// records, so an `OpRef` at or above it was minted inside the region. A
+    /// rewind taken inside the region cuts to a position the region itself
+    /// took and resets the heap cache with it, so a reused number answers as an
+    /// allocation again only once something re-allocates there.
     ///
-    /// Beside the box rather than on it, which the porting rules otherwise ask
-    /// for, because there is no slot to reach: the record-time store for a
-    /// per-box fact is the heap cache, whose flag word is heapcache.py's own
-    /// six `HF_*` bits with the version counter occupying everything above
-    /// them, and the fact itself is pyre-only -- upstream has no rewind region
-    /// at a dunder entry, so it has nothing that means "allocated inside one".
-    /// What the box does own is consulted: the exemption also requires
-    /// `is_unescaped`, so escaping the object, or any reset of the cache,
-    /// withdraws it. Membership is only ever the instantiations one dunder body
-    /// performs, and both ends of the region clear it.
-    pub binop_rewind_fresh: Vec<OpRef>,
+    /// `None` outside a region: set by the outermost
+    /// [`fbw_state::BinopRewindInlineGuard`] and cleared when it unwinds, so it
+    /// never carries a position from a region that has already ended.
+    pub binop_rewind_fresh_from: Option<u32>,
 }
 
 impl Default for WalkSession {
@@ -696,7 +698,7 @@ impl Default for WalkSession {
             recording_opcode_position: 0,
             binop_rewind_depth: 0,
             binop_rewind_refused: false,
-            binop_rewind_fresh: Vec::new(),
+            binop_rewind_fresh_from: None,
         }
     }
 }
