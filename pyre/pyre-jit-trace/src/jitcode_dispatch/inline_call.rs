@@ -7526,6 +7526,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_str(obj) }
                     )
                 {
+                    if !entry_is_call_boundary
+                        && fbw_executed_effect_count() == executed_effects_before
+                    {
+                        // A descriptor opcode such as FORMAT_WITH_SPEC owns
+                        // its result check and has no Python CALL boundary to
+                        // latch.  With no concrete effect, let its caller
+                        // rewind the attempt and emit the faithful residual.
+                        return resolved_inline_decline(op.pc, line!());
+                    }
                     // descroperation.py checks the app-level result before
                     // returning from `space.str` / `space.repr`. Re-run the
                     // original builtin call at the caller boundary so the
@@ -11045,6 +11054,29 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         ));
     }
 
+    // If this straight-line body is safe to sample, refuse a bad result
+    // before the sub-walk emits anything.  The shared `require_str_result`
+    // fallback latches a Python CALL boundary; FORMAT_WITH_SPEC is not one,
+    // so replaying it from that latch skips the interpreter's TypeError check.
+    // This is the format sibling of the sample in
+    // `try_walker_inline_exception_string_override`.
+    if let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) {
+        if body_facts.exc_override_sample_safe {
+            let sampled = {
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                pyre_interpreter::call::call_function_impl_result(
+                    method,
+                    &[concrete_value, concrete_spec],
+                )
+            };
+            let sampled_is_str = matches!(sampled, Ok(result)
+                if !result.is_null() && unsafe { pyre_object::is_str(result) });
+            if !sampled_is_str {
+                decline!("sampled __format__ result is not str");
+            }
+        }
+    }
+
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     let arg_concretes = vec![
         ConcreteValue::Ref(method),
@@ -11052,7 +11084,7 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_value),
         ConcreteValue::Ref(concrete_spec),
     ];
-    try_walker_inline_resolved_user_call(
+    let Some(inlined) = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
@@ -11077,15 +11109,43 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         has_closure,
         Some((value, concrete_value, w_class, version_tag)),
         None,
-        // The abort rewind names this entry, as it does for the property and
-        // exception-override routes that enter through the same plumbing.
-        true,
+        // FORMAT_WITH_SPEC is a descriptor opcode, not a Python CALL
+        // boundary.  A bad effect-free result declines to this residual.
+        false,
         // `__format__` returning a non-string is a TypeError the interpreter
         // raises; the plumbing guards the inlined result is a string so that
         // check keeps its meaning on the compiled path.
         true,
         None,
-    )
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if matches!(inlined.0, DispatchOutcome::Continue) {
+        // `space.format` checks `isinstance_w(result, str)` after the app-level
+        // call.  Pin the concrete string class observed by this trace: an
+        // exact str and each accepted str subclass get their own guarded
+        // version, while a later non-string result deopts to the residual that
+        // raises the faithful TypeError.
+        let result = ctx.registers_r[dst];
+        let concrete_result = match concrete_from_recorded_opref(ctx, result) {
+            ConcreteValue::Ref(obj) => obj,
+            other => unreachable!("accepted __format__ result is not a Ref: {other:?}"),
+        };
+        debug_assert!(
+            !concrete_result.is_null() && unsafe { pyre_object::is_str(concrete_result) }
+        );
+        let result_type = unsafe { (*concrete_result).ob_type } as i64;
+        let result_type_const = ctx.trace_ctx.const_int(result_type);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[result, result_type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(result, result_type);
+    }
+    Ok(Some(inlined))
 }
 
 /// Allocate the callee's three symbolic register banks for a sub-walk
