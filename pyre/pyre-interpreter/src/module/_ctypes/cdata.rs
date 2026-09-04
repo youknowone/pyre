@@ -1289,6 +1289,17 @@ pub(super) fn make_at_address(
     inst
 }
 
+/// Whether a simple-code write has to retain the value it stored.
+///
+/// `"O"` writes the word `pyobj_container` hands back, and the container holds
+/// only a weakref, so the buffer is the sole reference to that object -- which
+/// is why `O_set` returns a new reference for `PyCData_set` to keep.  A CData
+/// value is retained for the same reason: the write copied its buffer out and
+/// left no other owner.
+pub(super) fn value_needs_keep(tc: &str, value: PyObjectRef) -> bool {
+    tc == "O" || is_cdata_instance(value)
+}
+
 /// Keep `obj` alive for the lifetime of the buffer that `anchor` views, by
 /// storing it under `key` in the ultimate root's `"_objects_"` dict.
 pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
