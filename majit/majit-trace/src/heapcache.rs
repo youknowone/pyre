@@ -23,6 +23,56 @@ use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type};
 /// heapcache.py:96-104) and the implementation lives in `majit-metainterp`
 /// (`history::ConstOprefOracle`).  `&dyn SameConstantOracle`
 /// keeps the heapcache layer agnostic of the oracle's representation.
+/// The `field_index` that stands for a descr no numberer ever reached.
+///
+/// `heapcache.py get_field_updater(box, descr)` keys the per-box field
+/// cache on the descr object, so two fields of one struct can never share
+/// an entry.  Flattening that key to `Descr::index()` preserves the
+/// property only while the number is assigned: the unassigned answer is
+/// the `u32::MAX` sentinel (`descr.rs Descr::index`), a single key
+/// standing for every field of every struct.
+///
+/// Distinct structs colliding here is harmless — an entry is read back
+/// per box, and a box belongs to one struct.  What the flattening cannot
+/// express is *this* case: one box's own fields, which reach the cache
+/// with distinct offsets and so distinct numbers everywhere the number
+/// exists, all aliasing onto one entry when it does not.  Decline the
+/// sentinel rather than let a store under it answer a load of a
+/// different field.
+const UNNUMBERED_FIELD: u32 = u32::MAX;
+
+/// Field-cache operations declined because the descr carried
+/// [`UNNUMBERED_FIELD`].  A numberer covering every descr that reaches
+/// the cache leaves this at zero; a non-zero count names lost caching,
+/// not a wrong answer.
+pub static UNNUMBERED_FIELD_DECLINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reads [`UNNUMBERED_FIELD_DECLINES`].
+pub fn unnumbered_field_declines() -> u64 {
+    UNNUMBERED_FIELD_DECLINES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// True when `field_index` names no field, counting the decline.
+fn declines_unnumbered_field(field_index: u32) -> bool {
+    let unnumbered = field_index == UNNUMBERED_FIELD;
+    if unnumbered {
+        UNNUMBERED_FIELD_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A producer that reaches the cache is expected to have been
+        // numbered; the release build declines and keeps going, and this
+        // names the producer that was not rather than leaving the loss
+        // to a counter nobody reads.  `pyjitpl/dispatch.rs` screens the
+        // sentinel out ahead of the call for hand-assembled jitcodes,
+        // which are the numberer's documented gap.
+        debug_assert!(
+            false,
+            "field heapcache reached with an unnumbered descr: every field of \
+             every struct aliases onto this one key, so the entry is declined"
+        );
+    }
+    unnumbered
+}
+
 pub trait SameConstantOracle {
     fn same_constant(&self, a: OpRef, b: OpRef) -> bool;
 }
@@ -799,6 +849,9 @@ impl HeapCache {
         field_index: u32,
         oracle: &dyn SameConstantOracle,
     ) -> Option<OpRef> {
+        if declines_unnumbered_field(field_index) {
+            return None;
+        }
         let mut entry = self.heap_cache.remove(&field_index)?;
         let result = entry.read(obj, self, oracle);
         self.heap_cache.insert(field_index, entry);
@@ -828,6 +881,9 @@ impl HeapCache {
         value: OpRef,
         oracle: &dyn SameConstantOracle,
     ) {
+        if declines_unnumbered_field(field_index) {
+            return;
+        }
         let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
         entry.do_write_with_aliasing(obj, value, self, oracle);
         self.heap_cache.insert(field_index, entry);
@@ -852,6 +908,9 @@ impl HeapCache {
         value: OpRef,
         oracle: &dyn SameConstantOracle,
     ) {
+        if declines_unnumbered_field(field_index) {
+            return;
+        }
         let mut entry = self.heap_cache.remove(&field_index).unwrap_or_default();
         entry.read_now_known(obj, value, self, oracle);
         self.heap_cache.insert(field_index, entry);
