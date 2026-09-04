@@ -4512,11 +4512,7 @@ where
                 // folded into one op because no `getfield` an optimizer or a
                 // backend sees would then mean a load.
                 if is_ref && is_substruct {
-                    let addr = if struct_ptr == 0 {
-                        0
-                    } else {
-                        struct_ptr.wrapping_add(offset as i64)
-                    };
+                    let addr = struct_ptr.wrapping_add(offset as i64);
                     let base_int = ctx.execute_and_record(
                         Some(self.cpu.as_ref()),
                         OpCode::CastPtrToInt,

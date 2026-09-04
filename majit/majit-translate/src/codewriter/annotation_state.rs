@@ -159,9 +159,11 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         },
         SomeValue::Bool(_) => ValueType::Bool,
         SomeValue::Float(_) | SomeValue::LongFloat(_) => ValueType::Float,
-        // `getkind(SingleFloat) == 'int'` (history.py): singlefloats
-        // are stored in an int register, not the float bank.
-        SomeValue::SingleFloat(_) => ValueType::Int,
+        // Preserve the annotation-level type across fixpoint rounds.  The
+        // later codewriter kind projection banks SingleFloat as an integer;
+        // collapsing it here would instead union Int with SingleFloat on the
+        // next annotator pass and erase the binding as Unknown.
+        SomeValue::SingleFloat(_) => ValueType::SingleFloat,
         SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref(None),
         // Keep the `StringBuilder` shell distinct across the roundtrip so
         // the rtyper picks `StringBuilderRepr` rather than the generic
@@ -214,6 +216,14 @@ mod tests {
             "StringBuilder must project to SomeStringBuilder, got {shell:?}"
         );
         assert_eq!(somevalue_to_valuetype(&shell), ValueType::StringBuilder);
+    }
+
+    #[test]
+    fn singlefloat_roundtrips_through_shell() {
+        let shell = valuetype_to_someshell(&ValueType::SingleFloat)
+            .expect("SingleFloat projects to an annotation shell");
+        assert!(matches!(shell, SomeValue::SingleFloat(_)));
+        assert_eq!(somevalue_to_valuetype(&shell), ValueType::SingleFloat);
     }
 
     #[test]

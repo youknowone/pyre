@@ -39,8 +39,9 @@
 
 use std::collections::HashSet;
 
+use crate::flowspace::model::ConstValue;
 use crate::front::semantic::SemanticFunction;
-use crate::model::{Block, BlockId, FunctionGraph, OpKind, ValueType};
+use crate::model::{Block, BlockId, FunctionGraph, LinkArg, OpKind, ValueType};
 
 /// policy.py: shared mutable state and the default classifier.
 ///
@@ -406,6 +407,15 @@ pub fn contains_unsupported_variable_type(
                 return true;
             }
         }
+        if block.exits.iter().flat_map(|link| &link.args).any(|arg| {
+            matches!(
+                arg,
+                LinkArg::Const(constant)
+                    if matches!(constant.value, ConstValue::Int128(_) | ConstValue::UInt128(_))
+            )
+        }) {
+            return true;
+        }
         stack.extend(block.exits.iter().rev().map(|e| e.target));
     }
     false
@@ -762,6 +772,24 @@ mod tests {
         let mut g = FunctionGraph::new("wide_const");
         let entry = g.startblock;
         g.push_op_var(entry, OpKind::ConstUInt128(1), true);
+        assert!(contains_unsupported_variable_type(&g, true, true, true));
+    }
+
+    #[test]
+    fn a_128_bit_link_constant_is_unsupported() {
+        let mut g = FunctionGraph::new("wide_link_const");
+        let entry = g.startblock;
+        let (target, _) = g.create_block_with_arg_vars(1);
+        g.block_mut(entry).exits = vec![
+            crate::model::Link::new_mixed(
+                vec![LinkArg::Const(crate::flowspace::model::Constant::new(
+                    ConstValue::UInt128(1),
+                ))],
+                target,
+                None,
+            )
+            .with_prevblock(entry),
+        ];
         assert!(contains_unsupported_variable_type(&g, true, true, true));
     }
 

@@ -32,13 +32,6 @@ pub enum ValueType {
     /// `rbuiltin.py:178-189` / `rbuiltin.py:220-225` /
     /// `rarithmetic.py:600`.
     Unsigned,
-    /// RPython `r_longlonglong` / `lltype.SignedLongLongLong`.
-    ///
-    /// This is a translation-level 128-bit primitive used by
-    /// `rbigint` when `SHIFT == 63`. It deliberately remains distinct
-    /// from the word-sized `Int`: PyPy's source translator and rtyper
-    /// preserve it, while `history.getkind` rejects it at the JIT
-    /// codewriter boundary because it occupies 16 bytes.
     /// RPython `lltype.SingleFloat` — `rffi.r_singlefloat`, a Rust `f32`.
     ///
     /// Distinct from both [`ValueType::Int`] and [`ValueType::Float`].
@@ -54,6 +47,13 @@ pub enum ValueType {
     /// native `f32` arithmetic lower to an integer operation over the
     /// float's bit pattern.
     SingleFloat,
+    /// RPython `r_longlonglong` / `lltype.SignedLongLongLong`.
+    ///
+    /// This is a translation-level 128-bit primitive used by
+    /// `rbigint` when `SHIFT == 63`. It deliberately remains distinct
+    /// from the word-sized `Int`: PyPy's source translator and rtyper
+    /// preserve it, while `history.getkind` rejects it at the JIT
+    /// codewriter boundary because it occupies 16 bytes.
     Int128,
     /// RPython `r_ulonglonglong` / `lltype.UnsignedLongLongLong`.
     UInt128,

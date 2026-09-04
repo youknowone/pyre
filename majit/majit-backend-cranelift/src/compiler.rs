@@ -19264,6 +19264,15 @@ impl majit_backend::Backend for CraneliftBackend {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> majit_ir::GcRef {
         let offset = fielddescr.as_offset();
+        if matches!(
+            fielddescr,
+            majit_translate::jitcode::BhDescr::Field {
+                field_flag: majit_ir::descr::ArrayFlag::Struct,
+                ..
+            }
+        ) {
+            return majit_ir::GcRef((struct_ptr as usize).wrapping_add(offset));
+        }
         majit_ir::GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
     }
 

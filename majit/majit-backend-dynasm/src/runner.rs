@@ -3687,6 +3687,15 @@ impl Backend for DynasmBackend {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
         let offset = fielddescr.as_offset();
+        if matches!(
+            fielddescr,
+            majit_translate::jitcode::BhDescr::Field {
+                field_flag: majit_ir::descr::ArrayFlag::Struct,
+                ..
+            }
+        ) {
+            return GcRef((struct_ptr as usize).wrapping_add(offset));
+        }
         GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
     }
 

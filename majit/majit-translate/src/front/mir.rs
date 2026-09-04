@@ -2675,7 +2675,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // actual rewrite detaches the discriminant switch's block, so the
         // unreachable-block sweep is gated on that count.
         let checked_arith_rewritten = if lo.checked_arith_call_results.is_empty() {
-            0
+            crate::front::checked_arith::CheckedArithRewriteCount::default()
         } else {
             crate::front::checked_arith::rewire_checked_arith_call_sites(
                 &mut lo.graph,
@@ -2708,7 +2708,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `rewire_result_exc_call_sites` has already rewired this callee's
         // call sites to receive the unwrapped value.  Lower what the fold
         // produced, so the two halves of the one decision agree again.
-        if result_exc_callee && (checked_arith_rewritten > 0 || checked_arith_uint_rewritten > 0) {
+        if result_exc_callee && checked_arith_rewritten.result_shells > 0 {
             // This is a new validation pass over the shells the checked-arith
             // rewrites just created.  Earlier tail-forwards and rewritten
             // returns cannot certify these new returns: if none of them has a
@@ -2937,7 +2937,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || option_ok_or_else_try_rewritten > 0
             || result_map_err_rewritten > 0
             || next_rewritten > 0
-            || checked_arith_rewritten > 0
+            || checked_arith_rewritten.total > 0
             || checked_arith_uint_rewritten > 0
             || from_size_align_rewritten > 0
             || from_size_align_expect_rewritten > 0
@@ -8702,22 +8702,20 @@ impl<'a> Lowering<'a> {
                 // the conversion as identity too (Rust `String` and
                 // `&str` both lower to the immutable rpy_string), so
                 // it takes the same alias path.
-                // `core::mem::forget(x)` and `core::mem::drop(x)` leave
-                // nothing behind to record.  `forget` runs nothing by
-                // definition, and `drop` runs a destructor the trace model
-                // does not run either: `TermKind::Drop` above forwards
-                // unconditionally, so a value falling out of scope in traced
-                // code already leaves its destructor unrun, and spelling that
-                // same release as a call does not change what the model does.
+                // `core::mem::forget(x)` leaves nothing behind to record: it
+                // deliberately suppresses the destructor.  `core::mem::drop`
+                // is different — it must run destructor glue immediately —
+                // so it stays a residual call until Drop lowering preserves
+                // that observable effect.
                 //
-                // Their `FOREIGN_STDLIB_EXTERNALS` entries type the callsite
+                // Its `FOREIGN_STDLIB_EXTERNALS` entry types the callsite
                 // but still leave a residual naming a `core` body the build
                 // has no address for, and one residual target a portal can
                 // reach whose address the build left unbound refuses every
                 // trace, arm taken or not.  Binding one instead is not open:
                 // the path key collapses every `T`, so a single address would
                 // serve monomorphisations that do not share a destructor.
-                if args.len() == 1 && self.is_mem_release(&reg) {
+                if args.len() == 1 && self.is_mem_forget(&reg) {
                     let void = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Void);
@@ -13981,20 +13979,17 @@ impl<'a> Lowering<'a> {
     /// returns its argument unchanged and `core` has no graph body for it
     /// (an unregistered callee), so the callsite aliases its argument
     /// instead of calling the missing identity body.
-    /// `core::mem::forget(value)` / `core::mem::drop(value)` — the two ways
-    /// to spell "this value is released here".  `core` has no graph body for
-    /// either, so a callsite that keeps the call carries a residual whose
-    /// target the build cannot address.
-    fn is_mem_release(&self, reg: &RegularCall) -> bool {
+    /// `core::mem::forget(value)` deliberately suppresses destructor glue.
+    /// `core::mem::drop(value)` is not included: erasing that call would erase
+    /// an observable destructor, so it remains residual until Drop lowering
+    /// can preserve the effect.
+    fn is_mem_forget(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            matches!(
-                fd.item_meta.name_path().as_str(),
-                "core::mem::forget" | "core::mem::drop"
-            )
-        })
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::mem::forget")
     }
 
     fn is_hint_must_use(&self, reg: &RegularCall) -> bool {
