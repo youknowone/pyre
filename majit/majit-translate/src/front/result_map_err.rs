@@ -44,14 +44,19 @@ pub(crate) struct ResultMapErrSite {
 pub(crate) fn rewire_result_map_err_sites(
     graph: &mut FunctionGraph,
     sites: &[ResultMapErrSite],
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> usize {
     sites
         .iter()
-        .filter(|site| rewire_one(graph, site).is_ok())
+        .filter(|site| rewire_one(graph, site, spec).is_ok())
         .count()
 }
 
-fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), String> {
+fn rewire_one(
+    graph: &mut FunctionGraph,
+    site: &ResultMapErrSite,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<(), String> {
     let name = graph.name.clone();
     if !site.closure_env_is_trivially_dropless {
         return Err(format!(
@@ -95,18 +100,25 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
         graph.blocks[a].exitswitch,
         Some(crate::model::ExitSwitch::LastException)
     );
-    let saved_exit = if exception_lowered {
+    let (saved_exit, saved_exception_exit) = if exception_lowered {
         if graph.blocks[a].exits.len() != 2 {
             return Err(format!(
                 "{name}: Result::map_err LastException block does not have two exits"
             ));
         }
-        graph.blocks[a]
+        let normal = graph.blocks[a]
             .exits
             .iter()
             .find(|exit| exit.exitcase.is_none())
             .cloned()
-            .ok_or_else(|| format!("{name}: Result::map_err has no normal exception edge"))?
+            .ok_or_else(|| format!("{name}: Result::map_err has no normal exception edge"))?;
+        let exceptional = graph.blocks[a]
+            .exits
+            .iter()
+            .find(|exit| exit.exitcase.is_some())
+            .cloned()
+            .ok_or_else(|| format!("{name}: Result::map_err has no exceptional edge"))?;
+        (normal, Some(exceptional))
     } else {
         let [exit] = graph.blocks[a].exits.as_slice() else {
             return Err(format!("{name}: Result::map_err block has multiple exits"));
@@ -120,7 +132,7 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
                 "{name}: Result::map_err block exit is not a plain goto"
             ));
         }
-        exit.clone()
+        (exit.clone(), None)
     };
     let target = saved_exit.target;
     let mut carried = Vec::new();
@@ -203,7 +215,45 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
     );
     let mapped = emit_narrow(graph, err_block, mapped, &site.mapped_err_class_root);
     if exception_lowered {
-        graph.set_raise_values(err_block, mapped.clone(), mapped);
+        // result_exc has already made the map_err call a can-raise site. Keep
+        // that exact exceptional destination: a `?` site targets exceptblock,
+        // while catch_and_rewrap targets its local Err-shell rebuilding arm.
+        // In both cases the edge carries a trace-level exception object, not
+        // the interpreter-specific error carrier returned by the mapper.
+        let exc = crate::front::result_exc::materialize_error_to_exc_object(
+            graph, err_block, mapped, spec,
+        );
+        let exceptional = saved_exception_exit
+            .as_ref()
+            .expect("LastException form captured its exceptional edge");
+        let last_exception = exceptional
+            .last_exception
+            .as_ref()
+            .and_then(LinkArg::as_variable)
+            .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exception"))?;
+        let last_exc_value = exceptional
+            .last_exc_value
+            .as_ref()
+            .and_then(LinkArg::as_variable)
+            .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exc_value"))?;
+        let args = exceptional
+            .args
+            .iter()
+            .map(|arg| -> Result<LinkArg, String> {
+                Ok(match arg {
+                    LinkArg::Value(value) if value == last_exception || value == last_exc_value => {
+                        LinkArg::Value(exc.clone())
+                    }
+                    LinkArg::Value(value) => LinkArg::Value(
+                        map_source(&err_sources, &err_inputs, value).ok_or_else(|| {
+                            format!("{name}: exceptional map_err edge carries an unthreaded value")
+                        })?,
+                    ),
+                    LinkArg::Const(value) => LinkArg::Const(value.clone()),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        close_goto_mixed(graph, err_block, exceptional.target, args);
     } else {
         let err_result = emit_sum_variant(
             graph,
@@ -276,6 +326,27 @@ fn read_payload(
 mod tests {
     use super::*;
 
+    fn fixture_site(result_var: Variable) -> ResultMapErrSite {
+        ResultMapErrSite {
+            result_var,
+            receiver_owner: "core::result::Result<i64,str>".into(),
+            receiver_ok_owner: "core::result::Result<i64,str>::Ok".into(),
+            receiver_err_owner: "core::result::Result<i64,str>::Err".into(),
+            result_owner: "core::result::Result<i64,Error>".into(),
+            result_ok_owner: "core::result::Result<i64,Error>::Ok".into(),
+            result_err_owner: "core::result::Result<i64,Error>::Err".into(),
+            call_once_owner: "fixture::closure".into(),
+            ok_ty: ValueType::Int,
+            ok_class_root: None,
+            err_ty: ValueType::Str,
+            err_class_root: None,
+            mapped_err_ty: ValueType::Ref(Some("Error".into())),
+            mapped_err_class_root: Some("Error".into()),
+            args_tuple_suffix: "<str>".into(),
+            closure_env_is_trivially_dropless: false,
+        }
+    }
+
     #[test]
     fn map_err_becomes_ok_passthrough_and_err_closure_arms() {
         let mut graph = FunctionGraph::new("map_err_fixture");
@@ -297,25 +368,15 @@ mod tests {
         graph.set_return(join, None);
         graph.set_goto(entry, join, vec![result.clone()]);
 
-        let mut site = ResultMapErrSite {
-            result_var: result,
-            receiver_owner: "core::result::Result<i64,str>".into(),
-            receiver_ok_owner: "core::result::Result<i64,str>::Ok".into(),
-            receiver_err_owner: "core::result::Result<i64,str>::Err".into(),
-            result_owner: "core::result::Result<i64,Error>".into(),
-            result_ok_owner: "core::result::Result<i64,Error>::Ok".into(),
-            result_err_owner: "core::result::Result<i64,Error>::Err".into(),
-            call_once_owner: "fixture::closure".into(),
-            ok_ty: ValueType::Int,
-            ok_class_root: None,
-            err_ty: ValueType::Str,
-            err_class_root: None,
-            mapped_err_ty: ValueType::Ref(Some("Error".into())),
-            mapped_err_class_root: Some("Error".into()),
-            args_tuple_suffix: "<str>".into(),
-            closure_env_is_trivially_dropless: false,
-        };
-        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site.clone()]), 0);
+        let mut site = fixture_site(result);
+        assert_eq!(
+            rewire_result_map_err_sites(
+                &mut graph,
+                &[site.clone()],
+                crate::ErrorCarrierSpec::default()
+            ),
+            0
+        );
         assert!(graph.blocks[entry.0].operations.iter().any(|op| {
             matches!(
                 &op.kind,
@@ -325,7 +386,10 @@ mod tests {
         }));
 
         site.closure_env_is_trivially_dropless = true;
-        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site]), 1);
+        assert_eq!(
+            rewire_result_map_err_sites(&mut graph, &[site], crate::ErrorCarrierSpec::default()),
+            1
+        );
 
         let calls: Vec<&CallTarget> = graph
             .blocks
@@ -354,5 +418,93 @@ mod tests {
                 matches!(target, CallTarget::SyntheticTransparentCtor { name, .. } if name == variant)
             }));
         }
+    }
+
+    #[test]
+    fn exception_lowered_map_err_materializes_and_keeps_the_catch_target() {
+        let mut graph = FunctionGraph::new("map_err_catch_fixture");
+        let entry = graph.startblock;
+        let receiver = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let env = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+        let carried = graph.push_op_var(entry, OpKind::ConstInt(3), true).unwrap();
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method("map_err", Some("Result".into())),
+                    args: vec![receiver, env],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (normal, _) = graph.create_block_with_arg_vars(2);
+        graph.set_return(normal, None);
+        let (catch, _) = graph.create_block_with_arg_vars(3);
+        graph.set_return(catch, None);
+        let etype = graph.alloc_value_var();
+        let evalue = graph.alloc_value_var();
+        let mut exceptional = crate::model::Link::new_mixed(
+            vec![
+                LinkArg::Value(carried.clone()),
+                LinkArg::Value(etype.clone()),
+                LinkArg::Value(evalue.clone()),
+            ],
+            catch,
+            Some(crate::model::exception_exitcase()),
+        );
+        exceptional.last_exception = Some(LinkArg::Value(etype));
+        exceptional.last_exc_value = Some(LinkArg::Value(evalue));
+        graph.set_control_flow_metadata(
+            entry,
+            Some(crate::model::ExitSwitch::LastException),
+            vec![
+                crate::model::Link::new_mixed(
+                    vec![
+                        LinkArg::Value(result.clone()),
+                        LinkArg::Value(carried.clone()),
+                    ],
+                    normal,
+                    None,
+                ),
+                exceptional,
+            ],
+        );
+
+        let mut site = fixture_site(result);
+        site.closure_env_is_trivially_dropless = true;
+        let spec = crate::ErrorCarrierSpec {
+            to_exc_object: Some(&["fixture", "to_exc_object"]),
+            ..crate::ErrorCarrierSpec::default()
+        };
+        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site], spec), 1);
+
+        let materializer_block = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &["fixture".to_string(), "to_exc_object".to_string()]
+                    )
+                })
+            })
+            .expect("Err arm must materialize the mapped carrier");
+        assert_eq!(materializer_block.exits.len(), 1);
+        assert_eq!(materializer_block.exits[0].target, catch);
+        assert_ne!(materializer_block.exits[0].target, graph.exceptblock);
+        assert_eq!(materializer_block.exits[0].args.len(), 3);
+        let carried_alias = materializer_block.exits[0].args[0]
+            .as_variable()
+            .expect("carried value stays a Variable");
+        assert!(materializer_block.inputargs.contains(carried_alias));
+        assert_eq!(
+            materializer_block.exits[0].args[1],
+            materializer_block.exits[0].args[2]
+        );
     }
 }

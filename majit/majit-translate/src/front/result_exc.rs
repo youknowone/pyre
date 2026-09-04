@@ -816,7 +816,7 @@ fn lower_result_exc_returns_inner(
 /// allocation/rooting implementation out of the caller JitCode.  A consumer
 /// whose carrier already is the exception value declares no helper and gets
 /// the identity path.
-fn materialize_error_to_exc_object(
+pub(crate) fn materialize_error_to_exc_object(
     graph: &mut FunctionGraph,
     block: BlockId,
     payload: Variable,

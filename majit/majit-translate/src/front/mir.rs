@@ -2607,6 +2607,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
             &mut lo.graph,
             &lo.result_map_err_sites,
+            static_addrs.error_carrier,
         );
         if result_exc_callee {
             crate::front::result_exc::lower_result_exc_returns(
