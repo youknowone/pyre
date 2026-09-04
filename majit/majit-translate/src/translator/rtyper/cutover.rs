@@ -1661,7 +1661,7 @@ pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
     // phi RPython never constructs — not a missing union handler.  Skip
     // to the legacy walker until the pointer values lift as instances
     // (typed-Ref ClassDef projection).
-    if msg.contains("no upstream pair(s1, s2).union() handler in current subset") {
+    if msg.contains("pair(s1, s2).union() found no arm") {
         return Some("union-no-handler");
     }
     // `InstanceRepr.getfield` walking the `rbase` chain before the
@@ -3436,6 +3436,31 @@ fn rtyper_verbose_enabled() -> bool {
 /// ranked, finite legacy-walker-deletion worklist: each bucket names a
 /// concrete piece of work (port a Repr, lower a construct in `front::mir`,
 /// residual-ize a helper, specialize a generic ADT).
+/// Whether a `pair(s1, s2).union() found no arm: X ∪ Y` message names two
+/// operands of different kinds.
+///
+/// The operands are rendered by `annotator::model`'s `union_operand_id`, which
+/// spells a parameterised kind `Kind(detail)` and a bare one `Kind`, so the
+/// kind is the text before the first `(`.  Two `Instance(..)`s of different
+/// classes are the SAME kind — upstream's `pairtype(SomeInstance, SomeInstance)
+/// .union` handles that pair, and its failure is a class-hierarchy question,
+/// not a missing arm.
+///
+/// A message this cannot parse is reported as same-kind, so an unreadable one
+/// lands in the bucket that asks for work rather than the one that closes the
+/// question.
+fn union_pair_is_cross_kind(reason: &str) -> bool {
+    let Some((lhs, rhs)) = reason
+        .rsplit_once("found no arm: ")
+        .and_then(|(_, pair)| pair.split_once(" ∪ "))
+    else {
+        return false;
+    };
+    let kind = |s: &str| s.trim().split('(').next().unwrap_or("").trim().to_string();
+    let (lhs, rhs) = (kind(lhs), kind(rhs.lines().next().unwrap_or(rhs)));
+    !lhs.is_empty() && !rhs.is_empty() && lhs != rhs
+}
+
 fn classify_unported_reason(reason: &str) -> &'static str {
     // ── rtyper-stage named gaps (most specific first) ──
     if reason.contains("rtyper_makerepr — port") {
@@ -3461,8 +3486,17 @@ fn classify_unported_reason(reason: &str) -> &'static str {
         "DICT-KEY-EQ (str/instance dict keys)"
     } else if reason.contains("Call with CallTarget::Indirect") {
         "DYN-TRAIT-INDIRECT (lower_indirect_calls)"
-    } else if reason.contains("no upstream pair(s1, s2).union() handler") {
-        "UNION-PAIR-PORT"
+    } else if reason.contains("pair(s1, s2).union() found no arm") {
+        // Two dispositions share one message, and they call for opposite
+        // work.  Upstream's union table is same-kind almost throughout, so a
+        // cross-kind pair is one `pairtype(SomeObject, SomeObject).union`
+        // raises for as well: nothing to port, the merge itself is the
+        // defect.  A same-kind pair is the arm pyre has not written yet.
+        if union_pair_is_cross_kind(reason) {
+            "UNION-CROSS-KIND (a phi upstream never builds)"
+        } else {
+            "UNION-PAIR-PORT (same-kind arm not written)"
+        }
     } else if reason.contains("rbase missing") {
         "REPR-SETUP-ORDER (call_all_setups)"
     } else if reason.contains("calltable row not found in CallFamily") {
@@ -4662,6 +4696,93 @@ mod tests {
         assert!(!is_known_unported(msg));
     }
 
+    /// Graph carrying one `UnaryOp` under `op`, both operand and result
+    /// pre-bound `Int`, returning the result.  `op` decides whether
+    /// `flowspace_adapter::normalize_unary_op_name` accepts the graph, so a
+    /// name it does not register is the smallest unsupported translated op a
+    /// fixture can build.
+    fn one_unary_op_graph(name: &str, op: &str) -> LegacyGraph {
+        let mut graph = LegacyGraph::new(name);
+        let vars = mint_vars(&mut graph, 3);
+        let operand = vars[1].clone();
+        let result = vars[2].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::UnaryOp {
+                    op: op.to_string(),
+                    operand: operand.clone(),
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(result.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        setbinding(&operand, ValueType::Int);
+        setbinding(&result, ValueType::Int);
+        graph
+    }
+
+    /// The negative coverage the retirement plan asks for: introducing a
+    /// translated op the pipeline does not support has to fail the build, not
+    /// recover through the legacy walker.
+    ///
+    /// The fork is `dual_gate_check_with_registry`'s real-path arm — an error
+    /// `is_known_unported` classifies becomes `DualGateOutcome::Skip` and the
+    /// graph silently publishes the legacy walker's types, while an
+    /// unclassified one becomes `Err` and reaches
+    /// `dual_gate_publish_concretetypes`'s final `panic!`.  A new
+    /// `unported_category` arm broad enough to swallow this shape would move
+    /// the whole class from the first behaviour to the second without any
+    /// other test noticing, which is what this pins.
+    #[test]
+    #[should_panic(expected = "MAJIT_RTYPER real-path failure")]
+    fn an_unclassified_translated_op_fails_the_build_instead_of_skipping() {
+        let _lock = anchor_lock();
+        let graph = one_unary_op_graph(
+            "negative_coverage_unsupported_unary",
+            "__negative_coverage_unported_op__",
+        );
+        let mut codewriter = crate::codewriter::CodeWriter::new();
+        let mut callcontrol = crate::codewriter::call::CallControl::new();
+        codewriter.dual_gate_publish_concretetypes(&graph, &mut callcontrol, "negative_coverage");
+    }
+
+    /// The half of the test above that a `should_panic` cannot state: the
+    /// adapter's own refusal text is the one that must stay unclassified.
+    /// `normalize_unary_op_name` registers `pos` / `neg` / `invert` / `bool`
+    /// and the ported `str`; anything else raises this message, and
+    /// `unported_category` deliberately carries no arm for it.
+    #[test]
+    fn the_unary_op_adapter_refusal_carries_no_skip_category() {
+        let msg = "normalize_unary_op_name: pyre UnaryOp \
+                   `__negative_coverage_unported_op__` has no flowspace counterpart";
+        assert_eq!(
+            unported_category(msg),
+            None,
+            "an unsupported unary op must not be Skip-classified — a category here \
+             turns a build failure into a silent legacy-walker recovery"
+        );
+        assert!(!is_known_unported(msg));
+    }
+
     /// An annotator half that fails leaves the unwind carrying its
     /// `AnnotatorError`, not a rendering of it — the payload's type is what
     /// names the failing stage, the way the exception class does upstream.
@@ -4715,6 +4836,47 @@ mod tests {
             "UNION-ERROR (generic-ADT phi / pair)",
             "backwards setbinding on per-instantiation classdef knowntypedata \
              shares the generic-ADT union disposition, not UNCLASSIFIED"
+        );
+    }
+
+    /// A union fallback splits on operand kind, because the two halves call
+    /// for opposite work and only one of them is a porting task.
+    ///
+    /// Upstream defines `union` on same-kind pairs almost throughout
+    /// (`binaryop.py`: `pairtype(SomeInteger, SomeInteger)`,
+    /// `(SomeList, SomeList)`, `(SomeInstance, SomeInstance)`, …), with the
+    /// `SomeNone`/`SomeImpossibleValue` bridges and one cross-kind
+    /// `(SomeUnicodeString, SomeInteger)` as the exceptions. A cross-kind pair
+    /// therefore reaches `pairtype(SomeObject, SomeObject).union`, which
+    /// raises — and `llannotation.py` spells that out for the ll level, with
+    /// `pairtype(SomePtr, SomeObject).union` raising in its own body. There is
+    /// no arm to port for those; the merge is the defect.
+    #[test]
+    fn a_cross_kind_union_fallback_is_not_reported_as_a_porting_gap() {
+        let cross = "annotate PANIC: UnionError in mergeinputargs: UnionError: \
+                     pair(s1, s2).union() found no arm: \
+                     Instance(object_array::ItemsBlock) ∪ List";
+        assert_eq!(
+            classify_unported_reason(cross),
+            "UNION-CROSS-KIND (a phi upstream never builds)",
+            "a List meeting an Instance is a merge upstream raises on too, so \
+             naming it a porting gap prescribes an arm RPython does not have"
+        );
+
+        // Same kind, different classes: `pairtype(SomeInstance, SomeInstance)`
+        // exists upstream, so this one really is pyre's arm to write.
+        let same = "pair(s1, s2).union() found no arm: \
+                    Instance(option::Option<Wtf8Buf>::None) ∪ Instance(Exception)";
+        assert_eq!(
+            classify_unported_reason(same),
+            "UNION-PAIR-PORT (same-kind arm not written)"
+        );
+
+        // A message the split cannot read must land in the bucket that asks
+        // for work, never in the one that closes the question.
+        assert_eq!(
+            classify_unported_reason("pair(s1, s2).union() found no arm"),
+            "UNION-PAIR-PORT (same-kind arm not written)"
         );
     }
 

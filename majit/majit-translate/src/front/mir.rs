@@ -1027,6 +1027,16 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // name path or header alone, so they run first and a filtered-out
         // declaration never pays for the parse.
         let Some(body) = fd.unstructured() else {
+            // A declaration with no unstructured body never becomes a
+            // `SemanticFunction`, so it never reaches `function_graphs` and
+            // every callsite resolves it as an unregistered path.  The
+            // lowering errors below are already surfaced by `skipped`; this
+            // arm was the one membership drop that left no trace at all.
+            crate::decline::record_named(
+                crate::decline::gate::SEMANTIC_FN_LOOP,
+                "declaration-has-no-unstructured-body",
+                &fn_path,
+            );
             continue;
         };
         // A single function whose body the driver does not yet handle
@@ -6989,7 +6999,16 @@ impl<'a> Lowering<'a> {
                 // static of that shape gets.  Measured empty for pyre: all
                 // 7362 `pyre-object` local functions lower with an identical
                 // `__cast_instance_intrinsic` root histogram either way.
-                if let Some(addr) = self.pytype_static_addr(&segments)
+                //
+                // The identity route runs first and the path route is the
+                // fallback, not the other way round: a `PyreClassPyTypeOf`
+                // associated const has a path, and that path names its
+                // siblings too, so letting the key matcher answer first
+                // would let the label decide a question the identity can
+                // answer exactly.
+                if let Some(addr) = self
+                    .pytype_addr_by_impl_identity(id)
+                    .or_else(|| self.pytype_static_addr(&segments))
                     && let Some(root) = tyref_class_root(&place_ty, self.llbc)
                 {
                     let bb_id = self.block_id[mir_bb];
@@ -7089,12 +7108,26 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_size_const_global(id))
                     .or_else(|| self.fold_named_const_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
-                    .or_else(|| code_flags_const(&segments))
-                    .unwrap_or_else(|| OpKind::Call {
+                    .or_else(|| code_flags_const(&segments));
+                // No lane produced a value for this static.  The synthetic
+                // nullary call below targets the static's own path, which is
+                // not a function, so the failure only becomes visible two
+                // stages later as `not registered in CallRegistry` against
+                // that path — indistinguishable from a genuinely unregistered
+                // callee.  Record the lane failure here, where the reason
+                // still exists, so the census can tell the two apart.
+                let op = op.unwrap_or_else(|| {
+                    crate::decline::record_named(
+                        crate::decline::gate::GLOBAL_PLACE,
+                        "no-lane-produced-a-value",
+                        &segments.join("::"),
+                    );
+                    OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
                         args: vec![],
                         result_ty: tyref_to_value_type(&place_ty, self.llbc),
-                    });
+                    }
+                });
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7865,6 +7898,68 @@ impl<'a> Lowering<'a> {
             .pytypes
             .iter()
             .find(|(key, _)| static_key_matches(&full, &stripped, key))
+            .map(|(_, addr)| *addr)
+    }
+
+    /// The class singleton a `PyreClassPyTypeOf::PYTYPE` read names,
+    /// resolved through the impl's IDENTITY rather than through its
+    /// rendered path.
+    ///
+    /// `#[pyre_class]` gives one `PyType` address two names — the static,
+    /// and this associated const — and Charon renders the const's path
+    /// `<module>::<Impl>::PYTYPE`, dropping the impl id
+    /// ([`ItemMeta::trait_impl_id`]). That rendering is not injective, so
+    /// [`Self::pytype_static_addr`]'s key matching cannot serve this
+    /// family: a key that named one class here would name every class in
+    /// its module.
+    ///
+    /// So this never consults a path. It reads the global's own impl id,
+    /// takes that impl's `Self` type, and looks the owning ADT up in the
+    /// struct-keyed bucket — the translation of
+    /// `Bookkeeper.getdesc(Constant(pyobj))`, which resolves a prebuilt by
+    /// the object rather than by any spelling of it, and of
+    /// `rclass.InstanceRepr.convert_const_exact`, which caches one
+    /// prebuilt structure per object in an `identity_dict`. It is the
+    /// contract [`crate::translator::rtyper::cutover`] already imitates
+    /// for functions, applied to prebuilt data.
+    ///
+    /// `None` for any global that is not a trait-impl associated const,
+    /// whose impl has no resolvable `Self` ADT, or whose ADT owns no
+    /// class singleton — each of which leaves the ordinary path-keyed
+    /// handling below to answer.
+    fn pytype_addr_by_impl_identity(&self, def_id: u64) -> Option<i64> {
+        let impl_id = self.llbc.global_by_id(def_id)?.item_meta.trait_impl_id()?;
+        let row = self.llbc.trait_impl_by_id(impl_id)?;
+        // `impl_trait.generics.types[0]` is the `Self` of `impl Trait for
+        // Self`. Charon puts it first whatever else the trait is generic
+        // over, so this is the implementing type, not a trait parameter.
+        let self_ty: TyRef = serde_json::from_value(
+            row.get("impl_trait")?
+                .get("generics")?
+                .get("types")?
+                .as_array()?
+                .first()?
+                .clone(),
+        )
+        .ok()?;
+        let node = strip_ty_wrappers(tyref_node(&self_ty, self.llbc)?, self.llbc)?;
+        let struct_path = self
+            .llbc
+            .type_by_id(adt_node_def_id(node)?)?
+            .item_meta
+            .name_path();
+        // Compared with [`path_eq_ignoring_raw`], not `==`: this key is
+        // spelled by `module_path!()` on the host side and so keeps a
+        // raw-identifier `r#`, while the `name_path()` just read is
+        // Charon's canonical `DefPath` ident and has dropped it.  A class
+        // under `mod r#struct` would otherwise never match.
+        let stripped = strip_crate_prefix(&struct_path);
+        self.static_addrs
+            .pytypes_by_struct
+            .iter()
+            .find(|(key, _)| {
+                path_eq_ignoring_raw(key, &struct_path) || path_eq_ignoring_raw(key, &stripped)
+            })
             .map(|(_, addr)| *addr)
     }
 

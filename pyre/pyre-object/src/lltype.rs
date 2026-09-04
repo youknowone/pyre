@@ -169,6 +169,23 @@ pub struct PyreClassDescriptor {
     /// identifier difference (`mod r#struct`), which the consumer side
     /// normalizes away.
     pub pytype_path: &'static str,
+    /// Fully-qualified Rust path of the TYPE this describes
+    /// (`"pyre_interpreter::pycode::W_LineIter"`), as distinct from
+    /// [`Self::pytype_path`], which names the `PyType` static.
+    ///
+    /// Both name one address; the difference is what a reader can join on.
+    /// A flow graph that reads `PyreClassPyTypeOf::PYTYPE` — the associated
+    /// const spelling of the same singleton — carries no static path at
+    /// all: Charon renders that read `<module>::<Impl>::PYTYPE`, one
+    /// spelling for every trait impl in the module. The translator
+    /// resolves it through the impl's `Self` type instead, and this is the
+    /// key that answer lands on.
+    ///
+    /// Unlike the rendered path, this one is injective — a Rust type has
+    /// exactly one — which is what it must be to also serve as the linkage
+    /// symbol `patch_static_addr_constants` re-pairs across the build/run
+    /// boundary.
+    pub struct_path: &'static str,
 }
 
 // Safety: every field is either a static-`'static` reference (PyType,

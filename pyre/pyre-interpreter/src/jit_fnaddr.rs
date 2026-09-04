@@ -4583,6 +4583,31 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
     rows
 }
 
+/// Every `#[pyre_class]` type's `PyType` address, keyed by the RUST PATH
+/// OF THE TYPE rather than of the static holding it.
+///
+/// `#[pyre_class]` emits one address under two names: the static
+/// [`pyre_class_pytype_addrs`] keys on, and the associated const
+/// `impl PyreClassPyTypeOf for T { const PYTYPE = &<static> }`. A flow
+/// graph reading the second carries no static path — Charon renders that
+/// read `<module>::<Impl>::PYTYPE`, one spelling for every trait impl in
+/// the module — so the translator resolves it through the impl's `Self`
+/// type and joins on the type's own path, which is what this table
+/// supplies.
+///
+/// A type path is injective where the rendered one is not, and that is
+/// the property this key has to have: it is also the linkage symbol
+/// `runtime_fnaddr_patch::patch_static_addr_constants` re-pairs across
+/// the build/run boundary, where two entries sharing a name would pair
+/// the wrong address rather than merely fail to lower.
+pub fn pyre_class_pytype_by_struct_addrs() -> Vec<(&'static str, i64)> {
+    let mut rows = Vec::new();
+    pyre_object::lltype::for_each_class_descriptor(|d| {
+        rows.push((d.struct_path, d.pytype_ptr as usize as i64));
+    });
+    rows
+}
+
 /// The `PyType` static of every `#[pyre_class]` type, keyed by the
 /// fully-qualified Rust path the flowgraph names the global read with
 /// (`PyreClassDescriptor::pytype_path`).
@@ -4834,8 +4859,8 @@ mod tests {
     use super::{
         is_abi_unsound_argument_residual, is_list_write_barrier, is_pyframe_operand_stack_accessor,
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
-        jit_trace_fnaddrs, shadow_stack_get_word, shadow_stack_push_word,
-        shadow_stack_try_pop_to_word,
+        jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
+        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
     };
     use std::collections::HashMap;
 
@@ -5121,6 +5146,88 @@ mod tests {
             bindings["function::METHOD_WRAPPER_TYPE"],
             &crate::function::METHOD_WRAPPER_TYPE as *const _ as i64
         );
+    }
+
+    /// The struct-keyed table names each class exactly once, and names
+    /// the same address its static-keyed sibling does.
+    ///
+    /// Injectivity is the whole point of this key rather than a nicety.
+    /// It is what the rendered `<module>::<Impl>::PYTYPE` spelling lacks —
+    /// every trait impl in a module flattens onto it — and it is also what
+    /// `patch_static_addr_constants` needs to re-pair the right address
+    /// across the build/run boundary, where a shared key pairs the wrong
+    /// one instead of merely failing to lower. `rpython`'s own object ->
+    /// name layer holds itself to this: `translator/gensupp.py`'s
+    /// `NameManager.uniquename` numbers a colliding basename rather than
+    /// letting two objects share it.
+    #[test]
+    fn the_struct_keyed_pytype_table_names_each_class_exactly_once() {
+        let rows = pyre_class_pytype_by_struct_addrs();
+        let by_path: HashMap<&'static str, i64> = pyre_class_pytype_addrs().into_iter().collect();
+
+        assert!(
+            !rows.is_empty(),
+            "no `#[pyre_class]` descriptor was registered at all, so this \
+             table cannot be read as empty-because-correct"
+        );
+
+        let mut seen: HashMap<&'static str, i64> = HashMap::new();
+        for (struct_path, addr) in &rows {
+            if let Some(first) = seen.insert(struct_path, *addr) {
+                panic!(
+                    "{struct_path} appears twice (addresses {first:#x} and \
+                     {addr:#x}); the key must name one type, or the \
+                     build/run re-pairing binds whichever row it meets last"
+                );
+            }
+            assert_ne!(*addr, 0, "{struct_path} has no address");
+        }
+        assert_eq!(
+            seen.len(),
+            by_path.len(),
+            "the struct-keyed and static-keyed tables describe the same \
+             classes, so they must have the same length"
+        );
+
+        // Every address here is one the static-keyed table also carries:
+        // the two are two keys on one set of singletons, not two sets.
+        let addrs_by_static: std::collections::HashSet<i64> = by_path.values().copied().collect();
+        for (struct_path, addr) in &rows {
+            assert!(
+                addrs_by_static.contains(addr),
+                "{struct_path} binds {addr:#x}, which no `pytype_path` row \
+                 names; the two tables have drifted apart"
+            );
+        }
+    }
+
+    /// A struct path is not its `PyType` static's path, and the pair is
+    /// what lets a reader join on either.
+    ///
+    /// Pinned because the macro derives both from `module_path!()` and a
+    /// `stringify!`, so a refactor that made them coincide would leave the
+    /// join silently reading the wrong column.
+    #[test]
+    fn the_struct_path_and_the_pytype_path_name_different_items() {
+        let mut checked = 0usize;
+        pyre_object::lltype::for_each_class_descriptor(|d| {
+            assert_ne!(
+                d.struct_path, d.pytype_path,
+                "{} names the type and the static identically",
+                d.pyname
+            );
+            let (struct_mod, _) = d.struct_path.rsplit_once("::").expect("a qualified path");
+            let (pytype_mod, _) = d.pytype_path.rsplit_once("::").expect("a qualified path");
+            assert_eq!(
+                struct_mod, pytype_mod,
+                "{}'s type and static disagree about their module; the \
+                 translator resolves the static through the type, so they \
+                 have to be co-located",
+                d.pyname
+            );
+            checked += 1;
+        });
+        assert!(checked > 0, "no descriptor was visited");
     }
 
     #[test]

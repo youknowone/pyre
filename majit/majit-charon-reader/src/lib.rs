@@ -296,6 +296,27 @@ impl Llbc {
         &self.file.translated.trait_impls
     }
 
+    /// The `trait_impls` row whose `def_id` is `id` — the impl block
+    /// [`crate::ullbc::ItemMeta::trait_impl_id`] names.
+    ///
+    /// The id is tried as an index first, as the sibling `*_by_id`
+    /// accessors do, and the row is only accepted when it agrees about
+    /// its own `def_id`; a table that ever stops being dense then falls
+    /// to the scan instead of returning a neighbouring impl. Returning
+    /// the wrong impl here would bind one type's prebuilt address to
+    /// another's, so the disagreement is checked rather than assumed
+    /// away.
+    pub fn trait_impl_by_id(&self, def_id: u64) -> Option<&serde_json::Value> {
+        let says_id = |row: &serde_json::Value| {
+            row.get("def_id").and_then(serde_json::Value::as_u64) == Some(def_id)
+        };
+        let rows = &self.file.translated.trait_impls;
+        match rows.get(def_id as usize) {
+            Some(row) if says_id(row) => Some(row),
+            _ => rows.iter().find(|row| says_id(row)),
+        }
+    }
+
     /// Iterate over every present `FunDecl` (skipping opaque `null` entries).
     pub fn iter_local_fns(&self) -> impl Iterator<Item = &FunDecl> {
         self.file

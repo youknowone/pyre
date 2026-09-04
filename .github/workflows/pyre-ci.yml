@@ -603,6 +603,40 @@ jobs:
         cargo build -p majit-translate --release --example gc-root-reachability
         python3 scripts/check-gc-root-brackets.py
 
+    # The graphs the two-phase rtyper prepass still Skips to the legacy walker
+    # (#346), held to a shrinking list of names rather than a count: a family
+    # closed and a family reopened cancel in a total, and the reopening is the
+    # one worth catching.
+    #
+    # The reading costs a build script rerun, not a second pipeline: the
+    # prepass already runs inside `pyre-jit-trace`'s, and MAJIT_DECLINE_LOG
+    # only asks the gate it already passes through to print what it declined.
+    # This job is where that is cheapest -- the artefacts are on disk and
+    # `majit-translate` is warm from the acceptance test above.
+    #
+    # The baseline is per platform, and only this job measures one, so a fresh
+    # platform has none and the gate says so rather than passing. The refreshed
+    # file is uploaded below so seeding it is a download, not a Linux box.
+    - name: Check the rtyper skip subjects
+      id: rtyper-skip
+      run: python3 scripts/check-rtyper-skip-subjects.py
+    # Scoped to the step above, not to the job: an earlier step failing leaves
+    # no census on disk, and refreshing then would report a second failure
+    # about the first one's absence.
+    - name: Refresh the skip-subject baseline for download
+      if: failure() && steps.rtyper-skip.outcome == 'failure'
+      # `--no-build` reads the stderr the failed step already produced, so this
+      # re-reads the run that failed rather than measuring a second one.
+      run: python3 scripts/check-rtyper-skip-subjects.py --no-build --update
+    - name: Upload the refreshed skip-subject baseline
+      if: failure() && steps.rtyper-skip.outcome == 'failure'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: rtyper-skip-subjects-${{ runner.os }}-${{ runner.arch }}
+        path: majit/rtyper-skip-subjects.*.txt
+        retention-days: 7
+        if-no-files-found: error
+
   codspeed-benchmarks:
     name: CodSpeed benchmarks (ubuntu-24.04)
     runs-on: ubuntu-24.04

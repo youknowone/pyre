@@ -45,6 +45,7 @@ pub(crate) struct GraphBodyProvider {
     /// LLBC rather than for every LLBC up front.
     struct_field_attrs: Vec<OnceLock<HashMap<String, Vec<(String, ValueType)>>>>,
     pytypes: Vec<(String, i64)>,
+    pytypes_by_struct: Vec<(String, i64)>,
     refs: Vec<(String, i64)>,
     int_values: Vec<(String, i64)>,
     error_carrier: OwnedErrorCarrierSpec,
@@ -120,6 +121,7 @@ impl GraphBodyProvider {
             llbcs,
             struct_field_attrs,
             pytypes: own(static_addrs.pytypes),
+            pytypes_by_struct: own(static_addrs.pytypes_by_struct),
             refs: own(static_addrs.refs),
             int_values: own(static_addrs.int_values),
             error_carrier: OwnedErrorCarrierSpec::own(static_addrs.error_carrier),
@@ -177,6 +179,7 @@ impl GraphBodyProvider {
         })?;
         let attrs = self.struct_field_attrs[idx].get_or_init(|| mir::struct_field_attrs_of(llbc));
         let pytypes = borrowed(&self.pytypes);
+        let pytypes_by_struct = borrowed(&self.pytypes_by_struct);
         let refs = borrowed(&self.refs);
         let int_values = borrowed(&self.int_values);
         let carrier = &self.error_carrier;
@@ -192,6 +195,7 @@ impl GraphBodyProvider {
             fd,
             crate::HostStaticAddrs {
                 pytypes: &pytypes,
+                pytypes_by_struct: &pytypes_by_struct,
                 refs: &refs,
                 int_values: &int_values,
                 error_carrier: crate::ErrorCarrierSpec {

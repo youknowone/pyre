@@ -117,6 +117,18 @@ pub mod gate {
     /// reason: which one dominates decides whether the next stretch of work
     /// is a `SliceIndex` widening or a narrow-root one.
     pub const SLICE_GET_SITE: &str = "mir::recognize_slice_get_site";
+    /// The `PlaceKind::Global` lane chain in `resolve_place`.  A static
+    /// whose value none of the lanes can produce is synthesized as a
+    /// nullary call to its own path, which surfaces two stages later as
+    /// `not registered in CallRegistry` — naming the static, not the
+    /// lane failure that produced it.  Recording here is what keeps the
+    /// two apart in a census.
+    pub const GLOBAL_PLACE: &str = "mir::resolve_place::Global";
+    /// The per-function builder loop in `build_semantic_program_*`.  A
+    /// declaration dropped here never becomes a `SemanticFunction`, so it
+    /// never reaches `function_graphs` and every callsite resolves it as
+    /// an unregistered path.
+    pub const SEMANTIC_FN_LOOP: &str = "mir::build_semantic_program";
 }
 
 /// Verbosity of the decline census.  Resolved once, from the environment.
