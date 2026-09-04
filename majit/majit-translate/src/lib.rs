@@ -277,19 +277,23 @@ fn build_semantic_program_via_active_frontend(
             // (`rclass.py _parse_field_list`).
             program.immutable_fields =
                 front::llbc_hints::harvest_immutable_fields_from_llbcs(&llbcs);
-            // Re-source the unsafe-fn stub carrier from Charon: walk the
-            // full LLBC set for every local `unsafe fn` / unsafe
-            // impl-method projecting to a unit/bool return.  The consumer
-            // at `call_control.unsafe_fn_stubs` (lib.rs) reads this carrier.
-            // Same carrier also feeds the `#[pyre_class]` allocation
-            // constructors (`<Owner>::allocate[_stable](payload: Self)`): the
-            // non-numeric boxing ctors have no ported `malloc->new` lowering,
-            // so they residualize through the same annotator-only stub path.
+            // Re-source the annotator-only residual-stub carrier from Charon:
+            // unsafe function paths missing from GraphStore, every
+            // `dont_look_inside` declaration (whose body JitPolicy correctly
+            // excludes), and the `#[pyre_class]` allocation constructors all
+            // need a FunctionDesc signature even though they must not become
+            // JitCode candidates.
             program.unsafe_fn_stubs = llbcs
                 .iter()
                 .flat_map(|llbc| {
                     front::mir::collect_unsafe_fn_stubs_from_llbc(llbc, static_addrs.error_carrier)
                 })
+                .chain(llbcs.iter().flat_map(|llbc| {
+                    front::mir::collect_dont_look_inside_fn_stubs_from_llbc(
+                        llbc,
+                        static_addrs.error_carrier,
+                    )
+                }))
                 .chain(
                     llbcs
                         .iter()
@@ -1356,14 +1360,11 @@ fn analyze_pipeline_from_module_paths(
     // `arraydescrof_concrete` can fold field-level immutability into the
     // shared per-ARRAY descr's `is_pure` flag.
     call_control.recompute_immutable_array_types();
-    // The `unsafe_fn_stubs` carrier lets the codewriter's
-    // `dual_gate_registry` register every `unsafe fn` / unsafe
-    // impl-method as a stub-pygraph entry in CallRegistry, covering
-    // the bulk of the "not registered in CallRegistry" Skip cluster
-    // dominated by `pyre_object::is_*` predicates.  What a stub adds is the
-    // registry key those call sites spell, not a body the lowering refused
-    // — see `CallControl::unsafe_fn_stubs`.  Sourced from Charon via
-    // `front::mir::collect_unsafe_fn_stubs_from_llbc`, populated on the
+    // Historical `unsafe_fn_stubs` carrier for every annotator-only residual
+    // declaration: unsafe path aliases, `dont_look_inside` functions, and
+    // marked allocation constructors.  Each adds the FunctionDesc-equivalent
+    // key/signature the annotator needs, never a JitCode body — see
+    // `CallControl::unsafe_fn_stubs`.  Sourced from Charon and populated on the
     // SemanticProgram in `build_semantic_program_via_active_frontend`.
     call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();
     // `rpython.rtyper.extregistry.register_external` parity for the three

@@ -351,7 +351,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
 /// an arm's `raw` payload value.  `None` (no cast on the original result) is a
 /// pass-through: the raw value flows on unchanged.  The cast is jitcode-identity
 /// (`cast_pointer` → `same_as`), so duplicating it per arm is sound.
-fn emit_narrow(
+pub(crate) fn emit_narrow(
     graph: &mut FunctionGraph,
     bb: crate::model::BlockId,
     cast: &Option<(Vec<String>, ValueType)>,

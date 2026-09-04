@@ -285,24 +285,51 @@ thread_local! {
 /// it never received.
 type RecursionHome = *mut crate::PyExecutionContext;
 
+/// Read the bootstrap recursion state used before an execution context is
+/// installed.  PyPy's translated hot path owns this state on its live
+/// execution context; this Rust TLS is only the pre-context fallback and has
+/// no source-translatable object graph.
+#[majit_macros::dont_look_inside]
+fn detached_recursion_state_get() -> (usize, usize) {
+    DETACHED_RECURSION.with(|c| c.get())
+}
+
+/// Write the bootstrap recursion state used before an execution context is
+/// installed.  Keep only this TLS plumbing residual; the normal
+/// execution-context write in [`recursion_state_set`] remains visible to the
+/// translator.
+#[majit_macros::dont_look_inside]
+fn detached_recursion_state_set(depth: usize, accounted: usize) {
+    DETACHED_RECURSION.with(|c| c.set((depth, accounted)));
+}
+
 /// Read `(py_recursion_depth, accounted_activation)` from `home`.
 #[inline]
 fn recursion_state_get(home: RecursionHome) -> (usize, usize) {
-    match unsafe { home.as_ref() } {
-        Some(ec) => (ec.py_recursion_depth, ec.accounted_activation),
-        None => DETACHED_RECURSION.with(|c| c.get()),
+    if home.is_null() {
+        detached_recursion_state_get()
+    } else {
+        // PyPy reads recursion state directly from the live execution
+        // context.  Keep that field access visible to source translation;
+        // `raw_ptr::as_ref` would introduce a Rust-only `Option` call between
+        // the context and its fields.
+        let ec = unsafe { &*home };
+        (ec.py_recursion_depth, ec.accounted_activation)
     }
 }
 
 /// Write `(py_recursion_depth, accounted_activation)` back to `home`.
 #[inline]
 fn recursion_state_set(home: RecursionHome, depth: usize, accounted: usize) {
-    match unsafe { home.as_mut() } {
-        Some(ec) => {
-            ec.py_recursion_depth = depth;
-            ec.accounted_activation = accounted;
-        }
-        None => DETACHED_RECURSION.with(|c| c.set((depth, accounted))),
+    if home.is_null() {
+        detached_recursion_state_set(depth, accounted);
+    } else {
+        // This is the write-side twin of `recursion_state_get`: the
+        // execution-context fields, rather than a Rust pointer/Option helper,
+        // are the translated state.
+        let ec = unsafe { &mut *home };
+        ec.py_recursion_depth = depth;
+        ec.accounted_activation = accounted;
     }
 }
 
@@ -3931,14 +3958,17 @@ pub fn call_function_impl_result(
     // clears a thread-local and builds an error on the other one -- so an
     // unmoved run means the incoming slice already holds the live words, and
     // rebuilding it would allocate a list per call to copy them.
-    let rooted_args = roots_moved.then(|| {
-        let mut rooted_args = Vec::with_capacity(args.len());
+    let rooted_args;
+    let args = if roots_moved {
+        let mut reloaded = Vec::with_capacity(args.len());
         for i in 0..args.len() {
-            rooted_args.push(_roots.get(root_base + 1 + i));
+            reloaded.push(_roots.get(root_base + 1 + i));
         }
-        rooted_args
-    });
-    let args = rooted_args.as_deref().unwrap_or(args);
+        rooted_args = reloaded;
+        rooted_args.as_slice()
+    } else {
+        args
+    };
 
     // Binding an override descriptor below runs `baseobjspace::get`, whose
     // property and general `__get__` arms execute Python.  That updates the

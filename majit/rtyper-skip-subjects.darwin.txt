@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=e3524ccdb5313147 platform=darwin
+# corpus=f770b300ef98943f platform=darwin
 direct-skip (never reaches unported_category)	pyre_interpreter::gateway::builtin_code_get
 direct-skip (never reaches unported_category)	pyre_interpreter::module::_hashlib::hash_state_class::__majit_wrap___new__
 direct-skip (never reaches unported_category)	pyre_interpreter::module::_hashlib::hmac_class::__majit_wrap___new__
@@ -209,8 +209,6 @@ two-phase-never-a-subject	pyre_interpreter::call::call_function_impl_raw
 two-phase-never-a-subject	pyre_interpreter::call::call_user_function_plain_with_ctx
 two-phase-never-a-subject	pyre_interpreter::call::call_user_function_with_ctx
 two-phase-never-a-subject	pyre_interpreter::call::check_type_instantiable
-two-phase-never-a-subject	pyre_interpreter::call::enter_native_dispatch
-two-phase-never-a-subject	pyre_interpreter::call::enter_recursive_frame
 two-phase-never-a-subject	pyre_interpreter::call::frame_into_generator_for_function
 two-phase-never-a-subject	pyre_interpreter::call::make_user_call_frame
 two-phase-never-a-subject	pyre_interpreter::call::prepare_user_call
@@ -1842,8 +1840,6 @@ two-phase-never-a-subject	pyre_object::unicodeobject::w_str_get_index_storage
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_slot_get
 two-phase-never-a-subject	pyre_object::weakref::w_weakref_new
 two-phase-never-a-subject	pyre_object::weakref::w_weakref_object_slot_get
-two-phase-rtype-skipped	pyre_interpreter::builtins::exc_exception_new
-two-phase-rtype-skipped	pyre_interpreter::builtins::split_builtin_kwargs
 two-phase-rtype-skipped	pyre_interpreter::builtins::topframe_for_locals
 two-phase-rtype-skipped	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fdel_f_trace
 two-phase-rtype-skipped	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fget_f_trace

@@ -70,6 +70,11 @@ CENSUS_BANNER = "=== majit decline census [analyze_pipeline]"
 # subject is the last token before the first `": "`.
 DECLINE = re.compile(r"^\[decline\] " + re.escape(GATE) + r" (?P<body>.*?): ", re.M)
 
+# The summary prints a gate header even when its only row is the ACCEPT arm.
+# That makes a genuine zero-Skip run distinguishable from a stale `GATE`
+# spelling that matched no event at all.
+GATE_SUMMARY = re.compile(r"^  " + re.escape(GATE) + r"$", re.M)
+
 
 def corpus_key() -> tuple[str, list[str]]:
     """What the prepass read, named so a moved corpus is visible.
@@ -198,8 +203,8 @@ def run_build() -> pathlib.Path:
 def parse(text: str) -> dict[str, set[str]]:
     """`class -> {subject}` for every Skip in the census.
 
-    A run with no `[decline]` line at all is not a clean run: it is a run
-    whose census never came on, and the two must not share a spelling.
+    The caller separately requires [`GATE_SUMMARY`] when this returns empty,
+    distinguishing a terminal zero-Skip reading from a gate that never ran.
     """
     found: dict[str, set[str]] = {}
     for m in DECLINE.finditer(text):
@@ -211,12 +216,15 @@ def parse(text: str) -> dict[str, set[str]]:
     return found
 
 
-def read_baseline() -> tuple[dict[str, str], dict[str, set[str]]]:
-    if not baseline_path().is_file():
-        return {}, {}
+def read_baseline(
+    path: pathlib.Path | None = None,
+) -> tuple[bool, dict[str, str], dict[str, set[str]]]:
+    path = baseline_path() if path is None else path
+    if not path.is_file():
+        return False, {}, {}
     header: dict[str, str] = {}
     want: dict[str, set[str]] = {}
-    for line in baseline_path().read_text().splitlines():
+    for line in path.read_text().splitlines():
         if line.startswith("#"):
             for field in line[1:].split():
                 key, _, value = field.partition("=")
@@ -227,7 +235,7 @@ def read_baseline() -> tuple[dict[str, str], dict[str, set[str]]]:
             continue
         cls, _, subject = line.partition("\t")
         want.setdefault(cls, set()).add(subject)
-    return header, want
+    return True, header, want
 
 
 def write_baseline(header: dict[str, str], got: dict[str, set[str]]) -> None:
@@ -268,19 +276,18 @@ def main() -> int:
             "nothing about what was declined."
         )
     got = parse(census)
-    if not got:
+    if not got and not GATE_SUMMARY.search(census):
         sys.exit(
             f"error: {stderr_path.relative_to(ROOT)} holds no `[decline] {GATE}` "
-            "line.\n"
-            "  Zero Skips and a census that never came on print the same "
-            "nothing, so this is an error rather than a pass.  If the Skip set "
-            "is genuinely empty, that is the epic's done-when: record it with "
-            "--update and turn this arm into the invariant."
+            "line and no summary row for that gate.\n"
+            "  The census ran, but it never observed the dual gate under the "
+            "spelling this checker pins; treating that as zero Skips would hide "
+            "a renamed or unreachable gate."
         )
 
     corpus, unstamped = corpus_key()
     header = {"corpus": corpus, "platform": platform_key()}
-    recorded, want = read_baseline()
+    baseline_exists, recorded, want = read_baseline()
 
     if args.update:
         write_baseline(header, got)
@@ -289,7 +296,7 @@ def main() -> int:
               f"{len(got)} classes [{header['platform']}]")
         return 0
 
-    if not want:
+    if not baseline_exists:
         sys.exit(
             f"error: {baseline_path().relative_to(ROOT)} does not exist.\n"
             "  Seed it from a run on this platform: "
