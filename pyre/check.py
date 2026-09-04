@@ -5692,13 +5692,18 @@ def main():
         # what this file does elsewhere, but codspeed.yml execs this bench, so
         # a longer loop reads there as a regression of exactly the factor.
         #
-        # dynasm is left at 1.5: it has not failed on any host -- ubuntu 1.5x,
-        # macos 1.2x-1.3x, and windows 1.9x passes because `_compare_buffer`
-        # grants two scheduler ticks there.  Cranelift is the leg that failed,
-        # 1.6x-1.7x on runs 33720513664, 33748975755, 33750103555 and
-        # 33764632493, two of them `main`'s own; macos reads 1.2x-1.5x, and
-        # the 0.317x floor 1.9 derives stays far under it.
-        chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.5,     None,    1.9)
+        # Both legs were left at 1.5 while the arithmetic above moved the
+        # readings up to meet it, so neither carried margin and both then
+        # crossed: over the 38 CI jobs of 2026-09-03 dynasm reads 1.3x-1.4x on
+        # macos, 1.4x-1.6x on ubuntu and 1.7x-1.8x on windows, and cranelift
+        # 1.2x-1.3x on macos and 1.4x-1.7x on ubuntu.  Ten jobs failed on those
+        # readings, four of them `main`'s own.  Fitted to the widest of each
+        # leg with a third's headroom: 2.4 clears dynasm's 1.8x and 2.3 clears
+        # cranelift's 1.7x, and the 0.4x and 0.383x floors they derive stay a
+        # factor of three under the narrowest readings.  pypy's own execution
+        # here is 0.21s-0.36s across the hosts, so both bounds divide by a
+        # measurement rather than by the startup-subtraction floor.
+        chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    2.4,     None,    2.3)
         # fib_recursive's pypy ceilings of 6 and 8 both derive a floor capped at
         # parity, and macos dynasm reads 0.9x.  Run 33300212586 measured dynasm
         # 0.9-1.7x and cranelift 1.4-2.1x across the three hosts, so both are

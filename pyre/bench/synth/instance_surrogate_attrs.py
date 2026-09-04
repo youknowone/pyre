@@ -1,4 +1,13 @@
-# pyre-check: max-pypy-ratio=50
+# pyre-check: max-pypy-ratio=170
+# pypy's execution-only time here is a few hundredths of a second, so most runs
+# clamp the baseline to EXEC_TIME_FLOOR_S and decline the gate outright; the
+# ceiling is only ever applied on the runs that land just above the clamp,
+# where the denominator carries its own magnitude as error.  Over the 38 CI
+# jobs of 2026-09-03 those runs read 23.9x-117.4x on unchanged code.  Giving
+# pypy enough work to measure is not open here: pyre runs about 70x slower, so
+# a baseline over FLOOR_GATE_MIN_BASELINE_S would put this fixture past 18s.
+# 170 clears the widest reading by 45%.  It is an envelope on a noisy
+# denominator, not a claim about how fast this shape is.
 N = 200000
 
 METH = '\udc81'   # lone surrogate naming a method on the class
