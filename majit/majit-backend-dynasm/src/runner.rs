@@ -361,6 +361,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         typeid_is_object: Some(dynasm_typeid_is_object),
         is_registered_type_id: Some(dynasm_is_registered_type_id),
         can_move: Some(dynasm_can_move),
+        pin: Some(dynasm_pin),
+        unpin: Some(dynasm_unpin),
+        is_pinned: Some(dynasm_is_pinned),
         supports_guard_gc_type,
     });
     // The jitframe a compiled run returns stays alive as the deadframe until
@@ -392,6 +395,11 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         dynasm_subgraph_has_pending_finalizer,
     ));
     majit_gc::set_active_is_tracked(Some(dynasm_is_tracked));
+    majit_gc::set_active_gcflag_hooks(
+        Some(dynasm_get_gcflag_extra),
+        Some(dynasm_toggle_gcflag_extra),
+        Some(dynasm_get_gcflag_dummy),
+    );
     majit_gc::set_active_get_rpy_memory_usage(Some(dynasm_get_rpy_memory_usage));
     majit_gc::set_active_get_rpy_type_index(Some(dynasm_get_rpy_type_index));
     majit_gc::set_active_get_rpy_roots(Some(dynasm_get_rpy_roots));
@@ -490,6 +498,18 @@ fn dynasm_get_actual_typeid(gcref: GcRef) -> Option<u32> {
 
 fn dynasm_can_move(gcref: GcRef) -> bool {
     with_dynasm_active_gc(|gc| gc.can_move(gcref)).unwrap_or(false)
+}
+
+fn dynasm_pin(gcref: GcRef) -> bool {
+    with_dynasm_active_gc_mut(|gc| gc.pin(gcref)).unwrap_or(false)
+}
+
+fn dynasm_unpin(gcref: GcRef) {
+    with_dynasm_active_gc_mut(|gc| gc.unpin(gcref)).expect("missing active GC runtime");
+}
+
+fn dynasm_is_pinned(gcref: GcRef) -> bool {
+    with_dynasm_active_gc(|gc| gc.is_pinned(gcref)).unwrap_or(false)
 }
 
 fn dynasm_subclass_range(classptr: usize) -> Option<(i64, i64)> {
@@ -825,6 +845,22 @@ fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {
         return tracked;
     }
     majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.is_tracked(obj))
+}
+
+fn dynasm_get_gcflag_extra(obj: majit_ir::GcRef) -> bool {
+    gc_box::with_mut(|g| g.get_gcflag_extra(obj))
+        .unwrap_or_else(|| majit_gc::gc_sync::gc_op(|g| g.get_gcflag_extra(obj)))
+}
+
+fn dynasm_toggle_gcflag_extra(obj: majit_ir::GcRef) {
+    if gc_box::with_mut(|g| g.toggle_gcflag_extra(obj)).is_none() {
+        majit_gc::gc_sync::gc_op(|g| g.toggle_gcflag_extra(obj));
+    }
+}
+
+fn dynasm_get_gcflag_dummy(obj: majit_ir::GcRef) -> bool {
+    gc_box::with_mut(|g| g.get_gcflag_dummy(obj))
+        .unwrap_or_else(|| majit_gc::gc_sync::gc_op(|g| g.get_gcflag_dummy(obj)))
 }
 
 fn dynasm_get_rpy_memory_usage(obj: majit_ir::GcRef) -> Option<usize> {

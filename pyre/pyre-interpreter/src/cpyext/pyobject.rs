@@ -1114,8 +1114,15 @@ pub(super) unsafe fn resize_cached_bytes(
 /// right moment.
 pub(super) fn init_rawrefcount() {
     majit_gc::gc_rawrefcount_init(schedule_drain);
+    majit_gc::gc_rawrefcount_set_light_free(free_light_mirror);
     majit_gc::gc_rawrefcount_set_c_edge_census(super::gc::c_edges);
     majit_gc::gc_rawrefcount_set_finalizer_claim(super::gc::claim_finalizer);
+}
+
+/// `incminimark.py _rrc_free`'s raw release for a LIGHT link, routed through
+/// the same allocator and bookkeeping as every other cpyext mirror block.
+fn free_light_mirror(mirror: usize) {
+    unsafe { free_block(mirror as *mut CPyObject) };
 }
 
 /// Fired from inside a collection, so it may only schedule.

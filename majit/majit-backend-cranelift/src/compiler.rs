@@ -334,6 +334,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         typeid_is_object: Some(typeid_is_object_via_active_runtime),
         is_registered_type_id: Some(is_registered_type_id_via_active_runtime),
         can_move: Some(can_move_via_active_runtime),
+        pin: Some(pin_via_active_runtime),
+        unpin: Some(unpin_via_active_runtime),
+        is_pinned: Some(is_pinned_via_active_runtime),
         supports_guard_gc_type,
     });
     // No `set_active_gc_deadframe_hooks` call here, and the omission is the
@@ -383,6 +386,11 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         subgraph_has_pending_finalizer_via_active_runtime,
     ));
     majit_gc::set_active_is_tracked(Some(is_tracked_via_active_runtime));
+    majit_gc::set_active_gcflag_hooks(
+        Some(get_gcflag_extra_via_active_runtime),
+        Some(toggle_gcflag_extra_via_active_runtime),
+        Some(get_gcflag_dummy_via_active_runtime),
+    );
     majit_gc::set_active_get_rpy_memory_usage(Some(get_rpy_memory_usage_via_active_runtime));
     majit_gc::set_active_get_rpy_type_index(Some(get_rpy_type_index_via_active_runtime));
     majit_gc::set_active_get_rpy_roots(Some(get_rpy_roots_via_active_runtime));
@@ -1622,6 +1630,18 @@ fn can_move_via_active_runtime(gcref: GcRef) -> bool {
     with_cranelift_gc(|gc| gc.can_move(gcref)).unwrap_or(false)
 }
 
+fn pin_via_active_runtime(gcref: GcRef) -> bool {
+    with_cranelift_gc(|gc| gc.pin(gcref)).unwrap_or(false)
+}
+
+fn unpin_via_active_runtime(gcref: GcRef) {
+    with_cranelift_gc_required(|gc| gc.unpin(gcref));
+}
+
+fn is_pinned_via_active_runtime(gcref: GcRef) -> bool {
+    with_cranelift_gc(|gc| gc.is_pinned(gcref)).unwrap_or(false)
+}
+
 /// `majit_gc::SubclassRangeFn` installed by `set_gc_allocator`.
 /// Resolves the codegen-time `rclass.CLASSTYPE.subclassrange_{min,max}`
 /// lookup from x86/assembler.py:1971-1974 through the GC's
@@ -1782,6 +1802,18 @@ fn is_tracked_via_active_runtime(obj: GcRef) -> bool {
         return majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.is_tracked(obj));
     }
     false
+}
+
+fn get_gcflag_extra_via_active_runtime(obj: GcRef) -> bool {
+    with_cranelift_gc(|gc| gc.get_gcflag_extra(obj)).unwrap_or(false)
+}
+
+fn toggle_gcflag_extra_via_active_runtime(obj: GcRef) {
+    with_cranelift_gc(|gc| gc.toggle_gcflag_extra(obj));
+}
+
+fn get_gcflag_dummy_via_active_runtime(obj: GcRef) -> bool {
+    with_cranelift_gc(|gc| gc.get_gcflag_dummy(obj)).unwrap_or(false)
 }
 
 fn get_rpy_memory_usage_via_active_runtime(obj: GcRef) -> Option<usize> {

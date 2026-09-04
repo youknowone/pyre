@@ -352,8 +352,13 @@ pub struct TypeInfo {
     /// For variable-size objects: offset from object start to the length field.
     pub length_offset: usize,
     /// For variable-size objects: whether items contain GC pointers.
-    /// If true, each item is treated as a GcRef.
+    /// Derived from `var_gc_ptr_offsets`; retained as the infobit/card-layout
+    /// predicate used by the JIT-facing interfaces.
     pub items_have_gc_ptrs: bool,
+    /// `VARSIZE_TYPE_INFO.varofstoptrs`: byte offsets of every GC pointer
+    /// inside one variable-size item.  A plain `GcArray(GcRef)` is `[0]`; an
+    /// array of structs may contain several entries at non-zero offsets.
+    pub var_gc_ptr_offsets: Vec<usize>,
     /// RPython `rgc.register_custom_trace_hook` parity.
     /// When set, overrides offset-based tracing entirely.
     pub custom_trace: Option<CustomTraceFn>,
@@ -439,6 +444,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: false,
             has_subclass_range: false,
@@ -465,6 +471,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: false,
             has_subclass_range: false,
@@ -542,6 +549,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: false,
             has_subclass_range: false,
@@ -574,6 +582,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: true,
             has_subclass_range: true,
@@ -605,6 +614,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: true,
             has_subclass_range: true,
@@ -634,6 +644,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: true,
             has_subclass_range: true,
@@ -672,6 +683,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: true,
             has_subclass_range: true,
@@ -700,6 +712,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: Some(trace_fn),
             is_object: true,
             has_subclass_range: true,
@@ -725,6 +738,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: false,
             has_subclass_range: false,
@@ -747,6 +761,41 @@ impl TypeInfo {
         items_have_gc_ptrs: bool,
         gc_ptr_offsets: Vec<usize>,
     ) -> Self {
+        let var_gc_ptr_offsets = if items_have_gc_ptrs {
+            vec![0]
+        } else {
+            Vec::new()
+        };
+        Self::varsize_with_gc_ptr_offsets(
+            base_size,
+            item_size,
+            length_offset,
+            var_gc_ptr_offsets,
+            gc_ptr_offsets,
+        )
+    }
+
+    /// Create a variable-size type whose item is itself a structure.
+    ///
+    /// This is `q_varsize_offsets_to_gcpointers_in_var_part`: each offset is
+    /// relative to the start of one item and every item is visited with the
+    /// same offset table.
+    pub fn varsize_with_gc_ptr_offsets(
+        base_size: usize,
+        item_size: usize,
+        length_offset: usize,
+        var_gc_ptr_offsets: Vec<usize>,
+        gc_ptr_offsets: Vec<usize>,
+    ) -> Self {
+        for &offset in &var_gc_ptr_offsets {
+            assert!(
+                offset
+                    .checked_add(std::mem::size_of::<crate::GcRef>())
+                    .is_some_and(|end| end <= item_size),
+                "variable-item GC pointer at offset {offset} exceeds item size {item_size}",
+            );
+        }
+        let items_have_gc_ptrs = !var_gc_ptr_offsets.is_empty();
         TypeInfo {
             size: base_size,
             has_gc_ptrs: !gc_ptr_offsets.is_empty() || items_have_gc_ptrs,
@@ -754,6 +803,7 @@ impl TypeInfo {
             item_size,
             length_offset,
             items_have_gc_ptrs,
+            var_gc_ptr_offsets,
             custom_trace: None,
             is_object: false,
             has_subclass_range: false,
@@ -779,6 +829,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: Some(trace_fn),
             is_object: false,
             has_subclass_range: false,
@@ -820,6 +871,7 @@ impl TypeInfo {
             item_size,
             length_offset,
             items_have_gc_ptrs: false, // custom_trace handles ref tracing
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: Some(trace_fn),
             is_object: false,
             has_subclass_range: false,
@@ -870,7 +922,10 @@ impl TypeInfo {
             let length = unsafe { *((obj_addr + self.length_offset) as *const usize) };
             let items_start = obj_addr + self.size;
             for i in 0..length {
-                f((items_start + i * self.item_size) as *mut GcRef);
+                let item = items_start + i * self.item_size;
+                for &offset in &self.var_gc_ptr_offsets {
+                    f((item + offset) as *mut GcRef);
+                }
             }
         }
     }
@@ -1379,5 +1434,34 @@ mod tests {
         assert_eq!(visited[0], obj_addr + 8);
         assert_eq!(visited[1], obj_addr + 16);
         assert_eq!(visited[2], obj_addr + 24);
+    }
+
+    #[test]
+    fn test_for_each_gc_ptr_varsize_struct_items_uses_varofstoptrs() {
+        let word = std::mem::size_of::<GcRef>();
+        let info = TypeInfo::varsize_with_gc_ptr_offsets(
+            word,
+            3 * word,
+            0,
+            vec![word, 2 * word],
+            Vec::new(),
+        );
+
+        let mut data = vec![0u8; word + 2 * 3 * word];
+        let obj_addr = data.as_mut_ptr() as usize;
+        unsafe { *(obj_addr as *mut usize) = 2 };
+
+        let mut visited = Vec::new();
+        unsafe { info.for_each_gc_ptr(obj_addr, |ptr| visited.push(ptr as usize)) };
+
+        assert_eq!(
+            visited,
+            vec![
+                obj_addr + 2 * word,
+                obj_addr + 3 * word,
+                obj_addr + 5 * word,
+                obj_addr + 6 * word,
+            ]
+        );
     }
 }

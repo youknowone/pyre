@@ -884,6 +884,13 @@ fn wrap_raw_nodes(first: usize, last: usize) -> usize {
     let result_first = pyre_object::gc_roots::shadow_stack_len();
     for slot in first..last {
         let raw = majit_ir::GcRef(pyre_object::gc_roots::shadow_stack_get(slot) as usize);
+        // `inspector.py:get_rpy_roots` returns its non-resizable raw list with
+        // spare NULL entries; `referents.py:get_rpy_roots` removes those at
+        // the Python boundary. `get_rpy_referents` has no NULL padding, so the
+        // same check is harmless for its other caller.
+        if raw.is_null() {
+            continue;
+        }
         let wrapped = if majit_gc::is_app_level_object(raw) {
             // The query enters the collector; the address comes back out of
             // the slot rather than out of the word held across it.
@@ -1555,14 +1562,20 @@ crate::py_module! {
         "enable_finalizers" / 0 = |_| {
             // `interp_gc.py`: unlike gc.enable(), an unmatched public
             // enable is an error rather than a no-op.
-            if let Some(action) = user_del_action() {
-                if action.finalizers_lock_count == 0 {
-                    return Err(crate::PyError::value_error(
-                        "finalizers are already enabled",
-                    ));
-                }
-                enable_finalizers(action);
+            let Some(action) = user_del_action() else {
+                // Before UserDelAction is installed there cannot have been a
+                // matching disable. Treat that as the same zero lock depth,
+                // not as a bootstrap-only silent success.
+                return Err(crate::PyError::value_error(
+                    "finalizers are already enabled",
+                ));
+            };
+            if action.finalizers_lock_count == 0 {
+                return Err(crate::PyError::value_error(
+                    "finalizers are already enabled",
+                ));
             }
+            enable_finalizers(action);
             Ok(w_none())
         },
         "disable"       / 0 = |_| {
@@ -1755,13 +1768,13 @@ crate::py_module! {
         },
         "is_tracked"    / 1 = |args| {
             // CPython 3.14 `PyObject_GC_IsTracked` first requires
-            // `_PyObject_IS_GC`. Pyre's collector does not dynamically
-            // untrack eligible tuples/dicts, so that type-level eligibility
-            // is also its tracked state. Some eligible objects (notably
-            // modules) are rooted outside the moving arena, while scalar Rust
-            // structs may live inside it; arena membership therefore cannot
-            // be used as the app-level answer.
-            Ok(w_bool_from(crate::typedef::cpython_object_is_gc(args[0])))
+            // `_PyObject_IS_GC`, then asks the collector's tracked state. Host
+            // fallback objects are outside MiniMark and retain their type-level
+            // answer; managed objects must not bypass `GCBase.is_tracked`.
+            let eligible = crate::typedef::cpython_object_is_gc(args[0]);
+            let tracked = !majit_gc::gc_owns_object(args[0] as usize)
+                || majit_gc::is_tracked(majit_ir::GcRef(args[0] as usize));
+            Ok(w_bool_from(eligible && tracked))
         },
         "get_rpy_memory_usage" / 1 = |args| {
             // referents.py:97-104 / inspector.py:76-77.  The size is just the

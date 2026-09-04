@@ -107,8 +107,18 @@ pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRe
 /// Alignment for nursery allocations (8 bytes).
 const NURSERY_ALIGN: usize = 8;
 
-/// Align `size` up to `NURSERY_ALIGN`.
+/// `GcRewriterAssembler.round_up_for_allocation` — raise to the nursery's
+/// minimum object size, then align.
+///
+/// A nursery object that moves has its header replaced by the forwarded marker
+/// and the following word by the new address, so a block shorter than
+/// [`GcHeader::MIN_NURSERY_OBJ_SIZE`] would let that second word land in the
+/// next object.  `Nursery::alloc` already raises the runtime bump; the JIT
+/// bumps by whatever this hands `CALL_MALLOC_NURSERY` /
+/// `NURSERY_PTR_INCREMENT`, so it has to raise it too.  Upstream spells the
+/// same floor as `max(size, 2 * WORD)`.
 fn round_up(size: usize) -> usize {
+    let size = size.max(crate::header::GcHeader::MIN_NURSERY_OBJ_SIZE);
     (size + NURSERY_ALIGN - 1) & !(NURSERY_ALIGN - 1)
 }
 
@@ -4009,6 +4019,39 @@ mod tests {
             call.arg(3).to_opref(),
             len_ref,
             "the length operand is threaded through as the helper's num_elem"
+        );
+    }
+
+    /// `GcRewriterAssembler.round_up_for_allocation` raises to
+    /// `minimal_size_in_nursery` before aligning. Without the floor the JIT's inline bump
+    /// and `Nursery::alloc`'s bump disagree for a sub-minimum object, and the
+    /// next allocation lands inside the forwarding word of the previous one.
+    #[test]
+    fn a_headerless_new_below_the_nursery_minimum_bumps_by_the_minimum() {
+        let rw = make_rewriter();
+        let payload_size = std::mem::size_of::<usize>();
+        assert!(payload_size < crate::header::GcHeader::MIN_NURSERY_OBJ_SIZE);
+
+        let ops = vec![Op::with_descr(
+            OpCode::New,
+            &[],
+            headerless_size_descr(payload_size, 78),
+        )];
+
+        let (result, _constants, _gcrefs) =
+            rw.rewrite_for_gc_with_constants(&ops, &ConstMap::new());
+
+        let malloc = result
+            .iter()
+            .find(|o| o.opcode == OpCode::CallMallocNurseryHeaderless)
+            .expect("a one-word headerless struct fits the nursery");
+        assert_eq!(
+            malloc
+                .arg(0)
+                .to_opref()
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            crate::header::GcHeader::MIN_NURSERY_OBJ_SIZE as i64
         );
     }
 
