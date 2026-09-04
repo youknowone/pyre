@@ -13503,58 +13503,137 @@ fn nonascii_bytes_literal_span(source: &str, raw_index: usize) -> Option<(usize,
     None
 }
 
-/// CPython 3.14 `Parser/lexer/lexer.c`
-/// `maybe_raise_syntax_error_for_string_prefixes`.  Ruff tokenizes an
-/// incompatible prefix as a NAME followed by a STRING and reports the gap
-/// between simple statements, so recover the prefix around the quote selected
-/// by that parser error and apply CPython's ordered checks.
+/// `Parser/lexer/lexer.c` `maybe_raise_syntax_error_for_string_prefixes`.
+/// Ruff tokenizes an incompatible prefix as a NAME followed by a STRING and
+/// reports whatever grammar alternative that breaks, so the literal is
+/// recovered from the source text and given the ordered prefix checks.
 ///
-/// The quote is looked for on both sides of the reported token.  The check
-/// runs in the tokenizer, ahead of every grammar alternative, so the literal
-/// can stand after that token as well as before it: `invalid_assignment`
-/// names the target and the prefix is written in the value.
+/// The check runs in the tokenizer, ahead of every grammar alternative, so the
+/// literal can stand anywhere in the source -- after the reported token as
+/// well as before it -- and the token stream alone decides which one is
+/// reported: `f() = 'ok'; bu'x'` names the prefix, not the assignment.
 fn incompatible_string_prefix_error(
     source: &str,
     raw_index: usize,
 ) -> Option<(String, usize, usize)> {
     let bytes = source.as_bytes();
-    let anchor = raw_index.min(bytes.len());
-    // A reported token that is itself a quote is the literal in question, and
-    // stays the only candidate examined.
-    if matches!(bytes.get(anchor), Some(b'\'' | b'"')) {
-        return string_prefix_pair_error(bytes, anchor);
-    }
-    let before = bytes[..anchor]
-        .iter()
-        .rposition(|byte| matches!(*byte, b'\'' | b'"'));
-    // The tokenizer does not read a comment, so neither does this walk -- the
-    // quote it stops on has to open a real token.  Starting outside a literal,
-    // the first quote reached is always an opening one.
-    let after = {
-        let mut cursor = anchor;
-        loop {
-            match bytes.get(cursor) {
-                None => break None,
-                Some(b'#') => {
-                    cursor = bytes[cursor..]
-                        .iter()
-                        .position(|byte| *byte == b'\n')
-                        .map_or(bytes.len(), |newline| cursor + newline + 1);
-                }
-                Some(b'\'' | b'"') => break Some(cursor),
-                Some(_) => cursor += 1,
-            }
-        }
-    };
-    [before, after]
-        .into_iter()
-        .flatten()
-        .find_map(|quote| string_prefix_pair_error(bytes, quote))
+    first_string_prefix_pair_error(bytes, raw_index.min(bytes.len()))
 }
 
-/// The ordered prefix-pair checks applied to the letters written immediately
-/// before `quote`.
-fn string_prefix_pair_error(bytes: &[u8], quote: usize) -> Option<(String, usize, usize)> {
+/// The first string token in `bytes` whose prefix is an incompatible pair.
+///
+/// The tokenizer reads neither a comment nor the text of a literal, so neither
+/// does this walk: a quote it stops on opens a token, and a literal's own text
+/// is skipped.  An f-string's replacement fields are tokenized, so a literal
+/// written inside one is a token in its own right -- `f'{ub"y"}'` names its
+/// prefix, and `f'{d['k']}'` is one f-string rather than a literal ending at
+/// the quote before `k`.  An unterminated literal ends the walk: the tokenizer
+/// raises its own error there and never reaches a prefix written after it.
+///
+/// A literal inside a replacement field is diagnosed by the parser reading
+/// that field rather than by the tokenizer, so it only stands where it
+/// precedes the error already reported at `anchor`: `s = f'{ub"y"}'; f() = 1`
+/// names the prefix and `f() = 1; s = f'{ub"y"}'` names the assignment.
+fn first_string_prefix_pair_error(bytes: &[u8], anchor: usize) -> Option<(String, usize, usize)> {
+    /// One literal the walk is inside, and how many braces are open in it --
+    /// a replacement field, and any display written within that field.
+    struct OpenLiteral {
+        delimiter: u8,
+        triple: bool,
+        interpolated: bool,
+        braces: usize,
+    }
+
+    let mut open: Vec<OpenLiteral> = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        // The innermost literal's own text, unless a brace of it is open --
+        // inside one the walk is reading tokens again.
+        if let Some(literal) = open.last_mut().filter(|literal| literal.braces == 0) {
+            match byte {
+                // A backslash closes no literal, raw included: `r'\''` keeps
+                // the escape in its text and the quote after it in the token.
+                // In an interpolated literal it does not hide a following
+                // brace: PyPy's `fstring_find_literal` consumes the escape and
+                // then still applies its brace branch to that character.
+                b'\\'
+                    if literal.interpolated
+                        && matches!(bytes.get(cursor + 1), Some(b'{' | b'}')) =>
+                {
+                    cursor += 1
+                }
+                b'\\' => cursor += 2,
+                b'\n' if !literal.triple => return None,
+                // `{{` and `}}` each write one brace and open no field.
+                b'{' if literal.interpolated => {
+                    let doubled = bytes.get(cursor + 1) == Some(&b'{');
+                    cursor += 1 + usize::from(doubled);
+                    literal.braces += usize::from(!doubled);
+                }
+                b'}' if literal.interpolated => {
+                    cursor += 1 + usize::from(bytes.get(cursor + 1) == Some(&b'}'));
+                }
+                _ if byte == literal.delimiter => {
+                    if literal.triple && !bytes[cursor..].starts_with(&[byte; 3]) {
+                        cursor += 1;
+                    } else {
+                        cursor += if literal.triple { 3 } else { 1 };
+                        open.pop();
+                    }
+                }
+                _ => cursor += 1,
+            }
+            continue;
+        }
+        match byte {
+            // A comment runs to the end of its line.  Only outside a literal:
+            // what a replacement field writes is not one.
+            b'#' if open.is_empty() => {
+                cursor = bytes[cursor..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(bytes.len(), |newline| cursor + newline + 1);
+            }
+            b'{' | b'}' => {
+                if let Some(literal) = open.last_mut() {
+                    literal.braces = if byte == b'{' {
+                        literal.braces + 1
+                    } else {
+                        literal.braces - 1
+                    };
+                }
+                cursor += 1;
+            }
+            b'\'' | b'"' => {
+                if let Some(error) = string_prefix_pair_error(bytes, cursor)
+                    && (open.is_empty() || error.1 <= anchor)
+                {
+                    return Some(error);
+                }
+                let triple = bytes[cursor + 1..].starts_with(&[byte, byte]);
+                let interpolated = string_prefix_span(bytes, cursor).is_some_and(|prefix| {
+                    bytes[prefix]
+                        .iter()
+                        .any(|byte| matches!(byte.to_ascii_lowercase(), b'f' | b't'))
+                });
+                open.push(OpenLiteral {
+                    delimiter: byte,
+                    triple,
+                    interpolated,
+                    braces: 0,
+                });
+                cursor += if triple { 3 } else { 1 };
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+/// The letters written immediately before `quote`, or `None` when what stands
+/// there cannot open a token.
+fn string_prefix_span(bytes: &[u8], quote: usize) -> Option<std::ops::Range<usize>> {
     let mut start = quote;
     while start > 0
         && matches!(
@@ -13568,16 +13647,19 @@ fn string_prefix_pair_error(bytes: &[u8], quote: usize) -> Option<(String, usize
     // identifier running into the letters makes them part of that name, and a
     // name carries bytes past ASCII too -- which is also what sits behind the
     // closing quote of a literal whose text ends in those letters.
-    if start == quote
-        || bytes
-            .get(start.wrapping_sub(1))
-            .is_some_and(|byte| !byte.is_ascii() || byte.is_ascii_alphanumeric() || *byte == b'_')
-    {
-        return None;
-    }
-    let prefix = &bytes[start..quote];
+    let closes_a_token = !bytes
+        .get(start.wrapping_sub(1))
+        .is_some_and(|byte| !byte.is_ascii() || byte.is_ascii_alphanumeric() || *byte == b'_');
+    closes_a_token.then_some(start..quote)
+}
+
+/// The ordered prefix-pair checks applied to the letters written immediately
+/// before `quote`.
+fn string_prefix_pair_error(bytes: &[u8], quote: usize) -> Option<(String, usize, usize)> {
+    let prefix = string_prefix_span(bytes, quote)?;
+    let start = prefix.start;
     let mut seen = [false; 5];
-    for byte in prefix {
+    for byte in &bytes[prefix] {
         let index = match byte.to_ascii_lowercase() {
             b'b' => 0,
             b'r' => 1,

@@ -1455,7 +1455,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
             cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
             cdata::cdata_write(obj, offset, &bytes);
             let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
-            if cdata::is_cdata_instance(value) {
+            if cdata::value_needs_keep(&tc, value) {
                 cdata::keep_ref(obj, &index.to_string(), value);
             }
             Ok(pyre_object::w_none())
@@ -2094,7 +2094,7 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
             cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
             cdata::cdata_write(obj, offset, &bytes);
             let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
-            if cdata::is_cdata_instance(value) {
+            if cdata::value_needs_keep(&tc, value) {
                 cdata::keep_ref(obj, &idx.to_string(), value);
             }
             Ok(pyre_object::w_none())
@@ -2602,7 +2602,7 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
             cdata::release_bstr_slot(&tc, addr);
             unsafe { host_ctypes::copy_bytes_to_address(addr, &bytes, element_size) };
             let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
-            if cdata::is_cdata_instance(value) {
+            if cdata::value_needs_keep(&tc, value) {
                 cdata::keep_ref(obj, &index.to_string(), value);
             }
             Ok(pyre_object::w_none())
