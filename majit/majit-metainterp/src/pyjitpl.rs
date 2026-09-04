@@ -2783,9 +2783,7 @@ impl<M: Clone> MetaInterp<M> {
         let Some(trace_ctx) = self.tracing.as_mut() else {
             return;
         };
-        for op in trace_ctx.recorder.ops() {
-            walk_op_const_ptr_refs(op, &mut visitor);
-        }
+        trace_ctx.recorder.walk_const_ptr_refs(&mut visitor);
         // `set_concrete_at` also stamps a runtime `Value::Ref` onto recorder
         // InputArgs (loop / bridge entry args). No other walker visits them,
         // and an InputArg carries no args / fail_args, so `.value` is the only
@@ -8519,26 +8517,16 @@ impl<M: Clone> MetaInterp<M> {
                 .close_loop_with_descr(finish_args, Some(jump_descr));
         }
 
-        // Snapshot the trace ops (including JUMP) for bridge compilation.
-        // `ctx.ops()` yields `&[OpRc]`; the bridge compile helpers consume
-        // `&[Op]`, so materialize an owned value copy here.
-        let bridge_ops: Vec<majit_ir::Op> = ctx
-            .ops()
-            .iter()
-            .map(|op| {
-                let cloned = (**op).clone();
-                // `Op::clone` resets the concrete value slot to fresh-identity
-                // empty, but the bridge trace must carry the recorded runtime
-                // values (history.py:680 `_resint`/`_resref`) so the optimizer's
-                // jump_to_existing_trace virtual-state match can read the
-                // closing-jump args (`closing_jump_runtime_boxes`). Re-stamp the
-                // value the recorder placed on the source op identity.
-                if let Some(v) = op.get_value() {
-                    cloned.set_value(v);
-                }
-                cloned
-            })
-            .collect();
+        // Keep the recorded operations (including JUMP) alive while the
+        // recorder is cut below. `compile.py compile_trace` hands the live
+        // opencoder trace straight to `UnrollOptimizer.optimize_bridge`, whose
+        // `TraceIterator` is the one and only place fresh ResOperations are
+        // materialized. A deep `Op::clone` here used to materialize every op a
+        // first time merely to survive Rust's earlier cut; retaining the
+        // canonical `Rc<Op>` handles preserves the same live trace identity
+        // and lets `prepare_bridge_trace_for_optimizer` perform the sole fresh
+        // materialization, as upstream does.
+        let bridge_ops: Vec<majit_ir::OpRc> = ctx.ops().to_vec();
         // Carry the history's live input boxes, WITHOUT carrying the values
         // the recorder's own inputargs hold.
         //
@@ -8598,14 +8586,13 @@ impl<M: Clone> MetaInterp<M> {
         // ConstantPool to snapshot — this typed-constant map starts fresh.
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let call_pure_results = ctx.call_pure_results.clone();
-        let trace_snapshots = ctx.snapshots().to_vec();
         let (
             mut snapshot_boxes,
             snapshot_frame_sizes,
             mut snapshot_vable_boxes,
             mut snapshot_vref_boxes,
             snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace_snapshots, &mut constants);
+        ) = snapshot_map_from_trace_snapshots(ctx.snapshots(), &mut constants);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_boxes,
             &mut snapshot_vable_boxes,
@@ -13552,14 +13539,14 @@ impl<M: Clone> MetaInterp<M> {
     /// Optimize against the already-compiled loop at `green_key`, then
     /// compile the result as a fresh interpreter entry under
     /// `original_green_key`.
-    pub fn compile_entry_bridge(
+    pub fn compile_entry_bridge<T>(
         &mut self,
         green_key: u64,
         original_green_key: u64,
         meta: M,
         driver_descriptor: Option<crate::jitdriver::JitDriverStaticData>,
         orig_vable_ptr_entry: *const u8,
-        bridge_ops: &[majit_ir::Op],
+        bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArg],
         bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
@@ -13567,7 +13554,10 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_vable_boxes: SnapshotBoxes,
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
-    ) -> bool {
+    ) -> bool
+    where
+        T: std::borrow::Borrow<majit_ir::Op>,
+    {
         if !self.compiled_loops.contains_key(&green_key) {
             crate::mc_diag_bump(34); // compile_entry_bridge: target has no compiled loop
             return false;
@@ -14036,12 +14026,16 @@ impl<M: Clone> MetaInterp<M> {
     /// jump arg with no recorded value (or a Void result) is passed through
     /// unchanged, leaving the corresponding virtual-state entry to match
     /// statically as before.
-    fn closing_jump_runtime_boxes(
-        bridge_ops: &[majit_ir::Op],
+    fn closing_jump_runtime_boxes<T>(
+        bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArg],
-    ) -> Vec<OpRef> {
+    ) -> Vec<OpRef>
+    where
+        T: std::borrow::Borrow<majit_ir::Op>,
+    {
         let jump_arg_oprefs: Vec<OpRef> = bridge_ops
             .last()
+            .map(std::borrow::Borrow::borrow)
             .filter(|op| op.opcode == OpCode::Jump)
             .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
             .unwrap_or_default();
@@ -14055,7 +14049,7 @@ impl<M: Clone> MetaInterp<M> {
                 concrete.insert(OpRef::input_arg_typed(ia.index, ia.tp), v);
             }
         }
-        for op in bridge_ops {
+        for op in bridge_ops.iter().map(std::borrow::Borrow::borrow) {
             let pos = op.pos.get();
             if !pos.is_none()
                 && let Some(v) = op.get_value()
@@ -14097,7 +14091,7 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    pub fn compile_bridge(
+    pub fn compile_bridge<T>(
         &mut self,
         green_key: u64,
         // The jitcell the closing JUMP enters (`bridge_cell_token_key`).
@@ -14114,7 +14108,7 @@ impl<M: Clone> MetaInterp<M> {
         jump_target_key: u64,
         fail_index: u32,
         fail_descr: &dyn majit_ir::FailDescr,
-        bridge_ops: &[majit_ir::Op],
+        bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArg],
         bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
@@ -14123,7 +14117,10 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
         call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
-    ) -> bool {
+    ) -> bool
+    where
+        T: std::borrow::Borrow<majit_ir::Op>,
+    {
         self.remember_compiled_graph_write();
         self.last_compiled_artifact_token = None;
         crate::mc_diag_bump(8); // compile_bridge entered
@@ -23922,13 +23919,15 @@ mod tests {
 
         meta.walk_partial_trace_refs(|slot| match slot.0 {
             0x4000 => slot.0 = 0x5000,
-            0 => slot.0 = 0x6000,
             _ => {}
         });
 
         let ops = &meta.partial_trace.as_ref().unwrap().ops;
         assert_eq!(ops[0].arg(0).to_opref().as_const_ptr(), Some(GcRef(0x5000)));
-        assert_eq!(ops[0].arg(1).to_opref().as_const_ptr(), Some(GcRef(0x6000)));
+        // `opencoder.py Trace._refs[0]` reserves null and never registers it
+        // with the GC root tracer. `Operand::NullRef` carries that immutable
+        // sentinel inline, so only the non-null ConstPtr above is forwarded.
+        assert_eq!(ops[0].arg(1).to_opref().as_const_ptr(), Some(GcRef::NULL));
     }
 
     #[test]

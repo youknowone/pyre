@@ -428,11 +428,11 @@ runs:
 | 3 | 1,127,526 | 460,087 | 2.45x |
 
 The 3.0-4.1x above becomes 2.3-2.5x, at the same length and against a binary
-translated the same afternoon. What is left is length-independent: with
-bridges off majit reads 750K in the same sitting, so the compiled bridges
-still cost 1.5x over running none, and the deopt that every character takes
-on both sides runs 124 blackhole operations here against RPython's 82 (the
-table below). The heap is no longer in the ratio; the deopt is.
+translated the same afternoon. At that revision, with bridges off majit read
+750K in the same sitting, so the compiled bridges cost 1.5x over running none,
+and the deopt that every character takes ran 124 blackhole operations here
+against RPython's 82. The 2026-09-04 follow-up below closes that operation-count
+gap; bridge construction remains the structural difference.
 
 ### Where majit's share of that gap goes
 
@@ -444,7 +444,8 @@ and never converges, but so does RPython — see "The bridges are RPython's too"
 above. Refuted.
 
 **Not the blackhole byte-interpreting callees.** That was recorded as majit's
-big deviation, at 2142 blackhole ops per character against 39. Re-measured with
+big deviation, at 2142 blackhole ops per character against 39. Re-measured at
+that revision with
 `MAJIT_BH_DEBUG=1 MAJIT_GUARDLOG=1` at 1024 characters, and with RPython's own
 dump counted the same way (`bh: (\w+)` lines over `runner.py 20 1024`), both
 halves of that were wrong:
@@ -468,6 +469,56 @@ On this exact `shift` JitCode the working-register footprint falls from **36
 int / 26 ref** to **4 int / 3 ref**; the blackhole therefore has fewer slots to
 initialize and fewer renamings to execute. The native-entry test pins those
 counts so monotonic allocation cannot return unnoticed.
+
+#### 2026-09-04: the missing coalescing half
+
+The footprint result did not mean the register allocator was complete. RPython
+`tool/algo/regalloc.py::RegAllocator.coalesce_variables` runs between building
+the interference graph and coloring it, then
+`flatten.py::GraphFlattener.insert_renamings` omits a link copy when source and
+target received the same color. The proc-macro adapter skipped both operations;
+it also reserved the whole ABI-input prefix from temporaries instead of doing
+`GraphFlattener.enforce_input_args`' post-color swaps. In the flattened adapter,
+branch-join `Move{I,R,F}` operations are the link source/target pairs. They are
+now coalesced in reverse control-flow order, input colors are swapped into the
+ABI prefix afterwards, and identity moves are omitted.
+
+The same 1,024-character logs, normalized by actual deopts, now read:
+
+| per deopt | RPython | majit before coalescing | majit after |
+|---|---:|---:|---:|
+| all blackhole ops | 82.20 | 80.73 | **65.39** |
+| register copies | 3.09 `int_copy` | 17.55 | **2.21** |
+
+The earlier 124.3 total included the pre-coloring implementation; after the
+first coloring pass it had already fallen to 80.73, but that fact had not been
+re-measured. Coalescing removes another 15.34 `move_i` operations per deopt.
+The total is now lower than RPython rather than higher, so blackhole opcode
+count is no longer an explanation for the remaining speed gap.
+
+Retired-instruction slope over 262,144 → 1,048,576 characters, five timed runs
+per point, moved from the branch baseline's 28,274 to **27,464 instructions per
+character**. That is a real but much smaller 2.9% change: most remaining
+instructions are still spent constructing and optimizing bridges, not running
+the copies. Against the freshly translated RPython's 11,354 the current ratio
+is **2.42x**.
+
+Repeated non-null ConstPtr operands now share the trace's upstream-shaped ref
+cache; null uses the reserved inline ref-zero representation. Its same-tree A/B
+at 65,536 characters was 19.0 / 2,650 → 9.9 allocations / 1,747 bytes per
+character. Two ownership copies in bridge preparation were then removed: a
+tentative trace retains its existing `Rc<Op>` handles across `cut` instead of
+deep-cloning every operation, and snapshot maps read the live snapshot slice
+instead of cloning every frame/box vector first. Those bring the same census to
+**9.7 allocations / 1,649 bytes per character**. The peeled trace remains
+exactly `0 / 24 / 93 / 2`.
+
+The remaining boundary is literal rather than diagnostic: the live recorder is
+still `recorder::Trace` (`Vec<Rc<Op>>` plus structured snapshots), while the
+already-ported `opencoder::TraceRecordBuffer` flat operation and snapshot
+buffers are not yet the `TraceCtx` owner. Completing that field swap, then
+letting its `TraceIterator` be the sole operation materializer, is the remaining
+RPython-shaped route to remove the per-bridge allocator traffic.
 
 **It is bridge compilation, and allocation traffic inside it.** `/usr/bin/sample`
 over a 262,144-character run, counting only the `shortcircuit::mainloop`

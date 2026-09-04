@@ -2089,7 +2089,7 @@ impl TraceCtx {
     /// the box-keyed dicts upstream (e.g. `heapcache.py` `cache_anything[ref_box]`).
     /// Deterministic: the same recorded position always yields an `Operand`
     /// wrapping the same producer `Rc`.
-    pub fn operand_for(&self, opref: OpRef) -> majit_ir::operand::Operand {
+    pub fn operand_for(&mut self, opref: OpRef) -> majit_ir::operand::Operand {
         self.recorder.box_for_operand(opref)
     }
 
@@ -2348,6 +2348,7 @@ impl TraceCtx {
                     Operand::Op(o) => format!("{:?}", o.pos.get()),
                     Operand::InputArg(ia) => format!("IA{}", ia.index),
                     Operand::SmallInt(_) => format!("C{:?}", a.const_value().unwrap()),
+                    Operand::NullRef => "CRef(NULL)".to_string(),
                     Operand::Const(c) => format!("C{:?}", c.get()),
                     Operand::None => "_".to_string(),
                 })

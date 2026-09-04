@@ -40,6 +40,65 @@ impl RegisterCounts {
     }
 }
 
+/// RPython `tool/algo/unionfind.py::UnionFind`, narrowed to the symbolic
+/// registers owned by this proc-macro lowering path.
+///
+/// `majit-translate` has the same private helper for real flowspace
+/// Variables. Keeping this one local avoids making that implementation part
+/// of the cross-crate API merely for the temporary adapter that disappears
+/// once proc-macro helpers enter the normal codewriter graph.
+struct UnionFind {
+    parent: HashMap<Register, Register>,
+    weight: HashMap<Register, usize>,
+}
+
+impl UnionFind {
+    fn new() -> Self {
+        Self {
+            parent: HashMap::new(),
+            weight: HashMap::new(),
+        }
+    }
+
+    fn find_rep(&mut self, reg: Register) -> Register {
+        if !self.parent.contains_key(&reg) {
+            self.parent.insert(reg, reg);
+            self.weight.insert(reg, 1);
+            return reg;
+        }
+        let mut root = reg;
+        while self.parent[&root] != root {
+            root = self.parent[&root];
+        }
+        let mut current = reg;
+        while current != root {
+            let next = self.parent[&current];
+            self.parent.insert(current, root);
+            current = next;
+        }
+        root
+    }
+
+    fn union(&mut self, left: Register, right: Register) -> Register {
+        let left = self.find_rep(left);
+        let right = self.find_rep(right);
+        if left == right {
+            return left;
+        }
+        let left_weight = self.weight[&left];
+        let right_weight = self.weight[&right];
+        let (winner, loser) = if left_weight >= right_weight {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        self.parent.insert(loser, winner);
+        self.weight.remove(&loser);
+        self.weight.insert(winner, left_weight + right_weight);
+        winner
+    }
+}
+
 fn successors(ops: &[OpMeta]) -> Vec<Vec<usize>> {
     let labels: HashMap<String, usize> = ops
         .iter()
@@ -144,6 +203,16 @@ fn coloring(
     for kind in [BindingKind::Int, BindingKind::Ref, BindingKind::Float] {
         graphs.insert(kind, DependencyGraph::new());
     }
+    // `RegAllocator.make_dependencies` starts every block with all of its
+    // inputargs live and makes that set a clique. The proc-macro ABI registers
+    // are the entry block's inputargs; seed them explicitly so even an unused
+    // parameter retains a distinct caller slot.
+    for kind in [BindingKind::Int, BindingKind::Ref, BindingKind::Float] {
+        let inputs: BTreeSet<_> = (0..reserved.for_kind(kind))
+            .map(|index| Register::new(kind, index))
+            .collect();
+        add_clique(graphs.get_mut(&kind).unwrap(), &inputs);
+    }
     for op in ops {
         for &reg in op.reads.iter().chain(op.writes.iter()) {
             graphs.get_mut(&reg.kind).unwrap().add_node(reg);
@@ -169,37 +238,86 @@ fn coloring(
         }
     }
 
+    // RPython `tool/algo/regalloc.py::RegAllocator.coalesce_variables` walks
+    // blocks from the end and coalesces each link argument with the matching
+    // target inputarg before coloring. The proc-macro CFG has already
+    // flattened those links into typed Move operations, so those moves are
+    // exactly the source/target pairs to feed to the same algorithm. This was
+    // the missing half of this adapter's claimed pre-flatten allocation: every
+    // branch join survived as a runtime `int_copy` even when its Variables did
+    // not interfere.
+    let originals: BTreeSet<Register> = ops
+        .iter()
+        .flat_map(|op| op.reads.iter().chain(&op.writes))
+        .copied()
+        .chain(return_reg)
+        .collect();
+    let mut unionfind = UnionFind::new();
+    for op in ops.iter().rev() {
+        if !matches!(op.kind, OpKind::MoveI | OpKind::MoveR | OpKind::MoveF)
+            || op.reads.len() != 1
+            || op.writes.len() != 1
+        {
+            continue;
+        }
+        let source = unionfind.find_rep(op.reads[0]);
+        let target = unionfind.find_rep(op.writes[0]);
+        if source == target || source.kind != target.kind {
+            continue;
+        }
+        let graph = graphs.get_mut(&source.kind).unwrap();
+        if graph.has_edge(&source, &target) {
+            continue;
+        }
+        let representative = unionfind.union(source, target);
+        if representative == source {
+            graph.coalesce(target, source);
+        } else {
+            graph.coalesce(source, target);
+        }
+    }
+
     let mut result = HashMap::new();
     for kind in [BindingKind::Int, BindingKind::Ref, BindingKind::Float] {
         let fixed = reserved.for_kind(kind);
         let graph = &graphs[&kind];
-        // Portal/helper ABI inputs are precolored. RPython can color its graph
-        // inputs freely because the caller mapping is generated afterwards;
-        // pyre's proc-macro ABI is already published, so retaining those slots
-        // is the minimal structural adaptation.
-        for old in 0..fixed {
-            let old = Register::new(kind, old);
-            if graph.neighbours.contains_key(&old) {
-                result.insert(old, old);
-            }
-        }
-        for old in graph.lexicographic_order() {
-            if result.contains_key(&old) {
+        let mut representative_colors = graph.find_node_coloring();
+
+        // RPython `flatten.py::GraphFlattener.enforce_input_args` does not
+        // reserve the ABI prefix while coloring. It swaps colors afterwards,
+        // which lets a temporary reuse a dead input slot while still making
+        // caller-visible inputargs dense at 0..N. The former adapter excluded
+        // the entire prefix from every temporary.
+        for input_index in 0..fixed {
+            let input = Register::new(kind, input_index);
+            let representative = unionfind.find_rep(input);
+            let Some(current_color) = representative_colors.get(&representative).copied() else {
+                continue;
+            };
+            let desired_color = usize::from(input_index);
+            if current_color == desired_color {
                 continue;
             }
-            let mut forbidden = BTreeSet::new();
-            for neighbour in &graph.neighbours[&old] {
-                if let Some(colored) = result.get(neighbour) {
-                    forbidden.insert(colored.index);
+            for color in representative_colors.values_mut() {
+                if *color == current_color {
+                    *color = desired_color;
+                } else if *color == desired_color {
+                    *color = current_color;
                 }
             }
-            let mut color = 0u8;
-            while forbidden.contains(&color) || u16::from(color) < fixed {
-                color = color
-                    .checked_add(1)
-                    .expect("JitCode register coloring exceeds u8");
+        }
+
+        for original in originals.iter().filter(|reg| reg.kind == kind) {
+            let representative = unionfind.find_rep(*original);
+            if let Some(&color) = representative_colors.get(&representative) {
+                result.insert(
+                    *original,
+                    Register {
+                        kind,
+                        index: u8::try_from(color).expect("JitCode register coloring exceeds u8"),
+                    },
+                );
             }
-            result.insert(old, Register { kind, index: color });
         }
     }
     result
@@ -356,6 +474,20 @@ pub(super) fn compact_registers(
             }
         }
     }
+    // `flatten.py::GraphFlattener.insert_renamings` compares post-regalloc
+    // source and destination colors and emits no `*_copy` when they match.
+    // Our link moves were materialized before this adapter runs, so perform
+    // the same check after rewriting and remove the now-empty links.
+    let (statements, op_metadata): (Vec<_>, Vec<_>) = std::mem::take(&mut lowerer.statements)
+        .into_iter()
+        .zip(std::mem::take(&mut lowerer.op_metadata))
+        .filter(|(_, meta)| {
+            !matches!(meta.kind, OpKind::MoveI | OpKind::MoveR | OpKind::MoveF)
+                || meta.reads != meta.writes
+        })
+        .unzip();
+    lowerer.statements = statements;
+    lowerer.op_metadata = op_metadata;
     let mut counts = reserved;
     for mapped in mapping.values() {
         counts.observe(*mapped);
@@ -408,6 +540,103 @@ mod tests {
             .map(ToString::to_string)
             .collect::<String>();
         assert!(!emitted.contains("3u16"));
+    }
+
+    /// `RegAllocator.coalesce_variables` makes a link source and its target
+    /// inputarg one Variable when they do not interfere; `flatten.py`
+    /// `GraphFlattener.insert_renamings` consequently emits no copy.
+    #[test]
+    fn noninterfering_link_move_is_coalesced_and_not_emitted() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.emit_op(
+            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(1)]),
+            quote! { __builder.load_const_i_value(1u16, 41i64); },
+        );
+        lowerer.emit_op(
+            OpMeta::linear(
+                OpKind::MoveI,
+                vec![Register::int(1)],
+                vec![Register::int(2)],
+            ),
+            quote! { __builder.move_i(2u16, 1u16); },
+        );
+        lowerer.emit_op(
+            OpMeta::terminal(vec![Register::int(2)]),
+            quote! { __builder.int_return(2u16); },
+        );
+
+        let (counts, returned) = compact_registers(
+            &mut lowerer,
+            RegisterCounts {
+                ints: 1,
+                ..RegisterCounts::default()
+            },
+            Some(Register::int(2)),
+        );
+
+        assert_eq!(counts.ints, 1, "a dead ABI input slot is reusable");
+        assert_eq!(returned, Some(Register::int(0)));
+        assert!(
+            !lowerer
+                .op_metadata
+                .iter()
+                .any(|meta| meta.kind == OpKind::MoveI)
+        );
+        assert!(
+            !lowerer
+                .statements
+                .iter()
+                .map(ToString::to_string)
+                .collect::<String>()
+                .contains("move_i")
+        );
+    }
+
+    /// A link source that stays live after the assignment interferes with the
+    /// target. Upstream `_try_coalesce` leaves that renaming for flattening.
+    #[test]
+    fn interfering_link_move_remains_a_copy() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.emit_op(
+            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(1)]),
+            quote! { __builder.load_const_i_value(1u16, 41i64); },
+        );
+        lowerer.emit_op(
+            OpMeta::linear(
+                OpKind::MoveI,
+                vec![Register::int(1)],
+                vec![Register::int(2)],
+            ),
+            quote! { __builder.move_i(2u16, 1u16); },
+        );
+        lowerer.emit_op(
+            OpMeta::linear(
+                OpKind::BinopI,
+                Register::ints(&[1, 2]),
+                vec![Register::int(3)],
+            ),
+            quote! { __builder.record_binop_i(3u16, majit_ir::OpCode::IntAdd, 1u16, 2u16); },
+        );
+        lowerer.emit_op(
+            OpMeta::terminal(vec![Register::int(3)]),
+            quote! { __builder.int_return(3u16); },
+        );
+
+        compact_registers(
+            &mut lowerer,
+            RegisterCounts {
+                ints: 1,
+                ..RegisterCounts::default()
+            },
+            Some(Register::int(3)),
+        );
+
+        assert!(
+            lowerer
+                .op_metadata
+                .iter()
+                .any(|meta| meta.kind == OpKind::MoveI)
+        );
     }
 
     /// The rewriter reaches only the arguments of a `__builder` call, so an
