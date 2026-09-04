@@ -234,6 +234,14 @@ impl Layout {
 #[repr(C)]
 pub struct W_TypeObject {
     pub ob_header: PyObject,
+    /// `W_TypeObject._cpy_ref` (`cpyext/pyobject.py:add_direct_pyobj_storage`).
+    ///
+    /// Types keep their C mirror directly on the interpreter object. Most
+    /// type mirrors are ordinary rawrefcount P-links too, but a type realised
+    /// from an extension's `PyTypeObject` is a `W_PyCTypeObject`: its mirror
+    /// owns the interpreter object and is therefore an O-link, for which
+    /// `rawrefcount.from_obj` deliberately has no identity-table entry.
+    pub cpy_ref: *mut u8,
     /// Class name (heap-allocated, leaked).
     pub name: *mut String,
     /// App-level `__name__` object.  CPython preserves this object's identity
@@ -592,6 +600,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
             ob_type: &TYPE_TYPE as *const PyType,
             w_class: std::ptr::null_mut(),
         },
+        cpy_ref: std::ptr::null_mut(),
         mro_w: std::ptr::null_mut(),
         name,
         w_name: PY_NULL,
@@ -721,6 +730,7 @@ pub fn w_type_new_builtin(
             ob_type: &TYPE_TYPE as *const PyType,
             w_class: std::ptr::null_mut(),
         },
+        cpy_ref: std::ptr::null_mut(),
         mro_w: std::ptr::null_mut(),
         name,
         w_name: PY_NULL,
@@ -1602,6 +1612,26 @@ pub unsafe fn is_mro_purely_of_types(mro_w: &[PyObjectRef]) -> bool {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_type(obj: PyObjectRef) -> bool {
     py_type_check(obj, &TYPE_TYPE)
+}
+
+/// `W_TypeObject._cpyext_as_pyobj` from
+/// `cpyext/pyobject.py:add_direct_pyobj_storage`.
+///
+/// # Safety
+/// `obj` must be null or a valid type object.
+pub unsafe fn w_type_get_cpy_ref(obj: PyObjectRef) -> *mut u8 {
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (*(obj as *const W_TypeObject)).cpy_ref }
+}
+
+/// `W_TypeObject._cpyext_attach_pyobj`'s direct-storage half.
+///
+/// # Safety
+/// `obj` must be a valid type object and `raw` its live C mirror.
+pub unsafe fn w_type_set_cpy_ref(obj: PyObjectRef, raw: *mut u8) {
+    unsafe { (*(obj as *mut W_TypeObject)).cpy_ref = raw };
 }
 
 /// typeobject.py `is_heaptype(self)`.

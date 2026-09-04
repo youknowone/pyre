@@ -10552,6 +10552,7 @@ impl CraneliftBackend {
 
         let gc_nursery_addrs =
             with_cranelift_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr()));
+        let gc_max_nursery_object_size = with_cranelift_gc(|gc| gc.max_nursery_object_size());
         // llmodel.py:64-69 self.vtable_offset — backend property used by
         // bh_new_with_vtable. Capture for use in NEW_WITH_VTABLE codegen.
         let vtable_offset = self.vtable_offset;
@@ -14300,11 +14301,14 @@ impl CraneliftBackend {
                     let ad = descr
                         .as_array_descr()
                         .expect("CallMallocNurseryVarsize descr must be an ArrayDescr");
-                    let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
-                    let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
+                    let base_size_i64 = ad.base_size() as i64;
+                    let item_size_i64 = ad.item_size() as i64;
+                    let base_size = builder.ins().iconst(cl_types::I64, base_size_i64);
+                    let item_size = builder.ins().iconst(cl_types::I64, item_size_i64);
                     // The descr's tid, not 0: a varsize object typed 0 is
                     // traced with the layout of whatever registered first.
-                    let type_id = builder.ins().iconst(cl_types::I64, ad.type_id() as i64);
+                    let type_id_i64 = ad.type_id() as i64;
+                    let type_id = builder.ins().iconst(cl_types::I64, type_id_i64);
                     // rewrite.py:858: args = [ConstInt(kind), ConstInt(itemsize), v_length]
                     let length = resolve_opref_or_imm(
                         &mut builder,
@@ -14312,29 +14316,128 @@ impl CraneliftBackend {
                         &known_values,
                         op.arg(2).to_opref(),
                     );
-                    let result = emit_collecting_gc_call(
+                    // x86/aarch64 `malloc_cond_varsize`: reject negative or
+                    // implausibly large lengths before multiplying, then try
+                    // the nursery bump.  Only either failing edge spills the
+                    // live refs, installs the gcmap, and calls the collecting
+                    // helper.  The two comparisons are one combined SSA
+                    // predicate here; their control-flow contract is the same.
+                    let (nf_addr, nt_addr) =
+                        gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let max_young =
+                        gc_max_nursery_object_size.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    let word = std::mem::size_of::<usize>();
+                    // x86/regalloc.py `consider_call_malloc_nursery_varsize`
+                    // passes this byte-derived value directly as the length
+                    // precheck; `malloc_cond_varsize`'s nursery-top comparison
+                    // rejects a product that is still too large.
+                    let max_length = max_young.saturating_sub(2 * word);
+                    debug_assert!(ad.item_size() > 0);
+                    debug_assert!(
+                        ad.base_size() + GcHeader::SIZE >= GcHeader::MIN_NURSERY_OBJ_SIZE
+                    );
+                    let flags = MemFlagsData::trusted();
+                    let max_length_value = builder.ins().iconst(cl_types::I64, max_length as i64);
+                    let length_fits = builder.ins().icmp(
+                        IntCC::UnsignedLessThanOrEqual,
+                        length,
+                        max_length_value,
+                    );
+                    let scaled = builder.ins().imul(length, item_size);
+                    let unaligned_total = builder
+                        .ins()
+                        .iadd_imm_s(scaled, base_size_i64 + GcHeader::SIZE as i64 + 7);
+                    let align_mask = builder.ins().iconst(cl_types::I64, -8);
+                    let total = builder.ins().band(unaligned_total, align_mask);
+                    let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
+                    let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
+                    let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
+                    let new_free = builder.ins().iadd(free, total);
+                    let top = builder.ins().load(ptr_type, flags, nt_ptr, 0);
+                    let nursery_fits =
+                        builder
+                            .ins()
+                            .icmp(IntCC::UnsignedLessThanOrEqual, new_free, top);
+                    let fits = builder.ins().band(length_fits, nursery_fits);
+
+                    let live_refs: Vec<(u32, usize)> = ref_root_slots
+                        .iter()
+                        .filter(|(var_idx, _)| defined_ref_vars.contains(var_idx))
+                        .copied()
+                        .collect();
+                    let fast_block = builder.create_block();
+                    let slow_block = builder.create_block();
+                    let merge_block = builder.create_block();
+                    builder.append_block_param(merge_block, ptr_type); // result
+                    builder.append_block_param(merge_block, ptr_type); // jf_ptr
+                    for _ in &live_refs {
+                        builder.append_block_param(merge_block, cl_types::I64);
+                    }
+                    builder.ins().brif(fits, fast_block, &[], slow_block, &[]);
+
+                    builder.switch_to_block(fast_block);
+                    builder.seal_block(fast_block);
+                    builder.ins().store(flags, new_free, nf_ptr, 0);
+                    builder.ins().store(flags, type_id, free, 0);
+                    let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
+                    let fast_result = builder.ins().iadd(free, header_size);
+                    let mut fast_args: Vec<BlockArg> =
+                        vec![BlockArg::from(fast_result), BlockArg::from(jf_ptr)];
+                    for &(var_idx, _) in &live_refs {
+                        fast_args.push(BlockArg::from(builder.use_var(var(var_idx))));
+                    }
+                    builder.ins().jump(merge_block, &fast_args);
+
+                    builder.switch_to_block(slow_block);
+                    builder.seal_block(slow_block);
+                    builder.set_cold_block(slow_block);
+                    spill_ref_roots(
                         &mut builder,
-                        ptr_type,
-                        call_conv,
                         jf_ptr,
                         &live_ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
-                        per_call_gcmap,
+                    );
+                    emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                    let slow_result = emit_host_call(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
                         gc_alloc_varsize_shim as *const () as usize,
                         &[base_size, item_size, length, type_id],
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    let jf_ptr_slow =
+                        emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    emit_pop_gcmap(&mut builder, jf_ptr_slow, per_call_gcmap);
+                    reload_ref_roots(
+                        &mut builder,
+                        jf_ptr_slow,
+                        &live_ref_root_slots,
+                        &defined_ref_vars,
+                        &demoted_failarg_slots,
+                        ref_root_base_ofs,
+                    );
+                    let mut slow_args: Vec<BlockArg> =
+                        vec![BlockArg::from(slow_result), BlockArg::from(jf_ptr_slow)];
+                    for &(var_idx, _) in &live_refs {
+                        slow_args.push(BlockArg::from(builder.use_var(var(var_idx))));
+                    }
+                    builder.ins().jump(merge_block, &slow_args);
+
+                    builder.switch_to_block(merge_block);
+                    builder.seal_block(merge_block);
+                    let params = builder.block_params(merge_block).to_vec();
+                    let result = params[0];
+                    jf_ptr = params[1];
                     builder.ins().set_pinned_reg(jf_ptr);
+                    for (i, &(var_idx, _)) in live_refs.iter().enumerate() {
+                        builder.def_var(var(var_idx), params[2 + i]);
+                    }
                     builder.def_var(var(vi), result);
-                    // malloc_cond_varsize parity: the varsize slow path
-                    // (gc_alloc_varsize_shim) returns NULL on `PYPY_GC_MAX`
-                    // out-of-memory; propagate before the following
-                    // header/item stores dereference it.
                     emit_memory_error_check(
                         &mut builder,
                         ptr_type,
@@ -26284,6 +26387,15 @@ mod tests {
         let obj = backend.get_ref_value(&frame, 0);
         assert!(!obj.is_null());
         assert_eq!(unsafe { *(obj.0 as *const i64) }, 3);
+
+        // `malloc_cond_varsize` sends over-threshold lengths through the
+        // collecting helper.  The result is a born-old external allocation.
+        let large_length = 140_000;
+        let frame = backend.execute_token(&token, &[Value::Int(large_length)]);
+        let obj = backend.get_ref_value(&frame, 0);
+        assert!(!obj.is_null());
+        assert_eq!(unsafe { *(obj.0 as *const i64) }, large_length);
+        assert!(!majit_gc::can_move(obj));
     }
 
     #[test]

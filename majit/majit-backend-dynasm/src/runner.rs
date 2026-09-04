@@ -528,6 +528,13 @@ pub(crate) fn dynasm_nursery_addrs() -> (usize, usize) {
     with_dynasm_active_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr())).unwrap_or((0, 0))
 }
 
+/// `GcLLDescr_framework.max_size_of_young_obj`, consumed by
+/// `malloc_cond_varsize` before it computes `itemsize * length`.  Zero is the
+/// no-GC sentinel, paired with [`dynasm_nursery_addrs`]'s `(0, 0)` answer.
+pub(crate) fn dynasm_max_size_of_young_obj() -> usize {
+    with_dynasm_active_gc(|gc| gc.max_nursery_object_size()).unwrap_or(0)
+}
+
 /// Head of the recycle list an inline allocation takes from before it bumps.
 /// Zero when the bound GC keeps none, and when none is bound.
 pub(crate) fn dynasm_nursery_recycle_list_addr() -> usize {
@@ -4115,6 +4122,7 @@ mod tests {
     use majit_gc::collector::{GcConfig, MiniMarkGC};
     use majit_gc::header::header_of;
     use majit_gc::trace::TypeInfo;
+    use majit_ir::descr::SimpleArrayDescr;
     use majit_ir::operand::Operand;
     use majit_ir::{
         CallDescr, DescrRef, EffectInfo, ExtraEffect, InputArg, OopSpecIndex, OpCode, Type, Value,
@@ -4439,6 +4447,80 @@ mod tests {
         assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, 1);
         assert_eq!(unsafe { *(obj.0 as *const u64) }, 0xDEAD);
         assert_eq!(unsafe { *((obj.0 + 16) as *const i64) }, 1);
+    }
+
+    #[test]
+    fn test_gc_varsize_alloc_and_length_init_with_configured_runtime() {
+        install_test_libc_jitframe_tracer();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        let array_tid = gc.register_type(TypeInfo::varsize(8, 8, 0, false, Vec::new()));
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        consts.insert(10000, 0_i64); // FLAG_ARRAY
+        consts.insert(10001, 8_i64); // item size / length-store width
+        consts.insert(10002, 0_i64); // length offset
+        backend.set_constants(consts);
+        register_jitframe_type(&mut gc);
+        backend.set_gc_allocator(Box::new(gc));
+
+        let alloc = mk_op(
+            OpCode::CallMallocNurseryVarsize,
+            &[
+                OpRef::int_op(10000),
+                OpRef::int_op(10001),
+                OpRef::input_arg_int(0),
+            ],
+            1,
+        );
+        alloc.setdescr(Arc::new(SimpleArrayDescr::new(
+            0,
+            8,
+            8,
+            array_tid,
+            Type::Int,
+        )));
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            alloc,
+            mk_op(
+                OpCode::GcStore,
+                &[
+                    OpRef::ref_op(1),
+                    OpRef::int_op(10002),
+                    OpRef::input_arg_int(0),
+                    OpRef::int_op(10001),
+                ],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
+        ];
+
+        let token = JitCellToken::new(1501);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let frame = backend.execute_token(&token, &[Value::Int(3)]);
+        let obj = backend.get_ref_value(&frame, 0);
+
+        assert!(!obj.is_null());
+        assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, array_tid);
+        assert_eq!(unsafe { *(obj.0 as *const i64) }, 3);
+
+        // A length beyond `max_size_of_young_obj` must take the collecting
+        // helper edge, not overflow the inline size calculation or bump past
+        // the nursery top.  `external_malloc` returns this object born-old.
+        let large_length = 140_000;
+        let frame = backend.execute_token(&token, &[Value::Int(large_length)]);
+        let obj = backend.get_ref_value(&frame, 0);
+        assert!(!obj.is_null());
+        assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, array_tid);
+        assert_eq!(unsafe { *(obj.0 as *const i64) }, large_length);
+        assert!(!majit_gc::can_move(obj));
     }
 
     #[test]

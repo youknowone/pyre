@@ -2961,16 +2961,17 @@ fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
     // Pretend the TYPE_INFO table sits at a small in-memory address;
     // wasm validation only checks the bytecode shape, not the actual
     // load addresses, so any value works for codegen testing.
-    // majit `TypeEntry` stride = 32 bytes (TypeInfoLayout 16 + ClassTypeLayout 16).
-    // shift_by = log2(32) = 5, sizeof_ti = rffi.sizeof(TYPE_INFO) = 16.
+    // majit `TypeEntry` stride = 64 bytes (the four-word TYPE_INFO plus the
+    // four-word VARSIZE_TYPE_INFO/CLASSTYPE union tail).
+    // shift_by = log2(64) = 6, sizeof_ti = rffi.sizeof(TYPE_INFO) = 32.
     // gc.py _setup_guard_is_object: T_IS_RPYTHON_INSTANCE
     // = 0x100000 (gctypelayout.py:196), packed little-endian into a
     // Signed word — byte at offset +2 carries the flag, mask = 0x10.
     codegen::GuardGcTypeInfo {
         supports_guard_gc_type: true,
         base_type_info: 0x1000,
-        shift_by: 5,
-        sizeof_ti: 16, // size_of::<TypeInfoLayout>()
+        shift_by: 6,
+        sizeof_ti: 32, // size_of::<TypeInfoLayout>()
         infobits_offset: 2,
         is_object_flag: 0x10,
         subclassrange_min_offset: 0, // offset within ClassTypeLayout

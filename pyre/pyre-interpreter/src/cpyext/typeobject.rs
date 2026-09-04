@@ -377,6 +377,15 @@ const fn immortal_type() -> CPyTypeObject {
     }
 }
 
+/// The raw block `type_alloc` hands to `type_realize` upstream. It starts
+/// with an ordinary C reference; `track_reference` adds the rawrefcount share
+/// when the `W_PyCTypeObject` is attached.
+const fn allocated_type() -> CPyTypeObject {
+    let mut tp = immortal_type();
+    tp.ob_base.ob_base.ob_refcnt = 1;
+    tp
+}
+
 /// Sentinel type for a `PyModuleDef`, which is C static storage rather than a
 /// mirror of an interpreter object: its `ob_pyre_link` stays null and it is
 /// never entered in the census.
@@ -5400,12 +5409,12 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     stamp_tp_dict(tp, pyre_object::gc_roots::shadow_stack_get(type_slot));
     stamp_objclass(pyre_object::gc_roots::shadow_stack_get(type_slot), tp);
 
-    // The extension's own static becomes the type mirror: it is at a fixed
-    // address for the life of the library, which is what `attach_foreign` is
-    // for.
+    // `type_realize` allocates a `W_PyCTypeObject`, then `track_reference`
+    // dispatches to `W_PyCTypeObject._cpyext_attach_pyobj`: unlike ordinary
+    // type mirrors, the extension's existing block is an O-link and its
+    // address lives directly in the interpreter type's `_cpy_ref` field.
     unsafe {
-        (*tp).ob_base.ob_base.ob_refcnt = REFCNT_IMMORTAL;
-        pyobject::attach_foreign(
+        pyobject::attach_foreign_pyobj(
             pyre_object::gc_roots::shadow_stack_get(type_slot),
             &raw mut (*tp).ob_base.ob_base,
         );
@@ -6022,9 +6031,10 @@ fn from_spec(
             "PyType_FromSpec(): NULL spec",
         ));
     }
-    // The type object and its tables outlive the call for good: a type is
-    // immortal here, so the allocation is deliberately leaked.
-    let tp: *mut CPyTypeObject = Box::leak(Box::new(immortal_type()));
+    // The type block is raw storage, like `type_alloc` upstream. This port's
+    // allocator record cannot yet reclaim the leaked Rust box, but its
+    // refcount and rawrefcount ownership remain ordinary rather than immortal.
+    let tp: *mut CPyTypeObject = Box::leak(Box::new(allocated_type()));
     unsafe {
         (*tp).tp_name = (*spec).name;
         (*tp).tp_itemsize = (*spec).itemsize as isize;
