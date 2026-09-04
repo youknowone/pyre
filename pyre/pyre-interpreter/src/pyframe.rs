@@ -3746,7 +3746,13 @@ impl PyFrame {
         let locals_slot = roots.base();
         let _ = roots.pin_root(unsafe { pyre_object::w_dict_new() });
         let frame = unsafe { &mut *frame_anchor.live() };
-        frame.getorcreate_debug_data(-1).w_locals = roots.get(locals_slot);
+        // `getorcreate_debug_data` allocates the debug block this frame does not
+        // have yet, and an assignment evaluates its value before its place, so
+        // combining the two reads the dict's address before that allocation and
+        // stores it after — leaving the caller the live word and the frame the
+        // dead one.
+        let debug = frame.getorcreate_debug_data(-1);
+        debug.w_locals = roots.get(locals_slot);
         roots.get(locals_slot)
     }
 
@@ -3936,7 +3942,16 @@ impl PyFrame {
     /// through `space.setitem` / `space.getitem` / `space.delitem` on it.
     #[inline]
     pub fn setdictscope(&mut self, w_locals: PyObjectRef) -> Result<(), crate::PyError> {
-        self.getorcreate_debug_data(-1).w_locals = w_locals;
+        // A frame with no debug block yet allocates one below, which
+        // `getorcreate_debug_data` names as a collection point.  It anchors the
+        // frame it is called on; `w_locals` is the caller's word and nothing
+        // else names it, and an assignment evaluates its value before its
+        // place, so writing it directly would store a pre-collection address.
+        let roots = pyre_object::gc_roots::push_roots();
+        let locals_slot = roots.base();
+        let _ = roots.pin_root(w_locals);
+        let debug = self.getorcreate_debug_data(-1);
+        debug.w_locals = roots.get(locals_slot);
         self.locals2fast(false)
     }
 

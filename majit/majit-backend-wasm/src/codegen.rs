@@ -620,6 +620,7 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         if_(block_type: BlockType),
         local_tee(local: u32),
         loop_(block_type: BlockType),
+        memory_fill(mem: u32),
         return_call(function: u32),
     );
 
@@ -1877,6 +1878,58 @@ fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize
 /// yet defined has a null home and its local is written at its def, and a
 /// value never read after `at_op` has no consumer for the reload — the
 /// native regalloc likewise reloads a spilled box only on its next use.
+/// Null-initialise the home slots of `range` that `wanted` selects.
+///
+/// The slots are adjacent 8-byte words, so a run of them is a memset: one
+/// `memory.fill` writes what would otherwise be a `local.get`/`i64.const`/
+/// `i64.store` triple per slot. A trace with hundreds of homes spells that
+/// triple hundreds of times in its entry prologue, and the module is charged
+/// for it twice — once in what the host hands cranelift, and again on every
+/// entry that executes it.
+///
+/// A run pays for the fill's own operands only once it is long enough:
+/// the triple encodes in 7-9 bytes against the fill's 12-15, so a run of one
+/// or two slots stays a store. Both forms write exactly the same bytes.
+fn emit_null_home_slots(
+    sink: &mut PeepSink<'_, '_>,
+    frame: FrameGeometry,
+    range: std::ops::Range<u64>,
+    mut wanted: impl FnMut(u64) -> bool,
+) {
+    /// Shortest run of adjacent slots that a `memory.fill` encodes smaller
+    /// than the individual stores it replaces.
+    const FILL_MIN_SLOTS: u64 = 3;
+
+    let mut slot = range.start;
+    while slot < range.end {
+        if !wanted(slot) {
+            slot += 1;
+            continue;
+        }
+        let start = slot;
+        while slot < range.end && wanted(slot) {
+            slot += 1;
+        }
+        let offset = frame.home_slot_base + start * SLOT_SIZE;
+        if slot - start < FILL_MIN_SLOTS {
+            for h in start..slot {
+                sink.local_get(0);
+                sink.i64_const(0);
+                sink.i64_store(mem64(frame.home_slot_base + h * SLOT_SIZE));
+            }
+            continue;
+        }
+        // `memory.fill` takes its destination as an operand, not as a memarg
+        // offset, so the frame base is added in.
+        sink.local_get(0);
+        sink.i32_const(offset as i32);
+        sink.i32_add();
+        sink.i32_const(0);
+        sink.i32_const(((slot - start) * SLOT_SIZE) as i32);
+        sink.memory_fill(0);
+    }
+}
+
 fn emit_reload_refs_from_homes(
     sink: &mut PeepSink<'_, '_>,
     value_types: &ValueLocals,
@@ -4348,21 +4401,16 @@ fn build_function(
             input_filled_home[h as usize] = true;
         }
     }
-    for h in 0..ref_homes.len() as u64 {
-        if input_filled_home[h as usize] {
-            continue;
-        }
-        sink.local_get(0);
-        sink.i64_const(0);
-        sink.i64_store(mem64(frame.home_slot_base + h * SLOT_SIZE));
-    }
-    for h in 0..label_resume.ref_slots as u64 {
-        sink.local_get(0);
-        sink.i64_const(0);
-        sink.i64_store(mem64(
-            frame.home_slot_base + (frame.ordinary_home_slots() as u64 + h) * SLOT_SIZE,
-        ));
-    }
+    emit_null_home_slots(&mut sink, frame, 0..ref_homes.len() as u64, |h| {
+        !input_filled_home[h as usize]
+    });
+    let label_base = frame.ordinary_home_slots() as u64;
+    emit_null_home_slots(
+        &mut sink,
+        frame,
+        label_base..label_base + label_resume.ref_slots as u64,
+        |_| true,
+    );
 
     // Load inputs from frame into locals, and store Ref inputs to their homes.
     // The input value lives at the frame slot its producer wrote it to: the

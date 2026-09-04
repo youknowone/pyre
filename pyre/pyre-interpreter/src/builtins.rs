@@ -16364,6 +16364,21 @@ pub(crate) fn exec_or_eval(
         let _ = ns_roots.pin_root(closure);
         slot
     });
+    // The two namespace arguments outlive that same window.  `w_globals` is
+    // pinned above, but `globals_arg` is a different local even when the two
+    // name one object, and the tests below forward the argument rather than the
+    // resolved mapping.  `locals_arg` is the mapping the frame runs on; nothing
+    // else names it while the override runs.
+    let globals_arg_slot = (!globals_arg.is_null()).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = ns_roots.pin_root(globals_arg);
+        slot
+    });
+    let locals_arg_slot = (!locals_arg.is_null()).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = ns_roots.pin_root(locals_arg);
+        slot
+    });
     // pyopcode.py:773-774 `space.call_method(w_globals, 'setdefault', ...)`
     // (exec) and compiling.py:109-110 `space.setitem_str(w_globals, ...)`
     // (eval) dispatch on the ORIGINAL `w_globals` object so a dict-subclass
@@ -16373,6 +16388,13 @@ pub(crate) fn exec_or_eval(
     } else {
         ensure_exec_builtins(w_globals, caller_frame, exec_ctx)?;
     }
+    // Shadow the two namespace arguments with their post-collection addresses
+    // rather than reading each use site, so the identity test below
+    // (`ptr::eq(locals_arg, globals_arg)`) compares two words from the same
+    // collection.  Forwarding is per-object, so two slots that named one object
+    // still name one object and two that did not still do not.
+    let globals_arg = globals_arg_slot.map_or(globals_arg, pyre_object::gc_roots::shadow_stack_get);
+    let locals_arg = locals_arg_slot.map_or(locals_arg, pyre_object::gc_roots::shadow_stack_get);
 
     // pypy/interpreter/pyopcode.py:771-776 — `code.exec_code(space,
     // w_globals, w_locals, outer_func)` runs the frame on the

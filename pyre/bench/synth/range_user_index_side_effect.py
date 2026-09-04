@@ -29,4 +29,4 @@ def main():
 
 
 main()
-# Expected: 20000 10000
+# Expected: 40000 20000

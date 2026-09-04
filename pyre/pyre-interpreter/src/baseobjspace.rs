@@ -4588,7 +4588,15 @@ pub fn finditem_str_named(
         }
         .map_err(|_| take_pending_dict_key_error(wrapped_key(key, pycode, nameindex)));
     }
-    finditem(obj, wrapped_key(key, pycode, nameindex))
+    // `wrapped_key` realizes the code object's name slot, or interns a fresh
+    // `w_str` for a caller that named none; either allocates.  Arguments
+    // evaluate left to right, so `obj` is read before that allocation and would
+    // reach `finditem` at its pre-collection address.
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(obj);
+    let w_key = wrapped_key(key, pycode, nameindex);
+    finditem(pyre_object::gc_roots::shadow_stack_get(obj_slot), w_key)
 }
 
 /// The wrapped lookup key: the code object's shared name when the caller named
