@@ -258,9 +258,16 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
     // `bridges_compiled=7`. Re-record these two alongside that baseline.
     assert_eq!(stat_value(&stderr, "compiles"), 8);
     assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 7);
-    assert!(
-        !stderr.contains("memory.fill"),
-        "recursive CA still refills a nursery that is already zeroed:\n{stderr}"
+    // `emit_null_home_slots` now compresses the three qualifying trace-entry
+    // Ref-home runs into `memory.fill`.  They are not callee-frame clears: the
+    // CALL_ASSEMBLER allocation follows upstream `malloc_cond_varsize_frame`,
+    // which only bumps/reserves nursery space.  Pin the legitimate prologue
+    // census so restoring a per-CA payload fill still adds an instruction and
+    // fails this regression.
+    assert_eq!(
+        stderr.matches("memory.fill").count(),
+        3,
+        "recursive CA emitted a memory.fill outside the three Ref-home prologues:\n{stderr}"
     );
 }
 

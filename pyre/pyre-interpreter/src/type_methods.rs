@@ -1726,7 +1726,9 @@ impl TemplateRender {
     fn text(self) -> Wtf8Buf {
         match self {
             TemplateRender::Text(text) => text,
-            TemplateRender::Object(obj) => unsafe { pyre_object::w_str_get_wtf8(obj) }.to_wtf8_buf(),
+            TemplateRender::Object(obj) => {
+                unsafe { pyre_object::w_str_get_wtf8(obj) }.to_wtf8_buf()
+            }
         }
     }
 }
@@ -1786,8 +1788,7 @@ fn format_render(
     }
     let parsed = parse_format_parts(fmt)?;
     // Read once, before the loop the field emission below tests it in.
-    let sole_field =
-        parsed.len() == 1 && matches!(parsed[0], PyPyFormatPart::Field { .. });
+    let sole_field = parsed.len() == 1 && matches!(parsed[0], PyPyFormatPart::Field { .. });
     let mut result = Wtf8Buf::new();
     for part in &parsed {
         let (field_name, conversion_spec, format_spec) = match part {
