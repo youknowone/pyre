@@ -150,9 +150,6 @@ fn build_bh_jitdrivers_sd(
                 result_type,
                 portal_runner_ptr,
                 mainjitcode_calldescr,
-                // warmspot.py:921 `jd.mainjitcode`; `portal_jd_for` matches
-                // it against the raising portal frame's own jitcode.
-                mainjitcode: jd.mainjitcode.clone(),
             }
         })
         .collect()
@@ -5540,7 +5537,7 @@ impl<S: JitState> JitDriver<S> {
                 }
                 return Err(Decline::ReservedIdentitySlots);
             }
-            // `resume.py:1338` `jitcode = jitcodes[jitcode_pos]`: the position
+            // `resume.py` `jitcode = jitcodes[jitcode_pos]`: the position
             // is an offset into the jitcode the frame NAMES. Entering a
             // different one at that offset lands mid-instruction in unrelated
             // code, and the walk decodes whatever byte is there. The root frame
@@ -8973,7 +8970,7 @@ impl<S: JitState> JitDriver<S> {
         //     `ctx.virtualizable_boxes` / `virtualizable_values` /
         //     `virtualizable_array_lengths` from resume-decoded values.
         //
-        //   * `pyjitpl.py:3437 self.synchronize_virtualizable()`, the
+        //   * `pyjitpl.py self.synchronize_virtualizable()`, the
         //     routine's closing line, writes those same vable boxes back
         //     onto the live virtualizable. It is
         //     `ctx.synchronize_virtualizable_after_guard_failure()` below,

@@ -2862,7 +2862,6 @@ pub fn blackhole_resume_via_rd_numb(
             // `portal_jd_for` from claiming a frame for a synthetic driver
             // assembled around whichever jitcode happened to be innermost when
             // the chain was built.
-            mainjitcode: None,
         }]);
     {
         let vinfo = bh.virtualizable_info;
@@ -3420,7 +3419,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                 // publishes the pending exception, not just cranelift.
                 //
                 // Both carriers, because `handle_jitexception` reaches this arm
-                // by `raise value` (warmspot.py:996-1003) into RPython's single
+                // by `raise value` (warmspot.py) into RPython's single
                 // ll exception state, which is caller-blind: the compiled
                 // `CALL_ASSEMBLER` reads it through the backend cells and the
                 // walker's trace-time `execute_varargs_call` reads it through

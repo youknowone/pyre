@@ -152,15 +152,6 @@ pub struct BhJitDriverSd {
     /// `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
     /// function returned by `get_portal_runner` for `bh_call_*`.
     pub mainjitcode_calldescr: BhCallDescr,
-    /// `warmspot.py:921` `jd.mainjitcode` — the portal function's jitcode.
-    ///
-    /// `blackhole.py` `_handle_jitexception_in_portal` picks the driver whose
-    /// `mainjitcode is self.jitcode`, so a recursive `ContinueRunningNormally`
-    /// re-enters the portal that raised it and not some other driver's.
-    /// [`portal_jd_for`] asks for that same relation through the back-reference
-    /// `call.py:148` writes (`jd.mainjitcode.jitdriver_sd = jd`), which survives
-    /// a resume path materializing a fresh `Arc`.
-    pub mainjitcode: Option<std::sync::Arc<JitCode>>,
 }
 
 /// How [`BlackholeInterpreter::run`]'s dispatch loop stopped.
@@ -3381,7 +3372,7 @@ pub fn convert_and_run_from_pyjitpl(
         0
     };
 
-    // `warmspot.py:1010-1013` hands `ll_portal_runner` to the blackhole so a
+    // `warmspot.py` hands `ll_portal_runner` to the blackhole so a
     // recursive portal level can re-enter the portal function.  Without it
     // `handle_jitexception_dispatch` has nothing to call and
     // `ContinueRunningNormally` reaches its `expect`.
@@ -7224,7 +7215,7 @@ fn bhimpl_hint_force_virtualizable(_r: i64) {}
 /// `ContinueRunningNormally` is raised at a recursive portal level
 /// (`warmspot.py handle_jitexception_from_blackhole`).
 ///
-/// `warmspot.py:1010-1013` `jd.handle_jitexc_from_bh`, one per jitdriver.
+/// `warmspot.py` `jd.handle_jitexc_from_bh`, one per jitdriver.
 pub type PortalRunnerHook =
     fn(&crate::jitexc::JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>;
 
@@ -7267,7 +7258,8 @@ pub fn register_portal_runner_hook(jd_index: usize, hook: PortalRunnerHook) {
 /// `bh` is the portal frame that raised, i.e. upstream's `self`.
 ///
 /// The relation that loop walks is established from the other end by
-/// `call.py:148` `jd.mainjitcode.jitdriver_sd = jd`, so `jd.mainjitcode is
+/// `CallControl.find_all_graphs`'s `jd.mainjitcode.jitdriver_sd = jd`, so
+/// `jd.mainjitcode is
 /// self.jitcode` and `self.jitcode.jitdriver_sd is jd` answer the same
 /// question.  Reading the stamp is also the form `_run_forever`'s walk already
 /// uses to decide where to stop (`jitcode.jitdriver_sd().is_none()`), so asking
