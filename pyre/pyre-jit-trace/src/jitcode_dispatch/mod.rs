@@ -557,6 +557,15 @@ pub struct WalkSession {
     /// `MetaInterp.current_call_id`: the root portal owns id 0 and each
     /// subsequently entered Python portal frame consumes the next id.
     pub next_call_id: u64,
+    /// Seeded Python activations currently open in this walk attempt.
+    ///
+    /// This is the activation-width counterpart of `MetaInterp.framestack`:
+    /// a `CALL_ASSEMBLER` that resumes after several inlined entries must
+    /// charge every entry it skips. It is per session rather than TLS because
+    /// executing a residual while tracing may start another walk on the same
+    /// OS thread; that nested MetaInterp has no ownership of the outer walk's
+    /// frames.
+    pub open_inline_activations: u32,
     /// Root-frame counterpart of [`InlineFrame::debug_merge_point_py_pc`].
     pub root_debug_merge_point_py_pc: Option<u32>,
     /// Whether an abort fired inside an inline sub-walk. Its `op.pc` is then a
@@ -672,6 +681,7 @@ impl Default for WalkSession {
             is_being_profiled: false,
             framestack: Vec::new(),
             next_call_id: 1,
+            open_inline_activations: 0,
             root_debug_merge_point_py_pc: None,
             abort_in_subwalk: false,
             last_exc_value: None,

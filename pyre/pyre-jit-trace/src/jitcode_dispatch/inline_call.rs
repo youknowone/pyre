@@ -1997,7 +1997,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // this is the seam a guard cannot leave unbalanced.
     let units = ctx
         .trace_ctx
-        .const_int(i64::from(open_inline_activations() + 1));
+        .const_int(i64::from(open_inline_activations(ctx.session) + 1));
     let (saved_depth, displaced_activation) =
         record_activation_charge(ctx, op.pc, ec, callee_frame, units)?;
     record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, ec);
@@ -2186,11 +2186,11 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // `execute_frame`'s `finally` half of the same seam: give the activation
     // back before either exception arm leaves this compiled caller.
     record_activation_release(ctx.trace_ctx, ec, saved_depth, displaced_activation);
-    // `pyjitpl.py:2080-2081` keeps the assembler virtualizable alive between
-    // GUARD_NOT_FORCED and handle_possible_exception.  Keep it last in that
-    // interval: besides preserving the frame, it prevents the ordinary
-    // activation stores above from becoming the optimizer's "previous op"
-    // for GUARD_NO_EXCEPTION.
+    // `MetaInterp.direct_assembler_call` keeps the assembler virtualizable
+    // alive between GUARD_NOT_FORCED and `handle_possible_exception`. Keep it
+    // last in that interval: besides preserving the frame, it prevents the
+    // ordinary activation stores above from becoming the optimizer's
+    // "previous op" for GUARD_NO_EXCEPTION.
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     // pyjitpl.py `handle_possible_exception`.
     if exec_raised {
@@ -2267,7 +2267,6 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     target_pc: usize,
     w_code: *const (),
     is_being_profiled: bool,
-    recursive_activation: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
     let _ = nlocals;
@@ -2346,42 +2345,27 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     ctx.trace_ctx
         .heapcache_setfield_cached(callee_frame, last_instr_idx, last_instr);
 
-    // `pyframe.py execute_frame`'s activation entry for a recursive level this
-    // fold re-enters, the same seam [`record_activation_charge`] records for
-    // the arm that builds its own callee frame.  Every compiled recursion door
-    // begins past `execute_frame`, so the test against
-    // `sys.getrecursionlimit()` has no other home.  Without it the limit binds
-    // nothing for as long as the recursion stays compiled -- measured on a
-    // self-recursive callee that carries its own loop,
+    // `pyframe.py execute_frame`'s activation entry, the same seam
+    // [`record_activation_charge`] records for the arm that builds its own
+    // callee frame. Every compiled door begins past `execute_frame`, so the
+    // test against `sys.getrecursionlimit()` has no other home. Without it the
+    // limit binds neither recursion nor a deep acyclic chain for as long as
+    // the calls stay compiled -- measured on a self-recursive callee that
+    // carries its own loop,
     // `sys.setrecursionlimit(150)` followed by a 400-deep call returned a
     // value, and the counter it had meanwhile climbed past the limit made the
     // next ordinary activation raise `RecursionError` from a depth nothing was
     // left to unwind.
     //
-    // Do not charge an unrelated loop-bearing callee.  The residual executor
-    // resumes the caller before its native helper invocation unwinds, so those
-    // implementation frames can accumulate across a non-recursive Python
-    // loop.  Charging them turns repeated ordinary calls into false recursion.
-    // `recursive_activation` is therefore the MIFrame cycle test: the callee
-    // code is already present in the live inline stack or is the root portal.
-    //
     // The callee's own `OpenInlineActivation` is already closed by the time
     // this arm emits -- the sub-walk's `walker_ec_leave` drops it -- so this
-    // level is the `+ 1`, exactly as in the sibling arm.
-    let activation = if recursive_activation {
-        let units = ctx
-            .trace_ctx
-            .const_int(i64::from(open_inline_activations() + 1));
-        Some(record_activation_charge(
-            ctx,
-            op.pc,
-            callee_ec,
-            callee_frame,
-            units,
-        )?)
-    } else {
-        None
-    };
+    // level is the `+ 1`, exactly as in the sibling arm. The width belongs to
+    // this walk's `WalkSession`; a nested residual trace on the same thread
+    // owns a different session and cannot leak implementation frames into it.
+    let units = ctx
+        .trace_ctx
+        .const_int(i64::from(open_inline_activations(ctx.session) + 1));
+    let activation = record_activation_charge(ctx, op.pc, callee_ec, callee_frame, units)?;
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -2510,9 +2494,8 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // Restore before either exception arm leaves the compiled caller.  Put
     // PyPy's KEEPALIVE last in the interval so GUARD_NO_EXCEPTION still sees
     // an emitted call-adjacent operation even when the restore stores fold.
-    if let Some((saved_depth, displaced_activation)) = activation {
-        record_activation_release(ctx.trace_ctx, callee_ec, saved_depth, displaced_activation);
-    }
+    let (saved_depth, displaced_activation) = activation;
+    record_activation_release(ctx.trace_ctx, callee_ec, saved_depth, displaced_activation);
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     if exec_raised {
         walker_record_guard_exception(ctx, op.pc);
@@ -3339,15 +3322,12 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
 /// callee body, at the point the walk has reached.
 ///
 /// Record-time only: it costs the compiled code nothing and exists so the one
-/// seam that does survive to run time can name the width it stands for.  The
-/// walk is single-threaded and this counts its own nesting, so a thread-local
-/// is the whole of the state.
-fn open_inline_activations() -> u32 {
-    OPEN_INLINE_ACTIVATIONS.with(|c| c.get())
-}
-
-thread_local! {
-    static OPEN_INLINE_ACTIVATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+/// seam that does survive to run time can name the width it stands for. It is
+/// owned by the per-attempt [`WalkSession`], matching `MetaInterp.framestack`:
+/// a residual may re-enter the tracer on the same OS thread, but that nested
+/// walk must start with width zero rather than inherit the outer attempt.
+fn open_inline_activations(session: &std::cell::RefCell<WalkSession>) -> u32 {
+    session.borrow().open_inline_activations
 }
 
 /// Descriptor for the activation seam's load of the recursion-limit word.
@@ -3395,9 +3375,16 @@ fn recursion_limit_word_descr() -> DescrRef {
 /// reaches compiled code without invalidating it.
 ///
 /// Claim and charge both land before the guard, and neither is given back on
-/// it.  That is the state a deopt wants: the guard exit resumes the very frame
+/// it. That is the state a deopt wants: the guard exit resumes the very frame
 /// the claim names, so the interpreter's own entry finds it already accounted,
-/// spends nothing, and raises off the depth this charge produced.
+/// spends nothing, and raises off the depth this charge produced. The compare
+/// is nevertheless the PRE-entry test: for an aggregate width of `units`, the
+/// final activation sees `charged - 1`, so entry is refused only when
+/// `charged > limit`. `charged >= limit` would reject the activation that
+/// raises the depth exactly to the limit one level earlier than
+/// `PyFrame.execute_frame` does. [3.14-spec] CPython 3.14.6 and pypy3 7.3.22
+/// disagree at that exact boundary; the measured observable and both arms are
+/// pinned by `recursion_limit_binds_an_acyclic_portal_chain.py`.
 ///
 /// Returns the depth to restore and the claim to put back -- the two words the
 /// release takes, threaded to it as dataflow rather than respelled there.
@@ -3447,7 +3434,7 @@ fn record_activation_charge<Sym: WalkSym>(
         &[limit_addr, zero],
         recursion_limit_word_descr(),
     );
-    let over_limit = ctx.trace_ctx.record_op(OpCode::UintGe, &[charged, limit]);
+    let over_limit = ctx.trace_ctx.record_op(OpCode::UintGt, &[charged, limit]);
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[over_limit])?;
 
     Ok((saved_depth, displaced_activation))
@@ -3485,18 +3472,21 @@ fn record_activation_release(
 /// [`walker_ec_enter`] and [`walker_ec_leave`] has many ways out — a declined
 /// sub-walk, a poisoned pc, a rewind — and a width that leaks would price
 /// every later `CALL_ASSEMBLER` in the same trace too high.
-struct OpenInlineActivation;
+struct OpenInlineActivation<'a>(&'a std::cell::RefCell<WalkSession>);
 
-impl OpenInlineActivation {
-    fn open() -> Self {
-        OPEN_INLINE_ACTIVATIONS.with(|c| c.set(c.get() + 1));
-        Self
+impl<'a> OpenInlineActivation<'a> {
+    fn open(session: &'a std::cell::RefCell<WalkSession>) -> Self {
+        let mut walk = session.borrow_mut();
+        walk.open_inline_activations += 1;
+        drop(walk);
+        Self(session)
     }
 }
 
-impl Drop for OpenInlineActivation {
+impl Drop for OpenInlineActivation<'_> {
     fn drop(&mut self) {
-        OPEN_INLINE_ACTIVATIONS.with(|c| c.set(c.get().saturating_sub(1)));
+        let mut walk = self.0.borrow_mut();
+        walk.open_inline_activations = walk.open_inline_activations.saturating_sub(1);
     }
 }
 
@@ -5180,20 +5170,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
     let inline_recursion_count = fbw_inline_recursion_count(ctx, callee_code_key);
     let recursive_portal_present = fbw_recursive_portal_present(ctx, callee_code_key);
-    // The root MIFrame is deliberately absent from the inline framestack, so
-    // complete the cycle test with its portal code.  This is the runtime
-    // activation question, not the max-unroll greenkey count: a rebuilt
-    // mutual-recursion frame still represents a live Python level even when
-    // it carries no recursion greenkey.
-    let recursive_activation = recursive_portal_present
-        || (!ctx.fbw_mode.snapshot_sym.is_null()
-            && unsafe {
-                let sym = &*ctx.fbw_mode.snapshot_sym;
-                !sym.jitcode().is_null()
-                    && pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ())
-                        as usize
-                        == callee_code_key
-            });
     if inline_recursion_count >= max_unroll_recursion {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
@@ -6992,7 +6968,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // which runs once per fragment entry — charges in one go.  The
             // guard makes the width balanced across every early return between
             // here and the `leave`.
-            Some(OpenInlineActivation::open())
+            Some(OpenInlineActivation::open(ctx.session))
         }
     } else {
         None
@@ -7772,7 +7748,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 target_pc,
                 w_code,
                 is_being_profiled,
-                recursive_activation,
             )
         }
         other => Ok(Some((other, op.next_pc))),
