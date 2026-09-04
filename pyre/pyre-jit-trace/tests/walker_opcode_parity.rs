@@ -212,9 +212,10 @@ const MAJIT_ONLY: &[&str] = &[
     "inline_call_nested_ext/P",
     "record_known_result_int_ext/P",
     "record_known_result_ref_ext/P",
-    // Singles.
+    // Singles.  `goto_if_not_int_is_true/iL` left this list when #1679
+    // re-landed the fusion with the walker arm it needs, which is the move
+    // this file exists to make visible.
     "arraybase_vable/rdd>i",
-    "goto_if_not_int_is_true/iL",
     "newlist_clear/idddd>r",
     "rvmprof_code/ii",
 ];
@@ -331,9 +332,9 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
     // adding an arm to both tracers costs no edit here, while losing one from
     // either is caught by the three sets above.
     assert!(
-        both >= 149,
+        both >= 150,
         "the two tracers answer only {both} keys in common; the earlier \
-         measurement was 149 of {}",
+         measurement was 150 of {}",
         table.len(),
     );
 }
