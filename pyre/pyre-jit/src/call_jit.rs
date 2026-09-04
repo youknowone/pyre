@@ -1249,44 +1249,26 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
     }
 }
 
-/// blackhole.py get_portal_runner / warmspot.py portal_runner parity:
-/// Callback for bhimpl_recursive_call. Receives a frame pointer, executes
-/// the frame through the JIT-enabled interpreter (eval_loop_jit), and
-/// returns the result. This enables JIT re-entry at recursive portal depth.
-/// warmspot.py ll_portal_runner(*args) parity.
-/// Portal runner with full portal arg ABI.
-///
-/// blackhole.py:1113-1116: called with merged arg lists:
-///   all_i = greens_i + reds_i = [next_instr, is_being_profiled]
-///   all_r = greens_r + reds_r = [pycode, frame, ec]
-///   all_f = greens_f + reds_f = []
-///
-/// warmspot.py:972-975: portalfunc_ARGS extraction order:
-///   (Int, 'green_int', 0) → next_instr = all_i[0]
-///   (Int, 'green_int', 1) → is_being_profiled = all_i[1]
-///   (Ref, 'green_ref', 0) → pycode = all_r[0]
-///   (Ref, 'red_ref', 0)   → frame = all_r[1]
-///   (Ref, 'red_ref', 1)   → ec = all_r[2]
-pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> i64 {
-    // warmspot.py:972-975: extract portal args from merged lists, then run
-    // through the shared `bh_portal_runner_c` body.
-    let next_instr = all_i.first().copied().unwrap_or(0);
-    let is_being_profiled = all_i.get(1).copied().unwrap_or(0);
-    let pycode = all_r.first().copied().unwrap_or(0);
-    let frame_ptr = all_r.get(1).copied().unwrap_or(0);
-    let ec = all_r.get(2).copied().unwrap_or(0);
-    bh_portal_runner_c(next_instr, is_being_profiled, pycode, frame_ptr, ec)
-}
-
 /// C-ABI portal runner matching the `mainjitcode_calldescr` arg layout
 /// (`"iirrr"`: `next_instr:i, is_being_profiled:i, pycode:r, frame:r, ec:r`).
 ///
+/// `warmspot.py ll_portal_runner(*args)`, in the shape its callers dispatch.
+/// The five scalars are the `portalfunc_ARGS` tuple `warmspot.py`
+/// `handle_jitexception` rebuilds, already extracted from the merged banks
+/// `blackhole.py bhimpl_recursive_call_r` passes as `greens_* + reds_*`:
+/// greens `[next_instr:i, is_being_profiled:i, pycode:r]` then reds
+/// `[frame:r, ec:r]`.  The merged-bank form that does the extraction itself is
+/// `eval.rs pyre_portal_runner`, which serves the `ContinueRunningNormally`
+/// leg rather than a call.
+///
 /// This is the function `get_portal_runner` hands to `bh_call_r` for
-/// `bhimpl_recursive_call_*` (blackhole.py:1109-1116). `bh_call_r` invokes it
+/// `bhimpl_recursive_call_*` (blackhole.py), and the one
+/// `CallControl::get_jitcode_calldescr` publishes. `bh_call_r` invokes it
 /// through `collect_call_args` + `bh_call_i_dispatch`, i.e. as a raw C function
 /// whose five arguments arrive in integer registers per the calldescr — so the
 /// runner must take those five scalars directly. (A Rust `fn(&[i64], …)` would
-/// receive slice fat pointers there instead, corrupting every argument.)
+/// receive slice fat pointers there instead, corrupting every argument, which
+/// is why no `fn(&[i64], …)` spelling of it may be published beside a descr.)
 pub extern "C" fn bh_portal_runner_c(
     next_instr: i64,
     _is_being_profiled: i64,

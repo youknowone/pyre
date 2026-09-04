@@ -4723,8 +4723,9 @@ impl<M: Clone> MetaInterp<M> {
     /// (`index == None`), so its real driver is elected without one. That vinfo
     /// still belongs to the host's single logical driver, so it is adopted via
     /// the linear scan — but only while no *registered* driver owns a vinfo.
-    /// Once one does (pyre: jd0 at slot 1), a later registered driver that
-    /// carries none is genuinely novable (pyre: jd1 at slot 2) and gets `None`.
+    /// Once one does (pyre: jd0, which replaces the placeholder at slot 0), a
+    /// later registered driver that carries none is genuinely novable (pyre:
+    /// jd1 at slot 1) and gets `None`.
     fn resolve_active_jitdriver_sd_with_vinfo(&self) -> Option<usize> {
         if let Some(idx) = self.active_jitdriver_sd {
             if let Some(jd) = self.staticdata.jitdrivers_sd.get(idx)
@@ -21411,7 +21412,7 @@ mod metainterp_static_data_tests {
         // `majit-macros/src/lib.rs`): the f64 result is
         // pre-packed via `f64::to_bits` and the wrapper returns through
         // the integer return register.  Same ABI shape as
-        // `bh_portal_runner` (pyre-jit/src/call_jit.rs).
+        // `bh_portal_runner_c` (pyre-jit/src/call_jit.rs).
         let value = a as f64 * 0.5;
         value.to_bits() as i64
     }
@@ -21422,7 +21423,7 @@ mod metainterp_static_data_tests {
         // (do_recursive_call → portal_runner_adr, force-virtual
         // do_residual_call_full) materialises `funcbox.2` as a function
         // pointer with i64-return ABI — either the hand-written
-        // `bh_portal_runner` or `#[jit_module]`'s `concrete_ptr` wrapper
+        // `bh_portal_runner_c` or `#[jit_module]`'s `concrete_ptr` wrapper
         // that pre-packs the f64 result via `f64::to_bits`.  The f64-ABI
         // `trace_ptr` is consumed only by pyre-jit-trace's
         // `TraceCtx::call_may_force_*` family, which has its own seam

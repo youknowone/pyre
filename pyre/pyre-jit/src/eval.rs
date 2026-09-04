@@ -5552,8 +5552,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // same `portal_finishtoken` / `propagate_exc_descr` via the
     // `finish_setup_descrs_for_jitdrivers` tail. jd1 is novable
     // (`virtualizable_info` stays `None`), so `elect_active_jitdriver_sd`'s
-    // vinfo-scan keeps electing jd0 and jd1 stays inert until its merge point
-    // is traced in a later slice.
+    // vinfo-scan would elect jd0 for a jd1 trace; what keeps that from
+    // happening is `drive_unpack_iterable_trace` handing the door this
+    // registration's own slot.
     let jd1 = pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
     d.meta_interp_mut().register_jitdriver_sd(jd1);
     // `warmspot.py metainterp_sd.finish_setup(codewriter)` always installs
@@ -7846,15 +7847,19 @@ fn drive_unpack_iterable_trace(
         majit_ir::Value::Ref(majit_ir::GcRef(items as usize)),
     ];
 
-    // jd1's registered descriptor lives at `jitdrivers_sd[2]` (registered right
-    // after jd0 in `build_jit_driver_pair`). `elect_active_jitdriver_sd` honours
-    // `descriptor.index` first, which is how the novable jd1 is elected over jd0
-    // (whose `virtualizable_info` would otherwise win the fallback scan). Only
-    // the index is read here; the wired descriptor at that slot carries the
-    // finish/exc tokens.
+    // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
+    // the novable jd1 is elected over jd0 (whose `virtualizable_info` would
+    // otherwise win the fallback scan). Only the index is read here; the wired
+    // descriptor at that slot carries the finish/exc tokens.  It comes from the
+    // registration rather than from counting registrations at this end:
+    // call.py `CallControl.grab_initial_jitcodes` stamps the owning driver on
+    // its main JitCode, and the extracted jd1 portal carries that same baked
+    // index.  The door ignores an out-of-range index instead of refusing it,
+    // so a guessed number that names no slot reads as a jd0 election rather
+    // than as an error.
     let mut descriptor =
         pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
-    descriptor.index = Some(2);
+    descriptor.index = jitcode.jitdriver_sd();
 
     // The `(code_ptr, pc)` pair `green_key` was hashed from, not `(0, 0)`: a
     // zero `code_ptr` is the sentinel for "no raw pair available", and a

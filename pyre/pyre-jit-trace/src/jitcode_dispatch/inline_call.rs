@@ -2169,9 +2169,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // the call (`capture_resumedata(after_residual_call=True)`).
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    // `pyjitpl.py:2080-2081` keeps the assembler virtualizable alive after
-    // the force guard has captured its resume data.
-    ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     // `execute_frame`'s `finally: ec.leave(...)`.  A `finally` runs on every
     // exit, and compiled code has no such construct, so the restore is
     // recorded at the earliest point the call is known to have returned:
@@ -2186,10 +2183,15 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // calls).  The residual exposure — a failing GUARD_NOT_FORCED — is the one
     // `TopFrameRefGuard` (`pyre-jit/src/eval.rs`) already covers.
     record_ec_leave_frame_chain(ctx.trace_ctx, callee_frame, ec);
-    // `execute_frame`'s `finally` half of the same seam: the unit the enter
-    // spent, given back where the frame chain is given back.  It takes the
-    // enter's own result, so the two are one dataflow edge apart.
+    // `execute_frame`'s `finally` half of the same seam: give the activation
+    // back before either exception arm leaves this compiled caller.
     record_activation_release(ctx.trace_ctx, ec, saved_depth, displaced_activation);
+    // `pyjitpl.py:2080-2081` keeps the assembler virtualizable alive between
+    // GUARD_NOT_FORCED and handle_possible_exception.  Keep it last in that
+    // interval: besides preserving the frame, it prevents the ordinary
+    // activation stores above from becoming the optimizer's "previous op"
+    // for GUARD_NO_EXCEPTION.
+    ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     // pyjitpl.py `handle_possible_exception`.
     if exec_raised {
         // Raising branch (pyjitpl.py): `GUARD_EXCEPTION` with
@@ -2265,6 +2267,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     target_pc: usize,
     w_code: *const (),
     is_being_profiled: bool,
+    recursive_activation: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
     let _ = nlocals;
@@ -2342,6 +2345,43 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     );
     ctx.trace_ctx
         .heapcache_setfield_cached(callee_frame, last_instr_idx, last_instr);
+
+    // `pyframe.py execute_frame`'s activation entry for a recursive level this
+    // fold re-enters, the same seam [`record_activation_charge`] records for
+    // the arm that builds its own callee frame.  Every compiled recursion door
+    // begins past `execute_frame`, so the test against
+    // `sys.getrecursionlimit()` has no other home.  Without it the limit binds
+    // nothing for as long as the recursion stays compiled -- measured on a
+    // self-recursive callee that carries its own loop,
+    // `sys.setrecursionlimit(150)` followed by a 400-deep call returned a
+    // value, and the counter it had meanwhile climbed past the limit made the
+    // next ordinary activation raise `RecursionError` from a depth nothing was
+    // left to unwind.
+    //
+    // Do not charge an unrelated loop-bearing callee.  The residual executor
+    // resumes the caller before its native helper invocation unwinds, so those
+    // implementation frames can accumulate across a non-recursive Python
+    // loop.  Charging them turns repeated ordinary calls into false recursion.
+    // `recursive_activation` is therefore the MIFrame cycle test: the callee
+    // code is already present in the live inline stack or is the root portal.
+    //
+    // The callee's own `OpenInlineActivation` is already closed by the time
+    // this arm emits -- the sub-walk's `walker_ec_leave` drops it -- so this
+    // level is the `+ 1`, exactly as in the sibling arm.
+    let activation = if recursive_activation {
+        let units = ctx
+            .trace_ctx
+            .const_int(i64::from(open_inline_activations() + 1));
+        Some(record_activation_charge(
+            ctx,
+            op.pc,
+            callee_ec,
+            callee_frame,
+            units,
+        )?)
+    } else {
+        None
+    };
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -2467,7 +2507,12 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    // `pyjitpl.py:2080-2081` places KEEPALIVE after GUARD_NOT_FORCED.
+    // Restore before either exception arm leaves the compiled caller.  Put
+    // PyPy's KEEPALIVE last in the interval so GUARD_NO_EXCEPTION still sees
+    // an emitted call-adjacent operation even when the restore stores fold.
+    if let Some((saved_depth, displaced_activation)) = activation {
+        record_activation_release(ctx.trace_ctx, callee_ec, saved_depth, displaced_activation);
+    }
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     if exec_raised {
         walker_record_guard_exception(ctx, op.pc);
@@ -5135,6 +5180,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
     let inline_recursion_count = fbw_inline_recursion_count(ctx, callee_code_key);
     let recursive_portal_present = fbw_recursive_portal_present(ctx, callee_code_key);
+    // The root MIFrame is deliberately absent from the inline framestack, so
+    // complete the cycle test with its portal code.  This is the runtime
+    // activation question, not the max-unroll greenkey count: a rebuilt
+    // mutual-recursion frame still represents a live Python level even when
+    // it carries no recursion greenkey.
+    let recursive_activation = recursive_portal_present
+        || (!ctx.fbw_mode.snapshot_sym.is_null()
+            && unsafe {
+                let sym = &*ctx.fbw_mode.snapshot_sym;
+                !sym.jitcode().is_null()
+                    && pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ())
+                        as usize
+                        == callee_code_key
+            });
     if inline_recursion_count >= max_unroll_recursion {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
@@ -7713,6 +7772,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 target_pc,
                 w_code,
                 is_being_profiled,
+                recursive_activation,
             )
         }
         other => Ok(Some((other, op.next_pc))),
