@@ -3527,9 +3527,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         // trace.
         if obj.is_constant()
             && let Some(()) = spec_gate(SpecFold::LoadAttrPureRead, || {
-                let Some(plain) =
-                    (unsafe { pyre_interpreter::objspace::std::mapdict::pure_direct_read_attr(attr) })
-                else {
+                let Some(plain) = (unsafe {
+                    pyre_interpreter::objspace::std::mapdict::pure_direct_read_attr(attr)
+                }) else {
                     return Ok(None);
                 };
                 walker_pin_plain_ever_mutated(ctx, op_pc, plain)?;

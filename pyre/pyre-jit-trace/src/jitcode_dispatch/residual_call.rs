@@ -7111,6 +7111,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+        // The instance arm of `iter`: a user class's `__iter__` is Python, and
+        // left residual it costs an interpreter frame and the virtualref
+        // bracket that forces the caller's, once per `for` statement.
+        if let Some(outcome) = spec_gate(SpecFold::InstanceIter, || {
+            try_walker_specialize_instance_iter(
+                ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
+            )
+        })? {
+            return Ok(outcome);
+        }
     }
 
     // Range FOR_ITER is a C-level iterator advance.  Re-emit its field

@@ -445,6 +445,7 @@ spec_folds! {
     ZipTwoTupleIters     => ("zip_two_tuple_iters",      "specialize",    "for_iter_next"),
     ForIterList          => ("for_iter_list",            "specialize",    "for_iter_next"),
     InstanceNext         => ("instance_next",            "residual_call", "-"),
+    InstanceIter         => ("instance_iter",            "residual_call", "-"),
     GeneratorNext        => ("generator_next",           "residual_call", "-"),
     FrameLasti           => ("frame_lasti",              "specialize",    "load_attr"),
     LoadDeref            => ("load_deref",               "residual_call", "-"),

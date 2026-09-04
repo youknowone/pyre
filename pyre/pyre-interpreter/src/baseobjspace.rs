@@ -2272,6 +2272,42 @@ pub unsafe fn getitem_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64,
     }
 }
 
+/// GET_ITER fast path: return the receiver's type, its version tag, and the
+/// `__iter__` [`iter`] would dispatch for a user instance, so the full-body
+/// walker can inline the method in place of the opaque residual.
+///
+/// This mirrors only [`iter`]'s instance arm.  Iterable layouts claimed by an
+/// earlier arm, including the unpack iterator, the type-object metaclass arm
+/// and the later generic non-instance lookup retain the residual path.
+///
+/// The caller owes the `iter_check_is_iterator` step this does not perform:
+/// the value the method returns has to carry `__next__` on its type.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn iter_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    unsafe {
+        if crate::module::r#struct::is_unpack_iter(w_obj) || !is_instance(w_obj) {
+            return None;
+        }
+        let w_type = w_instance_get_type(w_obj);
+        if w_type.is_null() {
+            return None;
+        }
+        let method = lookup_in_type_where(w_type, "__iter__")?;
+        // descroperation.py:339-341 — an explicit `__iter__ = None` marks the
+        // type non-iterable even though the lookup succeeds.
+        if is_none(method) {
+            return None;
+        }
+        let version_tag = w_type_version_tag(w_type);
+        if version_tag == 0 {
+            return None;
+        }
+        Some((w_type, version_tag, method))
+    }
+}
+
 /// FOR_ITER fast path: return the receiver's type, its version tag, and the
 /// `__next__` [`next`] would dispatch for a user instance, so the full-body
 /// walker can inline the method in place of the opaque residual.

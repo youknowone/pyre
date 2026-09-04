@@ -1804,11 +1804,12 @@ fn caller_operand_slots<Sym: WalkSym>(
         });
     }
     let operand_count = match instruction {
-        // `[iterator]`, and `[owner]` for the attribute read whose descriptor
-        // body is the callee. The method form of `LOAD_ATTR` pushes two
-        // results but still consumes only the owner, and this depth is read
-        // before the instruction runs.
-        pyre_interpreter::Instruction::ForIter { .. }
+        // `[iterable]` for GET_ITER, `[iterator]` for FOR_ITER, and `[owner]`
+        // for the attribute read whose descriptor body is the callee. The
+        // method form of `LOAD_ATTR` pushes two results but still consumes only
+        // the owner, and this depth is read before the instruction runs.
+        pyre_interpreter::Instruction::GetIter
+        | pyre_interpreter::Instruction::ForIter { .. }
         | pyre_interpreter::Instruction::LoadAttr { .. } => 1,
         // `[lhs, rhs]`, and `[value, owner]` for the attribute store whose
         // setter body is the callee — `store_attr_cached` pops the owner

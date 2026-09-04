@@ -2382,7 +2382,15 @@ pub unsafe fn load_attr_unboxed_fast_path(
     {
         return None;
     }
-    Some((w_type, version_tag, map, p.storageindex, u.listindex, u.typ, attr))
+    Some((
+        w_type,
+        version_tag,
+        map,
+        p.storageindex,
+        u.listindex,
+        u.typ,
+        attr,
+    ))
 }
 
 /// The STORE_ATTR counterpart of [`load_attr_unboxed_fast_path`].  An
