@@ -258,10 +258,26 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
     // `bridges_compiled=7`. Re-record these two alongside that baseline.
     assert_eq!(stat_value(&stderr, "compiles"), 8);
     assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 7);
-    assert!(
-        !stderr.contains("memory.fill"),
-        "recursive CA still refills a nursery that is already zeroed:\n{stderr}"
-    );
+    let wat: Vec<_> = stderr.lines().map(str::trim).collect();
+    for (i, _) in wat
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == "memory.fill")
+    {
+        // Ref-home clears are frame-relative; the forbidden nursery refill is
+        // relative to the CALL_ASSEMBLER allocation scratch local instead.
+        let frame_home_fill = i >= 5
+            && wat[i - 5] == "local.get 0"
+            && wat[i - 4].starts_with("i32.const ")
+            && wat[i - 3] == "i32.add"
+            && wat[i - 2] == "i32.const 0"
+            && wat[i - 1].starts_with("i32.const ");
+        assert!(
+            frame_home_fill,
+            "recursive CA refills a nursery that is already zeroed near:\n{}",
+            wat[i.saturating_sub(5)..=i].join("\n")
+        );
+    }
 }
 
 #[test]
