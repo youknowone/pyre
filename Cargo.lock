@@ -3397,6 +3397,7 @@ dependencies = [
  "parking_lot",
  "paste",
  "rustix",
+ "rustls-native-certs",
  "rustpython-wtf8",
  "rustyline 18.0.1",
  "schannel",
