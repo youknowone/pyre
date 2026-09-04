@@ -2350,6 +2350,10 @@ impl Assembler {
                 base, field_index, ..
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert_eq!(
+                    kc, 'r',
+                    "virtualizable base must use the Ref register bank: RPython BlackholeInterpreter.bhimpl_getfield_vable_* declares @arguments(\"r\", \"d\")"
+                );
                 state.code.push(reg);
                 argcodes.push(kc);
                 // RPython: vable field → VableField descriptor (index, not byte offset).
@@ -2385,6 +2389,10 @@ impl Assembler {
                 ..
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert_eq!(
+                    kc, 'r',
+                    "virtualizable base must use the Ref register bank: RPython BlackholeInterpreter.bhimpl_setfield_vable_* declares @arguments(\"r\", ..., \"d\")"
+                );
                 state.code.push(reg);
                 argcodes.push(kc);
                 // `setfield_vable_i` is not in USE_C_FORM
@@ -2432,6 +2440,10 @@ impl Assembler {
                 array_is_signed,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert_eq!(
+                    kc, 'r',
+                    "virtualizable base must use the Ref register bank: RPython BlackholeInterpreter.bhimpl_getarrayitem_vable_* declares @arguments(\"r\", \"i\", \"d\", \"d\")"
+                );
                 state.code.push(reg);
                 argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind_var(elem_index, regallocs);
@@ -2474,6 +2486,10 @@ impl Assembler {
                 array_is_signed,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert_eq!(
+                    kc, 'r',
+                    "virtualizable base must use the Ref register bank: RPython BlackholeInterpreter.bhimpl_setarrayitem_vable_* declares @arguments(\"r\", \"i\", ..., \"d\", \"d\")"
+                );
                 state.code.push(reg);
                 argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind_var(elem_index, regallocs);
@@ -2511,6 +2527,10 @@ impl Assembler {
                 array_is_signed,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                assert_eq!(
+                    kc, 'r',
+                    "virtualizable base must use the Ref register bank: RPython BlackholeInterpreter.bhimpl_arraylen_vable declares @arguments(\"r\", \"d\", \"d\")"
+                );
                 state.code.push(reg);
                 argcodes.push(kc);
                 // The same descr pair its read and write siblings carry, in
@@ -7504,6 +7524,44 @@ mod tests {
                 asm.insns.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// Every upstream vable handler declares its base as `r`. An Int-bank
+    /// base would not be visited by the moving-GC root walker.
+    #[test]
+    #[should_panic(expected = "virtualizable base must use the Ref register bank")]
+    fn assemble_rejects_int_bank_virtualizable_base() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("int_vable_base");
+        let base_var = push_input_var(&mut graph, "frame", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::VableFieldRead {
+                    base: base_var.clone(),
+                    field_index: 0,
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .expect("field read has a result");
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
     }
 
     /// `arraylen_vable` is a cross-layer contract: the codewriter picks the

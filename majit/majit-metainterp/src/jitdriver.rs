@@ -228,11 +228,12 @@ pub fn drive_single_frame_blackhole(
     // pooled builder may allocate.  Option<i64> is not a contiguous root area,
     // so keep an index-parallel packed root vector and copy forwarding updates
     // back before copy_data_from_miframe reads the MIFrame.
-    let mut ref_roots: Vec<(usize, i64)> = miframe
-        .ref_values
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| value.map(|value| (index, value)))
+    let mut ref_roots: Vec<(usize, i64)> = (0..miframe.ref_regs.len())
+        .filter_map(|index| {
+            miframe
+                .ref_value_for_blackhole(index)
+                .map(|value| (index, value))
+        })
         .collect();
     let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     let mut packed_ref_roots: Vec<i64> = ref_roots.iter().map(|(_, value)| *value).collect();
@@ -269,7 +270,7 @@ pub fn drive_single_frame_blackhole(
     );
     for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
         *value = *forwarded;
-        miframe.ref_values[*index] = Some(*forwarded);
+        miframe.set_forwarded_ref_value(*index, *forwarded);
     }
     if let Some(index) = exception_root {
         last_exc_value = packed_ref_roots[index];
@@ -408,10 +409,10 @@ pub fn drive_multi_frame_blackhole(
     let mut ref_locations = Vec::new();
     let mut packed_ref_roots = Vec::new();
     for (frame_index, frame) in framestack.frames.iter().enumerate() {
-        for (color, value) in frame.ref_values.iter().enumerate() {
-            if let Some(value) = value {
+        for color in 0..frame.ref_regs.len() {
+            if let Some(value) = frame.ref_value_for_blackhole(color) {
                 ref_locations.push((frame_index, color));
-                packed_ref_roots.push(*value);
+                packed_ref_roots.push(value);
             }
         }
     }
@@ -434,7 +435,7 @@ pub fn drive_multi_frame_blackhole(
         .into_iter()
         .zip(packed_ref_roots.iter().copied())
     {
-        framestack.frames[frame_index].ref_values[color] = Some(forwarded);
+        framestack.frames[frame_index].set_forwarded_ref_value(color, forwarded);
     }
     if let Some(index) = exception_root {
         last_exc_value = packed_ref_roots[index];
