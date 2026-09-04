@@ -852,6 +852,23 @@ mod tests {
     // must provide the same exclusive serialization as it does for the GC.
     unsafe impl Sync for GcOpCounter {}
 
+    /// Install a GC only if this process has none.
+    ///
+    /// The `--ignored` tests share one process (`--test-threads=1`) and one GC
+    /// singleton, so **whichever runs first installs the GC everything else
+    /// then inherits**, and libtest orders them by name.  Three of them —
+    /// `entry_only_safepoint_preserves_fresh_gc_op_return`,
+    /// `multithreaded_collections_preserve_each_mutators_roots` and
+    /// `oldgen_nonmoving_preserves_other_mutators_roots` — allocate
+    /// `alloc_nursery_typed(0, 16)`, so they install a GC that has type 0
+    /// registered and guard it with the same `is_initialized` test.  The one
+    /// which sorts first is the one that actually installs.
+    ///
+    /// The GC built here registers no types.  A test whose name sorts ahead of
+    /// all three and reaches this therefore hands them a singleton whose type 0
+    /// does not exist — the typed allocations then run against an unregistered
+    /// type and the run wedges rather than fails.  Keep new names out of that
+    /// window, or install a typed GC as those three do.
     fn ensure_gc() {
         if !is_initialized() {
             let gc = Box::new(MiniMarkGC::new());

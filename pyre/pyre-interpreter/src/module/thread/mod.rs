@@ -636,6 +636,16 @@ pub(crate) fn current_exceptions() -> PyObjectRef {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn after_fork_child() {
     let ident = current_ident();
+    // Before anything below, which reaches Python objects and can therefore
+    // collect.  The mutex rebuild is already done — `rgil::allocate` hands it
+    // to `pthread_atfork`'s child arm, as `RPyGilAllocate` does — but the
+    // collector's *census* is not something upstream has to repair, so nothing
+    // in `reinit_threads` covers it: until these two run, `REGISTERED_THREADS`
+    // and the RUNNING count still describe threads that did not survive, so a
+    // collection taken here would wait in `quiesce_mutators` for them to park,
+    // and an STW root walk would read their vanished root areas.
+    majit_gc::shadow_stack::after_fork_child();
+    majit_gc::gc_sync::after_fork_child();
     {
         let mut contexts = EXECUTION_CONTEXTS.lock();
         // threadlocals.py `reinit_threads`: a fork can leave a worker
@@ -685,8 +695,6 @@ pub(crate) fn after_fork_child() {
         any(target_os = "macos", target_os = "linux")
     ))]
     crate::cpyext::after_fork_child();
-    majit_gc::shadow_stack::after_fork_child();
-    majit_gc::gc_sync::after_fork_child();
 }
 
 // os_lock.py `RPY_LOCK_FAILURE, RPY_LOCK_ACQUIRED, RPY_LOCK_INTR`.
