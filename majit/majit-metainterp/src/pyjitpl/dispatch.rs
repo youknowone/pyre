@@ -4576,15 +4576,21 @@ where
                 // `BC_SETFIELD_GC` fills this very cache — without the two
                 // halves here that cache is written and never read.
                 //
-                // The `is_always_pure() and isinstance(box, ConstPtr)` bypass
-                // `opimpl_getfield_gc_{i,r}` runs ahead of the updater is not
-                // spelled separately: the fold it performs lives inside
-                // `execute_and_record` (`is_pure_with_descr` admits
-                // GETFIELD_GC only through `descr.is_always_pure()`), which
-                // the miss path below routes through.  A cached const-struct
-                // pure field answers from the cache instead of re-folding —
-                // same value, and neither spelling records an operation.
-                let field_key = heapcache_field_key(&fielddescr);
+                // `opimpl_getfield_gc_{i,r,f}` runs one test ahead of the
+                // updater: a constant struct's always-pure field bypasses the
+                // heapcache completely, executing and returning a Const
+                // without reading, writing, or recording anything.  Spelling
+                // it as "this load has no cache key" reaches the miss path
+                // below, whose `execute_and_record` performs that very fold —
+                // `is_pure_with_descr` admits GETFIELD_GC only through
+                // `descr.is_always_pure()`, the same predicate — and the key
+                // being `None` is what then skips both cache halves.
+                let bypasses_heapcache = fielddescr.is_always_pure() && struct_opref.is_constant();
+                let field_key = if bypasses_heapcache {
+                    None
+                } else {
+                    heapcache_field_key(&fielddescr)
+                };
                 let cached =
                     field_key.and_then(|key| ctx.heapcache_getfield_cached(struct_opref, key));
                 let (op, reg_concrete) = if let Some(cached) = cached {
@@ -4672,7 +4678,21 @@ where
                 // .constbox())` rather than `==`, so that two NaNs compare
                 // equal; comparing the raw bit patterns is that same
                 // predicate, and `loaded` is already the bits.
-                let field_key = heapcache_field_key(&fielddescr);
+                // `opimpl_getfield_gc_{i,r,f}` runs one test ahead of the
+                // updater: a constant struct's always-pure field bypasses the
+                // heapcache completely, executing and returning a Const
+                // without reading, writing, or recording anything.  Spelling
+                // it as "this load has no cache key" reaches the miss path
+                // below, whose `execute_and_record` performs that very fold —
+                // `is_pure_with_descr` admits GETFIELD_GC only through
+                // `descr.is_always_pure()`, the same predicate — and the key
+                // being `None` is what then skips both cache halves.
+                let bypasses_heapcache = fielddescr.is_always_pure() && struct_opref.is_constant();
+                let field_key = if bypasses_heapcache {
+                    None
+                } else {
+                    heapcache_field_key(&fielddescr)
+                };
                 let cached =
                     field_key.and_then(|key| ctx.heapcache_getfield_cached(struct_opref, key));
                 let (op, reg_concrete) = if let Some(cached) = cached {
