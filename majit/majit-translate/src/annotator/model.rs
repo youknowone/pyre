@@ -3609,11 +3609,24 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // these through `obj.noneify()`.
         (SomeValue::None_(_), obj) | (obj, SomeValue::None_(_)) => obj.noneify(),
 
-        // Default fallback — upstream's `pair(...).union()` would
-        // consult binaryop.py which fills those arms (container
-        // key/value splicing, SomeByteArray ↔ string mixes, SomePtr,
-        // SomeAddress family, ...). Until then we raise UnionError
-        // so the annotator surfaces the gap loudly.
+        // Default fallback.  Reaching it does NOT imply an arm waiting to
+        // be ported: upstream's union table is same-kind almost
+        // throughout — `binaryop.py` defines `union` on
+        // `pairtype(SomeInteger, SomeInteger)`, `(SomeString, SomeString)`,
+        // `(SomeList, SomeList)`, `(SomeInstance, SomeInstance)` and their
+        // siblings, plus the `SomeNone`/`SomeImpossibleValue` bridges and a
+        // single cross-kind `(SomeUnicodeString, SomeInteger)`.  Everything
+        // else resolves through the MRO to `pairtype(SomeObject, SomeObject)
+        // .union`, which raises; the ll level is explicit about it, with
+        // `llannotation.py`'s `pairtype(SomePtr, SomeObject).union` and its
+        // `SomeAddress` twin raising in their own bodies.
+        //
+        // So a CROSS-kind pair here is a producer divergence — two levels of
+        // one value met at a merge upstream never builds — and porting an arm
+        // for it would invent a lattice join RPython does not have.  A
+        // SAME-kind pair is the porting gap.  `classify_unported_reason`
+        // splits the two on the operand names below, so the message must keep
+        // naming both sides.
         _ => Err(UnionError {
             lhs: Box::new(s1.clone()),
             rhs: Box::new(s2.clone()),
@@ -3624,8 +3637,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             // phrase is kept verbatim and first — `cutover.rs`'s `is_known_unported`
             // and `classify_unported_reason` match it with `contains`.
             msg: format!(
-                "no upstream pair(s1, s2).union() handler in current subset: \
-                 {} ∪ {}",
+                "pair(s1, s2).union() found no arm: {} ∪ {}",
                 union_operand_id(s1),
                 union_operand_id(s2)
             ),

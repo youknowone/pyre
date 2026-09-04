@@ -1661,7 +1661,7 @@ pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
     // phi RPython never constructs — not a missing union handler.  Skip
     // to the legacy walker until the pointer values lift as instances
     // (typed-Ref ClassDef projection).
-    if msg.contains("no upstream pair(s1, s2).union() handler in current subset") {
+    if msg.contains("pair(s1, s2).union() found no arm") {
         return Some("union-no-handler");
     }
     // `InstanceRepr.getfield` walking the `rbase` chain before the
@@ -3436,6 +3436,31 @@ fn rtyper_verbose_enabled() -> bool {
 /// ranked, finite legacy-walker-deletion worklist: each bucket names a
 /// concrete piece of work (port a Repr, lower a construct in `front::mir`,
 /// residual-ize a helper, specialize a generic ADT).
+/// Whether a `pair(s1, s2).union() found no arm: X ∪ Y` message names two
+/// operands of different kinds.
+///
+/// The operands are rendered by `annotator::model`'s `union_operand_id`, which
+/// spells a parameterised kind `Kind(detail)` and a bare one `Kind`, so the
+/// kind is the text before the first `(`.  Two `Instance(..)`s of different
+/// classes are the SAME kind — upstream's `pairtype(SomeInstance, SomeInstance)
+/// .union` handles that pair, and its failure is a class-hierarchy question,
+/// not a missing arm.
+///
+/// A message this cannot parse is reported as same-kind, so an unreadable one
+/// lands in the bucket that asks for work rather than the one that closes the
+/// question.
+fn union_pair_is_cross_kind(reason: &str) -> bool {
+    let Some((lhs, rhs)) = reason
+        .rsplit_once("found no arm: ")
+        .and_then(|(_, pair)| pair.split_once(" ∪ "))
+    else {
+        return false;
+    };
+    let kind = |s: &str| s.trim().split('(').next().unwrap_or("").trim().to_string();
+    let (lhs, rhs) = (kind(lhs), kind(rhs.lines().next().unwrap_or(rhs)));
+    !lhs.is_empty() && !rhs.is_empty() && lhs != rhs
+}
+
 fn classify_unported_reason(reason: &str) -> &'static str {
     // ── rtyper-stage named gaps (most specific first) ──
     if reason.contains("rtyper_makerepr — port") {
@@ -3461,8 +3486,17 @@ fn classify_unported_reason(reason: &str) -> &'static str {
         "DICT-KEY-EQ (str/instance dict keys)"
     } else if reason.contains("Call with CallTarget::Indirect") {
         "DYN-TRAIT-INDIRECT (lower_indirect_calls)"
-    } else if reason.contains("no upstream pair(s1, s2).union() handler") {
-        "UNION-PAIR-PORT"
+    } else if reason.contains("pair(s1, s2).union() found no arm") {
+        // Two dispositions share one message, and they call for opposite
+        // work.  Upstream's union table is same-kind almost throughout, so a
+        // cross-kind pair is one `pairtype(SomeObject, SomeObject).union`
+        // raises for as well: nothing to port, the merge itself is the
+        // defect.  A same-kind pair is the arm pyre has not written yet.
+        if union_pair_is_cross_kind(reason) {
+            "UNION-CROSS-KIND (a phi upstream never builds)"
+        } else {
+            "UNION-PAIR-PORT (same-kind arm not written)"
+        }
     } else if reason.contains("rbase missing") {
         "REPR-SETUP-ORDER (call_all_setups)"
     } else if reason.contains("calltable row not found in CallFamily") {
@@ -4802,6 +4836,47 @@ mod tests {
             "UNION-ERROR (generic-ADT phi / pair)",
             "backwards setbinding on per-instantiation classdef knowntypedata \
              shares the generic-ADT union disposition, not UNCLASSIFIED"
+        );
+    }
+
+    /// A union fallback splits on operand kind, because the two halves call
+    /// for opposite work and only one of them is a porting task.
+    ///
+    /// Upstream defines `union` on same-kind pairs almost throughout
+    /// (`binaryop.py`: `pairtype(SomeInteger, SomeInteger)`,
+    /// `(SomeList, SomeList)`, `(SomeInstance, SomeInstance)`, …), with the
+    /// `SomeNone`/`SomeImpossibleValue` bridges and one cross-kind
+    /// `(SomeUnicodeString, SomeInteger)` as the exceptions. A cross-kind pair
+    /// therefore reaches `pairtype(SomeObject, SomeObject).union`, which
+    /// raises — and `llannotation.py` spells that out for the ll level, with
+    /// `pairtype(SomePtr, SomeObject).union` raising in its own body. There is
+    /// no arm to port for those; the merge is the defect.
+    #[test]
+    fn a_cross_kind_union_fallback_is_not_reported_as_a_porting_gap() {
+        let cross = "annotate PANIC: UnionError in mergeinputargs: UnionError: \
+                     pair(s1, s2).union() found no arm: \
+                     Instance(object_array::ItemsBlock) ∪ List";
+        assert_eq!(
+            classify_unported_reason(cross),
+            "UNION-CROSS-KIND (a phi upstream never builds)",
+            "a List meeting an Instance is a merge upstream raises on too, so \
+             naming it a porting gap prescribes an arm RPython does not have"
+        );
+
+        // Same kind, different classes: `pairtype(SomeInstance, SomeInstance)`
+        // exists upstream, so this one really is pyre's arm to write.
+        let same = "pair(s1, s2).union() found no arm: \
+                    Instance(option::Option<Wtf8Buf>::None) ∪ Instance(Exception)";
+        assert_eq!(
+            classify_unported_reason(same),
+            "UNION-PAIR-PORT (same-kind arm not written)"
+        );
+
+        // A message the split cannot read must land in the bucket that asks
+        // for work, never in the one that closes the question.
+        assert_eq!(
+            classify_unported_reason("pair(s1, s2).union() found no arm"),
+            "UNION-PAIR-PORT (same-kind arm not written)"
         );
     }
 
