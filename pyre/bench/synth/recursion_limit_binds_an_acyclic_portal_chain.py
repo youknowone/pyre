@@ -5,18 +5,16 @@
 # distinct callees below each carry a loop so a warmed caller can cross their
 # entries through compiled portal/CALL_ASSEMBLER paths.
 #
-# The two limits pin both sides of `PyFrame.execute_frame`'s pre-entry check.
-# `frame_depth` includes its own transient frame, so `base + 5` leaves six
-# units from its caller: all six callees are admitted. `base + 4` leaves five,
-# so the sixth must raise. Checking the charged depth with `>=` rejects the
-# first case one level early, while
-# charging recursive code objects only lets the second case return normally.
+# The two limits pin the conservative lower-level check used by PyPy's
+# approximative recursion limit. On this six-callee compiled shape, `base + 5`
+# admits the chain while `base + 4` refuses its last aggregate activation.
+# Charging recursive code objects only would let the second case return
+# normally.
 #
-# This is the same intentional 3.14-spec split as
-# `recursion_limit_binds_a_portal_driven_recursion`: measured CPython 3.14.6
-# raises in the `base + 4` arm, while pypy3 7.3.22 returns. The implementation
-# still follows PyPy's `PyFrame.execute_frame` activation seam; the observable
-# boundary follows the pinned CPython build.
+# `pypy/module/sys/vm.py setrecursionlimit` is `@jit.dont_look_inside` and
+# explicitly documents this limit as approximative and checked at a lower
+# level. This fixture therefore pins pyre's conservative compiled seam rather
+# than claiming CPython's exact frame-count boundary.
 import sys
 
 WARM = 3000

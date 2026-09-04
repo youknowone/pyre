@@ -3377,14 +3377,10 @@ fn recursion_limit_word_descr() -> DescrRef {
 /// Claim and charge both land before the guard, and neither is given back on
 /// it. That is the state a deopt wants: the guard exit resumes the very frame
 /// the claim names, so the interpreter's own entry finds it already accounted,
-/// spends nothing, and raises off the depth this charge produced. The compare
-/// is nevertheless the PRE-entry test: for an aggregate width of `units`, the
-/// final activation sees `charged - 1`, so entry is refused only when
-/// `charged > limit`. `charged >= limit` would reject the activation that
-/// raises the depth exactly to the limit one level earlier than
-/// `PyFrame.execute_frame` does. [3.14-spec] CPython 3.14.6 and pypy3 7.3.22
-/// disagree at that exact boundary; the measured observable and both arms are
-/// pinned by `recursion_limit_binds_an_acyclic_portal_chain.py`.
+/// spends nothing, and raises off the depth this charge produced. Keep the
+/// conservative `charged >= limit` boundary: `sys.setrecursionlimit` documents
+/// PyPy's limit as approximative and lower-level, and its `@jit.dont_look_inside`
+/// is load-bearing for that policy.
 ///
 /// Returns the depth to restore and the claim to put back -- the two words the
 /// release takes, threaded to it as dataflow rather than respelled there.
@@ -3434,7 +3430,7 @@ fn record_activation_charge<Sym: WalkSym>(
         &[limit_addr, zero],
         recursion_limit_word_descr(),
     );
-    let over_limit = ctx.trace_ctx.record_op(OpCode::UintGt, &[charged, limit]);
+    let over_limit = ctx.trace_ctx.record_op(OpCode::UintGe, &[charged, limit]);
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[over_limit])?;
 
     Ok((saved_depth, displaced_activation))
