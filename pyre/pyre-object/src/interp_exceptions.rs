@@ -2240,6 +2240,7 @@ mod tests {
     /// without ever loading the tail field the tag lives in.
     #[test]
     fn test_kind_checked_rejects_non_exception_header() {
+        seed_subclass_ranges();
         let buf = [0usize; std::mem::size_of::<W_BaseException>() / 8];
         assert_eq!(
             unsafe { w_exception_kind_checked(buf.as_ptr() as PyObjectRef) },
