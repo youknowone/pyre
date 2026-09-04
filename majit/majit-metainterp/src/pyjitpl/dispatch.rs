@@ -4596,9 +4596,15 @@ where
                 let (op, reg_concrete) = if let Some(cached) = cached {
                     // `profiler.count_ops(rop.GETFIELD_GC_I,
                     // Counters.HEAPCACHED_OPS)` — folded-away op
-                    // accounting on the cache hit.
-                    ctx.profiler()
-                        .count_ops(kind, crate::pyjitpl::counters::HEAPCACHED_OPS);
+                    // accounting on the cache hit.  The opnum in
+                    // `_opimpl_getfield_gc_any_pureornot` is the
+                    // `GETFIELD_GC_I` literal whatever the field's type,
+                    // so the ref arm shares the int bucket rather than
+                    // reporting its own `kind`.
+                    ctx.profiler().count_ops(
+                        OpCode::GetfieldGcI,
+                        crate::pyjitpl::counters::HEAPCACHED_OPS,
+                    );
                     // The sanity check compares the freshly executed load
                     // against the cached box's own payload
                     // (`currfieldbox.getint()` / `.getref_base()`), read
@@ -4696,8 +4702,11 @@ where
                 let cached =
                     field_key.and_then(|key| ctx.heapcache_getfield_cached(struct_opref, key));
                 let (op, reg_concrete) = if let Some(cached) = cached {
+                    // The same `GETFIELD_GC_I` literal — `box_trace.rs`
+                    // wires its float port to the int bucket for this
+                    // reason.
                     ctx.profiler().count_ops(
-                        OpCode::GetfieldGcF,
+                        OpCode::GetfieldGcI,
                         crate::pyjitpl::counters::HEAPCACHED_OPS,
                     );
                     let expected = match ctx.box_value(cached) {

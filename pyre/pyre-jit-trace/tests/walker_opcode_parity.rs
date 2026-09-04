@@ -130,6 +130,30 @@ fn majit_walker_bytecodes(root: &Path) -> BTreeSet<String> {
     out
 }
 
+/// The text between the first `{` at or after `open` and its matching `}`.
+///
+/// Both scans below want a construct's own body and nothing after it: a
+/// `match` whose arms are the walker's keys, and a macro invocation whose
+/// entries are the arithmetic ones. Reading to end-of-file instead would
+/// admit lines that are not entries at all.
+fn braced_body(src: &str, open: usize) -> &str {
+    let start = src[open..].find('{').expect("the construct opens a block") + open + 1;
+    let mut depth = 1usize;
+    for (offset, ch) in src[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[start..start + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces after byte {open}");
+}
+
 /// The keys pyre's walker answers: the arms of `handle`'s `match op.key`, plus
 /// the `regular_record_table!` entries that stand in for the arithmetic arms.
 fn pyre_walker_keys(root: &Path) -> BTreeSet<String> {
@@ -141,24 +165,8 @@ fn pyre_walker_keys(root: &Path) -> BTreeSet<String> {
         .find("match op.key {")
         .map(|rel| at + rel)
         .expect("`handle` must dispatch on `op.key`");
-    let body_start = src[open..].find('{').expect("match opens a block") + open + 1;
-    let mut depth = 1usize;
-    let mut end = body_start;
-    for (offset, ch) in src[body_start..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = body_start + offset;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
     let mut out = BTreeSet::new();
-    for line in src[body_start..end].lines() {
+    for line in braced_body(&src, open).lines() {
         // An arm pattern sits at the match's own indent and carries its `=>`
         // on the same line; every arm in `handle` is written that way, and the
         // length assertion below is what notices if one stops being.
@@ -172,7 +180,11 @@ fn pyre_walker_keys(root: &Path) -> BTreeSet<String> {
     let table = arith
         .find("regular_record_table! {")
         .expect("the arithmetic arms live in `regular_record_table!`");
-    for line in arith[table..].lines() {
+    // Only the invocation's own body. Scanning to end-of-file would let any
+    // later `"opname/argcodes"` string in `arith.rs` — a doc example, a test
+    // fixture — enter this set without a generated arm behind it, and a key
+    // that enters unearned is a missing walker arm this gate stops noticing.
+    for line in braced_body(&arith, table).lines() {
         for key in quoted(code_of(line)) {
             if key.contains('/') {
                 out.insert(key);
