@@ -332,6 +332,10 @@ for source, message, position in (
     # can stand after the token the parser reported as well as before it.
     ("f() = bu'x'", "'u' and 'b' prefixes are incompatible", (1, 7, 1, 9)),
     ("f() = ub'x'", "'u' and 'b' prefixes are incompatible", (1, 7, 1, 9)),
+    # Like PyPy's `fstring_find_literal`, a backslash leaves a following brace
+    # visible to f-string parsing.  CPython 3.14's tokenizer therefore reads
+    # the first replacement field, while doubled braces below stay literal.
+    ("f'\\{bu\"x\"}'", "'u' and 'b' prefixes are incompatible", (1, 5, 1, 7)),
     # The tokenizer does not read a comment, so neither does the scan.
     ("x = = 1  # bu'z'", "invalid syntax", (1, 5, 1, 6)),
 ):
@@ -344,6 +348,13 @@ for source, message, position in (
         error.end_lineno,
         error.end_offset,
     )
+
+# An escaped doubled brace is literal text rather than a replacement field, so
+# its prefix-shaped contents cannot override the later assignment diagnostic.
+source = "f'\\{{ bu\"x\" }}'; 1=2"
+error = syntax_error(source)
+assert error.msg == "cannot assign to literal here. Maybe you meant '==' instead of '='?"
+assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (1, 18, 1, 19)
 
 
 # `eval` is `expressions NEWLINE* ENDMARKER` and has no assignment rule at all,

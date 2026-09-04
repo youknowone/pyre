@@ -13554,6 +13554,15 @@ fn first_string_prefix_pair_error(bytes: &[u8], anchor: usize) -> Option<(String
             match byte {
                 // A backslash closes no literal, raw included: `r'\''` keeps
                 // the escape in its text and the quote after it in the token.
+                // In an interpolated literal it does not hide a following
+                // brace: PyPy's `fstring_find_literal` consumes the escape and
+                // then still applies its brace branch to that character.
+                b'\\'
+                    if literal.interpolated
+                        && matches!(bytes.get(cursor + 1), Some(b'{' | b'}')) =>
+                {
+                    cursor += 1
+                }
                 b'\\' => cursor += 2,
                 b'\n' if !literal.triple => return None,
                 // `{{` and `}}` each write one brace and open no field.
