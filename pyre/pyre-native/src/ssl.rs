@@ -722,50 +722,25 @@ unsafe fn context_add_verify_der(
     Ok(added)
 }
 
-/// Certificate bundles the platform's OpenSSL build would compile in as
-/// `X509_get_default_cert_file()`, most specific first.
-const DEFAULT_CERT_FILES: &[&str] = &[
-    "/etc/ssl/certs/ca-certificates.crt",
-    "/etc/pki/tls/certs/ca-bundle.crt",
-    "/etc/ssl/ca-bundle.pem",
-    "/etc/pki/tls/cacert.pem",
-    "/etc/ssl/cert.pem",
-    "/usr/local/share/certs/ca-root-nss.crt",
-    "/usr/local/etc/openssl/cert.pem",
-];
-
-/// Hashed certificate directories corresponding to
-/// `X509_get_default_cert_dir()`.
-const DEFAULT_CERT_DIRS: &[&str] = &[
-    "/etc/ssl/certs",
-    "/etc/pki/tls/certs",
-    "/system/etc/security/cacerts",
-    "/usr/local/share/certs",
-];
-
 /// The trust file and directory this platform actually carries, for
 /// `_ssl.get_default_verify_paths()`.  Reporting the historical
 /// `/etc/ssl/cert.pem` pair everywhere names a store most Linux distributions
 /// do not have.  The environment variables that shadow these values are
 /// applied by `ssl.py`, so the compiled-in defaults are returned unshadowed.
+#[cfg(feature = "host_env")]
 #[inline(never)]
 pub fn default_verify_paths() -> (String, String) {
-    fn first_existing(
-        candidates: &[&'static str],
-        exists: fn(&std::path::Path) -> bool,
-    ) -> Option<&'static str> {
-        candidates
-            .iter()
-            .find(|candidate| exists(std::path::Path::new(candidate)))
-            .copied()
-    }
+    rustpython_host_env::native_certs::default_verify_paths()
+}
+
+/// The host-less build has no filesystem seam through which to discover a
+/// platform store, so retain OpenSSL's conventional compiled-in pair.
+#[cfg(not(feature = "host_env"))]
+#[inline(never)]
+pub fn default_verify_paths() -> (String, String) {
     (
-        first_existing(DEFAULT_CERT_FILES, std::path::Path::is_file)
-            .unwrap_or("/etc/ssl/cert.pem")
-            .to_string(),
-        first_existing(DEFAULT_CERT_DIRS, std::path::Path::is_dir)
-            .unwrap_or("/etc/ssl/certs")
-            .to_string(),
+        "/etc/ssl/cert.pem".to_string(),
+        "/etc/ssl/certs".to_string(),
     )
 }
 
@@ -776,13 +751,16 @@ pub fn default_verify_paths() -> (String, String) {
 /// `context` must point to a live [`Context`].
 #[inline(never)]
 pub unsafe fn context_load_native_roots(context: *mut Context) -> NativeResult<usize> {
+    #[cfg(feature = "host_env")]
+    let result = rustpython_host_env::native_certs::load();
+    #[cfg(not(feature = "host_env"))]
     let result = rustls_native_certs::load_native_certs();
-    let added = unsafe {
-        context_add_verify_der(
-            context,
-            result.certs.into_iter().map(|cert| cert.as_ref().to_vec()),
-        )?
-    };
+
+    #[cfg(feature = "host_env")]
+    let certs = result.certs.into_iter();
+    #[cfg(not(feature = "host_env"))]
+    let certs = result.certs.into_iter().map(|cert| cert.as_ref().to_vec());
+    let added = unsafe { context_add_verify_der(context, certs)? };
     if added == 0 && !result.errors.is_empty() {
         return Err(pem_error(&result.errors[0]));
     }

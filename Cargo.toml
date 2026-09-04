@@ -84,16 +84,21 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # VM-independent bzip2 stream engine next to the zlib one from #8631.  Both are
 # shared with rustpython-stdlib, so neither codec needs a pyre-local copy.
 #
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "zlib"] }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
+# Moved to RustPython #8649 after the SSL cipher/OID tables and cipher-string
+# parser from #8646, lazy capath loading from #8648, and native trust-store
+# loading plus default certificate-path discovery in rustpython-host_env from
+# #8649 were merged.
+#
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "zlib"] }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
 ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
-rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "287dcd91e9c64e302c9a6cd02f3f88f49ecf558b" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
