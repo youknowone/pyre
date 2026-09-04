@@ -2294,11 +2294,25 @@ impl Optimizer {
     }
 
     /// optimizer.py `is_call_pure_pure_canraise(op)`.
-    /// Mirrors PyPy exactly: ignore `MemoryError`-only effects when deciding
-    /// whether a CALL_PURE breaks guard resume-data sharing.
+    ///
+    /// ```text
+    /// if not rop.is_call_pure(op.getopnum()):
+    ///     return False
+    /// effectinfo = op.getdescr().get_extra_info()
+    /// return effectinfo.check_can_raise(ignore_memoryerror=True)
+    /// ```
+    ///
+    /// The `is_call_pure` gate is what makes the answer `False` for every
+    /// ordinary operation: only a CALL_PURE is formally side-effect free yet
+    /// still able to raise, so only a CALL_PURE can break guard resume-data
+    /// sharing while passing `has_no_side_effect`.  `MemoryError`-only
+    /// effects are ignored.
     pub fn is_call_pure_pure_canraise(op: &Op) -> bool {
+        if !op.opcode.is_call_pure() {
+            return false;
+        }
         op.with_call_descr(|cd| cd.get_extra_info().check_can_raise(true))
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     /// Add an optimization pass to the chain.
@@ -5275,6 +5289,15 @@ impl Optimizer {
     /// `store_final_boxes_in_guard` for fresh guards.
     fn emit_guard_operation(&mut self, mut op: Op, ctx: &mut OptContext) -> Op {
         let opcode = op.opcode;
+        // optimizer.py `_emit_operation`.  A side-effecting op emitted straight into
+        // `new_operations` (a forced virtual's NEW/SETFIELD_GC, a flushed lazy
+        // set) never reaches this function's `emit_operation` caller, so the
+        // reset it owes the chain is recorded on the context.  RPython gets
+        // this for free: `emit_extra` -> `emit` -> `_emit_operation` runs the
+        // reset whoever emitted the op.
+        if ctx.take_guard_chain_broken() {
+            self.last_guard_op_idx = None;
+        }
         // optimizer.py:661-664: GUARD_NO_EXCEPTION / GUARD_EXCEPTION can only
         // share resume data with a preceding GUARD_NOT_FORCED. Anything else
         // breaks the chain.  GUARD_NOT_FORCED_2 is intentionally excluded:
@@ -5294,19 +5317,35 @@ impl Optimizer {
             self.last_guard_op_idx = None;
         }
 
-        // optimizer.py:672-683: shared vs. fresh dispatch.
-        // RPython's descrless sharing applies to optimizer-created
-        // follow-up guards with no captured resume data of their own.  Pyre
-        // keeps resume snapshots in side tables keyed by rd_resume_position;
-        // unroll clones those entries and strips descrs to mirror
-        // opencoder.py.  If such a guard shared solely because descr is None,
-        // it would inherit the previous guard's resume pc and discard the
-        // cloned snapshot.
+        // optimizer.py `emit_guard_operation`: `if (self._last_guard_op and
+        // guard_op.getdescr() is None):` — a descrless guard reuses the
+        // previous guard's resume data instead of numbering its own.  The
+        // shared guard then resumes at the donor's position and the
+        // intervening operations re-execute; `_emit_operation` keeps the
+        // chain alive only across ops that are side-effect free, guards,
+        // jit_debug or ovf, which is what makes that re-execution sound.
+        // A recorded guard carries its own `rd_resume_position` and still
+        // shares upstream — that position is simply left unused, so it must
+        // not gate the test.
         // compile.py invent_fail_descr_for_op: GUARD_NOT_FORCED /
         // GUARD_NOT_FORCED_2 must always mint a fresh ResumeGuardForcedDescr
         // (`assert copied_from_descr is None`).  They are never on the
         // sharing chain.  Mirrors the OptContext path in
         // `optimizeopt/mod.rs`'s `emit_guard_operation`.
+        // `op.rd_resume_position.get() < 0` is a pyre precondition with no
+        // upstream counterpart, and it is load-bearing.  Upstream shares
+        // whenever `self._last_guard_op and guard_op.getdescr() is None`,
+        // because a sharing guard resumes at the donor's position and the
+        // ops in between merely re-execute.  Pyre resumes through a
+        // *recorded snapshot* named by `rd_resume_position`, and rewinding a
+        // guard that owns one replays the recorded bytecode range, not just
+        // the residual ops: side effects already committed in that range run
+        // a second time.  Measured on `bench/synth/short_circuit_side_effects`
+        // (0903): dropping this conjunct over-counts a helper by 2 and moves
+        // the total, and takes 131 check.py fixtures that are green on main
+        // red — 12 wrong answers and 7 crashes.  Only a guard the optimizer
+        // invented (no snapshot of its own, e.g. GUARD_NO_EXCEPTION after a
+        // call — upstream's own motivating case) can safely inherit one.
         let shared = !op.has_descr()
             && op.rd_resume_position.get() < 0
             && self.last_guard_op_idx.is_some()
@@ -5481,9 +5520,9 @@ impl Optimizer {
             .getdescr()
             .expect("optimizer.py:691 last_guard_op.getdescr() must exist");
         assert!(
-            !last_descr.is_resume_guard_copied(),
+            last_descr.is_resume_guard(),
             "optimizer.py:691 assert isinstance(last_descr, ResumeGuardDescr): \
-             ResumeGuardCopiedDescr forbidden as sharing donor"
+             donor descr is not a ResumeGuardDescr"
         );
         op.setdescr({
             use majit_ir::OpCode;
@@ -7327,6 +7366,36 @@ mod tests {
         // Out of range — None.
         assert_eq!(ctx.inputarg_type(OpRef::int_op(3)), None);
         assert_eq!(ctx.inputarg_type(OpRef::int_op(50)), None);
+    }
+
+    #[test]
+    fn test_is_call_pure_pure_canraise_false_for_ops_that_are_not_call_pure() {
+        // optimizer.py `is_call_pure_pure_canraise` opens with
+        // `if not rop.is_call_pure(op.getopnum()): return False`
+        // is the gate the whole guard-sharing chain rests on: `_emit_operation`
+        // keeps `_last_guard_op` alive across side-effect-free operations only
+        // while this answers False for them.  An ordinary op carries no call
+        // descr, and answering True there retires the chain on every operation.
+        for opcode in [
+            OpCode::IntAdd,
+            OpCode::GetfieldGcI,
+            OpCode::ForceToken,
+            OpCode::DebugMergePoint,
+        ] {
+            let op = Op::new(opcode, &[]);
+            assert!(
+                !Optimizer::is_call_pure_pure_canraise(&op),
+                "{opcode:?} is not a CALL_PURE, so optimizer.py:733 returns False"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_call_pure_pure_canraise_false_for_a_plain_call() {
+        // A non-pure CALL is excluded by the same gate; it breaks the chain
+        // through `has_no_side_effect` instead.
+        let op = Op::new(OpCode::CallI, &[]);
+        assert!(!Optimizer::is_call_pure_pure_canraise(&op));
     }
 
     #[test]

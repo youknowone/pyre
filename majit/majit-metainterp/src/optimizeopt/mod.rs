@@ -997,6 +997,17 @@ pub struct OptContext {
     /// `OptContext::emit` gates its guard handling on `!in_final_emission`
     /// to avoid duplicating Optimizer's bookkeeping.
     last_guard_idx: Option<usize>,
+    /// `_emit_operation`'s `self._last_guard_op = None`, raised for the
+    /// `Optimizer`-owned chain.
+    ///
+    /// RPython has a single emit funnel: `emit_extra` -> `emit` ->
+    /// `_emit_operation`, so an op emitted while the Optimizer is mid-flight
+    /// (a forced virtual's NEW/SETFIELD_GC, a flushed lazy set) still runs the
+    /// chain reset.  Pyre's `in_final_emission` shortcut emits those straight
+    /// into `new_operations`, bypassing `Optimizer::emit_operation`.  Record
+    /// the break here instead; `Optimizer::emit_guard_operation` takes it
+    /// before deciding whether the next guard may share.
+    guard_chain_broken: bool,
     /// Last rd_resume_position with a valid snapshot. Used as fallback
     /// for optimizer-created guards that can't share from a previous guard.
     /// resume.py parity: RPython guards always get a snapshot via
@@ -1867,6 +1878,7 @@ impl OptContext {
             input_ops: Vec::new(),
             input_ops_index: FxHashMap::default(),
             last_guard_idx: None,
+            guard_chain_broken: false,
             last_seen_snapshot_pos: None,
             cpu: crate::cpu::default_cpu(),
             remove_gctypeptr: true,
@@ -2485,6 +2497,7 @@ impl OptContext {
             input_ops: Vec::new(),
             input_ops_index: FxHashMap::default(),
             last_guard_idx: None,
+            guard_chain_broken: false,
             last_seen_snapshot_pos: None,
             cpu: crate::cpu::default_cpu(),
             remove_gctypeptr: true,
@@ -3031,8 +3044,11 @@ impl OptContext {
             if !self.in_final_emission {
                 self.emit_guard_operation(&mut op);
             }
-        } else if !self.in_final_emission {
-            // optimizer.py: is_call_pure_pure_canraise — CallPure that
+        } else {
+            // optimizer.py `_emit_operation` — the test runs for every emitted non-guard
+            // op, `in_final_emission` included: RPython reaches this code
+            // through `_emit_operation` no matter which layer emitted the op.
+            // is_call_pure_pure_canraise: a CallPure that
             // can_raise(ignore_memoryerror=True) counts as side-effectful even
             // though has_no_side_effect is true for call_pure opcodes.
             let dominated_by_side_effect = !((op.opcode.has_no_side_effect()
@@ -3041,6 +3057,7 @@ impl OptContext {
                 && !Self::is_call_pure_pure_canraise(&op));
             if dominated_by_side_effect {
                 self.last_guard_idx = None;
+                self.guard_chain_broken = true;
             }
         }
 
@@ -5059,7 +5076,7 @@ impl OptContext {
     /// host at `inputarg_base + i`. Reading slot `i` alone finds the
     /// unforwarded recorder host and loses the import, so a slot the
     /// preamble proved constant would reach the body as an unknown.
-    /// `unroll.py:497` `source.set_forwarded(target)` writes onto the very
+    /// `unroll.py` `source.set_forwarded(target)` writes onto the very
     /// box the body operations hold; the flat `OpRef` namespace splits that
     /// one box in two, and this rejoins them.
     ///
@@ -5093,7 +5110,7 @@ impl OptContext {
         // `head = Node(i, head)` would store the node the body just allocated
         // into that node's own `next`.
         //
-        // `unroll.py:497 source.set_forwarded(target)` unifies the label arg
+        // `unroll.py source.set_forwarded(target)` unifies the label arg
         // with the value the preamble jumps with, and those name one runtime
         // value only at loop entry.
         //
@@ -6170,21 +6187,20 @@ impl OptContext {
         )
     }
 
-    /// optimizer.py: is_call_pure_pure_canraise — a CallPure op whose
+    /// Take the pending `_last_guard_op = None` raised by a side-effecting op
+    /// that was emitted straight into `new_operations` while the Optimizer was
+    /// mid-flight.  Clears the flag.
+    pub(crate) fn take_guard_chain_broken(&mut self) -> bool {
+        std::mem::take(&mut self.guard_chain_broken)
+    }
+
+    /// optimizer.py is_call_pure_pure_canraise — a CallPure op whose
     /// effectinfo says check_can_raise(ignore_memoryerror=True). These ops are
     /// formally side-effect-free (has_no_side_effect), but their potential to
-    /// raise means they break guard resume-data sharing.
+    /// raise means they break guard resume-data sharing.  Both guard paths
+    /// answer this from the same place so they cannot drift.
     fn is_call_pure_pure_canraise(op: &Op) -> bool {
-        if !op.opcode.is_call_pure() {
-            return false;
-        }
-        let Some(descr) = op.getdescr() else {
-            return false;
-        };
-        let Some(cd) = descr.as_call_descr() else {
-            return false;
-        };
-        cd.get_extra_info().check_can_raise(true)
+        optimizer::Optimizer::is_call_pure_pure_canraise(op)
     }
 
     /// optimizer.py emit_guard_operation — decide whether to share
@@ -6210,15 +6226,20 @@ impl OptContext {
             self.last_guard_idx = None;
         }
 
-        // optimizer.py: `self._last_guard_op and guard_op.getdescr() is None`
-        // getdescr() is None only for optimizer-created guards in RPython.
-        // Pyre stores resume snapshots in side tables keyed by
-        // rd_resume_position; unroll clones those side-table entries and then
-        // strips descrs to match opencoder.py.  A guard that already carries a
-        // cloned rd_resume_position must therefore be finalized from its own
-        // snapshot instead of sharing the previous guard's resume descr.
+        // optimizer.py `emit_guard_operation`: `self._last_guard_op and guard_op.getdescr() is
+        // None` — the whole test.  A recorded guard also has no descr until
+        // `invent_fail_descr_for_op` mints one, so it shares too: the shared
+        // guard resumes at the donor's position and the operations between
+        // them re-execute.  `_emit_operation` only keeps the chain across
+        // side-effect-free / guard / jit_debug / ovf operations, which is
+        // what makes that sound.  A cloned `rd_resume_position` of its own is
+        // then simply unused and must not gate the test.
         // compile.py:925-926: GUARD_NOT_FORCED* must never share —
         // invent_fail_descr_for_op asserts copied_from_descr is None.
+        // `op.rd_resume_position.get() < 0`: see the same conjunct in
+        // `Optimizer::emit_guard_operation` — a guard that owns a recorded
+        // snapshot cannot inherit another's without replaying the recorded
+        // bytecode range, and its committed side effects with it.
         let can_share = self.last_guard_idx.is_some()
             && !op.has_descr()
             && op.rd_resume_position.get() < 0
@@ -6263,6 +6284,11 @@ impl OptContext {
                 Some(fa) => op.setfailargs(fa.iter().cloned().collect()),
                 None => op.clearfailargs(),
             }
+            // The sharer resumes at the donor's snapshot, so it must carry the
+            // donor's position too — its own recorded one is unused.  Mirrors
+            // the Optimizer path's `_copy_resume_data_from`.
+            op.rd_resume_position
+                .set(self.new_operations[idx].rd_resume_position.get());
             // bridgeopt.py parity: fail_arg_types carry the types the
             // serializer used when writing the class-knowledge bitfield in
             // rd_numb (memo.finish() uses numb_state.livebox_types). A
@@ -10226,7 +10252,7 @@ mod boxref_forwarding_tests {
     }
 
     /// A peeled body names its input args by the recorder slot, while
-    /// `import_state` (unroll.py:497 `source.set_forwarded(target)`) writes
+    /// `import_state` (unroll.py `source.set_forwarded(target)`) writes
     /// that iteration's value onto the host at `inputarg_base + slot`.
     /// RPython writes onto the one box the body operations hold; the flat
     /// `OpRef` namespace splits it in two, so reading the recorder slot on
@@ -10264,7 +10290,7 @@ mod boxref_forwarding_tests {
     /// A slot whose import forwards to a value the BODY produces must keep
     /// naming the label arg.
     ///
-    /// `unroll.py:497 source.set_forwarded(target)` unifies the label arg with
+    /// `unroll.py source.set_forwarded(target)` unifies the label arg with
     /// the value the preamble jumps with, and those are one runtime value only
     /// at loop entry. A result produced inside the trace is redefined every
     /// iteration, so substituting it for a body operand turns "the value this
