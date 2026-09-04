@@ -303,7 +303,7 @@ configuration.
 `PYRE_DEOPT_PROBE`, `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
 `MAJIT_DETERMINISM_TRACE`, `MAJIT_DTRACE_CONST_BT`,
 `MAJIT_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_DEPTH_CENSUS`,
-`PYRE_FBW_DESCENT_DENY`, `PYRE_FBW_DESCENT_SCAN_STATIC`, `PYRE_FBW_INLINE_DIAG`,
+`PYRE_FBW_DESCENT_DENY`, `PYRE_FBW_DESCENT_SCAN_OFF`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
 `PYRE_FBW_MF_DIAG`, `PYRE_FBW_REPLAY_DIRTY_BODY`, `PYRE_FBW_SPEC_CENSUS`,
 `PYRE_FBW_STRICT_DIAG`,
@@ -342,17 +342,16 @@ aborted in, so the next call leaves a residual instead of descending again —
 `warmstate.py` `disable_noninlinable_function` for the builtin descent. It is
 off because the mixture it creates is not sound: with it,
 `synth/pickle_ctor_args` compiles a wrong loop and its `Unpickler.load` raises
-`EOFError: Ran out of input`, while both neighbouring answers (refuse every
-descent, attempt every descent) are correct. It retires when that is fixed, at
-which point it becomes the default and the scan retires with it.
+`EOFError: Ran out of input`. Attempting every descent is independently unsound
+in the CPython pickle and hashlib suites, so the static refusal remains the
+default. It retires when both dynamic paths preserve per-frame state.
 
-`PYRE_FBW_DESCENT_SCAN_STATIC` restores the descent's un-lowered-helper scan
-as a decline (`descent_static_decline_enabled`), so a builtin body holding a
-symbolic-fnaddr residual call is refused before the descent starts rather than
-attempted once and remembered by `descent_denied`. Same shape and same reason
-as `PYRE_WALKABORT_OFF`: which descents happen is invisible in output, so
-weighing a static answer against a learned one needs one binary and one
-variable. It retires when the scan does.
+`PYRE_FBW_DESCENT_SCAN_OFF` disables the descent's un-lowered-helper scan
+(`descent_static_decline_enabled`), so a builtin body holding a symbolic-fnaddr
+residual call is attempted rather than refused before the descent starts.  The
+attempted rollback is currently observable in `test_pickle` and `test_hashlib`,
+so the scan remains the correctness default.  Same shape and same reason as
+`PYRE_WALKABORT_OFF`: the switch keeps the unsafe arm available for diagnosis.
 
 `PYRE_GC_SIZE_AUDIT` makes `finish_alloc_in_oldgen` panic, with a captured
 backtrace, when the block it just carved is smaller than the declared size of

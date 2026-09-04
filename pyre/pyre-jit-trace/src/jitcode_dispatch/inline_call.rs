@@ -768,14 +768,16 @@ impl std::fmt::Display for DescentDecline {
     }
 }
 
-/// Restore the scan's verdict as a decline: `PYRE_FBW_DESCENT_SCAN_STATIC=1`
-/// refuses a descent the scan objects to, instead of attempting it once and
-/// answering from what the attempt did.
+/// Kill switch for the scan above: `PYRE_FBW_DESCENT_SCAN_OFF=1` lets the
+/// descent run into the symbolic call and abort there instead of declining
+/// before it starts.
 ///
-/// The scan's own grading is why this is opt-in rather than the default: over
-/// the 561 `__pyre_wrap_*` gateway wrappers, 448 of the 487 it declines block
-/// on a call no complete path through the descent executes.  It is a static
-/// answer to a dynamic question, and [`descent_denied`] asks the question.
+/// The scan is conservative — over the 561 `__pyre_wrap_*` gateway wrappers,
+/// 448 of the 487 it declines block on a call no complete path through the
+/// descent executes — but the attempted-descent rollback is not observationally
+/// neutral.  It compiles `test_pickle` writes to an empty payload and changes
+/// `test_hashlib`'s bytes argument into a string.  Keep the proven-safe answer
+/// as the default until the rollback has true MIFrame-per-frame state.
 ///
 /// The same shape and the same reason as `PYRE_WALKABORT_OFF` in `trace.rs`:
 /// which descents happen is invisible in output — a refused descent is a
@@ -783,7 +785,7 @@ impl std::fmt::Display for DescentDecline {
 /// each other needs one binary and one variable.
 fn descent_static_decline_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DESCENT_SCAN_STATIC").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DESCENT_SCAN_OFF").is_none())
 }
 
 /// Bodies whose descent was attempted and aborted, so the next call to the
@@ -803,11 +805,10 @@ fn descent_static_decline_enabled() -> bool {
 /// not yet sound: it produces a process in which one trace of a body descends
 /// and the next does not, and `synth/pickle_ctor_args` compiles a wrong loop
 /// out of that mixture (`Unpickler.load` raises `EOFError: Ran out of input`;
-/// `loops_compiled` 3 -> 66).  Neither neighbouring answer does — refusing
-/// every descent (`PYRE_FBW_DESCENT_SCAN_STATIC=1`) and attempting every one
-/// both give the right answer — so what is wrong belongs to the mixture and
-/// not to either side of it.  `PYRE_WALKABORT_OFF=1` does not change it, so
-/// the blackhole forward resume is not what carries it.
+/// `loops_compiled` 3 -> 66). Attempting every descent is independently
+/// unsound in the CPython pickle and hashlib suites, so only the static refusal
+/// is a correctness boundary today. `PYRE_WALKABORT_OFF=1` does not change the
+/// mixed failure, so the blackhole forward resume is not what carries it.
 ///
 /// Per-thread for the reason `FBW_HAZARDOUS_INLINE_DENY` is: pyre's walk
 /// state is per-thread, and an abort observed while tracing is a property of
