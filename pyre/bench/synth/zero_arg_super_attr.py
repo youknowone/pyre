@@ -41,40 +41,44 @@
 # earlier `wtf8_key_is_utf8` wall this comment used to name is gone; that one
 # moved rather than resolved anything.
 #
-# The wall has since been lifted experimentally, and what is behind it is a
-# regression that gets worse with N rather than a constant factor.  Reading
-# the firing arm means publishing `w_method_new`, which is the wall, so these
-# figures come from a throwaway binary carrying that one registration.  A/B'd
-# with `PYRE_FBW_NO_SPECIALIZE`, identical output on every arm, best of 3, on
-# base `de7e1a70159`.  Per ITERATION, so a flat column is linear:
+# The wall has since been lifted experimentally.  What was behind it was not a
+# constant factor but a regression that got worse with N, and the cause was
+# the GC root bracket: the descended body pinned 10 roots per iteration and
+# truncated none, because only `RootScope::drop` shrinks the shadow stack and
+# that is a Rust `Drop`, which the MIR lowering's `TermKind::Drop` arm erased.
+# The bracket was push-only in jitcode, so the stack grew 10 slots per
+# iteration and every collection walked all of it.
 #
-#         N        descent      fold     `PYRE_NO_JIT=1`
-#   250,000    2156 ns/it    284 ns/it    1900 ns/it
-# 1,000,000    4781 ns/it     67 ns/it    2705 ns/it
-# 2,000,000    9078 ns/it     33 ns/it    1420 ns/it
+# That arm now lowers the bracket's glue as the call it is.  Reading the
+# firing arm still means publishing `w_method_new`, which is the wall, so
+# these figures come from a throwaway binary carrying that one registration.
+# A/B'd with `PYRE_FBW_NO_SPECIALIZE`, identical output on every arm, best of
+# 3, one script and one host.  Per ITERATION, so a flat column is linear:
 #
-# The descent's total is O(N^2) while the others are linear or flat (the
-# fold's TOTAL is 0.067s at every N from 1,000,000 up).  "Slower than not
-# running the JIT at all" is therefore 1.1x at N=250,000 and 6.4x at
-# N=2,000,000 -- a property of this file's N, not of the descent.
+#                  descent           fold          `PYRE_NO_JIT=1`
+#         N     before  after     before  after     before  after
+#   250,000      3131    265        353    182       1516    860
+#   500,000      3445    169        170     91       1315    774
+# 1,000,000      4372    119         87     46       1243    730
+# 2,000,000      8009     95         45     23       1181    709
 #
-# The cause is the GC root bracket.  The descended body pins 10 roots per
-# iteration and truncates none: `pin_root` grows the shadow stack, and only
-# `RootScope::drop` shrinks it -- a Rust `Drop`, which the MIR lowering's
-# `TermKind::Drop` arm erases.  The bracket is push-only in jitcode, so the
-# stack grows 10 slots per iteration and every collection walks all of it.
-# `PYPY_GC_NURSERY=512M` moves N=2,000,000 from 18.2s to 10.0s and leaves the
-# curve rising, which is what changing the NUMBER of collections does when
-# each one still walks a growing stack.  The one real `W_Super` allocation per
-# iteration is a constant per-iteration cost and is not what bends the curve.
+# "before" is `c827bea5aaa`, "after" is `7d57e55a2dc` with the close emitted.
+# The two binaries do not share a base, so the fold and `PYRE_NO_JIT` columns
+# are the free control: the base moved them by at most 2.0x, and no base bump
+# turns a rising column into a falling one.  The descent's total is now 0.049s
+# fixed plus 71ns per iteration, holding to within 0.5% across the four N, and
+# "slower than not running the JIT at all" is gone -- at N=2,000,000 it is
+# 7.4x faster than `PYRE_NO_JIT=1` where it had been 6.8x slower.
 #
-# It is not deopt: both arms report `loops_aborted=0 bridges_compiled=0
-# guard_failures=1`, and `MAJIT_GUARD_CENSUS` reads `distinct=2 total=3` on
-# the firing arm against `distinct=1 total=1` on the fold's.  `MAJIT_LOG_OPT`
-# measures 525 ops / 102 guards against the fold's 72 / 18, with 48 residual
-# calls per iteration where the fold has none, 32 of them the open half of
-# that unclosed bracket.  The gate comment above
-# `try_walker_orthodox_load_super_attr` carries the full reading.
+# It is not deopt, and never was: both arms report `loops_compiled=2
+# loops_aborted=0 bridges_compiled=0 guard_failures=1` with
+# `MAJIT_GUARD_CENSUS` at `distinct=1 total=1` on each.  `MAJIT_LOG_OPT`
+# measures 528 ops / 101 guards against the fold's 72 / 18, with 52 residual
+# calls per iteration where the fold has none, 36 of them the bracket -- four
+# opens and four closes now, not four opens alone.  The gate comment above
+# `try_walker_orthodox_load_super_attr` carries the full reading, including
+# why the wall stays even though the curve no longer bends: at this site the
+# descent is still 4.2x the fold, and the gate consults it first.
 #
 # `try_walker_specialize_load_super_attr` consults the descent first and
 # returns on success, so a firing descent can take a site away from the fold
