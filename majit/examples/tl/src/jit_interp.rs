@@ -825,13 +825,11 @@ mod tests {
     /// the seam resolves its token through `get_assembler_token` →
     /// `compile_tmp_callback`, which needs `jitdriver_sd.portal_runner_adr`.
     /// This crate installs its driver through the `#[jit_interp]` macro, which
-    /// has no hook for one, so the field stays 0 in violation of
-    /// `register_jitdriver_sd`'s documented invariant; the `debug_assert!`
-    /// fires, `run_to_end`'s `catch_unwind` turns it into an abort that does
-    /// not roll back what the seam already did, and
-    /// `jit_recursive_call_matches_interp` reads a stack with `stackpos` 0.
-    /// Wiring a `tl` portal runner is the prerequisite for either repair, and
-    /// it is what makes this probe worth re-measuring.
+    /// has no hook for one, so the field stays 0.  The production recursive
+    /// target resolver therefore declines before `compile_tmp_callback` rather
+    /// than synthesizing a callback whose funcbox would contain address zero.
+    /// Wiring a `tl` portal runner remains the prerequisite for compiling this
+    /// edge, and it is what makes this probe worth re-measuring.
     #[test]
     fn jit_portal_call_in_loop_body_blocks_tracing() {
         let (control_got, control, ..) = compile_probe(&sum_bytecode(), 500);
