@@ -1908,16 +1908,8 @@ pub fn standard_exc_instance(kind: ExcKind) -> PyObjectRef {
 /// `subclassrange_{min,max}` check (`rclass.py ll_issubclass`) matches
 /// every subclass without pointer-identity coupling.
 ///
-/// Stamped ranges are a startup precondition, not something this predicate
-/// establishes.  `rclass.py` assigns `subclassrange_min` at rtyper time, so
-/// `ll_isinstance` has no gate upstream either.  Here they are written by
-/// whichever full initializer the embedder runs -- `pyre_interpreter::
-/// typedef::init_typeobjects` or `pyre_jit::eval::build_gc`'s
-/// `write_subclass_ranges` -- both before the first Python frame.  Against an
-/// unstamped hierarchy every range reads `0..0` and this answers false for
-/// everything, real exceptions included; `pyre-object`'s own test binary is
-/// the one caller population that has no such initializer, and it seeds
-/// itself (`seed_subclass_ranges`).
+/// Subclass ranges are stamped by interpreter/JIT startup before Python runs,
+/// matching RPython's rtyper-time initialization.
 ///
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
@@ -2191,13 +2183,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
 mod tests {
     use super::*;
 
-    /// `pyre-object` cannot reach `init_typeobjects` -- that lives in the
-    /// crate which depends on this one -- and its test binary never runs
-    /// `build_gc`, so nothing stamps `subclassrange_{min,max}` here.  Left
-    /// unstamped every range reads `0..0` and `ll_isinstance` answers false
-    /// for every object.  Each case that needs a class answer seeds for
-    /// itself: libtest schedules the cases concurrently in one process, so
-    /// one seeding does serve all, but the order is not guaranteed.
+    // The standalone pyre-object test binary does not run interpreter startup.
     fn seed_subclass_ranges() {
         crate::pyobject::ensure_object_subclass_ranges_initialized();
     }

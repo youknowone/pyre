@@ -620,10 +620,7 @@ fn lower_result_exc_returns_inner(
         // be dropped and the JIT would raise earlier than the interpreter.
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
-        // call otherwise.  The one admitted exception is the root bracket's
-        // close, which is the shared epilogue every return path crosses —
-        // see [`forwards_to_returnblock_past_bracket_closes`] for why
-        // bypassing it costs a published slot rather than an answer.
+        // call otherwise. RootScope closes are harmless shared epilogues.
         let forward_err: Option<String> = if is_err {
             forwards_to_returnblock_past_bracket_closes(graph, bi, &ctor_var)
                 .err()
@@ -2100,20 +2097,8 @@ fn verify_drain_reraise_returns_err_payload(
         "reraise",
         name,
     )?;
-    // The shell flows to `returnblock` by a tail forward: block `R` deletes this
-    // whole reraise tail and substitutes an unconditional `raise vb`, so the arm
-    // must be an unconditional `return Err(e)` — a single exit, no exitswitch,
-    // only alias-hop blocks en route.  Those two requirements are what the
-    // substitution rests on, and `forwards_to_returnblock_inner` enforces them
-    // whichever variant is asked: a conditional tail (`if flag { return Err(e) }
-    // else { … }`) is rejected by the `exitswitch` arm, not by the operations
-    // test.  So the tolerant variant is the right one here for the reason it
-    // documents — the drain's `return Err(e)` reaches `returnblock` only through
-    // the function's shared epilogue, the block that closes the `push_roots`
-    // bracket, and demanding that block be *empty* declines every drain in a
-    // bracketed function.  Bypassing the close leaves a root-stack slot
-    // published on the raise path until an enclosing bracket retires it; the
-    // strict property still holds for every other operation.
+    // This rewrite still requires one unconditional exit; only the shared
+    // RootScope-close epilogue may carry an operation.
     if forwards_to_returnblock_past_bracket_closes(graph, reraise_target, &outer).is_ok() {
         Ok(())
     } else {
@@ -2822,23 +2807,9 @@ fn forwards_to_returnblock(
     forwards_to_returnblock_inner(graph, block, var, false)
 }
 
-/// [`forwards_to_returnblock`], additionally treating a block whose every
-/// operation is the root bracket's close as empty.
-///
-/// Such a block is the function's shared epilogue: the `Drop` that ends the
-/// `push_roots` bracket, reached from every return path (the declines this
-/// admits name 2 to 29 predecessors).  The `Err` rewrite bypasses it, so the
-/// close does not run on the raise path — which is exactly what happened
-/// before the lowering emitted one at all, and the block keeps running it for
-/// its other predecessors.  A missed close is a root-stack slot left
-/// published, not a wrong answer, and it is subsumed the moment an enclosing
-/// bracket closes: `RootScope::drop` truncates to a saved *length*, so an
-/// outer guard retires every slot pushed above its own save point.
-///
-/// Nothing else is admitted.  The strict property still holds for every other
-/// operation, for the reason the caller states: `set_raise_values` replaces
-/// the producer's exit, so an op left on a bypassed block is dropped and the
-/// JIT would raise before running it.
+/// Allow only RootScope closes in otherwise-empty forwarding blocks.
+/// The rewrite bypasses that close on the raise path; an enclosing scope
+/// truncates all slots above its saved length.
 fn forwards_to_returnblock_past_bracket_closes(
     graph: &FunctionGraph,
     block: usize,

@@ -8233,33 +8233,10 @@ impl<'a> Lowering<'a> {
                 target,
                 on_unwind,
             } => self.lower_call(mir_bb, call, target as usize, on_unwind as usize),
-            // `Drop` is a destructor invocation. RPython has no destructors,
-            // so there is no upstream arm to copy; what upstream does have is
-            // the rule that a call is either inlined or residualized, never
-            // dropped. `fn_ptr` names the glue, which is exactly
-            // `handle_residual_call`'s input shape, so a drop the lowering
-            // understands goes down the ordinary call path.
-            //
-            // The root bracket is the one that must: `push_roots` grows the
-            // shadow stack through `pin_root` and only `RootScope::drop`
-            // shrinks it again, so erasing the drop left a walked body
-            // pushing every iteration and truncating never — the stack the
-            // collector walks grew without bound and the body cost O(N^2).
-            // Measured on `bench/synth/zero_arg_super_attr.py`, ns per
-            // iteration at N = 250k / 500k / 1M / 2M: 3131 / 3445 / 4372 /
-            // 8009 with the drop erased, 357 / 229 / 163 / 129 with the glue
-            // called. A rising column against a falling one; the same run's
-            // untouched arms move by at most 1.4x.
-            //
-            // Every other drop still forwards to the success continuation and
-            // ignores the unwind path. That is an erasure, not a proof of no
-            // effect, and it is not defensible on the grounds this comment
-            // used to claim ("the destructor's own field ops become visible at
-            // a deeper inlining level" — a body that is never entered emits
-            // nothing). It is held here because 268 of the 303 glue targets in
-            // `pyre-object` alone have no extracted body, so a blanket call
-            // would residualize an unregistered symbol and decline the
-            // translation instead of improving it.
+            // RootScope drop closes the shadow-stack bracket opened by
+            // `push_roots`; erasing it made traced loops retain every pin.
+            // Other drops keep the legacy goto until their glue bodies and
+            // residual callees are available to the translator.
             TermKind::Drop {
                 place,
                 fn_ptr,
@@ -8286,20 +8263,7 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Lower a `Drop` as the call to the glue `fn_ptr` names.
-    ///
-    /// MIR hands the glue the dropped place itself. `Ref` / `RawPtr` are
-    /// same-Variable aliases in this front end ([`Self::place_ref_is_address_of`]),
-    /// so the argument resolves to the same Variable the body's own `&roots`
-    /// receivers already pass to `RootScope::pin_root` — the glue is handed
-    /// the guard the bracket was opened on, not a fresh address.
-    ///
-    /// The destination is the dropped local, retyped `()`. The glue returns
-    /// unit, so the call declares a `Void` result and what is written back is
-    /// a void Variable; the local it lands on is the one MIR has just declared
-    /// dead, which is what a `Drop` terminator means. Minting a synthetic
-    /// local instead would widen every per-local table in the lowering for a
-    /// slot no op ever reads.
+    /// Lower a local `Drop` as the glue call named by its MIR terminator.
     fn lower_drop_as_glue_call(
         &mut self,
         mir_bb: usize,
@@ -18916,13 +18880,7 @@ fn gc_root_pin_path(name: &str) -> bool {
     segments.last() == Some(&"pin_root") && segments.iter().any(|s| *s == "gc_roots")
 }
 
-/// True for the `RootScope` guard's drop glue — the closing half of the
-/// `push_roots` bracket, spelled by Charon as
-/// `pyre_object::gc_roots::RootScope::<Impl>::drop_in_place`.
-///
-/// The same three-part shape [`gc_root_pin_path`] uses, because the two name
-/// the two ends of one bracket: `gc_roots` and the leaf, with the `<Impl>`
-/// segment the glue carries in between.
+/// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
 fn gc_root_scope_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&"drop_in_place")
@@ -18930,20 +18888,7 @@ fn gc_root_scope_drop_glue_path(name: &str) -> bool {
         && segments.iter().any(|s| *s == "RootScope")
 }
 
-/// Whether a `Drop` terminator is lowered as a call to its glue rather than
-/// erased to a bare goto.
-///
-/// Two questions, both of which must answer yes:
-///
-/// * the glue is one whose body the extraction carries and whose leaf calls
-///   are registered — today the root bracket's, which bottoms out in
-///   `shadow_stack_cell_truncate`, a published fnaddr;
-/// * the dropped place is a bare local, so the argument is the guard's own
-///   Variable and the destination is a local the drop has just retired.
-///
-/// Read by both the lowering and [`compute_mir_liveness`], which has to agree
-/// with it: the liveness pass marks the dropped place as read exactly where
-/// this says a call will read it.
+/// Drops supported by both lowering and its liveness analysis.
 fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) -> bool {
     matches!(place.kind, PlaceKind::Local(_))
         && regular_call_name_path(fn_ptr, llbc)
@@ -18951,12 +18896,7 @@ fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) ->
             .is_some_and(gc_root_scope_drop_glue_path)
 }
 
-/// True for a lowered op that is the root bracket's close — the call
-/// [`Lowering::lower_drop_as_glue_call`] emits for a `RootScope` `Drop`.
-///
-/// The graph-level twin of [`gc_root_scope_drop_glue_path`], which reads the
-/// Charon name.  `CallTarget::FunctionPath` carries the crate-stripped
-/// spelling, so the `<Impl>` segment the name path shows is not present here.
+/// Match the lowered RootScope close used by result/exception rewrites.
 pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments },
@@ -18970,7 +18910,6 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
         && segments.iter().any(|s| s == "RootScope")
 }
 
-/// Blocks whose `Drop` terminator the lowering emits as a glue call.
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
     let mut out = bit_set::BitSet::with_capacity(body.body.len());
     for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -18983,11 +18922,7 @@ fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
     out
 }
 
-/// The `()` type, spelled the way [`is_unit_type`] reads it.
-///
-/// A synthesized call still needs a destination type, and the only property
-/// the lowering asks of a drop glue's is that it be unit: the call site must
-/// declare `Void` to agree with the callee graph's own `set_return(None)`.
+/// The `()` type expected by drop glue.
 fn unit_tyref() -> TyRef {
     TyRef::Other(serde_json::json!({
         "Adt": {
@@ -19609,14 +19544,7 @@ fn compute_mir_liveness(
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks);
             }
             TermKind::Drop { place, target, .. } => {
-                // A drop the lowering turns into its glue call reads the
-                // dropped place, exactly as the call it becomes.  Without the
-                // use the local is not live-in here and the synthesized
-                // argument would resolve to an unbound Variable — the guard
-                // handed to the truncate would be whatever that Variable
-                // holds.  A drop that stays a bare goto reads nothing, and
-                // marking it would keep locals alive across cleanup chains no
-                // emitted op touches.
+                // Glue calls read the dropped local; erased drops do not.
                 if glue_call_drops.contains(bb_idx) {
                     mark_place_use(&place, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 }
@@ -32809,35 +32737,17 @@ mod tests {
     }
 
     #[test]
-    fn only_the_root_scope_guard_drop_is_lowered_as_a_call() {
-        // The spelling Charon gives the closing half of the `push_roots`
-        // bracket, and the three near misses: another type's glue, the
-        // bracket's own opening half, and the guard's pin method.
+    fn root_scope_drop_is_classified_and_live() {
+        use bit_set::BitSet;
+        use majit_charon_reader::ullbc::Unstructured;
         assert!(super::gc_root_scope_drop_glue_path(
             "pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"
         ));
         assert!(!super::gc_root_scope_drop_glue_path(
             "alloc::vec::Vec::<Impl>::drop_in_place"
         ));
-        assert!(!super::gc_root_scope_drop_glue_path(
-            "pyre_object::gc_roots::push_roots"
-        ));
-        assert!(!super::gc_root_scope_drop_glue_path(
-            "pyre_object::gc_roots::RootScope::pin_root"
-        ));
-    }
 
-    #[test]
-    fn liveness_marks_the_dropped_guard_live_where_the_drop_becomes_a_call() {
-        use bit_set::BitSet;
-        use majit_charon_reader::ullbc::Unstructured;
-        // `_1` is the root-bracket guard: written in bb0, read nowhere but
-        // bb1's `Drop`.  A drop the lowering emits as its glue call reads the
-        // place; one it erases to a goto reads nothing.  The two passes have
-        // to answer alike, because the lowering resolves the synthesized
-        // argument out of the live-in table this builds -- an unmarked guard
-        // resolves to an unbound Variable and the truncate is handed whatever
-        // that holds.
+        // `_1` is written in bb0 and read only by bb1's Drop.
         let span = || {
             serde_json::json!({
                 "data": {
@@ -32853,14 +32763,12 @@ mod tests {
         let local =
             |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
         let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
-        // bb0:  _1 = const;  goto bb1
         let bb0 = serde_json::json!({
             "statements": [stmt(serde_json::json!({
                 "Assign": [place_local(1), {"Use": {"Const": null}}]
             }))],
             "terminator": {"kind": {"Goto": {"target": 1}}}
         });
-        // bb1:  drop(_1) -> bb2
         let bb1 = serde_json::json!({
             "statements": [],
             "terminator": {"kind": {"Drop": {

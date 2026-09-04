@@ -790,11 +790,7 @@ pub enum TermKind {
         /// Value whose destructor runs.  The GC liveness pass needs the place
         /// so a RootScope drop can end the bracket it opened.
         place: Place,
-        /// The drop glue Charon resolved for `place`'s type.  It carries the
-        /// same `{kind, generics}` shape a `Call`'s `func` does, because a
-        /// drop *is* a call: `core::ptr::drop_in_place::<T>` monomorphized for
-        /// the dropped type.  Keeping it is what lets a consumer lower the
-        /// terminator as the call it names instead of guessing from the type.
+        /// Drop glue resolved by Charon for `place`'s type.
         fn_ptr: RegularCall,
         target: u64,
         on_unwind: u64,
