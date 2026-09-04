@@ -1375,7 +1375,19 @@ impl HeapCache {
         // aggressive arm).  Pyre's `is_call()` is the broader
         // `_CALL_FIRST..=_CALL_LAST` range, so use the narrow
         // `is_plain_call()` predicate to mirror upstream's enumeration.
+        // `CALL_PURE_*` reaches here spelled as itself, where upstream would
+        // still be holding the plain `CALL_*` it recorded:
+        // `MIFrame.execute_varargs` (pyjitpl.py) records the residual through
+        // `execute_and_record_varargs(rop.CALL_*)` -- which is what runs
+        // `invalidate_caches` -- and only then does
+        // `record_result_of_call_pure` rewrite the opcode to `CALL_PURE_*`.
+        // So the elidable early-return below is on upstream's path for exactly
+        // these calls, and gating it on `is_plain_call` alone drops an
+        // `EF_ELIDABLE_CANNOT_RAISE` residual onto the blanket
+        // `reset_keep_likely_virtuals`, which bumps `head_version` and voids
+        // every box's class and nullity knowledge mid-trace.
         if opnum.is_plain_call()
+            || opnum.is_call_pure()
             || opnum.is_call_loopinvariant()
             || opnum.is_cond_call_value()
             || opnum == OpCode::CondCallN
