@@ -35,6 +35,10 @@ pub(crate) struct ResultMapErrSite {
     pub mapped_err_ty: ValueType,
     pub mapped_err_class_root: Option<String>,
     pub args_tuple_suffix: String,
+    /// True only when every captured field recursively needs no destructor.
+    /// Other closure environments stay on the fail-closed path until MIR Drop
+    /// lowering can preserve their conditional destruction on the Ok arm.
+    pub closure_env_is_trivially_dropless: bool,
 }
 
 pub(crate) fn rewire_result_map_err_sites(
@@ -49,6 +53,11 @@ pub(crate) fn rewire_result_map_err_sites(
 
 fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), String> {
     let name = graph.name.clone();
+    if !site.closure_env_is_trivially_dropless {
+        return Err(format!(
+            "{name}: Result::map_err closure captures values whose Ok-arm destruction is not lowered"
+        ));
+    }
     let a = graph
         .blocks
         .iter()
@@ -77,19 +86,42 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
         } if name == "map_err" && args.len() == 2 => (args[0].clone(), args[1].clone()),
         other => return Err(format!("{name}: recorded map_err site changed: {other:?}")),
     };
-    let [exit] = graph.blocks[a].exits.as_slice() else {
-        return Err(format!("{name}: Result::map_err block has multiple exits"));
+    // When the mapped Result is consumed by `?`, result_exc runs first and
+    // changes this call block to LastException exits.  The map_err rewrite
+    // then completes that same decision: receiver Ok forwards its payload to
+    // the normal edge, receiver Err calls the mapper and raises the mapped
+    // value.  A plain map_err consumer keeps the value-encoded Result arms.
+    let exception_lowered = matches!(
+        graph.blocks[a].exitswitch,
+        Some(crate::model::ExitSwitch::LastException)
+    );
+    let saved_exit = if exception_lowered {
+        if graph.blocks[a].exits.len() != 2 {
+            return Err(format!(
+                "{name}: Result::map_err LastException block does not have two exits"
+            ));
+        }
+        graph.blocks[a]
+            .exits
+            .iter()
+            .find(|exit| exit.exitcase.is_none())
+            .cloned()
+            .ok_or_else(|| format!("{name}: Result::map_err has no normal exception edge"))?
+    } else {
+        let [exit] = graph.blocks[a].exits.as_slice() else {
+            return Err(format!("{name}: Result::map_err block has multiple exits"));
+        };
+        if graph.blocks[a].exitswitch.is_some()
+            || exit.exitcase.is_some()
+            || exit.last_exception.is_some()
+            || exit.last_exc_value.is_some()
+        {
+            return Err(format!(
+                "{name}: Result::map_err block exit is not a plain goto"
+            ));
+        }
+        exit.clone()
     };
-    if graph.blocks[a].exitswitch.is_some()
-        || exit.exitcase.is_some()
-        || exit.last_exception.is_some()
-        || exit.last_exc_value.is_some()
-    {
-        return Err(format!(
-            "{name}: Result::map_err block exit is not a plain goto"
-        ));
-    }
-    let saved_exit = exit.clone();
     let target = saved_exit.target;
     let mut carried = Vec::new();
     for arg in &saved_exit.args {
@@ -122,14 +154,18 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
         site.ok_ty.clone(),
     );
     let ok_payload = emit_narrow(graph, ok_block, ok_payload, &site.ok_class_root);
-    let ok_result = emit_sum_variant(
-        graph,
-        ok_block,
-        &site.result_owner,
-        "Ok",
-        0,
-        Some((&site.result_ok_owner, ok_payload, site.ok_ty.clone())),
-    );
+    let ok_result = if exception_lowered {
+        ok_payload
+    } else {
+        emit_sum_variant(
+            graph,
+            ok_block,
+            &site.result_owner,
+            "Ok",
+            0,
+            Some((&site.result_ok_owner, ok_payload, site.ok_ty.clone())),
+        )
+    };
     let ok_args = reproduce_exit_args(
         &saved_exit,
         &site.result_var,
@@ -166,23 +202,27 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultMapErrSite) -> Result<(), 
         &site.args_tuple_suffix,
     );
     let mapped = emit_narrow(graph, err_block, mapped, &site.mapped_err_class_root);
-    let err_result = emit_sum_variant(
-        graph,
-        err_block,
-        &site.result_owner,
-        "Err",
-        1,
-        Some((&site.result_err_owner, mapped, site.mapped_err_ty.clone())),
-    );
-    let err_args = reproduce_exit_args(
-        &saved_exit,
-        &site.result_var,
-        &err_result,
-        &err_sources,
-        &err_inputs,
-        &name,
-    )?;
-    close_goto_mixed(graph, err_block, target, err_args);
+    if exception_lowered {
+        graph.set_raise_values(err_block, mapped.clone(), mapped);
+    } else {
+        let err_result = emit_sum_variant(
+            graph,
+            err_block,
+            &site.result_owner,
+            "Err",
+            1,
+            Some((&site.result_err_owner, mapped, site.mapped_err_ty.clone())),
+        );
+        let err_args = reproduce_exit_args(
+            &saved_exit,
+            &site.result_var,
+            &err_result,
+            &err_sources,
+            &err_inputs,
+            &name,
+        )?;
+        close_goto_mixed(graph, err_block, target, err_args);
+    }
 
     let a_id = graph.blocks[a].id;
     graph.blocks[a].operations.truncate(call_idx);
@@ -257,7 +297,7 @@ mod tests {
         graph.set_return(join, None);
         graph.set_goto(entry, join, vec![result.clone()]);
 
-        let site = ResultMapErrSite {
+        let mut site = ResultMapErrSite {
             result_var: result,
             receiver_owner: "core::result::Result<i64,str>".into(),
             receiver_ok_owner: "core::result::Result<i64,str>::Ok".into(),
@@ -273,7 +313,18 @@ mod tests {
             mapped_err_ty: ValueType::Ref(Some("Error".into())),
             mapped_err_class_root: Some("Error".into()),
             args_tuple_suffix: "<str>".into(),
+            closure_env_is_trivially_dropless: false,
         };
+        assert_eq!(rewire_result_map_err_sites(&mut graph, &[site.clone()]), 0);
+        assert!(graph.blocks[entry.0].operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                    if name == "map_err"
+            )
+        }));
+
+        site.closure_env_is_trivially_dropless = true;
         assert_eq!(rewire_result_map_err_sites(&mut graph, &[site]), 1);
 
         let calls: Vec<&CallTarget> = graph

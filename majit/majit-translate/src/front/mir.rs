@@ -2534,6 +2534,16 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     let result_exc_ok_is_unit = result_exc_callee
         && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
+        if let Some(site) = lo
+            .result_map_err_sites
+            .iter()
+            .find(|site| !site.closure_env_is_trivially_dropless)
+        {
+            return Err(LowerError::Unsupported(format!(
+                "{}: Result::map_err closure {} captures values, but the Ok-arm destructor glue is not lowered",
+                lo.graph.name, site.call_once_owner
+            )));
+        }
         if !lo.result_exc_call_results.is_empty()
             || !lo.option_ok_or_else_try_sites.is_empty()
             || !lo.result_map_err_sites.is_empty()
@@ -15583,6 +15593,7 @@ impl<'a> Lowering<'a> {
         let result_ok_owner = Self::tagged_pair_payload_owner(dest_decl, &result_owner, 0)?;
         let result_err_owner = Self::tagged_pair_payload_owner(dest_decl, &result_owner, 1)?;
         let env_decl = self.llbc.type_by_id(self.tyref_ref_adt_def_id(env_ty?)?)?;
+        let closure_env_is_trivially_dropless = self.type_decl_is_trivially_dropless(env_decl, 0);
 
         Some(crate::front::result_map_err::ResultMapErrSite {
             result_var: result_var.clone(),
@@ -15600,6 +15611,75 @@ impl<'a> Lowering<'a> {
             mapped_err_ty: tyref_enum_payload_value_type(&dest_err, self.llbc),
             mapped_err_class_root: enum_payload_instance_class_root(&dest_err, self.llbc),
             args_tuple_suffix: payload_tuple_suffix(&recv_err, self.llbc),
+            closure_env_is_trivially_dropless,
+        })
+    }
+
+    /// Conservative `needs_drop::<ClosureEnv>() == false` projection for the
+    /// compiler-generated closure types consumed by `Result::map_err`.
+    fn type_decl_is_trivially_dropless(&self, decl: &TypeDecl, depth: usize) -> bool {
+        if depth > 16 || self.type_decl_has_explicit_drop(decl.def_id) {
+            return false;
+        }
+        match &decl.kind {
+            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields
+                .iter()
+                .all(|field| self.tyref_is_trivially_dropless(&field.ty, depth + 1)),
+            TypeDeclKind::Enum(variants) => variants.iter().all(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .all(|field| self.tyref_is_trivially_dropless(&field.ty, depth + 1))
+            }),
+            TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => false,
+        }
+    }
+
+    fn tyref_is_trivially_dropless(&self, ty: &TyRef, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let Some(node) = tyref_node(ty, self.llbc) else {
+            return false;
+        };
+        if node.get("Literal").is_some()
+            || node.get("Ref").is_some()
+            || node.get("RawPtr").is_some()
+            || node.get("FnDef").is_some()
+            || node.get("FnPtr").is_some()
+        {
+            return true;
+        }
+        let Some(def_id) = strip_ty_wrappers(node, self.llbc).and_then(adt_node_def_id) else {
+            return false;
+        };
+        self.llbc
+            .type_by_id(def_id)
+            .is_some_and(|decl| self.type_decl_is_trivially_dropless(decl, depth + 1))
+    }
+
+    fn type_decl_has_explicit_drop(&self, def_id: u64) -> bool {
+        self.llbc.trait_impls_raw().iter().any(|impl_row| {
+            let Some(impl_trait) = impl_row.get("impl_trait") else {
+                return false;
+            };
+            let Some(trait_id) = impl_trait.get("id").and_then(serde_json::Value::as_u64) else {
+                return false;
+            };
+            if self
+                .llbc
+                .trait_by_id(trait_id)
+                .is_none_or(|decl| decl.item_meta.name_path() != "core::ops::drop::Drop")
+            {
+                return false;
+            }
+            impl_trait
+                .get("generics")
+                .and_then(|generics| generics.get("types"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|types| types.first())
+                .and_then(|owner| resolve_tyexpr_to_adt_def_id_free(self.llbc, owner))
+                == Some(def_id)
         })
     }
 
