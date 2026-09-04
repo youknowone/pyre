@@ -1762,7 +1762,14 @@ enum CallerOperandSlots {
 /// replaying the loop from its entry. `LOAD_ATTR` / `STORE_ATTR` are the
 /// attribute-access half of that — a property accessor, a `__getattr__` hook
 /// or a descriptor `__get__` body is reached from one of them, never from a
-/// Python-level CALL.
+/// Python-level CALL.  `FORMAT_WITH_SPEC` is the same half for `__format__`:
+/// the walker route that inlines a user `__format__` body
+/// (`try_walker_inline_format`) reaches this with the f-string opcode as the
+/// caller instruction, and with no arm here every one of those bodies passed
+/// each of that route's own screens and then lost the caller image, so the
+/// body stayed a residual call.  FORMAT_SIMPLE has no such route yet (its
+/// residual carries no spec operand to hand the two-parameter dunder), so it
+/// is not listed.
 ///
 /// CALL_KW is here for the opposite reason: it IS a Python-level call, and
 /// without an arm the seeded inline had no caller image for one, so every
@@ -1806,9 +1813,14 @@ fn caller_operand_slots<Sym: WalkSym>(
         // `[lhs, rhs]`, and `[value, owner]` for the attribute store whose
         // setter body is the callee — `store_attr_cached` pops the owner
         // first, so `value` is the deeper of the two.
+        //
+        // `FORMAT_WITH_SPEC` has the same shape: `format_with_spec`
+        // (`eval.rs`) pops the spec and then the value, so `value` — the
+        // receiver whose `__format__` is dispatched — is the deeper one.
         pyre_interpreter::Instruction::BinaryOp { .. }
         | pyre_interpreter::Instruction::CompareOp { .. }
-        | pyre_interpreter::Instruction::StoreAttr { .. } => 2,
+        | pyre_interpreter::Instruction::StoreAttr { .. }
+        | pyre_interpreter::Instruction::FormatWithSpec => 2,
         other => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[caller-operand-shape-absent] instruction={other:?} py_pc={py_pc}");
