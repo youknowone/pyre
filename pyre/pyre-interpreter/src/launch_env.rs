@@ -38,6 +38,11 @@ pub struct LaunchFlags {
     /// Read only on Windows, the only platform whose `PyPreConfig` carries it,
     /// and left false everywhere else.
     pub legacy_windows_fs_encoding: bool,
+    /// CPython's PEP 528 compatibility switch.  PyPy owns standard-stream
+    /// construction in `app_main.create_stdio`; on Windows the 3.14-visible
+    /// contract additionally requires this environment flag to keep those
+    /// streams on `_io.FileIO` instead of `_io._WindowsConsoleIO`.
+    pub legacy_windows_stdio: bool,
     /// CPython 3.14 `code_debug_ranges == 0`, selected by either
     /// `-X no_debug_ranges` or the PYTHONNODEBUGRANGES presence flag.
     pub no_debug_ranges: bool,
@@ -120,6 +125,7 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
     "PYTHONUTF8",
     "PYTHONWARNDEFAULTENCODING",
     "PYTHONLEGACYWINDOWSFSENCODING",
+    "PYTHONLEGACYWINDOWSSTDIO",
     "PYTHONWARNINGS",
     "PYTHONIOENCODING",
     "PYTHONNODEBUGRANGES",
@@ -319,6 +325,15 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
             &flags,
             flags.legacy_windows_fs_encoding,
             "PYTHONLEGACYWINDOWSFSENCODING",
+        );
+        // [3.14-spec] `CmdLineTest.test_python_legacy_windows_stdio` observes
+        // the raw standard-stream type in a fresh console.  PyPy's
+        // `app_main.create_stdio` remains the owner of stream construction;
+        // only CPython's compatibility flag is folded into that decision.
+        flags.legacy_windows_stdio = fold_int_flag(
+            &flags,
+            flags.legacy_windows_stdio,
+            "PYTHONLEGACYWINDOWSSTDIO",
         );
     }
     flags.utf8_mode = Some(resolve_utf8_mode(&flags)?);

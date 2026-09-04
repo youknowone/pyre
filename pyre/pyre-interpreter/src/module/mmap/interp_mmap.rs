@@ -1738,10 +1738,20 @@ fn mmap_new_object(
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(cls);
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let obj = W_MMap::allocate_stable(W_MMap {
+    // PyPy `mmap_new` / `W_MMap.__init__` creates the wrapper through
+    // `space.allocate_instance(W_MMap, w_subtype)`: it is an ordinary young
+    // GC object, not a non-moving side owner.  That placement is observable
+    // on Windows because the lightweight destructor closes the mapping
+    // section that otherwise prevents a mapped file from being truncated or
+    // unlinked.  The native mapping itself lives in the stable `Box` behind
+    // `backend`; no address derived from this movable wrapper is retained.
+    let pytype = unsafe {
+        &*<W_MMap as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE
+    };
+    let obj = pyre_object::lltype::malloc_typed_managed(W_MMap {
         ob: pyre_object::PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+            ob_type: pytype,
+            w_class: pyre_object::pyobject::get_instantiate(pytype),
         },
         map: 0,
         storage: std::ptr::null_mut(),
@@ -1751,10 +1761,17 @@ fn mmap_new_object(
         mode: mode as i64,
         offset,
         exports: 0,
-    });
-    crate::typedef::tag_subclass_instance(obj, unsafe {
-        pyre_object::gc_roots::shadow_stack_get(cls_slot)
-    })
+    }) as pyre_object::PyObjectRef;
+    // `tag_subclass_instance` can allocate while it installs mapdict state;
+    // reload the movable wrapper through the same root bracket that protects
+    // `cls` across the allocation above.
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    crate::typedef::tag_subclass_instance(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+    );
+    pyre_object::gc_roots::shadow_stack_get(obj_slot)
 }
 
 // `interp_mmap.py:55-130 mmap_new` / CPython 3.14's `trackfd` addition.

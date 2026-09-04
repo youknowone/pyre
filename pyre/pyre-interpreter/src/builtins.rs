@@ -21015,6 +21015,23 @@ fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate:
 /// choose exactly one buffered class, and only then add the text wrapper.  In
 /// particular, binary unbuffered I/O returns that raw stream.
 pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_open_impl(args, true)
+}
+
+/// Standard-stream entry to PyPy `_io.open`, retaining the same construction
+/// while allowing CPython's Windows legacy-stdio compatibility flag to bypass
+/// the console raw class for these three streams only.
+pub(crate) fn builtin_open_stdio(
+    args: &[PyObjectRef],
+    allow_windows_console: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    builtin_open_impl(args, allow_windows_console)
+}
+
+fn builtin_open_impl(
+    args: &[PyObjectRef],
+    allow_windows_console: bool,
+) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
     // Every declared slot binds before the unrecognized keywords are
     // reported, so a call missing `file` names `file`.
@@ -21224,14 +21241,19 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     let (raw_type, console) = {
         let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
-        if crate::module::_io::winconsoleio::pyio_get_console_type(file) != '\0' {
+        if allow_windows_console
+            && crate::module::_io::winconsoleio::pyio_get_console_type(file) != '\0'
+        {
             (crate::module::_io::windows_console_io_type(), true)
         } else {
             (crate::module::_io::fileio_type(), false)
         }
     };
     #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
-    let (raw_type, console) = (crate::module::_io::fileio_type(), false);
+    let (raw_type, console) = {
+        let _ = allow_windows_console;
+        (crate::module::_io::fileio_type(), false)
+    };
     let raw = crate::call::call_function_impl_result(
         raw_type,
         &[
