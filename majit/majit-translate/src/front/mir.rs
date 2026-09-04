@@ -2536,6 +2536,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
         if !lo.result_exc_call_results.is_empty()
             || !lo.option_ok_or_else_try_sites.is_empty()
+            || !lo.result_map_err_sites.is_empty()
             || result_exc_callee
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
@@ -2593,9 +2594,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 static_addrs.error_carrier,
             )
         };
-        let mut result_exc_rewritten = 0usize;
+        let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
+            &mut lo.graph,
+            &lo.result_map_err_sites,
+        );
         if result_exc_callee {
-            result_exc_rewritten = crate::front::result_exc::lower_result_exc_returns(
+            crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
                 tail_forwarded_returns,
                 static_addrs.error_carrier,
@@ -2705,9 +2709,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // call sites to receive the unwrapped value.  Lower what the fold
         // produced, so the two halves of the one decision agree again.
         if result_exc_callee && (checked_arith_rewritten > 0 || checked_arith_uint_rewritten > 0) {
+            // This is a new validation pass over the shells the checked-arith
+            // rewrites just created.  Earlier tail-forwards and rewritten
+            // returns cannot certify these new returns: if none of them has a
+            // supported shape, the callee must decline instead of exposing a
+            // mixture of unwrapped values and Result shells to its callers.
             crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
-                tail_forwarded_returns + result_exc_rewritten,
+                0,
                 static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
@@ -2926,6 +2935,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || option_ok_or_else_try_rewritten > 0
+            || result_map_err_rewritten > 0
             || next_rewritten > 0
             || checked_arith_rewritten > 0
             || checked_arith_uint_rewritten > 0
@@ -3533,6 +3543,10 @@ struct Lowering<'a> {
     /// not itself a translated scoped callee, so its `Result` shell must be
     /// removed together with the Option select.
     option_ok_or_else_try_sites: Vec<crate::front::result_exc::OptionOkOrElseTrySite>,
+    /// `Result::map_err(result, closure)` sites lowered to an explicit
+    /// Ok/Err closure-select before the exception-link pass consumes the
+    /// newly built result shells.
+    result_map_err_sites: Vec<crate::front::result_map_err::ResultMapErrSite>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.  The paired [`ValueType`] is the
@@ -3889,6 +3903,7 @@ impl<'a> Lowering<'a> {
             string_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
             option_ok_or_else_try_sites: Vec::new(),
+            result_map_err_sites: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
             checked_arith_ok_or_else_sites: Vec::new(),
@@ -12288,6 +12303,26 @@ impl<'a> Lowering<'a> {
         {
             self.is_none_sites.push(site);
         }
+        // `Result::map_err(result, closure)` is a foreign core combinator.
+        // Record the concrete receiver/result instantiations while their MIR
+        // types are available; the post-pass restores the ordinary Ok/Err
+        // diamond before exceptiontransform-style Result lowering runs.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && name == "map_err"
+            && let Some(site) = self.recognize_result_map_err_site(
+                first_arg_ty.as_ref(),
+                second_arg_ty.as_ref(),
+                &call.dest.ty,
+                &result_var,
+            )
+        {
+            self.result_map_err_sites.push(site);
+        }
         // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, closure)` sites
         // for the discriminant closure-select `front::option_closure_select`
         // synthesizes.  All three are Opaque (foreign `core`) with the `Option`
@@ -15518,6 +15553,58 @@ impl<'a> Lowering<'a> {
             payload_ty,
             error_ty,
             niche: self.tyref_is_niche_option_ptr(recv_ty),
+        })
+    }
+
+    /// Resolve `Result<T, E>::map_err(result, closure) -> Result<T, F>` into
+    /// the owners and payload types needed by `front::result_map_err`.
+    fn recognize_result_map_err_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        env_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::result_map_err::ResultMapErrSite> {
+        let recv_ty = recv_ty?;
+        let recv_ok = crate::front::result_exc::tyref_result_ok(recv_ty, self.llbc)?;
+        let recv_err = crate::front::result_exc::tyref_result_err(recv_ty, self.llbc)?;
+        let dest_ok = crate::front::result_exc::tyref_result_ok(dest_ty, self.llbc)?;
+        let dest_err = crate::front::result_exc::tyref_result_err(dest_ty, self.llbc)?;
+
+        let recv_decl = self.llbc.type_by_id(self.tyref_adt_def_id(recv_ty)?)?;
+        let dest_decl = self.llbc.type_by_id(self.tyref_adt_def_id(dest_ty)?)?;
+        let receiver_owner = format!(
+            "{}{}",
+            recv_decl.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+        );
+        let result_owner = format!(
+            "{}{}",
+            dest_decl.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let receiver_ok_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 0)?;
+        let receiver_err_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 1)?;
+        let result_ok_owner = Self::tagged_pair_payload_owner(dest_decl, &result_owner, 0)?;
+        let result_err_owner = Self::tagged_pair_payload_owner(dest_decl, &result_owner, 1)?;
+        let env_decl = self.llbc.type_by_id(self.tyref_ref_adt_def_id(env_ty?)?)?;
+
+        Some(crate::front::result_map_err::ResultMapErrSite {
+            result_var: result_var.clone(),
+            receiver_owner,
+            receiver_ok_owner,
+            receiver_err_owner,
+            result_owner,
+            result_ok_owner,
+            result_err_owner,
+            call_once_owner: env_decl.item_meta.name_path(),
+            ok_ty: tyref_enum_payload_value_type(&recv_ok, self.llbc),
+            ok_class_root: enum_payload_instance_class_root(&dest_ok, self.llbc),
+            err_ty: tyref_enum_payload_value_type(&recv_err, self.llbc),
+            err_class_root: enum_payload_instance_class_root(&recv_err, self.llbc),
+            mapped_err_ty: tyref_enum_payload_value_type(&dest_err, self.llbc),
+            mapped_err_class_root: enum_payload_instance_class_root(&dest_err, self.llbc),
+            args_tuple_suffix: payload_tuple_suffix(&recv_err, self.llbc),
         })
     }
 
@@ -23937,6 +24024,44 @@ fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: &Llbc) -> String {
     // 3. return tyref_tuple_suffix of the wrapper — the same renderer the read
     //    side routes through, so the `&`-stripped leaf matches by construction.
     tyref_tuple_suffix(&TyRef::Other(wrapper), llbc)
+}
+
+/// The closure-argument tuple spelling for an already projected enum payload.
+/// Both the synthesized writer and Charon's closure `call_once` reader use
+/// `tyref_tuple_suffix`, so reference erasure and generic rendering stay
+/// identical on the two sides.
+fn payload_tuple_suffix(payload: &TyRef, llbc: &Llbc) -> String {
+    let node = match payload {
+        TyRef::Inline { value: (_, value) } | TyRef::Other(value) => value.clone(),
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(value) => value.clone(),
+            None => return String::new(),
+        },
+    };
+    let wrapper = serde_json::json!({
+        "Adt": {
+            "id": "Tuple",
+            "generics": { "types": [node] }
+        }
+    });
+    tyref_tuple_suffix(&TyRef::Other(wrapper), llbc)
+}
+
+/// Preserve a reference payload's concrete class across a synthesized enum
+/// and closure-tuple field write.  RPython derives the field repr from that
+/// class annotation (`rclass.py:InstanceRepr._setup_repr`); the register-bank
+/// [`ValueType`] alone cannot distinguish two reference classes.
+fn enum_payload_instance_class_root(payload: &TyRef, llbc: &Llbc) -> Option<String> {
+    let payload = strip_ty_indirections(tyref_node(payload, llbc)?, llbc)?;
+    if let Some(root) = raw_ptr_pointee_class_root(payload, llbc) {
+        return Some(root);
+    }
+    if let Some(root) = adt_node_class_root(payload, llbc) {
+        return Some(root);
+    }
+    let pointee = payload.as_object()?.get("Ref")?.as_array()?.get(1)?;
+    let pointee = strip_ty_wrappers(pointee, llbc)?;
+    raw_ptr_pointee_class_root(pointee, llbc).or_else(|| adt_node_class_root(pointee, llbc))
 }
 
 /// A type-argument drives a per-instantiation variant-class split unless

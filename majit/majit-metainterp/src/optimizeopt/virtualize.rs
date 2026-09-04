@@ -2799,23 +2799,6 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
                 || field_variant.is_empty())
     }
 
-    /// Whether two module paths name one item, one of them possibly having had
-    /// its crate root stripped.  Charon spells the same declaration both ways
-    /// and the front end registers both as aliases of one `StructId`, but that
-    /// build-time registry is not serialized into the generated runtime, so
-    /// compare the paths segment-wise from the leaf: `grain::vm::Vm` and
-    /// `rhai::grain::vm::Vm` agree, `a::Vm` and `b::Vm` do not.
-    fn path_alias(left: &str, right: &str) -> bool {
-        let left: Vec<&str> = left.split("::").collect();
-        let right: Vec<&str> = right.split("::").collect();
-        let (long, short) = if left.len() >= right.len() {
-            (left, right)
-        } else {
-            (right, left)
-        };
-        short.as_slice() == &long[long.len() - short.len()..]
-    }
-
     // `rclass.InstanceRepr._setup_repr` gives a sum-type variant subclass the
     // base's fields before its own, and pyre's payload enums carry the tag on
     // that base alone (`front/mir.rs`), so a variant's flattened field list
@@ -2832,10 +2815,7 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         let Some((base, _variant)) = slot.rsplit_once("::") else {
             return false;
         };
-        path_alias(
-            base,
-            majit_ir::descr::strip_generic_args(field_owner).as_ref(),
-        )
+        base == majit_ir::descr::strip_generic_args(field_owner).as_ref()
     }
 
     let owners_agree = |slot_owner: &str, field_owner: &str| {
@@ -3848,6 +3828,34 @@ mod tests {
         )
         .with_parent_descr(base_parent, 0);
         assert!(!slot_holds_field(&slot, &unrelated));
+
+        let suffix_parent = majit_ir::descr::make_size_descr(8);
+        let suffix_collision = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "b::a::E.__discriminant".to_string(),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(suffix_parent, 0);
+        let collision_slot = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "a::E::V.__discriminant".to_string(),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(variant_parent, 0);
+        assert!(
+            !slot_holds_field(&collision_slot, &suffix_collision),
+            "a suffix-related path does not prove an enum inheritance edge"
+        );
     }
 
     #[test]
