@@ -1805,12 +1805,15 @@ fn caller_operand_slots<Sym: WalkSym>(
     }
     let operand_count = match instruction {
         // `[iterable]` for GET_ITER, `[iterator]` for FOR_ITER, and `[owner]`
-        // for the attribute read whose descriptor body is the callee. The
-        // method form of `LOAD_ATTR` pushes two results but still consumes only
-        // the owner, and this depth is read before the instruction runs.
-        pyre_interpreter::Instruction::GetIter
-        | pyre_interpreter::Instruction::ForIter { .. }
-        | pyre_interpreter::Instruction::LoadAttr { .. } => 1,
+        // for the attribute read whose descriptor body is the callee.  This
+        // stack end is the instruction's semantic fallthrough depth: the
+        // method form of LOAD_ATTR replaces its owner with `(attr,
+        // self_or_null)`, so the consumed owner is two slots below that end.
+        // The plain form replaces owner with one result and stays one below.
+        pyre_interpreter::Instruction::GetIter | pyre_interpreter::Instruction::ForIter { .. } => 1,
+        pyre_interpreter::Instruction::LoadAttr { namei } => {
+            1 + usize::from(namei.get(op_arg).is_method())
+        }
         // `[lhs, rhs]`, and `[value, owner]` for the attribute store whose
         // setter body is the callee — `store_attr_cached` pops the owner
         // first, so `value` is the deeper of the two.
