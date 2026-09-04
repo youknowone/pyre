@@ -885,13 +885,22 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
     use majit_translate::model::{CallTarget, OpKind, ValueType};
 
     const CLASS_ADDR: i64 = 0x00C0_FFEE;
-    let attrs = std::collections::HashMap::from([(
-        "W_IntObject".to_string(),
-        vec![
-            ("ob_header".to_string(), ValueType::Ref(None)),
-            ("intval".to_string(), ValueType::Int),
-        ],
-    )]);
+    let attrs = std::collections::HashMap::from([
+        (
+            "ObjectHeader".to_string(),
+            vec![
+                ("ob_type".to_string(), ValueType::Ref(None)),
+                ("w_class".to_string(), ValueType::Ref(None)),
+            ],
+        ),
+        (
+            "W_IntObject".to_string(),
+            vec![
+                ("ob_header".to_string(), ValueType::Ref(None)),
+                ("intval".to_string(), ValueType::Int),
+            ],
+        ),
+    ]);
 
     let llbc = load_corpus();
 

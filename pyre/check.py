@@ -4263,7 +4263,7 @@ class Check:
 
     def _retry_sample_note(
         self, backend, measured_times, baseline_key, baseline_times,
-    ):
+    ) -> str:
         """`median N` plus the span each side's samples actually covered.
 
         The retry medians PERF_RETRY_RUNS interleaved pairs and, until this
@@ -4474,18 +4474,20 @@ class Check:
         # Ratio and memory failures do not invalidate the run's counters, so
         # keep comparing or recording the jit-stats baseline after they fail.
         failures = []
-        retry_note = ""
+        retry_notes = []
         if vs_cpython and t_cpython not in (None, "-"):
-            passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
+            passed, bound, checked_elapsed, checked_baseline, gate_retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_cpython, float(t_cpython),
                 [python3(), script], pypy_output, "cpython",
             )
+            if gate_retry_note:
+                retry_notes.append(gate_retry_note)
             if not passed:
                 detail = self._gate_fail_detail(
                     backend, "cpython", checked_elapsed, checked_baseline,
                     vs_cpython, bound,
                 )
-                suffix = f" ({retry_note})" if retry_note else ""
+                suffix = f" ({gate_retry_note})" if gate_retry_note else ""
                 failures.append(
                     (
                         f"{red('SLOWER')}  pyre {detail}{suffix}",
@@ -4494,7 +4496,7 @@ class Check:
                         f"({ratio} vs pypy)",
                     )
                 )
-            if passed and retry_note:
+            if passed and gate_retry_note:
                 elapsed = checked_elapsed
                 ratio = _ratio(elapsed, t_pypy)
 
@@ -4512,16 +4514,18 @@ class Check:
             ):
                 self.pypy_ratio_ungated.append(name)
             minimum = perf_gate_floor(vs_pypy)
-            passed, bound, checked_elapsed, checked_baseline, retry_note = self._performance_gate_passed(
+            passed, bound, checked_elapsed, checked_baseline, gate_retry_note = self._performance_gate_passed(
                 backend, script, timeout, elapsed, vs_pypy, float(t_pypy),
                 [PYPY3, script], pypy_output, "pypy", minimum,
             )
+            if gate_retry_note:
+                retry_notes.append(gate_retry_note)
             if not passed:
                 detail = self._gate_fail_detail(
                     backend, "pypy", checked_elapsed, checked_baseline,
                     vs_pypy, bound, minimum,
                 )
-                suffix = f" ({retry_note})" if retry_note else ""
+                suffix = f" ({gate_retry_note})" if gate_retry_note else ""
                 label = "FASTER" if bound == "floor" else "SLOWER"
                 failures.append(
                     (
@@ -4531,7 +4535,7 @@ class Check:
                         f"({ratio} vs pypy)",
                     )
                 )
-            if passed and retry_note:
+            if passed and gate_retry_note:
                 elapsed = checked_elapsed
                 t_pypy = checked_baseline
                 ratio = _ratio(elapsed, t_pypy)
@@ -4585,13 +4589,15 @@ class Check:
                 # denominator concern it does have is handled above, by
                 # declining the gate outright and naming the fixture in the
                 # summary rather than quietly widening the bound.
-                passed, bound, checked_elapsed, checked_baseline, retry_note = (
+                passed, bound, checked_elapsed, checked_baseline, gate_retry_note = (
                     self._performance_gate_passed(
                         backend, script, timeout, elapsed,
                         ceiling, dynasm_elapsed,
                         [self._pyre("dynasm"), script], pypy_output, "dynasm",
                     )
                 )
+                if gate_retry_note:
+                    retry_notes.append(gate_retry_note)
                 if allowed:
                     # The values the gate judged, not the first sample: a
                     # median retry is what an allowance fitted to a slow
@@ -4606,7 +4612,7 @@ class Check:
                         backend, "dynasm", checked_elapsed, checked_baseline,
                         ceiling, bound,
                     )
-                    suffix = f" ({retry_note})" if retry_note else ""
+                    suffix = f" ({gate_retry_note})" if gate_retry_note else ""
                     failures.append(
                         (
                             f"{red('SLOWER')}  pyre {detail}{suffix}",
@@ -4660,6 +4666,7 @@ class Check:
             return
 
         self._record(backend, True, name, f"{elapsed:.2f}s")
+        retry_note = "; ".join(retry_notes)
         suffix = f" ({retry_note})" if retry_note else ""
         print(f"{green('PASS')}  {elapsed:.2f}s{suffix}")
         self._append_comparison(
