@@ -19673,16 +19673,26 @@ pub(crate) unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], c
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
             memoryview_check_released(obj)?;
-            if memoryview_contiguity(obj).0 {
-                let view = pyre_object::memoryview::w_memoryview_view(obj);
-                let full = view.backing().as_bytes();
-                let off = view.offset() as usize;
-                let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
-                if off <= full.len() && len <= full.len() - off {
-                    return Ok(&full[off..off + len]);
-                }
+            if !memoryview_contiguity(obj).0 {
+                // `PyBUF_SIMPLE` asks for the bytes in address order, and a
+                // strided view cannot hand them over without copying, so the
+                // request is refused rather than answered with the wrong ones.
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+            let view = pyre_object::memoryview::w_memoryview_view(obj);
+            let full = view.backing().as_bytes();
+            let off = view.offset() as usize;
+            let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
+            if off <= full.len() && len <= full.len() - off {
+                return Ok(&full[off..off + len]);
             }
         }
+        // This is the object-space acquisition layer; public gateways that
+        // own a more specific refusal (for example mmap's `Py_buffer`
+        // converter) translate this TypeError at their boundary.
         Err(crate::PyError::type_error(
             "a bytes-like object is required",
         ))
