@@ -4511,7 +4511,8 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_i(box, fielddescr) →
             // _opimpl_getfield_gc_any_pureornot (pyjitpl.py).
-            let field_index = fielddescr.index();
+            let record_descr = self.vable_static_record_descr(&fielddescr);
+            let field_index = record_descr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 // pyjitpl.py:934-945 sanity check: run the live field
                 // load (`executor.execute`) and assert equality against
@@ -4547,7 +4548,6 @@ impl TraceCtx {
                 );
                 return (cached, cached_value);
             }
-            let record_descr = self.vable_static_record_descr(&fielddescr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox).  `resbox`
             // in RPython carries the loaded value via `BoxInt.value`;
             // pyre stamps the frontend value slot for `op` with the live
@@ -4798,7 +4798,7 @@ impl TraceCtx {
             // parent-struct-layout `FieldDescr`; a non-static-field descr passes
             // through unchanged.
             let record_descr = self.vable_static_record_descr(&fielddescr);
-            let field_index = fielddescr.index();
+            let field_index = record_descr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index)
                 && cached == value
             {
@@ -4846,13 +4846,6 @@ impl TraceCtx {
         let stored = concrete.unwrap_or(Value::Ref(majit_ir::GcRef::NO_CONCRETE));
         let overwritten = VableEntryWrite::of(self, index);
         self.set_virtualizable_entry_at(index, value, stored);
-        // Keep the heapcache consistent: if a prior nonstandard getfield
-        // cached a value for this field (e.g., before a replace_box made
-        // the OpRef match the standard_box), updating the virtualizable
-        // shadow without clearing the heapcache leaves a stale entry
-        // that the next nonstandard getfield would hit.
-        let field_index = fielddescr.index();
-        self.heapcache_setfield_cached(vable_opref, field_index, value);
         // pyjitpl.py:3446 write_boxes parity: mirror the updated
         // shadow slot back into the live virtualizable.
         self.synchronize_virtualizable();
@@ -4886,7 +4879,8 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_r(box, fielddescr) →
             // _opimpl_getfield_gc_any_pureornot (pyjitpl.py).
-            let field_index = fielddescr.index();
+            let record_descr = self.vable_static_record_descr(&fielddescr);
+            let field_index = record_descr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 // pyjitpl.py:934-945 + :938-939 sanity check (ref arm):
                 //     resvalue = executor.execute(cpu, mi, opnum, fielddescr, box)
@@ -4920,7 +4914,6 @@ impl TraceCtx {
                 );
                 return (cached, cached_value);
             }
-            let record_descr = self.vable_static_record_descr(&fielddescr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — `resbox`
             // carries `.getref_base()` payload; pair it with the
             // recorded opref so subsequent `box_value(op)` matches
@@ -5002,7 +4995,8 @@ impl TraceCtx {
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_f(box, fielddescr) →
             // _opimpl_getfield_gc_any_pureornot (pyjitpl.py).
-            let field_index = fielddescr.index();
+            let record_descr = self.vable_static_record_descr(&fielddescr);
+            let field_index = record_descr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 // pyjitpl.py:941-945 sanity check (float arm):
                 //     resvalue = executor.execute(cpu, mi, opnum, fielddescr, box)
@@ -5038,7 +5032,6 @@ impl TraceCtx {
                 );
                 return (cached, cached_value);
             }
-            let record_descr = self.vable_static_record_descr(&fielddescr);
             // pyjitpl.py:949 upd.getfield_now_known(resbox) — pair the
             // float payload with the recorded opref so subsequent
             // `box_value(op)` matches RPython's executor-returned Box.  It is

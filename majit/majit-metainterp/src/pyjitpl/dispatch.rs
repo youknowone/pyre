@@ -9647,7 +9647,7 @@ where
                     .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
                 ctx.profiler()
                     .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
-                let length_field_index = length_fielddescr.index();
+                let length_field_key = heapcache_field_key(&length_fielddescr);
                 ctx.heapcache_invalidate_caches_varargs(
                     OpCode::SetfieldGc,
                     None,
@@ -9658,7 +9658,9 @@ where
                     &[sbox_op, length_opref],
                     length_fielddescr,
                 );
-                ctx.heapcache_setfield_cached(sbox_op, length_field_index, length_opref);
+                if let Some(field_key) = length_field_key {
+                    ctx.heapcache_setfield_cached(sbox_op, field_key, length_opref);
+                }
                 if struct_ptr != 0 {
                     unsafe {
                         *((struct_ptr as *mut u8).add(length_offset) as *mut i64) = length_val
@@ -9713,14 +9715,16 @@ where
                     .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
                 ctx.profiler()
                     .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
-                let items_field_index = items_fielddescr.index();
+                let items_field_key = heapcache_field_key(&items_fielddescr);
                 ctx.heapcache_invalidate_caches_varargs(
                     OpCode::SetfieldGc,
                     None,
                     &[sbox_op, abox_op],
                 );
                 ctx.record_op_with_descr(OpCode::SetfieldGc, &[sbox_op, abox_op], items_fielddescr);
-                ctx.heapcache_setfield_cached(sbox_op, items_field_index, abox_op);
+                if let Some(field_key) = items_field_key {
+                    ctx.heapcache_setfield_cached(sbox_op, field_key, abox_op);
+                }
                 if struct_ptr != 0 {
                     unsafe { *((struct_ptr as *mut u8).add(items_offset) as *mut i64) = array_ptr };
                     if majit_gc::gc_owns_object(struct_ptr as usize) {

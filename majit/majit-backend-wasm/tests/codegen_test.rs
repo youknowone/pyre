@@ -131,6 +131,30 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
         .unwrap_or_else(|err| panic!("invalid {name}= in wasm JIT stats: {err}\n{stderr}"))
 }
 
+/// The CALL_ASSEMBLER frame allocator returns a zeroed payload, so codegen
+/// must not clear that fresh frame again.  Entry prologues separately clear
+/// the current frame's GC Ref homes; #1683 deliberately coalesces those stores
+/// into `memory.fill`, identified by their local-0 (current frame) base.
+#[track_caller]
+fn assert_no_call_assembler_frame_fill(stderr: &str) {
+    let lines: Vec<_> = stderr.lines().map(str::trim).collect();
+    for (index, line) in lines.iter().enumerate() {
+        if *line != "memory.fill" {
+            continue;
+        }
+        let is_entry_home_clear = index >= 5
+            && lines[index - 5] == "local.get 0"
+            && lines[index - 4].starts_with("i32.const ")
+            && lines[index - 3] == "i32.add"
+            && lines[index - 2] == "i32.const 0"
+            && lines[index - 1].starts_with("i32.const ");
+        assert!(
+            is_entry_home_clear,
+            "recursive CA refilled a nursery frame instead of relying on its zeroed payload:\n{stderr}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
             run via `cargo test -- --ignored` in the check.py job, which builds them"]
@@ -258,26 +282,7 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
     // `bridges_compiled=7`. Re-record these two alongside that baseline.
     assert_eq!(stat_value(&stderr, "compiles"), 8);
     assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 7);
-    let wat: Vec<_> = stderr.lines().map(str::trim).collect();
-    for (i, _) in wat
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| **line == "memory.fill")
-    {
-        // Ref-home clears are frame-relative; the forbidden nursery refill is
-        // relative to the CALL_ASSEMBLER allocation scratch local instead.
-        let frame_home_fill = i >= 5
-            && wat[i - 5] == "local.get 0"
-            && wat[i - 4].starts_with("i32.const ")
-            && wat[i - 3] == "i32.add"
-            && wat[i - 2] == "i32.const 0"
-            && wat[i - 1].starts_with("i32.const ");
-        assert!(
-            frame_home_fill,
-            "recursive CA refills a nursery that is already zeroed near:\n{}",
-            wat[i.saturating_sub(5)..=i].join("\n")
-        );
-    }
+    assert_no_call_assembler_frame_fill(&stderr);
 }
 
 #[test]
