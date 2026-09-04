@@ -779,6 +779,17 @@ pub fn stack_check() -> Result<(), PyError> {
     Ok(())
 }
 
+/// Run only [`stack_check`]'s logical Python-activation-depth half.
+///
+/// A compiled fragment already carries the backend's native-stack probe at
+/// its entry. Its guard exit still has to reproduce `PyFrame.execute_frame`'s
+/// check against `sys.getrecursionlimit()`, without paying for that native
+/// probe a second time when it enters the portal runner.
+#[inline]
+pub fn check_recursion_depth() -> Result<(), PyError> {
+    recursion_depth_check(crate::call::py_recursion_depth())
+}
+
 /// One-word residual-call ABI for [`stack_check`].
 pub extern "C" fn stack_check_jit_abi() -> i64 {
     match stack_check() {
