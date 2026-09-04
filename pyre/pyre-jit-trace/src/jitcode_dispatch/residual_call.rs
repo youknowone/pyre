@@ -8809,6 +8809,23 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 )? {
                     return Ok(inlined);
                 }
+                // `Object.descr__getattribute__` gives any other user data
+                // descriptor the same traced call shape, with the descriptor,
+                // receiver and owner type as explicit arguments.
+                if let Some(inlined) = try_walker_inline_data_descriptor_get(
+                    ctx,
+                    op,
+                    code,
+                    &r_args,
+                    call_descr,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                }
                 // The name resolves nowhere and the type defines `__getattr__`:
                 // inline the hook in place of the miss walk plus its frame.
                 if let Some(inlined) = try_walker_inline_getattr_hook(

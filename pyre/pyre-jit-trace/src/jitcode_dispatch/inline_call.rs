@@ -8975,6 +8975,119 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     Ok(inlined)
 }
 
+/// Inline the general user data-descriptor call selected by
+/// `Object.descr__getattribute__`:
+/// `get_and_call_function(w_get, w_descr, w_obj, w_type)`.
+///
+/// Unlike the exact-`property` arm, the callee is the descriptor type's
+/// ordinary Python `__get__` function and receives all three explicit
+/// arguments.  The receiver class/version pins the named descriptor lookup;
+/// the descriptor's own map/class/version pins both its data-descriptor status
+/// and the `__get__` lookup.  The descriptor and owner type are green, while
+/// the accessed object remains the caller's red operand and is threaded into
+/// the callee's distinct MIFrame.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_data_descriptor_get<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, w_descr, descr_type, descr_version_tag, descr_map, w_get)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::data_descriptor_get_fast_path(concrete_obj, &name)
+    }) else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_get) }) else {
+        return Ok(None);
+    };
+    // `get_and_call_function`'s exact-Function arm supplies precisely the
+    // descriptor, receiver and receiver type.
+    if nparams != 3 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !body_facts.exc_override_straight_line {
+        return Ok(None);
+    }
+
+    let get_const = ctx.trace_ctx.const_ref(w_get as i64);
+    let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let arg_concretes = vec![
+        ConcreteValue::Ref(w_get),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(w_descr),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(w_type),
+    ];
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+
+    // The descriptor itself is mutable through `__class__` assignment.  Its
+    // live map/class guard is therefore load-bearing even though the receiver
+    // type lookup produced a constant pointer to it.
+    walker_guard_mapdict_instance_shape(
+        ctx,
+        op.pc,
+        descr_const,
+        w_descr,
+        descr_type,
+        descr_version_tag,
+        descr_map,
+    )?;
+    let inlined = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        get_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        w_get,
+        get_const,
+        w_get,
+        arg_concretes,
+        vec![descr_const, obj, type_const],
+        vec![
+            ConcreteValue::Ref(w_descr),
+            ConcreteValue::Ref(concrete_obj),
+            ConcreteValue::Ref(w_type),
+        ],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((obj, concrete_obj, w_type, version_tag)),
+        None,
+        true,
+        false,
+        None,
+    )?;
+    if inlined.is_none() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+    }
+    Ok(inlined)
+}
+
 /// Inline the receiver type's `__getattr__` hook for an attribute the type and
 /// the instance both lack — the miss twin of [`try_walker_inline_property_get`].
 ///

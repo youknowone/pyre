@@ -2304,6 +2304,76 @@ pub unsafe fn property_get_fast_path(
     Some((w_type, version_tag, w_descr, fget))
 }
 
+/// LOAD_ATTR user-data-descriptor fast path: resolve the exact Python
+/// `__get__` call made by `Object.descr__getattribute__`, without executing it.
+///
+/// PyPy first promotes the receiver type lookup, proves that the class value
+/// is a data descriptor, then looks up `__get__` on the descriptor's own live
+/// type and calls it as `(w_descr, w_obj, w_type)`.  Return every object whose
+/// shape that decision depends on so the full-body walker can install the
+/// corresponding receiver-type, descriptor-type and descriptor-map guards
+/// before entering the Python frame.
+///
+/// A receiver with `__getattr__` declines: an `AttributeError` raised anywhere
+/// in the inlined getter would otherwise have to re-enter the outer
+/// `_handle_getattribute` fallback, which this direct LOAD_ATTR sub-walk does
+/// not yet encode.  Builtin descriptors and descriptor objects without
+/// mapdict storage likewise stay on the complete residual protocol.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn data_descriptor_get_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(
+    PyObjectRef,
+    u64,
+    PyObjectRef,
+    PyObjectRef,
+    u64,
+    MapRef,
+    PyObjectRef,
+)> {
+    let receiver_map = unsafe { mapdict_map_or_null(w_obj) };
+    if receiver_map.is_null() {
+        return None;
+    }
+    let w_type = unsafe { (*(*receiver_map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null()
+        || unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some()
+        || unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some()
+    {
+        return None;
+    }
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
+    if !unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
+        return None;
+    }
+    let descr_type = crate::typedef::r#type(w_descr)?.as_ptr();
+    let descr_version_tag = unsafe { crate::baseobjspace::w_type_version_tag(descr_type) };
+    if descr_version_tag == 0 {
+        return None;
+    }
+    let descr_map = unsafe { mapdict_map_or_null(w_descr) };
+    if descr_map.is_null() {
+        return None;
+    }
+    let w_get = unsafe { crate::baseobjspace::lookup_in_type_where(descr_type, "__get__") }?;
+    Some((
+        w_type,
+        version_tag,
+        w_descr,
+        descr_type,
+        descr_version_tag,
+        descr_map,
+        w_get,
+    ))
+}
+
 /// STORE_ATTR `property` fast path: the setter twin of
 /// [`property_get_fast_path`], returning the type, version tag, the property
 /// object, and its Python `fset` when `obj.name = value` writes a property
