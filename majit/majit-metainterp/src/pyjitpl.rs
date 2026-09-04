@@ -5558,6 +5558,14 @@ impl<M: Clone> MetaInterp<M> {
                                 green_values: &[i64]|
          -> Option<(Arc<JitCellToken>, u64)> {
             let jd = staticdata.jitdrivers_sd.get(jd_index)?.clone();
+            // `warmspot.py` installs `portal_runner_adr` before
+            // `WarmEnterState.get_assembler_token` can synthesize a temporary
+            // callback.  Macro-only drivers do not yet have that installation
+            // seam, so preserve their clean trace abort instead of letting
+            // `compile_tmp_callback` bake the absent address into `funcbox`.
+            if jd.portal_runner_adr == 0 {
+                return None;
+            }
             let spec = jd.green_args_spec();
             // Resolve to the callee's CELL key before consulting either
             // index: the token comes off the celltable and the key travels
@@ -26302,6 +26310,43 @@ mod tests {
             .expect("CALL_ASSEMBLER_I recorded");
         let call_token2 = call.with_call_descr(|cd| cd.call_target_token()).flatten();
         assert_eq!(call_token2, Some(token_number));
+    }
+
+    #[test]
+    fn recursive_target_without_a_portal_runner_declines_before_tmp_callback() {
+        // `#[jit_interp]`-installed example drivers currently have no host
+        // hook that can publish `warmspot.py`'s `ll_portal_runner` address.
+        // A non-inline recursive decision must therefore remain a clean trace
+        // abort; entering `compile_tmp_callback` would assert in debug builds
+        // and record a call to address zero in release builds.
+        let mut meta = MetaInterp::<()>::new(10);
+        {
+            let staticdata = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
+            staticdata
+                .jitdrivers_sd
+                .push(JitDriverStaticData::new(vec![], vec![]));
+            staticdata.finish_setup_descrs_for_jitdrivers(&mut meta.backend);
+        }
+        assert_eq!(meta.staticdata.jitdrivers_sd[0].portal_runner_adr, 0);
+        let action = meta.force_start_tracing(889, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        let target = meta
+            .with_trace_ctx_and_token_resolver(
+                |_ctx,
+                 _resolve,
+                 recursive_target,
+                 _decision,
+                 _exec,
+                 _exec_ref,
+                 _exec_float,
+                 _exec_void| { recursive_target(0, &[]) },
+            )
+            .expect("trace is active");
+        assert!(
+            target.is_none(),
+            "a driver without portal_runner_adr must decline before callback synthesis",
+        );
     }
 
     #[test]
