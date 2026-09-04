@@ -32,7 +32,7 @@
 # rather than twice.  That halving is this file's recorded
 # `fbw_blackhole_adopted_single_frame` 10 -> 5, with `loops_aborted` unmoved.
 #
-# Expected output: (20000, 20000, 20000)
+# Expected output: (40000, 40000, 40000)
 import sys
 
 N = 40000

@@ -11,9 +11,11 @@
 # loop is JIT-compiled: the callee's traced iteration is committed concretely
 # during recording AND re-applied at the trace->compile boundary.
 #
-# Expected: len(acc) == 2 * N. Under the bug the JIT printed 2*N + 3 (a constant
-# over-count, independent of N, present only once N crosses the compile
-# threshold), on both backends, which share the trace/resume layer.
+# Under the bug the JIT printed `len(acc)` as 2*N + 3 (a constant over-count,
+# independent of N, present only once N crosses the compile threshold), on
+# both backends, which share the trace/resume layer.
+#
+# Expected: 2 * N
 N = 3114800
 
 

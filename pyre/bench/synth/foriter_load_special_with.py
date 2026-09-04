@@ -34,4 +34,5 @@ def main():
 
 
 main()
-# Expected: 3*N + sum(i for i in range(N) if i % 10), then N
+# The line carries 3*N + sum(i for i in range(N) if i % 10), then N.
+# Expected: 720120000 40000

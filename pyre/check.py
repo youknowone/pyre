@@ -5,6 +5,7 @@ Cross-platform Python translation of pyre/check.sh.
 """
 
 import argparse
+import ast
 import difflib
 import hashlib
 import math
@@ -1952,6 +1953,156 @@ def synth_jitstats_bands(path):
     return bands if bands is not None else {}
 
 
+EXPECTED_PREFIX = "# Expected"
+
+# What an `# Expected:` claim may name. The corpus states its expectations as
+# arithmetic over the fixture's own sizes, so the evaluator has to reach the
+# aggregate builtins those use and nothing else.
+EXPECTED_BUILTINS = {
+    "abs": abs, "divmod": divmod, "float": float, "int": int, "len": len,
+    "max": max, "min": min, "range": range, "round": round, "sum": sum,
+}
+
+# The node kinds an expectation is allowed to be built from: literals, the
+# names bound above or by the fixture, calls to those names, comprehensions,
+# and arithmetic. Anything else -- an attribute, a lambda, a subscript of a
+# name the fixture did not bind -- is not an expectation, it is prose.
+_EXPECTED_NODES = (
+    ast.Expression, ast.Constant, ast.Name, ast.Load, ast.Call, ast.keyword,
+    ast.Tuple, ast.List, ast.Set, ast.Dict, ast.Starred,
+    ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.IfExp,
+    ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp, ast.comprehension,
+    ast.operator, ast.unaryop, ast.boolop, ast.cmpop,
+)
+
+
+def _expected_constants(path):
+    """The fixture's own module-level numeric constants.
+
+    An expectation is worth more when it derives from the size the fixture
+    actually runs -- `2 * N` stays true when `N` moves, and a literal does
+    not. Only plain `NAME = <number>` bindings are read; anything computed is
+    left out rather than partially evaluated.
+    """
+    constants = {}
+    try:
+        module = ast.parse(Path(path).read_text(encoding="utf-8"))
+    except SyntaxError:
+        return constants
+    for node in module.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        value = node.value
+        if isinstance(target, ast.Name) and isinstance(value, ast.Constant):
+            if isinstance(value.value, (int, float)) and not isinstance(value.value, bool):
+                constants[target.id] = value.value
+    return constants
+
+
+def _expected_value(text, constants):
+    """`text` evaluated as an expectation, or None when it is not one."""
+    try:
+        tree = ast.parse(text.strip(), mode="eval")
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, _EXPECTED_NODES):
+            return None
+        if isinstance(node, ast.Name) and node.id not in EXPECTED_BUILTINS \
+                and node.id not in constants:
+            return None
+        # `4000 ('i', 'marker')` parses as a call on a literal. Only a name
+        # can be called here, so rejecting it keeps that shape prose rather
+        # than compiling something that can only fail at eval.
+        if isinstance(node, ast.Call) and not isinstance(node.func, ast.Name):
+            return None
+    try:
+        return eval(  # noqa: S307 - the allowlist above is the guard
+            compile(tree, "<expected>", "eval"),
+            {"__builtins__": {}, **EXPECTED_BUILTINS, **constants},
+        )
+    except Exception:
+        return None
+
+
+def _expected_claims(path):
+    """The lines a fixture states its own stdout will contain.
+
+        # Expected: 200010000
+        # Expected output: (40000, 40000, 40000)
+
+    A claim whose label ends the line introduces a block, one claim per
+    following indented comment line; otherwise the following indented comment
+    lines continue the claim they follow, which is how the corpus already
+    wraps its longer literals.
+
+        # Expected output:
+        #   4000 ('i', 'marker')
+        #   4000 ('i', 'marker', 'odd_only')
+
+    Returns `(claim, line)` pairs. Every `# Expected` line yields at least one
+    claim: a line that names nothing checkable is the rot this reader exists
+    to catch, so it is reported rather than skipped.
+    """
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    claims = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        if not line.startswith(EXPECTED_PREFIX):
+            continue
+        head = line[len(EXPECTED_PREFIX):]
+        text = head.split(":", 1)[1].strip() if ":" in head else ""
+        continuation = []
+        while index < len(lines) and lines[index].startswith("#  "):
+            continuation.append(lines[index].lstrip("#").strip())
+            index += 1
+        if text:
+            claims.append((" ".join([text, *continuation]).strip(), line))
+        else:
+            claims.extend((entry, line) for entry in continuation)
+            if not continuation:
+                claims.append(("", line))
+    return claims
+
+
+def _expected_mismatches(path, output):
+    """The fixture's `# Expected` claims that its own output does not bear out.
+
+    Each claim names one whole line of stdout, matched with internal
+    whitespace collapsed so a claim may stay aligned inside its comment
+    block. A claim spelled as arithmetic ending in its own result -- the
+    `20000 * 90 = 1800000` shape the corpus uses -- is taken at that result,
+    and one spelled as an expression is evaluated against the fixture's own
+    constants.
+    """
+    claims = _expected_claims(path)
+    if not claims:
+        return []
+    printed = {" ".join(line.split()) for line in output.splitlines() if line.strip()}
+    constants = _expected_constants(path)
+    mismatches = []
+    for claim, line in claims:
+        candidates = [claim]
+        # `a = b = value`: the corpus states the arithmetic and then its
+        # result. `==` and the ordering comparisons are not that shape.
+        tail = re.split(r"(?<![=!<>])=(?!=)", claim)[-1].strip()
+        if tail != claim:
+            candidates.append(tail)
+        for candidate in candidates:
+            normalized = " ".join(candidate.split())
+            if normalized in printed:
+                break
+            value = _expected_value(candidate, constants)
+            if value is not None and str(value) in printed:
+                break
+        else:
+            mismatches.append((claim, line))
+    return mismatches
+
+
 def _synth_header_flag(path, directive, malformed):
     """Read a valueless per-fixture header flag.
 
@@ -2286,8 +2437,58 @@ def check_synthetic_headers(pattern):
     if unusable:
         report_unusable_headers(unusable)
         return 1
-    print(f"{len(paths)} synthetic fixture header(s) read, pattern={pattern!r}")
+    broken = _expected_reader_selftest()
+    for case, detail in broken:
+        print(f"{red('ERROR')}: the `# Expected` reader mis-reads {case}: {detail}")
+    empty = [(path, line) for path in paths
+             for claim, line in _expected_claims(path) if not claim.strip()]
+    for path, line in empty:
+        print(f"{red('ERROR')}: {path} states an expectation with nothing in it: {line.strip()}")
+    if broken or empty:
+        return 1
+    claims = sum(len(_expected_claims(path)) for path in paths)
+    print(
+        f"{len(paths)} synthetic fixture header(s) read, {claims} expectation(s) "
+        f"parsed, pattern={pattern!r}"
+    )
     return 0
+
+
+# `(label, comment lines, stdout, should the reader object)`. The corpus proves
+# the reader accepts what the fixtures say; only a table can prove it still
+# objects when one of them stops being true, which is the direction that lets an
+# expectation rot. Runs in `--check-headers`, which builds nothing.
+EXPECTED_READER_CASES = (
+    ("a literal", "# Expected: 200010000\n", "200010000\n", False),
+    ("a rotted literal", "# Expected: 200010000\n", "200010001\n", True),
+    ("arithmetic and its result", "# Expected: 20000 * 90 = 1800000\n", "1800000\n", False),
+    ("a rotted result", "# Expected: 20000 * 90 = 1800000\n", "1800001\n", True),
+    ("an expression over a fixture constant", "# Expected: 2 * N\nN = 7\n", "14\n", False),
+    ("a rotted expression", "# Expected: 2 * N\nN = 7\n", "15\n", True),
+    ("a block", "# Expected output:\n#   a 1\n#   b 2\n", "a 1\nb 2\n", False),
+    ("a rotted block line", "# Expected output:\n#   a 1\n#   b 2\n", "a 1\nb 3\n", True),
+    ("a wrapped literal", "# Expected output: [1,\n#    2]\n", "[1, 2]\n", False),
+    ("an aligned block line", "# Expected output:\n#   a    1\n", "a 1\n", False),
+    ("prose", "# Expected: whatever the loop settles on\n", "5\n", True),
+    ("an expectation with nothing in it", "# Expected:\n", "5\n", True),
+    ("a name the fixture never bound", "# Expected: os.sep\n", "/\n", True),
+)
+
+
+def _expected_reader_selftest():
+    """The cases `_expected_mismatches` reads wrongly, as `(label, detail)`."""
+    broken = []
+    with tempfile.TemporaryDirectory() as directory:
+        fixture = Path(directory) / "fixture.py"
+        for label, header, output, should_object in EXPECTED_READER_CASES:
+            fixture.write_text(header, encoding="utf-8")
+            objected = bool(_expected_mismatches(str(fixture), output))
+            if objected != should_object:
+                broken.append((
+                    label,
+                    "objected" if objected else "stayed silent",
+                ))
+    return broken
 
 
 # `[spec-census] fold=<label> consulted=N fired=N suppressed=N site=... parent=...`
@@ -4839,6 +5040,23 @@ class Check:
             for backend in ALL_BACKENDS:
                 if self.enabled(backend):
                     self._record(backend, False, name, "cpython/pypy output mismatch")
+                    self._append_comparison(
+                        backend, name, t_cpython, t_pypy, "BASEFAIL",
+                    )
+            return
+
+        # The oracles agree, so this output is what the fixture is for -- and
+        # the place to hold its own `# Expected` comments to it. They were
+        # documentation nothing read, so they rotted: three named a count the
+        # fixture had not printed since its size was last doubled.
+        expected_mismatches = _expected_mismatches(path, pypy_output)
+        if expected_mismatches:
+            claim, line = expected_mismatches[0]
+            detail = f"{line.strip()} (fixture prints something else)"
+            print(f"    {'expected':<10s}{red('STALE')}  {detail}")
+            for backend in ALL_BACKENDS:
+                if self.enabled(backend):
+                    self._record(backend, False, name, f"stale expectation: {claim}")
                     self._append_comparison(
                         backend, name, t_cpython, t_pypy, "BASEFAIL",
                     )
