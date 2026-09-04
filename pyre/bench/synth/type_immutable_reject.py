@@ -1,7 +1,4 @@
-# pyre-check: max-pypy-ratio=40
-# pypy's exec time is pinned to the startup-subtraction floor here, so the
-# ratio is not a measurement: the ceiling is twice the slowest ratio the CI
-# runners observe (18.2x), rounded up.
+# pyre-check: max-pypy-ratio=3
 N = 152915500
 
 
