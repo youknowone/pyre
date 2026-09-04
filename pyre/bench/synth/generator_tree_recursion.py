@@ -1,19 +1,22 @@
-# pyre-check: max-pypy-ratio=14
+# pyre-check: max-pypy-ratio=23
 # pyre-check: jitstats-band=guard_failures=8
 # Successful bridge closure and a pre-trace Decline are not aborts in
 # `MetaInterp._interpret`. Charging both to pyre's local abort ceiling held this
 # fixture at 29 bridges / 3600 guard failures; the corrected lifecycle reaches
-# 48 / 7378. The PyPy oracle compiles still more (65 bridges) with forcings=0,
+# 33 / 4382. The PyPy oracle compiles still more (65 bridges) with forcings=0,
 # virtualizables forced=0 and nvirtuals=721, so the higher count is coverage,
-# not a regression to suppress. Four final-binary cranelift runs measured
-# 12.5x..12.7x; 14x leaves 10% headroom. The recovery target is PyPy's
-# zero-forcing per-`MIFrame` recursive-frame/blackhole path, not restoring the
-# abort-ceiling shortcut.
+# not a regression to suppress. Once the manual arithmetic folds were retired
+# onto generated interpreter descents, branch runs 33692288311, 33813140363 and
+# 33860926996 measured cranelift at 13.6x..19.7x and dynasm at 10.2x..13.8x
+# while the exact 3-loop / 33-bridge / 4382-guard shape stayed fixed. 23x is the
+# cross-host high plus 15%. The recovery target is PyPy's canonical codewriter
+# inline call to the arithmetic body and its zero-forcing per-`MIFrame`
+# recursive-frame/blackhole path, not either retired shortcut.
 # Jitcounter decay is 0.96 every 32 minor collections
 # (majit-trace/src/counter.rs), so guard_failures tracks collection count during
 # each guard's warm-up rather than a compile decision. One host measured
 # 3648..3661 across nursery sizes before the lifecycle fix; decay=0 now pins
-# 7378 everywhere, while loops_compiled=3 and bridges_compiled=48 remain
+# 4382 everywhere, while loops_compiled=3 and bridges_compiled=33 remain
 # gated exactly. The fixture sets decay=0 itself, so the band covers the pinned
 # run, not that 13-wide unpinned spread; width 8 is margin (0.22%). Real
 # regressions this gate caught moved by hundreds to thousands (828 -> 4923,

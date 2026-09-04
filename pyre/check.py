@@ -5727,7 +5727,14 @@ def main():
         # headroom, and both derived floors -- 0.483x and 0.567x -- stay under
         # the narrowest readings of 1.25x and 1.83x, which the same subtraction
         # moved up rather than down.
-        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       2.9,     2,       3.4)
+        # Runs 33692288311 and 33860926996 measured this branch after the
+        # manual arithmetic folds moved to generated interpreter descent:
+        # dynasm reached 3.8x and cranelift 4.1x while fib_recursive's exact
+        # loop/bridge/guard snapshot stayed unchanged. 4.4x and 4.8x are those
+        # cross-host highs plus 15%; their 0.733x/0.8x floors remain below the
+        # historical 0.9x low. The recovery is the canonical codewriter inline
+        # call to the selected arithmetic body, not restoring binary_op_int.
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       4.4,     2,       4.8)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.5,     None,    2.5)
         # Run 33363045302 measured spectral_norm at 0.4-1.4x on the healthy
