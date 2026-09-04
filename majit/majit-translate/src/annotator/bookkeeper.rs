@@ -5209,7 +5209,7 @@ mod tests {
         );
         bk.set_struct_fields(Rc::new(reg));
         // The origin `front::mir` now registers for an enum leaf.
-        majit_ir::descr::register_struct_origins(
+        let _registry = crate::test_support::register_struct_origins_serialized(
             [("Newt".to_string(), "probemod".to_string())].into(),
         );
 

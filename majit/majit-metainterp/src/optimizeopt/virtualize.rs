@@ -2807,20 +2807,39 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     // sums, for every other enum.  Restricted to the tag: it is the only row
     // the base carries, so a payload row reaching here under a base spelling
     // would be naming a field the base does not have.
-    fn variant_inherits_enum_tag(slot_owner: &str, field_owner: &str, field_key: &str) -> bool {
-        if field_key != "__discriminant" {
+    fn variant_inherits_enum_tag(
+        slot_owner: &str,
+        field_owner: &str,
+        field_name: &str,
+        parent_keys: Option<(u64, u64)>,
+    ) -> bool {
+        if field_name != "__discriminant" {
             return false;
         }
         let slot = majit_ir::descr::strip_generic_args(slot_owner);
         let Some((base, _variant)) = slot.rsplit_once("::") else {
             return false;
         };
-        base == majit_ir::descr::strip_generic_args(field_owner).as_ref()
+        if base != majit_ir::descr::strip_generic_args(field_owner).as_ref() {
+            return false;
+        }
+        // Unlike the two explicitly-declared Result/Option shells above, an
+        // arbitrary textual `Enum::Variant -> Enum` shape is not itself proof
+        // of inheritance: two crates can publish the same stripped spelling.
+        // Require both parent cache keys to be the identities derived from the
+        // producer-canonical names. This admits the distinct variant/base
+        // StructIds of the real superclass edge and rejects an alias whose
+        // spelling happens to collide with either identity.
+        parent_keys.is_some_and(|(slot_key, field_key)| {
+            majit_ir::descr::StructId::from_canonical_spelling(slot_owner).as_u64() == slot_key
+                && majit_ir::descr::StructId::from_canonical_spelling(field_owner).as_u64()
+                    == field_key
+        })
     }
 
-    let owners_agree = |slot_owner: &str, field_owner: &str| {
+    let owners_agree = |slot_owner: &str, field_owner: &str, parent_keys: Option<(u64, u64)>| {
         explicit_sum_inherits(slot_owner, field_owner)
-            || variant_inherits_enum_tag(slot_owner, field_owner, field.field_key())
+            || variant_inherits_enum_tag(slot_owner, field_owner, field.field_key(), parent_keys)
     };
 
     let names_name_same_owner = || match (display_owner(slot), display_owner(field)) {
@@ -2830,9 +2849,9 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
                 majit_ir::descr::struct_id_for_name(field_owner),
             ) {
                 (Some(slot_id), Some(field_id)) => {
-                    slot_id == field_id || owners_agree(slot_owner, field_owner)
+                    slot_id == field_id || owners_agree(slot_owner, field_owner, None)
                 }
-                _ => slot_owner == field_owner || owners_agree(slot_owner, field_owner),
+                _ => slot_owner == field_owner || owners_agree(slot_owner, field_owner, None),
             }
         }
         // Neither descriptor contains an owner spelling.  This is the
@@ -2858,7 +2877,7 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
                     slot_key == field_key
                         || match (display_owner(slot), display_owner(field)) {
                             (Some(slot_owner), Some(field_owner)) => {
-                                owners_agree(slot_owner, field_owner)
+                                owners_agree(slot_owner, field_owner, Some((slot_key, field_key)))
                             }
                             _ => false,
                         }
@@ -3851,10 +3870,80 @@ mod tests {
             "a::E::V.__discriminant".to_string(),
             "__discriminant".to_string(),
         )
-        .with_parent_descr(variant_parent, 0);
+        .with_parent_descr(variant_parent.clone(), 0);
         assert!(
             !slot_holds_field(&collision_slot, &suffix_collision),
             "a suffix-related path does not prove an enum inheritance edge"
+        );
+    }
+
+    #[test]
+    fn native_enum_tag_inheritance_requires_matching_parent_identities() {
+        let variant_owner = "types::dynamic::Union::Int";
+        let base_owner = "types::dynamic::Union";
+        let mut variant_size = majit_ir::descr::SimpleSizeDescr::new(0, 16, 1);
+        variant_size.set_cache_key(
+            majit_ir::descr::StructId::from_canonical_spelling(variant_owner).as_u64(),
+        );
+        let variant_parent = Arc::new(variant_size) as DescrRef;
+        let mut base_size = majit_ir::descr::SimpleSizeDescr::new(1, 16, 2);
+        base_size
+            .set_cache_key(majit_ir::descr::StructId::from_canonical_spelling(base_owner).as_u64());
+        let base_parent = Arc::new(base_size) as DescrRef;
+        let slot = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            1,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Unsigned,
+            format!("{variant_owner}.__discriminant"),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(variant_parent.clone(), 0);
+        let field = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            1,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Unsigned,
+            format!("{base_owner}.__discriminant"),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(base_parent.clone(), 0);
+        assert!(
+            slot_holds_field(&slot, &field),
+            "slot={:?} key={:?} parent={:?}; field={:?} key={:?} parent={:?}",
+            slot.field_name(),
+            slot.field_key(),
+            slot.get_parent_descr()
+                .and_then(|p| p.as_size_descr().map(|s| s.cache_key())),
+            field.field_name(),
+            field.field_key(),
+            field
+                .get_parent_descr()
+                .and_then(|p| p.as_size_descr().map(|s| s.cache_key())),
+        );
+
+        let mut foreign_size = majit_ir::descr::SimpleSizeDescr::new(2, 16, 3);
+        foreign_size
+            .set_cache_key(majit_ir::descr::StructId::from_canonical("other::Union::Int").as_u64());
+        let foreign_parent = Arc::new(foreign_size) as DescrRef;
+        let foreign = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            1,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Unsigned,
+            format!("{variant_owner}.__discriminant"),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(foreign_parent.clone(), 0);
+        assert!(
+            !slot_holds_field(&foreign, &field),
+            "a colliding owner spelling must not override a distinct parent identity"
         );
     }
 

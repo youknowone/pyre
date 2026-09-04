@@ -4101,12 +4101,15 @@ pub(crate) fn bh_size_spec_from_callcontrol(
 ///
 /// The row is named under the *variant*, the way the explicit shell's own tag
 /// row is: it is the variant's slot 0, and what identifies it as the base's
-/// field is the inheritance edge the read side resolves, not the spelling.
+/// field is the inheritance edge the read side resolves. Charon can spell the
+/// variant with a crate prefix or only the enum leaf while the discriminant
+/// read uses the crate-stripped canonical base. Rebuild the variant owner from
+/// that leaf's registered origin so both spell the same inheritance edge.
 fn inherited_enum_tag_spec(
     cc: &CallControl,
     variant_owner: &str,
 ) -> Option<crate::jitcode::BhFieldSpec> {
-    let (base_owner, _variant) = variant_owner.rsplit_once("::")?;
+    let (base_owner, variant) = variant_owner.rsplit_once("::")?;
     let entries = cc.struct_field_entries(base_owner)?;
     if entries.len() != 1 || entries[0].0 != "__discriminant" {
         return None;
@@ -4114,9 +4117,14 @@ fn inherited_enum_tag_spec(
     let tag = bh_all_field_specs_for_struct(cc, base_owner)
         .into_iter()
         .find(|spec| spec.field_key() == "__discriminant")?;
+    let base_leaf = base_owner.rsplit("::").next().unwrap_or(base_owner);
+    let canonical_variant_owner = format!(
+        "{}::{variant}",
+        majit_ir::descr::canonical_struct_name(base_leaf)
+    );
     Some(bh_field_spec_from_parts(
         0,
-        variant_owner,
+        &canonical_variant_owner,
         "__discriminant",
         tag.offset,
         tag.field_size,
@@ -6344,6 +6352,49 @@ mod tests {
             bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Option variant size");
         assert_eq!(spec.type_id, concrete_id.as_u64());
         assert_eq!(spec.all_fielddescrs.len(), 2);
+    }
+
+    #[test]
+    fn native_enum_variant_inherited_tag_uses_the_canonical_base_path() {
+        use crate::call::CallControl;
+
+        let _registry = crate::test_support::register_struct_origins_serialized(HashMap::from([
+            ("BinOperand".to_string(), "grain::bytecode::op".to_string()),
+            ("Union".to_string(), "types::dynamic".to_string()),
+        ]));
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        for (base, variant) in [
+            (
+                "rhai::grain::bytecode::op::BinOperand",
+                "rhai::grain::bytecode::op::BinOperand::Local",
+            ),
+            ("Union", "Union::Int"),
+        ] {
+            struct_fields.fields.insert(
+                base.to_string(),
+                vec![("__discriminant".to_string(), "u8".to_string())],
+            );
+            struct_fields.fields.insert(
+                variant.to_string(),
+                vec![("__pos_0".to_string(), "i64".to_string())],
+            );
+        }
+        cc.set_struct_fields(struct_fields);
+
+        let bin_operand =
+            bh_size_spec_from_callcontrol(&cc, "rhai::grain::bytecode::op::BinOperand::Local")
+                .expect("BinOperand variant size");
+        assert_eq!(
+            bin_operand.all_fielddescrs[0].name,
+            "grain::bytecode::op::BinOperand::Local.__discriminant"
+        );
+
+        let union = bh_size_spec_from_callcontrol(&cc, "Union::Int").expect("Union variant size");
+        assert_eq!(
+            union.all_fielddescrs[0].name,
+            "types::dynamic::Union::Int.__discriminant"
+        );
     }
 
     /// A user enum whose path merely ends in `option::Option::Some` gets no

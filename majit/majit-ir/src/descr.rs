@@ -380,6 +380,16 @@ impl StructId {
         StructId(path_hash(canonical_path))
     }
 
+    /// Mint the concrete identity named by an already-canonical spelling.
+    /// Generic enum variants carry their arguments before the variant tail
+    /// (`Result<T, E>::Ok`); use the same template + instantiation split as
+    /// [`struct_id_for_name`] without consulting its optional alias table.
+    pub fn from_canonical_spelling(canonical_path: &str) -> Self {
+        let template = strip_generic_args(canonical_path);
+        let id = Self::from_canonical(template.as_ref());
+        generic_args_span(canonical_path).map_or(id, |args| id.instantiate(args))
+    }
+
     /// Derive the identity of one concrete generic instantiation from the
     /// defining type's identity and its balanced `<...>` argument spelling.
     ///

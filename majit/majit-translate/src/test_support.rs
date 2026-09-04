@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+static STRUCT_REGISTRY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// Publish `table` into the process-global name → `StructId` map and hold
 /// every other registering test out until the returned guard drops.
 ///
@@ -39,8 +41,20 @@ use std::collections::HashMap;
 pub(crate) fn register_struct_ids_serialized(
     table: HashMap<String, Option<majit_ir::descr::StructId>>,
 ) -> parking_lot::MutexGuard<'static, ()> {
-    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-    let guard = LOCK.lock();
+    let guard = STRUCT_REGISTRY_TEST_LOCK.lock();
     majit_ir::descr::register_struct_ids(table);
+    guard
+}
+
+/// Publish an origin table while excluding tests that replace either global
+/// struct-name registry. Production publishes both together for one program;
+/// tests must likewise prevent one table from changing under another test's
+/// descriptor construction.
+#[must_use = "the returned guard holds the registry lock for the rest of the test"]
+pub(crate) fn register_struct_origins_serialized(
+    table: HashMap<String, String>,
+) -> parking_lot::MutexGuard<'static, ()> {
+    let guard = STRUCT_REGISTRY_TEST_LOCK.lock();
+    majit_ir::descr::register_struct_origins(table);
     guard
 }
