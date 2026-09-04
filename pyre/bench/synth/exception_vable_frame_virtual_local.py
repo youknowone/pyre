@@ -19,7 +19,9 @@
 # and cranelift both lost `marker` from the iteration the entry trace compiled
 # onwards.
 #
-# Expected output: 2000 ('i', 'marker') and 2000 ('i', 'marker', 'odd_only')
+# Expected output:
+#   4000 ('i', 'marker')
+#   4000 ('i', 'marker', 'odd_only')
 
 N = 8000
 

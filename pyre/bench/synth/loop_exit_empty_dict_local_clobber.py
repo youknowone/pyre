@@ -27,7 +27,7 @@
 #   * any iterator reproduced it (`list_iterator` and `enumerate` landed in the
 #     slot just as `range_iterator` did).
 #
-# Expected output: ('set', 'dict').
+# Expected output: ('set', 'dict')
 N = 8000
 
 
