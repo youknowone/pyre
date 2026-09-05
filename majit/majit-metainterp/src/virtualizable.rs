@@ -17,7 +17,7 @@
 use indexmap::IndexMap;
 use std::sync::{Arc, Weak};
 
-use majit_ir::{descr::descr_identity, DescrRef, Type};
+use majit_ir::{DescrRef, Type, descr::descr_identity};
 
 /// `virtualizable.py TOKEN_TRACING_RESCALL`: the GCREF address of the
 /// prebuilt `JITFRAME_DUMMY` object shared with virtual references.
