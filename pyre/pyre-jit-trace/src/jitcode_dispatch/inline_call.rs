@@ -1376,14 +1376,8 @@ fn summarize_descent_blockers(
     jitcode_index: usize,
     seen: &mut Vec<usize>,
 ) -> DescentBlockerSummary {
-    summarize_descent_blockers_with_entry(jitcode_index, seen, &[])
-}
-
-thread_local! {
-    /// How many times the scan has answered for a body already on its own
-    /// stack.  Read as a fence around a subtree: a subtree that leaves it
-    /// unchanged never consulted the stack.
-    static DESCENT_SCAN_CYCLE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    let mut cycle_hits = 0;
+    summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], &mut cycle_hits)
 }
 
 /// [`summarize_descent_blockers`] for a callee, memoized on the callee's body
@@ -1400,19 +1394,20 @@ thread_local! {
 fn summarize_descent_blockers_cached(
     jitcode_index: usize,
     seen: &mut Vec<usize>,
+    cycle_hits: &mut u64,
 ) -> DescentBlockerSummary {
     if seen.contains(&jitcode_index) {
-        return summarize_descent_blockers(jitcode_index, seen);
+        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
     }
     let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-        return summarize_descent_blockers(jitcode_index, seen);
+        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
     };
     if let Some(cached) = jitcode.descent_blocker_summary_if_computed() {
         return cached;
     }
-    let cycles_before = DESCENT_SCAN_CYCLE_HITS.with(|c| c.get());
-    let summary = summarize_descent_blockers(jitcode_index, seen);
-    if DESCENT_SCAN_CYCLE_HITS.with(|c| c.get()) == cycles_before {
+    let cycles_before = *cycle_hits;
+    let summary = summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
+    if *cycle_hits == cycles_before {
         jitcode.descent_blocker_summary(|| summary);
     }
     summary
@@ -1427,8 +1422,26 @@ fn summarize_descent_blockers_with_entry(
     seen: &mut Vec<usize>,
     entry_array_lengths: &[(usize, usize)],
 ) -> DescentBlockerSummary {
+    // This memoization fence belongs to this analysis stack, not to the
+    // executing thread. Every recursive callee shares it; an independent
+    // analysis (including a reentrant one) must not change its value.
+    let mut cycle_hits = 0;
+    summarize_descent_blockers_with_entry_inner(
+        jitcode_index,
+        seen,
+        entry_array_lengths,
+        &mut cycle_hits,
+    )
+}
+
+fn summarize_descent_blockers_with_entry_inner(
+    jitcode_index: usize,
+    seen: &mut Vec<usize>,
+    entry_array_lengths: &[(usize, usize)],
+    cycle_hits: &mut u64,
+) -> DescentBlockerSummary {
     if seen.contains(&jitcode_index) {
-        DESCENT_SCAN_CYCLE_HITS.with(|c| c.set(c.get() + 1));
+        *cycle_hits += 1;
         return DescentBlockerSummary {
             may_execute_effect: true,
             ..DescentBlockerSummary::default()
@@ -1462,7 +1475,7 @@ fn summarize_descent_blockers_with_entry(
             descrs
                 .at(descr_index)
                 .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                .map(|callee| summarize_descent_blockers_cached(callee, seen))
+                .map(|callee| summarize_descent_blockers_cached(callee, seen, cycle_hits))
         },
         &mut |_blocker, _effect| true,
         &mut residual_call_is_effect_free,

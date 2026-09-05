@@ -151,18 +151,18 @@ static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 // the callee's wasm signature and coerces each positional argument.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod residual_host {
-    /// Direct-call the blackhole helpers whose real wasm ABI is exactly the
-    /// uniform `i64` signature carried by the residual call.
+    /// Direct-call the blackhole helpers whose real wasm ABI is known exactly.
     ///
     /// The generic path below must reflect the callee's wasm type in the host:
     /// an `r` argument may be a real `i32` pointer, a void descriptor may name
     /// a word-returning target, and guessing either signature traps at a wasm
-    /// `call_indirect`.  These targets are different: every one is declared as
-    /// an explicit `pub extern "C" fn(i64, ...) -> i64` wrapper, and the CPU
-    /// function table stores those exact function addresses.  Comparing the
-    /// table index (`fn as usize` on wasm32) therefore proves both the callee
-    /// identity and its ABI.  Calling the named wrapper directly matches the
-    /// native blackhole dispatch while avoiding a guest -> host -> guest
+    /// `call_indirect`.  These targets are different: each word-returning entry
+    /// is declared as an explicit `pub extern "C" fn(i64, ...) -> i64` wrapper,
+    /// while the one true-void initializer is matched separately at arity zero.
+    /// The CPU function table stores those exact function addresses. Comparing
+    /// the table index (`fn as usize` on wasm32) therefore proves both the
+    /// callee identity and its ABI. Calling the named function directly matches
+    /// the native blackhole dispatch while avoiding a guest -> host -> guest
     /// reflection round-trip.
     ///
     /// Keep this an exact-function allow-list, not a signature inference: the
@@ -175,6 +175,13 @@ mod residual_host {
     /// remaining crossing arrives on this path (`src=host`) rather than from a
     /// compiled trace; these are its heaviest callees.
     fn direct_uniform_i64_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
+        if args.is_empty()
+            && func_ptr == pyre_object::pyobject::ensure_object_subclass_ranges_initialized as usize
+        {
+            pyre_object::pyobject::ensure_object_subclass_ranges_initialized();
+            return Some(0);
+        }
+
         macro_rules! uniform_i64_allow_list {
             ($( [$($arg:ident),*] => $callee:path ),* $(,)?) => {
                 match args {
@@ -193,6 +200,7 @@ mod residual_host {
             [value] => pyre_jit::call_jit::bh_truth_fn,
             [array] => pyre_jit::call_jit::bh_newtuple_from_array,
             [array] => pyre_jit::call_jit::bh_newlist_from_array,
+            [subcls, cls] => pyre_object::pyobject::__majit_call_target_ll_issubclass,
             [index, seq] => pyre_jit::call_jit::bh_unpack_item_fn,
             [callable, null_or_self] => pyre_jit::call_jit::bh_call_fn_0,
             [lhs, rhs, op_code] => pyre_jit::call_jit::bh_binary_op_fn,
