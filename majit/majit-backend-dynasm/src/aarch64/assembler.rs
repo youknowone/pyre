@@ -3542,10 +3542,11 @@ impl<'a> AssemblerARM64<'a> {
                 let slow_path = self.mc.new_dynamic_label();
                 let done = self.mc.new_dynamic_label();
                 let word = std::mem::size_of::<usize>();
-                // `consider_call_malloc_nursery_varsize` passes this value
-                // directly as `maxlength`; the following nursery-top check
-                // rejects a scaled size that is still too large.
-                let max_length = max_young.saturating_sub(2 * word);
+                // aarch64/regalloc.py `consider_call_malloc_nursery_varsize`:
+                // `maxlength = (max_size_of_young_obj - WORD * 2) / itemsize`.
+                // The compare below is against the item count, not the byte
+                // bound x86's precheck uses.
+                let max_length = max_young.saturating_sub(2 * word) / itemsize as usize;
                 let header_size = majit_gc::header::GcHeader::SIZE as i64;
                 debug_assert!(itemsize > 0);
                 debug_assert!(

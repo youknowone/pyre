@@ -685,12 +685,11 @@ pub fn dist(args: &[PyObjectRef]) -> PyResult {
     let collect_coords = |obj: PyObjectRef| -> Result<Vec<f64>, crate::PyError> {
         let items = crate::builtins::collect_iterable(obj)?;
         // Conversion can call an element's `__float__`, so publish the whole
-        // materialized sequence before converting any member.
+        // materialized sequence before converting any member. `pin_roots`
+        // writes every pointer before the first forwarding query; a
+        // per-item `pin_root` would let that query collect the rest.
         let _roots = pyre_object::gc_roots::push_roots();
-        let items_base = pyre_object::gc_roots::shadow_stack_len();
-        for &item in &items {
-            let _ = pyre_object::gc_roots::pin_root(item);
-        }
+        let items_base = pyre_object::gc_roots::pin_roots(&items);
         (0..items.len())
             .map(|index| {
                 try_get_double(pyre_object::gc_roots::shadow_stack_get(items_base + index))
@@ -1596,10 +1595,10 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
     let acc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(start);
     let items = crate::builtins::collect_iterable(positional[0])?;
-    let items_base = pyre_object::gc_roots::shadow_stack_len();
-    for &item in &items {
-        let _ = pyre_object::gc_roots::pin_root(item);
-    }
+    // `collect_iterable` returns unrooted pointers. Publish the whole
+    // slice before any forwarding query; a per-item `pin_root` is a
+    // safepoint that can move the still-unpinned tail.
+    let items_base = pyre_object::gc_roots::pin_roots(&items);
     // Multiplication can call `__mul__`; reload both operands after every
     // collection and keep the running product in its rooted slot.
     for index in 0..items.len() {
@@ -1624,21 +1623,16 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
     }
     let p = crate::builtins::collect_iterable(args[0])?;
     // Collecting the second input runs its iterator, so publish the first
-    // materialized sequence before that call.
+    // materialized sequence before that call. `pin_roots` writes every
+    // pointer before the first forwarding query.
     let _roots = pyre_object::gc_roots::push_roots();
-    let p_base = pyre_object::gc_roots::shadow_stack_len();
-    for &item in &p {
-        let _ = pyre_object::gc_roots::pin_root(item);
-    }
+    let p_base = pyre_object::gc_roots::pin_roots(&p);
     let q = crate::builtins::collect_iterable(args[1])?;
     // `mul` and `add` dispatch to the operands' `__mul__` / `__add__`, so a
     // Decimal or Fraction element makes every turn a collection point.  Both
     // collected sequences and the running total are native locals no root
     // walker updates, so publish them and read each operand back per turn.
-    let q_base = pyre_object::gc_roots::shadow_stack_len();
-    for &item in &q {
-        let _ = pyre_object::gc_roots::pin_root(item);
-    }
+    let q_base = pyre_object::gc_roots::pin_roots(&q);
     if p.len() != q.len() {
         return Err(crate::PyError::value_error(
             "Inputs are not the same length",

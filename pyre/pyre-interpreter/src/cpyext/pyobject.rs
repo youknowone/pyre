@@ -428,10 +428,27 @@ pub fn as_pyobj(w_obj: PyObjectRef) -> *mut CPyObject {
     if w_obj.is_null() {
         return std::ptr::null_mut();
     }
+    // pyobject.py `as_pyobj`: `_cpyext_as_pyobj` first, then `create_ref`
+    // when that lookup is empty. A type's `_cpy_ref` is the direct-storage
+    // spelling of the same miss; returning the null field skipped the
+    // create that every other object still takes.
     if unsafe { pyre_object::is_type(w_obj) } {
-        return unsafe { pyre_object::w_type_get_cpy_ref(w_obj) }.cast();
+        let direct = unsafe { pyre_object::w_type_get_cpy_ref(w_obj) };
+        if !direct.is_null() {
+            return direct.cast();
+        }
     }
-    majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize)) as *mut CPyObject
+    let existing = majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize));
+    if existing != 0 {
+        return existing as *mut CPyObject;
+    }
+    // `create_ref` needs the rawrefcount tables. Before `initialize()` they
+    // do not exist, so a miss stays a miss — the same answer the type
+    // `_cpy_ref` field already gave.
+    if !majit_gc::gc_rawrefcount_enabled() {
+        return std::ptr::null_mut();
+    }
+    ensure_mirror(w_obj)
 }
 
 /// Attach `W_Root`'s weakref lifeline to an already-existing C mirror.

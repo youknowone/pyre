@@ -4040,7 +4040,7 @@ mod tests {
         )];
 
         let (result, _constants, _gcrefs) =
-            rw.rewrite_for_gc_with_constants(&ops, &ConstMap::new());
+            rw.rewrite_for_gc_with_constants(&ops, &ConstMap::default());
 
         let malloc = result
             .iter()

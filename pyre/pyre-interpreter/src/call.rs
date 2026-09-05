@@ -5770,17 +5770,19 @@ fn build_class_inner(
             // Every `__set_name__` runs Python, so the snapshot cannot stay in
             // an untraced Vec across the loop.  `PyDict_Next` walks every
             // entry, so a descriptor stored under a non-string key gets its
-            // `__set_name__` call too.
+            // `__set_name__` call too. Publish every name/value before the
+            // first forwarding query: a per-item `pin_root` is a safepoint
+            // that can move the still-unpinned tail.
             let _entry_roots = pyre_object::gc_roots::push_roots();
-            let entries_root = pyre_object::gc_roots::shadow_stack_len();
-            let mut pinned = 0;
+            let mut flat = Vec::with_capacity(entries.len() * 2);
             for (w_name, value) in entries {
                 if !value.is_null() {
-                    let _ = pyre_object::gc_roots::pin_root(w_name);
-                    let _ = pyre_object::gc_roots::pin_root(value);
-                    pinned += 1;
+                    flat.push(w_name);
+                    flat.push(value);
                 }
             }
+            let entries_root = pyre_object::gc_roots::pin_roots(&flat);
+            let pinned = flat.len() / 2;
             for i in 0..pinned {
                 let w_name = pyre_object::gc_roots::shadow_stack_get(entries_root + i * 2);
                 let value = pyre_object::gc_roots::shadow_stack_get(entries_root + i * 2 + 1);

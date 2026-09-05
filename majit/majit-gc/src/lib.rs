@@ -3684,6 +3684,14 @@ pub fn gc_rawrefcount_init(dealloc_trigger: rawrefcount::DeallocTriggerFn) {
     gc_sync::gc_op(|gc| gc.rawrefcount_init(dealloc_trigger));
 }
 
+/// Whether [`gc_rawrefcount_init`] has run on the live collector.
+///
+/// `as_pyobj` / `create_ref` must not invent a link before this is true:
+/// `rawrefcount_create_link_pypy` asserts the table exists.
+pub fn gc_rawrefcount_enabled() -> bool {
+    gc_sync::is_initialized() && gc_sync::gc_query_reentrant(|gc| gc.rawrefcount_enabled())
+}
+
 /// Register the [`rawrefcount::CEdgeCensusFn`] the collector reads a block's
 /// own references from.  Upstream has no counterpart; see the type.
 pub fn gc_rawrefcount_set_c_edge_census(census: rawrefcount::CEdgeCensusFn) {

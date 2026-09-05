@@ -32867,6 +32867,19 @@ fn init_chain_type(ns: PyObjectRef) {
 
 // ── __dict__ / __weakref__ descriptors ───────────────────────────────
 
+/// Hold `obj` in a process-lifetime slot the collector can rewrite.
+///
+/// `dict_descr` / `weakref_descr` exist only in a `OnceLock`; without this
+/// they are invisible to a major collection and the recycled address is
+/// later installed as `__dict__` / `__weakref__`. Same idiom as
+/// `intern_exact_str`.
+fn root_cached_object(obj: pyre_object::PyObjectRef) -> Box<usize> {
+    let mut slot = Box::new(obj as usize);
+    let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
+    unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
+    slot
+}
+
 /// typedef.py dict_descr.
 ///
 /// ```python
@@ -32876,8 +32889,12 @@ fn init_chain_type(ns: PyObjectRef) {
 /// ```
 pub fn dict_descr() -> pyre_object::PyObjectRef {
     use std::sync::OnceLock;
-    static CACHED: OnceLock<usize> = OnceLock::new();
-    let addr = *CACHED.get_or_init(|| {
+    // The template lives only in this cache. A moving or sweeping collection
+    // would recycle the address, and `copy_for_type` would then hand the
+    // recycled block out as `__dict__`. Keep one rooted slot for the
+    // collector, the `intern_exact_str` idiom.
+    static CACHED: OnceLock<Box<usize>> = OnceLock::new();
+    let slot = CACHED.get_or_init(|| {
         let fget = make_builtin_function_with_arity("descr_get_dict", descr_get_dict, 2);
         let fset = make_builtin_function_with_arity("descr_set_dict", descr_set_dict, 3);
         let fdel = make_builtin_function_with_arity("descr_del_dict", descr_del_dict, 2);
@@ -32887,15 +32904,15 @@ pub fn dict_descr() -> pyre_object::PyObjectRef {
         // `"__dict__"` instead of the `"<generic property>"` sentinel.
         // The earlier setattr fix-up was masked by the new read-only
         // `__name__` getset and silently failed.
-        make_getset_property_named_doc(
+        root_cached_object(make_getset_property_named_doc(
             fget,
             fset,
             fdel,
             "dictionary for instance variables",
             "__dict__",
-        ) as usize
+        ))
     });
-    addr as pyre_object::PyObjectRef
+    **slot as pyre_object::PyObjectRef
 }
 
 /// typedef.py weakref_descr.
@@ -32907,20 +32924,20 @@ pub fn dict_descr() -> pyre_object::PyObjectRef {
 /// ```
 pub fn weakref_descr() -> pyre_object::PyObjectRef {
     use std::sync::OnceLock;
-    static CACHED: OnceLock<usize> = OnceLock::new();
-    let addr = *CACHED.get_or_init(|| {
+    static CACHED: OnceLock<Box<usize>> = OnceLock::new();
+    let slot = CACHED.get_or_init(|| {
         let fget = make_builtin_function_with_arity("descr_get_weakref", descr_get_weakref, 2);
         // typedef.py `weakref_descr.name = '__weakref__'` —
         // see `dict_descr` for the parity rationale.
-        make_getset_property_named_doc(
+        root_cached_object(make_getset_property_named_doc(
             fget,
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
             "list of weak references to the object",
             "__weakref__",
-        ) as usize
+        ))
     });
-    addr as pyre_object::PyObjectRef
+    **slot as pyre_object::PyObjectRef
 }
 
 /// PyPy stores `fget/fset/fdel/doc/reqcls/use_closure/name` directly on
