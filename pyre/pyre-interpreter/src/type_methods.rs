@@ -1692,7 +1692,7 @@ fn str_method_format_core(
     // = ANS_AUTO (empty `{}` fields), `Some(false)` = ANS_MANUAL (numbered
     // `{0}` fields).  Mixing the two raises ValueError.
     let mut numbering: Option<bool> = None;
-    let rendered = format_render(
+    match format_render(
         fmt,
         positional,
         kwargs_dict,
@@ -1700,9 +1700,37 @@ fn str_method_format_core(
         &mut auto_idx,
         &mut numbering,
         2,
-    )?;
-    // `str.format` / `%` rendering is a dominant dynamic-churn producer.
-    Ok(pyre_object::w_str_from_wtf8_managed(rendered))
+    )? {
+        TemplateRender::Object(obj) => Ok(obj),
+        // `str.format` / `%` rendering is a dominant dynamic-churn producer.
+        TemplateRender::Text(rendered) => Ok(pyre_object::w_str_from_wtf8_managed(rendered)),
+    }
+}
+
+/// What a template rendered to.
+///
+/// `build_string` (`unicode_format.h`) renders through a writer that adopts a
+/// lone written `str` as its own buffer instead of copying it, so a template
+/// that is exactly one replacement field yields that field's own formatted
+/// object — its identity and a `str` subclass's type both survive
+/// `"{}".format(x)` and `"{k}".format_map(m)`.  Every other template yields
+/// text, and a caller that cannot use an object (the nested-spec recursion
+/// splices its result into the surrounding template) reads it back with
+/// [`TemplateRender::text`].
+enum TemplateRender {
+    Text(Wtf8Buf),
+    Object(PyObjectRef),
+}
+
+impl TemplateRender {
+    fn text(self) -> Wtf8Buf {
+        match self {
+            TemplateRender::Text(text) => text,
+            TemplateRender::Object(obj) => {
+                unsafe { pyre_object::w_str_get_wtf8(obj) }.to_wtf8_buf()
+            }
+        }
+    }
 }
 
 /// `newformat.py Formatter.format` rendering pass.  Renders the
@@ -1718,7 +1746,7 @@ fn format_render(
     auto_idx: &mut usize,
     numbering: &mut Option<bool>,
     depth: u32,
-) -> Result<Wtf8Buf, crate::PyError> {
+) -> Result<TemplateRender, crate::PyError> {
     use rustpython_common::format::{
         FieldName, FieldNamePart, FieldType, FormatParseError, FromTemplate,
     };
@@ -1759,6 +1787,8 @@ fn format_render(
         return Err(crate::PyError::value_error("Max string recursion exceeded"));
     }
     let parsed = parse_format_parts(fmt)?;
+    // Read once, before the loop the field emission below tests it in.
+    let sole_field = parsed.len() == 1 && matches!(parsed[0], PyPyFormatPart::Field { .. });
     let mut result = Wtf8Buf::new();
     for part in &parsed {
         let (field_name, conversion_spec, format_spec) = match part {
@@ -1897,7 +1927,8 @@ fn format_render(
                 auto_idx,
                 numbering,
                 depth - 1,
-            )?;
+            )?
+            .text();
             val = inner.get(val_slot);
             spec
         } else {
@@ -1925,10 +1956,29 @@ fn format_render(
                 }
             },
         };
+        if sole_field {
+            // The whole template is this field, so hand back the object
+            // `__format__` produced rather than a copy of its text.  An empty
+            // spec crosses as `PY_NULL`, which `format_w` reads as empty:
+            // building a `str` for it would allocate where the byte path
+            // allocated nothing.
+            let inner = pyre_object::gc_roots::push_roots();
+            let converted_slot = inner.base();
+            let _ = inner.pin_root(converted);
+            let spec_obj = if resolved_spec.is_empty() {
+                pyre_object::PY_NULL
+            } else {
+                pyre_object::w_str_from_wtf8(resolved_spec)
+            };
+            return Ok(TemplateRender::Object(format_w(
+                inner.get(converted_slot),
+                spec_obj,
+            )?));
+        }
         let formatted = format_value_dispatch(converted, &resolved_spec)?;
         result.push_wtf8(&formatted);
     }
-    Ok(result)
+    Ok(TemplateRender::Text(result))
 }
 
 enum PyPyFormatPart {
