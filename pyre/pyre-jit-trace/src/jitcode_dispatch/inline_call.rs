@@ -509,8 +509,9 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
 /// (param-init `STORE_FAST` prologue, intermediate local writes) is therefore
 /// foldable too — only a vable op against a DIFFERENT base reg (a genuinely
 /// foreign vable, e.g. the caller's frame the seed does not own) escapes the
-/// fold and must decline.  An int/float-base vable op (the `iid`/`ird`
-/// intbase set variants) is not a frame-local store and also declines.
+/// fold and must decline. A malformed non-Ref-base vable op is never treated
+/// as frame-local; the assembler rejects that shape because every upstream
+/// `BlackholeInterpreter.bhimpl_*_vable_*` base argument is `r`.
 pub(crate) fn inline_resolvable_seeded_frame_op(
     body_code: &[u8],
     d: &DecodedOp,
@@ -522,8 +523,8 @@ pub(crate) fn inline_resolvable_seeded_frame_op(
     // Only ref-base vable ops (`getfield_vable_r/rd>r`,
     // `getarrayitem_vable_r/ridd>r`, `setfield_vable_*/rXd`,
     // `setarrayitem_vable_*/riXdd`) carry the frame ref in operand 0.  The
-    // intbase set variants (`setfield_vable_*/iXd`) take an Int base — not the
-    // seeded ref frame — so reject them.
+    // Any malformed non-Ref-base vable bytecode is not the seeded frame and is
+    // rejected here as a second line of defence behind the assembler.
     let is_frame_vable = d.opname.starts_with("getfield_vable_r")
         || d.opname.starts_with("getarrayitem_vable_r")
         || (d.opname.starts_with("setfield_vable") && d.argcodes.starts_with('r'))

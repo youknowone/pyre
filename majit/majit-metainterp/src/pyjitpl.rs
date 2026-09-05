@@ -2710,11 +2710,17 @@ impl<M: Clone> MetaInterp<M> {
         // storage needs an explicit walker. Independent of `self.tracing`:
         // frames are pushed for both recording and recursive-portal calls.
         for frame in self.framestack.frames.iter_mut() {
-            for slot in frame.ref_regs.iter_mut() {
+            for (slot, concrete) in frame.ref_regs.iter_mut().zip(frame.ref_values.iter_mut()) {
                 // Forward the inline `ConstPtr` gcref in place; non-Const
                 // positions (ResOp / InputArg refs) carry no inline ref.
                 if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
                     visitor(gcref);
+                    // The Box field above is authoritative, but pyre also
+                    // carries a concrete execution mirror.  Keep it aligned
+                    // so a later blackhole-entry root never publishes the
+                    // from-space address (`BlackholeInterpreter.
+                    // _copy_data_from_miframe` calls `box.getref_base()`).
+                    *concrete = Some(gcref.0 as i64);
                 }
             }
         }
@@ -2785,6 +2791,24 @@ impl<M: Clone> MetaInterp<M> {
         // trace walker does not rewrite that cache yet. Stale entries
         // miss after a moving collection and are repopulated by the next
         // CALL_PURE recording.
+
+        // Non-constant Ref registers name the recorder's `RefFrontendOp` /
+        // `InputArgRef`, whose attached concrete value was forwarded above.
+        // RPython has no second value to refresh: `registers_r[i]` is that Box
+        // itself and `getref_base()` reads its updated `_resref`.  Pyre's
+        // `ref_values` mirror must be brought back into line explicitly before
+        // interpreter execution or `_copy_data_from_miframe` reads it.
+        for frame in self.framestack.frames.iter_mut() {
+            for (opref, concrete) in frame.ref_regs.iter().zip(frame.ref_values.iter_mut()) {
+                let Some(opref) = *opref else { continue };
+                if opref.is_constant() {
+                    continue;
+                }
+                if let Some(Value::Ref(gcref)) = trace_ctx.box_value(opref) {
+                    *concrete = Some(gcref.0 as i64);
+                }
+            }
+        }
     }
 
     /// GC walker for ConstPtr GcRefs from snapshot maps during
@@ -23975,6 +23999,30 @@ mod tests {
 
         let ops = meta.tracing.as_ref().unwrap().recorder.ops();
         assert_eq!(ops[0].arg(0).to_opref().as_const_ptr(), Some(GcRef(0xB000)));
+    }
+
+    #[test]
+    fn walk_active_trace_refs_refreshes_miframe_ref_mirrors() {
+        let mut meta = MetaInterp::<()>::new(0);
+        let trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        let input = trace_ctx.recorder.inputargs()[0].opref();
+        trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
+        meta.tracing = Some(trace_ctx);
+
+        let mut b = crate::jitcode::JitCodeBuilder::default();
+        b.ref_return(0);
+        let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(b.finish()), 0);
+        frame.ref_regs[0] = Some(input);
+        frame.ref_values[0] = Some(0x7000);
+        meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == 0x7000 {
+                slot.0 = 0x8000;
+            }
+        });
+
+        assert_eq!(meta.framestack.frames[0].ref_values[0], Some(0x8000));
     }
 
     #[test]

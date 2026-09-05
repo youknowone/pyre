@@ -152,15 +152,6 @@ pub struct BhJitDriverSd {
     /// `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
     /// function returned by `get_portal_runner` for `bh_call_*`.
     pub mainjitcode_calldescr: BhCallDescr,
-    /// `warmspot.py:921` `jd.mainjitcode` — the portal function's jitcode.
-    ///
-    /// `blackhole.py` `_handle_jitexception_in_portal` picks the driver whose
-    /// `mainjitcode is self.jitcode`, so a recursive `ContinueRunningNormally`
-    /// re-enters the portal that raised it and not some other driver's.
-    /// [`portal_jd_for`] asks for that same relation through the back-reference
-    /// `call.py:148` writes (`jd.mainjitcode.jitdriver_sd = jd`), which survives
-    /// a resume path materializing a fresh `Arc`.
-    pub mainjitcode: Option<std::sync::Arc<JitCode>>,
 }
 
 /// How [`BlackholeInterpreter::run`]'s dispatch loop stopped.
@@ -961,7 +952,7 @@ impl BlackholeInterpreter {
             }
         }
         for i in 0..self.jitcode.num_regs_r() {
-            if let Some(val) = miframe.ref_values.get(i).copied().flatten() {
+            if let Some(val) = miframe.ref_value_for_blackhole(i) {
                 self.setarg_r(i, val);
             }
         }
@@ -1023,13 +1014,11 @@ impl BlackholeInterpreter {
     ///
     /// `BC_INLINE_CALL` is the one caller shape that does NOT end in a single
     /// result register: `JitCodeBuilder::inline_call_typed` closes every
-    /// variant with THREE return slots — `return_i`, `return_r`, `return_f`,
-    /// each a register byte or [`crate::jitcode::NO_RETURN_REG`] — because one
-    /// opcode covers all four result kinds.  At most one is a real register, so
-    /// a `NO_RETURN_REG` in the last byte identifies the three-slot tail (a
-    /// single-slot call being resumed always has a real register there, and
-    /// `push_reg_u8` never emits `NO_RETURN_REG` as one).  A float-returning
-    /// inline call needs no branch: its slot is last either way.
+    /// variant with three typed return slots.  Resolve that instruction with
+    /// [`JitCode::inline_call_ending_at`] rather than guessing from a sentinel
+    /// byte: the parser checks the opcode start, payload width and recorded
+    /// result type, so an unrelated operand byte cannot be mistaken for a
+    /// return layout.
     fn call_result_reg(&self, kind: BhReturnType) -> usize {
         // setfield_vable_i: op + struct_reg + value_reg + descr(2 bytes).
         const VSD_SYNC_LEN: usize = 5;
@@ -1038,24 +1027,40 @@ impl BlackholeInterpreter {
         const VSD_FIELD_IDX: usize = 2;
         let code = &self.jitcode.code;
         let pos = self.position;
+
+        let inline_result = |end_pc: usize| {
+            self.jitcode.inline_call_ending_at(end_pc).map(|site| {
+                let slot = match kind {
+                    BhReturnType::Int => site.return_i,
+                    BhReturnType::Ref => site.return_r,
+                    BhReturnType::Float => site.return_f,
+                    BhReturnType::Void => None,
+                };
+                slot.unwrap_or_else(|| {
+                    panic!(
+                        "call_result_reg: inline call ending at {end_pc} has no {kind:?} result slot"
+                    )
+                })
+            })
+        };
+
+        if let Some(slot) = inline_result(pos) {
+            return slot;
+        }
+
         if pos > VSD_SYNC_LEN
+            && self
+                .jitcode
+                .startpoints
+                .as_ref()
+                .is_some_and(|starts| starts.contains(&(pos - VSD_SYNC_LEN)))
             && code[pos - VSD_SYNC_LEN] == majit_translate::insns::BC_SETFIELD_VABLE_I
             && let Some(descr_idx) = self.peek_u16_at(pos - 2)
             && let Some(BhDescr::VableField { index }) = self.runtime_bh_descr(descr_idx as usize)
             && *index == VSD_FIELD_IDX
         {
-            return code[pos - VSD_SYNC_LEN - 1] as usize;
-        }
-        if code[pos - 1] == crate::jitcode::NO_RETURN_REG && pos >= 3 {
-            let slot_back = match kind {
-                BhReturnType::Int => 3,
-                BhReturnType::Ref => 2,
-                // A void return sets up no value, so this arm is unreachable
-                // through `_setup_return_value_*`; keep it on the last slot,
-                // which is where the single-slot convention would land.
-                BhReturnType::Float | BhReturnType::Void => 1,
-            };
-            return code[pos - slot_back] as usize;
+            let call_end = pos - VSD_SYNC_LEN;
+            return inline_result(call_end).unwrap_or(code[call_end - 1] as usize);
         }
         code[pos - 1] as usize
     }
@@ -3368,10 +3373,11 @@ pub fn convert_and_run_from_pyjitpl(
 
     let Some(mut first_bh) = next_bh else {
         majit_gc::shadow_stack::pop_resume_ref_roots_to(roots_depth);
-        // An empty framestack converted nothing, so no frame ran and none
-        // returned; `blackhole.py convert_and_run_from_pyjitpl` is always
-        // handed at least the portal level.
-        return JitException::BailToInterpreter;
+        // `blackhole.py convert_and_run_from_pyjitpl` unconditionally reads
+        // `firstbh.exception_last_value`: its caller invariant is a non-empty
+        // portal framestack.  A silent BailToInterpreter turns corruption of
+        // that invariant into an apparently resumable interpreter exit.
+        panic!("convert_and_run_from_pyjitpl: metainterp framestack is empty");
     };
     // blackhole.py:1812-1818
     let current_exc = if raising_exception {
@@ -3381,7 +3387,7 @@ pub fn convert_and_run_from_pyjitpl(
         0
     };
 
-    // `warmspot.py:1010-1013` hands `ll_portal_runner` to the blackhole so a
+    // `warmspot.py` hands `ll_portal_runner` to the blackhole so a
     // recursive portal level can re-enter the portal function.  Without it
     // `handle_jitexception_dispatch` has nothing to call and
     // `ContinueRunningNormally` reaches its `expect`.
@@ -4040,15 +4046,16 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_bad_shift_count_is_rejected() {
-        for opcode in [OpCode::IntLshift, OpCode::IntRshift, OpCode::UintRshift] {
-            for count in [-1, 64] {
-                assert!(
-                    std::panic::catch_unwind(|| exec_binop(opcode, 7, count)).is_err(),
-                    "{opcode:?} silently accepted shift count {count}",
-                );
-            }
-        }
+    fn test_executor_translated_shift_count_is_word_masked() {
+        // `check_shift_count` is untranslated-test scaffolding in PyPy.  The
+        // translated blackhole reaches the machine-word shift, whose count is
+        // masked to the low six bits on pyre's 64-bit targets.
+        assert_eq!(exec_binop(OpCode::IntLshift, 7, 64), 7);
+        assert_eq!(exec_binop(OpCode::IntRshift, 7, 64), 7);
+        assert_eq!(exec_binop(OpCode::UintRshift, 7, 64), 7);
+        assert_eq!(exec_binop(OpCode::IntLshift, 7, -1), i64::MIN);
+        assert_eq!(exec_binop(OpCode::IntRshift, 7, -1), 0);
+        assert_eq!(exec_binop(OpCode::UintRshift, 7, -1), 0);
     }
 
     // ── IntSignext ──
@@ -4211,6 +4218,36 @@ mod tests {
                 outcome,
                 crate::jitexc::JitException::DoneWithThisFrameInt(42)
             );
+        }
+
+        /// `BlackholeInterpreter._copy_data_from_miframe` reads each
+        /// `registers_r[i].getref_base()`. For a ConstPtr that means the
+        /// GC-forwarded value stored on the box, never pyre's execution mirror.
+        #[test]
+        fn copy_data_from_miframe_reads_forwarded_constptr_owner() {
+            use crate::pyjitpl::MIFrame;
+            use majit_ir::{GcRef, OpRef};
+
+            let mut b = JitCodeBuilder::default();
+            b.ref_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut frame = MIFrame::new(jitcode, 0);
+            frame.ref_regs[0] = Some(OpRef::const_ptr(GcRef(0xBEEF)));
+            frame.ref_values[0] = Some(0xDEAD);
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.copy_data_from_miframe(&frame);
+
+            assert_eq!(bh.registers_r[0], 0xBEEF);
+        }
+
+        #[test]
+        #[should_panic(expected = "metainterp framestack is empty")]
+        fn convert_and_run_from_pyjitpl_rejects_empty_framestack() {
+            let mut builder = build_test_bh_builder();
+            let framestack = crate::pyjitpl::MIFrameStack::empty();
+            let _ = convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
         }
 
         /// `_setup_return_value_i` must read `BC_INLINE_CALL`'s `return_i` slot,
@@ -5869,35 +5906,50 @@ mod tests {
         }
 
         #[test]
-        fn wire_bhimpl_handlers_wires_tagged_int_base_access_aliases() {
-            // Canonical RPython opnames (`_i`/`_r`/`_f`) emitted by pyre's
-            // build-time assembler — including the pyre tagged-int base
-            // variant (`/id>X`, `/iXd`, `/iid>X`) that carries the base
-            // pointer in an int register. Emit side: majit-translate
-            // assembler.rs FieldRead/FieldWrite/ArrayRead/VableFieldRead/
-            // VableFieldWrite derive the opname kind suffix from the
-            // value/result register kind.
+        fn wire_bhimpl_handlers_wires_non_vable_int_base_access_aliases() {
+            // Raw/tagged-pointer getfield/setfield/array operations may carry
+            // their base in the Int bank.  Virtualizable operations may not:
+            // every PyPy `bhimpl_*_vable_*` declares its base as `"r"`, and
+            // only the Ref bank is GC-forwarded.
             let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
             insns.insert("getfield_gc_i/id>i".to_string(), 0u8);
             insns.insert("getfield_gc_r/id>r".to_string(), 1u8);
             insns.insert("setfield_gc_i/iid".to_string(), 2u8);
             insns.insert("setfield_gc_r/ird".to_string(), 3u8);
             insns.insert("getarrayitem_gc_i/iid>i".to_string(), 4u8);
-            insns.insert("getfield_vable_i/id>i".to_string(), 5u8);
-            insns.insert("setfield_vable_i/iid".to_string(), 6u8);
-            insns.insert("setfield_vable_r/ird".to_string(), 7u8);
 
             let mut builder = BlackholeInterpBuilder::new();
             builder.setup_insns(&insns);
             super::wire_bhimpl_handlers(&mut builder);
 
             let placeholder = super::unwired_handler_placeholder as *const () as usize;
-            for slot in 0usize..=7 {
+            for slot in 0usize..=4 {
                 assert_ne!(
                     builder.dispatch_table[slot] as *const () as usize, placeholder,
                     "slot {slot} must be wired",
                 );
             }
+        }
+
+        #[test]
+        fn wire_bhimpl_handlers_rejects_vable_int_base_aliases() {
+            let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
+            insns.insert("getfield_vable_i/id>i".to_string(), 0u8);
+            insns.insert("setfield_vable_i/iid".to_string(), 1u8);
+            insns.insert("setfield_vable_r/ird".to_string(), 2u8);
+
+            let mut builder = BlackholeInterpBuilder::new();
+            builder.setup_insns(&insns);
+            super::wire_bhimpl_handlers(&mut builder);
+
+            assert_eq!(
+                builder.unwired_opnames(),
+                vec![
+                    "getfield_vable_i/id>i",
+                    "setfield_vable_i/iid",
+                    "setfield_vable_r/ird",
+                ],
+            );
         }
 
         #[test]
@@ -6418,37 +6470,24 @@ fn bhimpl_int_xor(a: i64, b: i64) -> i64 {
     a ^ b
 }
 
-/// `blackhole.py check_shift_count` — the untranslated blackhole rejects a
-/// count outside the machine-word range instead of letting the host language
-/// mask it.  Rust's shift operators panic only in debug for some spellings,
-/// while `wrapping_shl` masks by definition, so keep the upstream check
-/// explicit and identical for all three bhimpls.
-#[inline]
-fn check_shift_count(b: i64) {
-    assert!(
-        (0..i64::BITS as i64).contains(&b),
-        "Shift count, {b}, not in valid range, 0 .. {}.",
-        i64::BITS - 1,
-    );
-}
-
 /// blackhole.py `bhimpl_int_rshift(a, b): check_shift_count(b); return a >> b`.
 fn bhimpl_int_rshift(a: i64, b: i64) -> i64 {
-    check_shift_count(b);
-    a >> (b as u32)
+    // `check_shift_count` is guarded by `not we_are_translated()` upstream;
+    // the translated blackhole reaches the machine operation directly.  Pyre
+    // is always that translated runtime, so use the word-masked operation
+    // rather than turning an out-of-range count into a Rust panic.
+    a.wrapping_shr(b as u32)
 }
 
 /// blackhole.py `bhimpl_int_lshift(a, b): check_shift_count(b); return intmask(a << b)`.
 fn bhimpl_int_lshift(a: i64, b: i64) -> i64 {
-    check_shift_count(b);
     a.wrapping_shl(b as u32)
 }
 
 /// blackhole.py `bhimpl_uint_rshift(a, b): check_shift_count(b); return
 /// intmask(r_uint(a) >> r_uint(b))`.
 fn bhimpl_uint_rshift(a: i64, b: i64) -> i64 {
-    check_shift_count(b);
-    ((a as u64) >> (b as u32)) as i64
+    (a as u64).wrapping_shr(b as u32) as i64
 }
 
 /// blackhole.py `bhimpl_int_neg(a): return intmask(-a)`.
@@ -7224,7 +7263,7 @@ fn bhimpl_hint_force_virtualizable(_r: i64) {}
 /// `ContinueRunningNormally` is raised at a recursive portal level
 /// (`warmspot.py handle_jitexception_from_blackhole`).
 ///
-/// `warmspot.py:1010-1013` `jd.handle_jitexc_from_bh`, one per jitdriver.
+/// `warmspot.py` `jd.handle_jitexc_from_bh`, one per jitdriver.
 pub type PortalRunnerHook =
     fn(&crate::jitexc::JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>;
 
@@ -7267,7 +7306,8 @@ pub fn register_portal_runner_hook(jd_index: usize, hook: PortalRunnerHook) {
 /// `bh` is the portal frame that raised, i.e. upstream's `self`.
 ///
 /// The relation that loop walks is established from the other end by
-/// `call.py:148` `jd.mainjitcode.jitdriver_sd = jd`, so `jd.mainjitcode is
+/// `CallControl.find_all_graphs`'s `jd.mainjitcode.jitdriver_sd = jd`, so
+/// `jd.mainjitcode is
 /// self.jitcode` and `self.jitcode.jitdriver_sd is jd` answer the same
 /// question.  Reading the stamp is also the form `_run_forever`'s walk already
 /// uses to decide where to stop (`jitcode.jitdriver_sd().is_none()`), so asking
@@ -10933,23 +10973,18 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("cast_ptr_to_int/r>i", handler_cast_ptr_to_int);
     builder.wire_handler("cast_int_to_ptr/i>r", handler_cast_int_to_ptr);
 
-    // Vable field operations — canonical `/rd>X` / `/rXd` RPython shape
-    // (blackhole.py:1446-1495). pyre tagged-int base adds `/id>X` /
-    // `/iXd` variants handled by the `*_intbase` helpers. The
-    // Void/State/Unknown kinds follow the same rule as the plain field
-    // ops: the emit side (`majit-translate/src/codewriter/assembler.rs`
-    // `OpKind::FieldRead`/`FieldWrite`) derives the opname kind suffix
-    // from the value/result register's kind, so the `_v` sentinel form
-    // is no longer produced.
+    // Vable field operations — canonical `/rd>X` / `/rXd` RPython shape.
+    // Every `BlackholeInterpreter.bhimpl_*field_vable_*` declares the base
+    // operand as `r`; the assembler rejects an Int-bank base before it can
+    // produce an unrooted `/id>X` or `/iXd` bytecode. The result/value suffix
+    // still follows the concrete register kind, and the dead `_v` sentinel
+    // form is not emitted.
     builder.wire_handler("getfield_vable_i/rd>i", handler_getfield_vable_i);
     builder.wire_handler("getfield_vable_r/rd>r", handler_getfield_vable_r);
     builder.wire_handler("getfield_vable_f/rd>f", handler_getfield_vable_f);
-    builder.wire_handler("getfield_vable_i/id>i", handler_getfield_vable_i_intbase);
     builder.wire_handler("setfield_vable_i/rid", handler_setfield_vable_i);
     builder.wire_handler("setfield_vable_r/rrd", handler_setfield_vable_r);
     builder.wire_handler("setfield_vable_f/rfd", handler_setfield_vable_f);
-    builder.wire_handler("setfield_vable_i/iid", handler_setfield_vable_i_intbase);
-    builder.wire_handler("setfield_vable_r/ird", handler_setfield_vable_r_intbase);
     builder.wire_handler("getarrayitem_vable_i/ridd>i", handler_getarrayitem_vable_i);
     builder.wire_handler("getarrayitem_vable_r/ridd>r", handler_getarrayitem_vable_r);
     builder.wire_handler("setarrayitem_vable_i/riidd", handler_setarrayitem_vable_i);
@@ -11535,26 +11570,7 @@ fn handler_getfield_vable_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
-    }
-    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
-    let cpu = bh.cpu();
-    bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
-    Ok(p + 1)
-}
-fn handler_getfield_vable_i_intbase(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[p] as usize];
-    bh_vable_intbase_report(bh, struct_ptr, "getfield_vable_i");
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
-    }
+    vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
@@ -11566,10 +11582,7 @@ fn handler_getfield_vable_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
-    }
+    vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, &descr).0 as i64;
@@ -11581,10 +11594,7 @@ fn handler_getfield_vable_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
-    }
+    vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
@@ -11598,57 +11608,7 @@ fn handler_setfield_vable_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_i[code[p + 1] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
-    }
-    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
-    Ok(p)
-}
-/// `MAJIT_BH_VABLE_INTBASE`: report a vable base read out of the int bank that
-/// disagrees with the frame's forwarded virtualizable address.
-///
-/// The `*_vable_*_intbase` handlers take their struct operand from
-/// `registers_i`, and no walker forwards the int banks — only `registers_r`,
-/// the packed resume roots, and `virtualizable_ptr` are.  So a collection
-/// between the write of that int register and the handler leaves the address
-/// pointing where the object used to be, and the store lands in memory the
-/// collector has already reused.
-///
-/// `virtualizable_ptr` names the same object and IS forwarded (the drivers root
-/// it beside the Ref bank, precisely because a `-live-` clear can drop it from
-/// the bank), so the two disagreeing is the observable form of that staleness.
-/// Reported rather than repaired: the vable bytecodes are operand-addressed by
-/// design and substituting the rooted address would change which object a
-/// multi-virtualizable chain writes to.  Off unless armed.
-fn bh_vable_intbase_report(bh: &BlackholeInterpreter, struct_ptr: i64, opname: &str) {
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ARMED.get_or_init(|| std::env::var_os("MAJIT_BH_VABLE_INTBASE").is_some()) {
-        return;
-    }
-    if bh.virtualizable_ptr != 0 && struct_ptr != bh.virtualizable_ptr {
-        eprintln!(
-            "[bh-vable-intbase] {opname}: int-bank base {struct_ptr:#x} != \
-             forwarded virtualizable {:#x} (jitcode {:?} pos {} last {})",
-            bh.virtualizable_ptr, bh.jitcode.name, bh.position, bh.last_opcode_position,
-        );
-    }
-}
-
-fn handler_setfield_vable_i_intbase(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[p] as usize];
-    bh_vable_intbase_report(bh, struct_ptr, "setfield_vable_i");
-    let value = bh.registers_i[code[p + 1] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
-    }
+    vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
@@ -11661,27 +11621,7 @@ fn handler_setfield_vable_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_r[code[p + 1] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
-    }
-    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu();
-    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
-    Ok(p)
-}
-fn handler_setfield_vable_r_intbase(
-    bh: &mut BlackholeInterpreter,
-    code: &[u8],
-    p: usize,
-) -> Result<usize, DispatchError> {
-    let struct_ptr = bh.registers_i[code[p] as usize];
-    bh_vable_intbase_report(bh, struct_ptr, "setfield_vable_r");
-    let value = bh.registers_r[code[p + 1] as usize];
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
-    }
+    vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
@@ -11694,10 +11634,7 @@ fn handler_setfield_vable_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 1] as usize] as u64);
-    if !bh.virtualizable_info.is_null() {
-        let vinfo = unsafe { &*bh.virtualizable_info };
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
-    }
+    vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_f(struct_ptr, value, &descr);
@@ -11726,15 +11663,15 @@ fn handler_setfield_vable_f(
 // single-indirection storage so the canonical cpu chain works
 // directly.
 /// Resolve `bh.virtualizable_info` to a non-null reference and clear the
-/// vable token on `vable`.  RPython parity: vable array ops obtain the
-/// `vinfo` from `fielddescr.get_vinfo()` (`blackhole.py:1374`); pyre
-/// stores the same handle on `bh.virtualizable_info` because pyre's
-/// `BhDescr::VableArray` carries only an index into the
-/// vinfo-shared `array_fields` table (`vable_array_index`) and the
-/// vinfo itself is set when the production frame enters the
-/// virtualizable scope.  Vable array opcodes therefore require
+/// vable token on `vable`.  RPython parity: every
+/// `BlackholeInterpreter.bhimpl_{get,set}field_vable_*` and
+/// `bhimpl_{get,set}arrayitem_vable_*` obtains the vinfo from
+/// `fielddescr.get_vinfo()` and clears the token before touching storage.
+/// Pyre stores the same handle on `bh.virtualizable_info` because its
+/// `BhDescr::VableField` and `BhDescr::VableArray` contain only indices into
+/// the vinfo-owned field tables.  Vable opcodes therefore require
 /// `bh.virtualizable_info` to be non-null; an unset pointer means a
-/// builder constructed a vable-array bytecode outside a virtualizable
+/// builder constructed vable bytecode outside a virtualizable
 /// context — a contract bug that must fail loud in both debug and
 /// release builds, since the alternative is silent unsafe deref of a
 /// null pointer.
@@ -11744,8 +11681,8 @@ fn vable_clear_token_and_get_vinfo(
 ) -> &'static crate::virtualizable::VirtualizableInfo {
     if bh.virtualizable_info.is_null() {
         panic!(
-            "vable array opcode requires `bh.virtualizable_info` to be set \
-             (RPython `blackhole.py:1374 fielddescr.get_vinfo()` parity); \
+            "vable opcode requires `bh.virtualizable_info` to be set \
+             (RPython `BlackholeInterpreter.bhimpl_*field_vable_*` parity); \
              a null pointer here is a contract bug, not a recoverable case"
         );
     }

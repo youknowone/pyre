@@ -1102,6 +1102,37 @@ impl VirtualizableInfo {
             self.array_fields.len(),
             descrs.len()
         );
+        // A compiled array access reads its stride and signedness off these
+        // descriptors, while the blackhole reads and writes go through the
+        // cached `VableArrayInfo::item_size` / `item_signed`
+        // (`bh_getarrayitem_gc_i` dispatches on the pair).  A replacement that
+        // disagrees would leave the two halves loading a different width from
+        // a different address for the same array, so require the replacement
+        // to preserve what the cache already committed to.  `item_signed`
+        // selects a load only for `Int` items; `Ref` and `Float` have one
+        // representation each.
+        for (field, descr) in self.array_fields.iter().zip(descrs.iter()) {
+            let arr = descr.as_array_descr().unwrap_or_else(|| {
+                panic!(
+                    "replace_array_descrs: {} was given a descriptor that is                      not an ArrayDescr",
+                    field.name
+                )
+            });
+            assert_eq!(
+                arr.item_size(),
+                field.item_size,
+                "replace_array_descrs: {} replacement stride does not match                  the cached item_size",
+                field.name,
+            );
+            if field.item_type == Type::Int {
+                assert_eq!(
+                    arr.is_item_signed(),
+                    field.item_signed,
+                    "replace_array_descrs: {} replacement signedness does not                      match the cached item_signed",
+                    field.name,
+                );
+            }
+        }
         self.array_descrs = descrs;
     }
 
@@ -3105,10 +3136,21 @@ pub(crate) unsafe fn bhimpl_arraybase_vable(
         match array.storage {
             VableArrayStorage::EmbeddedArray { ptr_offset } => {
                 let container = *(vable_ptr.add(array.field_offset) as *const *const u8);
+                // Offsetting a null pointer is undefined behaviour even when
+                // the caller is about to reject the result: `add` requires the
+                // pointer to stay inside one allocation.  Hand the null back
+                // so `vable_read_array_item` / `vable_write_array_item` fail
+                // on their own null assertion, which names the array.
+                if container.is_null() {
+                    return std::ptr::null();
+                }
                 *(container.add(ptr_offset) as *const *const u8)
             }
             VableArrayStorage::DirectPointer => {
                 let arr_ptr = *(vable_ptr.add(array.field_offset) as *const *const u8);
+                if arr_ptr.is_null() {
+                    return std::ptr::null();
+                }
                 arr_ptr.add(array.items_offset)
             }
             VableArrayStorage::RustVec { data_ptr_fn, .. } => {
@@ -3337,7 +3379,7 @@ pub(crate) unsafe fn vable_write_array_item_at(
 
 /// virtualizable.py clear_vable_token, blackhole context.
 ///
-/// `virtualizable.py:218-222` is `if virtualizable.vable_token: force_now(...)`
+/// `virtualizable.py` is `if virtualizable.vable_token: force_now(...)`
 /// followed by `assert not virtualizable.vable_token`, and `force_now`
 /// (`:248-260`) splits on the token:
 ///

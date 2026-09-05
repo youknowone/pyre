@@ -198,6 +198,36 @@ impl MIFrame {
         }
     }
 
+    /// `history.py AbstractValue.getref_base()` for one entry of
+    /// `MIFrame.registers_r`.
+    ///
+    /// The symbolic register is the owner, just as the Box is upstream.  A
+    /// `ConstPtr` carries its GC-traced value inline and
+    /// `MetaInterp::walk_active_trace_refs` forwards that field in place;
+    /// `ref_values` is only pyre's concrete execution mirror and may still
+    /// contain the from-space address.  Non-constant frontend boxes keep
+    /// using the mirror, which the active-trace walker refreshes from the
+    /// Box-attached concrete value after every collection.
+    pub(crate) fn ref_value_for_blackhole(&self, index: usize) -> Option<i64> {
+        match self.ref_regs.get(index).copied().flatten() {
+            Some(OpRef::ConstPtr(gcref)) => Some(gcref.0 as i64),
+            Some(_) | None => self.ref_values.get(index).copied().flatten(),
+        }
+    }
+
+    /// Publish a forwarding update into both halves of a Ref register.
+    ///
+    /// The packed blackhole-entry root array can itself be forwarded before
+    /// `_copy_data_from_miframe` runs.  Updating only `ref_values` would leave
+    /// the authoritative inline `ConstPtr.value` stale, so keep the Box owner
+    /// and the execution mirror in lockstep.
+    pub(crate) fn set_forwarded_ref_value(&mut self, index: usize, value: i64) {
+        self.ref_values[index] = Some(value);
+        if let Some(OpRef::ConstPtr(gcref)) = self.ref_regs[index].as_mut() {
+            *gcref = majit_ir::GcRef(value as usize);
+        }
+    }
+
     /// RPython `pyjitpl.py` `MIFrame.setup(jitcode, greenkey=None)`.
     ///
     /// This is the entry-point that should back normal frame creation:

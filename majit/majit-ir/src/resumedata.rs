@@ -386,7 +386,8 @@ pub fn decode_tagged_value(
                 RebuiltValue::Unassigned
             } else {
                 let idx = (val - TAG_CONST_OFFSET) as usize;
-                // resume.py:1554/1571/1583 `self.consts[num -
+                // resume.py `ResumeDataDirectReader.decode_int` /
+                // `decode_ref` / `decode_float` each read `self.consts[num -
                 // TAG_CONST_OFFSET]` — a plain index, so an out-of-range
                 // number is an `IndexError` there.  The Const carries its type
                 // with it, which is why there is no defaulting answer to give:

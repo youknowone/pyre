@@ -2845,7 +2845,6 @@ pub fn blackhole_resume_via_rd_numb(
             // `portal_jd_for` from claiming a frame for a synthetic driver
             // assembled around whichever jitcode happened to be innermost when
             // the chain was built.
-            mainjitcode: None,
         }]);
     {
         let vinfo = bh.virtualizable_info;

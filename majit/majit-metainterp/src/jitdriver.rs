@@ -150,9 +150,6 @@ fn build_bh_jitdrivers_sd(
                 result_type,
                 portal_runner_ptr,
                 mainjitcode_calldescr,
-                // warmspot.py:921 `jd.mainjitcode`; `portal_jd_for` matches
-                // it against the raising portal frame's own jitcode.
-                mainjitcode: jd.mainjitcode.clone(),
             }
         })
         .collect()
@@ -231,11 +228,12 @@ pub fn drive_single_frame_blackhole(
     // pooled builder may allocate.  Option<i64> is not a contiguous root area,
     // so keep an index-parallel packed root vector and copy forwarding updates
     // back before copy_data_from_miframe reads the MIFrame.
-    let mut ref_roots: Vec<(usize, i64)> = miframe
-        .ref_values
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| value.map(|value| (index, value)))
+    let mut ref_roots: Vec<(usize, i64)> = (0..miframe.ref_regs.len())
+        .filter_map(|index| {
+            miframe
+                .ref_value_for_blackhole(index)
+                .map(|value| (index, value))
+        })
         .collect();
     let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     let mut packed_ref_roots: Vec<i64> = ref_roots.iter().map(|(_, value)| *value).collect();
@@ -272,7 +270,7 @@ pub fn drive_single_frame_blackhole(
     );
     for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
         *value = *forwarded;
-        miframe.ref_values[*index] = Some(*forwarded);
+        miframe.set_forwarded_ref_value(*index, *forwarded);
     }
     if let Some(index) = exception_root {
         last_exc_value = packed_ref_roots[index];
@@ -411,10 +409,10 @@ pub fn drive_multi_frame_blackhole(
     let mut ref_locations = Vec::new();
     let mut packed_ref_roots = Vec::new();
     for (frame_index, frame) in framestack.frames.iter().enumerate() {
-        for (color, value) in frame.ref_values.iter().enumerate() {
-            if let Some(value) = value {
+        for color in 0..frame.ref_regs.len() {
+            if let Some(value) = frame.ref_value_for_blackhole(color) {
                 ref_locations.push((frame_index, color));
-                packed_ref_roots.push(*value);
+                packed_ref_roots.push(value);
             }
         }
     }
@@ -437,7 +435,7 @@ pub fn drive_multi_frame_blackhole(
         .into_iter()
         .zip(packed_ref_roots.iter().copied())
     {
-        framestack.frames[frame_index].ref_values[color] = Some(forwarded);
+        framestack.frames[frame_index].set_forwarded_ref_value(color, forwarded);
     }
     if let Some(index) = exception_root {
         last_exc_value = packed_ref_roots[index];
@@ -5540,7 +5538,7 @@ impl<S: JitState> JitDriver<S> {
                 }
                 return Err(Decline::ReservedIdentitySlots);
             }
-            // `resume.py:1338` `jitcode = jitcodes[jitcode_pos]`: the position
+            // `resume.py` `jitcode = jitcodes[jitcode_pos]`: the position
             // is an offset into the jitcode the frame NAMES. Entering a
             // different one at that offset lands mid-instruction in unrelated
             // code, and the walk decodes whatever byte is there. The root frame
@@ -8978,7 +8976,7 @@ impl<S: JitState> JitDriver<S> {
         //     `ctx.virtualizable_boxes` / `virtualizable_values` /
         //     `virtualizable_array_lengths` from resume-decoded values.
         //
-        //   * `pyjitpl.py:3437 self.synchronize_virtualizable()`, the
+        //   * `pyjitpl.py self.synchronize_virtualizable()`, the
         //     routine's closing line, writes those same vable boxes back
         //     onto the live virtualizable. It is
         //     `ctx.synchronize_virtualizable_after_guard_failure()` below,
