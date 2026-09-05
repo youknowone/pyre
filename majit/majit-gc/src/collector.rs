@@ -6309,9 +6309,12 @@ impl MiniMarkGC {
             // another bare `_minor_collection()` before the next major step;
             // repeating only the major step lets a high-survival nursery keep
             // growing faster than marking observes it.
-            let threshold = self.threshold_bytes_made_old.saturating_sub(extrasize);
-            if self.bytes_made_old_since_cycle <= threshold {
-                break;
+            let mut threshold = self.threshold_bytes_made_old;
+            if threshold >= extrasize {
+                threshold -= extrasize;
+                if self.bytes_made_old_since_cycle <= threshold {
+                    break;
+                }
             }
             self.minor_collection_body();
         }
@@ -12911,6 +12914,44 @@ mod tests {
         assert!(gc.minor_collections > minors_before);
         gc.pending_reserving_size = 0;
         gc.roots.clear();
+    }
+
+    #[test]
+    fn reserving_more_than_credit_requires_progress_even_without_promotions() {
+        // `IncrementalMiniMarkGC.minor_collection_with_major_progress` only
+        // tests target A2 after `threshold >= extrasize`. Saturating the
+        // subtraction would let zero promoted bytes satisfy a negative budget.
+        for (extrasize, extra_minors) in [(0, 0), (512, 0), (513, 1), (1024, 1), (1025, 2)] {
+            let word = std::mem::size_of::<GcRef>();
+            let mut gc = test_gc(1024);
+            let tid = gc.register_type(TypeInfo::with_gc_ptrs(word, vec![0]));
+            let mut root = GcRef::NULL;
+            for _ in 0..8 {
+                let object = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + word);
+                unsafe { *(object.0 as *mut GcRef) = root };
+                root = object;
+            }
+            unsafe { gc.roots.add(&mut root) };
+            gc.set_mark_budget(1);
+            gc.start_incremental_cycle();
+            gc.bytes_made_old_since_cycle = 0;
+            gc.threshold_bytes_made_old = 0;
+            gc.pending_reserving_size = extrasize;
+            let minors_before = gc.minor_collections;
+
+            gc.run_major_progress_after_minor();
+
+            assert_eq!(gc.gc_state, GcState::Marking);
+            assert_eq!(gc.bytes_made_old_since_cycle, 0);
+            assert_eq!(
+                gc.minor_collections - minors_before,
+                extra_minors,
+                "reservation {extrasize} must fit the credit even without promotions"
+            );
+            assert!(gc.threshold_bytes_made_old >= extrasize);
+            gc.pending_reserving_size = 0;
+            gc.roots.clear();
+        }
     }
 
     #[test]
