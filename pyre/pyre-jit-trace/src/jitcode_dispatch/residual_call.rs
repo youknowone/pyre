@@ -279,31 +279,16 @@ macro_rules! latchdbg {
     };
 }
 
-/// Snapshot the live meta-interpreter framestack for a `SwitchToBlackhole`
-/// that stops the walk at an arbitrary coordinate.
+/// Snapshot the live meta-interpreter framestack for an abort at `resume_pc`.
+/// RPython's `run_blackhole_interp_to_cancel_tracing` routes every
+/// `SwitchToBlackhole` through `convert_and_run_from_pyjitpl`, which copies the
+/// current frame and all paused callers at their current program counters.
+/// [`WalkContext`] and [`WalkSession::framestack`] own the corresponding banks.
 ///
-/// Two triggers reach it, and both need the same image:
-///
-/// - `ABORT_TOO_LONG`.  RPython calls `blackhole_if_trace_too_long()`
-///   immediately after `MIFrame.run_one_step()` and
-///   `convert_and_run_from_pyjitpl` copies every live MIFrame at its
-///   already-advanced `pc` (`pyjitpl.py:2863-2866`, `blackhole.py:1799-1821`).
-///   `convert_and_run_from_pyjitpl`).
-///   `resume_pc` is `walk()`'s post-step `next_pc`.
-/// - A bridge carrier sub-walk that stopped on a walker capability gap.  That
-///   sub-walk IS the reconstructed callee's one real execution (see
-///   `drive_bridge_frame_subwalk`'s `is_authoritative_executor` contract), so
-///   the drain may not discard it and let the guard resume from `rd_numb` —
-///   that re-runs every residual it already ran.  `resume_pc` is the
-///   unexecuted instruction the walk stopped at
-///   ([`DispatchError::stop_pc`]), which is the same "arbitrary coordinate"
-///   shape.  Upstream never rewinds an aborted bridge either:
-///   `_handle_guard_failure` ends `assert False, "should always raise"`
-///   (`pyjitpl.py:2956`) and the conversion continues from the frames
-///   `interpret()` reached.
-///
-/// Either way the current [`WalkContext`] plus [`WalkSession::framestack`] own
-/// the concrete banks for the live frame and all paused callers.
+/// The caller must supply the next instruction for a completed step, or the
+/// stopped instruction for a capability gap.  Propagation through enclosing
+/// `walk()` calls must preserve the first image; otherwise the caller would
+/// replace the innermost frame where execution stopped.
 ///
 /// Return `false` without publishing a partial image when any live value is
 /// unresolved.  A zero-effect walk may then use the legacy entry replay;
@@ -597,6 +582,31 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         );
         false
     }
+}
+
+/// Prepare a quasi-immutable abort raised at `resume_pc`.
+///
+/// RPython's `_get_opimpl_method` advances `MIFrame.pc` before calling
+/// `opimpl_jit_force_quasi_immutable`; `convert_and_run_from_pyjitpl` therefore
+/// resumes after the qmut marker.  Pyre synthesizes that marker immediately
+/// before the residual operation it protects, so `resume_pc` is the same
+/// next-to-run position.  Inline aborts capture the whole framestack; root
+/// aborts retain the operand stack for `flush_qmut_abort_state`.
+fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    resume_pc: usize,
+) {
+    if ctx.fbw_mode.inline_subwalk {
+        // This is a new unwind, so a retained image from a recovered sub-walk
+        // must not replace its coordinate.
+        reset_single_frame_blackhole();
+        let _ = latch_abort_blackhole(ctx, resume_pc, "force-qmut");
+    } else if ctx.vstack_valid && !ctx.trace_ctx.is_bridge_trace {
+        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
+    }
+    // The session flag survives recovered sub-walks; always overwrite it at
+    // the raise site so a later root-frame abort cannot inherit `true`.
+    ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
 }
 
 /// Read-only counterpart of every adopter gate that can reject a latched
@@ -5631,45 +5641,15 @@ fn journal_walker_namespace_write<Sym: WalkSym>(
     Some(())
 }
 
-/// `pyjitpl.py opimpl_jit_force_quasi_immutable` for the module
-/// namespace's `version?` (`celldict.py _immutable_fields_ = ["version?"]`),
-/// asked ahead of an opaque STORE_NAME / STORE_GLOBAL / DELETE_NAME /
-/// DELETE_GLOBAL residual.
+/// Mirror `opimpl_jit_force_quasi_immutable` for a module namespace's
+/// `version?` before an opaque namespace-write residual.
 ///
-/// ```text
-///  mutatebox = self.execute_with_descr(rop.GETFIELD_GC_R, mutatefielddescr, box)
-///  if mutatebox.nonnull():
-///      do_force_quasi_immutable(cpu, box.getref_base(), mutatefielddescr)
-///      raise SwitchToBlackhole(Counters.ABORT_FORCE_QUASIIMMUT)
-///  self.metainterp.generate_guard(rop.GUARD_ISNULL, mutatebox, resumepc=orgpc)
-/// ```
-///
-/// Upstream meets the rtyper's `jit_force_quasi_immutable` inside the traced
-/// write (`rclass.py:715-718`) and abandons the attempt cheaply, which is why
-/// PyPy reports thousands of `abort: force quasi-immut` on this program shape
-/// and still compiles its loops. Pyre's write runs inside a frontend helper the
-/// walker never looks into, so the walker asks the same question here instead of
-/// meeting the operation; without it the trace completes carrying a `version`
-/// constant that is already stale, and the optimizer's revalidation then
-/// discards the loop *and* every interpreter entry bridge.
-///
-/// `is_installed()` is `mutatebox.nonnull()`; the bump predicate is
-/// [`pyre_object::celldict::store_would_bump_version`], the side-effect-free
-/// twin of `write_cell`, because only the write that replaces the stored
-/// pointer reaches `mutated()` (`celldict.py`) — an in-place cell write
-/// leaves `version` alone and a hot module-scope loop must keep its trace.
-///
-/// Deliberately NO `GUARD_ISNULL` arm on the not-installed path. Upstream's
-/// guard licenses the traced *inline* setfield that bypasses the invalidation
-/// function (`pyjitpl.py:1095-1102`); pyre's write stays inside the residual,
-/// which runs `notify_version_watchers` itself at runtime, so there is no
-/// bypass to license.
-///
-/// Fires BEFORE the residual executes, so the write is still entirely ahead of
-/// the walk — that is what lets the abort resume the interpreter at this opcode
-/// and have the write happen exactly once.  Everything the walk applied EARLIER
-/// stays applied: [`DispatchError::ForceQuasiImmutable`] carries the abort to
-/// the flush leg that commits the journal instead of replaying the region.
+/// The walker cannot see the qmut operation inside that residual, so it checks
+/// both the installed watcher and the side-effect-free
+/// [`pyre_object::celldict::store_would_bump_version`] predicate here.  It
+/// forces the watcher and aborts before executing the residual; forward resume
+/// then performs the namespace write exactly once.  No `GUARD_ISNULL` is needed
+/// because the residual itself calls `notify_version_watchers`.
 fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     helper: majit_ir::RuntimeHelperKind,
@@ -5748,17 +5728,10 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     if !bumps {
         return None;
     }
-    // pyjitpl.py:1113-1115: the tracer performs the invalidation itself and
-    // then abandons the attempt. Idempotent (`quasiimmut.py:47-48`), so the
-    // interpreter re-running the opcode forces nothing a second time.
+    // Match `do_force_quasi_immutable`: invalidate before raising.  Invalidation
+    // removes the installed watcher, so the resumed residual cannot force it
+    // a second time.
     unsafe { pyre_object::dictmultiobject::module_dict_strategy_force_version_qmut(strategy) };
-    // Offer the flush leg the operand stack this opcode began with.  Same
-    // preconditions as the escape latch: a sub-walk's mirror describes the
-    // CALLEE frame, and a bridge walk's abort path never reaches the epilogue
-    // that would adopt the flush.
-    if ctx.vstack_valid && !ctx.fbw_mode.inline_subwalk && !ctx.trace_ctx.is_bridge_trace {
-        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
-    }
     Some(())
 }
 
@@ -5800,27 +5773,14 @@ fn walker_active_py_code<Sym: WalkSym>(
     (!code_ptr.is_null()).then(|| unsafe { &*code_ptr })
 }
 
-/// Tracer-side `pyjitpl.py opimpl_jit_force_quasi_immutable` for the store a
-/// class statement performs.
+/// Mirror `opimpl_jit_force_quasi_immutable` for a class body hidden inside the
+/// opaque `build_class` residual.
 ///
-/// `compiling.py build_class` runs the class body in `newdict(module=True)`,
-/// and `celldict.py setitem_str` reads `ModuleDictStrategy.version?` through
-/// `getdictvalue_no_unwrapping` before `mutated()` writes it — so the body's
-/// very first `STORE_NAME` installs the quasi-immutable and immediately forces
-/// it, and upstream abandons every trace that executes a class body
-/// (`PYPYLOG=jit-summary` reports the count as `abort: force quasi-immut`).
-///
-/// pyre's whole `__build_class__` is one residual — its `BuiltinCode.func` has
-/// no generated gateway, so `try_walker_inline_builtin_call` cannot enter it —
-/// and the body runs a frame of its own inside that call.  The walk therefore
-/// never meets the store and asks the same question at the boundary, the way
-/// [`try_walker_force_quasi_immut_namespace_write`] does for the `*_NAME`
-/// helper.
-///
-/// No `record_quasiimmut_field` and no force accompany the abort.  Both act on
-/// the namespace this call has not created yet, and the `QuasiImmut` upstream
-/// mints there watches a mapping that is garbage the moment the attempt is
-/// abandoned, so neither has an effect to reproduce.
+/// `build_class` executes the body in a module-strategy dict, whose first
+/// `STORE_NAME` installs and forces `version?`; upstream therefore aborts the
+/// trace.  Pyre detects the same condition at the residual boundary.  The
+/// namespace does not exist yet, so there is no watcher to record or invalidate
+/// before the abort.
 fn try_walker_force_quasi_immut_class_body<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -5858,21 +5818,6 @@ fn try_walker_force_quasi_immut_class_body<Sym: WalkSym>(
     }
     if !pyre_interpreter::call::build_class_body_namespace_is_module_dict(&args) {
         return false;
-    }
-    // Offer the flush leg the operand stack this opcode began with, the way the
-    // two sibling qmut sites do, under the same three preconditions: a
-    // sub-walk's mirror describes the CALLEE frame, and a bridge walk's abort
-    // path never reaches the epilogue that would adopt the flush.
-    //
-    // Without the offer the leg declines and the legacy replay stands, which
-    // re-runs the walked region from its start on top of the residuals the walk
-    // already executed concretely.  The FOR_ITER item consumed at the loop
-    // header is then refused delivery by the R1 never-double guard
-    // ([`fbw_foriter_inflight_take`]) and the whole iteration is LOST: a
-    // `self.x = v` ahead of a class statement in a loop body dropped one
-    // iteration per abort on both native backends.
-    if ctx.vstack_valid && !ctx.fbw_mode.inline_subwalk && !ctx.trace_ctx.is_bridge_trace {
-        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
     }
     true
 }
@@ -6148,22 +6093,10 @@ pub(crate) fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
-/// Tracer-side pyjitpl.py:1105-1120
-/// `opimpl_jit_force_quasi_immutable` for mapdict writes hidden in residuals.
-/// The target predicate is side-effect-free; record comes before the installed
-/// test because pyjitpl.py `opimpl_record_quasiimmut_field` creates
-/// the hidden instance when it is null. Recording also preserves
-/// `AbstractAttribute.write`'s `if not attr.ever_mutated` read
-/// (mapdict.py:72).
-///
-/// Deliberately no `GUARD_ISNULL` arm after the installed test. Upstream's
-/// guard (pyjitpl.py:1117-1118) licenses a traced INLINE setfield that bypasses
-/// invalidation; pyre's write stays inside the residual and performs its own
-/// notify. This is sound while compiled traces emit no store to these four
-/// fields: `jit_mapdict_boxed_write`, `jit_mapdict_unboxed_write_raw`, and
-/// `jit_mapdict_unboxed_write_f` reach only `write_boxed_storage` /
-/// `write_unboxed_storage_raw`, while the add-transition inline emits only map
-/// and storage stores.
+/// Mirror `opimpl_jit_force_quasi_immutable` for mapdict writes hidden inside
+/// residuals.  Record the target before testing it because
+/// `opimpl_record_quasiimmut_field` creates the watcher.  No `GUARD_ISNULL` is
+/// needed: these writes remain residual and perform their own invalidation.
 fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -6176,18 +6109,9 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
     if !is_store && !matches!(helper, K::DeleteAttr) {
         return None;
     }
-    // Force only where the abort can hand the flush leg an operand-stack mirror
-    // it can adopt — the same predicate the latch below uses. Without it the
-    // abort falls to the legacy replay-from-entry, which re-runs every residual
-    // the walk already executed concretely; `pickle_terminal_raise_resume`
-    // reaches that through a `self.x = v` inside an inlined callee and
-    // desynchronises the unpickler's read position
-    // (`end=ForceQuasiImmutable committed=false effects=4`).
-    //
-    // Declining is sound, not a hole: without the abort the trace keeps
-    // recording and the optimizer's revalidation (heap.py:818-819
-    // `is_still_valid_for`) discards any loop whose recorded `?` value moved,
-    // so the only cost is a wasted trace attempt.
+    // This helper only raises where the root flush can adopt its operand stack.
+    // Otherwise the optimizer's `is_still_valid_for` check discards a loop
+    // whose recorded qmut value changed.
     if !ctx.vstack_valid || ctx.fbw_mode.inline_subwalk || ctx.trace_ctx.is_bridge_trace {
         return None;
     }
@@ -6302,10 +6226,6 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
             }
         }
     }
-    // Offer the flush leg the operand stack this opcode began with. Its three
-    // preconditions were established at the top of this function, which is the
-    // last point where declining to force is still free.
-    fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
     Some(())
 }
 
@@ -6692,20 +6612,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // A class statement's body store is hidden inside this residual; ask its
-    // `jit_force_quasi_immutable` question before anything applies the call, so
-    // the abort resumes the interpreter at this opcode with the class not yet
-    // built.
-    //
-    // `opimpl_jit_force_quasi_immutable` raises only under `mutatebox.nonnull()`
-    // — nothing watching, nothing to abandon the trace for.  That test cannot be
-    // asked here: the namespace does not exist until the residual runs.  What
-    // stands in for it is the frame the statement runs in.  The abort earns its
-    // cost when the fresh class reaches the caller's trace and is promoted
-    // there, and a frame whose every return is a constant hands nothing back,
-    // so the question is not asked for one.  This reads the return value only;
-    // a class stored to a global, a cell or a container still escapes unseen,
-    // which loses the brake rather than applying a wrong one.
+    // The class namespace does not exist until this residual runs, so the
+    // enclosing frame's non-constant return is the available signal that the
+    // fresh class can reach the trace.  Check before the call so forward resume
+    // executes the class body once.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
@@ -6713,11 +6623,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             .is_none_or(|active| !pyre_interpreter::code_returns_only_constants(active))
         && try_walker_force_quasi_immut_class_body(ctx, code, op, 1, &r_args)
     {
-        // Carry the reason to the `abort_trace` that follows, the way upstream
-        // carries it on the `SwitchToBlackhole` instance, and stamp the abort
-        // coordinate at the raise point.
         crate::state::note_force_quasi_immut_abort();
-        ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
+        prepare_force_quasi_immutable_abort(ctx, op.pc);
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
@@ -6942,22 +6849,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'v'
         && try_walker_force_quasi_immut_namespace_write(ctx, ei.runtime_helper, &r_args).is_some()
     {
-        // Carry the reason to the `abort_trace` that follows, the way upstream
-        // carries it on the `SwitchToBlackhole` instance (pyjitpl.py:2906-2910).
-        // Without it the abort lands in the `Generic` catch-all and the
-        // `abort: force quasi-immut` counter stays at 0.
         crate::state::note_force_quasi_immut_abort();
-        // Stamp the abort coordinate at the raise point, the way the two
-        // kept-stack branch-guard raises do, so the flush gate cannot observe
-        // an UNRELATED prior abort.  `abort_in_subwalk` is sticky for the whole
-        // trace attempt (`claim_abort_coordinate` only ever sets it), so an
-        // earlier inline sub-walk abort the walk RECOVERED from — the attempt
-        // discarded, the call residualized, the walk continued — leaves it true
-        // for every later abort.  `flush_qmut_abort_state`'s gate then declines
-        // a root-frame qmut abort as though its pc named a callee jitcode, and
-        // the legacy replay re-runs the region on top of the residuals the walk
-        // already executed.
-        ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
+        prepare_force_quasi_immutable_abort(ctx, op.pc);
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
@@ -8235,11 +8128,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         )
         .is_some()
     {
-        // A sub-walk abort's resume coordinate names the callee's code object;
-        // `self.x = v` inside an inlined callee is reachable, and the flush
-        // leg's guard reads this flag.
-        ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
         crate::state::note_force_quasi_immut_abort();
+        prepare_force_quasi_immutable_abort(ctx, op.pc);
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
