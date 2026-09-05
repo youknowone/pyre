@@ -3231,15 +3231,9 @@ pub trait Backend: Send {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
         let offset = fielddescr.as_offset();
-        if matches!(
-            fielddescr,
-            majit_translate::jitcode::BhDescr::Field {
-                field_flag: majit_ir::descr::ArrayFlag::Struct,
-                ..
-            }
-        ) {
-            return GcRef((struct_ptr as usize).wrapping_add(offset));
-        }
+        // `llmodel.py bh_getfield_gc_r` always loads the value. Address
+        // projections belong to `jtransform.py rewrite_op_getsubstruct`;
+        // the layout flag alone cannot turn an ordinary read into one.
         // SAFETY: see `bh_getfield_gc_i`.
         GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
     }

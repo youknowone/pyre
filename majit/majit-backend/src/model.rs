@@ -408,15 +408,9 @@ impl Cpu for DefaultCpu {
 
     fn bh_getfield_gc_r(&self, struct_ptr: usize, fd: &dyn FieldDescr) -> GcRef {
         let addr = struct_ptr + fd.offset();
-        // `descr.py FLAG_STRUCT`: the field IS a substructure, laid out inline
-        // at `offset`, so what a reference to it names is that address.
-        // `rtyper` hands such a projection to `getsubstruct`, never to
-        // `getfield`, and reading a word there would return the substructure's
-        // first bytes as if they were its address.
-        if fd.field_flag() == majit_ir::descr::ArrayFlag::Struct {
-            return GcRef(addr);
-        }
-        // llmodel.py read_ref_at_mem — pointer width.
+        // `llmodel.py bh_getfield_gc_r` / `read_ref_at_mem`: pointer-width
+        // value load. `rewrite_op_getsubstruct` handles address projections
+        // before execution; an inline layout alone does not request one.
         GcRef(unsafe { *(addr as *const usize) })
     }
 
@@ -471,4 +465,34 @@ pub fn cpu_from_cls_of_box_fn(f: fn(i64) -> i64) -> Arc<dyn Cpu> {
 /// + tests that want the model.py typeptr-at-offset-0 read.
 pub fn default_cpu() -> Arc<dyn Cpu> {
     Arc::new(DefaultCpu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_value_read_does_not_become_a_substructure_address() {
+        let referent = 123usize;
+        let field_words = [0usize, &referent as *const usize as usize];
+        for flag in [
+            majit_ir::descr::ArrayFlag::Pointer,
+            majit_ir::descr::ArrayFlag::Struct,
+        ] {
+            let fd = majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                std::mem::size_of::<usize>(),
+                std::mem::size_of::<usize>(),
+                majit_ir::Type::Ref,
+                false,
+                flag,
+                "Node.value".into(),
+                "value".into(),
+            );
+            assert_eq!(
+                DefaultCpu.bh_getfield_gc_r(field_words.as_ptr() as usize, &fd),
+                GcRef(field_words[1])
+            );
+        }
+    }
 }

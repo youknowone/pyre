@@ -19264,15 +19264,9 @@ impl majit_backend::Backend for CraneliftBackend {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> majit_ir::GcRef {
         let offset = fielddescr.as_offset();
-        if matches!(
-            fielddescr,
-            majit_translate::jitcode::BhDescr::Field {
-                field_flag: majit_ir::descr::ArrayFlag::Struct,
-                ..
-            }
-        ) {
-            return majit_ir::GcRef((struct_ptr as usize).wrapping_add(offset));
-        }
+        // `llmodel.py bh_getfield_gc_r` loads a value, including a by-value
+        // transparent newtype. Address projections are lowered separately by
+        // `jtransform.py rewrite_op_getsubstruct`.
         majit_ir::GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
     }
 
@@ -19509,6 +19503,32 @@ impl majit_backend::Backend for CraneliftBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reference_value_read_does_not_become_a_substructure_address() {
+        let referent = 123usize;
+        let field_words = [0usize, &referent as *const usize as usize];
+        let backend = CraneliftBackend::new();
+        for flag in [
+            majit_ir::descr::ArrayFlag::Pointer,
+            majit_ir::descr::ArrayFlag::Struct,
+        ] {
+            let fd = majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                std::mem::size_of::<usize>(),
+                std::mem::size_of::<usize>(),
+                majit_ir::Type::Ref,
+                false,
+                flag,
+                "Node.value".into(),
+                "value".into(),
+            );
+            let bh = majit_translate::jitcode::BhDescr::from_field_descr(&fd);
+            assert_eq!(
+                backend.bh_getfield_gc_r(field_words.as_ptr() as i64, &bh),
+                majit_ir::GcRef(field_words[1])
+            );
+        }
+    }
     use majit_backend::Backend;
     use majit_gc::GcFlags;
     use majit_gc::collector::{GcConfig, MiniMarkGC};

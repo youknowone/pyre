@@ -4062,6 +4062,32 @@ impl Backend for DynasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reference_value_read_does_not_become_a_substructure_address() {
+        let referent = 123usize;
+        let field_words = [0usize, &referent as *const usize as usize];
+        let backend = DynasmBackend::new();
+        for flag in [
+            majit_ir::descr::ArrayFlag::Pointer,
+            majit_ir::descr::ArrayFlag::Struct,
+        ] {
+            let fd = majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                std::mem::size_of::<usize>(),
+                std::mem::size_of::<usize>(),
+                majit_ir::Type::Ref,
+                false,
+                flag,
+                "Node.value".into(),
+                "value".into(),
+            );
+            let bh = majit_translate::jitcode::BhDescr::from_field_descr(&fd);
+            assert_eq!(
+                backend.bh_getfield_gc_r(field_words.as_ptr() as i64, &bh),
+                majit_ir::GcRef(field_words[1])
+            );
+        }
+    }
     use majit_backend::Backend;
     use majit_backend::jitframe::{
         FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_INFO_OFS,
