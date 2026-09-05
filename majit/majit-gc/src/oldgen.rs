@@ -469,7 +469,7 @@ impl OldGen {
                     true
                 }
             },
-            max_pages,
+            isize::try_from(max_pages).unwrap_or(isize::MAX),
         )
     }
 
@@ -503,17 +503,15 @@ impl OldGen {
         self.old_rawmalloced_objects.len()
     }
 
-    /// Arena membership is intentionally an address-range answer, not a live
-    /// block answer.  Rawmalloced objects retain exact payload membership.
-    ///
-    /// Split so the arena range test can inline into the caller and the payload
-    /// set cannot. Major marking asks this question once per root and once per
-    /// traced edge, and the arena answer settles almost all of them; keeping the
-    /// hashed lookup in the same body made the whole thing too large to inline,
-    /// so every edge paid a call.
+    /// Exact old-generation payload membership. `ArenaCollection` records its
+    /// returned block starts, which are GC header addresses; rawmalloc records
+    /// payloads because its card prefix makes the allocation start unsuitable.
     #[inline]
     pub fn contains(&self, obj_addr: usize) -> bool {
-        self.ac.contains(obj_addr) || self.rawmalloced_contains(obj_addr)
+        obj_addr
+            .checked_sub(GcHeader::SIZE)
+            .is_some_and(|header| self.ac.contains(header))
+            || self.rawmalloced_contains(obj_addr)
     }
 
     /// Split again inside: the filter test inlines into `contains`, the hashed

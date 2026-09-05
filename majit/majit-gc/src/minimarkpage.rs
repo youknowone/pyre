@@ -19,6 +19,11 @@ const ARENA_ALIGN: usize = if crate::header::GcHeader::ALIGN > WORD {
 struct ArenaReference {
     base: *mut u8,
     layout: Layout,
+    /// Pyre's hybrid heap needs an exact answer to "is this an allocated GC
+    /// block?", a question RPython's typed pointers never ask. One bit per
+    /// arena word keeps that adaptation on the allocator which owns the
+    /// lifetime, without an address-keyed side table.
+    live_words: Vec<usize>,
     nfreepages: usize,
     totalpages: usize,
     freepages: *mut u8,
@@ -53,7 +58,7 @@ pub struct ArenaCollection {
     /// retain minimarkpage.py's allocator shape; this flat range index avoids
     /// pointer-chasing every bucket for arbitrary-word validity checks.
     /// It changes only when an arena is allocated or freed.
-    arena_ranges: Vec<(usize, usize)>,
+    arena_ranges: Vec<(usize, usize, *mut ArenaReference)>,
     /// The range [`contains`] matched last.  Every field store that reaches the
     /// write barrier asks the membership question once, and consecutive stores
     /// name the same arena nearly always, so re-testing the previous answer
@@ -61,7 +66,7 @@ pub struct ArenaCollection {
     /// can only be stale if the range left `arena_ranges`, so `free_arena`
     /// clears it; inserting leaves every existing range where it was.
     /// `(usize::MAX, 0)` is the empty state — no address satisfies it.
-    last_range_hit: std::cell::Cell<(usize, usize)>,
+    last_range_hit: std::cell::Cell<(usize, usize, *mut ArenaReference)>,
     min_empty_nfreepages: usize,
     pub num_uninitialized_pages: usize,
     pub total_memory_used: usize,
@@ -117,7 +122,7 @@ impl ArenaCollection {
             old_arenas_lists: vec![ptr::null_mut(); max_pages_per_arena],
             current_arena: ptr::null_mut(),
             arena_ranges: Vec::new(),
-            last_range_hit: std::cell::Cell::new((usize::MAX, 0)),
+            last_range_hit: std::cell::Cell::new((usize::MAX, 0, ptr::null_mut())),
             min_empty_nfreepages: max_pages_per_arena,
             num_uninitialized_pages: 0,
             total_memory_used: 0,
@@ -160,6 +165,7 @@ impl ArenaCollection {
                 (*page).nextpage = self.full_page_for_size[size_class];
                 self.full_page_for_size[size_class] = page;
             }
+            Self::set_block_live((*page).arena, result as usize, true);
             result
         }
     }
@@ -251,6 +257,7 @@ impl ArenaCollection {
         let arena = Box::into_raw(Box::new(ArenaReference {
             base: arena_base,
             layout,
+            live_words: vec![0; self.arena_size.div_ceil(WORD * usize::BITS as usize)],
             nfreepages: 0,
             totalpages: npages,
             freepages: firstpage as *mut u8,
@@ -259,10 +266,10 @@ impl ArenaCollection {
         self.num_uninitialized_pages = npages;
         self.current_arena = arena;
         self.arenas_count += 1;
-        let range = (arena_base as usize, arena_end);
+        let range = (arena_base as usize, arena_end, arena);
         let index = self
             .arena_ranges
-            .binary_search_by_key(&range.0, |&(start, _)| start)
+            .binary_search_by_key(&range.0, |&(start, _, _)| start)
             .unwrap_err();
         self.arena_ranges.insert(index, range);
     }
@@ -285,12 +292,12 @@ impl ArenaCollection {
     pub(crate) fn mass_free_incremental(
         &mut self,
         ok_to_free_func: &mut impl FnMut(*mut u8) -> bool,
-        mut max_pages: usize,
+        mut max_pages: isize,
     ) -> bool {
         let mut size_class = self.size_class_with_old_pages;
         while size_class >= 1 {
             max_pages = self.mass_free_in_pages(size_class as usize, ok_to_free_func, max_pages);
-            if max_pages == 0 {
+            if max_pages <= 0 {
                 self.size_class_with_old_pages = size_class;
                 return false;
             }
@@ -306,7 +313,7 @@ impl ArenaCollection {
     /// `ArenaCollection.mass_free`, the non-incremental STW entry point.
     pub fn mass_free(&mut self, mut ok_to_free_func: impl FnMut(*mut u8) -> bool) {
         self.mass_free_prepare();
-        let complete = self.mass_free_incremental(&mut ok_to_free_func, usize::MAX);
+        let complete = self.mass_free_incremental(&mut ok_to_free_func, isize::MAX);
         assert!(
             complete,
             "non-incremental mass_free_in_pages returned false"
@@ -342,8 +349,8 @@ impl ArenaCollection {
         &mut self,
         size_class: usize,
         ok_to_free_func: &mut impl FnMut(*mut u8) -> bool,
-        mut max_pages: usize,
-    ) -> usize {
+        mut max_pages: isize,
+    ) -> isize {
         let nblocks = self.nblocks_for_size[size_class];
         let block_size = size_class * WORD;
         let mut remaining_partial_pages = self.page_for_size[size_class];
@@ -371,7 +378,7 @@ impl ArenaCollection {
                     self.free_page(page);
                 }
                 max_pages -= 1;
-                if max_pages == 0 {
+                if max_pages <= 0 {
                     if step == 0 {
                         self.old_full_page_for_size[size_class] = nextpage;
                     } else {
@@ -433,6 +440,7 @@ impl ArenaCollection {
                         "freeblocks are not ordered"
                     );
                     if ok_to_free_func(obj) {
+                        Self::set_block_live((*page).arena, obj as usize, false);
                         *prevfreeblockat = obj;
                         prevfreeblockat = obj as *mut *mut u8;
                         *prevfreeblockat = freeblock;
@@ -499,25 +507,58 @@ impl ArenaCollection {
         }
     }
 
-    /// Arena-owned address-range membership, matching the answer available to
-    /// incminimark from its arena pages.  It intentionally does not distinguish
-    /// live blocks from free/uninitialized bytes inside a live arena.  The
-    /// allocator's bucketed arena lists remain the source of allocation state;
-    /// this sorted flat index serves pyre's arbitrary-word membership query.
+    /// Exact allocated-block membership for the arena allocator.
+    ///
+    /// RPython never needs this query: the translated pointer type proves that
+    /// an edge names a GC object. Pyre's hybrid heap must reject host pointers,
+    /// freed blocks, and uninitialized arena bytes before reading a GC header.
+    /// The sorted range index finds the arena and its word bitmap distinguishes
+    /// the one valid block start from every other address in that range.
     #[inline]
     pub fn contains(&self, addr: usize) -> bool {
-        let (start, end) = self.last_range_hit.get();
+        let (start, end, arena) = self.last_range_hit.get();
         if addr >= start && addr < end {
-            return true;
+            return unsafe { Self::block_is_live(arena, addr) };
         }
         let index = self
             .arena_ranges
-            .partition_point(|&(start, _)| start <= addr);
+            .partition_point(|&(start, _, _)| start <= addr);
         if index > 0 && addr < self.arena_ranges[index - 1].1 {
-            self.last_range_hit.set(self.arena_ranges[index - 1]);
-            true
+            let range = self.arena_ranges[index - 1];
+            self.last_range_hit.set(range);
+            unsafe { Self::block_is_live(range.2, addr) }
         } else {
             false
+        }
+    }
+
+    #[inline]
+    unsafe fn block_is_live(arena: *mut ArenaReference, addr: usize) -> bool {
+        debug_assert!(!arena.is_null());
+        let base = unsafe { (*arena).base as usize };
+        let offset = addr - base;
+        if offset % WORD != 0 {
+            return false;
+        }
+        let bit = offset / WORD;
+        let word = bit / usize::BITS as usize;
+        let mask = 1usize << (bit % usize::BITS as usize);
+        unsafe { (&(*arena).live_words)[word] & mask != 0 }
+    }
+
+    #[inline]
+    unsafe fn set_block_live(arena: *mut ArenaReference, addr: usize, live: bool) {
+        let base = unsafe { (*arena).base as usize };
+        let offset = addr - base;
+        debug_assert_eq!(offset % WORD, 0);
+        let bit = offset / WORD;
+        let word = bit / usize::BITS as usize;
+        let mask = 1usize << (bit % usize::BITS as usize);
+        if live {
+            unsafe { (&mut (*arena).live_words)[word] |= mask };
+        } else {
+            debug_assert!(unsafe { (&(*arena).live_words)[word] & mask != 0 });
+            unsafe { (&mut (*arena).live_words)[word] &= !mask };
         }
     }
 
@@ -549,10 +590,10 @@ impl ArenaCollection {
             }
             let index = self
                 .arena_ranges
-                .binary_search_by_key(&base, |&(start, _)| start)
+                .binary_search_by_key(&base, |&(start, _, _)| start)
                 .expect("freed arena missing from range index");
             self.arena_ranges.remove(index);
-            self.last_range_hit.set((usize::MAX, 0));
+            self.last_range_hit.set((usize::MAX, 0, ptr::null_mut()));
             alloc::dealloc((*arena).base, (*arena).layout);
             self.total_memory_alloced -= self.arena_size;
             self.arenas_count -= 1;
@@ -627,8 +668,33 @@ mod tests {
         ac.mass_free(|obj| obj != survivor);
         assert_eq!(ac.total_memory_used, block_size);
         assert!(ac.contains(survivor as usize));
+        assert!(!ac.contains(objects[1] as usize));
+        assert!(!ac.contains(survivor as usize + WORD));
         let reused = ac.malloc(block_size);
         assert_ne!(reused, survivor);
+    }
+
+    #[test]
+    fn zero_page_incremental_budget_does_not_underflow() {
+        let mut ac = ArenaCollection::new(ARENA_SIZE, PAGE_SIZE, THRESHOLD);
+        let block_size = 2 * WORD;
+        let _objects: Vec<_> = (0..8).map(|_| ac.malloc(block_size)).collect();
+        let used_before = ac.total_memory_used;
+        ac.mass_free_prepare();
+        let mut visited = 0;
+
+        assert!(!ac.mass_free_incremental(
+            &mut |_| {
+                visited += 1;
+                true
+            },
+            0,
+        ));
+        assert_eq!(visited, 0);
+        assert_eq!(ac.total_memory_used, used_before);
+
+        while !ac.mass_free_incremental(&mut |_| false, 1) {}
+        assert_eq!(ac.total_memory_used, used_before);
     }
 
     #[test]

@@ -10,7 +10,10 @@ pub use gcreftracer::{GcTable, install_gc_table_walker};
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
 use majit_ir::{Const, ConstMap, GcRef, Op};
-pub use trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout};
+pub use trace::{
+    ClassTypeLayout, CustomDataLayout, TypeEntry, TypeEntryTail, TypeInfo, TypeInfoLayout,
+    VarSizeTypeInfoLayout,
+};
 
 /// Runtime layout of one registered variable-size GC object.
 ///
@@ -869,6 +872,21 @@ pub trait GcAllocator: Send {
         false
     }
 
+    /// `rgc.get_gcflag_extra` / `toggle_gcflag_extra` /
+    /// `get_gcflag_dummy`. Collectors without RPython header flags report the
+    /// two queries false and reject mutation.
+    fn get_gcflag_extra(&mut self, _obj: GcRef) -> bool {
+        false
+    }
+
+    fn toggle_gcflag_extra(&mut self, _obj: GcRef) {
+        panic!("toggle_gcflag_extra is unsupported by this collector")
+    }
+
+    fn get_gcflag_dummy(&mut self, _obj: GcRef) -> bool {
+        false
+    }
+
     /// `inspector.py:get_rpy_memory_usage`: size of the object's translated
     /// payload, excluding the GC header and anything reachable from it.
     /// `None` is the untranslated equivalent of inspector.py returning `-1`
@@ -1093,6 +1111,14 @@ pub trait GcAllocator: Send {
     /// When true, the JIT emits COND_CALL_GC_WB (inline flag test +
     /// conditional call) instead of a full barrier call.
     fn can_optimize_cond_call(&self) -> bool {
+        false
+    }
+
+    /// `GCBase.can_optimize_clean_setarrayitems`: whether the GC transform may
+    /// omit barriers for stores that only clear a freshly allocated array.
+    /// Collectors with card marking must return false because those stores can
+    /// otherwise leave the card bitmap clean while overwriting young edges.
+    fn can_optimize_clean_setarrayitems(&self) -> bool {
         false
     }
 
@@ -1581,6 +1607,15 @@ impl GcAllocator for GcHandle {
         // managed-heap object of the type the answer is read out of.
         gc_sync::gc_op_with_root(obj, |gc, obj| gc.is_tracked(obj))
     }
+    fn get_gcflag_extra(&mut self, obj: GcRef) -> bool {
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_gcflag_extra(obj))
+    }
+    fn toggle_gcflag_extra(&mut self, obj: GcRef) {
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.toggle_gcflag_extra(obj))
+    }
+    fn get_gcflag_dummy(&mut self, obj: GcRef) -> bool {
+        gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_gcflag_dummy(obj))
+    }
     fn get_rpy_memory_usage(&mut self, obj: GcRef) -> Option<usize> {
         gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_rpy_memory_usage(obj))
     }
@@ -1677,6 +1712,10 @@ impl GcAllocator for GcHandle {
     }
     fn can_optimize_cond_call(&self) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.can_optimize_cond_call())
+    }
+
+    fn can_optimize_clean_setarrayitems(&self) -> bool {
+        gc_sync::gc_query_reentrant(|gc| gc.can_optimize_clean_setarrayitems())
     }
     fn gc_step(&mut self) -> bool {
         gc_sync::gc_op(|gc| gc.gc_step())
@@ -1872,6 +1911,11 @@ pub type IsRegisteredTypeIdFn = fn(typeid: u32) -> bool;
 /// const-baking site (`x86/regalloc.py convert_to_imm`) consults
 /// this before baking a `ConstPtr` immediate.
 pub type CanMoveFn = fn(GcRef) -> bool;
+/// Active-collector implementations of `rgc.pin`, `rgc.unpin`, and
+/// `rgc._is_pinned` (`rpython/rlib/rgc.py`).
+pub type PinFn = fn(GcRef) -> bool;
+pub type UnpinFn = fn(GcRef);
+pub type IsPinnedFn = fn(GcRef) -> bool;
 
 global_hook!(static ACTIVE_CHECK_IS_OBJECT: CheckIsObjectFn);
 global_hook!(static ACTIVE_IS_TAGGED_IMMEDIATE: IsTaggedImmediateFn);
@@ -1881,6 +1925,9 @@ global_hook!(static ACTIVE_TYPEID_SUBCLASS_RANGE: TypeidSubclassRangeFn);
 global_hook!(static ACTIVE_TYPEID_IS_OBJECT: TypeidIsObjectFn);
 global_hook!(static ACTIVE_IS_REGISTERED_TYPE_ID: IsRegisteredTypeIdFn);
 global_hook!(static ACTIVE_CAN_MOVE: CanMoveFn);
+global_hook!(static ACTIVE_PIN: PinFn);
+global_hook!(static ACTIVE_UNPIN: UnpinFn);
+global_hook!(static ACTIVE_IS_PINNED: IsPinnedFn);
 static ACTIVE_SUPPORTS_GUARD_GC_TYPE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1898,6 +1945,9 @@ pub struct ActiveGcGuardHooks {
     pub typeid_is_object: Option<TypeidIsObjectFn>,
     pub is_registered_type_id: Option<IsRegisteredTypeIdFn>,
     pub can_move: Option<CanMoveFn>,
+    pub pin: Option<PinFn>,
+    pub unpin: Option<UnpinFn>,
+    pub is_pinned: Option<IsPinnedFn>,
     pub supports_guard_gc_type: bool,
 }
 
@@ -1917,6 +1967,9 @@ pub fn set_active_gc_guard_hooks(hooks: ActiveGcGuardHooks) {
     ACTIVE_TYPEID_IS_OBJECT.set(hooks.typeid_is_object);
     ACTIVE_IS_REGISTERED_TYPE_ID.set(hooks.is_registered_type_id);
     ACTIVE_CAN_MOVE.set(hooks.can_move);
+    ACTIVE_PIN.set(hooks.pin);
+    ACTIVE_UNPIN.set(hooks.unpin);
+    ACTIVE_IS_PINNED.set(hooks.is_pinned);
     ACTIVE_SUPPORTS_GUARD_GC_TYPE.store(
         hooks.supports_guard_gc_type,
         std::sync::atomic::Ordering::Release,
@@ -1935,6 +1988,9 @@ fn current_gc_guard_hooks() -> ActiveGcGuardHooks {
         typeid_is_object: ACTIVE_TYPEID_IS_OBJECT.get(),
         is_registered_type_id: ACTIVE_IS_REGISTERED_TYPE_ID.get(),
         can_move: ACTIVE_CAN_MOVE.get(),
+        pin: ACTIVE_PIN.get(),
+        unpin: ACTIVE_UNPIN.get(),
+        is_pinned: ACTIVE_IS_PINNED.get(),
         supports_guard_gc_type: supports_guard_gc_type(),
     }
 }
@@ -2089,6 +2145,34 @@ pub fn can_move(gcref: GcRef) -> bool {
         Some(f) => f(gcref),
         None => false,
     }
+}
+
+/// `rgc.pin(gcref)` shim. A missing collector has the untranslated
+/// `llheap.pin` behaviour and declines the request.
+pub fn pin(gcref: GcRef) -> bool {
+    if gcref.is_null() {
+        return false;
+    }
+    ACTIVE_PIN.get().is_some_and(|f| f(gcref))
+}
+
+/// `rgc.unpin(gcref)` shim. `rgc.unpin` is only valid after a successful
+/// [`pin`], so reaching an absent collector is a caller-contract violation,
+/// just as untranslated `llheap.unpin` is.
+pub fn unpin(gcref: GcRef) {
+    let f = ACTIVE_UNPIN
+        .get()
+        .expect("unpin() called without an active collector");
+    f(gcref);
+}
+
+/// `rgc._is_pinned(gcref)` shim. A missing collector is non-moving and has
+/// no pinned nursery objects.
+pub fn is_pinned(gcref: GcRef) -> bool {
+    if gcref.is_null() {
+        return false;
+    }
+    ACTIVE_IS_PINNED.get().is_some_and(|f| f(gcref))
 }
 
 /// x86/assembler.py:1971-1974 codegen-time bounds lookup shim used by
@@ -2781,6 +2865,56 @@ pub fn is_tracked(obj: GcRef) -> bool {
         Some(f) => f(obj),
         None => false,
     }
+}
+
+/// Active-backend hooks for `rgc`'s temporary traversal flags.
+pub type GetGcFlagFn = fn(GcRef) -> bool;
+pub type ToggleGcFlagFn = fn(GcRef);
+
+global_hook!(static ACTIVE_GET_GCFLAG_EXTRA: GetGcFlagFn);
+global_hook!(static ACTIVE_TOGGLE_GCFLAG_EXTRA: ToggleGcFlagFn);
+global_hook!(static ACTIVE_GET_GCFLAG_DUMMY: GetGcFlagFn);
+
+pub fn set_active_gcflag_hooks(
+    get_extra: Option<GetGcFlagFn>,
+    toggle_extra: Option<ToggleGcFlagFn>,
+    get_dummy: Option<GetGcFlagFn>,
+) {
+    ACTIVE_GET_GCFLAG_EXTRA.set(get_extra);
+    ACTIVE_TOGGLE_GCFLAG_EXTRA.set(toggle_extra);
+    ACTIVE_GET_GCFLAG_DUMMY.set(get_dummy);
+}
+
+/// `rgc.has_gcflag_extra`: IncrementalMiniMark exposes `GCFLAG_EXTRA`.
+pub const fn has_gcflag_extra() -> bool {
+    true
+}
+
+pub fn get_gcflag_extra(obj: GcRef) -> bool {
+    ACTIVE_GET_GCFLAG_EXTRA.get().is_some_and(|f| f(obj))
+}
+
+pub fn toggle_gcflag_extra(obj: GcRef) {
+    let toggle = ACTIVE_TOGGLE_GCFLAG_EXTRA
+        .get()
+        .expect("toggle_gcflag_extra called without an active collector");
+    toggle(obj);
+}
+
+pub fn get_gcflag_dummy(obj: GcRef) -> bool {
+    ACTIVE_GET_GCFLAG_DUMMY.get().is_some_and(|f| f(obj))
+}
+
+/// Translated `rgc.hide_nonmovable_gcref`: after the non-moving assertion,
+/// the representation change is just GCREF-to-address.
+pub fn hide_nonmovable_gcref(obj: GcRef) -> usize {
+    assert!(obj.is_null() || !can_move(obj));
+    obj.0
+}
+
+/// Translated `rgc.reveal_gcref`: address-to-GCREF inverse.
+pub const fn reveal_gcref(addr: usize) -> GcRef {
+    GcRef(addr)
 }
 
 /// Active-backend trampolines for `inspector.py:get_rpy_memory_usage` and
@@ -3550,6 +3684,14 @@ pub fn gc_rawrefcount_init(dealloc_trigger: rawrefcount::DeallocTriggerFn) {
     gc_sync::gc_op(|gc| gc.rawrefcount_init(dealloc_trigger));
 }
 
+/// Whether [`gc_rawrefcount_init`] has run on the live collector.
+///
+/// `as_pyobj` / `create_ref` must not invent a link before this is true:
+/// `rawrefcount_create_link_pypy` asserts the table exists.
+pub fn gc_rawrefcount_enabled() -> bool {
+    gc_sync::is_initialized() && gc_sync::gc_query_reentrant(|gc| gc.rawrefcount_enabled())
+}
+
 /// Register the [`rawrefcount::CEdgeCensusFn`] the collector reads a block's
 /// own references from.  Upstream has no counterpart; see the type.
 pub fn gc_rawrefcount_set_c_edge_census(census: rawrefcount::CEdgeCensusFn) {
@@ -3560,6 +3702,11 @@ pub fn gc_rawrefcount_set_c_edge_census(census: rawrefcount::CEdgeCensusFn) {
 /// block's finalizer through.  Upstream has no counterpart; see the type.
 pub fn gc_rawrefcount_set_finalizer_claim(claim: rawrefcount::FinalizerClaimFn) {
     gc_sync::gc_op(|gc| gc.rawrefcount_set_finalizer_claim(claim));
+}
+
+/// Register the allocator-matched release for an exact LIGHT mirror.
+pub fn gc_rawrefcount_set_light_free(free: rawrefcount::LightFreeFn) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_set_light_free(free));
 }
 
 /// `rawrefcount.py:create_link_pypy` — `mirror` is a mirror of `obj`, and
@@ -4095,6 +4242,7 @@ pub fn bh_probe_type_name(addr: usize) -> Option<&'static str> {
 #[cfg(test)]
 mod headerless_no_collect_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A `GcAllocator` that only implements the collecting headerless form, so
     /// the default `alloc_nursery_headerless_no_collect` has to forward to it.
@@ -4171,6 +4319,39 @@ mod headerless_no_collect_tests {
 
         set_active_alloc_nursery_headerless_no_collect(None);
         assert_eq!(alloc_nursery_headerless_no_collect(16), GcRef(0));
+    }
+
+    static LAST_UNPINNED: AtomicUsize = AtomicUsize::new(0);
+
+    fn stub_pin(obj: GcRef) -> bool {
+        obj == GcRef(0x5010)
+    }
+
+    fn stub_unpin(obj: GcRef) {
+        LAST_UNPINNED.store(obj.0, Ordering::SeqCst);
+    }
+
+    fn stub_is_pinned(obj: GcRef) -> bool {
+        obj == GcRef(0x5010)
+    }
+
+    #[test]
+    fn active_pin_hooks_expose_the_rgc_surface() {
+        LAST_UNPINNED.store(0, Ordering::SeqCst);
+        let _guard = override_gc_guard_hooks_for_test(ActiveGcGuardHooks {
+            pin: Some(stub_pin),
+            unpin: Some(stub_unpin),
+            is_pinned: Some(stub_is_pinned),
+            ..Default::default()
+        });
+
+        assert!(!pin(GcRef::NULL));
+        assert!(pin(GcRef(0x5010)));
+        assert!(!pin(GcRef(0x6010)));
+        assert!(is_pinned(GcRef(0x5010)));
+        assert!(!is_pinned(GcRef::NULL));
+        unpin(GcRef(0x5010));
+        assert_eq!(LAST_UNPINNED.load(Ordering::SeqCst), 0x5010);
     }
 
     /// incminimark.py names each `GCFLAG_*` at a position, and so does

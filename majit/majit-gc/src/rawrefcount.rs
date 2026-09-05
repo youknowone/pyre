@@ -28,33 +28,14 @@ use crate::address_dict::AddressMap;
 /// above it is a reference the C side holds.
 pub const REFCNT_FROM_PYPY: isize = (isize::MAX >> 2) + 1;
 
-/// The count a mirror that must never be freed starts at.
-///
-/// `rawrefcount.py:16-20` has two constants above [`REFCNT_FROM_PYPY`]:
-/// `REFCNT_FROM_PYPY_LIGHT`, for a mirror whose deallocation is a plain free
-/// with no deallocator to run, and `_Py_IMMORTAL_REFCNT`, for one that is never
-/// deallocated at all.  Only the second has a port, and that is not a gap:
-/// nothing creates a light mirror upstream either.  `cpyext` links every
-/// mirror with the plain share (`pypy/module/cpyext/pyobject.py:288`,
-/// `py_obj.c_ob_refcnt += rawrefcount.REFCNT_FROM_PYPY`), and the only
-/// assignments of the light one in the whole tree are in
-/// `rpython/rlib/test/test_rawrefcount.py` and
-/// `rpython/memory/gc/test/test_rawrefcount.py`.
-/// `pypy/doc/discussion/rawrefcount.rst:120-148` proposes the cases that would
-/// use it — "and we can use REFCNT_FROM_PYPY_LIGHT too: 'tp_dealloc' doesn't
-/// need to be called" — in the future tense.  Its three readers in
-/// `incminimark.py` (:3264, :3325, :3361) are therefore branches the
-/// translated interpreter never takes.
-///
-/// The value is chosen for headroom rather than to match either upstream
-/// constant: the asserts below hold it at least `1 << 60` clear of the
-/// threshold at which a mirror is freed, and the same clear of overflow, so no
-/// incref/decref imbalance a running process can produce reaches either end.
-pub const REFCNT_IMMORTAL: isize = REFCNT_FROM_PYPY + (1 << (isize::BITS - 4));
+/// `rawrefcount.py REFCNT_FROM_PYPY_LIGHT`. A dead link carrying this share
+/// needs no type-specific deallocator: `_rrc_free` can release the raw mirror
+/// immediately when no other references remain.
+pub const REFCNT_FROM_PYPY_LIGHT: isize = REFCNT_FROM_PYPY + ((isize::MAX >> 1) + 1);
 
-const IMMORTAL_HEADROOM: isize = 1 << (isize::BITS - 4);
-const _: () = assert!(REFCNT_IMMORTAL - REFCNT_FROM_PYPY >= IMMORTAL_HEADROOM);
-const _: () = assert!(isize::MAX - REFCNT_IMMORTAL >= IMMORTAL_HEADROOM);
+/// Pyre's C-API immortal marker. Keep it above the complete rawrefcount range;
+/// using the LIGHT value for this marker made every LIGHT branch unreachable.
+pub const REFCNT_IMMORTAL: isize = isize::MAX;
 
 /// Scheduled when the dead queue becomes non-empty.
 ///
@@ -62,6 +43,13 @@ const _: () = assert!(isize::MAX - REFCNT_IMMORTAL >= IMMORTAL_HEADROOM);
 /// collection entry point with the collector borrowed, so it may only schedule
 /// work; the drain itself happens later, from the embedder.
 pub type DeallocTriggerFn = fn();
+
+/// Releases a LIGHT mirror through the allocator that created it.
+///
+/// `incminimark.py _rrc_free` calls `lltype.free(..., flavor='raw')` for an
+/// exact LIGHT share.  The collector deliberately knows only the two-word
+/// prefix, so the embedder must supply the matching raw allocator operation.
+pub type LightFreeFn = fn(usize);
 
 /// `incminimark.py:3163-3166 PYOBJ_HDR`: the prefix of a mirror block the
 /// collector reads.  The real block is longer — a type pointer and whatever
@@ -118,6 +106,7 @@ pub(crate) struct RawRefCount {
     /// deallocator the embedder still has to run.
     pub(crate) dealloc_pending: Vec<usize>,
     pub(crate) dealloc_trigger: Option<DeallocTriggerFn>,
+    pub(crate) light_free: Option<LightFreeFn>,
     /// [`FinalizerClaimFn`], and the blocks it has claimed: mirrors kept alive
     /// for one collection so that the drain can run their finalizers.
     pub(crate) finalizer_claim: Option<FinalizerClaimFn>,
@@ -187,6 +176,11 @@ mod tests {
         // rawrefcount.py:15, on a 64-bit host.
         assert_eq!(REFCNT_FROM_PYPY, (isize::MAX / 4) + 1);
         assert_eq!(REFCNT_FROM_PYPY, 1 << (isize::BITS - 3));
+        assert_eq!(
+            REFCNT_FROM_PYPY_LIGHT,
+            REFCNT_FROM_PYPY + (1 << (isize::BITS - 2))
+        );
+        assert!(REFCNT_IMMORTAL > REFCNT_FROM_PYPY_LIGHT);
     }
 
     #[test]

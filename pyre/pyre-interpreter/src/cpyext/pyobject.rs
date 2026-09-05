@@ -2,8 +2,10 @@
 //!
 //! A C extension never sees a [`pyre_object::PyObject`].  It sees a mirror at a
 //! fixed address carrying a reference count and an `ob_pyre_link` to the moving
-//! interpreter object, which is the `rawrefcount` P-link
-//! (`rpython/rlib/rawrefcount.py`).
+//! interpreter object. Ordinary objects use rawrefcount's P-link; a
+//! `W_PyCTypeObject` realised from an extension type uses its O-link and keeps
+//! the mirror in `W_TypeObject._cpy_ref` (`rpython/rlib/rawrefcount.py`,
+//! `W_PyCTypeObject._cpyext_attach_pyobj`).
 //!
 //! A mirror's block is as large as its type asks for: `sizeof(PyObject)` for an
 //! ordinary object, `sizeof(PyTypeObject)` for a type, `tp_basicsize` for an
@@ -174,6 +176,12 @@ pub fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
 /// never receive the plain `PyObject`-sized block a non-type receives — a
 /// `PyModule_AddObject` of a class would otherwise decide the shape.
 pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
+    if unsafe { pyre_object::is_type(w_obj) } {
+        let direct = unsafe { pyre_object::w_type_get_cpy_ref(w_obj) };
+        if !direct.is_null() {
+            return direct as *mut CPyObject;
+        }
+    }
     let existing = majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize));
     if existing != 0 {
         return existing as *mut CPyObject;
@@ -313,6 +321,28 @@ pub(super) fn attach_foreign(w_obj: PyObjectRef, raw: *mut CPyObject) {
     enter(w_obj, raw, 0);
 }
 
+/// `W_PyCTypeObject._cpyext_attach_pyobj` — link an extension's existing
+/// `PyTypeObject` in the O direction and retain its address directly on the
+/// interpreter type.
+///
+/// `pyobject.py:track_reference` adds the link share before dispatching to the
+/// object's attachment method. Unlike a P-link, an O-link has no
+/// `rawrefcount.from_obj` entry: the direct `_cpy_ref` field is the lookup path.
+pub(super) fn attach_foreign_pyobj(w_obj: PyObjectRef, raw: *mut CPyObject) {
+    debug_assert!(unsafe { pyre_object::is_type(w_obj) });
+    debug_assert!(
+        unsafe { (*raw).ob_refcnt } < REFCNT_FROM_PYPY,
+        "track_reference requires the unshared C refcount"
+    );
+    unsafe {
+        (*raw).ob_refcnt += REFCNT_FROM_PYPY;
+        (*raw).ob_pyre_link = w_obj;
+        pyre_object::w_type_set_cpy_ref(w_obj, raw.cast());
+    }
+    record_block(raw as usize, 0);
+    majit_gc::gc_rawrefcount_create_link_pyobj(majit_ir::GcRef(w_obj as usize), raw as usize);
+}
+
 /// Link a block that already exists to a fresh interpreter object.
 ///
 /// `PyObject_Malloc` hands out an unlinked block and `PyObject_Init` is what
@@ -341,6 +371,9 @@ fn enter(w_obj: PyObjectRef, raw: *mut CPyObject, size: usize) {
         unsafe { (*raw).ob_refcnt } >= REFCNT_FROM_PYPY,
         "a linked mirror carries the link share"
     );
+    if unsafe { pyre_object::is_type(w_obj) } {
+        unsafe { pyre_object::w_type_set_cpy_ref(w_obj, raw.cast()) };
+    }
     record_block(raw as usize, size);
     majit_gc::gc_rawrefcount_create_link_pypy(majit_ir::GcRef(w_obj as usize), raw as usize);
 }
@@ -367,7 +400,10 @@ pub fn make_ref(w_obj: PyObjectRef) -> *mut CPyObject {
         return std::ptr::null_mut();
     }
     let raw = ensure_mirror(w_obj);
-    unsafe { (*raw).ob_refcnt += 1 };
+    // Static builtin mirrors use the immortal sentinel.  Go through the same
+    // incref operation the public API does so direct `_cpy_ref` storage does
+    // not try to increment `isize::MAX`.
+    unsafe { incref(raw) };
     raw
 }
 
@@ -392,7 +428,27 @@ pub fn as_pyobj(w_obj: PyObjectRef) -> *mut CPyObject {
     if w_obj.is_null() {
         return std::ptr::null_mut();
     }
-    majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize)) as *mut CPyObject
+    // pyobject.py `as_pyobj`: `_cpyext_as_pyobj` first, then `create_ref`
+    // when that lookup is empty. A type's `_cpy_ref` is the direct-storage
+    // spelling of the same miss; returning the null field skipped the
+    // create that every other object still takes.
+    if unsafe { pyre_object::is_type(w_obj) } {
+        let direct = unsafe { pyre_object::w_type_get_cpy_ref(w_obj) };
+        if !direct.is_null() {
+            return direct.cast();
+        }
+    }
+    let existing = majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize));
+    if existing != 0 {
+        return existing as *mut CPyObject;
+    }
+    // `create_ref` needs the rawrefcount tables. Before `initialize()` they
+    // do not exist, so a miss stays a miss — the same answer the type
+    // `_cpy_ref` field already gave.
+    if !majit_gc::gc_rawrefcount_enabled() {
+        return std::ptr::null_mut();
+    }
+    ensure_mirror(w_obj)
 }
 
 /// Attach `W_Root`'s weakref lifeline to an already-existing C mirror.
@@ -1114,8 +1170,15 @@ pub(super) unsafe fn resize_cached_bytes(
 /// right moment.
 pub(super) fn init_rawrefcount() {
     majit_gc::gc_rawrefcount_init(schedule_drain);
+    majit_gc::gc_rawrefcount_set_light_free(free_light_mirror);
     majit_gc::gc_rawrefcount_set_c_edge_census(super::gc::c_edges);
     majit_gc::gc_rawrefcount_set_finalizer_claim(super::gc::claim_finalizer);
+}
+
+/// `incminimark.py _rrc_free`'s raw release for a LIGHT link, routed through
+/// the same allocator and bookkeeping as every other cpyext mirror block.
+fn free_light_mirror(mirror: usize) {
+    unsafe { free_block(mirror as *mut CPyObject) };
 }
 
 /// Fired from inside a collection, so it may only schedule.

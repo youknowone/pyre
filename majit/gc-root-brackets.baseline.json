@@ -1,35 +1,35 @@
 {
   "darwin": {
-    "base": "e75174702af51d97b166e0ed9765cc85ebb51057",
+    "base": "5f2c4f688230346ec908bbeae5b9db580380d80e",
     "brackets_reaching_no_collection": 3,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 10,
     "frames_across_collecting_fns": 4,
-    "tier15_calls": 102,
-    "tier15_calls_fns": 56,
+    "tier15_calls": 101,
+    "tier15_calls_fns": 55,
     "tier1_calls": 0,
     "tier1_calls_fns": 0,
-    "unbracketed_calls": 2064,
-    "unbracketed_calls_fns": 835,
+    "unbracketed_calls": 2057,
+    "unbracketed_calls_fns": 832,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ]
   },
   "linux": {
-    "base": "903151ee679ae81c7817341478a26ec1f6b2c4df",
+    "base": "de7e1a70159ef1aa2a4d8b1900cfb10006b0f905",
     "brackets_reaching_no_collection": 3,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 10,
     "frames_across_collecting_fns": 4,
-    "tier15_calls": 0,
-    "tier15_calls_fns": 0,
-    "tier1_calls": 9,
-    "tier1_calls_fns": 7,
-    "unbracketed_calls": 2078,
-    "unbracketed_calls_fns": 832,
+    "tier15_calls": 101,
+    "tier15_calls_fns": 55,
+    "tier1_calls": 0,
+    "tier1_calls_fns": 0,
+    "unbracketed_calls": 2068,
+    "unbracketed_calls_fns": 836,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"

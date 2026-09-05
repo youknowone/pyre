@@ -1171,8 +1171,12 @@ pub(super) fn make_subview(
     // dictionary does move, and every store below allocates, so that is pinned
     // and read back at each store.  Each value is built into a local first: call
     // arguments evaluate left to right, so an inline allocating value would
-    // consume a pre-move dictionary word.
+    // consume a pre-move dictionary word.  `parent` is the caller's word for an
+    // object this function does not construct, so it is pinned and read back at
+    // each use for the same reason the dictionary is.
     let _roots = pyre_object::gc_roots::push_roots();
+    let parent_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(parent);
     let inst = pyre_object::w_instance_new(proto);
     let inst = pyre_object::gc_roots::pin_root(inst);
     let d = crate::baseobjspace::getdict_native(inst);
@@ -1182,19 +1186,21 @@ pub(super) fn make_subview(
     let _ = pyre_object::gc_roots::pin_root(d);
     let d_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     unsafe {
-        if let Some(ba) = cdata_buffer(parent) {
+        if let Some(ba) = cdata_buffer(pyre_object::gc_roots::shadow_stack_get(parent_slot)) {
             pyre_object::w_dict_setitem_str(
                 pyre_object::gc_roots::shadow_stack_get(d_slot),
                 CDATA_BUFFER_KEY,
                 ba,
             );
-            let w_offset = pyre_object::w_int_new((boff(parent) + field_offset) as i64);
+            let w_offset = pyre_object::w_int_new(
+                (boff(pyre_object::gc_roots::shadow_stack_get(parent_slot)) + field_offset) as i64,
+            );
             pyre_object::w_dict_setitem_str(
                 pyre_object::gc_roots::shadow_stack_get(d_slot),
                 BOFF_KEY,
                 w_offset,
             );
-        } else if let Some(addr) = baddr(parent) {
+        } else if let Some(addr) = baddr(pyre_object::gc_roots::shadow_stack_get(parent_slot)) {
             let w_address = pyre_object::w_int_new((addr + field_offset) as i64);
             pyre_object::w_dict_setitem_str(
                 pyre_object::gc_roots::shadow_stack_get(d_slot),
@@ -1211,7 +1217,7 @@ pub(super) fn make_subview(
         pyre_object::w_dict_setitem_str(
             pyre_object::gc_roots::shadow_stack_get(d_slot),
             BBASE_KEY,
-            parent,
+            pyre_object::gc_roots::shadow_stack_get(parent_slot),
         );
     }
     inst
@@ -1256,8 +1262,13 @@ pub(super) fn make_at_address(
     base: PyObjectRef,
 ) -> PyObjectRef {
     // The fresh instance is reachable only from this frame across the lookup and
-    // the stores below; it does not move, so one pin covers it.
+    // the stores below; it does not move, so one pin covers it.  `base` is the
+    // caller's word for an arbitrary object — `in_dll` forwards its library
+    // argument, which can be a bound method — so it is pinned and read back at
+    // the store, past the dictionary the lookup allocates.
     let _roots = pyre_object::gc_roots::push_roots();
+    let base_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(base);
     let inst = pyre_object::w_instance_new(proto);
     let inst = pyre_object::gc_roots::pin_root(inst);
     let d = crate::baseobjspace::getdict_native(inst);
@@ -1277,6 +1288,7 @@ pub(super) fn make_at_address(
                 BSZ_KEY,
                 w_size,
             );
+            let base = pyre_object::gc_roots::shadow_stack_get(base_slot);
             if !base.is_null() && !pyre_object::is_none(base) {
                 pyre_object::w_dict_setitem_str(
                     pyre_object::gc_roots::shadow_stack_get(d_slot),

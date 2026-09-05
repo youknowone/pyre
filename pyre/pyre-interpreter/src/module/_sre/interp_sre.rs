@@ -1148,7 +1148,15 @@ fn do_match(
         .copied()
         .ok_or_else(|| crate::PyError::type_error(format!("{name} requires self and string")))?;
     let code = get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
+    // A buffer subject is gathered into fresh bytes nothing else holds
+    // (`readbuf_obj`), and `subj` borrows that payload, so it has to survive the
+    // bound conversions below — `pos` and `endpos` run `__index__`, which is
+    // user code, and a sweep in there would free the gathered bytes underneath
+    // both the slice and the match this returns.
+    let _roots = pyre_object::gc_roots::push_roots();
     let (subj, w_buffer) = make_subject(pat, string)?;
+    let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_buffer);
 
     let (pos, endpos) = normalize_bounds(
         subj.len(),
@@ -1167,7 +1175,14 @@ fn do_match(
     };
 
     if matched {
-        Ok(make_match(pat, string, w_buffer, &state, pos as i64, endpos as i64))
+        Ok(make_match(
+            pat,
+            string,
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+            &state,
+            pos as i64,
+            endpos as i64,
+        ))
     } else {
         Ok(w_none())
     }
@@ -1356,7 +1371,13 @@ fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     // Validate the compiled code is present (matches do_match's guard).
     get_code(pat).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
+    // Same window as `do_match`: the gathered bytes are held only here across
+    // the `__index__` calls the bound conversions make, and the scanner keeps
+    // them as its `_buffer`.
+    let _roots = pyre_object::gc_roots::push_roots();
     let (subj, w_buffer) = make_subject(pat, string)?;
+    let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_buffer);
     let (pos, endpos) = normalize_bounds(
         subj.len(),
         arg_int_kw(args, 2, kwargs, "pos", 0)?,
@@ -1366,7 +1387,7 @@ fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let scanner = w_sre_scanner_new(
         pat,
         string,
-        w_buffer,
+        pyre_object::gc_roots::shadow_stack_get(buffer_slot),
         pos as i64,
         endpos as i64,
         export_active,

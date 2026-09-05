@@ -1091,7 +1091,10 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         typeid_subclass_range: Some(wasm_typeid_subclass_range),
         typeid_is_object: Some(wasm_typeid_is_object),
         is_registered_type_id: Some(wasm_is_registered_type_id),
-        can_move: None,
+        can_move: Some(wasm_can_move),
+        pin: Some(wasm_pin),
+        unpin: Some(wasm_unpin),
+        is_pinned: Some(wasm_is_pinned),
         supports_guard_gc_type,
     });
     majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
@@ -1117,6 +1120,11 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_get_referents(Some(wasm_get_referents));
     majit_gc::set_active_subgraph_has_pending_finalizer(Some(wasm_subgraph_has_pending_finalizer));
     majit_gc::set_active_is_tracked(Some(wasm_is_tracked));
+    majit_gc::set_active_gcflag_hooks(
+        Some(wasm_get_gcflag_extra),
+        Some(wasm_toggle_gcflag_extra),
+        Some(wasm_get_gcflag_dummy),
+    );
     majit_gc::set_active_get_rpy_memory_usage(Some(wasm_get_rpy_memory_usage));
     majit_gc::set_active_get_rpy_type_index(Some(wasm_get_rpy_type_index));
     majit_gc::set_active_get_rpy_roots(Some(wasm_get_rpy_roots));
@@ -1371,6 +1379,18 @@ fn wasm_is_tracked(obj: GcRef) -> bool {
     with_wasm_active_gc_mut(|gc| gc.is_tracked(obj)).unwrap_or(false)
 }
 
+fn wasm_get_gcflag_extra(obj: GcRef) -> bool {
+    with_wasm_active_gc_mut(|gc| gc.get_gcflag_extra(obj)).unwrap_or(false)
+}
+
+fn wasm_toggle_gcflag_extra(obj: GcRef) {
+    with_wasm_active_gc_mut(|gc| gc.toggle_gcflag_extra(obj));
+}
+
+fn wasm_get_gcflag_dummy(obj: GcRef) -> bool {
+    with_wasm_active_gc_mut(|gc| gc.get_gcflag_dummy(obj)).unwrap_or(false)
+}
+
 fn wasm_get_rpy_memory_usage(obj: GcRef) -> Option<usize> {
     with_wasm_active_gc_mut(|gc| gc.get_rpy_memory_usage(obj)).flatten()
 }
@@ -1444,6 +1464,22 @@ fn wasm_is_tagged_immediate(addr: usize) -> bool {
 
 fn wasm_get_actual_typeid(gcref: GcRef) -> Option<u32> {
     with_wasm_active_gc(|gc| gc.get_actual_typeid(gcref)).flatten()
+}
+
+fn wasm_can_move(gcref: GcRef) -> bool {
+    with_wasm_active_gc(|gc| gc.can_move(gcref)).unwrap_or(false)
+}
+
+fn wasm_pin(gcref: GcRef) -> bool {
+    with_wasm_active_gc_mut(|gc| gc.pin(gcref)).unwrap_or(false)
+}
+
+fn wasm_unpin(gcref: GcRef) {
+    with_wasm_active_gc_mut(|gc| gc.unpin(gcref)).expect("missing active GC runtime");
+}
+
+fn wasm_is_pinned(gcref: GcRef) -> bool {
+    with_wasm_active_gc(|gc| gc.is_pinned(gcref)).unwrap_or(false)
 }
 
 fn wasm_subclass_range(classptr: usize) -> Option<(i64, i64)> {

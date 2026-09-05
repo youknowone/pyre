@@ -12,30 +12,39 @@
 use majit_ir::GcRef;
 
 /// One `gctypelayout.GCData.TYPE_INFO` entry of the materialized
-/// type-info group (gc.py:592, x86/assembler.py:1924-1943).
+/// type-info group (`GcLLDescr_framework.get_translated_info_for_typeinfo`,
+/// `Assembler386.genop_guard_guard_is_object`).
 ///
-/// Mirrors the shape of `TYPE_INFO` that `genop_guard_guard_is_object`
-/// reads: `infobits` at offset 0 carries `T_IS_RPYTHON_INSTANCE`.
-///
-/// This row is *smaller* than upstream's, not equal to it. `GCData.TYPE_INFO`
-/// is four words — `infobits`, `customdata`, `fixedsize`, `ofstoptrs` — so 32
-/// bytes on 64-bit, and `VARSIZE_TYPE_INFO` extends it to eight; upstream's
-/// per-entry size is not even uniform, since `get_type_id` allocates the
-/// narrow struct for a fixed-size type and the wide one for a varsize type.
-/// majit consults only `infobits` and keeps the other fields out of this
-/// layout, so the row is one word of content. The reserved word is not there
-/// to match a size: it is there so `TypeEntry`'s stride stays a power of two,
-/// which is what lets the backend address the table by a shift. Deleting it
-/// gives a stride of 24 and the shift no longer applies.
+/// Mirrors `GCData.TYPE_INFO` field-for-field.  The pointer-valued fields are
+/// stored as native addresses so the row remains `Send` while retaining the
+/// C/lltype memory shape consumed by generated code.
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct TypeInfoLayout {
-    pub infobits: u64,
-    /// Reserved for future TYPE_INFO fields (customdata / fixedsize /
-    /// ofstoptrs in the RPython struct, gctypelayout.py:36-42). Kept
-    /// as a raw word so `sizeof_ti` matches the layout the backend
-    /// lowering expects.
-    pub _reserved: u64,
+    pub infobits: usize,
+    pub customdata: usize,
+    pub fixedsize: usize,
+    pub ofstoptrs: usize,
+}
+
+/// `GCData.CUSTOM_DATA_STRUCT` materialized behind
+/// [`TypeInfoLayout::customdata`].
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct CustomDataLayout {
+    pub customfunc: usize,
+    pub memory_pressure_offset: isize,
+}
+
+/// The four fields appended by `GCData.VARSIZE_TYPE_INFO` after its
+/// `TYPE_INFO header`.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct VarSizeTypeInfoLayout {
+    pub varitemsize: usize,
+    pub ofstovar: usize,
+    pub ofstolength: usize,
+    pub varofstoptrs: usize,
 }
 
 /// One `rclass.CLASSTYPE` entry of the materialized type-info group.
@@ -59,18 +68,36 @@ pub struct ClassTypeLayout {
     pub subclassrange_max: i64,
 }
 
-/// Paired `(TYPE_INFO, CLASSTYPE)` entry in the type-info group.
+/// The bytes following one [`TypeInfoLayout`] row.
 ///
-/// Matches the two-struct pattern RPython's translator emits in the
-/// type_info_group (see `add_vtable_after_typeinfo`
-/// gctypelayout.py:359-374). The fields must stay in this order —
-/// backends walk from `type_info` to `classtype` using
-/// `offset += sizeof_ti`.
+/// `TypeLayoutBuilder.add_vtable_after_typeinfo` asserts that an RPython
+/// instance carrying a `CLASSTYPE` is not varsize.  The same four-word tail can
+/// therefore hold either the varsize extension or the paired class metadata.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union TypeEntryTail {
+    pub varsize: VarSizeTypeInfoLayout,
+    pub classtype: ClassTypeLayout,
+    raw: [usize; 4],
+}
+
+impl Default for TypeEntryTail {
+    fn default() -> Self {
+        Self { raw: [0; 4] }
+    }
+}
+
+/// One materialized type-info group slot.
+///
+/// RPython's heterogeneous group member is either `(TYPE_INFO, CLASSTYPE)` or
+/// `VARSIZE_TYPE_INFO`.  majit's typeids are dense integer indices rather than
+/// pre-scaled `GROUP_MEMBER_OFFSET`s, so every slot has the maximum eight-word
+/// size and generated code can address it with one power-of-two shift.
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct TypeEntry {
     pub type_info: TypeInfoLayout,
-    pub classtype: ClassTypeLayout,
+    pub tail: TypeEntryTail,
 }
 
 impl TypeInfoLayout {
@@ -78,44 +105,44 @@ impl TypeInfoLayout {
     /// `infobits` carry the group member index; majit doesn't use
     /// this field today but reserves the bits to keep the bit layout
     /// compatible with the RPython constants below.
-    pub const T_MEMBER_INDEX: u64 = 0xffff;
+    pub const T_MEMBER_INDEX: usize = 0xffff;
     /// `T_IS_VARSIZE` (gctypelayout.py).
-    pub const T_IS_VARSIZE: u64 = 0x010000;
+    pub const T_IS_VARSIZE: usize = 0x010000;
     /// `T_HAS_GCPTR_IN_VARSIZE` (gctypelayout.py).
-    pub const T_HAS_GCPTR_IN_VARSIZE: u64 = 0x020000;
+    pub const T_HAS_GCPTR_IN_VARSIZE: usize = 0x020000;
     /// `T_IS_GCARRAY_OF_GCPTR` (gctypelayout.py).
-    pub const T_IS_GCARRAY_OF_GCPTR: u64 = 0x040000;
+    pub const T_IS_GCARRAY_OF_GCPTR: usize = 0x040000;
     /// `T_IS_WEAKREF` (gctypelayout.py).
-    pub const T_IS_WEAKREF: u64 = 0x080000;
+    pub const T_IS_WEAKREF: usize = 0x080000;
     /// `T_IS_RPYTHON_INSTANCE` — the type is a subclass of OBJECT
     /// (gctypelayout.py:196). Stored in `infobits` and tested by
     /// `genop_guard_guard_is_object` via the byte mask returned by
     /// `gc_ll_descr.get_translated_info_for_guard_is_object`
     /// (gc.py:603-622).
-    pub const T_IS_RPYTHON_INSTANCE: u64 = 0x100000;
+    pub const T_IS_RPYTHON_INSTANCE: usize = 0x100000;
     /// `T_HAS_CUSTOM_TRACE` (gctypelayout.py).
-    pub const T_HAS_CUSTOM_TRACE: u64 = 0x200000;
+    pub const T_HAS_CUSTOM_TRACE: usize = 0x200000;
     /// `T_HAS_OLDSTYLE_FINALIZER` (gctypelayout.py).
-    pub const T_HAS_OLDSTYLE_FINALIZER: u64 = 0x400000;
+    pub const T_HAS_OLDSTYLE_FINALIZER: usize = 0x400000;
     /// Lightweight-destructor marker (bit 23, the otherwise-unused slot
     /// between `T_HAS_OLDSTYLE_FINALIZER` and `T_HAS_GCPTR`). RPython
     /// folds the lightweight-destructor case into its `q_finalizer`
     /// machinery rather than a distinct infobit; majit models the
     /// `TypeInfo.destructor` half with its own bit so the materialized
     /// table reflects which types carry a destructor.
-    pub const T_HAS_DESTRUCTOR: u64 = 0x800000;
+    pub const T_HAS_DESTRUCTOR: usize = 0x800000;
     /// `T_HAS_GCPTR` (gctypelayout.py).
-    pub const T_HAS_GCPTR: u64 = 0x1000000;
+    pub const T_HAS_GCPTR: usize = 0x1000000;
     /// `T_HAS_MEMORY_PRESSURE` (gctypelayout.py) — first field is
     /// memory pressure field.
-    pub const T_HAS_MEMORY_PRESSURE: u64 = 0x2000000;
+    pub const T_HAS_MEMORY_PRESSURE: usize = 0x2000000;
     /// `T_KEY_MASK` (gctypelayout.py) — bug detection mask.
     /// `_check_valid_type_info` asserts `infobits & T_KEY_MASK ==
     /// T_KEY_VALUE`.
-    pub const T_KEY_MASK: u64 = 0xFC000000;
+    pub const T_KEY_MASK: usize = 0xFC000000;
     /// `T_KEY_VALUE` (gctypelayout.py) — bug detection sentinel
     /// stored in every valid `TYPE_INFO.infobits`.
-    pub const T_KEY_VALUE: u64 = 0x58000000;
+    pub const T_KEY_VALUE: usize = 0x58000000;
 
     pub const INFOBITS_OFFSET: usize = 0;
     /// `rffi.sizeof(GCData.TYPE_INFO)` equivalent. Reported by
@@ -140,7 +167,7 @@ impl TypeEntry {
     /// `get_translated_info_for_typeinfo` docstring.
     pub const STRIDE: usize = std::mem::size_of::<TypeEntry>();
     /// `log2(STRIDE)`. The backend uses this as `shift_by`
-    /// (x86/assembler.py:1934) so the formula
+    /// (`Assembler386.genop_guard_guard_is_object`) so the formula
     /// `base + (typeid << shift_by) + offset` lands on the right
     /// entry. RPython's 64-bit port sets `shift_by = 0` because its
     /// typeid is already pre-scaled to a byte offset
@@ -153,16 +180,38 @@ impl TypeEntry {
         Self::STRIDE.trailing_zeros() as u8
     };
 
-    fn from_type_info(info: &TypeInfo, index: u32) -> Self {
+    fn from_type_info(
+        info: &TypeInfo,
+        index: u32,
+        customdata: usize,
+        fixed_offsets: usize,
+        var_offsets: usize,
+    ) -> Self {
+        let mut tail = TypeEntryTail::default();
+        if info.item_size > 0 {
+            tail.varsize = VarSizeTypeInfoLayout {
+                varitemsize: info.item_size,
+                ofstovar: info.size,
+                ofstolength: info.length_offset,
+                varofstoptrs: var_offsets,
+            };
+        } else {
+            // Start from the all-zero raw tail so the two padding words in
+            // majit's uniform eight-word slot do not contain indeterminate
+            // bytes after writing the narrower CLASSTYPE member.
+            tail.classtype = ClassTypeLayout {
+                subclassrange_min: info.subclassrange_min,
+                subclassrange_max: info.subclassrange_max,
+            };
+        }
         TypeEntry {
             type_info: TypeInfoLayout {
                 infobits: encode_type_shape(info, index),
-                _reserved: 0,
+                customdata,
+                fixedsize: info.size,
+                ofstoptrs: fixed_offsets,
             },
-            classtype: ClassTypeLayout {
-                subclassrange_min: info.subclassrange_min,
-                subclassrange_max: info.subclassrange_max,
-            },
+            tail,
         }
     }
 }
@@ -202,18 +251,18 @@ impl TypeEntry {
 ///   if subclass of OBJECT: infobits |= T_IS_RPYTHON_INSTANCE
 ///   info.infobits = infobits | T_KEY_VALUE
 /// ```
-pub fn encode_type_shape(info: &TypeInfo, index: u32) -> u64 {
+pub fn encode_type_shape(info: &TypeInfo, index: u32) -> usize {
     // gctypelayout.py `infobits = index` — typeid in low 16 bits.
-    let mut infobits: u64 = (index as u64) & TypeInfoLayout::T_MEMBER_INDEX;
+    let mut infobits: usize = (index as usize) & TypeInfoLayout::T_MEMBER_INDEX;
     // gctypelayout.py: T_HAS_GCPTR if there are GC pointer
     // fields in the fixed part.
     if !info.gc_ptr_offsets.is_empty() {
         infobits |= TypeInfoLayout::T_HAS_GCPTR;
     }
-    // gctypelayout.py:245-257 customdata / destructor / oldstyle
-    // finalizer / memory pressure. majit only models the custom
-    // tracer half of this; treat custom_trace.is_some() as the
-    // T_HAS_CUSTOM_TRACE bit (info.py:178 `q_has_custom_trace`).
+    // `encode_type_shape` customdata / destructor / oldstyle finalizer /
+    // memory pressure. `custom_trace` selects T_HAS_CUSTOM_TRACE
+    // (info.py `q_has_custom_trace`); `old_style_finalizer` selects its own
+    // mutually-exclusive bit below.
     if info.custom_trace.is_some() {
         infobits |= TypeInfoLayout::T_HAS_CUSTOM_TRACE;
         // jitframe.py registers JITFRAME via custom_trace and is also
@@ -222,15 +271,15 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> u64 {
         // it (gctypelayout.py:81-83).
         infobits |= TypeInfoLayout::T_HAS_GCPTR;
     }
-    // gctypelayout.py:266-291 varsize encoding.
+    // `encode_type_shape` varsize encoding.
     if info.item_size > 0 {
         infobits |= TypeInfoLayout::T_IS_VARSIZE;
         if info.items_have_gc_ptrs {
-            // gctypelayout.py:288-289: variable-size array carrying
+            // `encode_type_shape`: a variable-size array carrying
             // GC pointers sets both flags.
             infobits |= TypeInfoLayout::T_HAS_GCPTR_IN_VARSIZE;
             infobits |= TypeInfoLayout::T_HAS_GCPTR;
-            // gctypelayout.py:278-280: pure GcArray-of-GcPtr.
+            // `encode_type_shape`: pure GcArray-of-GcPtr.
             if info.gc_ptr_offsets.is_empty() {
                 infobits |= TypeInfoLayout::T_IS_GCARRAY_OF_GCPTR;
             }
@@ -250,7 +299,10 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> u64 {
     if info.destructor.is_some() {
         infobits |= TypeInfoLayout::T_HAS_DESTRUCTOR;
     }
-    // gctypelayout.py:254-257: the translated type's custom data points at
+    if info.old_style_finalizer.is_some() {
+        infobits |= TypeInfoLayout::T_HAS_OLDSTYLE_FINALIZER;
+    }
+    // `encode_type_shape`: the translated type's custom data points at
     // its inherited `special_memory_pressure` field.
     if info.memory_pressure_offset.is_some() {
         infobits |= TypeInfoLayout::T_HAS_MEMORY_PRESSURE;
@@ -303,6 +355,11 @@ pub struct TypeRegistry {
     /// guards may embed this slice's base pointer; a boxed slice cannot grow or
     /// reallocate and is reclaimed with the registry.
     frozen_layout_table: Option<Box<[TypeEntry]>>,
+    /// Immortal `OFFSETS_TO_GC_PTR` arrays referenced by materialized rows.
+    /// Word zero is the lltype Array length, followed by Signed offsets.
+    offset_tables: Vec<Box<[usize]>>,
+    /// Immortal `CUSTOM_DATA_STRUCT` objects referenced by materialized rows.
+    custom_data: Vec<Box<CustomDataLayout>>,
     /// `gctypelayout.can_add_new_types` parity. `true` until the
     /// frontend calls `freeze_types`; after that, `register_type`
     /// panics. Mirrors how RPython's translator stops accepting new
@@ -352,8 +409,13 @@ pub struct TypeInfo {
     /// For variable-size objects: offset from object start to the length field.
     pub length_offset: usize,
     /// For variable-size objects: whether items contain GC pointers.
-    /// If true, each item is treated as a GcRef.
+    /// Derived from `var_gc_ptr_offsets`; retained as the infobit/card-layout
+    /// predicate used by the JIT-facing interfaces.
     pub items_have_gc_ptrs: bool,
+    /// `VARSIZE_TYPE_INFO.varofstoptrs`: byte offsets of every GC pointer
+    /// inside one variable-size item.  A plain `GcArray(GcRef)` is `[0]`; an
+    /// array of structs may contain several entries at non-zero offsets.
+    pub var_gc_ptr_offsets: Vec<usize>,
     /// RPython `rgc.register_custom_trace_hook` parity.
     /// When set, overrides offset-based tracing entirely.
     pub custom_trace: Option<CustomTraceFn>,
@@ -422,6 +484,11 @@ pub struct TypeInfo {
     /// payloads owning non-GC heap memory get their drop glue run. See
     /// [`DestructorFn`].
     pub destructor: Option<DestructorFn>,
+    /// `gctypelayout.py`'s `old_style_finalizer` custom function. Unlike a
+    /// lightweight destructor, this may run arbitrary code and resurrect its
+    /// object. IncrementalMiniMark therefore allocates the object old and
+    /// queues the callback until `GCBase.execute_finalizers`.
+    pub old_style_finalizer: Option<DestructorFn>,
     /// `gctypelayout.get_memory_pressure_ofs(TYPE)` parity. `Some(offset)`
     /// marks a fixed-size type carrying the inherited
     /// `special_memory_pressure` signed field read by
@@ -439,6 +506,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: false,
             has_subclass_range: false,
@@ -449,6 +517,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -465,6 +534,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: false,
             has_subclass_range: false,
@@ -475,6 +545,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: Some(destructor),
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -486,7 +557,34 @@ impl TypeInfo {
     /// allocation whose drop glue must run when the instance dies — e.g. the
     /// `W_MemoryView` header owning its `*const BufferView` box.
     pub fn with_destructor_fn(mut self, destructor: DestructorFn) -> Self {
+        assert!(
+            self.old_style_finalizer.is_none(),
+            "a type cannot have both a light and an old-style finalizer"
+        );
         self.destructor = Some(destructor);
+        self
+    }
+
+    /// Create a fixed-size type with PyPy's heavyweight, old-style finalizer.
+    /// The collector forces instances out of the nursery and invokes this only
+    /// after finalization ordering has kept the object graph alive.
+    pub fn with_old_style_finalizer(size: usize, finalizer: DestructorFn) -> Self {
+        Self::simple(size).with_old_style_finalizer_fn(finalizer)
+    }
+
+    /// Attach an old-style finalizer to another fixed-size type layout.
+    pub fn with_old_style_finalizer_fn(mut self, finalizer: DestructorFn) -> Self {
+        assert_eq!(self.item_size, 0, "finalizer types must be fixed-size");
+        assert!(!self.is_weakref, "a finalizer type cannot be a weakref");
+        assert!(
+            self.custom_trace.is_none(),
+            "an old-style finalizer cannot share the custom function slot"
+        );
+        assert!(
+            self.destructor.is_none(),
+            "a type cannot have both a light and an old-style finalizer"
+        );
+        self.old_style_finalizer = Some(finalizer);
         self
     }
 
@@ -542,6 +640,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: false,
             has_subclass_range: false,
@@ -552,6 +651,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: true,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -574,6 +674,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: true,
             has_subclass_range: true,
@@ -584,6 +685,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -605,6 +707,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: true,
             has_subclass_range: true,
@@ -615,6 +718,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -634,6 +738,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: true,
             has_subclass_range: true,
@@ -644,6 +749,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -672,6 +778,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: true,
             has_subclass_range: true,
@@ -682,6 +789,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -700,6 +808,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: Some(trace_fn),
             is_object: true,
             has_subclass_range: true,
@@ -710,6 +819,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -725,6 +835,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: None,
             is_object: false,
             has_subclass_range: false,
@@ -735,6 +846,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -747,6 +859,41 @@ impl TypeInfo {
         items_have_gc_ptrs: bool,
         gc_ptr_offsets: Vec<usize>,
     ) -> Self {
+        let var_gc_ptr_offsets = if items_have_gc_ptrs {
+            vec![0]
+        } else {
+            Vec::new()
+        };
+        Self::varsize_with_gc_ptr_offsets(
+            base_size,
+            item_size,
+            length_offset,
+            var_gc_ptr_offsets,
+            gc_ptr_offsets,
+        )
+    }
+
+    /// Create a variable-size type whose item is itself a structure.
+    ///
+    /// This is `q_varsize_offsets_to_gcpointers_in_var_part`: each offset is
+    /// relative to the start of one item and every item is visited with the
+    /// same offset table.
+    pub fn varsize_with_gc_ptr_offsets(
+        base_size: usize,
+        item_size: usize,
+        length_offset: usize,
+        var_gc_ptr_offsets: Vec<usize>,
+        gc_ptr_offsets: Vec<usize>,
+    ) -> Self {
+        for &offset in &var_gc_ptr_offsets {
+            assert!(
+                offset
+                    .checked_add(std::mem::size_of::<crate::GcRef>())
+                    .is_some_and(|end| end <= item_size),
+                "variable-item GC pointer at offset {offset} exceeds item size {item_size}",
+            );
+        }
+        let items_have_gc_ptrs = !var_gc_ptr_offsets.is_empty();
         TypeInfo {
             size: base_size,
             has_gc_ptrs: !gc_ptr_offsets.is_empty() || items_have_gc_ptrs,
@@ -754,6 +901,7 @@ impl TypeInfo {
             item_size,
             length_offset,
             items_have_gc_ptrs,
+            var_gc_ptr_offsets,
             custom_trace: None,
             is_object: false,
             has_subclass_range: false,
@@ -764,6 +912,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -779,6 +928,7 @@ impl TypeInfo {
             item_size: 0,
             length_offset: 0,
             items_have_gc_ptrs: false,
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: Some(trace_fn),
             is_object: false,
             has_subclass_range: false,
@@ -789,6 +939,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -820,6 +971,7 @@ impl TypeInfo {
             item_size,
             length_offset,
             items_have_gc_ptrs: false, // custom_trace handles ref tracing
+            var_gc_ptr_offsets: Vec::new(),
             custom_trace: Some(trace_fn),
             is_object: false,
             has_subclass_range: false,
@@ -830,6 +982,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -870,7 +1023,10 @@ impl TypeInfo {
             let length = unsafe { *((obj_addr + self.length_offset) as *const usize) };
             let items_start = obj_addr + self.size;
             for i in 0..length {
-                f((items_start + i * self.item_size) as *mut GcRef);
+                let item = items_start + i * self.item_size;
+                for &offset in &self.var_gc_ptr_offsets {
+                    f((item + offset) as *mut GcRef);
+                }
             }
         }
     }
@@ -882,6 +1038,8 @@ impl TypeRegistry {
             entries: Vec::new(),
             layout_table: Vec::new(),
             frozen_layout_table: None,
+            offset_tables: Vec::new(),
+            custom_data: Vec::new(),
             can_add_new_types: true,
         }
     }
@@ -937,9 +1095,10 @@ impl TypeRegistry {
             info.gc_ptr_offsets = offsets;
             info.has_gc_ptrs = !info.gc_ptr_offsets.is_empty() || info.items_have_gc_ptrs;
         }
-        let entry = TypeEntry::from_type_info(&info, id as u32);
         self.entries.push(info);
-        self.layout_table.push(entry);
+        // No row address is published until `freeze_types`; fill it there once
+        // the pointer-bearing auxiliary tables have stable storage.
+        self.layout_table.push(TypeEntry::default());
         id as u32
     }
 
@@ -973,13 +1132,53 @@ impl TypeRegistry {
         }
         self.can_add_new_types = false;
         self.assign_inheritance_ids();
-        // Refresh layout_table rows for object types whose
-        // subclassrange_{min,max} just changed.
+        self.offset_tables.reserve(self.entries.len() * 2);
+        self.custom_data.reserve(self.entries.len());
         for (i, info) in self.entries.iter().enumerate() {
-            self.layout_table[i] = TypeEntry::from_type_info(info, i as u32);
+            let fixed_offsets =
+                Self::materialize_offsets(&mut self.offset_tables, &info.gc_ptr_offsets);
+            let var_offsets =
+                Self::materialize_offsets(&mut self.offset_tables, &info.var_gc_ptr_offsets);
+            let customdata = if info.custom_trace.is_some()
+                || info.destructor.is_some()
+                || info.old_style_finalizer.is_some()
+                || info.memory_pressure_offset.is_some()
+            {
+                // Pyre permits its Rust-side custom tracer and lightweight
+                // destructor side channels to coexist.  Upstream has one
+                // CUSTOM_FUNC slot; when T_HAS_CUSTOM_TRACE is set, materialize
+                // that function and retain destructor dispatch on TypeInfo.
+                let customfunc = info
+                    .custom_trace
+                    .map(|f| f as usize)
+                    .or_else(|| info.old_style_finalizer.map(|f| f as usize))
+                    .or_else(|| info.destructor.map(|f| f as usize))
+                    .unwrap_or(0);
+                let data = Box::new(CustomDataLayout {
+                    customfunc,
+                    memory_pressure_offset: info.memory_pressure_offset.unwrap_or(0) as isize,
+                });
+                let address = (&*data) as *const CustomDataLayout as usize;
+                self.custom_data.push(data);
+                address
+            } else {
+                0
+            };
+            self.layout_table[i] =
+                TypeEntry::from_type_info(info, i as u32, customdata, fixed_offsets, var_offsets);
         }
         self.entries.shrink_to_fit();
         self.frozen_layout_table = Some(std::mem::take(&mut self.layout_table).into_boxed_slice());
+    }
+
+    fn materialize_offsets(storage: &mut Vec<Box<[usize]>>, offsets: &[usize]) -> usize {
+        let mut words = Vec::with_capacity(offsets.len() + 1);
+        words.push(offsets.len());
+        words.extend_from_slice(offsets);
+        let table = words.into_boxed_slice();
+        let address = table.as_ptr() as usize;
+        storage.push(table);
+        address
     }
 
     /// `rtyper/normalizecalls.py assign_inheritance_ids` /
@@ -1153,6 +1352,9 @@ impl Default for TypeRegistry {
 mod tests {
     use super::*;
 
+    unsafe fn materialized_destructor(_obj_addr: usize) {}
+    unsafe fn materialized_old_style_finalizer(_obj_addr: usize) {}
+
     #[test]
     fn test_type_registry() {
         let mut reg = TypeRegistry::new();
@@ -1164,6 +1366,79 @@ mod tests {
         assert_eq!(reg.get(id0).size, 16);
         assert_eq!(reg.get(id1).size, 32);
         assert!(!reg.get(id0).has_gc_ptrs);
+    }
+
+    #[test]
+    fn test_materialized_type_info_matches_gctypelayout_rows() {
+        let word = std::mem::size_of::<usize>();
+        assert_eq!(std::mem::size_of::<TypeInfoLayout>(), 4 * word);
+        assert_eq!(std::mem::size_of::<VarSizeTypeInfoLayout>(), 4 * word);
+        assert_eq!(std::mem::size_of::<TypeEntry>(), 8 * word);
+
+        let mut reg = TypeRegistry::new();
+        let fixed = reg.register(
+            TypeInfo::with_gc_ptrs(32, vec![0, 24])
+                .with_destructor_fn(materialized_destructor)
+                .with_memory_pressure_offset(16),
+        );
+        let var = reg.register(TypeInfo::varsize_with_gc_ptr_offsets(
+            16,
+            24,
+            8,
+            vec![0, 16],
+            vec![0],
+        ));
+        reg.freeze_types();
+
+        let fixed_row = &reg.type_info_table()[fixed as usize];
+        assert_eq!(fixed_row.type_info.fixedsize, 32);
+        assert_ne!(fixed_row.type_info.customdata, 0);
+        let custom = unsafe { &*(fixed_row.type_info.customdata as *const CustomDataLayout) };
+        assert_eq!(
+            custom.customfunc,
+            materialized_destructor as *const () as usize
+        );
+        assert_eq!(custom.memory_pressure_offset, 16);
+        let fixed_offsets = fixed_row.type_info.ofstoptrs as *const usize;
+        assert_eq!(unsafe { *fixed_offsets }, 2);
+        assert_eq!(unsafe { *fixed_offsets.add(1) }, 0);
+        assert_eq!(unsafe { *fixed_offsets.add(2) }, 24);
+
+        let var_row = &reg.type_info_table()[var as usize];
+        assert_eq!(var_row.type_info.fixedsize, 16);
+        let var_layout = unsafe { var_row.tail.varsize };
+        assert_eq!(var_layout.varitemsize, 24);
+        assert_eq!(var_layout.ofstovar, 16);
+        assert_eq!(var_layout.ofstolength, 8);
+        let var_offsets = var_layout.varofstoptrs as *const usize;
+        assert_eq!(unsafe { *var_offsets }, 2);
+        assert_eq!(unsafe { *var_offsets.add(1) }, 0);
+        assert_eq!(unsafe { *var_offsets.add(2) }, 16);
+    }
+
+    #[test]
+    fn old_style_finalizer_sets_infobit_and_custom_function() {
+        let mut reg = TypeRegistry::new();
+        let type_id = reg.register(TypeInfo::with_old_style_finalizer(
+            16,
+            materialized_old_style_finalizer,
+        ));
+        assert_ne!(
+            encode_type_shape(reg.get(type_id), type_id) & TypeInfoLayout::T_HAS_OLDSTYLE_FINALIZER,
+            0
+        );
+        assert_eq!(
+            encode_type_shape(reg.get(type_id), type_id) & TypeInfoLayout::T_HAS_DESTRUCTOR,
+            0
+        );
+
+        reg.freeze_types();
+        let row = &reg.type_info_table()[type_id as usize];
+        let custom = unsafe { &*(row.type_info.customdata as *const CustomDataLayout) };
+        assert_eq!(
+            custom.customfunc,
+            materialized_old_style_finalizer as *const () as usize
+        );
     }
 
     #[test]
@@ -1379,5 +1654,34 @@ mod tests {
         assert_eq!(visited[0], obj_addr + 8);
         assert_eq!(visited[1], obj_addr + 16);
         assert_eq!(visited[2], obj_addr + 24);
+    }
+
+    #[test]
+    fn test_for_each_gc_ptr_varsize_struct_items_uses_varofstoptrs() {
+        let word = std::mem::size_of::<GcRef>();
+        let info = TypeInfo::varsize_with_gc_ptr_offsets(
+            word,
+            3 * word,
+            0,
+            vec![word, 2 * word],
+            Vec::new(),
+        );
+
+        let mut data = vec![0u8; word + 2 * 3 * word];
+        let obj_addr = data.as_mut_ptr() as usize;
+        unsafe { *(obj_addr as *mut usize) = 2 };
+
+        let mut visited = Vec::new();
+        unsafe { info.for_each_gc_ptr(obj_addr, |ptr| visited.push(ptr as usize)) };
+
+        assert_eq!(
+            visited,
+            vec![
+                obj_addr + 2 * word,
+                obj_addr + 3 * word,
+                obj_addr + 5 * word,
+                obj_addr + 6 * word,
+            ]
+        );
     }
 }

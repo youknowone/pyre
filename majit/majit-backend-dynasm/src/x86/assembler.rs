@@ -4487,6 +4487,74 @@ impl<'a> Assembler386<'a> {
                     Some(Loc::Immed(i)) => i.value,
                     _ => 8,
                 };
+                // x86/assembler.py `malloc_cond_varsize`: keep the common
+                // short-array allocation in generated code.  The unsigned
+                // length precheck sends negative and implausibly large values
+                // to the checked helper before `itemsize * length`; the second
+                // check sends a merely-full nursery there.  ECX/EDX are the
+                // exact result/temp pair reserved by
+                // `consider_call_malloc_nursery_varsize`, so the original
+                // length location remains intact for the slow arm.
+                let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+                let max_young = crate::runner::dynasm_max_size_of_young_obj();
+                let slow_path = self.mc.new_dynamic_label();
+                let done = self.mc.new_dynamic_label();
+                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                let header_size = majit_gc::header::GcHeader::SIZE as i64;
+                let word = std::mem::size_of::<usize>();
+                // `consider_call_malloc_nursery_varsize` passes this value
+                // directly as `maxlength`; the following nursery-top check
+                // rejects a scaled size that is still too large.
+                let max_length = max_young.saturating_sub(2 * word);
+                debug_assert!(itemsize > 0);
+                debug_assert!(
+                    base_size as usize + majit_gc::header::GcHeader::SIZE
+                        >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
+                );
+                if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
+                    dynasm!(self.mc ; .arch x64 ; jmp =>slow_path);
+                } else {
+                    match arglocs.first() {
+                        Some(Loc::Reg(len_r)) => {
+                            debug_assert_ne!(len_r.value, crate::regloc::ECX.value);
+                            debug_assert_ne!(len_r.value, crate::regloc::EDX.value);
+                            dynasm!(self.mc ; .arch x64 ; mov rdx, Rq(len_r.value));
+                        }
+                        Some(Loc::Immed(len_i)) => {
+                            dynasm!(self.mc ; .arch x64 ; mov rdx, QWORD len_i.value);
+                        }
+                        Some(Loc::Frame(len_f)) => {
+                            dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + len_f.ebp_loc.value]);
+                        }
+                        Some(Loc::Ebp(len_e)) => {
+                            dynasm!(self.mc ; .arch x64 ; mov rdx, [rbp + len_e.value]);
+                        }
+                        other => {
+                            panic!("CallMallocNurseryVarsize length is not a value: {other:?}")
+                        }
+                    }
+                    dynasm!(self.mc ; .arch x64
+                        ; mov Rq(scratch), QWORD max_length as i64
+                        ; cmp rdx, Rq(scratch)
+                        ; ja =>slow_path
+                        ; mov Rq(scratch), QWORD nf_addr as i64
+                        ; mov rcx, [Rq(scratch)]
+                        ; imul rdx, rdx, itemsize as i32
+                        ; add rdx, (base_size + header_size + 7) as i32
+                        ; and rdx, -8
+                        ; add rdx, rcx
+                        ; mov Rq(scratch), QWORD nt_addr as i64
+                        ; cmp rdx, [Rq(scratch)]
+                        ; ja =>slow_path
+                        ; mov Rq(scratch), QWORD nf_addr as i64
+                        ; mov [Rq(scratch)], rdx
+                        ; mov Rq(scratch), QWORD type_id
+                        ; mov [rcx], Rq(scratch)
+                        ; add rcx, header_size as i32
+                        ; jmp =>done
+                    );
+                }
+                dynasm!(self.mc ; .arch x64 ; =>slow_path);
                 // x86/assembler.py:254 `_push_all_regs_to_jitframe` — the
                 // helper below can collect, and unlike the fixed-size path it
                 // is called directly rather than through the trampoline that
@@ -4585,6 +4653,7 @@ impl<'a> Assembler386<'a> {
                     let rv = r.value;
                     dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
                 }
+                dynasm!(self.mc ; .arch x64 ; =>done);
             }
             // x86/assembler.py `genop_discard_check_memory_error`
             // — emit `TEST reg, reg` + `JNZ skip` and inline the

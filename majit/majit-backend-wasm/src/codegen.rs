@@ -5979,8 +5979,8 @@ fn build_function(
             // GUARD_GC_TYPE: args[0] = object ref, args[1] = expected
             // type_id. The majit runtime stores the typeid in the GC
             // header word placed immediately before the object payload
-            // (`majit_gc::header::GcHeader::tid_and_flags`, lower 32
-            // bits). The cranelift backend lowers the same op this way
+            // (`majit_gc::header::GcHeader::tid_and_flags`, lower
+            // `TYPE_ID_BITS`). The cranelift backend lowers the same op this way
             // (compiler.rs GuardGcType branch). This is NOT the RPython
             // gcremovetypeptr layout — pyre's GC keeps the typeid in the
             // header, not at `obj[0]`.
@@ -5992,7 +5992,9 @@ fn build_function(
                     sink.i64_const(GcHeader::SIZE as i64);
                     sink.i64_sub();
                     sink.i32_wrap_i64();
-                    // Load 8-byte header word (tid_and_flags)
+                    // Load the physical header prefix. On wasm32 its upper
+                    // four bytes are ABI padding; TYPE_ID_MASK selects the
+                    // 16-bit type-id half of the logical RPython word.
                     sink.i64_load(mem64(0));
                     // Mask lower TYPE_ID_BITS to extract the type id
                     sink.i64_const(TYPE_ID_MASK as i64);

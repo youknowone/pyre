@@ -3532,6 +3532,75 @@ impl<'a> AssemblerARM64<'a> {
                     Some(Loc::Immed(i)) => i.value,
                     _ => 8,
                 };
+                // aarch64/assembler.py `malloc_cond_varsize`: x0 is the
+                // nursery/result register and x1 the size temporary reserved
+                // by regalloc.  Only the two failing comparisons enter the
+                // collecting helper; a short array commits the bump, stamps
+                // its tid, and returns the payload directly.
+                let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+                let max_young = crate::runner::dynasm_max_size_of_young_obj();
+                let slow_path = self.mc.new_dynamic_label();
+                let done = self.mc.new_dynamic_label();
+                let word = std::mem::size_of::<usize>();
+                // aarch64/regalloc.py `consider_call_malloc_nursery_varsize`:
+                // `maxlength = (max_size_of_young_obj - WORD * 2) / itemsize`.
+                // The compare below is against the item count, not the byte
+                // bound x86's precheck uses.
+                let max_length = max_young.saturating_sub(2 * word) / itemsize as usize;
+                let header_size = majit_gc::header::GcHeader::SIZE as i64;
+                debug_assert!(itemsize > 0);
+                debug_assert!(
+                    base_size as usize + majit_gc::header::GcHeader::SIZE
+                        >= majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE
+                );
+                if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
+                    dynasm!(self.mc ; .arch aarch64 ; b =>slow_path);
+                } else {
+                    match arglocs.first() {
+                        Some(Loc::Reg(len_r)) => {
+                            debug_assert_ne!(len_r.value, 0);
+                            debug_assert_ne!(len_r.value, 1);
+                            dynasm!(self.mc ; .arch aarch64 ; mov x1, X(len_r.value));
+                        }
+                        Some(Loc::Immed(len_i)) => self.emit_mov_imm64(1, len_i.value),
+                        Some(Loc::Frame(len_f)) => self.emit_ldr_fp(1, len_f.ebp_loc.value),
+                        Some(Loc::Ebp(len_e)) => self.emit_ldr_fp(1, len_e.value),
+                        other => {
+                            panic!("CallMallocNurseryVarsize length is not a value: {other:?}")
+                        }
+                    }
+                    self.emit_mov_imm64(16, max_length as i64);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; cmp x1, x16
+                        ; b.hi =>slow_path
+                    );
+                    self.emit_mov_imm64(0, nf_addr as i64);
+                    dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x0]);
+                    self.emit_mov_imm64(16, itemsize);
+                    dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x16);
+                    self.emit_mov_imm64(16, base_size + header_size + 7);
+                    dynasm!(self.mc ; .arch aarch64 ; add x1, x1, x16);
+                    self.emit_mov_imm64(16, -8);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; and x1, x1, x16
+                        ; add x1, x1, x0
+                    );
+                    self.emit_mov_imm64(16, nt_addr as i64);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; ldr x16, [x16]
+                        ; cmp x1, x16
+                        ; b.hi =>slow_path
+                    );
+                    self.emit_mov_imm64(16, nf_addr as i64);
+                    dynasm!(self.mc ; .arch aarch64 ; str x1, [x16]);
+                    self.emit_mov_imm64(16, type_id);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; str x16, [x0]
+                        ; add x0, x0, header_size as u32
+                        ; b =>done
+                    );
+                }
+                dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
                 // assembler.py:254 `_push_all_regs_to_jitframe` — the helper
                 // below can collect, and `emit_malloc_slowpath_helper_call`
                 // only saves the volatiles to the *stack*, where the
@@ -3624,6 +3693,7 @@ impl<'a> AssemblerARM64<'a> {
                     let rv = r.value;
                     dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
                 }
+                dynasm!(self.mc ; .arch aarch64 ; =>done);
             }
             // aarch64/opassembler.py `emit_op_check_memory_error` →
             // assembler.py:342-346 `propagate_memoryerror_if_reg_is_null`

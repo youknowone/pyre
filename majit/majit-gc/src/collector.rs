@@ -638,7 +638,7 @@ fn estimate_best_nursery_size() -> usize {
 /// `nonlarge_max + 1` directly as the large-object cutoff, so the doubling is
 /// of the cutoff itself.  A nursery below this cannot hold one non-large
 /// object, which is why upstream never lets the environment configure one.
-const LARGE_OBJECT_THRESHOLD: usize = (16384 + 512) * 8;
+const LARGE_OBJECT_THRESHOLD: usize = (16384 + 512) * std::mem::size_of::<usize>();
 
 /// incminimark.py:459-473 — the environment-configured nursery size, and the
 /// `debug_tiny_nursery` budget a request below `minsize` turns into.
@@ -675,7 +675,11 @@ fn default_nursery_size() -> (usize, Option<usize>) {
 /// env.py `addressable_size = float(2**63)` for a 64-bit host: the most
 /// memory the process could address, used as the fallback / upper clamp when
 /// the real total-memory probe is unavailable or larger.
-const ADDRESSABLE_SIZE: f64 = 9_223_372_036_854_775_808.0; // 2**63
+const ADDRESSABLE_SIZE: f64 = if usize::BITS == 64 {
+    9_223_372_036_854_775_808.0 // 2**63
+} else {
+    2_147_483_648.0 // 2**31
+};
 
 /// env.py `get_total_memory_darwin`. Clamp a sysctl-probed total:
 /// fall back to the addressable size when the probe failed (`<= 0`) and cap it
@@ -890,6 +894,11 @@ struct IncrementalMarkState {
     /// only the small fixed offsets and streams variable-part items one at a
     /// time, so a large varsize GC-pointer array is never retained here.
     mark_offsets: Vec<usize>,
+    /// Reusable `VARSIZE_TYPE_INFO.varofstoptrs` buffer for the same walk.
+    /// Its size is the number of pointer fields in one item, not the array
+    /// length, so major marking still streams items without proportional
+    /// temporary storage.
+    mark_var_offsets: Vec<usize>,
 }
 
 impl IncrementalMarkState {
@@ -905,6 +914,7 @@ impl IncrementalMarkState {
             objects_marked: 0,
             mark_budget_per_step,
             mark_offsets: Vec::new(),
+            mark_var_offsets: Vec::new(),
         }
     }
 }
@@ -952,6 +962,11 @@ pub struct MiniMarkGC {
     /// and it runs over every registered root on every major cycle.  A `Cell`
     /// because the snapshot is a `&self` reader.
     root_snapshot_capacity: std::cell::Cell<usize>,
+    /// `gc/base.py:_totalroots_rpy`, the non-shrinking raw-list capacity used
+    /// by `inspector.py:get_rpy_roots`. The raw result deliberately retains
+    /// NULL padding; `pypy/module/gc/referents.py:get_rpy_roots` filters it at
+    /// the app-level boundary.
+    totalroots_rpy: usize,
     /// incminimark.py: objects with GCFLAG_CARDS_SET bit.
     /// Card bits are stored inline before each object's GcHeader.
     /// This list tracks which objects have at least one card bit set.
@@ -991,12 +1006,15 @@ pub struct MiniMarkGC {
     /// incminimark.py:388-390.  Registrations first enter the probably-young
     /// deque as `(object, finalizer-handler-index)` pairs and are promoted by
     /// the next minor collection.
-    probably_young_objects_with_finalizers: VecDeque<(usize, usize)>,
+    probably_young_objects_with_finalizers: VecDeque<(usize, isize)>,
     /// incminimark.py:392-393.  Old objects still waiting to become
     /// unreachable, paired with their translated FinalizerQueue handler.
-    old_objects_with_finalizers: VecDeque<(usize, usize)>,
+    old_objects_with_finalizers: VecDeque<(usize, isize)>,
     /// gc/base.py finalizer handlers: one death deque and trigger per queue.
     finalizer_handlers: Vec<FinalizerHandler>,
+    /// `GCBase.run_old_style_finalizers`: heavyweight finalizers use the
+    /// historical queue index -1 and are invoked after new-style triggers.
+    run_old_style_finalizers: VecDeque<usize>,
     finalizer_lock: bool,
     /// incminimark.py:394 `self.enabled = True`.
     enabled: bool,
@@ -1017,8 +1035,10 @@ pub struct MiniMarkGC {
     oldgen_nonmoving_active: bool,
     /// Nursery payload addresses greyed during the current non-moving major
     /// (only populated while `oldgen_nonmoving_active`). Drained by the final
-    /// VISITED-clear pass.
-    oldgen_nonmoving_young_marks: Vec<usize>,
+    /// VISITED-clear pass. The boolean records whether this visit also added
+    /// TRACK_YOUNG_PTRS, so the adaptation restores the young object's exact
+    /// incoming flag contract afterwards.
+    oldgen_nonmoving_young_marks: Vec<(usize, bool)>,
     /// incminimark.py:3160,3175-3182 — the raw-refcount lists, identity tables
     /// and dead queue, empty until the embedder calls
     /// [`rawrefcount_init`](MiniMarkGC::rawrefcount_init).
@@ -1275,6 +1295,7 @@ impl MiniMarkGC {
             old_objects_pointing_to_young: Vec::new(),
             prebuilt_root_objects: Vec::new(),
             root_snapshot_capacity: std::cell::Cell::new(0),
+            totalroots_rpy: 0,
             old_objects_with_cards_set: Vec::new(),
             young_objects_with_weakrefs: Vec::new(),
             old_objects_with_weakrefs: Vec::new(),
@@ -1283,6 +1304,7 @@ impl MiniMarkGC {
             probably_young_objects_with_finalizers: VecDeque::new(),
             old_objects_with_finalizers: VecDeque::new(),
             finalizer_handlers: Vec::new(),
+            run_old_style_finalizers: VecDeque::new(),
             finalizer_lock: false,
             enabled: true,
             oldgen_nonmoving_active: false,
@@ -1358,8 +1380,8 @@ impl MiniMarkGC {
 
     /// incminimark.py:1292-1299: number of machine words needed for card bits.
     fn card_marking_words_for_length(&self, length: usize) -> usize {
-        const LONG_BIT: usize = 64;
-        const LONG_BIT_SHIFT: usize = 6;
+        const LONG_BIT: usize = usize::BITS as usize;
+        const LONG_BIT_SHIFT: usize = usize::BITS.trailing_zeros() as usize;
         (length + (LONG_BIT << self.card_page_shift) - 1)
             >> (self.card_page_shift as usize + LONG_BIT_SHIFT)
     }
@@ -1464,7 +1486,13 @@ impl MiniMarkGC {
             return (0, GcFlags::empty());
         }
         let extra_words = self.card_marking_words_for_length(length);
-        let card_header_bytes = 8 * extra_words; // WORD * extra_words
+        // incminimark.py `external_malloc`: `cardheadersize = WORD *
+        // extra_words`.  On wasm32 `GcHeader` retains an eight-byte physical
+        // prefix solely to align native Rust payloads, so round the logical
+        // card bytes up to that physical alignment; the bytes adjacent to the
+        // object remain the real card bitmap and any leading bytes are pad.
+        let logical_card_bytes = std::mem::size_of::<usize>() * extra_words;
+        let card_header_bytes = logical_card_bytes.div_ceil(GcHeader::ALIGN) * GcHeader::ALIGN;
         let mut extra_flags = GcFlags::GCFLAG_HAS_CARDS | GcFlags::GCFLAG_TRACK_YOUNG_PTRS;
         // incminimark.py:1032-1035: "if 'alloc_young', then we also
         // immediately set GCFLAG_CARDS_SET, but without adding the object to
@@ -1619,6 +1647,13 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
+        // incminimark.py `malloc_fixedsize`: a heavyweight old-style
+        // finalizer can allocate, collect and resurrect, so its object must
+        // never move. `finish_alloc_in_oldgen` performs the -1 registration.
+        if self.type_has_old_style_finalizer(type_id) {
+            return self.alloc_in_oldgen_clear(type_id, total_size);
+        }
+
         if total_size < self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
             if !ptr.is_null() {
@@ -1671,7 +1706,7 @@ impl MiniMarkGC {
             return GcRef(0);
         }
         let ptr = self.nursery.alloc(total_size);
-        let ptr = if ptr.is_null() {
+        let mut ptr = if ptr.is_null() {
             self.reserve_nursery_gap(total_size)
         } else {
             ptr
@@ -1682,6 +1717,18 @@ impl MiniMarkGC {
             // independently; retain their external-allocation fallback
             // only for an object that cannot physically fit anywhere.
             return self.alloc_in_oldgen_clear(type_id, total_size);
+        }
+        if ptr.is_null() {
+            // `IncrementalMiniMarkGC.collect_and_reserve`: finalizer or
+            // rawrefcount work run by the wrapper may have filled the nursery
+            // again.  The second attempt is exactly `_minor_collection()` —
+            // no major step and no second callback — so the retry sees an
+            // empty nursery apart from pinned barriers.
+            self.minor_collection_only();
+            ptr = self.nursery.alloc(total_size);
+            if ptr.is_null() {
+                ptr = self.reserve_nursery_gap(total_size);
+            }
         }
         assert!(
             !ptr.is_null(),
@@ -1779,6 +1826,11 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
+        if !FAST && self.type_has_old_style_finalizer(type_id) {
+            unsafe { *needs_write_barrier = true };
+            return self.alloc_in_oldgen_clear(type_id, total_size);
+        }
+
         if total_size < self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
             if !ptr.is_null() {
@@ -1831,21 +1883,33 @@ impl MiniMarkGC {
         self.pending_reserving_size = total_size;
         unsafe { self.roots.add(root) };
         self.do_collect_nursery();
-        self.roots.remove(root);
         self.pending_reserving_size = 0;
         if std::mem::take(&mut self.oom_pending) {
+            self.roots.remove(root);
             return GcRef(0);
         }
         let ptr = self.nursery.alloc(total_size);
-        let ptr = if ptr.is_null() {
+        let mut ptr = if ptr.is_null() {
             self.reserve_nursery_gap(total_size)
         } else {
             ptr
         };
         if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
+            self.roots.remove(root);
             unsafe { *needs_write_barrier = true };
             return self.alloc_in_oldgen_clear(type_id, total_size);
         }
+        if ptr.is_null() {
+            // Keep the exceptional native-stack slot registered across the
+            // second bare minor as well; it is precisely another moving
+            // collection, even though no major/callback tail follows it.
+            self.minor_collection_only();
+            ptr = self.nursery.alloc(total_size);
+            if ptr.is_null() {
+                ptr = self.reserve_nursery_gap(total_size);
+            }
+        }
+        self.roots.remove(root);
         assert!(
             !ptr.is_null(),
             "collect_and_reserve could not find nursery space for a non-large object"
@@ -2036,6 +2100,10 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
+        if self.type_has_old_style_finalizer(type_id) {
+            return self.alloc_in_oldgen_nursery_substitute(type_id, total_size);
+        }
+
         // Both fallbacks stand in for the nursery bump below, which clears
         // nothing — the same reading `spill_to_oldgen_or_null` takes for this
         // function's fallible counterpart.
@@ -2173,6 +2241,10 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
+        if !FAST && self.type_has_old_style_finalizer(type_id) {
+            return self.spill_to_oldgen_or_null(type_id, total_size);
+        }
+
         if total_size < self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
             if !ptr.is_null() {
@@ -2218,6 +2290,50 @@ impl MiniMarkGC {
         }
         if let Some(destructor) = self.types.get(type_id).destructor {
             unsafe { destructor(obj_addr) };
+        }
+    }
+
+    /// `q_is_old_style_finalizer(typeid)` from gctypelayout.py.
+    #[inline]
+    fn type_has_old_style_finalizer(&self, type_id: u32) -> bool {
+        (type_id as usize) < self.types.len()
+            && self.types.get(type_id).old_style_finalizer.is_some()
+    }
+
+    /// `GCBase.mark_finalizer_to_run` keeps the historical -1 queue index for
+    /// old-style finalizers and non-negative indexes for FinalizerQueue.
+    fn register_finalizer_index(&mut self, fq_index: isize, obj: GcRef) {
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+            return;
+        }
+        // `register_finalizer` is contracted to run at most once per object
+        // (`rgc.py:648-649`). A second deque entry survives the first
+        // `deal_with_objects_with_finalizers` pass through `new_with_finalizer`
+        // (incminimark.py:2944-2946) and delivers the object a second time on
+        // the next major collection, so honour the contract here rather than
+        // leaving it to every caller.
+        let hdr = unsafe { header_of(obj.0) };
+        if unsafe { (*hdr).has_flag(GcFlags::FINALIZER_REGISTERED) } {
+            return;
+        }
+        unsafe { (*hdr).set_flag(GcFlags::FINALIZER_REGISTERED) };
+        // `oldgen.contains` is not the "is it old" question on its own: both
+        // raw-malloc births share `try_rawmalloc_block`, so a young one is in
+        // `rawmalloced_payloads` as well and answers yes. It has to be excluded
+        // here, because filing it as old skips the GCFLAG_VISITED_RMY stamp
+        // `deal_with_young_objects_with_finalizers` owes a raw-malloced member,
+        // and `free_young_rawmalloced_objects` then releases the block at the
+        // end of that minor with its address still on the old deque.
+        if self.oldgen.contains(obj.0) && !self.is_young_rawmalloced(obj.0) {
+            // Pyre's host allocations can be born directly in old-gen and an
+            // explicit non-moving major intentionally skips the leading minor.
+            // This is the post-`_trace_drag_out1` destination of PyPy's
+            // probably-young deque, reached immediately for an already-old obj.
+            self.old_objects_with_finalizers
+                .push_back((obj.0, fq_index));
+        } else {
+            self.probably_young_objects_with_finalizers
+                .push_back((obj.0, fq_index));
         }
     }
 
@@ -2774,6 +2890,9 @@ impl MiniMarkGC {
                 self.old_objects_with_weakrefs.push(obj_addr);
             }
         }
+        if self.type_has_old_style_finalizer(type_id) {
+            self.register_finalizer_index(-1, GcRef(obj_addr));
+        }
         crate::note_bh_object(
             obj_addr,
             total_size - GcHeader::SIZE,
@@ -2919,7 +3038,11 @@ impl MiniMarkGC {
         if (type_id as usize) >= self.types.len() {
             return true;
         }
-        let contains_weakptr = self.types.get(type_id).is_weakref;
+        let info = self.types.get(type_id);
+        let contains_weakptr = info.is_weakref;
+        if info.old_style_finalizer.is_some() {
+            return false;
+        }
         debug_assert!(
             !contains_weakptr,
             "'contains_weakptr' specified for a large object"
@@ -3054,19 +3177,15 @@ impl MiniMarkGC {
             .retain(|&obj_addr| !oldgen.young_rawmalloced_contains(obj_addr));
     }
 
-    /// Perform a minor (nursery) collection.
+    /// `IncrementalMiniMarkGC._minor_collection`: perform only the nursery
+    /// collection, without major progress or the rawrefcount callback.
     ///
-    /// 1. Scan roots: copy referenced nursery objects to old gen.
-    /// 2. Process remembered set: copy nursery objects referenced by old-gen objects.
-    /// 3. Iteratively process newly discovered references until stable.
-    /// 4. Reset nursery.
-    pub fn do_collect_nursery(&mut self) {
+    /// The public wrapper below owns the stop-the-world guard.  Keeping this
+    /// body separate is load-bearing for `collect_and_reserve`: if a finalizer
+    /// or rawrefcount callback refills the nursery after the first collection,
+    /// upstream performs one more bare `_minor_collection()` before retrying.
+    fn minor_collection_body(&mut self) {
         let start = GcClock::start();
-        let _stw = if crate::gc_sync::stw_required() {
-            Some(crate::gc_sync::quiesce_mutators())
-        } else {
-            None
-        };
         let walk_all_mutators = crate::gc_sync::mutators_quiesced();
         if crate::majit_log_enabled() {
             eprintln!(
@@ -3513,14 +3632,32 @@ impl MiniMarkGC {
             self.get_total_memory_used(),
             self.pinned_objects_in_nursery,
         );
+    }
 
-        // Minor collections must also drive incremental major-collection
-        // progress. Like incminimark, take one or more major steps until
-        // promoted bytes are back under the current step credit.
+    /// `IncrementalMiniMarkGC._minor_collection`, including pyre's
+    /// stop-the-world ownership but deliberately excluding the wrapper tail.
+    fn minor_collection_only(&mut self) {
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        self.minor_collection_body();
+    }
+
+    /// Perform `minor_collection_with_major_progress(force_enabled=False)`.
+    ///
+    /// 1. Scan roots and evacuate the nursery.
+    /// 2. Advance the incremental major until both target invariants hold.
+    /// 3. Schedule rawrefcount work queued by either collection.
+    pub fn do_collect_nursery(&mut self) {
+        let _stw = if crate::gc_sync::stw_required() {
+            Some(crate::gc_sync::quiesce_mutators())
+        } else {
+            None
+        };
+        self.minor_collection_body();
         self.run_major_progress_after_minor();
-
-        // incminimark.py — `minor_collection_with_major_progress` is where
-        // upstream schedules the drain of whatever this collection queued.
         self.rrc_invoke_callback();
     }
 
@@ -3537,10 +3674,11 @@ impl MiniMarkGC {
     /// The young raw-malloced target is the second branch
     /// (incminimark.py:3083-3090): it survives without moving, so the slot
     /// needs no update and only its death has to be written. RPython's
-    /// pinned-target NULL semantics and prebuilt-target skipping still have no
-    /// pyre analog (no pinned-weakref code path, no immortal prebuilt objects
-    /// with `GCFLAG_NO_HEAP_PTRS`), so those filters remain out of scope until
-    /// the matching surfaces land.
+    /// PyPy deliberately does not support weakrefs to pinned targets (the XXX
+    /// immediately above this routine says so). Its prebuilt-target branch is
+    /// part of the contract, however: a `GCFLAG_NO_HEAP_PTRS` target is
+    /// immortal and never receives VISITED, so registering it for the next
+    /// major would make that major clear a live weakref.
     fn invalidate_young_weakrefs(&mut self) {
         while let Some(obj_addr) = self.young_objects_with_weakrefs.pop() {
             // incminimark.py:3065-3066: if not forwarded → weakref died.
@@ -3595,7 +3733,9 @@ impl MiniMarkGC {
             // does not own). Either way, the minor cycle leaves the
             // weakptr untouched and the major cycle gets
             // the chance to invalidate it later.
-            if self.oldgen.contains(pointing_to) {
+            if self.oldgen.contains(pointing_to)
+                && unsafe { !(*header_of(pointing_to)).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS) }
+            {
                 self.old_objects_with_weakrefs.push(new_obj);
             }
         }
@@ -3667,6 +3807,12 @@ impl MiniMarkGC {
         self.rrc.finalizer_claim = Some(claim);
     }
 
+    /// Register the allocator-matched release used by `_rrc_free` for an
+    /// exact [`rawrefcount::REFCNT_FROM_PYPY_LIGHT`] mirror.
+    pub fn rawrefcount_set_light_free(&mut self, free: rawrefcount::LightFreeFn) {
+        self.rrc.light_free = Some(free);
+    }
+
     /// Take this collection's edges from the embedder and count, per mirror,
     /// how many of its references the reporting blocks supply.
     ///
@@ -3687,18 +3833,21 @@ impl MiniMarkGC {
 
     /// Whether `mirror`'s count makes it root its linked object.
     ///
-    /// `incminimark.py:3264` is `rc == REFCNT_FROM_PYPY or rc ==
-    /// REFCNT_FROM_PYPY_LIGHT` — every reference above the link share is one C
-    /// holds, and holding it is what roots.  The light disjunct is dropped
-    /// because no mirror carries that count (see
-    /// [`rawrefcount::REFCNT_IMMORTAL`]); with one, the base share to subtract
-    /// below would have to be the light constant for such a mirror.  The subtraction is [`rawrefcount::CEdgeCensusFn`]'s: a reference
+    /// `incminimark.py:_rrc_minor_trace` treats either exact link share as
+    /// unreferenced. Every count above its corresponding share is one C holds,
+    /// and holding it is what roots. The subtraction after that is
+    /// [`rawrefcount::CEdgeCensusFn`]'s: a reference
     /// another block in the census supplies is not one from outside the heap,
     /// and whether *that* block's own object lives is settled by the trace, in
     /// [`Self::mark_c_edges`], rather than assumed here.
     fn rrc_roots_link(&self, mirror: usize) -> bool {
         let rc = unsafe { (*rawrefcount::pyobj(mirror)).ob_refcnt };
-        let held = rc - rawrefcount::REFCNT_FROM_PYPY;
+        let share = if rc >= rawrefcount::REFCNT_FROM_PYPY_LIGHT {
+            rawrefcount::REFCNT_FROM_PYPY_LIGHT
+        } else {
+            rawrefcount::REFCNT_FROM_PYPY
+        };
+        let held = rc - share;
         held > self.rrc.c_discount.get(&mirror).copied().unwrap_or(0)
     }
 
@@ -4181,22 +4330,37 @@ impl MiniMarkGC {
     /// incminimark.py `_rrc_free`.
     ///
     /// The linked object has died, so the interpreter's share of the count goes
-    /// away.  incminimark.py:3325-3332's `REFCNT_FROM_PYPY_LIGHT` branch has no
-    /// port, for the reason [`rawrefcount::REFCNT_IMMORTAL`] records: no
-    /// translated `cpyext` creates a light mirror, so upstream never takes that
-    /// branch either.  The immortal branch is pyre's own and is unreachable,
-    /// because a count above the link share forces the linked object alive in
-    /// both trace passes.
+    /// away. `incminimark.py:_rrc_free` releases an exact LIGHT mirror directly
+    /// with raw `free`; a LIGHT mirror with external references is merely
+    /// unlinked. The ordinary share still queues a zero-count mirror for its
+    /// type-specific C deallocator.
     fn _rrc_free(&mut self, mirror: usize) {
         let header = rawrefcount::pyobj(mirror);
         let mut rc = unsafe { (*header).ob_refcnt };
-        debug_assert!(
-            rc < rawrefcount::REFCNT_IMMORTAL,
-            "an immortal mirror reached the rawrefcount free pass"
-        );
+        debug_assert!(rc < rawrefcount::REFCNT_IMMORTAL);
+        if rc >= rawrefcount::REFCNT_FROM_PYPY_LIGHT {
+            rc -= rawrefcount::REFCNT_FROM_PYPY_LIGHT;
+            if rc == 0 {
+                let free = self
+                    .rrc
+                    .light_free
+                    .expect("rawrefcount LIGHT mirror has no allocator release callback");
+                free(mirror);
+            } else {
+                unsafe {
+                    (*header).ob_refcnt = rc;
+                    (*header).ob_link = 0;
+                }
+            }
+            return;
+        }
         debug_assert!(
             rc >= rawrefcount::REFCNT_FROM_PYPY,
             "rawrefcount refcount underflow"
+        );
+        debug_assert!(
+            (rc as f64) < (rawrefcount::REFCNT_FROM_PYPY_LIGHT as f64 * 0.99),
+            "refcount underflow from REFCNT_FROM_PYPY_LIGHT"
         );
         rc -= rawrefcount::REFCNT_FROM_PYPY;
         unsafe { (*header).ob_link = 0 };
@@ -5022,7 +5186,7 @@ impl MiniMarkGC {
             } {
                 unsafe { (*hdr).set_flag(GcFlags::GCFLAG_VISITED) };
                 self.incr_state.more_gray_stack.push(gcref.0);
-                self.note_nonmoving_young_mark(gcref.0);
+                self.note_nonmoving_young_mark(gcref.0, false);
             }
         }
     }
@@ -5090,6 +5254,7 @@ impl MiniMarkGC {
 
         let type_info = self.types.get(type_id);
         let noffsets = type_info.gc_ptr_offsets.len();
+        let n_var_offsets = type_info.var_gc_ptr_offsets.len();
         let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
         let item_size = type_info.item_size;
         let length_offset = type_info.length_offset;
@@ -5134,28 +5299,32 @@ impl MiniMarkGC {
             let length = unsafe { *((obj_addr + length_offset) as *const usize) };
             let items_start = obj_addr + base_size;
             for i in 0..length {
-                let slot = (items_start + i * item_size) as *mut GcRef;
-                let field_ref = unsafe { *slot };
-                self.assert_traced_slot_initialized(
-                    field_ref,
-                    slot as usize,
-                    obj_addr,
-                    "minor_varsize_item",
-                    site,
-                );
-                if self.is_nursery_object_start(field_ref.0) {
-                    let new_ref = self.copy_nursery_object(
-                        field_ref.0,
-                        "minor_varsize_item_target",
-                        site,
-                        obj_addr,
+                let item = items_start + i * item_size;
+                for j in 0..n_var_offsets {
+                    let offset = self.types.get(type_id).var_gc_ptr_offsets[j];
+                    let slot = (item + offset) as *mut GcRef;
+                    let field_ref = unsafe { *slot };
+                    self.assert_traced_slot_initialized(
+                        field_ref,
                         slot as usize,
+                        obj_addr,
+                        "minor_varsize_item",
+                        site,
                     );
-                    unsafe {
-                        *slot = new_ref;
+                    if self.is_nursery_object_start(field_ref.0) {
+                        let new_ref = self.copy_nursery_object(
+                            field_ref.0,
+                            "minor_varsize_item_target",
+                            site,
+                            obj_addr,
+                            slot as usize,
+                        );
+                        unsafe {
+                            *slot = new_ref;
+                        }
+                    } else if self.is_young_rawmalloced(field_ref.0) {
+                        self.visit_young_rawmalloced_object(field_ref.0);
                     }
-                } else if self.is_young_rawmalloced(field_ref.0) {
-                    self.visit_young_rawmalloced_object(field_ref.0);
                 }
             }
         }
@@ -5250,9 +5419,19 @@ impl MiniMarkGC {
         self.validate_type_id(unsafe { (*hdr).type_id() }, gcref.0, site);
         // SAFETY: header_of returns a raw pointer; keep each access
         // short-lived to avoid creating overlapping exclusive borrows.
+        let track_was_set = unsafe { (*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) };
         let newly_marked = unsafe {
-            if !(*hdr).has_flag(GcFlags::GCFLAG_VISITED) {
+            if !(*hdr).has_flag(GcFlags::GCFLAG_VISITED)
+                && !(*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS)
+            {
                 (*hdr).set_flag(GcFlags::GCFLAG_VISITED);
+                // `IncrementalMiniMarkGC.visit`: the first visit makes the
+                // object black *and* arms its write barrier.  The latter is
+                // what lets a mutation between incremental steps turn the
+                // black object gray again.
+                if !self.is_in_nursery(gcref.0) {
+                    (*hdr).set_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+                }
                 true
             } else {
                 false
@@ -5260,7 +5439,7 @@ impl MiniMarkGC {
         };
         if newly_marked {
             self.incr_state.gray_stack.push(gcref.0);
-            self.note_nonmoving_young_mark(gcref.0);
+            self.note_nonmoving_young_mark(gcref.0, !self.is_in_nursery(gcref.0) && !track_was_set);
 
             // incminimark.py:1322-1340 requires marking worklists to
             // contain no nursery objects after a minor. Pyre JITFRAME
@@ -5270,10 +5449,7 @@ impl MiniMarkGC {
             // mutator barrier. Arm this newly seeded old root in the
             // existing old_objects_pointing_to_young shape once, so that
             // minor forwards any such spill before resetting nursery.
-            if !self.is_in_nursery(gcref.0)
-                && unsafe { (*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) }
-            {
-                unsafe { (*hdr).clear_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) };
+            if !self.is_in_nursery(gcref.0) {
                 self.old_objects_pointing_to_young.push(gcref.0);
                 if crate::gc_lifetime_log_enabled() {
                     eprintln!(
@@ -5329,11 +5505,12 @@ impl MiniMarkGC {
     /// that as "already greyed", never pushes it, and never traces its
     /// children.
     #[inline]
-    fn note_nonmoving_young_mark(&mut self, addr: usize) {
+    fn note_nonmoving_young_mark(&mut self, addr: usize, armed_track_young_ptrs: bool) {
         if self.oldgen_nonmoving_active
             && (self.is_in_nursery(addr) || self.is_young_rawmalloced(addr))
         {
-            self.oldgen_nonmoving_young_marks.push(addr);
+            self.oldgen_nonmoving_young_marks
+                .push((addr, armed_track_young_ptrs));
         }
     }
 
@@ -5475,6 +5652,7 @@ impl MiniMarkGC {
         for addr in pending {
             result.push(GcRef(addr));
         }
+        result.extend(self.run_old_style_finalizers.iter().copied().map(GcRef));
         result
     }
 
@@ -5504,6 +5682,12 @@ impl MiniMarkGC {
                 .iter()
                 .flat_map(|handler| handler.deque.iter().copied())
                 .map(|addr| (GcRef(addr), "finalizer_death_queue")),
+        );
+        roots.extend(
+            self.run_old_style_finalizers
+                .iter()
+                .copied()
+                .map(|addr| (GcRef(addr), "old_style_finalizer_death_queue")),
         );
         for (gcref, site) in roots {
             self.seed_major_root(gcref, site);
@@ -5538,7 +5722,7 @@ impl MiniMarkGC {
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
         self.validate_type_id(type_id, obj_addr, "object_is_tracked");
         let type_info = self.types.get(type_id);
-        type_info.has_gc_ptrs || (type_info.items_have_gc_ptrs && type_info.item_size > 0)
+        type_info.has_gc_ptrs
     }
 
     /// `inspector.py:get_rpy_referents`: trace one object's direct GC
@@ -5565,7 +5749,10 @@ impl MiniMarkGC {
             let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
             let items_start = obj_addr + type_info.size;
             for i in 0..length {
-                visitor((items_start + i * type_info.item_size) as *mut GcRef);
+                let item = items_start + i * type_info.item_size;
+                for &offset in &type_info.var_gc_ptr_offsets {
+                    visitor((item + offset) as *mut GcRef);
+                }
             }
         }
     }
@@ -5648,10 +5835,12 @@ impl MiniMarkGC {
             let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
             let items_start = obj_addr + type_info.size;
             for i in 0..length {
-                let field_ref =
-                    unsafe { *((items_start + i * type_info.item_size) as *const GcRef) };
-                if !field_ref.is_null() {
-                    visitor(field_ref);
+                let item = items_start + i * type_info.item_size;
+                for &offset in &type_info.var_gc_ptr_offsets {
+                    let field_ref = unsafe { *((item + offset) as *const GcRef) };
+                    if !field_ref.is_null() {
+                        visitor(field_ref);
+                    }
                 }
             }
         }
@@ -5728,10 +5917,15 @@ impl MiniMarkGC {
         } else {
             None
         };
-        for root in self.enumerate_all_root_values() {
-            if !root.is_null() {
-                visitor(root);
-            }
+        let roots = self.enumerate_all_root_values();
+        if roots.len() > self.totalroots_rpy {
+            self.totalroots_rpy = roots.len() + roots.len() / 8 + 10;
+        }
+        for root in roots.iter().copied() {
+            visitor(root);
+        }
+        for _ in roots.len()..self.totalroots_rpy {
+            visitor(GcRef::NULL);
         }
         true
     }
@@ -6095,7 +6289,8 @@ impl MiniMarkGC {
         if !self.enabled {
             return;
         }
-        if self.gc_state == GcState::Scanning && !self.threshold_reached(0) {
+        let extrasize = self.pending_reserving_size;
+        if self.gc_state == GcState::Scanning && !self.threshold_reached(extrasize) {
             return;
         }
 
@@ -6107,12 +6302,18 @@ impl MiniMarkGC {
                 break;
             }
 
-            // incminimark.py:849-860 target (A2). Keep pyre's existing
-            // consecutive-step credit loop: the enclosing call has already
-            // completed the minor collection that supplied these promotions.
-            if self.bytes_made_old_since_cycle <= self.threshold_bytes_made_old {
+            // `minor_collection_with_major_progress` target (A2).  The
+            // allocation being reserved does not exist yet but must already
+            // fit under the credit line, hence the `threshold - extrasize`
+            // comparison.  If promotions still outrun credit, PyPy performs
+            // another bare `_minor_collection()` before the next major step;
+            // repeating only the major step lets a high-survival nursery keep
+            // growing faster than marking observes it.
+            let threshold = self.threshold_bytes_made_old.saturating_sub(extrasize);
+            if self.bytes_made_old_since_cycle <= threshold {
                 break;
             }
+            self.minor_collection_body();
         }
     }
 
@@ -6585,10 +6786,23 @@ impl MiniMarkGC {
                     self.major_collections,
                 );
             }
-            if unsafe { !(*hdr).has_flag(GcFlags::GCFLAG_VISITED) } {
-                unsafe { (*hdr).set_flag(GcFlags::GCFLAG_VISITED) };
+            let track_was_set = unsafe { (*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) };
+            if unsafe {
+                !(*hdr).has_flag(GcFlags::GCFLAG_VISITED)
+                    && !(*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS)
+            } {
+                unsafe {
+                    (*hdr).set_flag(GcFlags::GCFLAG_VISITED);
+                    // `IncrementalMiniMarkGC.visit` sets both bits on the
+                    // first visit.  A nursery object exists here only during
+                    // pyre's non-moving-major adaptation; nursery objects do
+                    // not participate in the old-object write barrier.
+                    if !self.is_in_nursery(addr) {
+                        (*hdr).set_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+                    }
+                };
                 self.incr_state.gray_stack.push(addr);
-                self.note_nonmoving_young_mark(addr);
+                self.note_nonmoving_young_mark(addr, !self.is_in_nursery(addr) && !track_was_set);
             }
         }
     }
@@ -6637,7 +6851,9 @@ impl MiniMarkGC {
         let custom_trace;
         let (item_size, length_offset, fixed_size, items_have_gc_ptrs);
         let mut offsets = std::mem::take(&mut self.incr_state.mark_offsets);
+        let mut var_offsets = std::mem::take(&mut self.incr_state.mark_var_offsets);
         offsets.clear();
+        var_offsets.clear();
         {
             let type_info = self.types.get(type_id);
             custom_trace = type_info.custom_trace;
@@ -6647,6 +6863,7 @@ impl MiniMarkGC {
             items_have_gc_ptrs = type_info.items_have_gc_ptrs;
             if custom_trace.is_none() {
                 offsets.extend_from_slice(&type_info.gc_ptr_offsets);
+                var_offsets.extend_from_slice(&type_info.var_gc_ptr_offsets);
             }
         }
 
@@ -6685,14 +6902,13 @@ impl MiniMarkGC {
                 let length = unsafe { *((obj_addr + length_offset) as *const usize) };
                 let items_start = obj_addr + fixed_size;
                 for i in 0..length {
-                    let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
-                    if !field_ref.is_null() {
-                        self.grey_child(
-                            field_ref.0,
-                            obj_addr,
-                            items_start + i * item_size,
-                            "major_varsize_item",
-                        );
+                    let item = items_start + i * item_size;
+                    for &offset in &var_offsets {
+                        let slot = item + offset;
+                        let field_ref = unsafe { *(slot as *const GcRef) };
+                        if !field_ref.is_null() {
+                            self.grey_child(field_ref.0, obj_addr, slot, "major_varsize_item");
+                        }
                     }
                 }
             }
@@ -6700,6 +6916,7 @@ impl MiniMarkGC {
 
         // Return the (small) offsets buffer for reuse.
         self.incr_state.mark_offsets = offsets;
+        self.incr_state.mark_var_offsets = var_offsets;
     }
 
     /// incminimark.py:1793-1799 + :2461-2470 — final snapshot-at-the-beginning
@@ -7227,9 +7444,12 @@ impl MiniMarkGC {
             let length = unsafe { *((obj_addr + info.length_offset) as *const usize) };
             let items_start = obj_addr + info.size;
             for i in 0..length {
-                let child = unsafe { *((items_start + i * info.item_size) as *const GcRef) };
-                if !child.is_null() && self.is_managed_heap_object(child.0) {
-                    children.push(child.0);
+                let item = items_start + i * info.item_size;
+                for &offset in &info.var_gc_ptr_offsets {
+                    let child = unsafe { *((item + offset) as *const GcRef) };
+                    if !child.is_null() && self.is_managed_heap_object(child.0) {
+                        children.push(child.0);
+                    }
                 }
             }
         }
@@ -7258,7 +7478,9 @@ impl MiniMarkGC {
     /// and code object is on those lists and a predicate that counted them
     /// would never answer zero.
     pub(crate) fn registered_finalizer_count(&self) -> usize {
-        self.probably_young_objects_with_finalizers.len() + self.old_objects_with_finalizers.len()
+        self.probably_young_objects_with_finalizers.len()
+            + self.old_objects_with_finalizers.len()
+            + self.run_old_style_finalizers.len()
     }
 
     /// Whether a collection could still hand control back to the program.
@@ -7384,7 +7606,13 @@ impl MiniMarkGC {
 
         while let Some((obj_addr, fq_index)) = marked.pop_front() {
             if self.finalization_state(obj_addr) == 2 {
-                self.finalizer_handlers[fq_index].deque.push_back(obj_addr);
+                if fq_index == -1 {
+                    self.run_old_style_finalizers.push_back(obj_addr);
+                } else {
+                    self.finalizer_handlers[fq_index as usize]
+                        .deque
+                        .push_back(obj_addr);
+                }
                 self.recursively_clear_finalization_ordering(obj_addr);
             } else {
                 new_with_finalizer.push_back((obj_addr, fq_index));
@@ -7402,6 +7630,22 @@ impl MiniMarkGC {
             if !handler.deque.is_empty() {
                 (handler.trigger)();
             }
+        }
+        // GCBase.execute_finalizers runs old-style callbacks only after every
+        // new-style queue trigger. Pop before calling so a nested collection
+        // cannot invoke the same object twice. PyPy's GC transform keeps the
+        // popped `obj` local alive across `call_destructor`; register the Rust
+        // local explicitly for that same re-entrant-collection contract.
+        while let Some(obj_addr) = self.run_old_style_finalizers.pop_front() {
+            let mut obj = GcRef(obj_addr);
+            unsafe { self.roots.add(&mut obj) };
+            let type_id = unsafe { (*header_of(obj.0)).type_id() };
+            if (type_id as usize) < self.types.len()
+                && let Some(finalizer) = self.types.get(type_id).old_style_finalizer
+            {
+                unsafe { finalizer(obj.0) };
+            }
+            self.roots.remove(&mut obj);
         }
         self.finalizer_lock = false;
     }
@@ -7487,12 +7731,8 @@ impl MiniMarkGC {
         // This is the `_minor_collection()` performed by upstream's
         // `gc_step_until(STATE_MARKING)` before it starts the fresh cycle.
         // Upstream calls the low-level `_minor_collection`, which has no
-        // major-progress tail, so suppress this wrapper's tail the way
-        // `gc_step_until_scanning_with_minors` does.
-        let was_enabled = self.enabled;
-        self.enabled = false;
-        self.do_collect_nursery();
-        self.enabled = was_enabled;
+        // major-progress or rawrefcount-callback tail.
+        self.minor_collection_body();
 
         // The rest of that same `gc_step_until(STATE_MARKING)` iteration.
         // Reaching MARKING through `major_collection_step` is what runs the
@@ -7552,9 +7792,7 @@ impl MiniMarkGC {
             // called too often, the memory usage will keep increasing, because
             // we'll never completely fill the nursery (and so never run
             // anything about the major collection)."
-            let was_enabled = std::mem::replace(&mut self.enabled, false);
-            self.do_collect_nursery();
-            self.enabled = was_enabled;
+            self.minor_collection_body();
         } else {
             self.minor_collection_with_major_progress(true);
             // gen == 1 is gen == 0 plus "if no major collection is running,
@@ -7601,10 +7839,7 @@ impl MiniMarkGC {
         // `_minor_collection`, not `minor_collection_with_major_progress`:
         // the explicit `major_collection_step` below is the one and only
         // state transition performed by this call.
-        let was_enabled = self.enabled;
-        self.enabled = false;
-        self.do_collect_nursery();
-        self.enabled = was_enabled;
+        self.minor_collection_body();
         self.major_collection_step();
 
         // incminimark.py:821.
@@ -7676,13 +7911,18 @@ impl MiniMarkGC {
     /// objects and skip their old-generation children.
     fn clear_oldgen_nonmoving_young_marks(&mut self) {
         let marks = std::mem::take(&mut self.oldgen_nonmoving_young_marks);
-        for addr in marks {
+        for (addr, clear_track_young_ptrs) in marks {
             // Nothing moved and nothing young was freed, so each addr is still
             // where it was noted; the guard is defensive against a duplicate
             // already cleared.
             if self.is_in_nursery(addr) || self.is_young_rawmalloced(addr) {
                 let hdr = unsafe { header_of(addr) };
-                unsafe { (*hdr).clear_flag(GcFlags::GCFLAG_VISITED) };
+                unsafe {
+                    (*hdr).clear_flag(GcFlags::GCFLAG_VISITED);
+                    if clear_track_young_ptrs {
+                        (*hdr).clear_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+                    }
+                };
             }
         }
     }
@@ -7700,15 +7940,9 @@ impl MiniMarkGC {
     /// place.
     fn gc_step_until_scanning_with_minors(&mut self) {
         while self.gc_state != GcState::Scanning {
-            // `do_collect_nursery` is pyre's public
-            // `minor_collection_with_major_progress`, whereas upstream calls
-            // the lower-level `_minor_collection` here and then advances one
-            // explicit step.  Suppress that wrapper's automatic progress so
-            // this remains the literal one-minor/one-major loop.
-            let was_enabled = self.enabled;
-            self.enabled = false;
-            self.do_collect_nursery();
-            self.enabled = was_enabled;
+            // Upstream calls the lower-level `_minor_collection` here and
+            // then advances one explicit step.
+            self.minor_collection_body();
             self.major_collection_step();
         }
     }
@@ -7988,14 +8222,9 @@ impl MiniMarkGC {
     /// the card bits stay where they are, so the per-card record is no longer
     /// true of the object and only the whole-object record is.
     ///
-    /// Nothing calls this outside tests, and nothing could act on it if it
-    /// did: `CARDS_SET` is only ever set behind a `HAS_CARDS` test, and the
-    /// one non-test place that sets `HAS_CARDS`, `alloc_in_oldgen_with_cards`,
-    /// has no production caller. So the guard above rejects every object pyre
-    /// can build today.
-    ///
-    /// It stops rejecting them the moment a production caller of that
-    /// allocator lands, and the sites that owe this call are the item moves in
+    /// `alloc_varsize_typed` reaches
+    /// `alloc_varsize_nonmoving_prefer_young`, so production list storage can
+    /// carry cards. The sites that owe this call are the item moves in
     /// `pyre_object::listobject`'s `W_ListObject` — `object_insert`,
     /// `object_remove` and `object_drain` each shift items with a bare
     /// `ptr::copy`, and `object_reverse` permutes them with a bare
@@ -8151,6 +8380,7 @@ impl MiniMarkGC {
             if type_info.items_have_gc_ptrs && type_info.item_size > 0 {
                 let item_size = type_info.item_size;
                 let base_size = type_info.size;
+                let n_var_offsets = type_info.var_gc_ptr_offsets.len();
                 let items_start = obj + base_size;
                 let card_page_indices = 1usize << self.card_page_shift;
 
@@ -8174,28 +8404,32 @@ impl MiniMarkGC {
                             }
                             // trace_and_drag_out_of_nursery_partial
                             for i in interval_start..interval_stop {
-                                let slot = (items_start + i * item_size) as *mut GcRef;
-                                let field_ref = unsafe { *slot };
-                                self.assert_traced_slot_initialized(
-                                    field_ref,
-                                    slot as usize,
-                                    obj,
-                                    "minor_dirty_card_item",
-                                    "minor_dirty_card",
-                                );
-                                if self.is_nursery_object_start(field_ref.0) {
-                                    let new_ref = self.copy_nursery_object(
-                                        field_ref.0,
-                                        "minor_dirty_card_item_target",
-                                        "minor_dirty_card",
-                                        obj,
+                                let item = items_start + i * item_size;
+                                for j in 0..n_var_offsets {
+                                    let offset = self.types.get(type_id).var_gc_ptr_offsets[j];
+                                    let slot = (item + offset) as *mut GcRef;
+                                    let field_ref = unsafe { *slot };
+                                    self.assert_traced_slot_initialized(
+                                        field_ref,
                                         slot as usize,
+                                        obj,
+                                        "minor_dirty_card_item",
+                                        "minor_dirty_card",
                                     );
-                                    unsafe {
-                                        *slot = new_ref;
+                                    if self.is_nursery_object_start(field_ref.0) {
+                                        let new_ref = self.copy_nursery_object(
+                                            field_ref.0,
+                                            "minor_dirty_card_item_target",
+                                            "minor_dirty_card",
+                                            obj,
+                                            slot as usize,
+                                        );
+                                        unsafe {
+                                            *slot = new_ref;
+                                        }
+                                    } else if self.is_young_rawmalloced(field_ref.0) {
+                                        self.visit_young_rawmalloced_object(field_ref.0);
                                     }
-                                } else if self.is_young_rawmalloced(field_ref.0) {
-                                    self.visit_young_rawmalloced_object(field_ref.0);
                                 }
                             }
                         }
@@ -8277,6 +8511,15 @@ impl MiniMarkGC {
     /// flag test on the object header.
     pub fn can_optimize_cond_call(&self) -> bool {
         true
+    }
+
+    /// `IncrementalMiniMarkGC.can_optimize_clean_setarrayitems`.
+    ///
+    /// A clean bulk store is barrier-free only when card marking is disabled.
+    /// With cards, clearing array items without marking their pages can hide
+    /// young references from the next minor collection.
+    pub fn can_optimize_clean_setarrayitems(&self) -> bool {
+        self.config.card_page_indices == 0
     }
 
     /// Perform one incremental GC step. Called from JIT safepoints.
@@ -8401,6 +8644,48 @@ impl MiniMarkGC {
         }
         let hdr = unsafe { &*header_of(obj.0) };
         !hdr.is_forwarded() && hdr.has_flag(GcFlags::GCFLAG_PINNED)
+    }
+
+    /// `rgc.get_gcflag_extra`: read RPython's temporary traversal bit from a
+    /// managed or translated-prebuilt object.
+    pub fn get_gcflag_extra(&self, obj: GcRef) -> bool {
+        assert!(!obj.is_null(), "get_gcflag_extra(NULL)");
+        self.gcflag_header(obj)
+            .is_some_and(|hdr| unsafe { (*hdr).has_flag(GcFlags::GCFLAG_EXTRA) })
+    }
+
+    /// `rgc.toggle_gcflag_extra`: toggle the traversal bit in place. As in
+    /// upstream, the argument must be a non-NULL GC object.
+    pub fn toggle_gcflag_extra(&self, obj: GcRef) {
+        assert!(!obj.is_null(), "toggle_gcflag_extra(NULL)");
+        let hdr = self
+            .gcflag_header(obj)
+            .expect("toggle_gcflag_extra called for a non-GC object");
+        unsafe {
+            if (*hdr).has_flag(GcFlags::GCFLAG_EXTRA) {
+                (*hdr).clear_flag(GcFlags::GCFLAG_EXTRA);
+            } else {
+                (*hdr).set_flag(GcFlags::GCFLAG_EXTRA);
+            }
+        }
+    }
+
+    /// `rgc.get_gcflag_dummy`: whether this is the low-level dummy value used
+    /// by translated hash tables.
+    pub fn get_gcflag_dummy(&self, obj: GcRef) -> bool {
+        if obj.is_null() {
+            return false;
+        }
+        self.gcflag_header(obj)
+            .is_some_and(|hdr| unsafe { (*hdr).has_flag(GcFlags::GCFLAG_DUMMY) })
+    }
+
+    fn gcflag_header(&self, obj: GcRef) -> Option<*mut GcHeader> {
+        if self.is_managed_heap_object(obj.0) {
+            Some(unsafe { header_of(obj.0) })
+        } else {
+            self.registered_external_header(obj.0)
+        }
     }
 
     /// Number of objects in the remembered set (for testing / diagnostics).
@@ -8627,7 +8912,7 @@ impl GcAllocator for MiniMarkGC {
     fn type_alloc_is_plain(&self, type_id: u32) -> bool {
         (type_id as usize) < self.types.len() && {
             let info = self.types.get(type_id);
-            info.destructor.is_none() && !info.is_weakref
+            info.destructor.is_none() && info.old_style_finalizer.is_none() && !info.is_weakref
         }
     }
 
@@ -8711,6 +8996,18 @@ impl GcAllocator for MiniMarkGC {
         self.object_is_tracked(obj.0)
     }
 
+    fn get_gcflag_extra(&mut self, obj: GcRef) -> bool {
+        MiniMarkGC::get_gcflag_extra(self, obj)
+    }
+
+    fn toggle_gcflag_extra(&mut self, obj: GcRef) {
+        MiniMarkGC::toggle_gcflag_extra(self, obj)
+    }
+
+    fn get_gcflag_dummy(&mut self, obj: GcRef) -> bool {
+        MiniMarkGC::get_gcflag_dummy(self, obj)
+    }
+
     fn get_rpy_memory_usage(&mut self, obj: GcRef) -> Option<usize> {
         self.rpy_memory_usage(obj)
     }
@@ -8778,35 +9075,8 @@ impl GcAllocator for MiniMarkGC {
                 trigger,
             });
         }
-        // `register_finalizer` is contracted to run at most once per object
-        // (`rgc.py:648-649`). A second deque entry survives the first
-        // `deal_with_objects_with_finalizers` pass through `new_with_finalizer`
-        // (incminimark.py:2944-2946) and delivers the object a second time on
-        // the next major collection, so honour the contract here rather than
-        // leaving it to every caller.
-        let hdr = unsafe { header_of(obj.0) };
-        if unsafe { (*hdr).has_flag(GcFlags::FINALIZER_REGISTERED) } {
-            return;
-        }
-        unsafe { (*hdr).set_flag(GcFlags::FINALIZER_REGISTERED) };
-        // `oldgen.contains` is not the "is it old" question on its own: both
-        // raw-malloc births share `try_rawmalloc_block`, so a young one is in
-        // `rawmalloced_payloads` as well and answers yes. It has to be excluded
-        // here, because filing it as old skips the GCFLAG_VISITED_RMY stamp
-        // `deal_with_young_objects_with_finalizers` owes a raw-malloced member,
-        // and `free_young_rawmalloced_objects` then releases the block at the
-        // end of that minor with its address still on the old deque.
-        if self.oldgen.contains(obj.0) && !self.is_young_rawmalloced(obj.0) {
-            // Pyre's host allocations can be born directly in old-gen and an
-            // explicit non-moving major intentionally skips the leading minor.
-            // This is the post-`_trace_drag_out1` destination of PyPy's
-            // probably-young deque, reached immediately for an already-old obj.
-            self.old_objects_with_finalizers
-                .push_back((obj.0, fq_index));
-        } else {
-            self.probably_young_objects_with_finalizers
-                .push_back((obj.0, fq_index));
-        }
+        let fq_index = isize::try_from(fq_index).expect("finalizer queue index exceeds Signed");
+        self.register_finalizer_index(fq_index, obj);
     }
 
     fn ignore_finalizer(&mut self, obj: GcRef) {
@@ -8871,6 +9141,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn can_optimize_cond_call(&self) -> bool {
         self.can_optimize_cond_call()
+    }
+
+    fn can_optimize_clean_setarrayitems(&self) -> bool {
+        self.can_optimize_clean_setarrayitems()
     }
 
     fn gc_step(&mut self) -> bool {
@@ -10241,6 +10515,8 @@ mod tests {
         let mut roots = Vec::new();
         assert!(gc.do_get_rpy_roots(&mut |root| roots.push(root)));
         assert!(roots.contains(&holder));
+        assert_eq!(roots.last(), Some(&GcRef::NULL));
+        assert!(roots.len() > roots.iter().filter(|root| !root.is_null()).count());
 
         let mut referents = Vec::new();
         assert!(gc.do_get_rpy_referents(holder, &mut |child| { referents.push(child) }));
@@ -10282,6 +10558,23 @@ mod tests {
         let mut off_heap = 0usize;
         assert!(!gc.object_is_tracked(&mut off_heap as *mut usize as usize));
         gc.roots.clear();
+    }
+
+    #[test]
+    fn public_rgc_flags_use_the_objects_header_without_a_side_table() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::object(32));
+        let obj = gc.alloc_with_type(tid, 32);
+
+        assert!(!gc.get_gcflag_extra(obj));
+        gc.toggle_gcflag_extra(obj);
+        assert!(gc.get_gcflag_extra(obj));
+        gc.toggle_gcflag_extra(obj);
+        assert!(!gc.get_gcflag_extra(obj));
+
+        assert!(!gc.get_gcflag_dummy(obj));
+        unsafe { (*header_of(obj.0)).set_flag(GcFlags::GCFLAG_DUMMY) };
+        assert!(gc.get_gcflag_dummy(obj));
     }
 
     #[test]
@@ -11389,7 +11682,8 @@ mod tests {
         // arm has no other route onto the list a major collection drains.
         assert!(gc.old_objects_with_destructors.contains(&obj.0));
         // `allocsize = cardheadersize + round_up_for_allocation(totalsize)`.
-        let card_header_bytes = 8 * gc.card_marking_words_for_length(length);
+        let card_header_bytes =
+            std::mem::size_of::<usize>() * gc.card_marking_words_for_length(length);
         assert!(card_header_bytes > 0);
         assert_eq!(
             gc.bytes_made_old_since_cycle - bytes_before,
@@ -12165,6 +12459,49 @@ mod tests {
     }
 
     #[test]
+    fn varsize_struct_item_offsets_survive_minor_major_and_inspection() {
+        let word = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(8192);
+        let array_tid = gc.register_type(TypeInfo::varsize_with_gc_ptr_offsets(
+            word,
+            3 * word,
+            0,
+            vec![word, 2 * word],
+            Vec::new(),
+        ));
+        let leaf_tid = gc.register_type(TypeInfo::simple(word));
+        let mut array = GcAllocator::alloc_varsize_typed(&mut gc, array_tid, word, 3 * word, 2);
+        let items = array.0 + word;
+        let markers = [0xA11CEusize, 0xB0Busize, 0xCAFEusize, 0xD00Dusize];
+        for (index, marker) in markers.into_iter().enumerate() {
+            let child = gc.alloc_with_type(leaf_tid, word);
+            unsafe { *(child.0 as *mut usize) = marker };
+            let item = items + (index / 2) * 3 * word;
+            let offset = (1 + index % 2) * word;
+            unsafe { *((item + offset) as *mut GcRef) = child };
+        }
+        unsafe { gc.roots.add(&mut array) };
+
+        gc.do_collect_nursery();
+
+        let mut referents = Vec::new();
+        gc.visit_referents(array.0, &mut |child| referents.push(child));
+        assert_eq!(referents.len(), markers.len());
+        for (child, marker) in referents.iter().zip(markers) {
+            assert_eq!(unsafe { *(child.0 as *const usize) }, marker);
+        }
+
+        gc.do_collect_full();
+        let mut referents_after_major = Vec::new();
+        gc.visit_referents(array.0, &mut |child| referents_after_major.push(child));
+        assert_eq!(referents_after_major.len(), markers.len());
+        for (child, marker) in referents_after_major.iter().zip(markers) {
+            assert_eq!(unsafe { *(child.0 as *const usize) }, marker);
+        }
+        gc.roots.clear();
+    }
+
+    #[test]
     fn test_data_integrity_across_collections() {
         // Allocate objects with distinctive data, collect, verify data.
         let mut gc = test_gc(2048);
@@ -12500,7 +12837,7 @@ mod tests {
     }
 
     #[test]
-    fn test_minor_collection_can_take_multiple_major_steps_when_promotions_outpace_credit() {
+    fn test_major_progress_repeats_minor_when_promotions_outpace_credit() {
         let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(1024);
         let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
@@ -12528,14 +12865,51 @@ mod tests {
         // of objects so incminimark-style accounting demands extra progress.
         gc.bytes_made_old_since_cycle = gc.config.nursery_size;
         gc.threshold_bytes_made_old = 0;
+        let minors_before = gc.minor_collections;
         gc.run_major_progress_after_minor();
 
+        assert!(
+            gc.minor_collections > minors_before,
+            "target A2 failure must run another bare minor before its next major step"
+        );
         assert!(
             gc.incremental_objects_marked() >= 2
                 || gc.threshold_bytes_made_old > gc.config.nursery_size / 2,
             "major progress should take multiple steps when promoted bytes outpace credit"
         );
 
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn reserving_size_is_subtracted_from_major_progress_credit() {
+        let word = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(1024);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(word, vec![0]));
+
+        let mut previous = GcRef::NULL;
+        for _ in 0..4 {
+            let object = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + word);
+            unsafe { *(object.0 as *mut GcRef) = previous };
+            previous = object;
+        }
+        let mut root = previous;
+        unsafe { gc.roots.add(&mut root) };
+        gc.set_mark_budget(1);
+        gc.start_incremental_cycle();
+
+        // One step grants 512 bytes. The promoted total fits that unadjusted
+        // credit, but not the 512 - 256 bytes left after accounting for the
+        // allocation that is waiting for `collect_and_reserve`.
+        gc.bytes_made_old_since_cycle = gc.config.nursery_size / 2 - 1;
+        gc.threshold_bytes_made_old = 0;
+        gc.pending_reserving_size = gc.config.nursery_size / 4;
+        let minors_before = gc.minor_collections;
+
+        gc.run_major_progress_after_minor();
+
+        assert!(gc.minor_collections > minors_before);
+        gc.pending_reserving_size = 0;
         gc.roots.clear();
     }
 
@@ -13210,6 +13584,69 @@ mod tests {
     // ── Write barrier + incremental marking interaction tests ──
 
     #[test]
+    fn first_major_visit_arms_child_for_incremental_write_barrier() {
+        let word = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(word, vec![0]));
+        let leaf_tid = gc.register_type(TypeInfo::simple(word));
+
+        let grandparent = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + word);
+        let holder = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + word);
+        let white_child = gc.alloc_in_oldgen_clear(leaf_tid, GcHeader::SIZE + word);
+        unsafe {
+            *(grandparent.0 as *mut GcRef) = holder;
+            *(holder.0 as *mut GcRef) = GcRef::NULL;
+        }
+        let mut root = grandparent;
+        unsafe { gc.roots.add(&mut root) };
+
+        gc.start_incremental_cycle();
+        gc.old_objects_pointing_to_young.clear();
+        let root_work = gc.incr_state.gray_stack.pop().expect("root was seeded");
+        gc.mark_object(root_work);
+        let holder_work = gc.incr_state.gray_stack.pop().expect("child was greyed");
+        assert_eq!(holder_work, holder.0);
+        gc.mark_object(holder_work);
+
+        assert!(unsafe { (*header_of(holder.0)).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS) });
+        assert!(!unsafe { (*header_of(white_child.0)).has_flag(GcFlags::GCFLAG_VISITED) });
+
+        gc.do_write_barrier(holder);
+        unsafe { *(holder.0 as *mut GcRef) = white_child };
+        assert!(gc.old_objects_pointing_to_young.contains(&holder.0));
+
+        while gc.gc_state != GcState::Scanning {
+            gc.major_collection_step();
+        }
+        assert!(gc.oldgen.contains(white_child.0));
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn major_visit_ignores_no_heap_ptrs_objects_without_stamping_visited() {
+        let word = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(word, vec![0]));
+        let leaf_tid = gc.register_type(TypeInfo::simple(word));
+        let holder = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + word);
+        let clean_prebuilt = gc.alloc_in_oldgen_clear(leaf_tid, GcHeader::SIZE + word);
+        unsafe {
+            *(holder.0 as *mut GcRef) = clean_prebuilt;
+            (*header_of(clean_prebuilt.0)).set_flag(GcFlags::GCFLAG_NO_HEAP_PTRS);
+        }
+        let mut root = holder;
+        unsafe { gc.roots.add(&mut root) };
+
+        gc.start_incremental_cycle();
+        let root_work = gc.incr_state.gray_stack.pop().expect("root was seeded");
+        gc.mark_object(root_work);
+
+        assert!(!unsafe { (*header_of(clean_prebuilt.0)).has_flag(GcFlags::GCFLAG_VISITED) });
+        assert!(!gc.incr_state.gray_stack.contains(&clean_prebuilt.0));
+        gc.roots.clear();
+    }
+
+    #[test]
     fn test_write_barrier_during_incremental_marking() {
         // Verify that write barriers fired during an active incremental
         // marking cycle correctly add old-gen objects to the remembered set.
@@ -13616,6 +14053,20 @@ mod tests {
         assert!(gc.can_optimize_cond_call());
     }
 
+    #[test]
+    fn clean_setarrayitems_optimization_follows_card_configuration() {
+        let cards = test_gc(4096);
+        assert!(!cards.can_optimize_clean_setarrayitems());
+
+        let no_cards = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            card_page_indices: 0,
+            ..GcConfig::default()
+        });
+        assert!(no_cards.can_optimize_clean_setarrayitems());
+    }
+
     /// env.py `get_L2cache_linux2_cpuinfo`: use the smallest valid
     /// per-CPU K/k value, ignore another unit and malformed lines, and retain
     /// the upstream `_findend('\n' + label)` first-line behavior.
@@ -13695,6 +14146,7 @@ cache size\t: 8192 kB\n";
         let gc = test_gc(4096);
         let alloc: &dyn GcAllocator = &gc;
         assert!(alloc.can_optimize_cond_call());
+        assert!(!alloc.can_optimize_clean_setarrayitems());
     }
 
     #[test]
@@ -14361,6 +14813,36 @@ cache size\t: 8192 kB\n";
         gc.roots.clear();
     }
 
+    /// incminimark.py `invalidate_young_weakrefs`: a clean prebuilt target is
+    /// immortal but intentionally never marked VISITED. Carrying its weakref
+    /// into `old_objects_with_weakrefs` would therefore clear a live edge at
+    /// the next major collection.
+    #[test]
+    fn young_weakref_to_no_heap_ptrs_target_skips_old_weakref_queue() {
+        let mut gc = test_gc(4096);
+        let target_tid = gc.register_type(TypeInfo::simple(16));
+        let wref_tid = gc.register_type(TypeInfo::weakref());
+
+        let target = gc.alloc_in_oldgen_clear(target_tid, GcHeader::SIZE + 16);
+        unsafe { (*header_of(target.0)).set_flag(GcFlags::GCFLAG_NO_HEAP_PTRS) };
+        let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
+        unsafe {
+            *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
+        }
+
+        let mut wref_root = wref;
+        unsafe { gc.roots.add(&mut wref_root) };
+        gc.do_collect_nursery();
+
+        assert!(gc.oldgen.contains(wref_root.0));
+        assert!(gc.old_objects_with_weakrefs.is_empty());
+        let after = unsafe {
+            crate::weakref::ll_weakref_deref(wref_root.0 as *const crate::weakref::Weakref)
+        };
+        assert_eq!(after, target);
+        gc.roots.clear();
+    }
+
     /// incminimark.py:3065-3066 "weakref itself dies" branch. The
     /// WEAKREF object has no root → the cycle treats the entry as a
     /// no-op (no panic, no UB) and the bookkeeping list ends up empty.
@@ -14697,6 +15179,41 @@ cache size\t: 8192 kB\n";
         // ArenaCollection::contains is intentionally an arena-range query and
         // can stay true for a freed block while the current arena is retained.
         // The allocator's exact live count verifies reclamation here.
+        assert_eq!(gc.oldgen.object_count(), 0);
+    }
+
+    /// incminimark.py `malloc_fixedsize(..., is_finalizer_light=False)` and
+    /// GCBase.execute_finalizers: an old-style finalizer is born old, runs only
+    /// after finalization ordering, and leaves the resurrectable object alive
+    /// until a later major cycle.
+    #[test]
+    fn old_style_finalizer_is_born_old_and_runs_from_its_distinct_queue() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn finalizer(_obj_addr: usize) {
+            RUNS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        RUNS.store(0, Ordering::Relaxed);
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_old_style_finalizer(16, finalizer));
+        let obj = gc.alloc_with_type(tid, 16);
+
+        assert!(!gc.is_in_nursery(obj.0));
+        assert_eq!(
+            gc.old_objects_with_finalizers,
+            VecDeque::from([(obj.0, -1)])
+        );
+        assert!(gc.young_objects_with_destructors.is_empty());
+
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(RUNS.load(Ordering::Relaxed), 1);
+        assert!(gc.run_old_style_finalizers.is_empty());
+        assert_eq!(gc.oldgen.object_count(), 1);
+
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(RUNS.load(Ordering::Relaxed), 1);
         assert_eq!(gc.oldgen.object_count(), 0);
     }
 
@@ -15258,15 +15775,22 @@ cache size\t: 8192 kB\n";
         /// `fn`, and a `static` would be shared with every test the harness
         /// runs concurrently.  The collector calls it on the calling thread.
         static RRC_TRIGGER_FIRED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static RRC_LIGHT_FREED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     fn rrc_test_trigger() {
         RRC_TRIGGER_FIRED.with(|fired| fired.set(fired.get() + 1));
     }
 
+    fn rrc_test_light_free(mirror: usize) {
+        unsafe { drop(Box::from_raw(rawrefcount::pyobj(mirror))) };
+        RRC_LIGHT_FREED.with(|freed| freed.set(freed.get() + 1));
+    }
+
     fn rrc_test_gc() -> MiniMarkGC {
         let mut gc = test_gc(1 << 16);
         gc.rawrefcount_init(rrc_test_trigger);
+        gc.rawrefcount_set_light_free(rrc_test_light_free);
         assert!(gc.rawrefcount_enabled());
         gc
     }
@@ -15325,6 +15849,41 @@ cache size\t: 8192 kB\n";
             1,
             "incminimark.py:3248-3250 schedules the drain for a non-empty queue"
         );
+    }
+
+    /// incminimark.py `_rrc_free`: LIGHT means the mirror needs no C
+    /// deallocator. With external references remaining, subtract the light
+    /// share and unlink it without putting it on the deallocation queue.
+    #[test]
+    fn a_light_mirror_is_unlinked_without_deallocator_queueing() {
+        let mut gc = rrc_test_gc();
+        let tid = gc.register_type(TypeInfo::object(64));
+        let object = gc.alloc_with_type(tid, 64);
+        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY_LIGHT + 2);
+        gc.rawrefcount_create_link_pyobj(object.0, mirror);
+
+        gc.do_collect_nursery();
+
+        assert_eq!(mirror_link(mirror), 0);
+        assert_eq!(mirror_refcnt(mirror), 2);
+        assert_eq!(gc.rawrefcount_next_dead(), 0);
+    }
+
+    /// `incminimark.py _rrc_free`: an exact LIGHT share needs no deallocator
+    /// queue and returns the raw mirror through the embedder's allocator.
+    #[test]
+    fn an_exact_light_mirror_is_freed_immediately() {
+        let mut gc = rrc_test_gc();
+        let tid = gc.register_type(TypeInfo::object(64));
+        let object = gc.alloc_with_type(tid, 64);
+        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY_LIGHT);
+        gc.rawrefcount_create_link_pyobj(object.0, mirror);
+
+        RRC_LIGHT_FREED.with(|freed| freed.set(0));
+        gc.do_collect_nursery();
+
+        assert_eq!(RRC_LIGHT_FREED.with(|freed| freed.get()), 1);
+        assert_eq!(gc.rawrefcount_next_dead(), 0);
     }
 
     /// incminimark.py:3359-3375 and :3397-3409: the same two outcomes, decided
