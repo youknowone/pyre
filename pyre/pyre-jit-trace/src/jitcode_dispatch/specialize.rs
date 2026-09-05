@@ -10838,23 +10838,25 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
 
-    // Resolve the descriptor case before emitting anything.  A function-valued
-    // class attribute is not a plain class-attribute read: getattr binds it to
-    // the receiver.  PyPy traces that Method allocation and virtualizes it into
-    // the following CALL, so reproduce the same guarded allocation here.
+    // A function-valued class attribute is not a plain class-attribute read:
+    // getattr binds it to the receiver.  The LOAD_ATTR spelling already emits
+    // that Method through [`try_walker_specialize_load_bound_method_attr`].
+    // Doing the same for this builtin spelling lets a REDUCE-style
+    // `getattr(obj, name)` — pickle reconstructs bound methods that way —
+    // put a virtual Method on a list (the unpickler stack) inside a
+    // recursive portal.  That combination is the ubuntu-dynasm
+    // `test.test_pickle` crash: an oldgen list item pointing 384 bytes into
+    // a JITFRAME (`site=minor_varsize_item_target`, holder tid 9).  Leave
+    // the builtin spelling on the residual until escaped-Method force is
+    // safe; the immediately-called surrogate method in
+    // `instance_surrogate_attrs` still reaches the CALL through the residual
+    // and the property arm below still folds.
     let bound_method = unsafe {
         pyre_interpreter::baseobjspace::bound_method_attr_fast_path_wtf8(concrete_obj, name)
     };
-    let bound_method = match bound_method {
-        Some((w_type, version_tag, w_descr, true)) => {
-            let Some(shadow) = (unsafe { walker_classify_shadow_guard(concrete_obj) }) else {
-                return Ok(None);
-            };
-            Some((w_type, version_tag, w_descr, Some(shadow)))
-        }
-        Some((w_type, version_tag, w_descr, false)) => Some((w_type, version_tag, w_descr, None)),
-        None => None,
-    };
+    if bound_method.is_some() {
+        return Ok(None);
+    }
 
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
     let callable_op = r_args[0];
@@ -10879,21 +10881,6 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
             OpCode::GuardValue,
             &[name_ref, name_const],
         )?;
-    }
-
-    if let Some((w_type, _version_tag, w_descr, shadow)) = bound_method {
-        walker_emit_constant_descr_bound_method(
-            ctx,
-            op.pc,
-            r_args[2],
-            concrete_obj,
-            w_type,
-            w_descr,
-            shadow,
-            dst,
-            'r',
-        )?;
-        return Ok(Some(()));
     }
 
     let Ok(name) = name.as_str() else {
