@@ -6408,6 +6408,19 @@ pub fn cast_uint_to_float(x: i64) -> f64 {
     (x as u64) as f64
 }
 
+/// Residual-call ABI for [`cast_uint_to_float`]. `jtransform.py`
+/// `rewrite_op_cast_uint_to_float = _do_builtin_call` residual-calls
+/// `support.py _ll_1_cast_uint_to_float`.
+pub extern "C" fn _ll_1_cast_uint_to_float(x: i64) -> f64 {
+    cast_uint_to_float(x)
+}
+
+/// Residual-call ABI for [`cast_float_to_uint`]. `jtransform.py`
+/// `rewrite_op_cast_float_to_uint = _do_builtin_call`.
+pub extern "C" fn _ll_1_cast_float_to_uint(f: f64) -> i64 {
+    cast_float_to_uint(f)
+}
+
 /// RPython `support.py:274 _ll_1_cast_float_to_uint(f)` —
 /// `r_uint(long(f))` mod 2^64 wrap (matching
 /// `op_cast_float_to_uint` at `opimpl.py`).  Plain

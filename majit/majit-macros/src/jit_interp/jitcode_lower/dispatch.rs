@@ -2747,13 +2747,18 @@ pub(super) fn lower_dispatch_chain(
             None
         };
         let inline_outcome = if pc_return_increment.is_none()
-            && pc_is_green(config)
             && matches!(
                 arm.pattern,
                 crate::jit_interp::classify::ArmPattern::Lowerable
             )
             && !has_infer_call
         {
+            // Red `pc` still lives in the merge-point register file. A
+            // sub-JitCode `pc += N` never writes that slot back
+            // (`BC_INLINE_CALL` is caller→callee only), so the next
+            // merge point rereads a stale pc. Inline with `pc_pinned`
+            // is the same Variable-in-place write RPython's flatten
+            // keeps for `next_instr`.
             lowerer.try_inline_dispatch_arm(&arm.original_body)
         } else {
             InlineArmOutcome::Rejected
@@ -3350,7 +3355,22 @@ pub(super) fn resolve_reds(
 
     let owned_red_names: Vec<String>;
     let reds_names: Vec<&str> = if !explicit_red_names.is_empty() {
-        owned_red_names = explicit_red_names;
+        // `promote_greens` only walks `jitdriver.greens`. A name that is
+        // also listed in `reds` would be both guarded and passed as a
+        // red — `handle_jit_marker__jit_merge_point` keeps the two lists
+        // disjoint (`args[2:2+num_green]` vs the tail).
+        let green_names: HashSet<String> = config
+            .greens
+            .iter()
+            .filter_map(|expr| match expr {
+                syn::Expr::Path(p) => p.path.get_ident().map(|i| i.to_string()),
+                _ => None,
+            })
+            .collect();
+        owned_red_names = explicit_red_names
+            .into_iter()
+            .filter(|name| !green_names.contains(name))
+            .collect();
         owned_red_names.iter().map(|s| s.as_str()).collect()
     } else {
         // Issue 2.2 (support.py:121 _kind2count = {'int':1,'ref':2,'float':3}):
@@ -3851,8 +3871,15 @@ pub(crate) fn lower_dispatch_body(
     let reds_i_lit: Vec<_> = reds_i.iter().map(|b| quote::quote!(#b)).collect();
     let reds_r_lit: Vec<_> = reds_r.iter().map(|b| quote::quote!(#b)).collect();
     let reds_f_lit: Vec<_> = reds_f.iter().map(|b| quote::quote!(#b)).collect();
+    let mut merge_reads: Vec<Register> = Vec::new();
+    merge_reads.extend(greens_i.iter().map(|&b| Register::int(u16::from(b))));
+    merge_reads.extend(greens_r.iter().map(|&b| Register::ref_(u16::from(b))));
+    merge_reads.extend(greens_f.iter().map(|&b| Register::float(u16::from(b))));
+    merge_reads.extend(reds_i.iter().map(|&b| Register::int(u16::from(b))));
+    merge_reads.extend(reds_r.iter().map(|&b| Register::ref_(u16::from(b))));
+    merge_reads.extend(reds_f.iter().map(|&b| Register::float(u16::from(b))));
     lowerer.emit_op(
-        OpMeta::linear(OpKind::JitMergePoint, vec![], vec![]),
+        OpMeta::linear(OpKind::JitMergePoint, merge_reads, vec![]),
         quote::quote! {
             // __jdindex: jtransform.py:1704 portal_jd.index threaded as runtime param.
             __builder.jit_merge_point(

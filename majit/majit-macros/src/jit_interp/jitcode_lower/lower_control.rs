@@ -71,6 +71,22 @@ impl<'c> Lowerer<'c> {
                 {
                     return None;
                 }
+                // `_rewrite_equality` then `optimize_goto_if_not`:
+                // `int_eq(x, 0)` → `int_is_zero` → `goto_if_not_int_is_zero`.
+                if matches!(lhs.kind, BindingKind::Int)
+                    && matches!(binary.op, BinOp::Eq(_) | BinOp::Ne(_))
+                {
+                    let left_zero = int_literal_value(&binary.left) == Some(0);
+                    let right_zero = int_literal_value(&binary.right) == Some(0);
+                    if left_zero || right_zero {
+                        let value = if right_zero { lhs } else { rhs };
+                        let negated = matches!(binary.op, BinOp::Eq(_));
+                        return Some(LoweredCondition::Value {
+                            binding: value,
+                            negated,
+                        });
+                    }
+                }
                 let prefix = match lhs.kind {
                     BindingKind::Int => "goto_if_not_int_",
                     BindingKind::Float => "goto_if_not_float_",
@@ -548,7 +564,10 @@ impl<'c> Lowerer<'c> {
                 self.emit_jump(break_label);
                 Some(())
             }
-            Stmt::Expr(Expr::Continue(_), _) => {
+            Stmt::Expr(Expr::Continue(cont), _) => {
+                if cont.label.is_some() {
+                    return None;
+                }
                 self.emit_jump(continue_label);
                 Some(())
             }
@@ -799,25 +818,17 @@ impl<'c> Lowerer<'c> {
         &mut self,
         expr_match: &syn::ExprMatch,
     ) -> Option<Option<Binding>> {
-        let (builder_method, recv, arg, none_body) = parse_checked_ovf_match(expr_match)?;
-        Some(self.emit_checked_ovf_match(builder_method, recv, arg, none_body))
+        let parsed = parse_checked_ovf_match(expr_match)?;
+        Some(self.emit_checked_ovf_match(parsed))
     }
 
-    fn emit_checked_ovf_match(
-        &mut self,
-        builder_method: &str,
-        recv: &Expr,
-        arg: &Expr,
-        none_body: &Expr,
-    ) -> Option<Binding> {
-        let lhs = self.lower_value_expr(recv)?;
-        let rhs = self.lower_value_expr(arg)?;
+    fn emit_checked_ovf_match(&mut self, parsed: CheckedOvfMatch<'_>) -> Option<Binding> {
+        let lhs = self.lower_value_expr(parsed.recv)?;
+        let rhs = self.lower_value_expr(parsed.arg)?;
         if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
             return None;
         }
-        // Lower the overflow (None) arm into a deferred sequence up front so its
-        // result register is known for the convergence move.
-        let (none_seq, none_binding) = self.lower_branch_value_expr(none_body)?;
+        let (none_seq, none_binding) = self.lower_branch_value_expr(parsed.none_body)?;
         if !matches!(none_binding.kind, BindingKind::Int) {
             return None;
         }
@@ -825,15 +836,13 @@ impl<'c> Lowerer<'c> {
         let dst = self.alloc_reg();
         let ovf_label = self.alloc_label();
         let end_label = self.alloc_label();
-        let builder_ident = format_ident!("{builder_method}");
+        let builder_ident = format_ident!("{}", parsed.builder_method);
         let lhs_reg = lhs.reg;
         let rhs_reg = rhs.reg;
         let none_reg = none_binding.reg;
 
         self.emit_aux(quote! { let #ovf_label = __builder.new_label(); });
         self.emit_aux(quote! { let #end_label = __builder.new_label(); });
-        // `-live-` precedes the fused guard so blackhole liveness decodes at the
-        // op's resume position (see `lower_if_stmt`).
         self.emit_op(
             OpMeta::live_marker(),
             quote! { let _ = __builder.live_placeholder(); },
@@ -847,9 +856,39 @@ impl<'c> Lowerer<'c> {
             ),
             quote! { __builder.#builder_ident(#dst, #lhs_reg, #rhs_reg, #ovf_label); },
         );
-        // No-overflow path: `dst` holds the result; skip the overflow arm.
+        if !some_arm_is_identity(parsed.some_pat, parsed.some_body) {
+            let saved = self.bindings.clone();
+            if let Some(name) = some_pat_bound_name(parsed.some_pat) {
+                self.bindings.insert(
+                    name,
+                    Binding {
+                        reg: dst,
+                        kind: BindingKind::Int,
+                        depends_on_stack: false,
+                        struct_type: None,
+                    },
+                );
+            }
+            let lowered = self.lower_branch_value_expr(parsed.some_body);
+            self.bindings = saved;
+            let (seq, binding) = lowered?;
+            if !matches!(binding.kind, BindingKind::Int) {
+                return None;
+            }
+            self.append_lowered_sequence(seq);
+            if binding.reg != dst {
+                let some_reg = binding.reg;
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::MoveI,
+                        vec![Register::int(some_reg)],
+                        vec![Register::int(dst)],
+                    ),
+                    quote! { __builder.move_i(#dst, #some_reg); },
+                );
+            }
+        }
         self.emit_jump(&end_label);
-        // Overflow path: run the None arm and converge its result into `dst`.
         self.emit_label_def(&ovf_label);
         self.append_lowered_sequence(none_seq);
         self.emit_op(
@@ -893,13 +932,53 @@ fn option_variant_of_pat(pat: &Pat) -> Option<OptionPatVariant> {
     }
 }
 
-/// Recognize the orthodox `ovfcheck` idiom
-/// `match recv.checked_{add,sub,mul}(arg) { Some(_) => _, None => <handler> }`.
-/// Returns the fused builder method name, the two operand expressions, and the
-/// overflow (`None`) arm body; `None` when `expr_match` is not this shape.
-fn parse_checked_ovf_match(
-    expr_match: &syn::ExprMatch,
-) -> Option<(&'static str, &Expr, &Expr, &Expr)> {
+struct CheckedOvfMatch<'a> {
+    builder_method: &'static str,
+    recv: &'a Expr,
+    arg: &'a Expr,
+    none_body: &'a Expr,
+    some_pat: &'a Pat,
+    some_body: &'a Expr,
+}
+
+fn some_pat_bound_name(pat: &Pat) -> Option<String> {
+    let Pat::TupleStruct(ts) = pat else {
+        return None;
+    };
+    if ts.elems.len() != 1 {
+        return None;
+    }
+    match &ts.elems[0] {
+        Pat::Ident(pi) if pi.subpat.is_none() => Some(pi.ident.to_string()),
+        _ => None,
+    }
+}
+
+/// `Some(v) => v` is RPython `ovfcheck`'s success edge: the residual is
+/// the overflow-checked add itself. Any other success body must be
+/// lowered; treating it as identity miscompiles.
+fn some_arm_is_identity(pat: &Pat, body: &Expr) -> bool {
+    let Some(name) = some_pat_bound_name(pat) else {
+        return false;
+    };
+    match body {
+        Expr::Path(p) => p
+            .path
+            .get_ident()
+            .is_some_and(|ident| ident == name.as_str()),
+        Expr::Block(block) if block.block.stmts.len() == 1 => match &block.block.stmts[0] {
+            Stmt::Expr(Expr::Path(p), None) => p
+                .path
+                .get_ident()
+                .is_some_and(|ident| ident == name.as_str()),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Recognize `match recv.checked_{add,sub,mul}(arg) { Some(..) => .., None => .. }`.
+fn parse_checked_ovf_match(expr_match: &syn::ExprMatch) -> Option<CheckedOvfMatch<'_>> {
     let call = match &*expr_match.expr {
         Expr::MethodCall(call) => call,
         _ => return None,
@@ -915,25 +994,29 @@ fn parse_checked_ovf_match(
     }
     let recv = &*call.receiver;
     let arg = call.args.first()?;
-    // Exactly two guard-less arms: `Some(_) => _` and `None => <handler>`.
     if expr_match.arms.len() != 2 {
         return None;
     }
-    let mut some_seen = false;
-    let mut none_body: Option<&Expr> = None;
+    let mut some_arm = None;
+    let mut none_body = None;
     for arm in &expr_match.arms {
         if arm.guard.is_some() {
             return None;
         }
         match option_variant_of_pat(&arm.pat)? {
-            OptionPatVariant::Some => some_seen = true,
+            OptionPatVariant::Some => some_arm = Some((&arm.pat, &*arm.body)),
             OptionPatVariant::None => none_body = Some(&*arm.body),
         }
     }
-    if !some_seen {
-        return None;
-    }
-    Some((builder_method, recv, arg, none_body?))
+    let (some_pat, some_body) = some_arm?;
+    Some(CheckedOvfMatch {
+        builder_method,
+        recv,
+        arg,
+        none_body: none_body?,
+        some_pat,
+        some_body,
+    })
 }
 
 #[cfg(test)]
@@ -1163,5 +1246,106 @@ mod unroll_binding_tests {
             .get("value")
             .expect("the typed local must create its identifier binding");
         assert!(matches!(binding.kind, BindingKind::Int));
+    }
+
+    #[test]
+    fn a_labelled_continue_in_a_loop_refuses() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.bindings.insert(
+            "flag".to_string(),
+            Binding {
+                reg: 0,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: syn::ExprWhile = syn::parse_quote! {
+            'outer: while flag {
+                continue 'outer;
+            }
+        };
+        assert!(
+            lowerer.lower_while_loop(&expr).is_none(),
+            "a labelled continue must not retarget the innermost header"
+        );
+    }
+
+    #[test]
+    fn if_eq_zero_fuses_to_goto_if_not_int_is_zero() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.bindings.insert(
+            "n".to_string(),
+            Binding {
+                reg: 4,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr_if: syn::ExprIf = syn::parse_quote! { if n == 0 { } };
+        assert!(lowerer.lower_if_stmt(&expr_if).is_some());
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(|tokens| tokens.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            emitted.contains("goto_if_not_int_is_zero"),
+            "`if n == 0` must fuse to int_is_zero, got:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("goto_if_not_int_eq"),
+            "must not keep the binary compare:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn checked_add_some_body_is_lowered() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.bindings.insert(
+            "a".to_string(),
+            Binding {
+                reg: 1,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        lowerer.bindings.insert(
+            "b".to_string(),
+            Binding {
+                reg: 2,
+                kind: BindingKind::Int,
+                depends_on_stack: false,
+                struct_type: None,
+            },
+        );
+        let expr: syn::ExprMatch = syn::parse_quote! {
+            match a.checked_add(b) {
+                Some(v) => v + 1,
+                None => 0,
+            }
+        };
+        let binding = lowerer
+            .lower_checked_ovf_match(&expr)
+            .expect("recognized")
+            .expect("lowered");
+        assert!(matches!(binding.kind, BindingKind::Int));
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(|tokens| tokens.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            emitted.contains("int_add_jump_if_ovf"),
+            "expected ovf jump, got:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("IntAdd") || emitted.contains("int_add"),
+            "Some(v) => v + 1 must emit the increment, got:\n{emitted}"
+        );
     }
 }
