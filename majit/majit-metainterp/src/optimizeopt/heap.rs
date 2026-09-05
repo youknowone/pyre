@@ -7161,7 +7161,7 @@ mod tests {
         opt.snapshot_boxes = snapshots;
 
         let result =
-            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::default(), 1024);
 
         let set_pos = result
             .iter()
