@@ -21,14 +21,10 @@
 //! `backendopt/removeassert.py`; retaining an extra proof only for the opaque
 //! `Index::index` shim would be a non-upstream control-flow restriction.
 //!
-//! A bare `RangeTo` still declines, and NOT for a semantic reason — upstream
-//! would clamp it like any other stop.  It declines because the ops it lowers
-//! to are not yet wired downstream: admitting it planted bare `getslice/rii>r`
-//! from `split_builtin_kwargs` and `do_warn_explicit` that nothing consumes.
-//! `MinusOne` and `StaticLength` are the two RangeTo shapes whose stop the
-//! rewrite can name at the callsite, so only they are carved out.  When the
-//! unwired `getslice/rii>r` is handled, the RangeTo decline should go: one
-//! rule for every stop is the upstream shape.
+//! RangeTo uses the same StartStop contract for every defined stop. As in
+//! RPython's AbstractBaseListRepr.rtype_getslice and ll_listslice_startstop,
+//! no static-length, dominance, or array-mutation proof is needed: the runtime
+//! helper receives the original stop and clamps it against the live length.
 //!
 //! The earlier failure was an unwired frontend `getslice` planted before a
 //! graph fell through the legacy walker. Every admitted path now uses an
@@ -174,8 +170,8 @@ pub(crate) fn rewire_slice_index_rangefrom_sites(
 }
 
 /// Rewrite captured `RangeTo { end }` indexes through the synthetic-call
-/// channel. The stop must either be the receiver's `len - 1`, or be bounded
-/// by a dominating branch against the receiver's static array length.
+/// channel. Preserve the actual stop for StartStop; only the receiver's
+/// `len - 1` selects RPython's specialized MinusOne helper.
 pub(crate) fn rewire_slice_index_rangeto_sites(
     graph: &mut FunctionGraph,
     sites: &[SliceIndexRangeToSite],
@@ -205,7 +201,7 @@ enum SliceIndexBounds<'a> {
     MinusOne {
         end: &'a Variable,
     },
-    StaticLength {
+    RangeTo {
         end: &'a Variable,
     },
 }
@@ -229,18 +225,8 @@ fn rewire_one_slice_index_rangeto_site(
         .ok_or_else(|| format!("{}: no RangeTo index consumer", graph.name))?;
     let bounds = if minus_one_end_matches(graph, &site.end, &slice) {
         SliceIndexBounds::MinusOne { end: &site.end }
-    } else if rangeto_static_length_bound_matches(graph, &site.end, &slice, range) {
-        SliceIndexBounds::StaticLength { end: &site.end }
     } else {
-        // Not a bounds decline — `ll_listslice_startstop` would clamp this
-        // stop.  The two shapes above are the ones whose stop this rewrite can
-        // name at the callsite; a general one lowers to a `getslice/rii>r`
-        // nothing downstream consumes yet (see the module header).
-        return Err(format!(
-            "{}: RangeTo stop is neither the MinusOne nor the static-length \
-             shape — declining until a general getslice is wired",
-            graph.name
-        ));
+        SliceIndexBounds::RangeTo { end: &site.end }
     };
     rewire_one_slice_index_site(graph, range, bounds)
 }
@@ -292,7 +278,7 @@ fn rewire_one_slice_index_site(
             bounds,
             SliceIndexBounds::Range { .. }
                 | SliceIndexBounds::MinusOne { .. }
-                | SliceIndexBounds::StaticLength { .. }
+                | SliceIndexBounds::RangeTo { .. }
         ),
     ) {
         return Err(format!(
@@ -303,8 +289,8 @@ fn rewire_one_slice_index_site(
     // 3. Validate the selected bounds before mutating. `decompose_slice_args`
     // (rtyper.rs) requires a non-negative start.  A slice-index consumer
     // statically selects `SliceIndex<usize>`, so its bounds retain the
-    // unsigned/nonnegative annotation even when computed; the marker is
-    // expanded only after annotation.  Nothing more is asked, because upstream
+    // unsigned/nonnegative annotation even when computed; the marker expands
+    // only in the rtyper flowspace adapter. Nothing more is asked, because upstream
     // asks nothing more: `ll_listslice_startstop`
     // (`rpython/rtyper/rlist.py:893-903`) clamps an oversized stop and states
     // `start <= length` / `stop >= start` as `ll_assert`s.  The one extra
@@ -334,19 +320,17 @@ fn rewire_one_slice_index_site(
                 ));
             }
         }
-        SliceIndexBounds::StaticLength { end } => {
+        SliceIndexBounds::RangeTo { end } => {
             if !graph_defines(graph, end) {
-                return Err(format!(
-                    "{name}: StaticLength end is not defined in the graph"
-                ));
+                return Err(format!("{name}: RangeTo end is not defined in the graph"));
             }
         }
     }
 
     // --- All structural validation passed; mutate the graph. ---
 
-    // 4. Remove the range construction only for the RangeFrom rewrites.
-    // MinusOne leaves the ctor and its FieldWrite in
+    // 4. Remove the range construction for RangeFrom and Range rewrites.
+    // RangeTo (including MinusOne) leaves the ctor and its FieldWrite in
     //    place: the range can be carried by a block link without being read
     //    by an operation, and sweeping its sole defining ctor would orphan
     //    that link-carried value.
@@ -399,12 +383,12 @@ fn rewire_one_slice_index_site(
                 },
             };
         }
-        SliceIndexBounds::MinusOne { .. } | SliceIndexBounds::StaticLength { .. } => {
+        SliceIndexBounds::MinusOne { .. } | SliceIndexBounds::RangeTo { .. } => {
             let (segments, args) = match bounds {
                 SliceIndexBounds::MinusOne { .. } => {
                     (vec!["__getslice_minusone".to_string()], vec![slice])
                 }
-                SliceIndexBounds::StaticLength { end } => (
+                SliceIndexBounds::RangeTo { end } => (
                     vec!["__getslice_rangeto".to_string()],
                     vec![slice, end.clone()],
                 ),
@@ -553,421 +537,6 @@ fn const_int_value(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
         })
 }
 
-fn static_array_repeat_length(graph: &FunctionGraph, slice: &Variable) -> Option<i64> {
-    let slice = resolve_block_alias(graph, slice)?;
-    graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .find_map(|op| {
-            if op.result.as_ref() != Some(&slice) {
-                return None;
-            }
-            let OpKind::Call {
-                target: CallTarget::FunctionPath { segments },
-                args,
-                ..
-            } = &op.kind
-            else {
-                return None;
-            };
-            if segments != &["__array_repeat".to_string()] || args.len() != 2 {
-                return None;
-            }
-            const_int_value(graph, &args[1])
-        })
-}
-
-fn comparison_for_switch(
-    graph: &FunctionGraph,
-    switch: &Variable,
-) -> Option<(String, Variable, i64)> {
-    let switch = resolve_block_alias(graph, switch)?;
-    let operand = graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .find_map(|op| {
-            if op.result.as_ref() != Some(&switch) {
-                return None;
-            }
-            match &op.kind {
-                OpKind::BinOp { op, lhs, rhs, .. } => Some((op.clone(), lhs.clone(), rhs.clone())),
-                OpKind::UnaryOp { op, operand, .. } if op == "bool" => {
-                    Some(("bool".to_string(), operand.clone(), switch.clone()))
-                }
-                _ => None,
-            }
-        })?;
-    if operand.0 == "bool" {
-        let nested = comparison_for_switch(graph, &operand.1)?;
-        return Some(nested);
-    }
-    Some((operand.0, operand.1, const_int_value(graph, &operand.2)?))
-}
-
-/// Compare the values represented by two comparison operands. Ordinary MIR
-/// aliases retain the old identity-based proof. A second `ArrayLen` operation
-/// is also the same value when its base resolves to the first operation's
-/// base, but only if no length-changing or unclassified operation occurs in
-/// the interval between the reads and the base has not escaped before it.
-/// This is deliberately not general value numbering: two length reads are
-/// interchangeable only for a demonstrably stable array.
-fn comparison_operand_matches_end(
-    graph: &FunctionGraph,
-    end: &Variable,
-    comparison_lhs: &Variable,
-) -> bool {
-    let Some(end_root) = resolve_block_alias(graph, end) else {
-        return false;
-    };
-    let Some(lhs_root) = resolve_block_alias(graph, comparison_lhs) else {
-        return false;
-    };
-    if end_root == lhs_root {
-        return true;
-    }
-
-    let array_len_definition = |value: &Variable| {
-        graph
-            .blocks
-            .iter()
-            .find_map(|block| {
-                block.operations.iter().enumerate().find_map(|(index, op)| {
-                    (op.result.as_ref() == Some(value)).then(|| match &op.kind {
-                        OpKind::ArrayLen { base, .. } => {
-                            resolve_block_alias(graph, base).map(|base| (base, block.id, index))
-                        }
-                        _ => None,
-                    })
-                })
-            })
-            .flatten()
-    };
-    let (Some((end_base, end_block, end_index)), Some((lhs_base, lhs_block, lhs_index))) = (
-        array_len_definition(&end_root),
-        array_len_definition(&lhs_root),
-    ) else {
-        return false;
-    };
-    end_base == lhs_base
-        && array_len_base_is_stable(
-            graph,
-            &end_base,
-            (lhs_block, lhs_index),
-            (end_block, end_index),
-        )
-}
-
-fn readonly_array_len_call(target: &CallTarget) -> bool {
-    let CallTarget::FunctionPath { segments } = target else {
-        return false;
-    };
-    matches!(
-        segments.join("::").as_str(),
-        "core::slice::<Impl>::len"
-            | "alloc::vec::<Impl>::len"
-            | "core::slice::<Impl>::as_slice"
-            | "alloc::vec::<Impl>::as_slice"
-            | "core::slice::<Impl>::as_ptr"
-            | "core::slice::index::<Impl>::index"
-            | "core::slice::<Impl>::get"
-            | "core::slice::<Impl>::iter"
-            | "core::slice::iter"
-    )
-}
-
-/// The extra `ArrayLen` value proof is sound only when no operation can alter
-/// the resolved base's length between the two reads. Fixed-shape array reads,
-/// arithmetic, and guards are structurally non-mutating; calls are admitted
-/// only for the small set of known read-only accessors. Everything else is
-/// conservatively treated as a possible mutation.
-fn array_len_base_is_stable(
-    graph: &FunctionGraph,
-    base: &Variable,
-    lhs_definition: (crate::model::BlockId, usize),
-    end_definition: (crate::model::BlockId, usize),
-) -> bool {
-    let mut dominators: std::collections::HashMap<
-        crate::model::BlockId,
-        std::collections::HashSet<crate::model::BlockId>,
-    > = graph
-        .blocks
-        .iter()
-        .map(|block| {
-            (
-                block.id,
-                graph.blocks.iter().map(|other| other.id).collect(),
-            )
-        })
-        .collect();
-    dominators.insert(graph.startblock, [graph.startblock].into_iter().collect());
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in &graph.blocks {
-            if block.id == graph.startblock {
-                continue;
-            }
-            let predecessors = graph.predecessors(block.id);
-            if predecessors.is_empty() {
-                continue;
-            }
-            let mut next = dominators[&predecessors[0]].clone();
-            for predecessor in &predecessors[1..] {
-                next.retain(|id| dominators[predecessor].contains(id));
-            }
-            next.insert(block.id);
-            if next != dominators[&block.id] {
-                dominators.insert(block.id, next);
-                changed = true;
-            }
-        }
-    }
-
-    let (earlier, later) = if lhs_definition.0 == end_definition.0 {
-        if lhs_definition.1 < end_definition.1 {
-            (lhs_definition, end_definition)
-        } else {
-            (end_definition, lhs_definition)
-        }
-    } else if dominators[&end_definition.0].contains(&lhs_definition.0) {
-        (lhs_definition, end_definition)
-    } else if dominators[&lhs_definition.0].contains(&end_definition.0) {
-        (end_definition, lhs_definition)
-    } else {
-        return false;
-    };
-
-    let mut forward = std::collections::HashSet::new();
-    let mut todo = vec![earlier.0];
-    while let Some(block) = todo.pop() {
-        if !forward.insert(block) {
-            continue;
-        }
-        todo.extend(graph.successors(block));
-    }
-
-    let mut backward = std::collections::HashSet::new();
-    let mut todo = vec![later.0];
-    while let Some(block) = todo.pop() {
-        if !backward.insert(block) {
-            continue;
-        }
-        todo.extend(graph.predecessors(block));
-    }
-
-    let mut later_is_in_cycle = false;
-    let mut cycle_todo = graph.successors(later.0);
-    let mut cycle_seen = std::collections::HashSet::new();
-    while let Some(block) = cycle_todo.pop() {
-        if block == later.0 {
-            later_is_in_cycle = true;
-            break;
-        }
-        if cycle_seen.insert(block) {
-            cycle_todo.extend(graph.successors(block));
-        }
-    }
-
-    let resolves_to_base = |var: &Variable| match resolve_block_alias(graph, var) {
-        Some(root) => root == *base,
-        None => true,
-    };
-    let reachable_from_start = reachable_from_start(graph);
-    let escaped_before_later = graph.blocks.iter().any(|block| {
-        if !reachable_from_start.contains(&block.id) || !backward.contains(&block.id) {
-            return false;
-        }
-        let end = if block.id == later.0 && !later_is_in_cycle {
-            later.1
-        } else {
-            block.operations.len()
-        };
-        block.operations[..end].iter().any(|op| match &op.kind {
-            OpKind::FieldWrite { value, .. } | OpKind::ArrayWrite { value, .. } => {
-                value.as_variable().is_some_and(&resolves_to_base)
-            }
-            OpKind::Call { target, args, .. } if !readonly_array_len_call(target) => {
-                args.iter().any(&resolves_to_base)
-            }
-            _ => false,
-        })
-    });
-    if escaped_before_later {
-        return false;
-    }
-
-    forward.intersection(&backward).all(|block_id| {
-        let Some(block) = graph.blocks.iter().find(|block| block.id == *block_id) else {
-            return true;
-        };
-        let start = if block.id == earlier.0 && !later_is_in_cycle {
-            earlier.1 + 1
-        } else {
-            0
-        };
-        let end = if block.id == later.0 && !later_is_in_cycle {
-            later.1
-        } else {
-            block.operations.len()
-        };
-        let operations = &block.operations[start..end];
-        operations.iter().all(|op| match &op.kind {
-            OpKind::ConstInt(_)
-            | OpKind::ConstUInt(_)
-            | OpKind::ConstInt128(_)
-            | OpKind::ConstUInt128(_)
-            | OpKind::ConstBool(_)
-            | OpKind::ConstFloat(_)
-            | OpKind::ConstRef(_)
-            | OpKind::ConstRefNull
-            | OpKind::ConstNone
-            | OpKind::ConstRefAddr(_)
-            | OpKind::ConstSymbolic { .. }
-            | OpKind::ArrayLen { .. }
-            | OpKind::ArrayRead { .. }
-            | OpKind::ArrayWrite { .. }
-            | OpKind::FieldRead { .. }
-            | OpKind::BinOp { .. }
-            | OpKind::UnaryOp { .. } => true,
-            OpKind::Call { target, .. } => readonly_array_len_call(target),
-            _ => false,
-        })
-    })
-}
-
-fn reaches_without_retesting(
-    graph: &FunctionGraph,
-    start: crate::model::BlockId,
-    target: crate::model::BlockId,
-    forbidden: crate::model::BlockId,
-) -> bool {
-    let mut todo = vec![start];
-    let mut seen = std::collections::HashSet::new();
-    while let Some(block) = todo.pop() {
-        if block == forbidden || !seen.insert(block) {
-            continue;
-        }
-        if block == target {
-            return true;
-        }
-        todo.extend(graph.successors(block));
-    }
-    false
-}
-
-/// Prove `end <= N` at the index block, where `N` is the receiver's static
-/// `__array_repeat` length. A comparison is useful only when its successful
-/// edge, not merely the comparison block, dominates the index site.
-fn rangeto_static_length_bound_matches(
-    graph: &FunctionGraph,
-    end: &Variable,
-    slice: &Variable,
-    range: &Variable,
-) -> bool {
-    let Some(n) = static_array_repeat_length(graph, slice) else {
-        return false;
-    };
-    let Some(index_block) = graph
-        .blocks
-        .iter()
-        .find_map(|b| {
-            b.operations.iter().enumerate().find_map(|(index, op)| {
-                (is_slice_range_index_call(&op.kind)
-                    && matches!(&op.kind, OpKind::Call { args, .. } if args.get(1) == Some(range)))
-                .then_some((b.id, index))
-            })
-        })
-        .map(|(block, _)| block)
-    else {
-        return false;
-    };
-
-    let mut dominators: std::collections::HashMap<
-        crate::model::BlockId,
-        std::collections::HashSet<crate::model::BlockId>,
-    > = graph
-        .blocks
-        .iter()
-        .map(|b| (b.id, graph.blocks.iter().map(|x| x.id).collect()))
-        .collect();
-    dominators.insert(graph.startblock, [graph.startblock].into_iter().collect());
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in &graph.blocks {
-            if block.id == graph.startblock {
-                continue;
-            }
-            let preds = graph.predecessors(block.id);
-            if preds.is_empty() {
-                continue;
-            }
-            let mut next: std::collections::HashSet<_> = dominators[&preds[0]].clone();
-            for pred in &preds[1..] {
-                next.retain(|id| dominators[pred].contains(id));
-            }
-            next.insert(block.id);
-            if next != dominators[&block.id] {
-                dominators.insert(block.id, next);
-                changed = true;
-            }
-        }
-    }
-    for candidate in &graph.blocks {
-        if candidate.id == index_block || !dominators[&index_block].contains(&candidate.id) {
-            continue;
-        }
-        let Some(crate::model::ExitSwitch::Value(switch)) = &candidate.exitswitch else {
-            continue;
-        };
-        let Some((op, lhs, bound)) = comparison_for_switch(graph, switch) else {
-            continue;
-        };
-        let Some(success) = (match op.as_str() {
-            "le" if bound == n => Some(true),
-            "lt" if n.checked_add(1) == Some(bound) => Some(true),
-            "gt" if bound == n => Some(false),
-            "ge" if n.checked_add(1) == Some(bound) => Some(false),
-            _ => None,
-        }) else {
-            continue;
-        };
-        let mut true_target = None;
-        let mut false_target = None;
-        for link in &candidate.exits {
-            match link.exitcase {
-                Some(crate::model::ExitCase::Bool(true)) => true_target = Some(link.target),
-                Some(crate::model::ExitCase::Bool(false)) => false_target = Some(link.target),
-                _ => {}
-            }
-        }
-        let (Some(true_target), Some(false_target)) = (true_target, false_target) else {
-            continue;
-        };
-        let proving_edge_target = if success { true_target } else { false_target };
-        if !comparison_operand_matches_end(graph, end, &lhs) {
-            continue;
-        }
-        if reaches_without_retesting(graph, proving_edge_target, index_block, candidate.id)
-            && !reaches_without_retesting(
-                graph,
-                if success { false_target } else { true_target },
-                index_block,
-                candidate.id,
-            )
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// `end = sub(ArrayLen(slice), 1)` is the only RangeTo shape whose stop is
-/// proven against this receiver's length, and only its unsigned form has the
-/// required wraparound semantics. `ArrayLen` and plain `sub` are the measured
-/// post-lowering forms (`front/mir.rs`).
 fn minus_one_end_matches(graph: &FunctionGraph, end: &Variable, slice: &Variable) -> bool {
     let Some(end) = resolve_block_alias(graph, end) else {
         return false;
@@ -1544,6 +1113,51 @@ mod tests {
             .any(|op| is_slice_range_index_call(&op.kind))
     }
 
+    /// Every general RangeTo keeps the original stop, receiver and result.
+    /// In particular, a branch/phi or mutation cannot substitute a different
+    /// ArrayLen for the captured stop. The marker also stays safe for legacy.
+    fn assert_rangeto_rewrite(g: &mut FunctionGraph, site: SliceIndexRangeToSite) {
+        let original = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find(|op| is_slice_range_index_call(&op.kind))
+            .unwrap()
+            .clone();
+        let OpKind::Call {
+            args, result_ty, ..
+        } = &original.kind
+        else {
+            unreachable!()
+        };
+        let expected_args = vec![args[0].clone(), site.end.clone()];
+        assert_eq!(rewire_slice_index_rangeto_sites(g, &[site]), 1);
+        assert!(!has_residual_slice_index(g));
+        let rewritten = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find(|op| op.result == original.result)
+            .unwrap();
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            result_ty: new_ty,
+        } = &rewritten.kind
+        else {
+            panic!("RangeTo must remain a synthetic call until flowspace adaptation");
+        };
+        assert_eq!(segments, &["__getslice_rangeto"]);
+        assert_eq!(args, &expected_args);
+        assert_eq!(new_ty, result_ty);
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(&op.kind, OpKind::GetSlice { .. }))
+        );
+    }
+
     fn length_changing_call(base: &Variable) -> OpKind {
         OpKind::Call {
             target: CallTarget::FunctionPath {
@@ -1579,71 +1193,7 @@ mod tests {
     }
 
     #[test]
-    fn array_len_stability_declines_unknown_phi_operand() {
-        let mut g = FunctionGraph::new("array_len_unknown_phi_operand");
-        let entry = g.startblock;
-        let base = g.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
-        let other = g.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
-        let cond = g.push_op_var(entry, OpKind::ConstBool(true), true).unwrap();
-        let (site, args) = g.create_block_with_arg_vars(1);
-        g.set_branch(
-            entry,
-            cond,
-            site,
-            vec![base.clone()],
-            site,
-            vec![other.clone()],
-        );
-        let lhs = g
-            .push_op_var(
-                site,
-                OpKind::ArrayLen {
-                    base: base.clone(),
-                    array_type_id: None,
-                    nolength: false,
-                },
-                true,
-            )
-            .unwrap();
-        g.block_mut(site).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec!["alloc".into(), "vec".into(), "<Impl>".into(), "push".into()],
-                },
-                args: vec![args[0].clone(), other],
-                result_ty: ValueType::Void,
-            },
-        });
-        let end = g
-            .push_op_var(
-                site,
-                OpKind::ArrayLen {
-                    base: base.clone(),
-                    array_type_id: None,
-                    nolength: false,
-                },
-                true,
-            )
-            .unwrap();
-        let definitions = |result: &Variable| {
-            let index = g
-                .block(site)
-                .operations
-                .iter()
-                .position(|op| op.result.as_ref() == Some(result))
-                .unwrap();
-            (site, index)
-        };
-
-        assert!(
-            !array_len_base_is_stable(&g, &base, definitions(&lhs), definitions(&end)),
-            "an unresolved phi operand must keep the proof conservative"
-        );
-    }
-
-    #[test]
-    fn array_len_stability_rejects_unresolved_accessor_path() {
+    fn rangeto_preserves_end_across_unresolved_accessor_path() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
         let site_block = g
             .blocks
@@ -1684,12 +1234,7 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            rewire_slice_index_rangeto_sites(&mut g, &[site]),
-            0,
-            "an opaque function named get must not pass the accessor allowlist"
-        );
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
@@ -1855,35 +1400,19 @@ mod tests {
     }
 
     #[test]
-    fn rangeto_static_length_self_phi_rewrites() {
+    fn rangeto_self_phi_rewrites() {
         let (mut g, site) = build_rangeto_self_phi_graph(false);
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 1);
-        assert!(!has_residual_slice_index(&g));
-        assert_eq!(
-            g.blocks
-                .iter()
-                .flat_map(|b| &b.operations)
-                .filter(|op| matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        ..
-                    } if segments == &["__getslice_rangeto".to_string()]
-                ))
-                .count(),
-            1
-        );
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_distinct_phi_declines() {
+    fn rangeto_distinct_phi_rewrites() {
         let (mut g, site) = build_rangeto_self_phi_graph(true);
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_mixed_variable_constant_phi_declines() {
+    fn rangeto_mixed_variable_constant_phi_rewrites() {
         let (mut g, site) = build_rangeto_self_phi_graph(false);
         let (site_block, phi) = g
             .blocks
@@ -1911,12 +1440,7 @@ mod tests {
             None,
             "a constant incoming phi argument must make alias resolution fail closed"
         );
-        assert_eq!(
-            rewire_slice_index_rangeto_sites(&mut g, &[site]),
-            0,
-            "a RangeTo fold relying on a mixed variable/constant phi alias must decline"
-        );
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
@@ -2039,71 +1563,31 @@ mod tests {
     }
 
     #[test]
-    fn rangeto_static_length_dominating_le_rewrites() {
+    fn rangeto_dominating_le_rewrites() {
         let (mut g, site) = build_rangeto_static_length_graph(Some(8), true, true);
-        let expected_end = site.end.clone();
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 1);
-        assert!(!has_residual_slice_index(&g));
-        assert!(g.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    args,
-                    ..
-                } if segments == &["__getslice_rangeto".to_string()]
-                    && args.len() == 2
-                    && args[1] == expected_end
-            )
-        }));
-        assert!(!g.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments },
-                    ..
-                } if segments == &["__getslice_minusone".to_string()]
-            )
-        }));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_matches_equivalent_arraylen_values() {
+    fn rangeto_matches_equivalent_arraylen_values() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 1);
-        assert!(!has_residual_slice_index(&g));
-        assert_eq!(
-            g.blocks
-                .iter()
-                .flat_map(|b| &b.operations)
-                .filter(|op| matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        ..
-                    } if segments == &["__getslice_rangeto".to_string()]
-                ))
-                .count(),
-            1
-        );
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_rejects_arraylen_different_bases() {
+    fn rangeto_preserves_end_across_arraylen_different_bases() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(true, false);
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_rejects_mutable_arraylen_base() {
+    fn rangeto_preserves_end_across_mutable_arraylen_base() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, true);
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_rejects_prebranch_mutation_after_lhs_read() {
+    fn rangeto_preserves_end_across_prebranch_mutation_after_lhs_read() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
         let entry = g.startblock;
         let (lhs_index, base) = g
@@ -2124,16 +1608,11 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            rewire_slice_index_rangeto_sites(&mut g, &[site]),
-            0,
-            "a mutation after the comparison ArrayLen but before its branch must decline"
-        );
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_rejects_shrink_between_end_and_lhs_reads() {
+    fn rangeto_preserves_end_across_shrink_between_end_and_lhs_reads() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
         let entry = g.startblock;
         let (lhs_index, base) = g
@@ -2171,16 +1650,11 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            rewire_slice_index_rangeto_sites(&mut g, &[site]),
-            0,
-            "a shrink between an earlier end ArrayLen and the comparison ArrayLen must decline"
-        );
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_rejects_opaque_call_without_base_operand() {
+    fn rangeto_preserves_end_across_opaque_call_without_base_operand() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
         let entry = g.startblock;
         let owner = g.push_op_var(entry, OpKind::ConstInt(17), true).unwrap();
@@ -2199,16 +1673,11 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            rewire_slice_index_rangeto_sites(&mut g, &[site]),
-            0,
-            "an opaque call between the ArrayLen reads must decline even without a base operand"
-        );
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_rejects_arraywrite_publish_reload_mutation() {
+    fn rangeto_preserves_end_across_arraywrite_publish_reload_mutation() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
         let entry = g.startblock;
         let (lhs_index, base) = g
@@ -2268,16 +1737,11 @@ mod tests {
             .operations
             .splice(lhs_index..lhs_index, prefix);
 
-        assert_eq!(
-            rewire_slice_index_rangeto_sites(&mut g, &[site]),
-            0,
-            "publishing the base through ArrayWrite before an indirect mutation must decline"
-        );
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_ignores_mutation_strictly_after_later_read() {
+    fn rangeto_ignores_mutation_strictly_after_later_read() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
         let (site_block, base) = arraylen_site_base(&g, &site.end);
         let end_index = g
@@ -2294,12 +1758,11 @@ mod tests {
             },
         );
 
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 1);
-        assert!(!has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_ignores_mutation_after_site() {
+    fn rangeto_ignores_mutation_after_site() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
         let (site_block, base) = arraylen_site_base(&g, &site.end);
         let (after_block, _) = g.create_block_with_arg_vars(0);
@@ -2308,13 +1771,12 @@ mod tests {
             kind: length_changing_call(&base),
         });
 
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 1);
-        assert!(!has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
         assert_ne!(site_block, after_block);
     }
 
     #[test]
-    fn rangeto_static_length_rejects_mutation_between_bound_and_site() {
+    fn rangeto_preserves_end_across_mutation_between_bound_and_site() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
         let (site_block, _) = arraylen_site_base(&g, &site.end);
         let entry = g.startblock;
@@ -2349,12 +1811,11 @@ mod tests {
             None,
         )];
 
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_rejects_mutation_after_site_in_loop() {
+    fn rangeto_preserves_end_across_mutation_after_site_in_loop() {
         let (mut g, site) = build_rangeto_arraylen_value_graph(false, false);
         let (site_block, base) = arraylen_site_base(&g, &site.end);
         let (loop_block, loop_args) = g.create_block_with_arg_vars(1);
@@ -2374,36 +1835,31 @@ mod tests {
             &g, loop_args, site_block, None,
         )];
 
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_without_bound_declines() {
+    fn rangeto_without_bound_rewrites() {
         let (mut g, site) = build_rangeto_static_length_graph(None, true, true);
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_weak_bound_declines() {
+    fn rangeto_weak_bound_rewrites() {
         let (mut g, site) = build_rangeto_static_length_graph(Some(9), true, true);
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_wrong_edge_declines() {
+    fn rangeto_wrong_edge_rewrites() {
         let (mut g, site) = build_rangeto_static_length_graph(Some(8), false, true);
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
-    fn rangeto_static_length_unknown_repeat_count_declines() {
+    fn rangeto_unknown_repeat_count_rewrites() {
         let (mut g, site) = build_rangeto_static_length_graph(Some(8), true, false);
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
-        assert!(has_residual_slice_index(&g));
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     /// Build the minimal `&s[k..]` shape — a `ConstInt(k)` start, a
@@ -2685,7 +2141,7 @@ mod tests {
     /// `&s[..k]` uses the existing StartStop contract: a synthetic constant
     /// zero start and the aggregate's real `end` value as stop.
     #[test]
-    fn rewrite_declines_general_rangeto_without_length_proof() {
+    fn rewrite_general_rangeto_keeps_link_carried_range_defined() {
         let mut g = FunctionGraph::new("test_slice_index_rangeto");
         let a = g.startblock;
         let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
@@ -2739,14 +2195,7 @@ mod tests {
             range_result: range.clone(),
             end: end.clone(),
         };
-        assert_eq!(rewire_slice_index_rangeto_sites(&mut g, &[site]), 0);
-        assert!(
-            g.blocks
-                .iter()
-                .flat_map(|blk| &blk.operations)
-                .any(|op| { is_slice_range_index_call(&op.kind) }),
-            "general RangeTo remains residual"
-        );
+        assert_rangeto_rewrite(&mut g, site);
         for block in &g.blocks {
             for link in &block.exits {
                 for arg in &link.args {
@@ -2758,27 +2207,24 @@ mod tests {
         }
     }
 
-    /// A RangeTo whose end is computed at runtime declines. The measured
-    /// `args.len() - 1` sites have this shape and have no length proof.
+    /// A runtime stop is passed unchanged; no length proof is required.
     #[test]
-    fn rewrite_declines_runtime_end() {
+    fn rewrite_preserves_runtime_end() {
         let mut g = FunctionGraph::new("test_slice_index_rangeto_runtime");
         let a = g.startblock;
         let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
-        let len = g.push_op_var(a, OpKind::ConstInt(8), true).unwrap();
-        let one = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
         let end = g
             .push_op_var(
                 a,
-                OpKind::BinOp {
-                    op: "sub".into(),
-                    lhs: len,
-                    rhs: one,
-                    result_ty: ValueType::Int,
+                OpKind::Input {
+                    name: "end".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
                 },
                 true,
             )
             .unwrap();
+        g.push_inputarg_var(a, end.clone());
         let range = g
             .push_op_var(
                 a,
@@ -2813,25 +2259,20 @@ mod tests {
             range_result: range,
             end,
         };
-        assert_eq!(
-            rewire_slice_index_rangeto_sites(&mut g, &[site]),
-            0,
-            "runtime RangeTo end declines"
-        );
-        assert!(
-            g.blocks
-                .iter()
-                .flat_map(|blk| &blk.operations)
-                .any(|op| is_slice_range_index_call(&op.kind)),
-            "residual slice::index call remains"
-        );
-        assert!(
-            !g.blocks
-                .iter()
-                .flat_map(|blk| &blk.operations)
-                .any(|op| matches!(&op.kind, OpKind::GetSlice { .. })),
-            "no getslice is planted on decline"
-        );
+        assert_rangeto_rewrite(&mut g, site);
+    }
+
+    #[test]
+    fn rangeto_oversized_stop_is_left_for_runtime_clamping() {
+        let (mut g, site) = build_rangeto_static_length_graph(None, true, true);
+        let end_op = g
+            .blocks
+            .iter_mut()
+            .flat_map(|b| &mut b.operations)
+            .find(|op| op.result.as_ref() == Some(&site.end))
+            .unwrap();
+        end_op.kind = OpKind::ConstUInt(999);
+        assert_rangeto_rewrite(&mut g, site);
     }
 
     #[test]
