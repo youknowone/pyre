@@ -31,8 +31,12 @@
 //! bytecode, `GILReleaseAction` (gil.py) yields it from the periodic
 //! action; [`yield_thread`] is that yield.
 
-use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+// thread_pthread.c's mutex1_t and mutex2_t own native synchronization objects.
+// rpy_init_mutexes resets them in the forked child. A parking_lot mutex also
+// has waiters in a process-global queue: replacing its local bytes would leave
+// vanished parent threads queued at the same address and lose child wakeups.
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::gc_sync;
@@ -90,7 +94,7 @@ impl Mutex2 {
     /// thread_pthread.c:570-575 `mutex2_unlock`. The signal is sent after the
     /// mutex is dropped, as in the C.
     fn unlock(&self) {
-        *self.locked.lock() = false;
+        *self.locked.lock().unwrap() = false;
         self.cond.notify_one();
     }
 
@@ -107,7 +111,7 @@ impl Mutex2 {
     /// lock the stealer keeps for the whole steal loop, and is dropped in place
     /// of `mutex2_loop_stop` (:579-581).
     fn loop_start(&self) -> MutexGuard<'_, bool> {
-        self.locked.lock()
+        self.locked.lock().unwrap()
     }
 
     /// thread_pthread.c:582-595 `mutex2_lock_timeout`. Returns the guard along
@@ -120,7 +124,7 @@ impl Mutex2 {
     ) -> (MutexGuard<'a, bool>, bool) {
         let mut guard = guard;
         if *guard {
-            self.cond.wait_for(&mut guard, delay);
+            (guard, _) = self.cond.wait_timeout(guard, delay).unwrap();
         }
         let result = !*guard;
         *guard = true;
@@ -129,8 +133,8 @@ impl Mutex2 {
 }
 
 /// thread_gil.c:89-90. Held in one cell because `rpy_init_mutexes` re-creates
-/// both of them together, and a `parking_lot::Mutex` can only be reset by
-/// overwriting it.
+/// both of them together. The native wait queues do not retain the parent
+/// threads when the child replaces these synchronization objects.
 struct GilMutexes {
     stealer: Mutex<()>,
     gil: Mutex2,
@@ -391,7 +395,7 @@ fn acquire_slow_path(ident: usize) {
     // first-in-first-out order, this gives the threads a round-robin chance.
     {
         let mutexes = mutexes();
-        let _stealer = mutexes.stealer.lock();
+        let _stealer = mutexes.stealer.lock().unwrap();
         let mut gil = mutexes.gil.loop_start();
 
         // We are now the stealer thread. Steals!
@@ -412,9 +416,11 @@ fn acquire_slow_path(ident: usize) {
                 break;
             }
         }
+        // RPyGilAcquireSlowPath decrements while both queue locks are still
+        // held, before mutex2_loop_stop and mutex1_unlock publish the exit.
+        RPY_WAITING_THREADS.fetch_sub(1, Ordering::SeqCst);
     }
 
-    RPY_WAITING_THREADS.fetch_sub(1, Ordering::SeqCst);
     gc_sync::rejoin_running_after_gil(census);
     // Both exits from the steal loop leave *this* thread's ident in the word,
     // so the exit condition is ownership, not merely that the word is taken.
@@ -468,6 +474,7 @@ impl Drop for GilGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
 
     /// `RPY_FASTGIL` and `RPY_WAITING_THREADS` are process-global and the test
     /// harness runs test functions on concurrent threads, so a second test
@@ -493,5 +500,76 @@ mod tests {
         let _guard = GilGuard::acquire();
         assert!(!yield_thread());
         assert!(am_i_holding_the_gil());
+    }
+
+    /// thread_gil.c's rpy_init_mutexes must leave only the surviving thread
+    /// in the child's wait queues, not just reset the local lock bytes.
+    #[cfg(unix)]
+    #[test]
+    fn fork_reinitialization_drops_vanished_stealer_waiters() {
+        const CHILD_ENV: &str = "MAJIT_RGIL_FORK_REINIT_TEST";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Other GC tests share these process-global locks. Fork only in
+            // a fresh test process running this one case.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rgil::tests::fork_reinitialization_drops_vanished_stealer_waiters",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "fork probe failed: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        fn start_waiter() -> std::thread::JoinHandle<()> {
+            // A channel can park through libdispatch on macOS, which traps
+            // after a multithreaded fork. Keep the probe's readiness signal
+            // independent of that runtime; only the GIL lock should park.
+            let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let started = ready.clone();
+            let waiter = std::thread::spawn(move || {
+                started.store(true, Ordering::Release);
+                let _guard = mutexes().stealer.lock().unwrap();
+            });
+            while !ready.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // Allow the contended lock call to park after its entry signal.
+            std::thread::sleep(Duration::from_millis(100));
+            waiter
+        }
+
+        allocate(); // Installs the real rpy_init_mutexes child hook.
+        let held = mutexes().stealer.lock().unwrap();
+        let parent_waiter = start_waiter();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // The atfork callback already replaced the mutex. Do not unlock
+            // that new mutex through the guard for its old incarnation.
+            std::mem::forget(held);
+            unsafe { libc::alarm(5) };
+            let held = mutexes().stealer.lock().unwrap();
+            let child_waiter = start_waiter();
+            drop(held);
+            child_waiter.join().unwrap();
+            unsafe { libc::_exit(0) };
+        }
+        drop(held);
+        parent_waiter.join().unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child stalled after GIL mutex reinitialization: wait status {status}"
+        );
     }
 }
