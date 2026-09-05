@@ -7988,7 +7988,7 @@ impl<'a> Lowering<'a> {
         // PyType address would reinterpret a `PyreClassDescriptor`/scalar as
         // `PyType`.  Select the exact trait item first, then use identity only
         // for the part it actually proves: which class owns that `PYTYPE`.
-        if !is_pyre_class_pytype_assoc_const(&item_path, &trait_path) {
+        if !is_class_pytype_assoc_const(&item_path, &trait_path) {
             return None;
         }
         // `impl_trait.generics.types[0]` is the `Self` of `impl Trait for
@@ -24787,7 +24787,7 @@ fn path_ends_with_segments(path: &str, key: &str) -> bool {
 /// three axes separate mirrors RPython's prebuilt lookup: object identity
 /// chooses the owner while the attribute lookup still chooses one field of
 /// that object.
-fn is_pyre_class_pytype_assoc_const(item_path: &str, trait_path: &str) -> bool {
+fn is_class_pytype_assoc_const(item_path: &str, trait_path: &str) -> bool {
     item_path.rsplit("::").next() == Some("PYTYPE")
         && path_ends_with_segments(trait_path, "pyre_object::lltype::PyreClassPyTypeOf")
 }
@@ -28346,10 +28346,10 @@ mod tests {
         DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
         cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
         checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
-        is_core_result_map_err_path, is_pyre_class_pytype_assoc_const,
-        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
-        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
-        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_value_type,
+        is_class_pytype_assoc_const, is_core_result_map_err_path, json_ty_is_thin_pointer_element,
+        json_ty_scalar_element_spelling, push_ptr_to_unsigned_cast, shaped_array_parts,
+        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
+        tyref_positional_aggregate_root, tyref_to_value_type,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -28390,19 +28390,19 @@ mod tests {
     #[test]
     fn pytype_identity_lane_selects_the_trait_item_before_the_impl_owner() {
         let trait_path = "pyre_object::lltype::PyreClassPyTypeOf";
-        assert!(is_pyre_class_pytype_assoc_const(
+        assert!(is_class_pytype_assoc_const(
             "pyre_object::functional::<Impl>::PYTYPE",
             trait_path,
         ));
-        assert!(!is_pyre_class_pytype_assoc_const(
+        assert!(!is_class_pytype_assoc_const(
             "pyre_object::functional::<Impl>::DESCRIPTOR",
             trait_path,
         ));
-        assert!(!is_pyre_class_pytype_assoc_const(
+        assert!(!is_class_pytype_assoc_const(
             "pyre_object::functional::<Impl>::PYNAME",
             trait_path,
         ));
-        assert!(!is_pyre_class_pytype_assoc_const(
+        assert!(!is_class_pytype_assoc_const(
             "other_crate::<Impl>::PYTYPE",
             "other_crate::lltype::PyreClassPyTypeOf",
         ));
