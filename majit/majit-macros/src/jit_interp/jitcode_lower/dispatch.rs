@@ -3666,6 +3666,7 @@ pub(crate) fn lower_dispatch_body(
     config: &LowererConfig,
     func_block: &syn::Block,
     classified_arms: &[crate::jit_interp::classify::ClassifiedArm],
+    portal_output: &syn::ReturnType,
 ) -> Option<GeneratedJitCodeBody> {
     let mut lowerer = Lowerer::new(Some(config));
     // RPython `assembler` emits exactly one `-live-` per source point;
@@ -4025,19 +4026,35 @@ pub(crate) fn lower_dispatch_body(
     // committed prefix would leave the prefix in the JitCode and still
     // terminate in `void_return`, so the native suffix -- the prefix included
     // -- would run a second time once the `Finish` breaks the dispatch loop.
+    //
+    // A portal whose declared return type has no finish projection lowers no
+    // epilogue at all.  The two drains that make a lowered epilogue run once --
+    // `FinishReturn::drain` after the back edge and
+    // `FinishReturn::drain_single_pass` at the single-executor close -- are both
+    // emitted only for a type `finish_return_for` recognises.  Without one they
+    // are empty, so a published FINISH is consumed by nobody: the close breaks
+    // the native loop and the source suffix runs a SECOND time, and the back
+    // edge resumes at the merge point the compiled run already ran past.
+    // Reading the same predicate the drains read is what keeps the two from
+    // disagreeing about which types are projectable.
+    let epilogue_has_finish_projection =
+        crate::jit_interp::finish_return_for(portal_output).is_some();
     let prefix_len = post_loop
         .len()
         .saturating_sub(usize::from(return_expr.is_some()));
-    let binding = lowerer
-        .transactional(|inner| {
-            for stmt in &post_loop[..prefix_len] {
-                inner.lower_stmt(stmt)?;
-            }
-            match return_expr {
-                Some(expr) => inner.lower_value_expr(expr).map(Some),
-                None => Some(None),
-            }
+    let binding = epilogue_has_finish_projection
+        .then(|| {
+            lowerer.transactional(|inner| {
+                for stmt in &post_loop[..prefix_len] {
+                    inner.lower_stmt(stmt)?;
+                }
+                match return_expr {
+                    Some(expr) => inner.lower_value_expr(expr).map(Some),
+                    None => Some(None),
+                }
+            })
         })
+        .flatten()
         .flatten();
     let (reads, emitter) = typed_return_terminator(binding);
     lowerer.emit_op(OpMeta::terminal(reads), emitter);

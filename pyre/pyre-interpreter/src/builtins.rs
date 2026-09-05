@@ -16437,6 +16437,35 @@ pub(crate) fn exec_or_eval(
         let _ = ns_roots.pin_root(w_globals);
         slot
     });
+    // `locals_arg` is what `setdictscope` binds far below, and the plant on the
+    // next lines runs user Python: a dict-subclass `setdefault` /
+    // `__contains__` / `__setitem__` can collect, and the nursery relocates the
+    // caller's mapping.  The caller's own reference is forwarded, so its dict
+    // keeps reading correctly while this local copy is left naming the vacated
+    // block; the frame then runs against a stale mapping and every LOAD_NAME /
+    // STORE_NAME through it faults on a header that no longer describes a dict.
+    // Publish it here beside `w_globals` and read it back where it is consumed.
+    //
+    // The two identity questions are answered here for the same reason: asked
+    // after the move, `std::ptr::eq` would compare a forwarded pointer against
+    // a stale one and report two objects where there is one.
+    //
+    // Dict and non-dict mapping arms share the `setdictscope` path — for exact
+    // dict locals this matches the `code.exec_code(space, w_globals, w_locals)`
+    // chain in pyopcode.py `exec_`, which feeds `space.setitem(w_locals, name,
+    // value)` to STORE_NAME.  Pyre's earlier `is_dict_w` arm built a
+    // storage copy and drained it back through a `Vec<String>` snapshot to
+    // mirror DELETE_GLOBAL while preserving alias mutations; routing through
+    // `setdictscope` retires the copy + snapshot entirely.
+    let locals_is_absent = is_none_or_null(locals_arg);
+    let globals_is_absent = is_none_or_null(globals_arg);
+    let locals_is_globals =
+        !locals_is_absent && !globals_is_absent && std::ptr::eq(locals_arg, globals_arg);
+    let locals_object_slot = (!locals_is_absent && !locals_is_globals).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = ns_roots.pin_root(locals_arg);
+        slot
+    });
     // The validated closure is the caller's tuple, and it is consumed last of
     // all -- after `ensure_*_builtins`, the two namespace pins and the
     // snapshot allocation.  It goes on the same scope as they do rather than
@@ -16503,7 +16532,7 @@ pub(crate) fn exec_or_eval(
     // locals=globals and pyre's existing same-dict path handles it.
     let mut implicit_caller_locals: pyre_object::PyObjectRef = std::ptr::null_mut();
     let caller_frame = caller_anchor.live();
-    if is_none_or_null(globals_arg) && is_none_or_null(locals_arg) && !caller_frame.is_null() {
+    if globals_is_absent && locals_is_absent && !caller_frame.is_null() {
         // The caller's locals as `locals()` reports them: its real namespace
         // for a module or class frame, an independent snapshot for an
         // optimized one.  The snapshot is what keeps `exec("y = 1")` inside a
@@ -16513,29 +16542,6 @@ pub(crate) fn exec_or_eval(
     let implicit_locals_slot = (!implicit_caller_locals.is_null()).then(|| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = ns_roots.pin_root(implicit_caller_locals);
-        slot
-    });
-    let mut locals_object_arg: pyre_object::PyObjectRef = std::ptr::null_mut();
-    if !is_none_or_null(locals_arg) {
-        let same_as_globals =
-            !is_none_or_null(globals_arg) && std::ptr::eq(locals_arg, globals_arg);
-        if !same_as_globals {
-            // Dict and non-dict mapping arms share the
-            // setdictscope path — for exact dict locals this
-            // matches PyPy's `code.exec_code(space, w_globals,
-            // w_locals)` chain (pyopcode.py:776) which feeds
-            // `space.setitem(w_locals, name, value)` to STORE_NAME.
-            // Pyre's earlier `is_dict_w` arm built a storage copy and
-            // drained it back through a `Vec<String>` snapshot to
-            // mirror DELETE_GLOBAL while preserving alias mutations;
-            // routing through `setdictscope` retires the copy +
-            // snapshot entirely.
-            locals_object_arg = locals_arg;
-        }
-    }
-    let locals_object_slot = (!locals_object_arg.is_null()).then(|| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = ns_roots.pin_root(locals_object_arg);
         slot
     });
     // function.py Function.__init__ — build the closure carrier for

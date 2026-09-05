@@ -5742,11 +5742,28 @@ impl TraceCtx {
         // the merge point was seeded under a different frame layout and
         // should not match.
         // Same reverse scan, same short-circuit; the loop form exists only so
-        // the SHAPE REJECTION can be tallied. `pyjitpl.py:3020 assert
+        // the SHAPE REJECTION can be tallied. `reached_loop_header`'s `assert
         // len(original_boxes) == len(live_arg_boxes)` asserts here — upstream
-        // never filters. Slot 54 counts every same-green-key merge point this
-        // rule discards, so a corpus reading 0 can promote the filter to a
-        // `debug_assert!`.
+        // never filters.
+        //
+        // Slot 54 read 0 over 537 fixtures (`pyre/bench/synth` 527 +
+        // `pyre/bench` 10, where the `nested_loop` the note above names
+        // actually lives), release, `MAJIT_STATS=1`, against a live
+        // denominator — this is the loop-close decision, so every loop
+        // compiled in that corpus took the matching return. That reading does
+        // NOT license promoting the filter to an assert, because the length
+        // test is not only a shape check: `TraceCtx::new`
+        // (`trace_ctx.rs:1755-1766`) seeds `current_merge_points` at trace
+        // start with an entry carrying the trace's OWN green key and the
+        // recorder's inputargs as its `green_boxes`, and the length test is
+        // what keeps that seed from matching. Dropping it makes the FIRST
+        // arrival at a loop header find the seed and close immediately;
+        // `jit_merge_point_first_visit_continues_then_closes_loop` and
+        // `jit_merge_point_int_form_resolves_jdindex_from_the_int_bank`
+        // (`pyre-jit-trace/src/jitcode_dispatch/tests.rs`) pin the
+        // first-arrival-continues contract and fail on it. The assert lands
+        // once the seed is distinguishable from a registered merge point, not
+        // on a counter reading.
         for mp in self.current_merge_points.iter().rev() {
             if mp.green_key != key {
                 continue;

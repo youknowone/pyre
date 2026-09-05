@@ -21,12 +21,12 @@ use super::{
 /// The `EffectInfo` a jitcode-lowered `#[jit_may_force]` helper carries.
 ///
 /// `EF_RANDOM_EFFECTS`, for the reason `pyre-jit`'s `CallFlavor::MayForce`
-/// resolves to the same constant: `call.py:288-289 if
+/// resolves to the same constant: `call.py getcalldescr`'s `if
 /// virtualizable_analyzer.analyze(op):` reaches
 /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` only through
 /// `effectinfo_from_writeanalyze(self.readwrite_analyzer.analyze(op))`
-/// (`call.py:319-323`), which names every field and array the callee writes —
-/// `self.stack[*]` for `tl.py Stack.roll`. The helper reached from here is a
+/// (`call.py getcalldescr`), which names every field and array the callee
+/// writes — `self.stack[*]` for `tl.py Stack.roll`. The helper reached from here is a
 /// Rust `extern "C"` fn with no graph for that analyzer to walk, so an empty
 /// write set asserts something it has not proved, and
 /// `heap.py force_from_effectinfo` believes it.
@@ -42,7 +42,7 @@ use super::{
 ///
 /// The promotion costs no may-force machinery: `check_forces_virtual_or_
 /// virtualizable()` reads `extraeffect >= EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
-/// (`effectinfo.py:249-250`) and RandomEffects is above it, so
+/// (`effectinfo.py`) and RandomEffects is above it, so
 /// `do_residual_call` still selects `CALL_MAY_FORCE_*` with its vable/vref
 /// preparation.
 fn jitcode_may_force_effect_info() -> majit_ir::effectinfo::EffectInfo {

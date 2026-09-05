@@ -13,10 +13,14 @@
 //!   by `items.append(w_item)`).
 //! * [`UnpackJitState`] — `Meta = PyreMeta`, `Sym = UnpackSym`, `Env = PyreEnv`.
 //!
-//! The descriptor builder and its second `register_jitdriver_sd` registration
-//! in `build_jit_driver_pair` now exist. The remaining activation follow-ups
-//! are blackhole entry and the merge-point invocation at
-//! `_unpackiterable_unknown_length`.
+//! Dormant means gated, not unbuilt: the descriptor builder, its second
+//! `register_jitdriver_sd` registration in `build_jit_driver_pair`, the
+//! merge-point invocation (`eval.rs drive_unpack_iterable_trace`) and the
+//! blackhole entry (`resume_in_blackhole_from_exit_layout`) all exist.  What
+//! keeps them off the hot path is `PYRE_JD1`, which is opt-in because pyre
+//! drives jd1 through the same `MetaInterp.tracing` slot as the bytecode
+//! portal — see `eval.rs jd1_experiment_enabled` for why that is not yet
+//! RPython's independent second driver.
 
 use majit_ir::{OpRef, Type};
 use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};

@@ -443,20 +443,27 @@ impl CallControl {
     /// signatures. Keeping the method shape preserves the call.py:167
     /// `(fnaddr, calldescr) = self.get_jitcode_calldescr(graph)` flow even so.
     ///
-    /// Nothing dispatches the address it returns. `bhimpl_recursive_call_*`
-    /// reaches the portal through `get_portal_runner`, which answers
-    /// `bh_portal_runner_c` with the `"iirrr"` descr that really describes it;
-    /// and where upstream's `bhimpl_inline_call_*` calls
-    /// `cpu.bh_call_*(jitcode.fnaddr, …)` (blackhole.py:1279-1320), pyre reads
-    /// its callee out of a build-time descr pool whose `fnaddr` comes from
-    /// `JitCodeBuilder::set_native_entry`, and a CodeObject jitcode minted here
-    /// is never in that pool. So this stamps a non-null placeholder, and the
-    /// descr beside it describes `bh_portal_runner_c`, not the slice-taking
-    /// `bh_portal_runner` whose address it takes.
+    /// Nothing dispatches the address it returns today. `bhimpl_recursive_call_*`
+    /// reaches the portal through `get_portal_runner`, and where upstream's
+    /// `bhimpl_inline_call_*` calls `cpu.bh_call_*(jitcode.fnaddr, …)`
+    /// (`blackhole.py bhimpl_inline_call_*`), pyre reads its callee out of a build-time
+    /// descr pool whose `fnaddr` comes from `JitCodeBuilder::set_native_entry`,
+    /// and a CodeObject jitcode minted here is never in that pool.
+    ///
+    /// The pair is still the one that describes the portal runner, rather than
+    /// a placeholder address beside an arbitrary descr.  A published `fnaddr`
+    /// whose descr does not describe it is only latent while nothing dispatches
+    /// it: the first caller that does reads the arg banks through the descr and
+    /// calls the address, so the mismatch surfaces as a wrong-ABI call rather
+    /// than as an error.  `bh_portal_runner_c` is the C-ABI runner
+    /// `get_portal_runner` already answers with, and `"iirrr"` is the
+    /// `portalfunc_ARGS` layout it consumes (`warmspot.py handle_jitexception`):
+    /// greens `[next_instr:i, is_being_profiled:i, pycode:r]` + reds
+    /// `[frame:r, ec:r]` (`interp_jit.py PyPyJitDriver`).
     pub fn get_jitcode_calldescr(&self, _graph: *const CodeObject) -> (i64, BhCallDescr) {
-        let fnaddr = crate::call_jit::bh_portal_runner as *const () as usize as i64;
+        let fnaddr = crate::call_jit::bh_portal_runner_c as *const () as usize as i64;
         let calldescr = BhCallDescr::from_arg_classes(
-            "r".to_string(),
+            "iirrr".to_string(),
             'r',
             majit_ir::descr::EffectInfo::MOST_GENERAL,
         );
@@ -590,5 +597,23 @@ impl CallControl {
 impl Default for CallControl {
     fn default() -> Self {
         Self::new(Cpu::default(), Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitcode_calldescr_matches_its_published_portal_runner() {
+        let control = CallControl::default();
+        let (fnaddr, calldescr) = control.get_jitcode_calldescr(std::ptr::null());
+
+        assert_eq!(
+            fnaddr,
+            crate::call_jit::bh_portal_runner_c as *const () as usize as i64
+        );
+        assert_eq!(calldescr.arg_classes, "iirrr");
+        assert_eq!(calldescr.result_type, 'r');
     }
 }

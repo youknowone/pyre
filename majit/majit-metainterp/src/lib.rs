@@ -1577,7 +1577,11 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// 54 = `has_merge_point_with_shape_assert` rejected a SAME-green-key merge
 /// point because its `green_boxes` length differed from `live_args_len`, where
 /// `pyjitpl.py assert len(original_boxes) == len(live_arg_boxes)` asserts
-/// instead of filtering; 55 = `register_retrace_merge_point` declined to
+/// instead of filtering — 54 read 0 over the 537-fixture bench corpus and the
+/// rule still cannot become an assert, because the same length test is what
+/// keeps the trace-start seed `TraceCtx::new` plants under the trace's own
+/// green key from matching a loop header's first arrival; 55 =
+/// `register_retrace_merge_point` declined to
 /// register because some jump arg carried no intrinsic type, where
 /// `pyjitpl.py:3059-3060 self.current_merge_points.append((live_arg_boxes,
 /// start))` appends unconditionally; 56 = `close_header_pc` fell back to
