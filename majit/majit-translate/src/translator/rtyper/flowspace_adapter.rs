@@ -1547,7 +1547,7 @@ pub fn translate_op(
             Ok(vec![FlowspaceOp::new("getslice", hl_args, result)])
         }
 
-        // ─── `NewWithVtable` — boxing GC allocation (`fuse_boxing_alloc`) ───
+        // ─── `New` / `NewWithVtable` — boxing GC allocation ───
         // The model-graph op carries the boxing struct leaf `owner` and flows
         // straight to the codewriter/assembler (`new_with_vtable`).  For the
         // ephemeral annotation / rtype type-oracle it mirrors the
@@ -1556,11 +1556,11 @@ pub fn translate_op(
         // result as a fresh `SomeInstance(owner)`.  `getuniqueclassdef_for_
         // struct_root` first forces the struct's field rows to be projected so
         // the trailing payload `FieldWrite(result, …)` resolves.
-        OpKind::NewWithVtable { owner, .. } => {
+        OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } => {
             let bk = call_registry.bookkeeper();
             bk.getuniqueclassdef_for_struct_root(owner).map_err(|e| {
                 TyperError::message(format!(
-                    "translate_op: NewWithVtable owner {owner:?} is not a known struct root: {e}"
+                    "translate_op: allocation owner {owner:?} is not a known struct root: {e}"
                 ))
             })?;
             let host = bk.intern_class_by_qualname(owner);
@@ -3295,6 +3295,8 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::Abort { .. } => "Abort",
         OpKind::NewArrayClear { .. } => "NewArrayClear",
         OpKind::NewListClear { .. } => "NewListClear",
+        OpKind::New { .. } => "New",
+        OpKind::NewWithVtable { .. } => "NewWithVtable",
         // Catch-all for variants pyre may add without bumping this
         // table — surfaces as `<unknown>` in the fail-loud message
         // rather than a misleading variant tag.  The catch-all message
@@ -7523,6 +7525,57 @@ mod tests {
             }),
             "Input"
         );
+        assert_eq!(
+            opkind_variant_name(&OpKind::New {
+                owner: "PlainObject".into(),
+            }),
+            "New"
+        );
+        assert_eq!(
+            opkind_variant_name(&OpKind::NewWithVtable {
+                owner: "TypedObject".into(),
+                vtable: 1,
+            }),
+            "NewWithVtable"
+        );
+    }
+
+    #[test]
+    fn translate_op_accepts_both_boxing_allocation_variants() {
+        let registry = empty_call_registry();
+        registry
+            .bookkeeper()
+            .set_struct_fields(Rc::new(crate::front::StructFieldRegistry {
+                fields: HashMap::from([
+                    ("PlainObject".to_string(), vec![]),
+                    ("TypedObject".to_string(), vec![]),
+                ]),
+            }));
+        let mut graph = LegacyGraph::new("allocation_variants_fixture");
+
+        for kind in [
+            OpKind::New {
+                owner: "PlainObject".into(),
+            },
+            OpKind::NewWithVtable {
+                owner: "TypedObject".into(),
+                vtable: 1,
+            },
+        ] {
+            let result = graph.alloc_value_var();
+            let value_map = HashMap::from([(result.clone(), Hlvalue::Variable(Variable::new()))]);
+            let translated = translate_op(
+                &SpaceOperation {
+                    result: Some(result),
+                    kind,
+                },
+                &value_map,
+                &registry,
+            )
+            .expect("both allocation variants must reach the rtyper as a typed constructor");
+            assert_eq!(translated.len(), 1);
+            assert_eq!(translated[0].opname, "simple_call");
+        }
     }
 
     /// The prebuilt-constant-array define-op (`front::mir`'s
