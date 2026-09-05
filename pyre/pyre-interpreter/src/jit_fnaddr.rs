@@ -24,6 +24,8 @@ pub trait ResidualSlot {}
 /// such a function receives `1` for `Some(p)` and `0` for `None`, never `p`.
 /// That is a silent wrong value rather than a crash, which is why this trait
 /// is deliberately narrow.
+/// This is only a size/bank check: a narrow integer result still needs a
+/// typed widening bridge before a word-returning dispatcher may call it.
 pub trait ResidualRet {}
 
 impl ResidualRet for () {}
@@ -98,6 +100,20 @@ extern "C" fn shadow_stack_try_pop_to_word(depth: i64) {
 extern "C" fn bh_code_unit_at(code: i64, index: i64) -> i64 {
     let code = unsafe { &*(code as usize as *const crate::CodeObject) };
     i64::from(crate::pyopcode::code_unit_at(code, index as usize))
+}
+
+/// `descr.py CallDescr.create_call_stub`: call with the actual RESULT type,
+/// then cast to Signed. A raw `-> bool` target defines only the low byte of
+/// the result on x86, while our residual dispatcher reads a whole word.
+/// The policy macro cannot emit this bridge from the opaque `PyObjectRef`
+/// alias spelling, so supply it at the source-only registry boundary.
+extern "C" fn bh_w_type_issubtype(w_type: i64, cls: i64) -> i64 {
+    unsafe {
+        pyre_object::w_type_issubtype(
+            w_type as pyre_object::PyObjectRef,
+            cls as pyre_object::PyObjectRef,
+        ) as i64
+    }
 }
 
 /// Publication helpers that check the signature instead of erasing it.
@@ -1496,15 +1512,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `w_type_issubtype` is the MRO membership scan (`_issubtype`,
     // typeobject.py), run under the JIT inside `_pure_issubtype`
     // (`@elidable_promote`, typeobject.py:1657).  Its `#[dont_look_inside]`
-    // residualises the call; bind the `-> bool` Rust `fn` directly by
-    // qualified path (2-pointer args, JIT-representable, no C-ABI bridge).
-    let w_type_issubtype: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> bool =
-        pyre_object::w_type_issubtype;
-    upa2(
+    // residualises the call. `CallDescr.create_call_stub` calls a boolean
+    // RESULT before widening to Signed: bind the word-ABI bridge, never the
+    // raw Rust function whose upper result-register bits are undefined.
+    cpa2(
         &mut entries,
         "pyre_object::typeobject::w_type_issubtype",
         "pyre_object::w_type_issubtype",
-        w_type_issubtype,
+        bh_w_type_issubtype,
     );
     // `lookup_exc_class_for_kind` reads the process-global `EXC_CLASS_BY_KIND`
     // registry the tracer cannot model; its residual call rides a C-ABI
@@ -5080,6 +5095,29 @@ mod tests {
         try_pop_to(depth);
         assert_eq!(push(marker), depth, "try_pop_to left the depth unrestored");
         try_pop_to(depth);
+    }
+
+    #[test]
+    fn subtype_residual_registers_the_word_abi() {
+        // descr.py CallDescr.create_call_stub calls the actual RESULT type
+        // before casting to Signed. The trampoline implements that
+        // conversion for the word-returning residual ABI; a raw Rust bool
+        // function leaves the upper return-register bits undefined on x86.
+        let target: extern "C" fn(i64, i64) -> i64 = super::bh_w_type_issubtype;
+        let entries = jit_trace_fnaddrs();
+        for path in [
+            "pyre_object::typeobject::w_type_issubtype",
+            "pyre_object::w_type_issubtype",
+        ] {
+            assert_eq!(
+                entries
+                    .iter()
+                    .find(|(name, _)| *name == path)
+                    .map(|(_, addr)| *addr),
+                Some(target as *const () as usize as i64),
+                "{path} must widen the bool before the residual reads a word",
+            );
+        }
     }
 
     #[test]

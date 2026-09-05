@@ -6854,17 +6854,23 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
         if pyre_object::is_exact_type(obj, &pyre_object::descriptor::SUPER_TYPE) {
             return super_getattribute(obj, w_name);
         }
-        if pyre_object::descriptor::is_super(obj)
-            && let Some(w_type) = crate::typedef::r#type(obj)
+        if let Some(w_type) = crate::typedef::r#type(obj)
             && let Some(slot) = getattribute_if_not_from_object(w_type.as_ptr())
         {
-            let owned_by_heap_type =
-                lookup_where_with_method_cache(w_type.as_ptr(), "__getattribute__").is_some_and(
+            // DescrOperation._handle_getattribute calls the receiver's slot
+            // before the default descriptor lookup, irrespective of the
+            // attribute name's encoding. Keep getattr_str_impl's existing
+            // owner admission: builtin forwarding slots must not recurse
+            // through this object-space entry point.
+            let owner_dispatches_getattribute = is_instance(obj)
+                || lookup_where_with_method_cache(w_type.as_ptr(), "__getattribute__").is_some_and(
                     |(owner, found)| {
-                        std::ptr::eq(found, slot) && pyre_object::w_type_is_heaptype(owner)
+                        std::ptr::eq(found, slot)
+                            && (pyre_object::w_type_is_heaptype(owner)
+                                || pyre_object::w_type_dispatches_own_getattribute(owner))
                     },
                 );
-            if !owned_by_heap_type {
+            if !owner_dispatches_getattribute && pyre_object::descriptor::is_super(obj) {
                 return match super_getattribute(obj, w_name) {
                     Ok(value) => Ok(value),
                     Err(err) if err.kind == PyErrorKind::AttributeError => {
@@ -6873,12 +6879,19 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
                     Err(err) => Err(err),
                 };
             }
-            match get_and_call_function(slot, obj, w_type.as_ptr(), &[w_name]) {
-                Ok(value) => return Ok(value),
-                Err(err) if err.kind == PyErrorKind::AttributeError => {
-                    return instance_getattr_hook_or_err_wtf8(w_type.as_ptr(), obj, w_name, err);
+            if owner_dispatches_getattribute {
+                match get_and_call_function(slot, obj, w_type.as_ptr(), &[w_name]) {
+                    Ok(value) => return Ok(value),
+                    Err(err) if err.kind == PyErrorKind::AttributeError => {
+                        return instance_getattr_hook_or_err_wtf8(
+                            w_type.as_ptr(),
+                            obj,
+                            w_name,
+                            err,
+                        );
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
             }
         }
         match object_getattribute_surrogate(obj, w_name, name) {

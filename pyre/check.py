@@ -2544,6 +2544,11 @@ def spec_fold_census(binary, path, timeout_s, wasm=False):
     env["PYRE_WASM_SPEC_CENSUS" if wasm else "PYRE_FBW_SPEC_CENSUS"] = "1"
     _, _, code, err = run_timed([binary, path], timeout_s=timeout_s, env=env)
     if code != 0:
+        # A census panic is a runtime failure, not a missing fold. Preserve
+        # the evidence just as the ordinary benchmark failure path does.
+        if err:
+            print("\n─── spec-fold census stderr ───")
+            print(err.rstrip())
         return None, code
     return {m.group(1): int(m.group(2)) for m in SPEC_CENSUS_FOLD_RE.finditer(err)}, 0
 

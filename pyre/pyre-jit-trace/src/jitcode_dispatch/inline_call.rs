@@ -12481,7 +12481,15 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
 /// sub-walk driver is active.  A nested CALL yields and replays that one step;
 /// these marks prove the replay crosses no concrete effect and delimit the IR
 /// preamble to cut.
+///
+/// `pyjitpl.py MetaInterp.perform_call` changes frames only at a call. The
+/// local replay continuation needs a heap-cache checkpoint for that CALL's
+/// preamble, not for scalar operations, field reads or control flow. Both
+/// direct inline calls and descents entered through residual-call handlers
+/// can suspend. A non-call clears the checkpoint, so an unexpected suspension
+/// fails at the driver's existing assertion rather than reusing stale state.
 pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
+    opname: &str,
     trace_position: majit_metainterp::recorder::TracePosition,
     heap_cache: &majit_metainterp::heapcache::HeapCache,
 ) {
@@ -12499,8 +12507,57 @@ pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
         exchange.step_trace_position = Some(trace_position);
         exchange.step_effect_count = fbw_executed_effect_count();
         exchange.step_unjournaled = fbw_has_unjournaled_effect();
-        exchange.step_heap_cache = Some(heap_cache.clone());
+        exchange.step_heap_cache = (opname.starts_with("inline_call_")
+            || opname.starts_with("residual_call_"))
+        .then(|| heap_cache.clone());
     });
+}
+
+#[cfg(test)]
+mod subwalk_checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn only_calls_keep_a_heap_cache_replay_checkpoint() {
+        let mut exchange = SubWalkExchange::<crate::state::PyreSym> {
+            pending: None,
+            completed: None,
+            active_frame_id: 0,
+            next_frame_id: 1,
+            step_trace_position: None,
+            step_effect_count: 0,
+            step_unjournaled: false,
+            step_heap_cache: None,
+        };
+        let _driver = SubWalkDriverGuard::install(&mut exchange);
+        let position = majit_metainterp::recorder::TracePosition {
+            _pos: 0,
+            _count: 0,
+            _index: 0,
+            snapshot_data_len: 0,
+            snapshot_array_data_len: 0,
+            guard_count: Some(0),
+        };
+        let heap_cache = majit_metainterp::heapcache::HeapCache::new();
+        for (opname, keeps_checkpoint) in [
+            ("inline_call_r_r", true),
+            ("int_add", false),
+            ("residual_call_ir_i", true),
+            ("getfield_gc_r", false),
+            ("goto_if_not", false),
+            ("live", false),
+            ("inline_call_irf_v", true),
+            ("int_return", false),
+        ] {
+            note_subwalk_driver_step::<crate::state::PyreSym>(opname, position, &heap_cache);
+            assert_eq!(
+                exchange.step_heap_cache.is_some(),
+                keeps_checkpoint,
+                "{opname}"
+            );
+            assert_eq!(exchange.step_trace_position, Some(position));
+        }
+    }
 }
 
 /// Seed a callee jitcode's register banks with positional args and walk

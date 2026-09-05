@@ -3530,6 +3530,11 @@ pub fn step<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
+    inline_call::note_subwalk_driver_step::<Sym>(
+        op.opname,
+        ctx.trace_ctx.get_trace_position(),
+        ctx.trace_ctx.heap_cache(),
+    );
     // The walker mixes translated vable operations (which update the shadow)
     // with concrete interpreter steps (which update the heap PyFrame).  Pull
     // those concrete writes into `virtualizable_boxes` before any handler can
@@ -3636,10 +3641,6 @@ pub fn walk<Sym: WalkSym>(
             let callee = fbw_state::fbw_innermost_inline_callee_key(ctx);
             return Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee));
         }
-        inline_call::note_subwalk_driver_step::<Sym>(
-            ctx.trace_ctx.get_trace_position(),
-            ctx.trace_ctx.heap_cache(),
-        );
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => stepped,
             // Not an abort: a nested inline_call asked the heap-owned
