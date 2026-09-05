@@ -4058,8 +4058,32 @@ mod tests {
 
     #[test]
     fn explicit_sum_inheritance_rejects_a_registered_lookalike() {
-        static REGISTRY: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        let _registry = REGISTRY.lock();
+        // This fixture replaces the process-global type registry. A mutex
+        // local to this test cannot protect other optimizer tests reading it:
+        // clearing the table between their identity lookups made a genuine
+        // Option shell intermittently fail slot_holds_field. Keep the global
+        // owner (descr.py::GcCache's STRUCT identity) and isolate the fixture,
+        // rather than making production identity thread-local for tests.
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var_os("MAJIT_TEST_SHELL_REGISTRY_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "optimizeopt::virtualize::tests::explicit_sum_inheritance_rejects_a_registered_lookalike",
+                    "--nocapture",
+                ])
+                .env("MAJIT_TEST_SHELL_REGISTRY_CHILD", "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("the isolated registry fixture runs");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated registry fixture failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let core_some = majit_ir::descr::StructId::from_canonical("core::option::Option::Some");
         let user_some =
             majit_ir::descr::StructId::from_canonical("user_crate::option::Option::Some");
