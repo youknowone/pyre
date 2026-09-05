@@ -1,5 +1,5 @@
-# Builtin getattr of a method stays residual. Folding it into a virtual
-# Method lets pickle's REDUCE store that Method on the unpickler stack.
+# pyre-check: gate=1
+# A bound method may escape its trace through pickle's REDUCE stack.
 import pickle
 
 

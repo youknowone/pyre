@@ -697,6 +697,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // guard resume at the loop header instead of the guard's own
             // opcode, re-running loop iterations and corrupting the result.
             // Mirror of `MIFrame::publish_last_instr_to_vable`.
+            let mut async_force_vable_boxes = None;
             if sym.owns_virtualizable_shadow() {
                 let last_instr_value = py_pc as i64 - 1;
                 let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
@@ -706,6 +707,25 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     last_instr_op,
                     Value::Int(last_instr_value),
                 );
+                // `ResumeGuardForcedDescr.handle_async_forcing` consumes the
+                // virtualizable section WHILE the residual is running. Its
+                // result belongs to the MIFrame's post-call registers, but
+                // the interpreter has not pushed it yet. Preserve the stack
+                // before the post-call depth/operand overlay below, otherwise
+                // forcing reads an unwritten result home as a GC Ref.
+                // Do publish last_instr first: the walker does not maintain
+                // that scalar at each opcode, and callers inspecting this
+                // frame must see the current call, not the last merge point.
+                let guard_opcode = match scope.guard_stamp {
+                    GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
+                    GuardStampTarget::GuardFromEnd(from_end) => {
+                        ctx.trace_ctx.guard_op_opcode_from_end(from_end)
+                    }
+                };
+                if matches!(guard_opcode, Some(OpCode::GuardNotForced)) {
+                    async_force_vable_boxes =
+                        Some(ctx.trace_ctx.build_snapshot_vable_vref_boxes().0);
+                }
                 // Publish `valuestackdepth` for THIS guard's resume
                 // coordinate the same way `last_instr` is published above.
                 // `sym.valuestackdepth` is NOT usable: the walker never
@@ -1192,6 +1212,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 ctx.trace_ctx.set_virtualizable_box_at(idx, value);
             }
             let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+            let vable_boxes = async_force_vable_boxes.unwrap_or(vable_boxes);
             for (idx, old) in saved_shadow {
                 if let Some(old) = old {
                     ctx.trace_ctx.set_virtualizable_box_at(idx, old);
