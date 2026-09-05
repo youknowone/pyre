@@ -3046,6 +3046,7 @@ impl Assembler {
                 OpKind::ConstUInt(_) => "ConstUInt",
                 OpKind::ConstInt128(_) => "ConstInt128",
                 OpKind::ConstUInt128(_) => "ConstUInt128",
+                OpKind::ConstSingleFloat(_) => "ConstSingleFloat",
                 OpKind::ConstBool(_) => "ConstBool",
                 OpKind::ConstSymbolic { .. } => "ConstSymbolic",
                 OpKind::ConstFloat(_) => "ConstFloat",
@@ -3572,6 +3573,12 @@ fn value_type_to_kind(ty: &crate::model::ValueType) -> char {
         ValueType::Int128 | ValueType::UInt128 => {
             panic!("getkind: 128-bit integer type is too large (history.py:62)")
         }
+        ValueType::SingleFloat => panic!(
+            "getkind: SingleFloat is not supported (history.py:61) — majit is \
+             the `supports_singlefloats = False` CPU (backend/model.py:20), so \
+             the codewriter policy refuses a graph carrying one; reaching here \
+             means a carrier escaped `collect_declared_value_types`"
+        ),
     }
 }
 
@@ -3849,35 +3856,29 @@ impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for NoStruc
 /// Whether `owner` names one of the three enum variants `front/mir` gives an
 /// explicit `[tag@0 | payload@8]` shell to.
 ///
-/// `front/mir` admits every spelling from the bare `Result::Ok` up to the fully
-/// qualified `std::result::Result::Ok`, and `canonical_struct_name` keeps
-/// whichever the call site used, so this accepts each of them -- but as a
-/// *suffix of the whole path*, matched segment by segment against a `core` or
-/// `std` root.  A plain `ends_with` also admits a user enum declared at
-/// `mycrate::option::Option::Some`, which `front::option_ctor` never gives a
-/// shell to; its payload would then be described at offset 8 behind an injected
-/// discriminant rather than at its registered native layout.  Anchoring at the
-/// root rejects that while keeping every real spelling, the same reason
-/// [`crate::front::option_ctor::option_variant_ctor_tag`] anchors its own head.
+/// `front/mir` admits aliases from the bare `Result::Ok` up to the fully
+/// qualified standard-library spelling. The spelling alone is insufficient:
+/// a crate root named `option` can define `option::Option::Some` too. Resolve
+/// the candidate and the fully-qualified `core`/`std` anchors through the
+/// StructId registry and require their defining identities to agree.
 ///
 /// A lone leaf (`Ok`) is not enough: the shortest form `front/mir` produces
 /// names the enum as well as the variant.
 fn is_explicit_shell_variant_owner(owner: &str) -> bool {
-    const SHELLED: [&[&str]; 6] = [
-        &["core", "result", "Result", "Ok"],
-        &["std", "result", "Result", "Ok"],
-        &["core", "result", "Result", "Err"],
-        &["std", "result", "Result", "Err"],
-        &["core", "option", "Option", "Some"],
-        &["std", "option", "Option", "Some"],
+    const SHELLED: [&str; 6] = [
+        "core::result::Result::Ok",
+        "std::result::Result::Ok",
+        "core::result::Result::Err",
+        "std::result::Result::Err",
+        "core::option::Option::Some",
+        "std::option::Option::Some",
     ];
-    let segments: Vec<&str> = owner.split("::").collect();
-    if segments.len() < 2 {
+    let Some(owner_id) = majit_ir::descr::struct_template_id_for_name(owner) else {
         return false;
-    }
+    };
     SHELLED
-        .iter()
-        .any(|path| segments.len() <= path.len() && segments == path[path.len() - segments.len()..])
+        .into_iter()
+        .any(|anchor| majit_ir::descr::struct_template_id_for_name(anchor) == Some(owner_id))
 }
 
 pub(crate) fn bh_size_spec_from_callcontrol(
@@ -3986,6 +3987,31 @@ pub(crate) fn bh_size_spec_from_callcontrol(
             field.index_in_parent = index;
         }
     }
+    // `rclass.py InstanceRepr._setup_repr` seats a sum-type variant subclass's
+    // own fields after the base's, and pyre registers that base carrying the
+    // enum's synthetic `__discriminant` row alone (`front/mir.rs`).
+    // `Rvalue::Discriminant`
+    // reads the tag through the base identity while the allocation is the
+    // variant, and `PtrInfo` indexes a virtual's fields by `index_in_parent`,
+    // so a variant list without the inherited row gives the tag and the first
+    // payload slot 0 alike: the payload store replaces the tag, and every
+    // later read of either resolves to a slot holding the other.  The explicit
+    // shell reconstructs that row above; a native enum's variant inherits the
+    // same row, at the tag's own recorded offset and width rather than the
+    // shell's word, and keeps it first the way the walk that counts through
+    // the embedded base does.
+    if !result_variant
+        && !all_fielddescrs
+            .iter()
+            .any(|field| field.field_key() == "__discriminant")
+        && let Some(tag) = inherited_enum_tag_spec(cc, template_owner)
+    {
+        for (index, field) in all_fielddescrs.iter_mut().enumerate() {
+            field.index = (index + 1) as u32;
+            field.index_in_parent = index + 1;
+        }
+        all_fielddescrs.insert(0, tag);
+    }
     let violating_fields = all_fielddescrs
         .iter()
         .filter(|field| field.offset + field.field_size > size)
@@ -4055,6 +4081,53 @@ pub(crate) fn bh_size_spec_from_callcontrol(
         vtable: 0,
         all_fielddescrs,
     })
+}
+
+/// The enum base's `__discriminant` row that `variant_owner` inherits, or
+/// `None` when `variant_owner` does not name a variant of a tag-carrying enum.
+///
+/// The evidence is the `__discriminant`-only base registration `front/mir.rs`
+/// writes for every payload enum whose tag width Charon spelled -- a plain
+/// struct whose path merely contains `::` registers its own rows under that
+/// key and fails the shape test, and an enum whose tag width was recorded but
+/// is unspellable registers no base at all, which is the state that wants a
+/// declining read rather than a reconstructed slot.
+///
+/// The row is named under the *variant*, the way the explicit shell's own tag
+/// row is: it is the variant's slot 0, and what identifies it as the base's
+/// field is the inheritance edge the read side resolves. Charon can spell the
+/// variant with a crate prefix or only the enum leaf while the discriminant
+/// read uses the crate-stripped canonical base. Rebuild the variant owner from
+/// that leaf's registered origin so both spell the same inheritance edge.
+fn inherited_enum_tag_spec(
+    cc: &CallControl,
+    variant_owner: &str,
+) -> Option<crate::jitcode::BhFieldSpec> {
+    let (base_owner, variant) = variant_owner.rsplit_once("::")?;
+    let entries = cc.struct_field_entries(base_owner)?;
+    if entries.len() != 1 || entries[0].0 != "__discriminant" {
+        return None;
+    }
+    let tag = bh_all_field_specs_for_struct(cc, base_owner)
+        .into_iter()
+        .find(|spec| spec.field_key() == "__discriminant")?;
+    let base_leaf = base_owner.rsplit("::").next().unwrap_or(base_owner);
+    let canonical_variant_owner = format!(
+        "{}::{variant}",
+        majit_ir::descr::canonical_struct_name(base_leaf)
+    );
+    Some(bh_field_spec_from_parts(
+        0,
+        &canonical_variant_owner,
+        "__discriminant",
+        tag.offset,
+        tag.field_size,
+        tag.field_type,
+        tag.field_flag,
+        tag.is_immutable,
+        tag.is_quasi_immutable,
+        0,
+    ))
 }
 
 fn bh_all_field_specs_for_struct(
@@ -5020,6 +5093,12 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::ConstInt(_) | OpKind::ConstUInt(_) => "int_copy".into(),
         OpKind::ConstInt128(_) | OpKind::ConstUInt128(_) => {
             panic!("getkind: 128-bit integer constant is too large (history.py:62)")
+        }
+        OpKind::ConstSingleFloat(_) => {
+            panic!(
+                "getkind: SingleFloat constant is not supported (history.py:61) — \
+                 the codewriter policy refuses a graph carrying one"
+            )
         }
         // RPython folds `lltype.Bool` into kind `'int'`
         // (`flatten.py:getkind`), so the bool constant materialises
@@ -5992,6 +6071,46 @@ mod tests {
 
     use crate::test_support::register_struct_ids_serialized;
 
+    fn standard_shell_struct_ids() -> HashMap<String, Option<majit_ir::descr::StructId>> {
+        let option_some = majit_ir::descr::StructId::from_canonical("core::option::Option::Some");
+        let result_ok = majit_ir::descr::StructId::from_canonical("core::result::Result::Ok");
+        let result_err = majit_ir::descr::StructId::from_canonical("core::result::Result::Err");
+        let mut ids = HashMap::new();
+        for name in [
+            "Option::Some",
+            "option::Option::Some",
+            "std::option::Option::Some",
+            "core::option::Option::Some",
+        ] {
+            ids.insert(name.to_string(), Some(option_some));
+        }
+        for (identity, names) in [
+            (
+                result_ok,
+                [
+                    "Result::Ok",
+                    "result::Result::Ok",
+                    "std::result::Result::Ok",
+                    "core::result::Result::Ok",
+                ],
+            ),
+            (
+                result_err,
+                [
+                    "Result::Err",
+                    "result::Result::Err",
+                    "std::result::Result::Err",
+                    "core::result::Result::Err",
+                ],
+            ),
+        ] {
+            for name in names {
+                ids.insert(name.to_string(), Some(identity));
+            }
+        }
+        ids
+    }
+
     #[test]
     fn fielddescrof_resolves_the_slot_when_the_offset_comes_from_the_layout_registry() {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
@@ -6188,6 +6307,7 @@ mod tests {
     fn explicit_result_variant_size_inherits_discriminant_slot() {
         use crate::call::CallControl;
 
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
         let mut cc = CallControl::new();
         let mut struct_fields = crate::front::StructFieldRegistry::default();
         struct_fields.fields.insert(
@@ -6211,6 +6331,7 @@ mod tests {
     fn instantiated_result_payload_follows_template_discriminant_slot() {
         use crate::call::CallControl;
 
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
         let owner = "core::result::Result<*mut PyObject,PyError>::Ok";
         let mut cc = CallControl::new();
         let mut struct_fields = crate::front::StructFieldRegistry::default();
@@ -6251,10 +6372,7 @@ mod tests {
         let template_name = "core::option::Option::Some";
         let template_id = majit_ir::descr::StructId::from_canonical(template_name);
         let concrete_id = template_id.instantiate("<i64>");
-        let _registry = register_struct_ids_serialized(HashMap::from([(
-            template_name.to_string(),
-            Some(template_id),
-        )]));
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
         let mut cc = CallControl::new();
         let mut struct_fields = crate::front::StructFieldRegistry::default();
         struct_fields.fields.insert(
@@ -6269,6 +6387,52 @@ mod tests {
         assert_eq!(spec.all_fielddescrs.len(), 2);
     }
 
+    #[test]
+    fn native_enum_variant_inherited_tag_uses_the_canonical_base_path() {
+        use crate::call::CallControl;
+
+        let _registry = crate::test_support::register_struct_registries_serialized(
+            HashMap::new(),
+            HashMap::from([
+                ("BinOperand".to_string(), "grain::bytecode::op".to_string()),
+                ("Union".to_string(), "types::dynamic".to_string()),
+            ]),
+        );
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        for (base, variant) in [
+            (
+                "rhai::grain::bytecode::op::BinOperand",
+                "rhai::grain::bytecode::op::BinOperand::Local",
+            ),
+            ("Union", "Union::Int"),
+        ] {
+            struct_fields.fields.insert(
+                base.to_string(),
+                vec![("__discriminant".to_string(), "u8".to_string())],
+            );
+            struct_fields.fields.insert(
+                variant.to_string(),
+                vec![("__pos_0".to_string(), "i64".to_string())],
+            );
+        }
+        cc.set_struct_fields(struct_fields);
+
+        let bin_operand =
+            bh_size_spec_from_callcontrol(&cc, "rhai::grain::bytecode::op::BinOperand::Local")
+                .expect("BinOperand variant size");
+        assert_eq!(
+            bin_operand.all_fielddescrs[0].name,
+            "grain::bytecode::op::BinOperand::Local.__discriminant"
+        );
+
+        let union = bh_size_spec_from_callcontrol(&cc, "Union::Int").expect("Union variant size");
+        assert_eq!(
+            union.all_fielddescrs[0].name,
+            "types::dynamic::Union::Int.__discriminant"
+        );
+    }
+
     /// A user enum whose path merely ends in `option::Option::Some` gets no
     /// shell: `front::option_ctor` never writes a tag for it, so its payload
     /// stays where its own registered layout puts it.
@@ -6276,11 +6440,19 @@ mod tests {
     fn a_lookalike_variant_owner_keeps_its_native_layout() {
         use crate::call::CallControl;
 
-        let owner = "mycrate::option::Option<*mut PyObject>::Some";
+        let owner = "option::Option<*mut PyObject>::Some";
+        let mut ids = standard_shell_struct_ids();
+        ids.insert(
+            "option::Option::Some".to_string(),
+            Some(majit_ir::descr::StructId::from_canonical(
+                "user_crate::option::Option::Some",
+            )),
+        );
+        let _registry = register_struct_ids_serialized(ids);
         let mut cc = CallControl::new();
         let mut struct_fields = crate::front::StructFieldRegistry::default();
         struct_fields.fields.insert(
-            "mycrate::option::Option::Some".to_string(),
+            "option::Option::Some".to_string(),
             vec![("__pos_0".to_string(), "*mut PyObject".to_string())],
         );
         cc.set_struct_fields(struct_fields);
@@ -6299,6 +6471,7 @@ mod tests {
     /// pins the same list on the producer side.
     #[test]
     fn the_shelled_variant_owners_are_every_rooted_spelling() {
+        let _registry = register_struct_ids_serialized(standard_shell_struct_ids());
         for owner in [
             "Result::Ok",
             "result::Result::Ok",
@@ -6325,6 +6498,22 @@ mod tests {
         ] {
             assert!(!is_explicit_shell_variant_owner(owner), "{owner}");
         }
+    }
+
+    #[test]
+    fn a_short_standard_library_lookalike_is_not_a_shell_by_spelling() {
+        let mut ids = standard_shell_struct_ids();
+        ids.insert(
+            "option::Option::Some".to_string(),
+            Some(majit_ir::descr::StructId::from_canonical(
+                "user_crate::option::Option::Some",
+            )),
+        );
+        let _registry = register_struct_ids_serialized(ids);
+        assert!(!is_explicit_shell_variant_owner("option::Option::Some"));
+        assert!(is_explicit_shell_variant_owner(
+            "core::option::Option::Some"
+        ));
     }
 
     #[test]

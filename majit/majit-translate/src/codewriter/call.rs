@@ -8133,6 +8133,11 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::Unknown => majit_ir::value::Type::Ref,
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
+                            crate::model::ValueType::SingleFloat => panic!(
+                                "getkind: SingleFloat is not supported \
+                                 (history.py:61) — the codewriter policy \
+                                 refuses a graph carrying one"
+                            ),
                             crate::model::ValueType::Int128 | crate::model::ValueType::UInt128 => {
                                 panic!(
                                     "getkind: 128-bit array item type is too large \
@@ -8186,6 +8191,11 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::Unknown => majit_ir::value::Type::Ref,
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
+                            crate::model::ValueType::SingleFloat => panic!(
+                                "getkind: SingleFloat is not supported \
+                                 (history.py:61) — the codewriter policy \
+                                 refuses a graph carrying one"
+                            ),
                             crate::model::ValueType::Int128 | crate::model::ValueType::UInt128 => {
                                 panic!(
                                     "getkind: 128-bit array item type is too large \
@@ -8994,6 +9004,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
+        | OpKind::ConstSingleFloat(_)
         | OpKind::ConstStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
@@ -9149,6 +9160,7 @@ fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
         ValueType::Unknown => 5,
         ValueType::Int128 => 6,
         ValueType::UInt128 => 7,
+        ValueType::SingleFloat => 8,
     }
 }
 

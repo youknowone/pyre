@@ -267,6 +267,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::ConstInt(_) => ValueType::Int,
         OpKind::ConstUInt(_) => ValueType::Unsigned,
         OpKind::ConstInt128(_) => ValueType::Int128,
+        OpKind::ConstSingleFloat(_) => ValueType::SingleFloat,
         OpKind::ConstUInt128(_) => ValueType::UInt128,
         OpKind::ConstBool(_) => ValueType::Bool,
         // `_we_are_jitted` symbolic carries its own concretetype

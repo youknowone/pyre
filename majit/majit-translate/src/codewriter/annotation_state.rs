@@ -46,6 +46,13 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
         // codewriter / regalloc share register classes via Int|Unsigned
         // arms downstream.
         ValueType::Int => Some(SomeValue::Integer(SomeInteger::default())),
+        // `SomeSingleFloat`, agreeing with the bookkeeper, which already
+        // shells a Rust `f32` field this way (`bookkeeper.rs`'s `"f32"`
+        // arm).  Shelling it as `SomeInteger` made the two disagree
+        // about the same type.
+        ValueType::SingleFloat => Some(SomeValue::SingleFloat(
+            crate::annotator::model::SomeSingleFloat::new(),
+        )),
         ValueType::Unsigned => Some(SomeValue::Integer(SomeInteger::new(false, true))),
         ValueType::Int128 => Some(SomeValue::Integer(SomeInteger::new_with_knowntype(
             false,
@@ -152,9 +159,11 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         },
         SomeValue::Bool(_) => ValueType::Bool,
         SomeValue::Float(_) | SomeValue::LongFloat(_) => ValueType::Float,
-        // `getkind(SingleFloat) == 'int'` (history.py): singlefloats
-        // are stored in an int register, not the float bank.
-        SomeValue::SingleFloat(_) => ValueType::Int,
+        // Preserve the annotation-level type across fixpoint rounds.  The
+        // later codewriter kind projection banks SingleFloat as an integer;
+        // collapsing it here would instead union Int with SingleFloat on the
+        // next annotator pass and erase the binding as Unknown.
+        SomeValue::SingleFloat(_) => ValueType::SingleFloat,
         SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref(None),
         // Keep the `StringBuilder` shell distinct across the roundtrip so
         // the rtyper picks `StringBuilderRepr` rather than the generic
@@ -207,6 +216,14 @@ mod tests {
             "StringBuilder must project to SomeStringBuilder, got {shell:?}"
         );
         assert_eq!(somevalue_to_valuetype(&shell), ValueType::StringBuilder);
+    }
+
+    #[test]
+    fn singlefloat_roundtrips_through_shell() {
+        let shell = valuetype_to_someshell(&ValueType::SingleFloat)
+            .expect("SingleFloat projects to an annotation shell");
+        assert!(matches!(shell, SomeValue::SingleFloat(_)));
+        assert_eq!(somevalue_to_valuetype(&shell), ValueType::SingleFloat);
     }
 
     #[test]

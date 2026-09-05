@@ -1,9 +1,10 @@
-//! `usize::checked_{add,mul}()` → native unsigned-overflow ops + a
+//! `usize::checked_{add,sub,mul}()` → native unsigned-overflow ops + a
 //! virtualized `Option`.
 //!
 //! ## Positioning
 //!
-//! `core::num::<Impl>::checked_add` / `checked_mul` on **unsigned** operands
+//! `core::num::<Impl>::checked_add` / `checked_sub` / `checked_mul` on
+//! **unsigned** operands
 //! are Opaque core bodies (Charon cannot extract `core`), so the caller
 //! carries a residual `checked_*` call the rtyper census cannot type.
 //! [`crate::front::checked_arith`] lowers the **signed** match-shape into a
@@ -16,6 +17,8 @@
 //!     product is non-zero: `uint_mul_high(x, y) != 0`.
 //!   - `checked_add(x, y)` overflows iff the sum wrapped below an addend
 //!     (carry): `uint_lt(x + y, x)`.
+//!   - `checked_sub(x, y)` underflows iff the subtrahend is above the
+//!     minuend (borrow): `uint_lt(x, y)`.
 //!
 //! ## The rewrite (`rewire_one_checked_arith_uint_site`)
 //!
@@ -26,6 +29,8 @@
 //!     `disc = eq(hi, 0)`, value = `lo`.
 //!   - `checked_add`: `sum = add(x, y)`, `ovf = uint_lt(sum, x)`,
 //!     `disc = eq(ovf, 0)`, value = `sum`.
+//!   - `checked_sub`: `diff = sub(x, y)`, `ovf = uint_lt(x, y)`,
+//!     `disc = eq(ovf, 0)`, value = `diff`.
 //!   - `opt = Some/None` aggregate with `__discriminant = disc` (dynamic,
 //!     `1` = `Some` when no overflow, `0` = `None` on overflow) and
 //!     `__pos_0 = value`.
@@ -37,7 +42,7 @@
 //!
 //! It is **fail-safe**: any structural mismatch returns `Err`, the caller
 //! leaves the residual call untouched, and the census Skip / legacy-walker
-//! fallback is unchanged.  Gating (an unsigned `checked_{add,mul}` producer
+//! fallback is unchanged.  Gating (an unsigned `checked_{add,sub,mul}` producer
 //! still present as its `Call`) is applied both at the recording site (only
 //! unsigned operands are recorded) and here (the producer must still be the
 //! `Call`, so a site [`crate::front::checked_arith`] already rewrote is
@@ -47,7 +52,7 @@ use crate::flowspace::model::Variable;
 use crate::front::bool_then::emit_option_variant_dynamic;
 use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
 
-/// A recorded unsigned `checked_{add,mul}` call whose result is an
+/// A recorded unsigned `checked_{add,sub,mul}` call whose result is an
 /// `Option<T>`, captured during body lowering with the `Option`/`Some` owners
 /// and payload type resolved from the destination type.
 #[derive(Clone)]
@@ -64,7 +69,7 @@ pub(crate) struct CheckedArithUintSite {
     pub payload_ty: ValueType,
 }
 
-/// Rewrite every recorded unsigned `checked_{add,mul}` site into the native
+/// Rewrite every recorded unsigned `checked_{add,sub,mul}` site into the native
 /// overflow-test + virtualized `Option` shape.  Returns the number of sites
 /// rewritten; declined sites keep their residual call (census Skip).
 pub(crate) fn rewire_checked_arith_uint_sites(
@@ -90,13 +95,11 @@ pub(crate) fn rewire_checked_arith_uint_sites(
     rewritten
 }
 
-/// The unsigned `checked_*` operators this pass lowers.  `checked_sub` is
-/// intentionally absent: unsigned subtraction underflow is a `uint_lt(x, y)`
-/// guard, but no census site spells it in the `?`-shape, so it stays a
-/// residual.
+/// The unsigned `checked_*` operators this pass lowers.
 #[derive(Clone, Copy)]
 enum UintArith {
     Add,
+    Sub,
     Mul,
 }
 
@@ -104,6 +107,7 @@ impl UintArith {
     fn from_leaf(leaf: &str) -> Option<Self> {
         match leaf {
             "checked_add" => Some(UintArith::Add),
+            "checked_sub" => Some(UintArith::Sub),
             "checked_mul" => Some(UintArith::Mul),
             _ => None,
         }
@@ -129,7 +133,8 @@ fn rewire_one_checked_arith_uint_site(
         })
         .ok_or_else(|| format!("{name}: checked_* result var has no producer block"))?;
 
-    // The call must still be A's last op (a `[..]::checked_add/checked_mul`
+    // The call must still be A's last op (a
+    // `[..]::checked_add/checked_sub/checked_mul`
     // 2-arg FunctionPath call); a site `checked_arith`'s first pass already
     // rewrote is now a `*_ovf` BinOp producer — skip it.  The overflow op is
     // resolved here (before any mutation) so an unsupported leaf declines
@@ -198,6 +203,22 @@ fn rewire_one_checked_arith_uint_site(
             let ovf = push_binop(graph, a_id, "uint_lt", sum.clone(), lhs, ValueType::Int);
             let disc = push_no_overflow_disc(graph, a_id, ovf);
             (sum, disc)
+        }
+        UintArith::Sub => {
+            let diff = push_binop(
+                graph,
+                a_id,
+                "sub",
+                lhs.clone(),
+                rhs.clone(),
+                ValueType::Unsigned,
+            );
+            // Unsigned borrow: the subtrahend is strictly above the minuend.
+            // The difference is emitted either way and read only when the
+            // discriminant says `Some`, as the wrapped sum above is.
+            let ovf = push_binop(graph, a_id, "uint_lt", lhs, rhs, ValueType::Int);
+            let disc = push_no_overflow_disc(graph, a_id, ovf);
+            (diff, disc)
         }
     };
 
@@ -278,6 +299,22 @@ mod tests {
             some_owner: "core::option::Option::Some".to_string(),
             payload_ty: ValueType::Unsigned,
         }
+    }
+
+    /// The two operands [`build_checked_site`] fed the `checked_*` call.
+    ///
+    /// Matched by their literal values rather than by position: the rewrite
+    /// appends a `0` of its own for the discriminant test, so a positional
+    /// read would pick that up once the pass has run.
+    fn const_operand_vars(graph: &FunctionGraph, a: usize) -> (Variable, Variable) {
+        let mut operands = graph.blocks[a]
+            .operations
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::ConstInt(3) | OpKind::ConstInt(8)))
+            .filter_map(|op| op.result.clone());
+        let x = operands.next().expect("the first operand");
+        let y = operands.next().expect("the second operand");
+        (x, y)
     }
 
     /// The op names / owners the virtualized `Option` tail carries, in order.
@@ -374,6 +411,32 @@ mod tests {
         assert_eq!(rewritten, 1, "the unsigned checked_add site must rewrite");
         // Carry test: `add` (wrapping sum) + `uint_lt(sum, x)` + `eq`.
         assert_eq!(tail_binops(&g, a), vec!["add", "uint_lt", "eq"]);
+    }
+
+    #[test]
+    fn checked_sub_lowers_to_uint_lt_borrow_test() {
+        let (mut g, opt, a) = build_checked_site("checked_sub");
+        let rewritten = rewire_checked_arith_uint_sites(&mut g, &[site_for(&opt)]);
+        assert_eq!(rewritten, 1, "the unsigned checked_sub site must rewrite");
+        // Borrow test: `sub` (wrapping difference) + `uint_lt(x, y)` + `eq`.
+        assert_eq!(tail_binops(&g, a), vec!["sub", "uint_lt", "eq"]);
+
+        // Which operand order makes the test a borrow is the whole of this
+        // arm's correctness: `x < y` underflows, while the carry arm's
+        // `sum < x` is a different question about different values. Reversed,
+        // the tag would answer `Some` on exactly the inputs that underflow.
+        let (x, y) = const_operand_vars(&g, a);
+        let borrow = g.blocks[a]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::BinOp {
+                    op: name, lhs, rhs, ..
+                } if name == "uint_lt" => Some((lhs.clone(), rhs.clone())),
+                _ => None,
+            })
+            .expect("the borrow test must be present");
+        assert_eq!(borrow, (x, y));
     }
 
     #[test]

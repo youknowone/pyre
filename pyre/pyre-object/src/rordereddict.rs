@@ -409,12 +409,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         let mask = self.indexes.len() - 1;
         let mut i = (hash as usize) & mask;
         let mut perturb = hash;
-        let mut probes = 0;
         while self.indexes[i] != FREE {
             i = Self::probe_next(i, perturb, mask);
             perturb >>= PERTURB_SHIFT;
-            probes += 1;
-            debug_assert!(probes <= self.indexes.len(), "no FREE slot to insert into");
         }
         self.indexes[i] = slot + VALID_OFFSET;
     }
@@ -553,11 +550,16 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         // `if len(d.entries) == d.num_ever_used_items: ll_dict_grow(d)` — the
         // entries array is full, and `ll_dict_grow` (755) compacts instead of
         // growing when over half of it is dead.
-        if self.entries.len() == self.entries.capacity()
-            && self.num_live_items < self.entries.len() / 2
-        {
-            self.remove_deleted_items();
-            reindexed = true;
+        if self.entries.len() == self.entries.capacity() {
+            if self.num_live_items < self.entries.len() / 2 {
+                self.remove_deleted_items();
+                reindexed = true;
+            } else {
+                // `ll_dict_grow` prepares the entries array before the index
+                // is published. Reserve here so the final push cannot allocate.
+                self.entries.reserve(1);
+                self.generation = self.generation.wrapping_add(1);
+            }
         }
         let mut rc = self.resize_counter - 3;
         if rc <= 0 {
@@ -565,7 +567,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             reindexed = true;
             rc = self.resize_counter - 3;
         }
-        // A reindex rebuilt the whole table, so the probe's slot names nothing.
+        // `_ll_dict_setitem_lookup_done`: after growth/resize, publish the
+        // index and then initialize the preallocated entry, with no allocation
+        // between them. Only a reindex invalidates the original probe's slot.
         match index_slot.filter(|_| !reindexed) {
             Some(index_slot) => self.indexes[index_slot] = self.next_slot() + VALID_OFFSET,
             None => {
@@ -574,20 +578,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             }
         }
         self.resize_counter = rc;
-        // `ll_dict_grow` replaces `d.entries` outright when the array is full,
-        // so a growth here is the same event `entries != d.entries` reports.
-        //
-        // !! Read the *capacity*, not the data pointer: a `Vec` growth goes
-        // through `realloc`, and an allocator that extends the block in place
-        // hands back the address it already had — measured, this passed on
-        // dynasm and cranelift and left wasm answering a mutating `__eq__`
-        // without its restart.  Capacity changes on every growth whatever the
-        // allocator does.
-        let entries_capacity = self.entries.capacity();
         self.entries.push(Some(Entry { hash, key, value }));
-        if self.entries.capacity() != entries_capacity {
-            self.generation = self.generation.wrapping_add(1);
-        }
         self.num_live_items += 1;
     }
 
@@ -598,15 +589,13 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         let target = slot as u32 + VALID_OFFSET;
         let mut i = (hash as usize) & mask;
         let mut perturb = hash;
-        let mut probes = 0;
         while self.indexes[i] != target {
+            // `ll_dict_delete_by_entry_index` checks for FREE, not a probe
+            // count: the perturb prefix may revisit slots before becoming a
+            // full-period walk, so a valid search can exceed indexes.len().
+            debug_assert_ne!(self.indexes[i], FREE, "no index slot names entry {slot}");
             i = Self::probe_next(i, perturb, mask);
             perturb >>= PERTURB_SHIFT;
-            probes += 1;
-            debug_assert!(
-                probes <= self.indexes.len(),
-                "no index slot names entry {slot}"
-            );
         }
         self.indexes[i] = DELETED;
     }
@@ -818,6 +807,33 @@ impl<K, V, S> IntoIterator for RDict<K, V, S> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn perturb_probes_can_revisit_slots_before_covering_the_table() {
+        #[derive(Default)]
+        struct CollisionHasher;
+        impl Hasher for CollisionHasher {
+            fn finish(&self) -> u64 {
+                0x3a18_dd5a_e3c4_5eb9
+            }
+            fn write(&mut self, _: &[u8]) {}
+        }
+        let mut d: RDict<u64, u64, std::hash::BuildHasherDefault<CollisionHasher>> = RDict::new();
+        for key in 0..10 {
+            d.insert(key, key);
+        }
+        assert_eq!(d.indexes.len(), 16);
+        check_invariants(&d);
+        // The tenth distinct slot is reached after 20 probes, despite the
+        // index table having only 16 slots. The perturb prefix revisits slots.
+        assert_eq!(d.remove(&9), Some(9));
+        d.reindex(16);
+        check_invariants(&d);
+        for key in 0..9 {
+            assert_eq!(d.remove(&key), Some(key));
+        }
+        check_invariants(&d);
+    }
+
     // ---- a reference model: insertion-ordered Vec + linear lookup ----
     #[derive(Default)]
     struct Model {
@@ -931,6 +947,24 @@ mod tests {
         check_invariants(&d);
         let got: Vec<u64> = d.keys().copied().collect();
         assert_eq!(got, (0..100).filter(|i| i % 2 == 1).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn insert_after_reindex_still_names_the_new_slot() {
+        let mut d: RDict<u64, u64> = RDict::new();
+        for i in 0..32 {
+            d.insert(i, i);
+        }
+        for i in 0..24 {
+            d.remove(&i);
+        }
+        for i in 100..116 {
+            d.insert(i, i);
+        }
+        check_invariants(&d);
+        assert_eq!(d.get(&115), Some(&115));
+        assert_eq!(d.remove(&115), Some(115));
+        check_invariants(&d);
     }
 
     #[test]

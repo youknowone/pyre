@@ -32,6 +32,21 @@ pub enum ValueType {
     /// `rbuiltin.py:178-189` / `rbuiltin.py:220-225` /
     /// `rarithmetic.py:600`.
     Unsigned,
+    /// RPython `lltype.SingleFloat` — `rffi.r_singlefloat`, a Rust `f32`.
+    ///
+    /// Distinct from both [`ValueType::Int`] and [`ValueType::Float`].
+    /// `history.getkind` banks it as `'int'` ("singlefloats are stored in
+    /// an int") but only when the CPU supports singlefloats; the base
+    /// backend does not (`backend/model.py:20`), and RPython gives it no
+    /// arithmetic at all — `rffi` converts through `cast_singlefloat_to_float`
+    /// before computing and back afterwards, so the rtyper never emits a
+    /// float-kind operation over a SingleFloat operand.
+    ///
+    /// It is spelled here so the codewriter policy can refuse a graph that
+    /// carries one, rather than collapsing into `Int` and letting Rust's
+    /// native `f32` arithmetic lower to an integer operation over the
+    /// float's bit pattern.
+    SingleFloat,
     /// RPython `r_longlonglong` / `lltype.SignedLongLongLong`.
     ///
     /// This is a translation-level 128-bit primitive used by
@@ -772,6 +787,19 @@ pub enum OpKind {
     /// existing `constants_f` pool with a `float_copy` op, mirroring
     /// the `ConstInt` → `int_copy` lowering.
     ConstFloat(u64),
+    /// RPython `flowmodel.py:Constant(value)` whose `concretetype` is
+    /// `lltype.SingleFloat` — a Rust `f32` literal.  Stored as the f32
+    /// bit pattern, which is what distinguishes it from [`OpKind::ConstFloat`]:
+    /// a Charon float constant records its width (`{"Float": {"value":
+    /// "...", "ty": "F32"}}`), and parsing both widths into an f64 bit
+    /// pattern is what erased it.
+    ///
+    /// It carries no [`ValueType`] field, for the same reason
+    /// [`OpKind::ConstInt128`] carries none: the width is in the variant
+    /// name.  The codewriter policy reaches it the way `policy.py:96-98`
+    /// reaches upstream's `Constant(value, SingleFloat)` through
+    /// `op.args`, and refuses the graph.
+    ConstSingleFloat(u32),
     /// RPython `flowmodel.py:Constant(str_value)` after
     /// `StringRepr.convert_const` resolves the host string to a
     /// prebuilt `Ptr(STR)`. The pre-jtransform string-constant fold

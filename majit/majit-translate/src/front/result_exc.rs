@@ -438,13 +438,26 @@ pub(crate) fn lower_result_exc_returns(
     // is the same here — this only records the reason before it is
     // discarded, so the refusal stays countable.
     let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns, spec);
-    if let Err(msg) = &outcome {
-        crate::decline::record_reason(
+    match &outcome {
+        Err(msg) => crate::decline::record_reason(
             RESULT_EXC_CALLEE_GATE,
             "callee-declined-to-residual",
             msg,
             &graph.name,
-        );
+        ),
+        // An accept that rewrote nothing is the third outcome, and the one a
+        // decline census cannot show: the callee keeps returning its shell
+        // while `rewire_result_exc_call_sites` has already rewired its call
+        // sites to the unwrapped value, so the two halves of the one decision
+        // disagree without either half saying so.
+        Ok(0) => crate::decline::observe_accept(
+            RESULT_EXC_CALLEE_GATE,
+            "callee-accepted-without-rewriting",
+            &graph.name,
+        ),
+        Ok(_) => {
+            crate::decline::observe_accept(RESULT_EXC_CALLEE_GATE, "callee-rewritten", &graph.name);
+        }
     }
     outcome
 }
@@ -502,6 +515,7 @@ fn lower_result_exc_returns_inner(
         // returns a payload-carrying Result (unit payloads would lower
         // with no FieldWrite and need a Void widening).
         let mut fieldwrite_idx: Option<(usize, Variable)> = None;
+        let mut discriminant_write_idx: Option<usize> = None;
         for (i, op) in graph.blocks[bi]
             .operations
             .iter()
@@ -513,10 +527,30 @@ fn lower_result_exc_returns_inner(
             } = &op.kind
                 && *base == ctor_var
             {
+                if field.name == "__discriminant" {
+                    if discriminant_write_idx.is_some() {
+                        return Err(format!(
+                            "{}: block {bi} Result ctor has two __discriminant writes",
+                            graph.name
+                        ));
+                    }
+                    let expected = i64::from(is_err);
+                    if link_arg_const_int_in_block(graph, bi, value) != Some(expected) {
+                        return Err(format!(
+                            "{}: block {bi} Result {} ctor has a non-matching \
+                             __discriminant write (expected {expected})",
+                            graph.name,
+                            if is_err { "Err" } else { "Ok" },
+                        ));
+                    }
+                    discriminant_write_idx = Some(i);
+                    continue;
+                }
                 if field.name != "__pos_0" || fieldwrite_idx.is_some() {
                     return Err(format!(
                         "{}: block {bi} Result ctor with unexpected FieldWrite \
-                         {} — only a single __pos_0 payload is supported",
+                         {} — only __discriminant and a single __pos_0 payload \
+                         are supported",
                         graph.name, field.name
                     ));
                 }
@@ -556,7 +590,8 @@ fn lower_result_exc_returns_inner(
         // the `Err` rewrite discards the exit wholesale (`set_raise_values`
         // → `set_goto`), so multiple forwarding slots lower soundly.
         let consumers = count_var_uses(graph, &ctor_var);
-        let well_formed_return = consumers.op_uses == 1 && consumers.link_uses >= 1;
+        let expected_op_uses = 1 + usize::from(discriminant_write_idx.is_some());
+        let well_formed_return = consumers.op_uses == expected_op_uses && consumers.link_uses >= 1;
         // The shell must flow out through this block's single
         // unconditional exit.  A conditional exit is acceptable only when
         // the ctor is a consumed intermediate, not a return value: the
@@ -600,6 +635,19 @@ fn lower_result_exc_returns_inner(
                     graph.name
                 ));
             }
+            crate::decline::record_reason(
+                RESULT_EXC_CALLEE_GATE,
+                "site-skipped-consumed-intermediate",
+                &format!(
+                    "{}: block {bi} conditional {} shell left materialised \
+                     (op_uses={}, link_uses={})",
+                    graph.name,
+                    if is_err { "Err" } else { "Ok" },
+                    consumers.op_uses,
+                    consumers.link_uses,
+                ),
+                &graph.name,
+            );
             continue;
         }
         // A ctor is one of this graph's return values only if its value
@@ -668,15 +716,41 @@ fn lower_result_exc_returns_inner(
                     graph.name
                 ));
             }
+            crate::decline::record_reason(
+                RESULT_EXC_CALLEE_GATE,
+                "site-skipped-consumed-intermediate",
+                &format!(
+                    "{}: block {bi} {} shell left materialised (op_uses={}, \
+                     link_uses={}{})",
+                    graph.name,
+                    if is_err { "Err" } else { "Ok" },
+                    consumers.op_uses,
+                    consumers.link_uses,
+                    forward_err
+                        .as_deref()
+                        .map(|e| format!("; {e}"))
+                        .unwrap_or_default(),
+                ),
+                &graph.name,
+            );
             continue;
         }
 
-        // Drop the ctor + FieldWrite (higher index first).
+        // Drop the ctor + payload and optional static discriminant writes
+        // (higher index first).  A dead `ConstInt` producer for the tag is
+        // removed by the ordinary dead-op sweep.
         {
             let ops = &mut graph.blocks[bi].operations;
             debug_assert!(fw_idx > ctor_idx);
-            ops.remove(fw_idx);
-            ops.remove(ctor_idx);
+            let mut remove = vec![ctor_idx, fw_idx];
+            if let Some(disc_idx) = discriminant_write_idx {
+                remove.push(disc_idx);
+            }
+            remove.sort_unstable();
+            remove.dedup();
+            for idx in remove.into_iter().rev() {
+                ops.remove(idx);
+            }
         }
         if is_err {
             // `return Err(e)` → materialise the runtime exception
@@ -742,7 +816,7 @@ fn lower_result_exc_returns_inner(
 /// allocation/rooting implementation out of the caller JitCode.  A consumer
 /// whose carrier already is the exception value declares no helper and gets
 /// the identity path.
-fn materialize_error_to_exc_object(
+pub(crate) fn materialize_error_to_exc_object(
     graph: &mut FunctionGraph,
     block: BlockId,
     payload: Variable,
@@ -791,6 +865,26 @@ struct UseCounts {
     link_uses: usize,
 }
 
+/// Resolve the literal tag written beside a statically selected `Result`
+/// variant.  `front::mir` and the combinator adapters both materialise the
+/// discriminant in the constructor block, while later widening may inline it
+/// into the `FieldWrite` as a flowspace constant.
+fn link_arg_const_int_in_block(graph: &FunctionGraph, block: usize, arg: &LinkArg) -> Option<i64> {
+    match arg {
+        LinkArg::Const(c) => match &c.value {
+            crate::flowspace::model::ConstValue::Int(value) => Some(*value),
+            _ => None,
+        },
+        LinkArg::Value(var) => graph.blocks[block].operations.iter().find_map(|op| {
+            (op.result.as_ref() == Some(var)).then_some(match &op.kind {
+                OpKind::ConstInt(value) => Some(*value),
+                OpKind::ConstUInt(value) => i64::try_from(*value).ok(),
+                _ => None,
+            })?
+        }),
+    }
+}
+
 /// Count uses of `var` as an op operand and as a link arg across the
 /// whole graph (producer `op.result` slots are not uses).
 fn count_var_uses(graph: &FunctionGraph, var: &Variable) -> UseCounts {
@@ -834,6 +928,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::ConstInt(_)
         | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
+        | OpKind::ConstSingleFloat(_)
         | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
@@ -3662,6 +3757,92 @@ fn message_is_str_literal(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod static_result_shell_tests {
+    use super::*;
+    use crate::model::SpaceOperation;
+
+    fn ok_shell_with_tag(tag: i64) -> (FunctionGraph, Variable, Variable) {
+        let mut graph = FunctionGraph::new("static_result_shell");
+        let entry = graph.startblock;
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(41), true)
+            .expect("payload");
+        let shell = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<i64,E>".into()],
+                        "Ok",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::result::Result<i64,E>::Ok".into())),
+                },
+                true,
+            )
+            .expect("shell");
+        let disc = graph
+            .push_op_var(entry, OpKind::ConstInt(tag), true)
+            .expect("tag");
+        for (name, owner, value) in [
+            ("__discriminant", "core::result::Result<i64,E>", disc),
+            (
+                "__pos_0",
+                "core::result::Result<i64,E>::Ok",
+                payload.clone(),
+            ),
+        ] {
+            graph.block_mut(entry).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: shell.clone(),
+                    field: crate::model::FieldDescriptor {
+                        name: name.into(),
+                        owner_root: Some(owner.into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                    },
+                    value: LinkArg::Value(value),
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        let returnblock = graph.returnblock;
+        graph.set_goto(entry, returnblock, vec![shell.clone()]);
+        (graph, shell, payload)
+    }
+
+    #[test]
+    fn static_ok_tag_write_is_removed_with_the_result_shell() {
+        let (mut graph, shell, payload) = ok_shell_with_tag(0);
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+                .expect("matching static tag lowers"),
+            1
+        );
+        assert!(graph.blocks.iter().flat_map(|b| &b.operations).all(|op| {
+            !matches!(&op.kind, OpKind::FieldWrite { base, .. } if *base == shell)
+                && !matches!(&op.kind, OpKind::Call { target, .. } if result_ctor_kind(target).is_some())
+        }));
+        assert!(
+            graph.blocks[graph.startblock.0].exits[0]
+                .args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(value) if *value == payload))
+        );
+    }
+
+    #[test]
+    fn static_ok_with_err_tag_is_rejected() {
+        let (mut graph, _, _) = ok_shell_with_tag(1);
+        let err = lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
+            .expect_err("mismatched variant tag must fail closed");
+        assert!(err.contains("non-matching __discriminant write"));
+    }
 }
 
 #[cfg(test)]

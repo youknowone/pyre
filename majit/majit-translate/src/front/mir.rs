@@ -1479,7 +1479,8 @@ fn tuple_field_value_type(type_name: &str) -> ValueType {
         // kind rather than collapsing into `Int` like the word-sized integers.
         "i128" => ValueType::Int128,
         "u128" => ValueType::UInt128,
-        "bool" | "char" | "f32" | "i8" | "i16" | "i32" | "i64" | "isize" => ValueType::Int,
+        "f32" => ValueType::SingleFloat,
+        "bool" | "char" | "i8" | "i16" | "i32" | "i64" | "isize" => ValueType::Int,
         // A `u*` element shells to an unsigned `SomeInteger`
         // (`valuetype_to_someshell(Unsigned)`), so an `r_uint` tuple element
         // reconciles with the FORCE_ATTRIBUTES seed instead of walling
@@ -2533,8 +2534,19 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     let result_exc_ok_is_unit = result_exc_callee
         && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
+        if let Some(site) = lo
+            .result_map_err_sites
+            .iter()
+            .find(|site| !site.closure_env_is_trivially_dropless)
+        {
+            return Err(LowerError::Unsupported(format!(
+                "{}: Result::map_err closure {} captures values, but the Ok-arm destructor glue is not lowered",
+                lo.graph.name, site.call_once_owner
+            )));
+        }
         if !lo.result_exc_call_results.is_empty()
             || !lo.option_ok_or_else_try_sites.is_empty()
+            || !lo.result_map_err_sites.is_empty()
             || result_exc_callee
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
@@ -2592,6 +2604,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 static_addrs.error_carrier,
             )
         };
+        let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
+            &mut lo.graph,
+            &lo.result_map_err_sites,
+            static_addrs.error_carrier,
+        );
         if result_exc_callee {
             crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
@@ -2669,7 +2686,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // actual rewrite detaches the discriminant switch's block, so the
         // unreachable-block sweep is gated on that count.
         let checked_arith_rewritten = if lo.checked_arith_call_results.is_empty() {
-            0
+            crate::front::checked_arith::CheckedArithRewriteCount::default()
         } else {
             crate::front::checked_arith::rewire_checked_arith_call_sites(
                 &mut lo.graph,
@@ -2693,6 +2710,29 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.checked_arith_uint_sites,
             )
         };
+        // `rewire_checked_arith_ok_or_else` rebuilds `Result::Ok(sum)` /
+        // `Result::Err(closure())` shells on the two edges it fuses, and it
+        // runs after the callee rule above.  A scoped callee whose return WAS
+        // that `checked_*(..).ok_or_else(..)` pair therefore had nothing for
+        // the callee rule to rewrite when it ran, and carries the fold's fresh
+        // shells into its returnblock afterwards — while
+        // `rewire_result_exc_call_sites` has already rewired this callee's
+        // call sites to receive the unwrapped value.  Lower what the fold
+        // produced, so the two halves of the one decision agree again.
+        if result_exc_callee && checked_arith_rewritten.result_shells > 0 {
+            // This is a new validation pass over the shells the checked-arith
+            // rewrites just created.  Earlier tail-forwards and rewritten
+            // returns cannot certify these new returns: if none of them has a
+            // supported shape, the callee must decline instead of exposing a
+            // mixture of unwrapped values and Result shells to its callers.
+            crate::front::result_exc::lower_result_exc_returns(
+                &mut lo.graph,
+                0,
+                static_addrs.error_carrier,
+            )
+            .map_err(LowerError::Unsupported)?;
+            crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
+        }
         // The `Layout::from_size_align(..).ok()` rewrite
         // (`front::from_size_align`) collapses the `from_size_align` + `ok`
         // residual pair into a native `uint_lt` bound test + a virtualized
@@ -2906,8 +2946,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
             || option_ok_or_else_try_rewritten > 0
+            || result_map_err_rewritten > 0
             || next_rewritten > 0
-            || checked_arith_rewritten > 0
+            || checked_arith_rewritten.total > 0
             || checked_arith_uint_rewritten > 0
             || from_size_align_rewritten > 0
             || from_size_align_expect_rewritten > 0
@@ -3513,6 +3554,10 @@ struct Lowering<'a> {
     /// not itself a translated scoped callee, so its `Result` shell must be
     /// removed together with the Option select.
     option_ok_or_else_try_sites: Vec<crate::front::result_exc::OptionOkOrElseTrySite>,
+    /// `Result::map_err(result, closure)` sites lowered to an explicit
+    /// Ok/Err closure-select before the exception-link pass consumes the
+    /// newly built result shells.
+    result_map_err_sites: Vec<crate::front::result_map_err::ResultMapErrSite>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.  The paired [`ValueType`] is the
@@ -3869,6 +3914,7 @@ impl<'a> Lowering<'a> {
             string_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
             option_ok_or_else_try_sites: Vec::new(),
+            result_map_err_sites: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
             checked_arith_ok_or_else_sites: Vec::new(),
@@ -6372,6 +6418,7 @@ impl<'a> Lowering<'a> {
             DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
             DecodedConst::Bool(b) => OpKind::ConstBool(b),
             DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
+            DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
             // String / char / byte-string constants — no
             // ConstStr opkind exists; synthesise a 0-arg `Call` whose
             // path encodes the literal text so the IR stays stable.
@@ -8666,6 +8713,29 @@ impl<'a> Lowering<'a> {
                 // the conversion as identity too (Rust `String` and
                 // `&str` both lower to the immutable rpy_string), so
                 // it takes the same alias path.
+                // `core::mem::forget(x)` leaves nothing behind to record: it
+                // deliberately suppresses the destructor.  `core::mem::drop`
+                // is different — it must run destructor glue immediately —
+                // so it stays a residual call until Drop lowering preserves
+                // that observable effect.
+                //
+                // Its `FOREIGN_STDLIB_EXTERNALS` entry types the callsite
+                // but still leave a residual naming a `core` body the build
+                // has no address for, and one residual target a portal can
+                // reach whose address the build left unbound refuses every
+                // trace, arm taken or not.  Binding one instead is not open:
+                // the path key collapses every `T`, so a single address would
+                // serve monomorphisations that do not share a destructor.
+                if args.len() == 1 && self.is_mem_forget(&reg) {
+                    let void = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                    self.local_var[dest_local] = Some(void);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 if args.len() == 1
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
                         || self.is_reflexive_from(&reg)
@@ -11854,28 +11924,34 @@ impl<'a> Lowering<'a> {
         {
             self.checked_arith_ok_or_else_sites.push(site);
         }
-        // Capture UNSIGNED `usize::checked_{add,mul}()` results
+        // Capture UNSIGNED `usize::checked_{add,sub,mul}()` results
         // (`Option<usize>`) for the native-overflow rewiring pass
         // (`front::checked_arith_uint`).  Signed arithmetic stays on
         // `front::checked_arith` (→ `*_ovf` + OverflowError); unsigned has no
         // signed-overflow op, so it lowers to `uint_mul_high` / `uint_lt`
         // overflow tests + a virtualized `Option`.  The operand-signedness
         // gate lives here because the operand types are only in hand at the
-        // call site; `checked_sub` is excluded (no `?`-shape census site).
+        // call site.
+        //
+        // Either operand answers for both: these are
+        // `fn(self, rhs: Self) -> Option<Self>`, so the two are one type.  A
+        // literal operand carries no `Place` to read a type from, which is
+        // what `n.checked_sub(1)` spells, so demanding that both resolve would
+        // leave the constant-operand form on the residual path for want of a
+        // type the callee's signature already fixes.
         if let OpKind::Call { target, .. } = &op_kind
             && let CallTarget::FunctionPath { segments } = target
             && matches!(
                 segments.last().map(String::as_str),
-                Some("checked_add" | "checked_mul")
+                Some("checked_add" | "checked_sub" | "checked_mul")
             )
             && crate::front::checked_arith::is_checked_arith_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
-            && first_arg_ty
+            && let Some(operand_atom) = first_arg_ty
                 .as_ref()
-                .is_some_and(|t| tyref_to_value_type(t, self.llbc) == ValueType::Unsigned)
-            && second_arg_ty
-                .as_ref()
-                .is_some_and(|t| tyref_to_value_type(t, self.llbc) == ValueType::Unsigned)
+                .or(second_arg_ty.as_ref())
+                .and_then(|t| self.tyref_literal_uint_atom(t))
+            && checked_arith_uint_atom_is_word_sized(operand_atom)
             && let Some(site) = self.recognize_checked_arith_uint_site(&call.dest.ty, &result_var)
         {
             self.checked_arith_uint_sites.push(site);
@@ -12235,6 +12311,29 @@ impl<'a> Lowering<'a> {
                 self.recognize_is_none_site(first_arg_ty.as_ref(), &result_var, name == "is_some")
         {
             self.is_none_sites.push(site);
+        }
+        // `Result::map_err(result, closure)` is a foreign core combinator.
+        // Record the concrete receiver/result instantiations while their MIR
+        // types are available; the post-pass restores the ordinary Ok/Err
+        // diamond before exceptiontransform-style Result lowering runs.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && name == "map_err"
+            && callee_name_path
+                .as_deref()
+                .is_some_and(is_core_result_map_err_path)
+            && let Some(site) = self.recognize_result_map_err_site(
+                first_arg_ty.as_ref(),
+                second_arg_ty.as_ref(),
+                &call.dest.ty,
+                &result_var,
+            )
+        {
+            self.result_map_err_sites.push(site);
         }
         // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, closure)` sites
         // for the discriminant closure-select `front::option_closure_select`
@@ -13899,6 +13998,19 @@ impl<'a> Lowering<'a> {
     /// returns its argument unchanged and `core` has no graph body for it
     /// (an unregistered callee), so the callsite aliases its argument
     /// instead of calling the missing identity body.
+    /// `core::mem::forget(value)` deliberately suppresses destructor glue.
+    /// `core::mem::drop(value)` is not included: erasing that call would erase
+    /// an observable destructor, so it remains residual until Drop lowering
+    /// can preserve the effect.
+    fn is_mem_forget(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::mem::forget")
+    }
+
     fn is_hint_must_use(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -15455,6 +15567,127 @@ impl<'a> Lowering<'a> {
             payload_ty,
             error_ty,
             niche: self.tyref_is_niche_option_ptr(recv_ty),
+        })
+    }
+
+    /// Resolve `Result<T, E>::map_err(result, closure) -> Result<T, F>` into
+    /// the owners and payload types needed by `front::result_map_err`.
+    fn recognize_result_map_err_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        env_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::result_map_err::ResultMapErrSite> {
+        let recv_ty = recv_ty?;
+        let recv_ok = crate::front::result_exc::tyref_result_ok(recv_ty, self.llbc)?;
+        let recv_err = crate::front::result_exc::tyref_result_err(recv_ty, self.llbc)?;
+        let dest_ok = crate::front::result_exc::tyref_result_ok(dest_ty, self.llbc)?;
+        let dest_err = crate::front::result_exc::tyref_result_err(dest_ty, self.llbc)?;
+
+        let recv_decl = self.llbc.type_by_id(self.tyref_adt_def_id(recv_ty)?)?;
+        let dest_decl = self.llbc.type_by_id(self.tyref_adt_def_id(dest_ty)?)?;
+        let receiver_owner = format!(
+            "{}{}",
+            recv_decl.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+        );
+        let result_owner = format!(
+            "{}{}",
+            dest_decl.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let receiver_ok_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 0)?;
+        let receiver_err_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 1)?;
+        let result_ok_owner = Self::tagged_pair_payload_owner(dest_decl, &result_owner, 0)?;
+        let result_err_owner = Self::tagged_pair_payload_owner(dest_decl, &result_owner, 1)?;
+        let env_decl = self.llbc.type_by_id(self.tyref_ref_adt_def_id(env_ty?)?)?;
+        let closure_env_is_trivially_dropless = self.type_decl_is_trivially_dropless(env_decl, 0);
+
+        Some(crate::front::result_map_err::ResultMapErrSite {
+            result_var: result_var.clone(),
+            receiver_owner,
+            receiver_ok_owner,
+            receiver_err_owner,
+            result_owner,
+            result_ok_owner,
+            result_err_owner,
+            call_once_owner: env_decl.item_meta.name_path(),
+            ok_ty: tyref_enum_payload_value_type(&recv_ok, self.llbc),
+            ok_class_root: enum_payload_instance_class_root(&dest_ok, self.llbc),
+            err_ty: tyref_enum_payload_value_type(&recv_err, self.llbc),
+            err_class_root: enum_payload_instance_class_root(&recv_err, self.llbc),
+            mapped_err_ty: tyref_enum_payload_value_type(&dest_err, self.llbc),
+            mapped_err_class_root: enum_payload_instance_class_root(&dest_err, self.llbc),
+            args_tuple_suffix: payload_tuple_suffix(&recv_err, self.llbc),
+            closure_env_is_trivially_dropless,
+        })
+    }
+
+    /// Conservative `needs_drop::<ClosureEnv>() == false` projection for the
+    /// compiler-generated closure types consumed by `Result::map_err`.
+    fn type_decl_is_trivially_dropless(&self, decl: &TypeDecl, depth: usize) -> bool {
+        if depth > 16 || self.type_decl_has_explicit_drop(decl.def_id) {
+            return false;
+        }
+        match &decl.kind {
+            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields
+                .iter()
+                .all(|field| self.tyref_is_trivially_dropless(&field.ty, depth + 1)),
+            TypeDeclKind::Enum(variants) => variants.iter().all(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .all(|field| self.tyref_is_trivially_dropless(&field.ty, depth + 1))
+            }),
+            TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => false,
+        }
+    }
+
+    fn tyref_is_trivially_dropless(&self, ty: &TyRef, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let Some(node) = tyref_node(ty, self.llbc) else {
+            return false;
+        };
+        if node.get("Literal").is_some()
+            || node.get("Ref").is_some()
+            || node.get("RawPtr").is_some()
+            || node.get("FnDef").is_some()
+            || node.get("FnPtr").is_some()
+        {
+            return true;
+        }
+        let Some(def_id) = strip_ty_wrappers(node, self.llbc).and_then(adt_node_def_id) else {
+            return false;
+        };
+        self.llbc
+            .type_by_id(def_id)
+            .is_some_and(|decl| self.type_decl_is_trivially_dropless(decl, depth + 1))
+    }
+
+    fn type_decl_has_explicit_drop(&self, def_id: u64) -> bool {
+        self.llbc.trait_impls_raw().iter().any(|impl_row| {
+            let Some(impl_trait) = impl_row.get("impl_trait") else {
+                return false;
+            };
+            let owner = impl_trait
+                .get("generics")
+                .and_then(|generics| generics.get("types"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|types| types.first())
+                .and_then(|owner| resolve_tyexpr_to_adt_def_id_free(self.llbc, owner));
+            if owner != Some(def_id) {
+                return false;
+            }
+            // Missing trait metadata cannot prove this capture dropless.
+            // Keep the call residual until its destructor contract is known.
+            impl_trait
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|trait_id| self.llbc.trait_by_id(trait_id))
+                .is_none_or(|decl| decl.item_meta.name_path() == "core::ops::drop::Drop")
         })
     }
 
@@ -17805,6 +18038,14 @@ impl<'a> Lowering<'a> {
             self.block_entry_positional_aggregate_locals[target_bb].remove(&local_idx);
         }
     }
+}
+
+/// The unsigned checked-arithmetic pass uses one machine-word operation and
+/// its carry/borrow test.  Charon's flattened [`ValueType::Unsigned`] erases
+/// the source width, so retain the literal atom at the capture gate: a narrow
+/// `u8`/`u16`/`u32` overflow is not necessarily a word overflow.
+fn checked_arith_uint_atom_is_word_sized(atom: &str) -> bool {
+    matches!(atom, "U64") || (atom == "Usize" && crate::layout::target_word_size() == 8)
 }
 
 /// Which PBC family an `OpKind::IndirectCall` through a bare function
@@ -20669,6 +20910,11 @@ fn value_type_bank(ty: &ValueType) -> u8 {
         ValueType::Unknown => 5,
         ValueType::Int128 => 6,
         ValueType::UInt128 => 7,
+        // Its own bank, not the integer one `getkind` would give it: a
+        // same-bank pair is aliased without an op, and an `f32` that
+        // aliased an `i64` is what let Rust's native `f32` arithmetic
+        // lower to integer arithmetic over the float's bit pattern.
+        ValueType::SingleFloat => 8,
     }
 }
 
@@ -20906,11 +21152,13 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
                 return ValueType::Bool;
             }
             if let Some(f) = lit_obj.get("Float").and_then(serde_json::Value::as_str) {
-                // `getkind(SingleFloat) == 'int'` (history.py): single
-                // floats live in the int register bank; only `f64`
-                // (`lltype.Float`) keeps the float kind.
+                // A singlefloat is neither `Int` nor `Float`: `getkind`
+                // banks it as `'int'`, but only where the CPU supports
+                // singlefloats, and RPython gives it no arithmetic to
+                // bank in the first place.  Spelling it apart is what
+                // lets the codewriter policy refuse the graph.
                 return if f == "F32" {
-                    ValueType::Int
+                    ValueType::SingleFloat
                 } else {
                     ValueType::Float
                 };
@@ -21445,6 +21693,7 @@ fn dont_look_inside_return_token(
         ValueType::Int128 => "i128",
         ValueType::UInt128 => "u128",
         ValueType::Float => "f64",
+        ValueType::SingleFloat => "f32",
         // A `*mut PyObject` result keeps its typed `OBJECTPTR` lowering, so a
         // caller reading the returned object's fields rtypes against the real
         // struct; the generic `GCREF` `ref` token would erase that and stub
@@ -21579,10 +21828,10 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
                 return ValueType::Bool;
             }
             if let Some(f) = lit_obj.get("Float").and_then(serde_json::Value::as_str) {
-                // `getkind(SingleFloat) == 'int'`: single floats are
-                // int-banked; only `f64` keeps the float kind.
+                // See [`tyref_to_value_type`]: a singlefloat is spelled
+                // apart from both banks so the policy can refuse it.
                 return if f == "F32" {
-                    ValueType::Int
+                    ValueType::SingleFloat
                 } else {
                     ValueType::Float
                 };
@@ -23868,6 +24117,44 @@ fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: &Llbc) -> String {
     tyref_tuple_suffix(&TyRef::Other(wrapper), llbc)
 }
 
+/// The closure-argument tuple spelling for an already projected enum payload.
+/// Both the synthesized writer and Charon's closure `call_once` reader use
+/// `tyref_tuple_suffix`, so reference erasure and generic rendering stay
+/// identical on the two sides.
+fn payload_tuple_suffix(payload: &TyRef, llbc: &Llbc) -> String {
+    let node = match payload {
+        TyRef::Inline { value: (_, value) } | TyRef::Other(value) => value.clone(),
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(value) => value.clone(),
+            None => return String::new(),
+        },
+    };
+    let wrapper = serde_json::json!({
+        "Adt": {
+            "id": "Tuple",
+            "generics": { "types": [node] }
+        }
+    });
+    tyref_tuple_suffix(&TyRef::Other(wrapper), llbc)
+}
+
+/// Preserve a reference payload's concrete class across a synthesized enum
+/// and closure-tuple field write.  RPython derives the field repr from that
+/// class annotation (`rclass.py:InstanceRepr._setup_repr`); the register-bank
+/// [`ValueType`] alone cannot distinguish two reference classes.
+fn enum_payload_instance_class_root(payload: &TyRef, llbc: &Llbc) -> Option<String> {
+    let payload = strip_ty_indirections(tyref_node(payload, llbc)?, llbc)?;
+    if let Some(root) = raw_ptr_pointee_class_root(payload, llbc) {
+        return Some(root);
+    }
+    if let Some(root) = adt_node_class_root(payload, llbc) {
+        return Some(root);
+    }
+    let pointee = payload.as_object()?.get("Ref")?.as_array()?.get(1)?;
+    let pointee = strip_ty_wrappers(pointee, llbc)?;
+    raw_ptr_pointee_class_root(pointee, llbc).or_else(|| adt_node_class_root(pointee, llbc))
+}
+
 /// A type-argument drives a per-instantiation variant-class split unless
 /// it is in the deferred-or-degenerate set below.  A split mints a
 /// distinct `<…>`-suffixed variant classdef (`Result<bool>::Ok` vs
@@ -24546,6 +24833,10 @@ enum DecodedConst {
     UInt128(u128),
     Bool(bool),
     Float(u64),
+    /// An `f32` literal, as its f32 bit pattern.  Charon records the
+    /// width on the constant (`{"Float": {"value": "...", "ty": "F32"}}`),
+    /// and parsing both widths into an f64 bit pattern is what erased it.
+    SingleFloat(u32),
     /// String / char / byte-string literals. The IR has no dedicated
     /// string constant opkind; the codewriter treats these as opaque
     /// pointer-typed values. We carry the textual representation as a
@@ -24562,6 +24853,8 @@ enum DecodedConst {
 #[derive(Clone, Copy)]
 enum ConstLit {
     Int(i64),
+    /// See [`DecodedConst::SingleFloat`].
+    SingleFloat(u32),
     /// Unsigned integer bits.  Keeping this distinct is required while
     /// evaluating const initializers: `(1_u64 << 63) - 1` cannot be
     /// evaluated correctly after prematurely reinterpreting the first
@@ -24721,13 +25014,21 @@ fn decode_const_lit(value: &serde_json::Value) -> Option<ConstLit> {
     if let Some(value) = literal.get("Bool").and_then(serde_json::Value::as_bool) {
         return Some(ConstLit::Bool(value));
     }
-    if let Some(value) = literal
-        .get("Float")
-        .and_then(|float| float.get("value"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(|text| text.parse::<f64>().ok())
+    if let Some(float) = literal.get("Float")
+        && let Some(value) = float
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| text.parse::<f64>().ok())
     {
-        return Some(ConstLit::Float(value.to_bits()));
+        // See [`decode_literal_constant`]: the width rides beside the
+        // value, and an `f32` keeps its own carrier.
+        return Some(
+            if float.get("ty").and_then(serde_json::Value::as_str) == Some("F32") {
+                ConstLit::SingleFloat((value as f32).to_bits())
+            } else {
+                ConstLit::Float(value.to_bits())
+            },
+        );
     }
     None
 }
@@ -24803,6 +25104,7 @@ fn const_lit_to_op(value: ConstLit) -> Option<OpKind> {
         ConstLit::UInt(n) => Some(OpKind::ConstUInt(n)),
         ConstLit::Bool(b) => Some(OpKind::ConstBool(b)),
         ConstLit::Float(bits) => Some(OpKind::ConstFloat(bits)),
+        ConstLit::SingleFloat(bits) => Some(OpKind::ConstSingleFloat(bits)),
         ConstLit::Checked(..) | ConstLit::CheckedUInt(..) => None,
     }
 }
@@ -25228,13 +25530,19 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
         return Ok(DecodedConst::Bool(b));
     }
     if let Some(f) = lit_obj.get("Float") {
-        if let Some(s) = f
-            .as_object()
-            .and_then(|m| m.get("value"))
-            .and_then(Value::as_str)
+        if let Some(obj) = f.as_object()
+            && let Some(s) = obj.get("value").and_then(Value::as_str)
             && let Ok(v) = s.parse::<f64>()
         {
-            return Ok(DecodedConst::Float(v.to_bits()));
+            // The width is carried beside the value, and an `f32` keeps
+            // its own carrier: narrowing to `f32` here is the conversion
+            // rustc already applied to the literal, and the f64 bit
+            // pattern of the same number is a different value.
+            return Ok(if obj.get("ty").and_then(Value::as_str) == Some("F32") {
+                DecodedConst::SingleFloat((v as f32).to_bits())
+            } else {
+                DecodedConst::Float(v.to_bits())
+            });
         }
         return Err(LowerError::Schema(format!("Float shape: {f}")));
     }
@@ -25717,6 +26025,18 @@ fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
             .iter()
             .zip(tail)
             .all(|(s, t)| s.as_str() == *t)
+}
+
+/// `core::result::<Impl>::map_err` / `std::result::Result::map_err`.
+///
+/// The leaf name `map_err` is not enough: an extension trait can publish
+/// the same method on `Result` and Charon still emits `CallTarget::Method`.
+/// Gate on the resolved callee path so a foreign `map_err` stays residual.
+fn is_core_result_map_err_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core" | "std", "result", "<Impl>" | "Result", "map_err"]
+    )
 }
 
 /// `<[T]>::to_vec` — Rust MIR `alloc::slice::<Impl>::to_vec`, a slice→owned-Vec
@@ -27927,12 +28247,46 @@ mod tests {
     use super::{
         DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
         cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
-        decode_literal, fn_ptr_family_for, json_ty_is_thin_pointer_element,
+        checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
+        is_core_result_map_err_path, json_ty_is_thin_pointer_element,
         json_ty_scalar_element_spelling, push_ptr_to_unsigned_cast, shaped_array_parts,
         simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr, tyref_to_value_type,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
+
+    #[test]
+    fn map_err_capture_requires_the_core_result_callee() {
+        for path in [
+            "core::result::<Impl>::map_err",
+            "std::result::<Impl>::map_err",
+            "core::result::Result::map_err",
+            "std::result::Result::map_err",
+        ] {
+            assert!(is_core_result_map_err_path(path), "{path}");
+        }
+        for path in [
+            "map_err",
+            "Result::map_err",
+            "mycrate::result::<Impl>::map_err",
+            "core::result::ResultExt::<Impl>::map_err",
+            "foo::bar::map_err",
+        ] {
+            assert!(!is_core_result_map_err_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn checked_unsigned_capture_rejects_narrow_integer_atoms() {
+        for atom in ["U8", "U16", "U32", "U128"] {
+            assert!(!checked_arith_uint_atom_is_word_sized(atom));
+        }
+        assert!(checked_arith_uint_atom_is_word_sized("U64"));
+        assert_eq!(
+            checked_arith_uint_atom_is_word_sized("Usize"),
+            crate::layout::target_word_size() == 8
+        );
+    }
 
     #[test]
     fn numeric_bank_crossing_casts_preserve_the_builtin_owner() {
@@ -31200,6 +31554,67 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    #[test]
+    fn map_err_drop_detection_requires_resolved_trait_metadata() {
+        use super::{Lowering, Unstructured};
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span.clone(), "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        for (trait_name, dropless) in [(Some("Drop"), false), (None, false), (Some("Copy"), true)] {
+            let traits = trait_name
+                .map(|name| {
+                    vec![serde_json::json!({
+                        "def_id": 0, "item_meta": meta(&["core", "ops", "drop", name])
+                    })]
+                })
+                .unwrap_or_default();
+            let file = serde_json::json!({
+                "charon_version": "0.1.201", "has_errors": false,
+                "translated": {
+                    "crate_name": "fixture",
+                    "type_decls": [{"def_id": 0, "item_meta": meta(&["fixture", "Capture"]), "kind": {"Struct": []}}],
+                    "fun_decls": [], "global_decls": [], "trait_decls": traits,
+                    "trait_impls": [{"impl_trait": {"id": 0, "generics": {"types": [
+                        {"HashConsedValue": [1, {"Adt": {"id": {"Adt": 0}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}}]}
+                    ]}}}]
+                }
+            });
+            let llbc = Llbc::from_slice(file.to_string().as_bytes()).unwrap();
+            let body: Unstructured = serde_json::from_value(serde_json::json!({
+                "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span.clone()
+            }))
+            .unwrap();
+            let dont_look_inside = std::collections::HashSet::new();
+            let lowering = Lowering::new(
+                &llbc,
+                "fixture".into(),
+                &body,
+                crate::HostStaticAddrs::default(),
+                &[],
+                None,
+                &dont_look_inside,
+            )
+            .unwrap();
+            assert_eq!(
+                lowering.type_decl_is_trivially_dropless(llbc.type_by_id(0).unwrap(), 0),
+                dropless,
+                "{trait_name:?}"
+            );
+            assert!(
+                !lowering.type_decl_has_explicit_drop(99),
+                "an unrelated owner must not be rejected"
+            );
+        }
     }
 
     #[test]

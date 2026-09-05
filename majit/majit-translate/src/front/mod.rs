@@ -86,6 +86,7 @@ pub(crate) mod range_contains;
 pub(crate) mod range_iter;
 pub(crate) mod rbigint_call;
 pub(crate) mod result_exc;
+pub(crate) mod result_map_err;
 pub(crate) mod rfloat_call;
 pub(crate) mod saturating_sub;
 pub mod semantic;

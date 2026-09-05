@@ -347,13 +347,27 @@ pub(crate) fn emit_option_variant(
     disc: i64,
     payload: Option<(&str, Variable, ValueType)>,
 ) -> Variable {
-    let res = graph.alloc_value_var();
     let variant = match disc {
         0 => "None",
         1 => "Some",
         other => panic!("emit_option_variant: Option discriminant must be 0 or 1, got {other}"),
     };
-    push_option_variant_ctor(graph, block, res.clone(), option_owner, variant);
+    emit_sum_variant(graph, block, option_owner, variant, disc, payload)
+}
+
+/// Build one statically selected two-variant enum shell.  This is the common
+/// aggregate shape used by `Option` and `Result`: a variant constructor, the
+/// enum-root discriminant row, and an optional variant-owned payload row.
+pub(crate) fn emit_sum_variant(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    enum_owner: &str,
+    variant: &str,
+    disc: i64,
+    payload: Option<(&str, Variable, ValueType)>,
+) -> Variable {
+    let res = graph.alloc_value_var();
+    push_option_variant_ctor(graph, block, res.clone(), enum_owner, variant);
     // `__discriminant` keys the enum root (tag offset 0 of every variant);
     // materialize the tag as a `ConstInt` value, matching the aggregate
     // path's `FieldWrite { value: Value(..) }` shape.
@@ -362,7 +376,7 @@ pub(crate) fn emit_option_variant(
         result: Some(disc_var.clone()),
         kind: OpKind::ConstInt(disc),
     });
-    write_option_fields(graph, block, &res, option_owner, disc_var, payload);
+    write_option_fields(graph, block, &res, enum_owner, disc_var, payload);
     res
 }
 

@@ -2725,60 +2725,169 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         name.strip_suffix(key)?.strip_suffix('.')
     }
 
+    /// The shelled sum `(enum, variant)` an owner spelling names, with its
+    /// qualification and its instantiation erased.  The variant is empty when
+    /// the spelling names the enum itself; `None` when the owner is not a
+    /// shelled sum at all.
+    ///
+    /// `front/mir` gives `Option::Some`, `Result::Ok` and `Result::Err` an
+    /// explicit `[tag@0 | payload@8]` shell, and admits every spelling from
+    /// the bare `Result::Ok` up to the fully qualified
+    /// `std::result::Result::Ok`.  The two producers of one shelled field
+    /// therefore reach here disagreeing on both halves of the spelling at
+    /// once: the allocation carries the instantiated owner
+    /// (`core::option::Option<Dynamic>::Some`) while the read carries the
+    /// erased template (`Option::Some`).  The shell's layout is the same for
+    /// every instantiation -- that is what makes it a shell -- so erasing the
+    /// argument list here loses nothing the field identity needs.
+    ///
+    /// The segments are matched as a suffix of a `core`/`std`-rooted path, so
+    /// a user enum declared at `mycrate::option::Option::Some` stays out:
+    /// `front::option_ctor` writes no tag for that one, so its payload sits at
+    /// its own registered layout rather than behind an injected discriminant.
+    /// `codewriter/assembler.rs is_explicit_shell_variant_owner` anchors the
+    /// producer side the same way and for the same reason, and likewise takes
+    /// a lone leaf (`Ok`) as too little evidence.
+    fn shelled_sum_owner(owner: &str) -> Option<(&'static str, &'static str)> {
+        const SHELLED: [&[&str]; 6] = [
+            &["core", "result", "Result", "Ok"],
+            &["std", "result", "Result", "Ok"],
+            &["core", "result", "Result", "Err"],
+            &["std", "result", "Result", "Err"],
+            &["core", "option", "Option", "Some"],
+            &["std", "option", "Option", "Some"],
+        ];
+        let owner = majit_ir::descr::strip_generic_args(owner);
+        let segments: Vec<&str> = owner.split("::").collect();
+        if segments.len() < 2 {
+            return None;
+        }
+        for path in SHELLED {
+            if segments.len() <= path.len() && segments == path[path.len() - segments.len()..] {
+                return Some((path[path.len() - 2], path[path.len() - 1]));
+            }
+            let enum_path = &path[..path.len() - 1];
+            if segments.len() <= enum_path.len()
+                && segments == enum_path[enum_path.len() - segments.len()..]
+            {
+                return Some((path[path.len() - 2], ""));
+            }
+        }
+        None
+    }
+
     // `heaptracker.all_fielddescrs(gccache, STRUCT)` walks an embedded base
     // before the subclass's own fields.  Consequently a subclass SizeDescr
     // legitimately contains the base's FieldDescr at the same slot even
     // though their parent STRUCT keys differ (`rclass.InstanceRepr._setup_repr`
     // creates exactly this `super` edge).  Pyre's explicit Result/Option shell
-    // serializes the flattened row under the variant parent, so recover that
-    // one proven inheritance edge from the qualified owners.  Do not accept a
-    // same-name/same-offset field from an arbitrary different struct.
-    fn explicit_sum_inherits(slot_owner: &str, field_owner: &str) -> bool {
-        fn same_owner(left: &str, right: &str) -> bool {
-            let left = majit_ir::descr::strip_generic_args(left);
-            let right = majit_ir::descr::strip_generic_args(right);
-            // The translated explicit sum shell is deliberately accepted
-            // under both the full standard-library spelling and Charon's
-            // crate-stripped spelling (`core::option::Option` /
-            // `option::Option`, likewise `Result`).  The translator-side
-            // StructId registry proves those aliases while building the
-            // JitCode, but that build-only registry is not serialized into
-            // the generated runtime.  Recover only these two already-gated
-            // shell identities here; a general suffix comparison would merge
-            // an unrelated `mycrate::option::Option` and violate
-            // `descr.py`'s `(STRUCT, fieldname)` identity.
-            fn explicit_sum_template(name: &str) -> Option<&'static str> {
-                let segments: Vec<&str> = name.split("::").collect();
-                match segments.as_slice() {
-                    ["option", "Option"] | ["core" | "std", "option", "Option"] => Some("Option"),
-                    ["result", "Result"] | ["core" | "std", "result", "Result"] => Some("Result"),
-                    _ => None,
-                }
-            }
-            if let (Some(left), Some(right)) = (
-                explicit_sum_template(left.as_ref()),
-                explicit_sum_template(right.as_ref()),
-            ) {
-                return left == right;
-            }
-            match (
-                majit_ir::descr::struct_template_id_for_name(left.as_ref()),
-                majit_ir::descr::struct_template_id_for_name(right.as_ref()),
-            ) {
-                (Some(left), Some(right)) => left == right,
-                _ => {
-                    majit_ir::descr::canonical_struct_name(left.as_ref())
-                        == majit_ir::descr::canonical_struct_name(right.as_ref())
-                }
-            }
-        }
-
-        let slot = majit_ir::descr::strip_generic_args(slot_owner);
-        let Some((base, variant)) = slot.rsplit_once("::") else {
+    // serializes the flattened row under the variant parent while a read of
+    // that row can name the enum, so recover that one proven inheritance edge
+    // from the qualified owners.  Two *different* variants of one enum are not
+    // that edge -- their payloads are different fields sharing an address --
+    // and neither is a same-name/same-offset field from an arbitrary struct.
+    fn is_registered_std_shell(owner: &str) -> bool {
+        // Same anchors `codewriter/assembler.rs is_explicit_shell_variant_owner`
+        // uses, plus the enum roots the inherited-tag edge names. A name
+        // registered to any other StructId is a lookalike and must not ride
+        // the shell inheritance exception.
+        const ANCHORS: [&str; 10] = [
+            "core::result::Result::Ok",
+            "std::result::Result::Ok",
+            "core::result::Result::Err",
+            "std::result::Result::Err",
+            "core::option::Option::Some",
+            "std::option::Option::Some",
+            "core::result::Result",
+            "std::result::Result",
+            "core::option::Option",
+            "std::option::Option",
+        ];
+        let Some(owner_id) = majit_ir::descr::struct_template_id_for_name(owner) else {
             return false;
         };
-        matches!(variant, "Some" | "Ok" | "Err") && same_owner(base, field_owner)
+        ANCHORS.iter().any(|anchor| {
+            majit_ir::descr::struct_template_id_for_name(anchor) == Some(owner_id)
+                || majit_ir::descr::StructId::from_canonical(anchor) == owner_id
+        })
     }
+
+    fn explicit_sum_inherits(slot_owner: &str, field_owner: &str) -> bool {
+        let (Some((slot_enum, slot_variant)), Some((field_enum, field_variant))) = (
+            shelled_sum_owner(slot_owner),
+            shelled_sum_owner(field_owner),
+        ) else {
+            return false;
+        };
+        if slot_enum != field_enum
+            || !(slot_variant == field_variant
+                || slot_variant.is_empty()
+                || field_variant.is_empty())
+        {
+            return false;
+        }
+        // Spelling is not identity. When the StructId table is populated,
+        // both owners must resolve to a core/std shell; a user type that
+        // collapses to `result::Result` keeps its own StructId and must
+        // not inherit a standard-library tag or payload slot.
+        //
+        // An empty table is the pre-registry test shape: nothing has been
+        // published, so there is no lookalike to distinguish and the
+        // textual edge stands.
+        match (
+            majit_ir::descr::struct_template_id_for_name(slot_owner),
+            majit_ir::descr::struct_template_id_for_name(field_owner),
+        ) {
+            (None, None) => true,
+            (slot_id, field_id) => {
+                slot_id.is_none_or(|_| is_registered_std_shell(slot_owner))
+                    && field_id.is_none_or(|_| is_registered_std_shell(field_owner))
+            }
+        }
+    }
+
+    // `rclass.InstanceRepr._setup_repr` gives a sum-type variant subclass the
+    // base's fields before its own, and pyre's payload enums carry the tag on
+    // that base alone (`front/mir.rs`), so a variant's flattened field list
+    // legitimately holds a row whose own parent descr is the base.  That is
+    // the same super edge `explicit_sum_inherits` recovers for the two shelled
+    // sums, for every other enum.  Restricted to the tag: it is the only row
+    // the base carries, so a payload row reaching here under a base spelling
+    // would be naming a field the base does not have.
+    fn variant_inherits_enum_tag(
+        slot_owner: &str,
+        field_owner: &str,
+        field_name: &str,
+        parent_keys: Option<(u64, u64)>,
+    ) -> bool {
+        if field_name != "__discriminant" {
+            return false;
+        }
+        let slot = majit_ir::descr::strip_generic_args(slot_owner);
+        let Some((base, _variant)) = slot.rsplit_once("::") else {
+            return false;
+        };
+        if base != majit_ir::descr::strip_generic_args(field_owner).as_ref() {
+            return false;
+        }
+        // Unlike the two explicitly-declared Result/Option shells above, an
+        // arbitrary textual `Enum::Variant -> Enum` shape is not itself proof
+        // of inheritance: two crates can publish the same stripped spelling.
+        // Require both parent cache keys to be the identities derived from the
+        // producer-canonical names. This admits the distinct variant/base
+        // StructIds of the real superclass edge and rejects an alias whose
+        // spelling happens to collide with either identity.
+        parent_keys.is_some_and(|(slot_key, field_key)| {
+            majit_ir::descr::StructId::from_canonical_spelling(slot_owner).as_u64() == slot_key
+                && majit_ir::descr::StructId::from_canonical_spelling(field_owner).as_u64()
+                    == field_key
+        })
+    }
+
+    let owners_agree = |slot_owner: &str, field_owner: &str, parent_keys: Option<(u64, u64)>| {
+        explicit_sum_inherits(slot_owner, field_owner)
+            || variant_inherits_enum_tag(slot_owner, field_owner, field.field_key(), parent_keys)
+    };
 
     let names_name_same_owner = || match (display_owner(slot), display_owner(field)) {
         (Some(slot_owner), Some(field_owner)) => {
@@ -2786,8 +2895,10 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
                 majit_ir::descr::struct_id_for_name(slot_owner),
                 majit_ir::descr::struct_id_for_name(field_owner),
             ) {
-                (Some(slot_id), Some(field_id)) => slot_id == field_id,
-                _ => slot_owner == field_owner,
+                (Some(slot_id), Some(field_id)) => {
+                    slot_id == field_id || owners_agree(slot_owner, field_owner, None)
+                }
+                _ => slot_owner == field_owner || owners_agree(slot_owner, field_owner, None),
             }
         }
         // Neither descriptor contains an owner spelling.  This is the
@@ -2813,7 +2924,7 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
                     slot_key == field_key
                         || match (display_owner(slot), display_owner(field)) {
                             (Some(slot_owner), Some(field_owner)) => {
-                                explicit_sum_inherits(slot_owner, field_owner)
+                                owners_agree(slot_owner, field_owner, Some((slot_key, field_key)))
                             }
                             _ => false,
                         }
@@ -3783,6 +3894,220 @@ mod tests {
         )
         .with_parent_descr(base_parent, 0);
         assert!(!slot_holds_field(&slot, &unrelated));
+
+        let suffix_parent = majit_ir::descr::make_size_descr(8);
+        let suffix_collision = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "b::a::E.__discriminant".to_string(),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(suffix_parent, 0);
+        let collision_slot = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "a::E::V.__discriminant".to_string(),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(variant_parent.clone(), 0);
+        assert!(
+            !slot_holds_field(&collision_slot, &suffix_collision),
+            "a suffix-related path does not prove an enum inheritance edge"
+        );
+    }
+
+    #[test]
+    fn native_enum_tag_inheritance_requires_matching_parent_identities() {
+        let variant_owner = "types::dynamic::Union::Int";
+        let base_owner = "types::dynamic::Union";
+        let mut variant_size = majit_ir::descr::SimpleSizeDescr::new(0, 16, 1);
+        variant_size.set_cache_key(
+            majit_ir::descr::StructId::from_canonical_spelling(variant_owner).as_u64(),
+        );
+        let variant_parent = Arc::new(variant_size) as DescrRef;
+        let mut base_size = majit_ir::descr::SimpleSizeDescr::new(1, 16, 2);
+        base_size
+            .set_cache_key(majit_ir::descr::StructId::from_canonical_spelling(base_owner).as_u64());
+        let base_parent = Arc::new(base_size) as DescrRef;
+        let slot = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            1,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Unsigned,
+            format!("{variant_owner}.__discriminant"),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(variant_parent.clone(), 0);
+        let field = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            1,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Unsigned,
+            format!("{base_owner}.__discriminant"),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(base_parent.clone(), 0);
+        assert!(
+            slot_holds_field(&slot, &field),
+            "slot={:?} key={:?} parent={:?}; field={:?} key={:?} parent={:?}",
+            slot.field_name(),
+            slot.field_key(),
+            slot.get_parent_descr()
+                .and_then(|p| p.as_size_descr().map(|s| s.cache_key())),
+            field.field_name(),
+            field.field_key(),
+            field
+                .get_parent_descr()
+                .and_then(|p| p.as_size_descr().map(|s| s.cache_key())),
+        );
+
+        let mut foreign_size = majit_ir::descr::SimpleSizeDescr::new(2, 16, 3);
+        foreign_size
+            .set_cache_key(majit_ir::descr::StructId::from_canonical("other::Union::Int").as_u64());
+        let foreign_parent = Arc::new(foreign_size) as DescrRef;
+        let foreign = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            1,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Unsigned,
+            format!("{variant_owner}.__discriminant"),
+            "__discriminant".to_string(),
+        )
+        .with_parent_descr(foreign_parent.clone(), 0);
+        assert!(
+            !slot_holds_field(&foreign, &field),
+            "a colliding owner spelling must not override a distinct parent identity"
+        );
+    }
+
+    #[test]
+    fn slot_identity_accepts_the_shell_template_spelling_of_a_variant_payload() {
+        let mut variant_size = majit_ir::descr::SimpleSizeDescr::new(0, 16, 1);
+        variant_size.set_cache_key(0x61);
+        let variant_parent = Arc::new(variant_size) as DescrRef;
+        let mut template_size = majit_ir::descr::SimpleSizeDescr::new(1, 16, 2);
+        template_size.set_cache_key(0x62);
+        let template_parent = Arc::new(template_size) as DescrRef;
+
+        // The allocation names the instantiation it allocated; the read names
+        // the shell template, whose declared payload width is the erased one.
+        let slot = majit_ir::SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "core::option::Option<Dynamic>::Some.__pos_0".to_string(),
+            "__pos_0".to_string(),
+        )
+        .with_parent_descr(variant_parent.clone(), 1);
+        let template = majit_ir::SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "Option::Some.__pos_0".to_string(),
+            "__pos_0".to_string(),
+        )
+        .with_parent_descr(template_parent.clone(), 1);
+        assert!(slot_holds_field(&slot, &template));
+
+        // Two variants of one shelled enum put different fields at one
+        // address, so the shell template does not merge them.
+        let ok = majit_ir::SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "core::result::Result<Dynamic,str>::Ok.__pos_0".to_string(),
+            "__pos_0".to_string(),
+        )
+        .with_parent_descr(variant_parent, 1);
+        let err = majit_ir::SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "Result::Err.__pos_0".to_string(),
+            "__pos_0".to_string(),
+        )
+        .with_parent_descr(template_parent, 1);
+        assert!(!slot_holds_field(&ok, &err));
+    }
+
+    #[test]
+    fn explicit_sum_inheritance_rejects_a_registered_lookalike() {
+        static REGISTRY: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _registry = REGISTRY.lock();
+        let core_some = majit_ir::descr::StructId::from_canonical("core::option::Option::Some");
+        let user_some =
+            majit_ir::descr::StructId::from_canonical("user_crate::option::Option::Some");
+        let mut ids = std::collections::HashMap::new();
+        for name in [
+            "Option::Some",
+            "core::option::Option::Some",
+            "std::option::Option::Some",
+        ] {
+            ids.insert(name.to_string(), Some(core_some));
+        }
+        ids.insert("option::Option::Some".to_string(), Some(user_some));
+        majit_ir::descr::register_struct_ids(ids);
+
+        let mut user_size = majit_ir::descr::SimpleSizeDescr::new(0, 8, 1);
+        user_size.set_cache_key(user_some.as_u64());
+        let user_parent = Arc::new(user_size) as DescrRef;
+        let mut core_size = majit_ir::descr::SimpleSizeDescr::new(1, 16, 2);
+        core_size.set_cache_key(core_some.as_u64());
+        let core_parent = Arc::new(core_size) as DescrRef;
+
+        let lookalike = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "option::Option::Some.__pos_0".to_string(),
+            "__pos_0".to_string(),
+        )
+        .with_parent_descr(user_parent, 0);
+        let shell = majit_ir::SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "Option::Some.__pos_0".to_string(),
+            "__pos_0".to_string(),
+        )
+        .with_parent_descr(core_parent, 1);
+        assert!(
+            !slot_holds_field(&lookalike, &shell),
+            "a user type registered under option::Option::Some must not inherit the std shell"
+        );
+        majit_ir::descr::register_struct_ids(std::collections::HashMap::new());
     }
 
     fn assign_positions(ops: &mut [Op]) {

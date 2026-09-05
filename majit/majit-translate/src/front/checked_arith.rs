@@ -180,15 +180,24 @@ fn var_read_in_reachable(
 /// left as the residual call (Skip), so a mismatch never regresses a graph
 /// the legacy walker already handled.  Returns the number of sites
 /// rewritten.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CheckedArithRewriteCount {
+    pub(crate) total: usize,
+    pub(crate) result_shells: usize,
+}
+
 pub(crate) fn rewire_checked_arith_call_sites(
     graph: &mut FunctionGraph,
     sites: &[Variable],
     ok_or_else_sites: &[CheckedArithOkOrElseSite],
-) -> usize {
-    let mut rewritten = 0;
+) -> CheckedArithRewriteCount {
+    let mut rewritten = CheckedArithRewriteCount::default();
     for opt in sites {
         match rewire_one_checked_arith_site(graph, opt, ok_or_else_sites) {
-            Ok(()) => rewritten += 1,
+            Ok(created_result_shell) => {
+                rewritten.total += 1;
+                rewritten.result_shells += usize::from(created_result_shell);
+            }
             Err(_decline) => {
                 if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
                     eprintln!(
@@ -209,7 +218,7 @@ fn rewire_one_checked_arith_site(
     graph: &mut FunctionGraph,
     opt: &Variable,
     ok_or_else_sites: &[CheckedArithOkOrElseSite],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let name = graph.name.clone();
     // Block A: the `checked_*()` residual call producing `opt`, closed by
     // lower_call with a single forwarding exit.
@@ -287,6 +296,7 @@ fn rewire_one_checked_arith_site(
             ovf_opname,
             ok_or_else_sites,
         )
+        .map(|()| true)
         .map_err(|reason| {
             format!("{name}: block {c} lacks the Option __discriminant read; {reason}")
         });
@@ -430,7 +440,7 @@ fn rewire_one_checked_arith_site(
         Link::new_mixed(normal_args, some_target, None),
         overflow_link,
     ];
-    Ok(())
+    Ok(false)
 }
 
 /// Rewrite the signed-arithmetic `checked_*(lhs, rhs).ok_or_else(env)` shape.
@@ -787,7 +797,8 @@ mod tests {
         ];
 
         let rewritten = rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[]);
-        assert_eq!(rewritten, 1, "the checked_add site must be rewritten");
+        assert_eq!(rewritten.total, 1, "the checked_add site must be rewritten");
+        assert_eq!(rewritten.result_shells, 0);
 
         // Block A's last op is now `add_ovf(va, vb)`, reusing `opt`.
         let last = g.blocks[a.0].operations.last().unwrap();
@@ -890,7 +901,8 @@ mod tests {
         };
         let rewritten =
             rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[paired]);
-        assert_eq!(rewritten, 1);
+        assert_eq!(rewritten.total, 1);
+        assert_eq!(rewritten.result_shells, 1);
         assert!(matches!(
             &g.blocks[a.0].operations.last().unwrap().kind,
             OpKind::BinOp { op, .. } if op == "add_ovf"
@@ -1016,7 +1028,8 @@ mod tests {
         ];
 
         let rewritten = rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[]);
-        assert_eq!(rewritten, 0, "a None arm that reads opt must decline");
+        assert_eq!(rewritten.total, 0, "a None arm that reads opt must decline");
+        assert_eq!(rewritten.result_shells, 0);
         // The residual call survives untouched.
         let last = g.blocks[a.0].operations.last().unwrap();
         assert!(matches!(
