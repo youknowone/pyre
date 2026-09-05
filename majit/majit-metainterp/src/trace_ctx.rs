@@ -1265,6 +1265,11 @@ impl TraceCtx {
     /// AbstractValue.getXXX()` / `history.py *FrontendOp(pos,
     /// value)` parity).
     pub fn heapcache_getfield_cached(&mut self, obj: OpRef, field_index: u32) -> Option<OpRef> {
+        // PyPy keys by descriptor identity. An unnumbered Rust descriptor
+        // has no such key: u32::MAX is shared by unrelated fallback fields.
+        if field_index == u32::MAX {
+            return None;
+        }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache.getfield_cached(obj, field_index, oracle)
     }
@@ -1279,6 +1284,9 @@ impl TraceCtx {
     /// covering the const pool, standard-virtualizable shadow, and
     /// `Box::value: Cell<Option<Value>>` field in one call.
     pub fn heapcache_setfield_cached(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
+        if field_index == u32::MAX {
+            return;
+        }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .setfield_cached(obj, field_index, value, oracle)
@@ -1290,6 +1298,9 @@ impl TraceCtx {
     /// the cache-hit sanity check resolves later via
     /// `lookup_opref_concrete`.
     pub fn heapcache_getfield_now_known(&mut self, obj: OpRef, field_index: u32, value: OpRef) {
+        if field_index == u32::MAX {
+            return;
+        }
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .getfield_now_known(obj, field_index, value, oracle)
@@ -6377,7 +6388,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         ctx.set_cpu(Some(&cpu));
-        let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
+        let fd = majit_ir::make_field_descr_full(1, 0, 8, Type::Int, false);
         let cached = ctx.const_int(42);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
@@ -6388,6 +6399,27 @@ mod tests {
             0xCAFE_BABE,
             fd,
         );
+    }
+
+    #[test]
+    fn unnumbered_field_descriptors_do_not_share_a_heapcache_entry() {
+        let mut recorder = Trace::new();
+        let obj = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let a = majit_ir::make_field_descr_full(u32::MAX, 0, 8, Type::Int, false);
+        let b = majit_ir::make_field_descr_full(u32::MAX, 8, 8, Type::Int, false);
+        let value = ctx.const_int(42);
+        ctx.heapcache_getfield_now_known(obj, a.index(), value);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, b.index()), None);
+        ctx.heapcache_setfield_cached(obj, a.index(), value);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, b.index()), None);
+        // A genuine descriptor identity still supports forwarding.
+        ctx.heapcache_getfield_now_known(obj, 1, value);
+        assert_eq!(ctx.heapcache_getfield_cached(obj, 1), Some(value));
     }
 
     /// `test_pyjitpl.py test_remove_consts_and_duplicates` — the upstream
@@ -6539,7 +6571,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         ctx.set_cpu(Some(&cpu));
-        let fd = majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::ArrayFlag::Signed);
+        let fd = majit_ir::make_field_descr_full(1, 0, 8, Type::Ref, false);
         let cached = ctx.const_ref(0xAAAA_BBBB);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
@@ -6570,7 +6602,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         ctx.set_cpu(Some(&cpu));
-        let fd = majit_ir::make_field_descr(0, 8, Type::Float, majit_ir::ArrayFlag::Signed);
+        let fd = majit_ir::make_field_descr_full(1, 0, 8, Type::Float, false);
         let cached = ctx.const_float((1.5_f64).to_bits() as i64);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);
@@ -6644,7 +6676,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         ctx.set_cpu(Some(&cpu));
-        let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
+        let fd = majit_ir::make_field_descr_full(1, 0, 8, Type::Int, false);
         let cached = ctx.const_int(7);
         let field_index = fd.index();
         ctx.heapcache_getfield_now_known(vable, field_index, cached);

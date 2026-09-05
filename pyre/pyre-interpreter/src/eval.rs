@@ -4155,11 +4155,12 @@ impl OpcodeStepExecutor for PyFrame {
         if crate::baseobjspace::finditem_str(roots.get(locals_slot), "__annotations__")?.is_none() {
             let key_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(unsafe { pyre_object::w_str_new("__annotations__") });
-            let w_annotations = pyre_object::w_dict_new();
+            let annotations_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(pyre_object::w_dict_new());
             crate::baseobjspace::setitem(
                 roots.get(locals_slot),
                 roots.get(key_slot),
-                w_annotations,
+                roots.get(annotations_slot),
             )?;
         }
         Ok(())

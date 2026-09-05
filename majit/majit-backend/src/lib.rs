@@ -1600,6 +1600,10 @@ impl JitCellToken {
     /// model.py: reset_compiled()
     /// Remove the compiled code (e.g., after invalidation).
     pub fn reset_compiled(&mut self) {
+        // The quasi-immutable projection can outlive the token's machine
+        // code. Synchronize with invalidate_loop's entire patch walk before
+        // releasing that code, not just with removal of the address list.
+        self.invalidate_sites.lock().positions.clear();
         self.compiled.take();
     }
 
@@ -1826,15 +1830,15 @@ impl LoopInvalidation {
         // site, then empty the list.  Emptying is what makes a bridge
         // compiled afterwards start valid, so that a repeated invalidation
         // "must invalidate all newer GUARD_NOT_INVALIDATED, but not the old one
-        // that already has a bridge attached to it".  The lock is released
-        // first: the writer flips page protections, and holding a mutex across
-        // that would serialise it against a compile that only wants to append.
-        let (write, positions) = {
+        // that already has a bridge attached to it". Keep the lock through
+        // the write: JitCellToken teardown takes it before freeing code, so
+        // the registry's longer-lived projection cannot patch recycled memory.
+        {
             let mut sites = self.sites.lock();
-            (sites.write, std::mem::take(&mut sites.positions))
-        };
-        if let Some(write) = write {
-            write(&positions);
+            if let Some(write) = sites.write {
+                write(&sites.positions);
+            }
+            sites.positions.clear();
         }
         // After the flags, not before: a reader that keys a cache on the
         // generation pairs the value it read with the answer it computed, so
@@ -1848,6 +1852,15 @@ impl LoopInvalidation {
 impl majit_ir::QuasiImmutLoopToken for LoopInvalidation {
     fn invalidate_for_quasi_immut(&self) {
         self.invalidate();
+    }
+}
+
+impl Drop for JitCellToken {
+    fn drop(&mut self) {
+        // `model.CompiledLoopToken` owns both invalidate_positions and the
+        // code they name. Our thread-safe registry projection shares only the
+        // former; detach it before Rust drops compiled/asmmemmgr_blocks.
+        self.invalidate_sites.lock().positions.clear();
     }
 }
 
@@ -4653,6 +4666,50 @@ mod tests {
         );
         token.invalidate();
         assert_eq!(*WRITTEN.lock(), vec![0x1000, 0x2000]);
+    }
+
+    #[test]
+    fn invalidation_projection_cannot_patch_released_code() {
+        fn write(positions: &[InvalidatePosition]) {
+            assert!(positions.is_empty(), "patch address outlived compiled code");
+        }
+        for reset in [false, true] {
+            let mut token = JitCellToken::new(42);
+            token.record_invalidate_positions(
+                write,
+                vec![InvalidatePosition {
+                    addr: 0x1000,
+                    word: 1,
+                }],
+            );
+            let handle = token.quasi_immut_handle();
+            if reset {
+                token.reset_compiled();
+                handle.invalidate();
+            }
+            drop(token);
+            handle.invalidate();
+        }
+    }
+
+    #[test]
+    fn invalidation_holds_code_lifetime_lock_during_patch() {
+        fn write(positions: &[InvalidatePosition]) {
+            for position in positions {
+                let sites =
+                    unsafe { &*(position.addr as *const parking_lot::Mutex<InvalidateSites>) };
+                assert!(sites.try_lock().is_none(), "teardown can race this writer");
+            }
+        }
+        let token = JitCellToken::new(42);
+        token.record_invalidate_positions(
+            write,
+            vec![InvalidatePosition {
+                addr: Arc::as_ptr(&token.invalidate_sites) as usize,
+                word: 0,
+            }],
+        );
+        token.invalidate();
     }
 
     #[test]

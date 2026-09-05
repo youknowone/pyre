@@ -6203,13 +6203,15 @@ impl CallControl {
                     // this marker from looked-inside code.  Match the upstream
                     // opname leaf directly; `VableForce` is retained only for
                     // already-transformed compatibility graphs.
-                    OpKind::Call { target, .. }
-                        if target
-                            .path_segments()
-                            .and_then(|s| s.last().copied())
-                            .is_some_and(|leaf| {
-                                matches!(leaf, "jit_force_virtualizable" | "jit_force_virtual")
-                            }) =>
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().is_some_and(|leaf| {
+                        matches!(
+                            leaf.as_str(),
+                            "jit_force_virtualizable" | "jit_force_virtual"
+                        )
+                    }) =>
                     {
                         return true;
                     }
@@ -10579,6 +10581,31 @@ mod tests {
             descriptor.extra_info.extraeffect,
             ExtraEffect::ForcesVirtualOrVirtualizable
         );
+    }
+
+    #[test]
+    fn test_force_marker_name_on_method_is_not_a_primitive() {
+        for name in ["jit_force_virtualizable", "jit_force_virtual"] {
+            let mut cc = CallControl::new();
+            let mut graph = FunctionGraph::new("entry");
+            graph.push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::Method {
+                        name: name.to_string(),
+                        receiver_root: Some("Unrelated".to_string()),
+                        resolved_path: None,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Void,
+                },
+                false,
+            );
+            graph.set_return(graph.startblock, None);
+            let path = CallPath::from_segments(["entry"]);
+            cc.register_function_graph(path.clone(), graph);
+            assert!(!cc.analyze_forces_virtualizable(&path, &mut HashSet::new()));
+        }
     }
 
     #[test]

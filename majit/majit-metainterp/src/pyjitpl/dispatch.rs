@@ -1711,6 +1711,17 @@ where
         }
     }
 
+    fn apply_pending_box_replace(&mut self, ctx: &mut TraceCtx) {
+        let Some((oldbox, newbox)) = ctx.take_pending_box_replace() else {
+            return;
+        };
+        // `pyjitpl.MetaInterp.replace_box` framestack walk. TraceCtx already
+        // rewrote vrefs / vable boxes / heapcache; the register banks remain.
+        for frame in self.frames.frames.iter_mut() {
+            frame.replace_active_box_in_frame(oldbox, newbox, Type::Ref);
+        }
+    }
+
     /// Attach a resume snapshot to a guard a `TraceCtx::vable_*` call emitted
     /// internally, if it emitted one.
     ///
@@ -1733,12 +1744,8 @@ where
     /// One call can emit TWO: a vable array access whose symbolic frame box
     /// differs from the standard box but shares its pointer promotes the
     /// `isstandard` PTR_EQ and then the index, so every guard the call added is
-    /// stamped, not just the last. In pyre the two snapshots currently come
-    /// out identical because `TraceCtx::replace_box` updates the side tables
-    /// but not the live `MIFrame`s; this is a pre-existing gap, not parity:
-    /// upstream `MetaInterp.replace_box` walks the framestack via
-    /// `frame.replace_active_box_in_frame`, so its second capture sees the
-    /// standard box where the first saw the old one. The loop runs in emission
+    /// stamped, not just the last. `apply_pending_box_replace` updates the
+    /// live MIFrames as `MetaInterp.replace_box` does upstream. The loop runs in emission
     /// order because each capture leaves the root frame's in-flight result slot
     /// cleared.
     ///
@@ -1752,18 +1759,6 @@ where
     /// a `-live-` marker in front of every vable op (`lower_vable.rs`, mirroring
     /// `jtransform.py:764/798/814/845/926`), so `opcode_pc - SIZE_LIVE_OP`
     /// resolves the liveness the snapshot needs.
-    fn apply_pending_box_replace(&mut self, ctx: &mut TraceCtx) {
-        let Some((oldbox, newbox)) = ctx.take_pending_box_replace() else {
-            return;
-        };
-        // `pyjitpl.py replace_box` framestack walk. `TraceCtx::replace_box`
-        // already rewrote vrefs / vable boxes / heapcache; only the
-        // register banks remain.
-        for frame in self.frames.frames.iter_mut() {
-            frame.replace_active_box_in_frame(oldbox, newbox, Type::Ref);
-        }
-    }
-
     fn capture_vable_promote_guard(
         &mut self,
         ctx: &mut TraceCtx,

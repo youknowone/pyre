@@ -244,6 +244,7 @@ pub use branch::*;
 mod vstack_mirror;
 pub use vstack_mirror::*;
 mod vable_ops;
+use vable_ops::FrameBoxReplacements;
 pub use vable_ops::*;
 mod heapcache_ops;
 pub use heapcache_ops::*;
@@ -552,6 +553,9 @@ pub struct InlineFrame {
 /// through [`WalkContext`] — `MetaInterp.framestack` (`pyjitpl.py`,
 /// `:2487`; depth scan `:1390`). Innermost level last.
 pub struct WalkSession {
+    /// Live frame owners waiting to apply `MetaInterp.replace_box` to their
+    /// borrowed register banks. Resume snapshots are updated synchronously.
+    pub(crate) box_replacement_frames: Vec<std::rc::Weak<vable_ops::FrameBoxReplacementInbox>>,
     /// The root frame's `is_being_profiled` portal green for this walk.
     pub is_being_profiled: bool,
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
@@ -685,6 +689,7 @@ impl Default for WalkSession {
     fn default() -> Self {
         Self {
             is_being_profiled: false,
+            box_replacement_frames: Vec::new(),
             framestack: Vec::new(),
             next_call_id: 1,
             open_inline_activations: 0,

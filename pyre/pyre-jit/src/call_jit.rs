@@ -3228,16 +3228,23 @@ pub fn blackhole_resume_via_rd_numb(
         let caller = next;
         if caller.is_none() {
             // blackhole.py _done_with_this_frame
+            // The terminal level has no caller branch below to close its
+            // execution scope. Root the result across ExecutionContext.leave,
+            // whose caller-vref force can collect.
+            let roots = pyre_object::gc_roots::push_roots();
+            if matches!(rt, BhReturnType::Ref) {
+                let _ = roots.pin_root(bh.get_tmpreg_r() as PyObjectRef);
+            }
+            leave_resumed_blackhole_frame(&bh, false);
             let result = match rt {
                 BhReturnType::Void => BlackholeResult::DoneWithThisFrameVoid,
                 BhReturnType::Int => BlackholeResult::DoneWithThisFrameInt(bh.get_tmpreg_i()),
-                BhReturnType::Ref => {
-                    BlackholeResult::DoneWithThisFrameRef(bh.get_tmpreg_r() as PyObjectRef)
-                }
+                BhReturnType::Ref => BlackholeResult::DoneWithThisFrameRef(roots.get(roots.base())),
                 BhReturnType::Float => BlackholeResult::DoneWithThisFrameFloat(f64::from_bits(
                     bh.get_tmpreg_f() as u64,
                 )),
             };
+            release_bh_rd(bh);
             return result;
         }
         let mut caller_bh = caller.unwrap();

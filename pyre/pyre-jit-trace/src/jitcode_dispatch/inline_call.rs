@@ -6964,6 +6964,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     } else {
         None
     };
+    let caller_replacements = FrameBoxReplacements::new(ctx.session);
     let (callee_outcome, callee_class_of_last_exc_is_const) = {
         let mut sub_wc = WalkContext {
             callee_shadow: Some(super::CalleeLocalsShadow {
@@ -7449,6 +7450,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
         (result, class_of_last_exc_is_const)
     };
+    caller_replacements.apply(ctx);
+    drop(caller_replacements);
     // `executioncontext.py leave`, in the original's `finally`
     // position: the sub-walk block above is an expression that always
     // completes, so every callee exit — return, exception, or decline —
@@ -11655,6 +11658,7 @@ impl Drop for SubWalkDriverGuard {
 }
 
 struct SubWalkFrame<'a, Sym: WalkSym> {
+    box_replacements: FrameBoxReplacements,
     id: usize,
     caller_pc: usize,
     pc: usize,
@@ -11729,6 +11733,9 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
             live_before_jit_pc: self.live_before_jit_pc,
             live_after_jit_pc: self.live_after_jit_pc,
         };
+        // This owner survives SubWalkSuspended, unlike an invocation of walk.
+        // Synchronize the paused frame before resuming its CALL continuation.
+        self.box_replacements.apply(&mut walk_ctx);
         if self.seed_from_active_resume {
             self.seed_from_active_resume = false;
             if let Some(frame) =
@@ -11740,7 +11747,9 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         }
         // The bank is rooted by `SubWalkDriver::push_frame` for this frame's
         // whole residency, which outlasts this call.
+        self.box_replacements.set_listening(false);
         let result = walk(self.body.code, self.pc, &mut walk_ctx);
+        self.box_replacements.set_listening(true);
         self.callee_shadow = walk_ctx.callee_shadow.take();
         self.inline_callee_consts = walk_ctx.inline_callee_consts;
         self.inline_poison_pcs = walk_ctx.inline_poison_pcs.take();
@@ -12087,6 +12096,7 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
         id
     };
     let frame = SubWalkFrame {
+        box_replacements: FrameBoxReplacements::new(ctx.session),
         id: frame_id,
         caller_pc: pc,
         pc: 0,
@@ -12143,7 +12153,10 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
     let descent_unjournaled_before = fbw_has_unjournaled_effect();
     let mut driver = SubWalkDriver::new(frame);
     let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
+    let caller_replacements = FrameBoxReplacements::new(ctx.session);
     let result = driver.drive(ctx.trace_ctx);
+    caller_replacements.apply(ctx);
+    drop(caller_replacements);
     match result {
         Ok((outcome, class_state)) => {
             // `MetaInterp.class_of_last_exc_is_const` is shared across the

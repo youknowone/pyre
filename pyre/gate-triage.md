@@ -290,7 +290,7 @@ enters at pc 0 with the portal's declared arguments.  The numeric
 probe passes before firing; it defaults to zero.  Neither has an effect unless
 the probe in §6c is enabled.
 
-### §6c — Default-OFF diagnostics, censuses and probes (76): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (74): keep, cost nothing
 
 Deleting one of these environment reads does not change behavior when the
 variable is unset. They remain listed so diagnostics are not mistaken for dead

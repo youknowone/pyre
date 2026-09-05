@@ -209,6 +209,22 @@ impl Default for GraphTransformConfig {
     }
 }
 
+impl GraphTransformConfig {
+    fn virtualizable_field(
+        &self,
+        field: &FieldDescriptor,
+    ) -> Option<&VirtualizableFieldDescriptor> {
+        self.vable_fields.iter().find(|item| item.matches(field))
+    }
+
+    fn virtualizable_array(
+        &self,
+        field: &FieldDescriptor,
+    ) -> Option<&VirtualizableFieldDescriptor> {
+        self.vable_arrays.iter().find(|item| item.matches(field))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructStorageDescriptor {
     pub owner: String,
@@ -1318,16 +1334,8 @@ impl<'a> Transformer<'a> {
             )
         });
         if !is_fresh
-            || (!self
-                .config
-                .vable_fields
-                .iter()
-                .any(|item| item.matches(field))
-                && !self
-                    .config
-                    .vable_arrays
-                    .iter()
-                    .any(|item| item.matches(field)))
+            || (self.config.virtualizable_field(field).is_none()
+                && self.config.virtualizable_array(field).is_none())
         {
             return;
         }
@@ -3499,9 +3507,7 @@ impl<'a> Transformer<'a> {
         // Track virtualizable array field reads
         if let Some(array_field) = self
             .config
-            .vable_arrays
-            .iter()
-            .find(|c| c.matches(field))
+            .virtualizable_array(field)
             .filter(|_| lower_vable)
             && let Some(result) = op.result.clone()
         {
@@ -3533,9 +3539,7 @@ impl<'a> Transformer<'a> {
         // Virtualizable scalar field → VableFieldRead
         if let Some(vable_field) = self
             .config
-            .vable_fields
-            .iter()
-            .find(|c| c.matches(field))
+            .virtualizable_field(field)
             .filter(|_| lower_vable)
         {
             self.notes.push(GraphTransformNote {
@@ -3708,9 +3712,7 @@ impl<'a> Transformer<'a> {
         let fresh_virtualizable = fresh_virtualizable || field.base_is_local_aggregate();
         if let Some(vable_field) = self
             .config
-            .vable_fields
-            .iter()
-            .find(|c| c.matches(field))
+            .virtualizable_field(field)
             .filter(|_| !fresh_virtualizable)
         {
             self.notes.push(GraphTransformNote {
@@ -8631,9 +8633,10 @@ fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
 }
 
 /// The rtyper op `jit_force_virtualizable`, not `hint_force_virtualizable`.
-/// Matched on the leaf so both a free helper and a method spelling rewrite.
+/// A method with the same name is not the rtyper primitive.
 fn is_jit_force_virtualizable_target(target: &CallTarget) -> bool {
-    target.path_segments().and_then(|segs| segs.last().copied()) == Some("jit_force_virtualizable")
+    matches!(target, CallTarget::FunctionPath { segments }
+        if segments.last().is_some_and(|name| name == "jit_force_virtualizable"))
 }
 
 /// Match a `CallEffectOverride` pattern against a call target.
@@ -12183,6 +12186,19 @@ mod tests {
         assert!(matches!(
             ops[2].kind,
             OpKind::VableFieldRead { field_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn force_virtualizable_method_is_not_deleted_as_a_primitive() {
+        let method = CallTarget::Method {
+            name: "jit_force_virtualizable".to_string(),
+            receiver_root: Some("Unrelated".to_string()),
+            resolved_path: None,
+        };
+        assert!(!is_jit_force_virtualizable_target(&method));
+        assert!(is_jit_force_virtualizable_target(
+            &CallTarget::function_path(["executioncontext", "jit_force_virtualizable",])
         ));
     }
 

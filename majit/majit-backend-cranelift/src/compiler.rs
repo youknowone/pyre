@@ -5716,19 +5716,17 @@ fn resolve_opref_or_imm(
     use_declared_var_or_panic(builder, opref, "resolve_opref_or_imm")
 }
 
-/// The frame slot each of an attached bridge's inputargs is read from, in
-/// bridge inputarg order — `rebuild_faillocs_from_descr` decoded onto this
-/// guard by `collect_guards`.
-///
-/// An empty `bridge_source_slots` is the plain-identity case, the one
-/// `emit_attached_bridge_dispatch` skips its compaction for: the descr carries
-/// no `rd_locs`, so the k-th entry value is the k-th logical fail arg.
-fn bridge_entry_slots(info: &GuardInfo, arity: usize) -> Vec<usize> {
-    if info.bridge_source_slots.is_empty() {
-        (0..arity).collect()
-    } else {
-        info.bridge_source_slots.clone()
-    }
+/// Logical fail-arg positions in a merged bridge's inputarg order.
+/// `compile.ResumeGuardDescr.get_inputargs_and_holes` removes the holes, not
+/// the physical spill offset. Attached bridges instead load from rd_locs
+/// (`bridge_source_slots`); those addresses must never index fail_arg_refs,
+/// especially after GUARD_NOT_FORCED_2 moves spills past the result slot.
+fn bridge_entry_indices(fail_arg_refs: &[OpRef]) -> Vec<usize> {
+    fail_arg_refs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| (!arg.is_none()).then_some(index))
+        .collect()
 }
 
 fn resolve_failarg_opref(
@@ -7589,7 +7587,7 @@ fn check_region_entry_slots(
         else {
             return decline("has no guard in the merged stream");
         };
-        let slots = bridge_entry_slots(info, arity);
+        let slots = bridge_entry_indices(&info.fail_arg_refs);
         if slots.len() != arity {
             return decline(&format!(
                 "reads {} entry value(s) for {arity} inputarg(s)",
@@ -7745,8 +7743,7 @@ fn emit_guard_exit(
         // compacts the frame slots into for the out-of-line bridge.
         // `check_region_entry_slots` already refused the merge unless every one
         // of these slots exists and holds a live fail arg.
-        let arity = builder.block_params(region_block).len();
-        let vals: Vec<CValue> = bridge_entry_slots(info, arity)
+        let vals: Vec<CValue> = bridge_entry_indices(&info.fail_arg_refs)
             .iter()
             .map(|&slot| info.fail_arg_refs[slot])
             .map(|arg_ref| {
@@ -27823,6 +27820,20 @@ mod tests {
             !backend_after_clear.get_latest_descr(&frame).is_finish(),
             "the async bit must use the same guard-failure exit"
         );
+    }
+
+    #[test]
+    fn merged_bridge_entry_uses_logical_failargs_and_skips_holes() {
+        let args = [
+            OpRef::input_arg_int(0),
+            OpRef::NONE,
+            OpRef::input_arg_int(1),
+        ];
+        // The corresponding rd_locs may be [17, 0xffff, 19] for a force
+        // spill region. A merged bridge takes SSA values 0 and 2, not frame
+        // locations 17 and 19; no physical address participates here.
+        assert_eq!(bridge_entry_indices(&args), vec![0, 2]);
+        assert!(bridge_entry_indices(&[OpRef::NONE]).is_empty());
     }
 
     #[test]

@@ -394,7 +394,7 @@ impl VirtualizableInfo {
             self.token_offset,
             item_size_for_type(Type::Ref),
             Type::Ref,
-            majit_ir::ArrayFlag::Unsigned,
+            majit_ir::ArrayFlag::Pointer,
             0,
             vinfo.clone(),
         ));
@@ -1940,6 +1940,9 @@ mod tests {
 
         let token = info.vable_token_descr.as_ref().unwrap();
         assert!(token.as_field_descr().unwrap().get_vinfo().is_none());
+        // `rvirtualizable.AbstractVirtualizableInstanceRepr._setup_repr`
+        // declares vable_token as llmemory.GCREF, not an unsigned integer.
+        assert!(token.as_field_descr().unwrap().is_pointer_field());
     }
 
     #[test]

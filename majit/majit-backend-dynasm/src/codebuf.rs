@@ -133,7 +133,11 @@ pub fn write_invalidate_positions(positions: &[majit_backend::InvalidatePosition
             position.addr
         );
         with_writable(position.addr as *mut u8, 4, || unsafe {
-            (position.addr as *mut u32).write(position.word);
+            // Require one indivisible word store even when LLVM knows more
+            // about the instruction bytes than the native code reader does.
+            // The cache flush in with_writable publishes it to instruction fetch.
+            std::sync::atomic::AtomicU32::from_ptr(position.addr as *mut u32)
+                .store(position.word, std::sync::atomic::Ordering::Relaxed);
         });
     }
 }

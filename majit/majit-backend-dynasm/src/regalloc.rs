@@ -6892,15 +6892,34 @@ mod tests {
         // is a bridge-prologue stack check whose expected size is patched
         // after assembly (emit_check_frame_depth + patch_stack_checks), not a
         // value threaded through the guard's arglocs.
-        let i0 = OpRef::input_arg_ref(0);
-        let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
-        let ops = vec![make_guard(OpCode::GuardNotForced2, 0, &[], &[i0])];
+        let token = OpRef::ref_op(0);
+        let force = Op::new(OpCode::ForceToken, &[]);
+        force.pos.set(token);
+        let inputargs = vec![];
+        let ops = vec![force, make_guard(OpCode::GuardNotForced2, 1, &[], &[token])];
 
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let output = ra.walk_operations();
+        // FORCE_TOKEN produces a Ref in a register, with no pre-existing
+        // inputarg frame home. SAVE_ALL_REGS must emit a real spill for it.
+        let Some(RegAllocOp::Perform {
+            result_loc: Some(Loc::Reg(register)),
+            ..
+        }) = output.first()
+        else {
+            panic!("FORCE_TOKEN must produce a register-resident Ref: {output:?}")
+        };
+        assert!(
+            has_move_from(&output, &Loc::Reg(*register)),
+            "missing force spill"
+        );
 
-        match &output[0] {
+        match output
+            .iter()
+            .find(|op| matches!(op, RegAllocOp::PerformGuard { .. }))
+            .expect("expected PerformGuard")
+        {
             RegAllocOp::PerformGuard {
                 arglocs, faillocs, ..
             } => {

@@ -10534,7 +10534,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // generator keeps its frame alive after leaving the portal,
                 // so force precisely this exit.  Ordinary Return deliberately
                 // remains lazy through FORCE_TOKEN + GUARD_NOT_FORCED_2.
-                let _ = majit_metainterp::jit::hint_force_virtualizable(frame);
+                f = FrameView::reload(f);
+                let _ = majit_metainterp::jit::hint_force_virtualizable(unsafe { &mut *f });
                 return LoopResult::Done(Ok(result));
             }
             Err(mut err) => {
