@@ -1537,7 +1537,16 @@ pub(super) fn rtype_jit_force_virtualizable(
         })?;
     let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_frame.as_ref())])?;
     hop.exception_cannot_occur()?;
-    Ok(hop.genop("jit_force_virtualizable", vlist, GenopResult::Void))
+    // This is a call returning None, not an operation with an impossible
+    // result. LowLevelOpList.genop(resulttype=lltype.Void) returns its Void
+    // Variable, as ExtLoopHeader.specialize_call does for a source marker.
+    // Omitting resulttype returns no Variable and makes translate_hl_to_ll
+    // require s_ImpossibleValue instead of the marker's s_None annotation.
+    Ok(hop.genop(
+        "jit_force_virtualizable",
+        vlist,
+        GenopResult::LLType(LowLevelType::Void),
+    ))
 }
 
 /// `BigInt::from(i64) -> BigInt` residual lowering, reached through
@@ -4749,12 +4758,16 @@ mod tests {
             Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int")));
         hop.args_r.borrow_mut().push(Some(frame_repr));
 
-        // Void genop yields no result variable to the caller.
-        let result = rtype_jit_force_virtualizable(&hop, &HashMap::new()).unwrap();
-        assert!(result.is_none());
+        // The marker returns None normally. Returning no Hlvalue here would
+        // tell translate_hl_to_ll that the call never returns and reject the
+        // annotator's s_None result at every descriptor gateway.
+        let result = rtype_jit_force_virtualizable(&hop, &HashMap::new())
+            .unwrap()
+            .expect("a None-returning marker must return its Void Variable");
 
         let llops = hop.llops.borrow();
         let last = llops.ops.last().expect("the force llop is emitted");
+        assert_eq!(result, last.result);
         assert_eq!(last.opname, "jit_force_virtualizable");
         assert_eq!(
             last.args.len(),

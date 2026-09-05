@@ -7085,20 +7085,13 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
-                // A prebuilt object-space singleton whose declared type is
-                // a zero-field unit struct (the dict-strategy singletons
-                // `EMPTY_DICT_STRATEGY`, `OBJECT_DICT_STRATEGY`, …).  Narrow
-                // the raw GCREF address through `__cast_instance_intrinsic[<impl>]`
-                // so the read types `SomeInstance(<impl>)` — the prebuilt
-                // instance the annotator would give it (`immutablevalue`).
-                // The bare `ConstRefAddr` types `SomePtr`, which cannot union
-                // with the classdef-less `dstrategy` field cell (`_ptr ∪
-                // <other>`); a classed instance unions cleanly (the None-side
-                // widen arm in `SomeInstance ∪ SomeInstance`).  Gated to
-                // zero-field structs so the field-bearing object singletons
-                // (`None` / `True` / `False` / `Ellipsis` / `NotImplemented`)
-                // in the same `refs` bucket keep their raw-pointer lowering.
-                if let Some(root) = self.refs_static_zerofield_struct_root(&place_ty)
+                // Bookkeeper.immutablevalue annotates a prebuilt instance
+                // with its class regardless of whether that class has fields.
+                // Preserve that owner on both unit strategy implementations
+                // and field-bearing strategy holders, whose address is stored
+                // in W_DictObject.dstrategy. A bare ConstRefAddr would instead
+                // annotate the latter as SomePtr and lose its instance repr.
+                if let Some(root) = self.refs_static_struct_root(&place_ty)
                     && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
                 {
                     let bb_id = self.block_id[mir_bb];
@@ -7976,8 +7969,21 @@ impl<'a> Lowering<'a> {
     /// class singleton — each of which leaves the ordinary path-keyed
     /// handling below to answer.
     fn pytype_addr_by_impl_identity(&self, def_id: u64) -> Option<i64> {
-        let impl_id = self.llbc.global_by_id(def_id)?.item_meta.trait_impl_id()?;
+        let global = self.llbc.global_by_id(def_id)?;
+        let item_path = global.item_meta.name_path();
+        let impl_id = global.item_meta.trait_impl_id()?;
         let row = self.llbc.trait_impl_by_id(impl_id)?;
+        let trait_id = row.get("impl_trait")?.get("id")?.as_u64()?;
+        let trait_path = self.llbc.trait_by_id(trait_id)?.item_meta.name_path();
+        // The impl identity names the OWNER, not which associated item was
+        // read.  `PyreClassPyTypeOf` also defines `DESCRIPTOR`, `PYNAME`, and
+        // the CPython flag constants; mapping any of those to the owner's
+        // PyType address would reinterpret a `PyreClassDescriptor`/scalar as
+        // `PyType`.  Select the exact trait item first, then use identity only
+        // for the part it actually proves: which class owns that `PYTYPE`.
+        if !is_class_pytype_assoc_const(&item_path, &trait_path) {
+            return None;
+        }
         // `impl_trait.generics.types[0]` is the `Self` of `impl Trait for
         // Self`. Charon puts it first whatever else the trait is generic
         // over, so this is the implementing type, not a trait parameter.
@@ -8412,6 +8418,13 @@ impl<'a> Lowering<'a> {
                 // the Some-arm `__pos_0` payload) resolves against the Option classdef
                 // instead of blocking on a classdef-less GCREF.
                 .or_else(|| self.option_residual_narrow_root(&call.dest.ty))
+                // A tuple/array returned across a call boundary has the same
+                // synthetic positional layout as one built in the caller,
+                // but `tyref_to_value_type` deliberately classifies every
+                // non-scalar as `Ref(None)`.  Recover the exact shaped owner
+                // here so the caller's `.N` reads see the TupleRepr fields
+                // registered from the callee's aggregate construction.
+                .or_else(|| tyref_positional_aggregate_root(&call.dest.ty, self.llbc))
         } else {
             None
         };
@@ -17451,14 +17464,15 @@ impl<'a> Lowering<'a> {
         Some(v)
     }
 
-    /// The struct-root canonical name of `ty` when it resolves to a
-    /// zero-field unit struct — the shape of the prebuilt dict-strategy
-    /// singletons (`EmptyDictStrategy`, `ObjectDictStrategy`, …).  The
-    /// `PlaceKind::Global` reader narrows a `refs`-bucket static of such a
-    /// type through `__cast_instance_intrinsic[<root>]` to a classed
-    /// `SomeInstance`.  Returns `None` for a field-bearing struct (the
-    /// object singletons `W_NoneObject` / `W_BoolObject` / … in the same
-    /// bucket keep their raw-pointer lowering) or any non-struct shape.
+    /// The canonical owner of a prebuilt ref whose declared type is a known
+    /// struct. Mirrors Bookkeeper.immutablevalue's SomeInstance classification
+    /// and InstanceRepr.convert_const_exact's per-instance representation.
+    /// Field-bearing instances need the same owner as zero-field ones.
+    ///
+    /// Opaque declarations do not prove the pointed-to layout. In particular,
+    /// the OnceLock globals used to initialize Python singletons are opaque in
+    /// LLBC, and their registered refs identify the initialized Python objects,
+    /// not the OnceLock containers. Keep those on their existing raw-ref path.
     ///
     /// The name is crate-stripped ([`strip_crate_prefix`]) so it matches
     /// the canonical `module::Leaf` spelling every other classdef path keys
@@ -17470,14 +17484,12 @@ impl<'a> Lowering<'a> {
     /// instance would have no `basedef` and two sibling strategy singletons
     /// (`EmptyDictStrategy` / `EmptyKwargsDictStrategy`) `commonbase` to
     /// nothing at a `mergeinputargs` join (`UnionError: no common base`).
-    fn refs_static_zerofield_struct_root(&self, ty: &TyRef) -> Option<String> {
+    fn refs_static_struct_root(&self, ty: &TyRef) -> Option<String> {
         let v = self.tyref_adt_body(ty)?;
         let def_id = inline_adt_def_id(v)?;
         let td = self.llbc.type_by_id(def_id)?;
         match &td.kind {
-            TypeDeclKind::Struct(fields) if fields.is_empty() => {
-                Some(strip_crate_prefix(&td.item_meta.name_path()))
-            }
+            TypeDeclKind::Struct(_) => Some(strip_crate_prefix(&td.item_meta.name_path())),
             _ => None,
         }
     }
@@ -20134,10 +20146,46 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
     crate::flowspace::argument::Signature,
     Option<String>,
 )> {
+    collect_fn_stubs_from_llbc_if(llbc, error_carrier, |fd| fd.signature.is_unsafe)
+}
+
+/// Collect signature-only residual stubs for every local function marked
+/// `#[dont_look_inside]`, including functions which the JIT policy correctly
+/// omitted from `CallControl::function_graphs`.
+///
+/// RPython creates the `FunctionDesc` from the callable independently of
+/// `find_all_graphs`, then `JitPolicy.look_inside_graph` merely keeps its body
+/// out of the JitCode closure.  Feeding these declarations through the same
+/// annotator-only stub carrier restores that ordering: a caller can annotate
+/// the declared residual call even though there is intentionally no body to
+/// compile.
+pub(crate) fn collect_dont_look_inside_fn_stubs_from_llbc(
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    Option<String>,
+)> {
+    let marked = dont_look_inside_set_of(llbc);
+    collect_fn_stubs_from_llbc_if(llbc, error_carrier, |fd| {
+        marked.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+    })
+}
+
+fn collect_fn_stubs_from_llbc_if(
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+    include: impl Fn(&FunDecl) -> bool,
+) -> Vec<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    Option<String>,
+)> {
     use crate::flowspace::argument::Signature;
     let mut out = Vec::new();
     for fd in llbc.iter_local_fns() {
-        if !fd.signature.is_unsafe {
+        if !include(fd) {
             continue;
         }
         // Global initializers are synthetic, not user-callable fns; the
@@ -24042,6 +24090,34 @@ fn tyref_positional_aggregate_suffix(ty: &TyRef, llbc: &Llbc) -> String {
     }
 }
 
+/// Exact synthetic owner of a non-empty tuple or fixed-size array type.
+///
+/// RPython carries a function-return tuple as `SomeTuple` and its rtyper
+/// chooses the matching per-shape `TupleRepr`.  Charon's call destination
+/// retains that complete element shape even though [`tyref_to_value_type`]
+/// only reports the common reference bank, so call-result narrowing uses this
+/// owner to preserve the same positional representation across the boundary.
+fn tyref_positional_aggregate_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let node = tyref_node(ty, llbc)?;
+    let suffix = tyref_positional_aggregate_suffix(ty, llbc);
+    if suffix.is_empty() {
+        return None;
+    }
+    if node
+        .as_object()
+        .and_then(|body| body.get("Adt"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|adt| adt.get("id"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Tuple")
+    {
+        return Some(format!("Tuple{suffix}"));
+    }
+    node.as_object()
+        .is_some_and(|body| body.contains_key("Array"))
+        .then(|| format!("Array{suffix}"))
+}
+
 /// The `<X>` enum-instantiation suffix for a destination `Option<X>` /
 /// `Result<X, E>` local `ty`.  A runtime-discriminant decomposition
 /// (`checked_neg`, `usize::try_from`) constructs the enum ROOT — no static
@@ -24692,6 +24768,20 @@ fn path_has_suffix_ignoring_raw(path: &str, key: &str) -> bool {
 /// the only input whose answer changes.
 fn path_ends_with_segments(path: &str, key: &str) -> bool {
     path_eq_ignoring_raw(path, key) || path_has_suffix_ignoring_raw(path, key)
+}
+
+/// Whether an impl-owned global is exactly
+/// `PyreClassPyTypeOf::PYTYPE`.
+///
+/// The associated-item name selects the value; the trait path selects the
+/// namespace that gives that name its meaning.  The impl id deliberately does
+/// neither — it identifies only the implementing `Self` type.  Keeping these
+/// three axes separate mirrors RPython's prebuilt lookup: object identity
+/// chooses the owner while the attribute lookup still chooses one field of
+/// that object.
+fn is_class_pytype_assoc_const(item_path: &str, trait_path: &str) -> bool {
+    item_path.rsplit("::").next() == Some("PYTYPE")
+        && path_ends_with_segments(trait_path, "pyre_object::lltype::PyreClassPyTypeOf")
 }
 
 fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
@@ -28248,9 +28338,10 @@ mod tests {
         DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
         cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
         checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
-        is_core_result_map_err_path, json_ty_is_thin_pointer_element,
+        is_class_pytype_assoc_const, is_core_result_map_err_path, json_ty_is_thin_pointer_element,
         json_ty_scalar_element_spelling, push_ptr_to_unsigned_cast, shaped_array_parts,
-        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr, tyref_to_value_type,
+        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
+        tyref_positional_aggregate_root, tyref_to_value_type,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -28286,6 +28377,27 @@ mod tests {
             checked_arith_uint_atom_is_word_sized("Usize"),
             crate::layout::target_word_size() == 8
         );
+    }
+
+    #[test]
+    fn pytype_identity_lane_selects_the_trait_item_before_the_impl_owner() {
+        let trait_path = "pyre_object::lltype::PyreClassPyTypeOf";
+        assert!(is_class_pytype_assoc_const(
+            "pyre_object::functional::<Impl>::PYTYPE",
+            trait_path,
+        ));
+        assert!(!is_class_pytype_assoc_const(
+            "pyre_object::functional::<Impl>::DESCRIPTOR",
+            trait_path,
+        ));
+        assert!(!is_class_pytype_assoc_const(
+            "pyre_object::functional::<Impl>::PYNAME",
+            trait_path,
+        ));
+        assert!(!is_class_pytype_assoc_const(
+            "other_crate::<Impl>::PYTYPE",
+            "other_crate::lltype::PyreClassPyTypeOf",
+        ));
     }
 
     #[test]
@@ -31854,6 +31966,25 @@ mod tests {
     }
 
     #[test]
+    fn positional_call_result_recovers_its_exact_tuple_repr_owner() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let pair = TyRef::Other(serde_json::json!({
+            "Adt": {
+                "id": "Tuple",
+                "generics": {"types": [usize_ty.clone(), usize_ty]}
+            }
+        }));
+        let scalar = TyRef::Other(serde_json::json!({"Literal": {"UInt": "Usize"}}));
+
+        assert_eq!(
+            tyref_positional_aggregate_root(&pair, &llbc).as_deref(),
+            Some("Tuple<usize,usize>")
+        );
+        assert_eq!(tyref_positional_aggregate_root(&scalar, &llbc), None);
+    }
+
+    #[test]
     fn positional_shapes_register_distinct_pointer_aware_struct_layouts() {
         let mut graph = FunctionGraph::new("array_shapes");
         let entry = graph.startblock;
@@ -34378,6 +34509,49 @@ mod tests {
             unwrap_residuals, 0,
             "checked conversion Result::unwrap must become a discriminant guard"
         );
+    }
+
+    /// `complex_val` returns the RPython spelling of an optional pair.  The
+    /// arithmetic helpers call `unwrap` only after their numeric dispatch has
+    /// established the value is present, so the opaque Rust combinator must be
+    /// translated to the ordinary payload guard instead of becoming a method
+    /// lookup on an Option shell.
+    #[test]
+    #[ignore]
+    fn complex_arithmetic_unwraps_lower_to_payload_guards() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        for name in [
+            "pyre_interpreter::objspace::descroperation::complex_add",
+            "pyre_interpreter::objspace::descroperation::complex_sub",
+            "pyre_interpreter::objspace::descroperation::complex_mul",
+            "pyre_interpreter::objspace::descroperation::complex_truediv",
+            "pyre_interpreter::objspace::descroperation::complex_neg",
+        ] {
+            let graph = super::lower_function(&llbc, name)
+                .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
+            let residuals: Vec<_> = graph
+                .blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(block, bb)| {
+                    bb.operations.iter().filter_map(move |op| match &op.kind {
+                        OpKind::Call {
+                            target: CallTarget::Method { name, .. },
+                            ..
+                        } if name == "unwrap" => Some((block, op.clone(), bb.exits.clone())),
+                        _ => None,
+                    })
+                })
+                .collect();
+            assert!(
+                residuals.is_empty(),
+                "{name}: Option::unwrap must become a payload guard: {residuals:#?}"
+            );
+        }
     }
 
     /// The unwrapped-list storage adapters are Rust spellings of
@@ -37370,6 +37544,120 @@ mod tests {
                 "native/runtime leaf {expected} must remain residual; got {residuals:?}"
             );
         }
+    }
+
+    /// A prebuilt holder is an instance even when it has fields. Preserve its
+    /// registered identity and class when installing it into a dict, matching
+    /// Bookkeeper.immutablevalue and W_DictObject's strategy instance slot.
+    #[test]
+    #[ignore = "requires the extracted pyre-object LLBC"]
+    fn prebuilt_strategy_holder_keeps_its_instance_repr() {
+        let llbc = Llbc::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        ))
+        .expect("load object LLBC");
+        let addr = 0x1234_5678;
+        let refs = [("dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF", addr)];
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "pyre_object::dictmultiobject::w_dict_new_kwargs",
+            crate::HostStaticAddrs {
+                refs: &refs,
+                ..Default::default()
+            },
+        )
+        .expect("lower kwargs dict constructor");
+        let raw = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::ConstRefAddr(value) if *value == addr => op.result.clone(),
+                _ => None,
+            })
+            .expect("the holder retains its registered prebuilt address");
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(&op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        result_ty: ValueType::Ref(Some(owner)),
+                    } if segments.first().map(String::as_str)
+                        == Some(crate::runtime_names::shims::CAST_INSTANCE)
+                        && owner == "dictmultiobject::DictStrategyRef"
+                        && args.as_slice() == std::slice::from_ref(&raw))
+                }),
+            "a field-bearing prebuilt holder must enter annotation as its own instance"
+        );
+
+        // This registry row is the Python object returned by the accessor,
+        // not the opaque OnceLock global that initializes it. Do not infer
+        // the container's class from the registered object's address.
+        let refs = [("noneobject::NONE_SINGLETON", addr)];
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "pyre_object::noneobject::w_none",
+            crate::HostStaticAddrs {
+                refs: &refs,
+                ..Default::default()
+            },
+        )
+        .expect("lower singleton accessor");
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(&op.kind, OpKind::ConstRefAddr(value) if *value == addr))
+        );
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(&op.kind,
+                OpKind::Call { result_ty: ValueType::Ref(Some(owner)), .. }
+                    if owner.contains("OnceLock")))
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn getset_direct_residual_keeps_a_functiondesc_without_a_jitcode_body() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let specs = super::collect_dont_look_inside_fn_stubs_from_llbc(
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+        );
+        let expected = ["pyre_interpreter", "typedef", "call_getset_fget_direct"];
+        let (_, signature, token) = specs
+            .iter()
+            .find(|(segments, _, _)| {
+                segments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected.iter().copied())
+            })
+            .expect("dont_look_inside getset trampoline must have a residual stub");
+
+        assert_eq!(signature.argnames.len(), 3);
+        assert!(
+            super::super::super::translator::rtyper::cutover::residual_return_shell(
+                token.as_deref()
+            )
+            .is_some(),
+            "the declared Result<PyObjectRef, PyError> return must be annotatable"
+        );
     }
 
     /// PyPy's deque mutation marker is an object-resident `lock` identity:

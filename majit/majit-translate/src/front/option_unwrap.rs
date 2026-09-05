@@ -104,14 +104,47 @@ fn rewire_one_unwrap_site(graph: &mut FunctionGraph, site: &UnwrapSite) -> Resul
         })
         .ok_or_else(|| format!("{name}: unwrap result var has no producer block"))?;
 
-    // The call must be A's last op (lower_call closes the block right after
-    // pushing it) so removing it leaves the receiver construction as the tail.
-    let call_idx = graph.blocks[a].operations.len() - 1;
-    if graph.blocks[a].operations[call_idx].result.as_ref() != Some(&site.result_var) {
+    // The call sits at the block tail, optionally followed by the single
+    // `__cast_instance_intrinsic(result)` that restores a returned aggregate's
+    // RPython repr identity.  This is the same lower_call shape accepted by
+    // `option_unwrap_or`: the cast is a jitcode identity, but the continuation
+    // consumes its result rather than the raw call value, so it must move into
+    // the successful arm with the extracted payload.
+    let call_idx = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.result_var))
+        .expect("result var producer resolved to block A above");
+    let last_idx = graph.blocks[a].operations.len() - 1;
+    let (cast, out_var): (Option<(Vec<String>, ValueType)>, Variable) = if call_idx == last_idx {
+        (None, site.result_var.clone())
+    } else if call_idx == last_idx - 1 {
+        let tail = &graph.blocks[a].operations[last_idx];
+        match (&tail.kind, tail.result.clone()) {
+            (
+                OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments },
+                    args,
+                    result_ty,
+                },
+                Some(narrowed),
+            ) if segments.first().map(String::as_str)
+                == Some(crate::runtime_names::shims::CAST_INSTANCE)
+                && args.as_slice() == std::slice::from_ref(&site.result_var) =>
+            {
+                (Some((segments.clone(), result_ty.clone())), narrowed)
+            }
+            _ => {
+                return Err(format!(
+                    "{name}: unwrap call is not the last op of block {a}"
+                ));
+            }
+        }
+    } else {
         return Err(format!(
             "{name}: unwrap call is not the last op of block {a}"
         ));
-    }
+    };
     // Capture the receiver enum operand (the sole argument).
     let recv = match &graph.blocks[a].operations[call_idx].kind {
         OpKind::Call { args, .. } if args.len() == 1 => args[0].clone(),
@@ -143,7 +176,7 @@ fn rewire_one_unwrap_site(graph: &mut FunctionGraph, site: &UnwrapSite) -> Resul
     let mut carried: Vec<Variable> = Vec::new();
     for arg in &saved_exit.args {
         if let LinkArg::Value(v) = arg
-            && *v != site.result_var
+            && *v != out_var
             && !carried.contains(v)
         {
             carried.push(v.clone());
@@ -187,10 +220,12 @@ fn rewire_one_unwrap_site(graph: &mut FunctionGraph, site: &UnwrapSite) -> Resul
         });
         payload
     };
+    let payload_value =
+        crate::front::option_unwrap_or::emit_narrow(graph, payload_bb, &cast, payload);
     let payload_link_args = reproduce_exit_args(
         &saved_exit,
-        &site.result_var,
-        &payload,
+        &out_var,
+        &payload_value,
         &payload_sources,
         &payload_inputs,
         &name,
@@ -204,6 +239,9 @@ fn rewire_one_unwrap_site(graph: &mut FunctionGraph, site: &UnwrapSite) -> Resul
     // The receiver construction ops stay as A's tail. `Option::Some = 1`, so
     // its payload is the true arm; `Result::Ok = 0`, so its payload is false.
     let a_id = graph.blocks[a].id;
+    if cast.is_some() {
+        graph.blocks[a].operations.remove(last_idx);
+    }
     graph.blocks[a].operations.remove(call_idx);
     let disc = graph.alloc_value_var();
     if site.niche {
@@ -342,6 +380,68 @@ mod tests {
             .filter(|blk| blk.exits.iter().any(|link| link.target == g.exceptblock))
             .count();
         assert_eq!(raises, 1, "the None arm raises to exceptblock");
+    }
+
+    /// A returned tuple/instance is narrowed immediately after `unwrap` by
+    /// `lower_call`.  The guard rewrite must move that identity cast into the
+    /// payload arm and forward the narrowed value, exactly as `unwrap_or` does.
+    #[test]
+    fn rewrite_lifts_unwrap_with_trailing_narrowing_cast() {
+        let mut g = FunctionGraph::new("test_option_unwrap_narrow");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: unwrap_target(),
+                    args: vec![opt],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let narrowed = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
+                            "Tuple<f64,f64>".to_string(),
+                        ],
+                    },
+                    args: vec![result.clone()],
+                    result_ty: ValueType::Ref(Some("Tuple<f64,f64>".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![narrowed]);
+
+        let rewritten = rewire_unwrap_call_sites(
+            &mut g,
+            &[UnwrapSite {
+                result_var: result,
+                enum_owner: "core::option::Option<(f64,f64)>".into(),
+                payload_owner: "core::option::Option<(f64,f64)>::Some".into(),
+                payload_ty: ValueType::Ref(None),
+                payload_on_disc_true: true,
+                niche: false,
+            }],
+        );
+        assert_eq!(rewritten, 1);
+        assert!(!g.blocks.iter().flat_map(|bb| &bb.operations).any(|op| {
+            matches!(&op.kind, OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                if name == "unwrap")
+        }));
+        assert!(g.blocks.iter().flat_map(|bb| &bb.operations).any(|op| {
+            matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                if segments.first().map(String::as_str)
+                    == Some(crate::runtime_names::shims::CAST_INSTANCE))
+        }));
     }
 
     /// `Result::Ok = 0`, so its payload arm is the `bool(disc)`-false exit;

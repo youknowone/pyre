@@ -2712,7 +2712,7 @@ fn declared_funcptr_type_from_legacy(
     Some(crate::translator::rtyper::lltypesystem::lltype::FuncType { args, result })
 }
 
-/// Register a batch of unsafe-fn stub
+/// Register a batch of annotator-only residual
 /// `(segments, signature, FUNC.RESULT token)` specs into `registry`.
 /// Each entry is wrapped through [`residual_return_shell`] +
 /// [`build_stub_pygraph_with_result_shell`]
@@ -2722,17 +2722,17 @@ fn declared_funcptr_type_from_legacy(
 ///   the dual gate no longer Skips with "not registered in
 ///   CallRegistry" for these paths.
 ///
-/// `specs` is typically the output of
-/// `front::mir::collect_unsafe_fn_stubs_from_llbc` (the Charon/LLBC-
-/// sourced stub-spec list).  Per-fn failures ([`residual_return_shell`]
+/// `specs` is the Charon/LLBC-sourced carrier assembled from unsafe path
+/// aliases, `dont_look_inside` declarations, and marked constructors. Per-fn
+/// failures ([`residual_return_shell`]
 /// declines the token, or registry already has the same key
 /// at a conflicting signature) propagate as silent skips — the
 /// upstream "not registered" Skip path then absorbs that specific fn
 /// while the rest of the batch lands.
 ///
 /// Mirrors `populate_call_registry_from_call_graphs`'s "register and
-/// prefill" contract but feeds from `collect_unsafe_fn_stubs_from_llbc`
-/// rather than from the `function_graphs` `GraphStore`.  The two key
+/// prefill" contract but feeds from declarations rather than from the
+/// `function_graphs` `GraphStore`.  The two key
 /// differently, so both can hold the same fn; `CallControl::unsafe_fn_stubs`
 /// carries the measured split.
 ///

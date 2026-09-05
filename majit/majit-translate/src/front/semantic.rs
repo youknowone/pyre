@@ -317,16 +317,13 @@ pub struct SemanticProgram {
     /// only hold a string (`llmemory::FieldOffset`'s `st._name`, a nested
     /// field's rendered type) can reach the identity-keyed layout maps.
     pub struct_ids: HashMap<String, Option<majit_ir::descr::StructId>>,
-    /// `(path-segments, Signature, return-lltype)` for every local
-    /// `unsafe fn` / unsafe impl-method whose return type resolves to
-    /// unit or bool, harvested from the LLBC by
-    /// `front::mir::collect_unsafe_fn_stubs_from_llbc`.  Feeds
-    /// `CallControl.unsafe_fn_stubs` →
-    /// `cutover::register_unsafe_fn_stubs` so the dual gate registers a
-    /// stub PyGraph for each, covering the "not registered in
-    /// CallRegistry" Skip cluster dominated by `pyre_object::is_*`.
-    /// These callees' bodies access raw pointers the flowspace adapter
-    /// does not model, so only a typed signature stub is registered.
+    /// Annotator-only residual declarations `(path-segments, Signature,
+    /// return-lltype)`.  The historical field name covers three sources:
+    /// unsafe path aliases, `dont_look_inside` functions whose bodies JitPolicy
+    /// excludes, and marked allocation constructors.  All retain an RPython
+    /// `FunctionDesc`-equivalent signature without becoming JitCode bodies.
+    /// Feeds `CallControl.unsafe_fn_stubs` →
+    /// `cutover::register_unsafe_fn_stubs`.
     pub unsafe_fn_stubs: Vec<(
         Vec<String>,
         crate::flowspace::argument::Signature,
