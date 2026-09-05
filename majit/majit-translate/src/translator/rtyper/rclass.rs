@@ -2904,16 +2904,10 @@ impl InstanceRepr {
     /// concretetype=self.lowleveltype)` (the upstream `convert_const`
     /// `value is None` branch).
     pub fn null_instance(&self) -> Result<_ptr, TyperError> {
-        let object_lltype = match self.object_type.clone() {
-            LowLevelType::ForwardReference(fwd) => fwd.resolved().ok_or_else(|| {
-                TyperError::message(
-                    "InstanceRepr.null_instance: object_type ForwardReference not \
-                     resolved (call setup() first)",
-                )
-            })?,
-            other => other,
-        };
-        lltype::nullptr(object_lltype).map_err(TyperError::message)
+        // rclass.InstanceRepr.null_instance passes object_type directly.
+        // A null pointer needs no object layout; Ptr retains an unresolved
+        // ForwardReference until ordinary repr setup resolves that identity.
+        lltype::nullptr(self.object_type.clone()).map_err(TyperError::message)
     }
 
     /// RPython `InstanceRepr.upcast(self, result)` (rclass.py):
@@ -5969,7 +5963,10 @@ mod tests {
         };
         let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
         let inst = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).expect("getinstancerepr");
-        Repr::setup(inst.as_ref() as &dyn Repr).expect("setup InstanceRepr");
+        assert!(matches!(
+            &inst.object_type,
+            LowLevelType::ForwardReference(fwd) if fwd.resolved().is_none()
+        ));
 
         let c = (inst.as_ref() as &dyn Repr)
             .convert_const(&ConstValue::None)
@@ -5979,6 +5976,9 @@ mod tests {
             panic!("convert_const(None) must produce LLPtr, got {:?}", c.value);
         };
         assert!(!ptr.nonzero(), "null_instance must be a null pointer");
+        Repr::setup(inst.as_ref() as &dyn Repr).expect("setup InstanceRepr after null creation");
+        assert_eq!(c.concretetype.as_ref(), Some(inst.lowleveltype()));
+        assert!(!ptr.nonzero());
     }
 
     #[test]

@@ -7085,20 +7085,13 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
-                // A prebuilt object-space singleton whose declared type is
-                // a zero-field unit struct (the dict-strategy singletons
-                // `EMPTY_DICT_STRATEGY`, `OBJECT_DICT_STRATEGY`, …).  Narrow
-                // the raw GCREF address through `__cast_instance_intrinsic[<impl>]`
-                // so the read types `SomeInstance(<impl>)` — the prebuilt
-                // instance the annotator would give it (`immutablevalue`).
-                // The bare `ConstRefAddr` types `SomePtr`, which cannot union
-                // with the classdef-less `dstrategy` field cell (`_ptr ∪
-                // <other>`); a classed instance unions cleanly (the None-side
-                // widen arm in `SomeInstance ∪ SomeInstance`).  Gated to
-                // zero-field structs so the field-bearing object singletons
-                // (`None` / `True` / `False` / `Ellipsis` / `NotImplemented`)
-                // in the same `refs` bucket keep their raw-pointer lowering.
-                if let Some(root) = self.refs_static_zerofield_struct_root(&place_ty)
+                // Bookkeeper.immutablevalue annotates a prebuilt instance
+                // with its class regardless of whether that class has fields.
+                // Preserve that owner on both unit strategy implementations
+                // and field-bearing strategy holders, whose address is stored
+                // in W_DictObject.dstrategy. A bare ConstRefAddr would instead
+                // annotate the latter as SomePtr and lose its instance repr.
+                if let Some(root) = self.refs_static_struct_root(&place_ty)
                     && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
                 {
                     let bb_id = self.block_id[mir_bb];
@@ -17471,14 +17464,15 @@ impl<'a> Lowering<'a> {
         Some(v)
     }
 
-    /// The struct-root canonical name of `ty` when it resolves to a
-    /// zero-field unit struct — the shape of the prebuilt dict-strategy
-    /// singletons (`EmptyDictStrategy`, `ObjectDictStrategy`, …).  The
-    /// `PlaceKind::Global` reader narrows a `refs`-bucket static of such a
-    /// type through `__cast_instance_intrinsic[<root>]` to a classed
-    /// `SomeInstance`.  Returns `None` for a field-bearing struct (the
-    /// object singletons `W_NoneObject` / `W_BoolObject` / … in the same
-    /// bucket keep their raw-pointer lowering) or any non-struct shape.
+    /// The canonical owner of a prebuilt ref whose declared type is a known
+    /// struct. Mirrors Bookkeeper.immutablevalue's SomeInstance classification
+    /// and InstanceRepr.convert_const_exact's per-instance representation.
+    /// Field-bearing instances need the same owner as zero-field ones.
+    ///
+    /// Opaque declarations do not prove the pointed-to layout. In particular,
+    /// the OnceLock globals used to initialize Python singletons are opaque in
+    /// LLBC, and their registered refs identify the initialized Python objects,
+    /// not the OnceLock containers. Keep those on their existing raw-ref path.
     ///
     /// The name is crate-stripped ([`strip_crate_prefix`]) so it matches
     /// the canonical `module::Leaf` spelling every other classdef path keys
@@ -17490,14 +17484,12 @@ impl<'a> Lowering<'a> {
     /// instance would have no `basedef` and two sibling strategy singletons
     /// (`EmptyDictStrategy` / `EmptyKwargsDictStrategy`) `commonbase` to
     /// nothing at a `mergeinputargs` join (`UnionError: no common base`).
-    fn refs_static_zerofield_struct_root(&self, ty: &TyRef) -> Option<String> {
+    fn refs_static_struct_root(&self, ty: &TyRef) -> Option<String> {
         let v = self.tyref_adt_body(ty)?;
         let def_id = inline_adt_def_id(v)?;
         let td = self.llbc.type_by_id(def_id)?;
         match &td.kind {
-            TypeDeclKind::Struct(fields) if fields.is_empty() => {
-                Some(strip_crate_prefix(&td.item_meta.name_path()))
-            }
+            TypeDeclKind::Struct(_) => Some(strip_crate_prefix(&td.item_meta.name_path())),
             _ => None,
         }
     }
@@ -37552,6 +37544,87 @@ mod tests {
                 "native/runtime leaf {expected} must remain residual; got {residuals:?}"
             );
         }
+    }
+
+    /// A prebuilt holder is an instance even when it has fields. Preserve its
+    /// registered identity and class when installing it into a dict, matching
+    /// Bookkeeper.immutablevalue and W_DictObject's strategy instance slot.
+    #[test]
+    #[ignore = "requires the extracted pyre-object LLBC"]
+    fn prebuilt_strategy_holder_keeps_its_instance_repr() {
+        let llbc = Llbc::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        ))
+        .expect("load object LLBC");
+        let addr = 0x1234_5678;
+        let refs = [("dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF", addr)];
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "pyre_object::dictmultiobject::w_dict_new_kwargs",
+            crate::HostStaticAddrs {
+                refs: &refs,
+                ..Default::default()
+            },
+        )
+        .expect("lower kwargs dict constructor");
+        let raw = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::ConstRefAddr(value) if *value == addr => op.result.clone(),
+                _ => None,
+            })
+            .expect("the holder retains its registered prebuilt address");
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(&op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        result_ty: ValueType::Ref(Some(owner)),
+                    } if segments.first().map(String::as_str)
+                        == Some(crate::runtime_names::shims::CAST_INSTANCE)
+                        && owner == "dictmultiobject::DictStrategyRef"
+                        && args.as_slice() == std::slice::from_ref(&raw))
+                }),
+            "a field-bearing prebuilt holder must enter annotation as its own instance"
+        );
+
+        // This registry row is the Python object returned by the accessor,
+        // not the opaque OnceLock global that initializes it. Do not infer
+        // the container's class from the registered object's address.
+        let refs = [("noneobject::NONE_SINGLETON", addr)];
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "pyre_object::noneobject::w_none",
+            crate::HostStaticAddrs {
+                refs: &refs,
+                ..Default::default()
+            },
+        )
+        .expect("lower singleton accessor");
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(&op.kind, OpKind::ConstRefAddr(value) if *value == addr))
+        );
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(&op.kind,
+                OpKind::Call { result_ty: ValueType::Ref(Some(owner)), .. }
+                    if owner.contains("OnceLock")))
+        );
     }
 
     #[test]
