@@ -16,6 +16,7 @@ a table slot, and the table is a real object the root walk forwards.
 
 import ctypes
 import gc
+import weakref
 
 payload = ["alpha", "beta"]
 box = ctypes.py_object(payload)
@@ -55,5 +56,70 @@ assert payload[-1] == 199
 number = ctypes.py_object(10**30)
 gc.collect(0)
 assert number.value == 10**30, number.value
+
+
+# CPython's `O_set` hands `PyCData_set` the referent represented by the word
+# it stored.  A same-typed `py_object` assignment therefore retains the value
+# at assignment time, not the wrapper whose `.value` can subsequently change.
+class Payload:
+    pass
+
+
+class ObjectField(ctypes.Structure):
+    _fields_ = [("value", ctypes.py_object)]
+
+
+ObjectArray = ctypes.py_object * 1
+
+
+def assert_wrapper_copy_keeps_referent(destination, write, read):
+    original = Payload()
+    original_ref = weakref.ref(original)
+    holder = ctypes.py_object(original)
+    write(destination, holder)
+    holder.value = Payload()
+    del original
+    gc.collect(0)
+    kept = original_ref()
+    assert kept is not None
+    assert read(destination) is kept
+
+
+field = ObjectField()
+assert_wrapper_copy_keeps_referent(
+    field,
+    lambda destination, value: setattr(destination, "value", value),
+    lambda destination: destination.value,
+)
+
+array = ObjectArray()
+assert_wrapper_copy_keeps_referent(
+    array,
+    lambda destination, value: destination.__setitem__(0, value),
+    lambda destination: destination[0],
+)
+
+pointer_base = ObjectArray()
+pointer = ctypes.cast(pointer_base, ctypes.POINTER(ctypes.py_object))
+assert_wrapper_copy_keeps_referent(
+    pointer,
+    lambda destination, value: destination.__setitem__(0, value),
+    lambda destination: destination[0],
+)
+
+# `None` is already held strongly by PyPy's `GlobalPyobjContainer`, and
+# CPython does not expose a redundant keepalive entry for it.
+none_field = ObjectField()
+none_field.value = None
+assert none_field._objects is None
+
+none_array = ObjectArray()
+none_array[0] = None
+assert none_array._objects is None
+
+none_pointer_base = ObjectArray()
+none_pointer = ctypes.cast(none_pointer_base, ctypes.POINTER(ctypes.py_object))
+none_pointer[0] = None
+assert "0" not in none_pointer._objects
 
 print("OK")
