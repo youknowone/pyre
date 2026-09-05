@@ -34386,6 +34386,17 @@ mod tests {
                 "on_unwind": 99
             }})
         };
+        // `TermKind::Drop` requires Charon's drop-glue `fn_ptr` (#1689).
+        // Without it `term()` fails and the analyzer treats the raw JSON as
+        // an unmodelled mention of the guard, retiring the bracket.
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": {"Regular": 0}}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
         let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
         // Callee ids: 1 = push_roots, 2 = base, 3 = pin_root, 4 = get,
         // 5 = an unrelated function.
@@ -34413,7 +34424,7 @@ mod tests {
                     block(vec![borrow(3, 2)], call(2, vec![copy(3)], 4, 2)),
                     block(vec![borrow(5, 2)], call(3, vec![copy(5), copy(1)], 6, 3)),
                     block(vec![borrow(7, 2)], call(last_callee, vec![copy(7), copy(get_index)], 8, 4)),
-                    block(vec![], serde_json::json!({"Drop": {"place": place(2), "target": 5, "on_unwind": 99}})),
+                    block(vec![], drop_guard(2, 5)),
                     block(vec![], serde_json::json!("Return")),
                 ]
             });
@@ -34446,7 +34457,7 @@ mod tests {
                     ],
                     call(4, vec![copy(7), copy(9)], 8, 4),
                 ),
-                block(vec![], serde_json::json!({"Drop": {"place": place(2), "target": 5, "on_unwind": 99}})),
+                block(vec![], drop_guard(2, 5)),
                 block(vec![], serde_json::json!("Return")),
             ]
         }))

@@ -79,8 +79,7 @@ use majit_charon_reader::ullbc::TyRef;
 
 use crate::flowspace::model::Variable;
 use crate::model::{
-    BlockId, CallFuncPtr, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind,
-    SpaceOperation, ValueType,
+    BlockId, CallFuncPtr, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
 };
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
