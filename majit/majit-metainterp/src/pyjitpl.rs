@@ -21090,9 +21090,6 @@ mod metainterp_static_data_tests {
             fn loop_header_pc(&self) -> usize {
                 0
             }
-            fn fail_args(&self) -> Option<Vec<OpRef>> {
-                None
-            }
         }
         let mut sym = NoopSym;
         let runtime = crate::ClosureRuntime::new(|_| 0);

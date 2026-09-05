@@ -62,14 +62,6 @@ impl JitCodeSym for UnpackSym {
             .expect("jd1 drain body must contain a jit_merge_point")
             .pc
     }
-
-    fn fail_args(&self) -> Option<Vec<OpRef>> {
-        Some(vec![self.w_iterator, self.items])
-    }
-
-    fn fail_args_types(&self) -> Option<Vec<Type>> {
-        Some(vec![Type::Ref, Type::Ref])
-    }
 }
 
 /// jd1 `JitState`: reuses [`PyreMeta`] (the "shape of the traced code") and the

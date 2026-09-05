@@ -584,27 +584,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         })
         .collect();
 
-    // ── fail_args ──
-    let fail_scalar_parts: Vec<TokenStream> = scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.push(self.#fname); }
-        })
-        .collect();
-    let fail_array_parts: Vec<TokenStream> = arrays
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.extend_from_slice(&self.#fname); }
-        })
-        .collect();
-    let fail_vable_identity_part: TokenStream = if has_vable_identity {
-        quote! { args.push(self.__vable_identity); }
-    } else {
-        quote! {}
-    };
-
     // ── build_meta: capture flattened array lengths ──
     let build_meta_fields: Vec<TokenStream> = arrays
         .iter()
@@ -1452,13 +1431,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     } else {
         quote! {}
     };
-    let fail_ref_scalar_parts: Vec<TokenStream> = ref_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.push(self.#fname); }
-        })
-        .collect();
     let state_ref_field_ref_arms: Vec<TokenStream> = ref_scalars
         .iter()
         .enumerate()
@@ -1634,13 +1606,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .map(|(_, f)| {
             let fname = &f.name;
             quote! { args.push(sym.#fname); }
-        })
-        .collect();
-    let fail_float_scalar_parts: Vec<TokenStream> = float_scalars
-        .iter()
-        .map(|(_, f)| {
-            let fname = &f.name;
-            quote! { args.push(self.#fname); }
         })
         .collect();
     let collect_float_scalar_values_parts: Vec<TokenStream> = float_scalars
@@ -2760,16 +2725,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     #(#set_state_array_value_arms)*
                     _ => {}
                 }
-            }
-
-            fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
-                let mut args = Vec::new();
-                #(#fail_scalar_parts)*
-                #(#fail_array_parts)*
-                #fail_vable_identity_part
-                #(#fail_ref_scalar_parts)*
-                #(#fail_float_scalar_parts)*
-                Some(args)
             }
 
             #[allow(unused_assignments, unused_variables)]

@@ -773,12 +773,19 @@ impl Trace {
     /// explicit adaptation. Constants inserted by test-only direct-op helpers
     /// are not in the pool and are visited from their operation instead.
     pub(crate) fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
-        let cached_len = self.const_ptrs.len();
-        for _ in 0..cached_len {
-            let (_, operand) = self
-                .const_ptrs
-                .swap_remove_index(0)
-                .expect("cached ConstPtr length changed during GC walk");
+        // `history.py new_ref_dict` uses `rd_hash` / `lltype.identityhash`,
+        // which survives movement. Our address-keyed map must remove ALL old
+        // keys before inserting any new ones: a destination can equal another
+        // object's old address. Removing index zero and immediately reinserting
+        // also changes which object swap_remove brings into index zero, so a
+        // fixed-count loop can repeatedly visit the same box and skip others.
+        // Drain the identities, retaining the map's capacity, then re-key once.
+        let operands: smallvec::SmallVec<[Operand; 8]> = self
+            .const_ptrs
+            .drain(..)
+            .map(|(_, operand)| operand)
+            .collect();
+        for operand in operands {
             operand.walk_const_ptr_refs(visitor);
             let Value::Ref(gcref) = operand
                 .const_value()
@@ -1025,6 +1032,37 @@ mod tests {
 
         let stale = rec.box_for_operand(OpRef::const_ptr(old));
         assert_ne!(stale, moved, "the pre-move key must no longer be cached");
+    }
+
+    #[test]
+    fn ref_pool_gc_visits_each_box_once_and_rekeys_overlapping_addresses() {
+        let mut rec = Trace::new();
+        let boxes: Vec<_> = (1..=4)
+            .map(|i| rec.box_for_operand(OpRef::const_ptr(GcRef(i * 0x1000))))
+            .collect();
+        let constants: Vec<_> = boxes.iter().map(Operand::to_opref).collect();
+        for &constant in &constants {
+            rec.record_op(OpCode::SameAsR, &[constant]);
+        }
+        rec.record_guard_with_fail_args(
+            OpCode::GuardTrue,
+            &[OpRef::const_int(1)],
+            None,
+            &constants,
+        );
+        let mut visited = Vec::new();
+        rec.walk_const_ptr_refs(&mut |reference| {
+            visited.push(reference.0);
+            reference.0 += 0x1000;
+        });
+        visited.sort_unstable();
+        assert_eq!(visited, vec![0x1000, 0x2000, 0x3000, 0x4000]);
+        assert_eq!(rec.const_ptrs.len(), 4);
+        for (index, original) in boxes.iter().enumerate() {
+            let address = GcRef((index + 2) * 0x1000);
+            assert_eq!(original.const_value(), Some(Value::Ref(address)));
+            assert_eq!(*original, rec.box_for_operand(OpRef::const_ptr(address)));
+        }
     }
 
     #[test]
