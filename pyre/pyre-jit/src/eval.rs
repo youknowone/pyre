@@ -9474,10 +9474,6 @@ fn eval_with_jit_inner(
     init_callbacks();
     #[cfg(feature = "cranelift")]
     majit_backend_cranelift::register_resumedata_deopt(crate::call_jit::cranelift_resumedata_deopt);
-    #[cfg(feature = "cranelift")]
-    majit_backend_cranelift::register_recovery_layout(
-        crate::call_jit::cranelift_recovery_layout_for_descr,
-    );
     let jit_shape = cached_unsupported_jit_shape(code);
     // Every declining shape runs the frame in the plain interpreter, so the
     // tracer never sees it. Record the decline in the census — keyed by the
@@ -14662,10 +14658,23 @@ fn replay_pending_fields(
     exit_layout: &CompiledExitLayout,
     virtuals_cache: &mut HashMap<usize, Value>,
 ) {
-    let Some(ref recovery) = exit_layout.recovery_layout else {
-        return;
-    };
-    if recovery.pending_field_layouts.is_empty() {
+    let num_failargs = exit_layout.exit_types.len() as i32;
+    // `resume.py _prepare_pendingfields` reads the list off the guard's
+    // `rd_pendingfields`.  The root loop's frontend record carries it
+    // pre-resolved in `recovery_layout`; a bridge guard has no such record
+    // (`compile.py send_bridge_to_backend`), so it is resolved off the
+    // descr-owned storage here.
+    let pending: std::borrow::Cow<'_, [majit_backend::ExitPendingFieldLayout]> =
+        match exit_layout.recovery_layout.as_deref() {
+            Some(recovery) => std::borrow::Cow::Borrowed(&recovery.pending_field_layouts),
+            None => match exit_layout.storage.as_deref() {
+                Some(storage) => {
+                    std::borrow::Cow::Owned(storage.exit_pending_field_layouts(num_failargs))
+                }
+                None => return,
+            },
+        };
+    if pending.is_empty() {
         return;
     }
 
@@ -14679,7 +14688,6 @@ fn replay_pending_fields(
         .storage
         .as_deref()
         .map(|s| s.rd_virtuals.as_slice());
-    let num_failargs = exit_layout.exit_types.len() as i32;
     let value_to_raw_bits = |value: Value| match value {
         Value::Int(i) => i,
         Value::Float(f) => f.to_bits() as i64,
@@ -14707,7 +14715,7 @@ fn replay_pending_fields(
         }
     };
 
-    for pf in &recovery.pending_field_layouts {
+    for pf in pending.iter() {
         let Some(target_ptr) = resolve_value(&pf.target) else {
             continue;
         };
@@ -15227,6 +15235,77 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_descr_storage_replays_pending_field_and_array_writes() {
+        #[repr(C)]
+        struct FieldTarget {
+            value: i64,
+        }
+
+        let mut field_target = FieldTarget { value: 1 };
+        let mut array_target = [2_i64, 3_i64];
+        let field_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(1, 0, 8, Type::Int, false),
+        );
+        let array_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleArrayDescr::new(2, 0, 8, 0, Type::Int),
+        );
+        let tagged = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGBOX)
+                .expect("small fail-argument index is taggable")
+        };
+        let pending = vec![
+            majit_ir::GuardPendingFieldEntry {
+                descr: Some(field_descr),
+                item_index: -1,
+                target: majit_ir::OpRef::input_arg_ref(0),
+                value: majit_ir::OpRef::input_arg_int(1),
+                target_tagged: tagged(0),
+                value_tagged: tagged(1),
+            },
+            majit_ir::GuardPendingFieldEntry {
+                descr: Some(array_descr),
+                item_index: 1,
+                target: majit_ir::OpRef::input_arg_ref(2),
+                value: majit_ir::OpRef::input_arg_int(3),
+                target_tagged: tagged(2),
+                value_tagged: tagged(3),
+            },
+        ];
+        let layout = CompiledExitLayout {
+            rd_loop_token: 1,
+            trace_id: 2,
+            fail_index: 3,
+            source_op_index: None,
+            exit_types: [Type::Ref, Type::Int, Type::Ref, Type::Int]
+                .into_iter()
+                .collect(),
+            is_finish: false,
+            is_exception_exit: false,
+            recovery_layout: None,
+            resume_layout: None,
+            storage: Some(majit_metainterp::resume::ResumeStorage::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                pending,
+            )),
+        };
+        let values = [
+            Value::Ref(majit_ir::GcRef(
+                (&mut field_target as *mut FieldTarget) as usize,
+            )),
+            Value::Int(41),
+            Value::Ref(majit_ir::GcRef(array_target.as_mut_ptr() as usize)),
+            Value::Int(42),
+        ];
+
+        replay_pending_fields(&values, &layout, &mut HashMap::new());
+
+        assert_eq!(field_target.value, 41);
+        assert_eq!(array_target, [2, 42]);
+    }
 
     /// `interp_jit.PyPyJitDriver.greens` carries the PyCode object, not the
     /// host CodeObject hidden behind pyre's wrapper.  The hash-only marker

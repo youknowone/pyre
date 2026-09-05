@@ -2647,6 +2647,20 @@ impl<S: JitState> JitDriver<S> {
             .get_resume_storage_with_slot_types(green_key, trace_id, fail_index)
     }
 
+    /// Descr-first form of [`Self::get_resume_storage_with_slot_types`]
+    /// (`ResumeGuardDescr.get_resumestorage`): a bridge guard has no
+    /// frontend record, so the storage is read off the descr itself.
+    pub fn get_resume_storage_with_slot_types_for_descr(
+        &self,
+        descr: &dyn majit_ir::FailDescr,
+        green_key: u64,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<(std::sync::Arc<crate::resume::ResumeStorage>, Vec<Type>)> {
+        self.meta
+            .get_resume_storage_with_slot_types_for_descr(descr, green_key, trace_id, fail_index)
+    }
+
     pub fn get_exit_types(
         &self,
         green_key: u64,
@@ -6404,13 +6418,6 @@ impl<S: JitState> JitDriver<S> {
             // compile.py handle_fail
             let fail_index = result.fail_index;
             let trace_id = result.trace_id;
-            // Taken, not cloned: `result` is dropped a few lines below, and
-            // the finish arm above — the one that carries no layout — has
-            // already returned.
-            let exit_layout = *result
-                .exit_layout
-                .take()
-                .expect("a guard exit carries its exit layout");
             // `warmstate.py execute_assembler` reads fail values from the
             // deadframe in place. Pyre projects its typed exit buffer back to
             // machine words for the resume helpers; reuse the entry scratch's
@@ -6422,6 +6429,13 @@ impl<S: JitState> JitDriver<S> {
                 .descr_arc
                 .take()
                 .expect("a guard exit carries its descr");
+            // `compile.py handle_fail(self, deadframe, ...)`: the failing
+            // guard's own `ResumeGuardDescr` is what every read below is off
+            // — its fail-arg types, its `rd_*` resume payload — not a layout
+            // assembled per failure from the frontend's records.
+            let fd: &dyn majit_ir::FailDescr = descr_arc
+                .as_fail_descr()
+                .expect("a guard exit carries a FailDescr");
             let guard_value_operand = result.guard_value_operand;
             // `compile.py handle_fail` `resumedescr.rd_loop_token`, resolved
             // once where the run handed the descr back.
@@ -6463,22 +6477,21 @@ impl<S: JitState> JitDriver<S> {
             if crate::callee_rca_enabled() {
                 eprintln!(
                     "[callee-rca][guard-fail] fail_index={} trace_id={} raw_values={:?} exit_types={:?}",
-                    fail_index, trace_id, raw_values, exit_layout.exit_types,
+                    fail_index,
+                    trace_id,
+                    raw_values,
+                    fd.fail_arg_types(),
                 );
                 if let Some(dump) = state.debug_state_fields(&compiled_meta) {
                     eprintln!("[callee-rca][post-execute-token-state]\n{dump}");
                 }
             }
-            let fallback_green_key = if exit_layout.rd_loop_token != 0 {
-                exit_layout.rd_loop_token
-            } else {
-                green_key
-            };
             // Resolved once for the whole event, where the run handed the descr
             // back, and carried here: `compile.py handle_fail` reads
             // `resumedescr.rd_loop_token` once and hands the loop it names to
-            // both the layout it looks up and the `must_compile` call.
-            let owning_key = descr_owning_key.unwrap_or(fallback_green_key);
+            // the `must_compile` call. A descr with no owner stamped is the
+            // loop that was entered.
+            let owning_key = descr_owning_key.unwrap_or(green_key);
             let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
                 &descr_arc,
                 &raw_values,
@@ -6531,18 +6544,26 @@ impl<S: JitState> JitDriver<S> {
             }
 
             // compile.py:711 resume_in_blackhole
-            // compile.py `ResumeGuardDescr` storage — borrow
-            // `rd_numb` / `rd_consts()` / `rd_virtuals` off the shared
-            // Arc so blackhole resume observes the guard-owned pool
-            // the GC walker updates (no per-call Vec clone).
-            if let Some(storage) = exit_layout.storage.as_deref() {
-                let rd_numb = storage.rd_numb.as_ref();
-                let rd_consts_slice: &[Const] = storage.rd_consts();
+            // compile.py `ResumeGuardDescr` storage — `rd_numb` /
+            // `rd_consts` / `rd_virtuals` / `rd_pendingfields` borrowed off
+            // the failing descr itself (`get_resumestorage(): return self`),
+            // so blackhole resume observes the guard-owned pool the GC
+            // walker updates, and nothing is built per failure to hold them.
+            if let Some(rd_numb) = fd.rd_numb() {
+                let rd_consts_slice: &[Const] = fd.rd_consts().unwrap_or(&[]);
 
-                // `resume.py _prepare_virtuals` — off the guard's own storage,
-                // which builds the reader-shaped virtuals once and hands the
-                // same list to every later resume off this guard.
-                let rd_virtuals_slice = Some(storage.virtual_infos());
+                // `resume.py _prepare_virtuals` reads `storage.rd_virtuals`,
+                // the reader-shaped list built at compile time. The descr
+                // carries the compile-time `RdVirtualInfo` list; converting it
+                // here is one pass per failure, and none at all for the
+                // common guard that has no virtuals.
+                let virtual_infos: Vec<crate::resume::VirtualInfo> = fd
+                    .rd_virtuals()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|rd| crate::resume::virtual_info_from_rd(rd))
+                    .collect();
+                let rd_virtuals_slice = Some(virtual_infos.as_slice());
 
                 // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
                 // curbh.setposition(jitcode, pc)`.  Per-driver
@@ -6626,9 +6647,9 @@ impl<S: JitState> JitDriver<S> {
                     rd_consts_slice,
                     all_liveness,
                     &raw_values,
-                    Some(&exit_layout.exit_types),
+                    Some(fd.fail_arg_types()),
                     rd_virtuals_slice,
-                    Some(storage.rd_pendingfields()), // rd_guard_pendingfields
+                    Some(fd.rd_pendingfields().unwrap_or(&[])), // rd_guard_pendingfields
                     Some(
                         &self.meta_interp().staticdata.virtualref_info
                             as &dyn crate::resume::VRefInfo,
@@ -7049,11 +7070,16 @@ impl<S: JitState> JitDriver<S> {
             // which resumes at the loop entry against state the recovery has
             // already rewound. The failing guard's own layout carries the same
             // header pc, so reading it first also answers without a lookup.
-            let guard_resume_pc = exit_layout
-                .recovery_layout
-                .as_ref()
-                .and_then(|recovery| recovery.frames.first())
-                .and_then(|frame| frame.header_pc)
+            // A bridge guard carries no frontend recovery layout
+            // (`compile.py send_bridge_to_backend`); the backend stamped
+            // its trace's header pc on the descr (`CompiledTraceInfo`), so
+            // that is read next.
+            let guard_resume_pc = fd
+                .trace_info_any()
+                .and_then(|info| {
+                    info.downcast_ref::<majit_backend::CompiledTraceInfo>()
+                        .map(|info| info.header_pc)
+                })
                 .or_else(|| self.get_merge_point_pc(owning_key, trace_id, fail_index))
                 .map(|pc| pc as usize)
                 .unwrap_or(target_pc);

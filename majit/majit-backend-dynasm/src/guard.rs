@@ -2,7 +2,6 @@
 /// jump offset (`history.py _attrs_` `adr_jump_offset`) lives on the
 /// metainterp `ResumeGuardDescr` (`majit-metainterp/src/compile.rs`) and
 /// is accessed here via `meta_resume_fd()` forwarding.
-use majit_ir::FailDescr;
 
 // Descr-by-address recovery is now a pure `Arc::from_raw` against the
 // `FailDescrCell` wrapper baked at codegen time —
@@ -70,13 +69,13 @@ pub use majit_backend::llmodel::decode_rd_loc_slot;
 /// answer the trait-default `0` for both methods; the layout pipeline
 /// must read position from the Vec, not from the descr.
 pub fn layout_for_fail_descr(
-    fd: &dyn FailDescr,
+    descr: &majit_ir::DescrRef,
     fail_index: u32,
     trace_id: u64,
 ) -> majit_backend::FailDescrLayout {
-    // resume.py:450-488 propagate rd_* so `compiled_exit_layout_from_backend`
-    // can reach them after the frontend trace cache evicts the owning
-    // `CompiledTrace` entry (pyjitpl.rs).
+    let fd = descr
+        .as_fail_descr()
+        .expect("layout_for_fail_descr requires a Descr that exposes the FailDescr trait");
     let fail_arg_types = fd.fail_arg_types();
     majit_backend::FailDescrLayout {
         fail_index,
@@ -92,10 +91,7 @@ pub fn layout_for_fail_descr(
         // `StoredExitLayout.recovery_layout`).
         recovery_layout: None,
         trace_info: None,
-        rd_numb: fd.rd_numb().map(|s| s.to_vec()),
-        rd_consts: fd.rd_consts().map(|s| s.to_vec()),
-        rd_virtuals: fd.rd_virtuals().map(|s| s.to_vec()),
-        rd_pendingfields: fd.rd_pendingfields().map(|s| s.to_vec()),
+        descr: Some(descr.clone()),
     }
 }
 

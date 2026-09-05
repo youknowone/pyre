@@ -61,18 +61,12 @@ impl JITMemoryProvider for CraneliftArenaMemoryProvider {
     fn allocate(&mut self, size: usize, align: u64, kind: JITMemoryKind) -> io::Result<*mut u8> {
         let align = usize::try_from(align)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "JIT alignment overflow"))?;
-        if !align.is_power_of_two() || align > region::page::size() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "JIT alignment must be a power of two no larger than a page",
-            ));
-        }
         let used = if matches!(kind, JITMemoryKind::Executable) {
             size
         } else {
             0
         };
-        let block = self.shared.arena.allocate(size, used)?;
+        let block = self.shared.arena.allocate_aligned(size, used, align)?;
         let ptr = block.ptr() as *mut u8;
         self.shared.allocations.lock().push(Allocation {
             block,

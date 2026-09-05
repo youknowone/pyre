@@ -2163,46 +2163,6 @@ pub fn register_resumedata_deopt(f: ResumeDataDeoptFn) {
     let _ = RESUMEDATA_DEOPT_FN.set(f);
 }
 
-/// On-demand layout reconstruction callback.  Returns
-/// an `ExitRecoveryLayout` for the descr at `descr_addr`, optionally
-/// prefixed by `caller_prefix`.  Implementation looks up the
-/// metainterp's `StoredExitLayout` cache (keyed by trace_id /
-/// fail_index_per_trace) and converts the cached `resume_layout` via
-/// `ResumeLayout::to_exit_recovery_layout_with_caller_prefix`.
-///
-/// Sibling of [`RESUMEDATA_DEOPT_FN`] but returns layout structure
-/// instead of replaying deopt — used by `recovery_layout_ref()` to
-/// produce `ExitRecoveryLayout` without depending on the meta-side
-/// `ResumeGuardDescr.recovery_layout` cache.
-///
-/// Returns `None` for descrs without a `ResumeGuardDescr` meta_descr
-/// (synthetic FINISH / external-JUMP) or when the StoredExitLayout
-/// lookup fails (descr not in metainterp cache, e.g. overlay
-/// synthetics).  Callers must handle `None`.
-type RecoveryLayoutFn = fn(usize, Option<&ExitRecoveryLayout>) -> Option<ExitRecoveryLayout>;
-static RECOVERY_LAYOUT_FN: OnceLock<RecoveryLayoutFn> = OnceLock::new();
-
-/// Register the on-demand layout reconstruction callback for the
-/// Path 1 epic.  pyre-jit calls this during JIT boot alongside
-/// `register_resumedata_deopt`.
-pub fn register_recovery_layout(f: RecoveryLayoutFn) {
-    let _ = RECOVERY_LAYOUT_FN.set(f);
-}
-
-/// Dispatch helper consulted by `fail_descr_recovery_layout`.
-/// Returns `None` if the callback hasn't been registered yet
-/// (cranelift in pure-backend tests without pyre-jit boot); production
-/// callers fall through to the metainterp's
-/// `trace_layout_ref.recovery_layout` fallback at
-/// `pyjitpl.rs`, matching dynasm parity.
-pub(crate) fn recovery_layout_via_callback(
-    descr_addr: usize,
-    caller_prefix: Option<&ExitRecoveryLayout>,
-) -> Option<ExitRecoveryLayout> {
-    let cb = RECOVERY_LAYOUT_FN.get().copied()?;
-    cb(descr_addr, caller_prefix)
-}
-
 /// Dispatch entry used by the four runtime-deopt callers
 /// (compiler.rs) — drives the on-demand
 /// `ResumeDataDirectReader` callback
@@ -8137,30 +8097,6 @@ impl CompiledLoop {
     }
 }
 
-/// Resolve the `ExitRecoveryLayout` for a fail descr via the on-demand
-/// callback.  The cranelift backend no longer caches a
-/// recovery layout — pyre-jit's
-/// `cranelift_recovery_layout_for_descr` reconstructs it from the
-/// metainterp's `StoredExitLayout.resume_layout` cache, matching
-/// dynasm's contract where `describe_deadframe` returns
-/// `recovery_layout: None` and consumers fall back to the metainterp's
-/// `trace_layout_ref.recovery_layout`.  Returns `None` when no
-/// callback is registered (test scaffolds without pyre-jit) or when
-/// the descr is synthetic (no `rd_loop_token_clt`).
-fn fail_descr_recovery_layout(descr: &DescrRef) -> Option<ExitRecoveryLayout> {
-    // The callback (`cranelift_recovery_layout_for_descr`) resolves the
-    // descr via `Backend::fail_descr_arc_from_addr` →
-    // `recover_fail_descr_cell`, which requires a `FailDescrCell` thin
-    // pointer.  Wrap in a fresh cell and bake its address; the local
-    // cell stays alive through the callback and the recovery bumps the
-    // refcount inside.
-    let cell = majit_ir::FailDescrCell::wrap(descr.clone());
-    let addr = Arc::as_ptr(&cell) as *const () as usize;
-    let result = recovery_layout_via_callback(addr, None);
-    drop(cell);
-    result
-}
-
 /// Read the per-trace `CompiledTraceInfo` from the meta-side
 /// per-emission slot.  Routes through the
 /// `FailDescr::trace_info_any` trait method so copied descrs return
@@ -8186,8 +8122,6 @@ fn fail_descr_layout(
         .as_fail_descr()
         .expect("fail_descr_layout requires a Descr that exposes the FailDescr trait");
     let fail_arg_types = fd.fail_arg_types();
-    let recovery = fail_descr_recovery_layout(descr);
-    let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
     majit_backend::FailDescrLayout {
         fail_index,
         source_op_index: fd.source_op_index(),
@@ -8196,12 +8130,9 @@ fn fail_descr_layout(
         fail_arg_types: fail_arg_types.to_vec(),
         is_finish: fd.is_finish(),
         is_exception_exit: fd.is_exit_frame_with_exception(),
-        recovery_layout: recovery,
-        frame_stack,
-        rd_numb: fd.rd_numb().map(|s| s.to_vec()),
-        rd_consts: fd.rd_consts().map(|s| s.to_vec()),
-        rd_virtuals: fd.rd_virtuals().map(|s| s.to_vec()),
-        rd_pendingfields: fd.rd_pendingfields().map(|s| s.to_vec()),
+        recovery_layout: None,
+        frame_stack: None,
+        descr: Some(descr.clone()),
     }
 }
 
@@ -9497,7 +9428,7 @@ impl CraneliftBackend {
             asm_memory_handle,
             module,
             func_ctx,
-            constants: majit_ir::ConstMap::new(),
+            constants: majit_ir::ConstMap::default(),
             callinfocollection: None,
             func_counter: 0,
             trace_counter: 1,
@@ -17597,10 +17528,6 @@ fn collect_guards(
             if descr.is_resume_guard() || descr.is_resume_guard_copied() {
                 as_fd(&descr).set_source_op_index(op_idx);
             }
-            // Backend no longer caches an `ExitRecoveryLayout` per descr;
-            // `fail_descr_recovery_layout` reads on demand via
-            // `recovery_layout_via_callback` (metainterp's
-            // `compute_recovery_layout_for_descr`).
             let _ = recovery_layout;
             if let Some(target) = external_jump_target {
                 fail_descr_set_external_jump_target(&descr, target);
@@ -17870,6 +17797,7 @@ impl majit_backend::Backend for CraneliftBackend {
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
+        let _writing = majit_backend::AssemblerWriting::enter();
         // `x86/assembler.py:514` parity — bump
         // `cpu.tracker.total_compiled_loops` and open the
         // `jit-mem-looptoken-alloc` debug section at the same point
@@ -18013,6 +17941,7 @@ impl majit_backend::Backend for CraneliftBackend {
         previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
+        let _writing = majit_backend::AssemblerWriting::enter();
         // `x86/runner.py:100-101` parity — bump this backend's
         // tracker and the per-loop bridges_count before assembling.
         if let Some(clt) = original_token.compiled_loop_token() {
@@ -18299,74 +18228,33 @@ impl majit_backend::Backend for CraneliftBackend {
         CraneliftBackend::set_callinfocollection(self, cic);
     }
 
-    fn store_guard_hashes(&self, token: &JitCellToken, hashes: &[u64]) {
-        let compiled = token
-            .compiled
-            .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current);
-        if let Some(compiled) = compiled {
-            for (i, &hash) in hashes.iter().enumerate() {
-                if let Some(descr) = compiled.fail_descrs.get(i) {
-                    // `compile.py` `store_hash` only fires for non-
-                    // final `AbstractResumeGuardDescr` whose status is
-                    // still 0.  Route through the FailDescr trait so the
-                    // metainterp class hierarchy answers `final_descr`
-                    // (Done*/Exit*/Propagate, compile.py:624 / 658-662 /
-                    // 1092) instead of the backend-local mirror.
-                    // `compile.py` `store_hash` only fires on
-                    // `AbstractResumeGuardDescr`.  `is_finish()` excludes
-                    // `Done*` finishes but still permits other final
-                    // non-guard descrs (`ExitFrameWithExceptionDescrRef`,
-                    // `PropagateExceptionDescr`) since they answer
-                    // `is_finish() == false`.  Gate on the canonical
-                    // `ResumeDescr` family instead.
-                    let fd = as_fd(descr);
-                    if (fd.is_resume_guard() || fd.is_resume_guard_copied()) && fd.get_status() == 0
-                    {
-                        fd.store_hash(hash);
-                    }
-                }
-            }
-        }
-    }
-
-    fn store_bridge_guard_hashes(
+    fn bridge_was_compiled(
         &self,
-        token: &JitCellToken,
+        original_token: &JitCellToken,
         source_trace_id: u64,
         source_fail_index: u32,
-        hashes: &[u64],
-    ) {
-        let compiled = token
+    ) -> bool {
+        let Some(original_compiled) = original_token
             .compiled
             .get()
-            .and_then(|c| c.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current);
-        if let Some(compiled) = compiled {
-            // Use recursive search matching compiled_bridge_fail_descr_layouts.
-            let source_descr = find_fail_descr_in_fail_descrs(
-                &compiled.fail_descrs,
-                source_trace_id,
-                source_fail_index,
-            );
-            if let Some(descr) = source_descr
-                && let Some(bridge) = fail_descr_bridge_ref(as_fd(&descr))
-            {
-                for (i, &hash) in hashes.iter().enumerate() {
-                    if let Some(bd) = bridge.fail_descrs.get(i) {
-                        // Same `ResumeDescr`-family gate as in
-                        // `store_guard_hashes` above (compile.py:826-829).
-                        let fd = as_fd(bd);
-                        if (fd.is_resume_guard() || fd.is_resume_guard_copied())
-                            && fd.get_status() == 0
-                        {
-                            fd.store_hash(hash);
-                        }
-                    }
-                }
-            }
-        }
+            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)
+        else {
+            return false;
+        };
+        find_fail_descr_in_fail_descrs(
+            &original_compiled.fail_descrs,
+            source_trace_id,
+            source_fail_index,
+        )
+        .and_then(|descr| fail_descr_bridge_ref(as_fd(&descr)))
+        .is_some()
+    }
+
+    /// The guard's dispatch cell holds the `BridgeData` once a bridge is
+    /// attached; `patch_jump_for_descr` installs it.
+    fn bridge_attached(&self, descr: &dyn majit_ir::FailDescr) -> Option<bool> {
+        Some(fail_descr_bridge_ref(descr).is_some())
     }
 
     fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {
@@ -18986,6 +18874,7 @@ impl majit_backend::Backend for CraneliftBackend {
         old: &JitCellToken,
         new: &JitCellToken,
     ) -> Result<(), BackendError> {
+        let _writing = majit_backend::AssemblerWriting::enter();
         let new_addr = new.ll_function_addr();
         if new_addr != 0 {
             old.set_ll_function_addr(new_addr);

@@ -11,6 +11,12 @@ dynasm = ["majit-metainterp/dynasm"]
 # on a busy machine. Off by default: it is process-wide, so its four relaxed
 # atomics per allocation would sit inside the timed rows otherwise.
 alloc-census = []
+# Swap the allocator under the census without changing what the census counts:
+# `pyrex` ships mimalloc as its default global allocator and this example did
+# not, so a per-bridge cost measured here was charged the platform allocator's
+# price rather than the one pyre runs on. The counters are identical across the
+# pair, which makes it a control for allocation *cost* alone.
+fast-alloc = ["dep:mimalloc"]
 
 [dependencies]
 majit-backend = { workspace = true }
@@ -18,3 +24,4 @@ majit-gc = { workspace = true }
 majit-ir = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-macros = { workspace = true }
+mimalloc = { version = "0.1", optional = true }

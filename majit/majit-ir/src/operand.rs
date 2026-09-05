@@ -76,6 +76,10 @@ pub enum Operand {
     /// same one-word payload as an `Rc`, so it does not enlarge `Operand` or
     /// the three inline operand slots in every [`Op`](crate::resoperation::Op).
     SmallInt(u64),
+    /// `opencoder.py Trace._cached_const_ptr`: null is encoded as ref-pool
+    /// index zero without adding an entry. It is immutable and needs no GC
+    /// forwarding cell, so keep the global null constant allocation-free.
+    NullRef,
     /// A constant (`history.py/268/314` `ConstInt`/`ConstFloat`/
     /// `ConstPtr`). The value lives in an `Rc<Cell<Value>>`: the `Cell` lets
     /// the GC root walker forward an inline `ConstPtr` `GcRef` in place
@@ -96,6 +100,9 @@ pub enum Operand {
 impl Operand {
     #[inline]
     fn fresh_const_value(value: Value) -> Operand {
+        if value == Value::Ref(GcRef::NULL) {
+            return Operand::NullRef;
+        }
         if let Value::Int(value) = value
             && let Some(encoded) = fresh_small_int(value)
         {
@@ -150,6 +157,7 @@ impl Operand {
             OpRef::None => Operand::None,
             OpRef::ConstInt(v) => Self::fresh_const_value(Value::Int(v)),
             OpRef::ConstFloat(v) => Operand::Const(Rc::new(Cell::new(Value::Float(v)))),
+            OpRef::ConstPtr(v) if v.is_null() => Operand::NullRef,
             OpRef::ConstPtr(v) => Operand::Const(Rc::new(Cell::new(Value::Ref(v)))),
             _ => panic!(
                 "from_opref: position-only ref {r:?} has no producer to bind — \
@@ -210,6 +218,7 @@ impl Operand {
             Operand::Op(op) => op.pos.get(),
             Operand::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp),
             Operand::SmallInt(encoded) => OpRef::const_int(small_int_value(*encoded)),
+            Operand::NullRef => OpRef::const_ptr(GcRef::NULL),
             // Re-encodes from the live `Cell` value, so a GC-moved `ConstPtr`
             // reads back at its post-move address (forwarding.rs parity).
             Operand::Const(cell) => match cell.get() {
@@ -227,7 +236,7 @@ impl Operand {
         match self {
             Operand::Op(op) => Some(op.pos.get().raw()),
             Operand::InputArg(ia) => Some(ia.index),
-            Operand::SmallInt(_) | Operand::Const(_) | Operand::None => None,
+            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => None,
         }
     }
 
@@ -237,6 +246,7 @@ impl Operand {
             Operand::Op(op) => op.pos.get().ty().unwrap_or(Type::Void),
             Operand::InputArg(ia) => ia.tp,
             Operand::SmallInt(_) => Type::Int,
+            Operand::NullRef => Type::Ref,
             Operand::Const(cell) => cell.get().get_type(),
             Operand::None => Type::Void,
         }
@@ -247,6 +257,7 @@ impl Operand {
     pub fn const_value(&self) -> Option<Value> {
         match self {
             Operand::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
+            Operand::NullRef => Some(Value::Ref(GcRef::NULL)),
             Operand::Const(cell) => Some(cell.get()),
             _ => None,
         }
@@ -260,6 +271,7 @@ impl Operand {
     pub fn get_value(&self) -> Option<Value> {
         match self {
             Operand::SmallInt(encoded) => Some(Value::Int(small_int_value(*encoded))),
+            Operand::NullRef => Some(Value::Ref(GcRef::NULL)),
             Operand::Const(cell) => Some(cell.get()),
             Operand::Op(op) => op.get_value(),
             Operand::InputArg(ia) => ia.get_value(),
@@ -282,7 +294,10 @@ impl Operand {
 
     /// `resoperation.py is_constant`.
     pub fn is_constant(&self) -> bool {
-        matches!(self, Operand::SmallInt(_) | Operand::Const(_))
+        matches!(
+            self,
+            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_)
+        )
     }
 
     pub fn is_inputarg(&self) -> bool {
@@ -337,7 +352,9 @@ impl Operand {
             let forwarded = match &cur {
                 Operand::Op(op) => op.get_forwarded(),
                 Operand::InputArg(ia) => ia.get_forwarded(),
-                Operand::SmallInt(_) | Operand::Const(_) | Operand::None => return cur,
+                Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => {
+                    return cur;
+                }
             };
             match forwarded {
                 Forwarded::None | Forwarded::Info(_) => return cur,
@@ -383,7 +400,7 @@ impl Operand {
         match self {
             Operand::Op(op) => f(&**op),
             Operand::InputArg(ia) => f(&**ia),
-            Operand::SmallInt(_) | Operand::Const(_) | Operand::None => default,
+            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => default,
         }
     }
 
@@ -394,7 +411,7 @@ impl Operand {
         match self {
             Operand::Op(op) => f(&**op),
             Operand::InputArg(ia) => f(&**ia),
-            Operand::SmallInt(_) | Operand::Const(_) | Operand::None => panic!(
+            Operand::SmallInt(_) | Operand::NullRef | Operand::Const(_) | Operand::None => panic!(
                 "Operand::{what} on a non-producer operand — only a bound \
                  Op/InputArg carries a _forwarded slot (box identity precondition)"
             ),
@@ -532,7 +549,11 @@ impl Operand {
                     cell.set(v);
                 }
             }
-            Operand::None | Operand::Op(_) | Operand::InputArg(_) | Operand::SmallInt(_) => {}
+            Operand::None
+            | Operand::Op(_)
+            | Operand::InputArg(_)
+            | Operand::SmallInt(_)
+            | Operand::NullRef => {}
         }
     }
 }
@@ -553,6 +574,7 @@ impl PartialEq for Operand {
             (Operand::Op(a), Operand::Op(b)) => Rc::ptr_eq(a, b),
             (Operand::InputArg(a), Operand::InputArg(b)) => Rc::ptr_eq(a, b),
             (Operand::SmallInt(a), Operand::SmallInt(b)) => a == b,
+            (Operand::NullRef, Operand::NullRef) => true,
             (Operand::Const(a), Operand::Const(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
@@ -581,8 +603,9 @@ impl std::hash::Hash for Operand {
                 3u8.hash(state);
                 encoded.hash(state);
             }
+            Operand::NullRef => 4u8.hash(state),
             Operand::Const(cell) => {
-                4u8.hash(state);
+                5u8.hash(state);
                 (Rc::as_ptr(cell) as usize).hash(state);
             }
         }
@@ -933,6 +956,22 @@ mod tests {
         // SmallInt deliberately replaces an Rc-sized payload. Pin this on the
         // two 64-bit production hosts so adding it cannot silently grow the
         // three inline Operand slots embedded in every Op.
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(std::mem::size_of::<Operand>(), 16);
+    }
+
+    /// `opencoder.py Trace._cached_const_ptr` reserves ref-pool index zero for
+    /// null, so recording and decoding it must not mint a forwarding cell.
+    #[test]
+    fn null_ref_is_inline_and_round_trips() {
+        let null = Operand::from_opref(OpRef::const_ptr(GcRef::NULL));
+        assert!(matches!(null, Operand::NullRef));
+        assert!(null.is_constant());
+        assert_eq!(null.type_(), Type::Ref);
+        assert_eq!(null.const_value(), Some(Value::Ref(GcRef::NULL)));
+        assert_eq!(null.to_opref(), OpRef::const_ptr(GcRef::NULL));
+        assert!(null.same_box(&Operand::const_(Const::Ref(GcRef::NULL))));
+
         #[cfg(target_pointer_width = "64")]
         assert_eq!(std::mem::size_of::<Operand>(), 16);
     }

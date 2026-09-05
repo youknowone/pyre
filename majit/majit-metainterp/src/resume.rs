@@ -13,7 +13,8 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use majit_backend::{
-    ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitVirtualLayout,
+    ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
+    ExitVirtualLayout,
 };
 use majit_ir::{Const, GcRef, OpRef, Type};
 
@@ -244,7 +245,9 @@ impl NumberingState {
             liveboxes: LiveboxMap::new(),
             num_boxes: 0,
             num_virtuals: 0,
-            livebox_types: indexmap::IndexMap::default(),
+            // At most one entry per numbered box, and `size` counts the
+            // boxes, so the table never rehashes mid-guard.
+            livebox_types: indexmap::IndexMap::with_capacity_and_hasher(size, FxBuildHasher),
         }
     }
     pub fn append_short(&mut self, item: i16) {
@@ -691,6 +694,88 @@ impl ResumeStorage {
     }
 }
 
+/// One `resume.py` PENDINGFIELDSTRUCT entry (lldescr / num / fieldnum /
+/// itemindex) as the layout the replayers consume: `itemindex >= 0` names a
+/// setarrayitem, a field descr a setfield; target and value are the tagged
+/// resume slots decoded by [`exit_source_from_tagged`].
+pub fn exit_pending_field_layout(
+    pf: &majit_ir::GuardPendingFieldEntry,
+    num_failargs: i32,
+    rd_consts: &[Const],
+    num_virtuals: i32,
+) -> ExitPendingFieldLayout {
+    // The lldescr is always present: it is captured off the SETFIELD_GC /
+    // SETARRAYITEM_GC that produced the pending field (heap.py
+    // force_lazy_sets_for_guard); pyre's producer in `optimizer.rs`'s
+    // `emit_guard_operation` mirrors this with `pf.descr = pf_op.descr`.
+    let descr = pf
+        .descr
+        .clone()
+        .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
+    let item_index =
+        if descr.as_array_descr().is_some() {
+            Some(usize::try_from(pf.item_index).expect(
+                "resume.py:1003 setarrayitem pending field requires non-negative item_index",
+            ))
+        } else if descr.as_field_descr().is_some() {
+            None
+        } else {
+            panic!(
+                "pending field descr must be FieldDescr or ArrayDescr (descr={:?})",
+                descr,
+            );
+        };
+    ExitPendingFieldLayout {
+        descr: pf.descr.clone(),
+        is_array_item: item_index.is_some(),
+        item_index,
+        target: exit_source_from_tagged(pf.target_tagged, num_failargs, rd_consts, num_virtuals),
+        value: exit_source_from_tagged(pf.value_tagged, num_failargs, rd_consts, num_virtuals),
+    }
+}
+
+/// `resume.py` tag decoding of one `fieldnums` / `rd_pendingfields` entry
+/// into the exit-slot source the recovery readers consume: TAGBOX names a
+/// deadframe slot (negative counts from the end), TAGVIRTUAL an
+/// `rd_virtuals` entry (negative for the nested virtuals
+/// `resume.py assign_number_to_virtual` numbers that way, resolved as
+/// `resume.py AbstractResumeDataReader.getvirtual_ptr` does), TAGINT an inline
+/// int and TAGCONST an `rd_consts` entry (`resume.py` `self.consts[num -
+/// TAG_CONST_OFFSET]`).
+pub fn exit_source_from_tagged(
+    tagged: i16,
+    num_failargs: i32,
+    rd_consts: &[Const],
+    num_virtuals: i32,
+) -> ExitValueSourceLayout {
+    let (val, tagbits) = majit_ir::resumedata::untag(tagged);
+    match tagbits {
+        majit_ir::resumedata::TAGBOX => {
+            let idx = if val >= 0 {
+                val as usize
+            } else {
+                (num_failargs + val) as usize
+            };
+            ExitValueSourceLayout::ExitValue(idx)
+        }
+        majit_ir::resumedata::TAGVIRTUAL => {
+            let idx = if val >= 0 {
+                val as usize
+            } else {
+                (num_virtuals + val) as usize
+            };
+            ExitValueSourceLayout::Virtual(idx)
+        }
+        majit_ir::resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64, Type::Int),
+        majit_ir::resumedata::TAGCONST => {
+            let idx = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
+            let c = rd_consts.get(idx).copied().unwrap_or(Const::Int(0));
+            ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
+        }
+        _ => ExitValueSourceLayout::Constant(0, Type::Int),
+    }
+}
+
 // Pyre is single-threaded; UnsafeCell prevents auto-Send/Sync so
 // provide them explicitly (matches RPython's non-thread-safe
 // ResumeGuardDescr).
@@ -780,6 +865,19 @@ impl ResumeStorage {
                 .map(|rd| virtual_info_from_rd(rd))
                 .collect()
         })
+    }
+
+    /// `resume.py _prepare_pendingfields` read off `rd_pendingfields`: this
+    /// guard's deferred writes as exit-slot sources, ready to replay against
+    /// the deadframe.  Derived on demand from the guard-owned payload, so
+    /// nothing is kept per guard for it.
+    pub fn exit_pending_field_layouts(&self, num_failargs: i32) -> Vec<ExitPendingFieldLayout> {
+        let rd_consts = self.rd_consts();
+        let num_virtuals = self.rd_virtuals.as_slice().len() as i32;
+        self.rd_pendingfields()
+            .iter()
+            .map(|pf| exit_pending_field_layout(pf, num_failargs, rd_consts, num_virtuals))
+            .collect()
     }
 
     pub fn with_shared_consts(
@@ -8320,9 +8418,12 @@ pub fn blackhole_from_resumedata<'a>(
         // bank before filling it so a materialization collection during
         // `consume_one_section` forwards the refs already written here (the
         // Vec buffer is stable — `setarg_r` only indexes — and the frame
-        // itself is already boxed, so chaining it moves a pointer).
-        unsafe {
-            majit_gc::shadow_stack::push_resume_ref_roots(&mut nextbh.registers_r);
+        // itself is already boxed, so chaining it moves a pointer). A pooled
+        // interpreter is rooted for its whole life already.
+        if !nextbh.is_rooted() {
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut nextbh.registers_r);
+            }
         }
 
         // resume.py:1341

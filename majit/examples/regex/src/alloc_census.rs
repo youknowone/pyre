@@ -25,7 +25,13 @@
 //!     --features dynasm,alloc-census
 //! ```
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
+
+/// The allocator the counters sit in front of. See the `fast-alloc` feature.
+#[cfg(feature = "fast-alloc")]
+const INNER: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(not(feature = "fast-alloc"))]
+const INNER: std::alloc::System = std::alloc::System;
 use std::cell::Cell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -159,30 +165,30 @@ pub struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if IN_TRACE.try_with(Cell::get).unwrap_or(false) {
-            return unsafe { System.alloc(layout) };
+            return unsafe { INNER.alloc(layout) };
         }
         observe(layout.size(), false);
         trace_size(layout.size());
-        unsafe { System.alloc(layout) }
+        unsafe { INNER.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if IN_TRACE.try_with(Cell::get).unwrap_or(false) {
-            return unsafe { System.alloc_zeroed(layout) };
+            return unsafe { INNER.alloc_zeroed(layout) };
         }
         observe(layout.size(), true);
         trace_size(layout.size());
-        unsafe { System.alloc_zeroed(layout) }
+        unsafe { INNER.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         FREES.fetch_add(1, Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { INNER.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if IN_TRACE.try_with(Cell::get).unwrap_or(false) {
-            return unsafe { System.realloc(ptr, layout, new_size) };
+            return unsafe { INNER.realloc(ptr, layout, new_size) };
         }
         // Counted as one allocation of the growth, not of the whole block: a
         // `Vec` doubling from 1 MiB to 2 MiB moves 1 MiB of new bytes, and
@@ -190,7 +196,7 @@ unsafe impl GlobalAlloc for Counting {
         let growth = new_size.saturating_sub(layout.size());
         observe(growth, false);
         trace_size(growth);
-        unsafe { System.realloc(ptr, layout, new_size) }
+        unsafe { INNER.realloc(ptr, layout, new_size) }
     }
 }
 

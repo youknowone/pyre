@@ -78,6 +78,33 @@ fn lengths() -> Vec<usize> {
     parsed
 }
 
+/// `PYRE_REGEX_ROWS=<comma-separated row indexes>` runs only those rows of
+/// [`NAMES`]. A process-wide counter such as `/usr/bin/time -l`'s
+/// `instructions retired` then charges one row alone, which is the reading
+/// that survives a loaded machine. Deselected rows are absent, not synthetic
+/// NaNs, so they cannot enter the summary's spreads or ratios.
+fn row_selected(index: usize) -> bool {
+    static ROWS: std::sync::OnceLock<Option<Vec<usize>>> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| {
+        let value = std::env::var_os("PYRE_REGEX_ROWS")?;
+        let value = value.to_string_lossy();
+        Some(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    part.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("PYRE_REGEX_ROWS contains a non-usize: {part:?}")
+                    })
+                })
+                .collect(),
+        )
+    })
+    .as_ref()
+    .is_none_or(|rows| rows.contains(&index))
+}
+
 /// The `{N}` of the post's benchmark regex `(a|b)*a(a|b){20}a(a|b)*`.
 const N: usize = 20;
 
@@ -213,7 +240,14 @@ fn bench(
     s: &[u8],
     counter: Option<&AtomicUsize>,
     mut run: impl FnMut(*mut NodeRec, &[u8]) -> bool,
-) -> Row {
+) -> Option<Row> {
+    let index = NAMES
+        .iter()
+        .position(|candidate| *candidate == name)
+        .expect("every row is named in NAMES");
+    if !row_selected(index) {
+        return None;
+    }
     assert!(
         !run(root, s),
         "{name}: the benchmark input is supposed NOT to match"
@@ -246,7 +280,7 @@ fn bench(
     };
     let compiles = counter.map_or(0, |c| c.load(Ordering::Relaxed) - before);
     rates.sort_by(f64::total_cmp);
-    Row {
+    Some(Row {
         name,
         rates,
         compiles,
@@ -254,7 +288,7 @@ fn bench(
         alloc,
         #[cfg(feature = "alloc-census")]
         alloc_sizes,
-    }
+    })
 }
 
 /// The peeled loop body of a recorded trace: everything from the last `Label`
@@ -341,7 +375,7 @@ fn main() {
     println!("the input is nonmatching(len, {N}, {SEED}) — it matches nothing, so the matcher");
     println!("must read every character and no early exit can hide the per-character cost.");
 
-    let mut sweep: Vec<(usize, [Row; 3])> = Vec::new();
+    let mut sweep: Vec<(usize, [Option<Row>; 3])> = Vec::new();
     for len in lengths() {
         let s = nonmatching(len, N, SEED);
         assert!(
@@ -368,7 +402,11 @@ fn main() {
 
         println!();
         println!("  {} chars, no match as intended:", commas(len as f64));
-        for row in &rows {
+        for (name, row) in NAMES.iter().zip(&rows) {
+            let Some(row) = row else {
+                println!("    {name:<32}: not selected");
+                continue;
+            };
             let compiled = if row.compiles > 0 {
                 format!(
                     "   {:.1} loops compiled per run",
@@ -408,35 +446,45 @@ fn main() {
 
     // Per row: the spread across the lengths, and which length was fastest —
     // the direction is what separates the two explanations below.
-    let mut shape: Vec<(f64, usize)> = Vec::new();
+    let mut shape: Vec<Option<(f64, usize)>> = Vec::new();
     for (i, name) in NAMES.iter().enumerate() {
         print!("  {name:<32}");
         let (mut lo, mut hi, mut best) = (f64::MAX, 0.0f64, 0usize);
         for (j, (_, rows)) in sweep.iter().enumerate() {
-            let m = rows[i].median();
-            lo = lo.min(m);
-            if m > hi {
-                hi = m;
-                best = j;
+            if let Some(row) = &rows[i] {
+                let m = row.median();
+                lo = lo.min(m);
+                if m > hi {
+                    hi = m;
+                    best = j;
+                }
+                print!("{:>14}", commas(m));
+            } else {
+                print!("{:>14}", "-");
             }
-            print!("{:>14}", commas(m));
         }
-        println!("{:>8.2}x", hi / lo);
-        shape.push((hi / lo, best));
+        if hi == 0.0 {
+            println!("{:>9}", "n/a");
+            shape.push(None);
+        } else {
+            println!("{:>8.2}x", hi / lo);
+            shape.push(Some((hi / lo, best)));
+        }
     }
 
     let not_flat: Vec<usize> = (0..NAMES.len())
-        .filter(|i| shape[*i].0 > FLAT_ENOUGH)
+        .filter(|i| shape[*i].is_some_and(|shape| shape.0 > FLAT_ENOUGH))
         .collect();
     if !not_flat.is_empty() {
         println!();
         println!("  FINDING: not every row reports a per-character rate.");
         for i in &not_flat {
+            let (spread, best) = shape[*i].expect("not_flat contains measured rows");
             println!(
                 "    {:<32} spread {:>6.2}x, fastest at {:>9} chars",
                 NAMES[*i],
-                shape[*i].0,
-                commas(sweep[shape[*i].1].0 as f64),
+                spread,
+                commas(sweep[best].0 as f64),
             );
         }
         println!("    A row fastest at the LONGEST input is amortizing a cost that is fixed per");
@@ -475,8 +523,9 @@ fn main() {
     let (len, rows) = sweep.last().expect("lengths() is not empty");
     let slowest = rows
         .iter()
+        .flatten()
         .min_by(|a, b| a.median().total_cmp(&b.median()))
-        .expect("three rows");
+        .expect("PYRE_REGEX_ROWS selected no benchmark rows");
     println!();
     println!(
         "SUMMARY — (a|b)*a(a|b){{{N}}}a(a|b)* over {} chars, median of {REPEATS} runs.",
@@ -490,7 +539,11 @@ fn main() {
         "  {:<32}{:>14}{:>12}",
         "implementation", "chars/s", "speedup"
     );
-    for row in rows {
+    for (name, row) in NAMES.iter().zip(rows) {
+        let Some(row) = row else {
+            println!("  {name:<32}{:>26}", "not selected");
+            continue;
+        };
         println!(
             "  {:<32}{:>14}{:>11.1}x",
             row.name,
@@ -501,14 +554,16 @@ fn main() {
     println!("  {:<32}{:>26}", "CPython `re`", "not ported here");
 
     // ── the two ratios the post makes its claims from ──────────────────────
-    let jit = rows[R_JIT].median();
-    let aot = rows[R_INTERP].median();
     println!();
     println!("the two ratios the post's headline claims are made of:");
-    println!(
-        "  majit JIT / the same matcher compiled ahead of time : {:>5.1}x",
-        jit / aot
-    );
+    if let (Some(jit), Some(aot)) = (&rows[R_JIT], &rows[R_INTERP]) {
+        println!(
+            "  majit JIT / the same matcher compiled ahead of time : {:>5.1}x",
+            jit.median() / aot.median()
+        );
+    } else {
+        println!("  majit JIT / the same matcher compiled ahead of time :   n/a");
+    }
     println!("      the comparable quantity in the post is its own 16,500,000 / 720,000 = 22.9x,");
     println!("      on its 2010 machine. Both sides divide a JIT that specialized on the regex");
     println!("      by the same algorithm compiled ahead of time — here `rustc -O`, there");
@@ -543,6 +598,21 @@ fn main() {
         "this run took {:.1}s of wall clock, all of it inside the rows above.",
         started.elapsed().as_secs_f64()
     );
+
+    // The bridge row, on stderr so it never enters the tables above. `BRIDGES`
+    // is what the guards earned; `BRIDGE_OPS` is how much trace each carried,
+    // and the quotient is the unit a per-bridge cost divides by.
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bridges = shortcircuit::BRIDGES.load(Relaxed);
+        if bridges != 0 {
+            eprintln!(
+                "bridges {bridges}, ops {}, {:.1} ops/bridge",
+                shortcircuit::BRIDGE_OPS.load(Relaxed),
+                shortcircuit::BRIDGE_OPS.load(Relaxed) as f64 / bridges as f64,
+            );
+        }
+    }
 
     if bad != 0 {
         std::process::exit(1);

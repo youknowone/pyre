@@ -296,6 +296,10 @@ pub struct BlackholeInterpreter {
     pub position: usize,
     /// Caller frame in the blackhole frame chain.
     pub nextblackholeinterp: Option<Box<BlackholeInterpreter>>,
+    /// Whether `acquire_interp` registered this interpreter's traced fields
+    /// with `shadow_stack::register_bh_interp` for its whole life (the
+    /// pooled, boxed case). `run()` roots an unregistered one per call.
+    rooted: bool,
     /// Free-list link owned by `BlackholeInterpBuilder.blackholeinterps`.
     /// This is distinct from `nextblackholeinterp`, exactly as upstream's
     /// `back` pool link is distinct from the live caller-frame chain.
@@ -527,6 +531,14 @@ thread_local! {
     static EMPTY_JITCODE: std::sync::Arc<JitCode> = std::sync::Arc::new(JitCode::default());
 }
 
+impl Drop for BlackholeInterpreter {
+    fn drop(&mut self) {
+        if self.rooted {
+            majit_gc::shadow_stack::unregister_bh_interp(&self.registers_r);
+        }
+    }
+}
+
 impl Default for BlackholeInterpreter {
     /// Sentinel-value interpreter used by
     /// `BlackholeInterpBuilder::acquire_interp`'s `unwrap_or_default()`
@@ -557,6 +569,7 @@ impl Default for BlackholeInterpreter {
             jitcode: EMPTY_JITCODE.with(std::sync::Arc::clone),
             position: 0,
             nextblackholeinterp: None,
+            rooted: false,
             back: None,
             return_type: BhReturnType::Void,
             aborted: false,
@@ -961,6 +974,12 @@ impl BlackholeInterpreter {
                 self.setarg_f(i, val);
             }
         }
+    }
+
+    /// Whether this interpreter's traced fields are registered as GC roots
+    /// for its whole life (`acquire_interp`).
+    pub fn is_rooted(&self) -> bool {
+        self.rooted
     }
 
     /// blackhole.py cleanup_registers
@@ -1714,23 +1733,22 @@ impl BlackholeInterpreter {
         // that caller it reads a stale/zeroed frame (its `locals_cells_stack_w`
         // slot NULL) and a vable opcode dereferences it.  Rooting the full
         // pending chain here mirrors the RPython invariant.
-        let bh_depth = unsafe {
-            let depth = majit_gc::shadow_stack::push_bh_regs(
-                &mut self.registers_r,
-                &mut self.tmpreg_r,
-                &mut self.exception_last_value,
-            );
-            let mut caller = self.nextblackholeinterp.as_deref_mut();
-            while let Some(frame) = caller {
-                majit_gc::shadow_stack::push_bh_regs(
-                    &mut frame.registers_r,
-                    &mut frame.tmpreg_r,
-                    &mut frame.exception_last_value,
-                );
-                caller = frame.nextblackholeinterp.as_deref_mut();
+        // A pooled interpreter is registered for its whole life
+        // (`acquire_interp`); only one built outside the pool is rooted here.
+        let bh_depth = majit_gc::shadow_stack::bh_regs_depth();
+        unsafe {
+            let mut frame = Some(&mut *self);
+            while let Some(f) = frame {
+                if !f.rooted {
+                    majit_gc::shadow_stack::push_bh_regs(
+                        &mut f.registers_r,
+                        &mut f.tmpreg_r,
+                        &mut f.exception_last_value,
+                    );
+                }
+                frame = f.nextblackholeinterp.as_deref_mut();
             }
-            depth
-        };
+        }
         let vable_roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
         unsafe {
             let mut current = Some(&mut *self);
@@ -1752,9 +1770,11 @@ impl BlackholeInterpreter {
                 // SLOT so the walker rewrites it, the same shape
                 // `blackhole_from_resumedata` already applies to the resume
                 // reader's own `virtualizable_ptr` for the chain-build window.
-                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
-                    &mut frame.virtualizable_ptr,
-                ));
+                if !frame.rooted {
+                    majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
+                        &mut frame.virtualizable_ptr,
+                    ));
+                }
                 if !frame.virtualizable_info.is_null() {
                     let vinfo = &*frame.virtualizable_info;
                     vinfo.push_resume_ref_roots_for_registers(&frame.registers_r);
@@ -2755,7 +2775,20 @@ impl BlackholeInterpBuilder {
             self.blackholeinterps = head.back.take();
             head
         } else {
-            Box::new(BlackholeInterpreter::default())
+            let mut bh = Box::new(BlackholeInterpreter::default());
+            // The interpreter is a GC object upstream, so its ref-holding
+            // fields are traced for as long as it exists. The box gives them
+            // a fixed address; `Drop` unregisters.
+            unsafe {
+                majit_gc::shadow_stack::register_bh_interp(
+                    &mut bh.registers_r,
+                    &mut bh.tmpreg_r,
+                    &mut bh.exception_last_value,
+                    &mut bh.virtualizable_ptr,
+                );
+            }
+            bh.rooted = true;
+            bh
         };
         // RPython blackhole.py:284-289:
         //   self.cpu = builder.cpu
@@ -3519,11 +3552,9 @@ mod tests {
     fn handler_state_field_moves_between_register_slots() {
         // Two scalars: slot 0, slot 1. load_state_field copies a scalar slot
         // into a working register; store_state_field copies back.
-        let mut bh = BlackholeInterpreter {
-            state_field_layout: StateFieldLayout::new(2, vec![], 0, 0),
-            registers_i: vec![10, 20, 0, 0],
-            ..BlackholeInterpreter::default()
-        };
+        let mut bh = BlackholeInterpreter::default();
+        bh.state_field_layout = StateFieldLayout::new(2, vec![], 0, 0);
+        bh.registers_i = vec![10, 20, 0, 0];
 
         // load_state_field/di: field_idx=1 (u16 LE) → dest reg 2.
         let next = handler_load_state_field_di(&mut bh, &[1, 0, 2], 0).unwrap();
@@ -3543,11 +3574,9 @@ mod tests {
         // arg keeps r0). load_state_field_ref copies a ref slot into a
         // working ref register; store_state_field_ref copies back. Raw
         // pointer bits round-trip.
-        let mut bh = BlackholeInterpreter {
-            state_field_layout: StateFieldLayout::with_ref_scalars(0, vec![], 0, 2, 1, 0),
-            registers_r: vec![0x9999, 0xAAAA, 0xBBBB, 0, 0],
-            ..BlackholeInterpreter::default()
-        };
+        let mut bh = BlackholeInterpreter::default();
+        bh.state_field_layout = StateFieldLayout::with_ref_scalars(0, vec![], 0, 2, 1, 0);
+        bh.registers_r = vec![0x9999, 0xAAAA, 0xBBBB, 0, 0];
 
         // load_state_field_ref/dr: field_idx=1 (u16 LE) → dest ref reg 3.
         let next = handler_load_state_field_ref_dr(&mut bh, &[1, 0, 3], 0).unwrap();
@@ -3569,12 +3598,10 @@ mod tests {
     #[test]
     fn handler_state_array_indexes_flattened_slots() {
         // 1 scalar (slot 0) + 1 fixed array of len 4 (slots 1..5).
-        let mut bh = BlackholeInterpreter {
-            state_field_layout: StateFieldLayout::new(1, vec![4], 0, 0),
-            // [scalar, a0, a1, a2, a3, idx_reg, dest_reg]
-            registers_i: vec![0, 100, 101, 102, 103, 0, 0],
-            ..BlackholeInterpreter::default()
-        };
+        let mut bh = BlackholeInterpreter::default();
+        bh.state_field_layout = StateFieldLayout::new(1, vec![4], 0, 0);
+        // [scalar, a0, a1, a2, a3, idx_reg, dest_reg]
+        bh.registers_i = vec![0, 100, 101, 102, 103, 0, 0];
 
         // load_state_array/dii: array_idx=0, index_reg=5 (holds 2), dest=6.
         bh.registers_i[5] = 2;

@@ -2206,9 +2206,12 @@ fn jit_blackhole_resume_from_guard(
     // unboxed ints are treated as pointers → SIGSEGV. Both come out of one
     // layout resolution so the storage and the types cannot describe
     // different deadframes.
-    if let Some((storage, deadframe_types)) =
-        driver.get_resume_storage_with_slot_types(actual_green_key, trace_id, fail_index)
-    {
+    if let Some((storage, deadframe_types)) = driver.get_resume_storage_with_slot_types_for_descr(
+        descr_fd,
+        actual_green_key,
+        trace_id,
+        fail_index,
+    ) {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
@@ -4496,13 +4499,18 @@ fn jit_ca_handle_guard_failure(
     // compile.py: get exit_layout from the compiled trace.
     // Use owning_key (not green_key) — after retrace the descriptor
     // may belong to a different compiled entry than green_key.
+    // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
+    // descr's own; a bridge guard has no frontend record.
     let exit_layout = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp().get_compiled_exit_layout_in_trace(
-            owning_key,
-            source_trace_id,
-            source_fail_index,
-        )
+        descr_arc.as_fail_descr().and_then(|fd| {
+            driver.meta_interp().get_compiled_exit_layout_for_descr(
+                fd,
+                owning_key,
+                source_trace_id,
+                source_fail_index,
+            )
+        })
     };
     let Some(exit_layout) = exit_layout else {
         return false;
@@ -4612,13 +4620,18 @@ fn try_compile_ca_bridge(
         };
         return CaBridgeAttempt { terminal_declined };
     }
+    // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
+    // descr's own; a bridge guard has no frontend record.
     let exit_layout = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp().get_compiled_exit_layout_in_trace(
-            owning_key,
-            source_trace_id,
-            source_fail_index,
-        )
+        descr_arc.as_fail_descr().and_then(|fd| {
+            driver.meta_interp().get_compiled_exit_layout_for_descr(
+                fd,
+                owning_key,
+                source_trace_id,
+                source_fail_index,
+            )
+        })
     };
     let Some(exit_layout) = exit_layout else {
         return CaBridgeAttempt {
@@ -7988,34 +8001,6 @@ pub fn cranelift_resumedata_deopt(
     // 9. Replace outputs with rebuilt.
     *outputs = rebuilt;
     true
-}
-
-/// Pyre-jit side of the on-demand
-/// `ExitRecoveryLayout` reconstruction callback registered into
-/// cranelift via `register_recovery_layout` (eval.rs:init_callbacks).
-/// Used by `CraneliftFailDescr::recovery_layout_ref` to derive the
-/// layout from the metainterp-side `StoredExitLayout.resume_layout`
-/// summary instead of reading the
-/// `ResumeGuardDescr.recovery_layout` cache.
-///
-/// Returns `None` for synthetic descrs (FINISH / external-JUMP /
-/// overlay) without a `ResumeGuardDescr` meta_descr or for descrs
-/// whose `compiled_loops` entry has been evicted; callers fall back
-/// to the meta-side slot read in that case.
-#[cfg(feature = "cranelift")]
-pub fn cranelift_recovery_layout_for_descr(
-    descr_addr: usize,
-    caller_prefix: Option<&majit_backend::ExitRecoveryLayout>,
-) -> Option<majit_backend::ExitRecoveryLayout> {
-    use majit_backend::Backend;
-
-    let (driver, _) = crate::eval::driver_pair();
-    let backend = driver.meta_interp().backend();
-    let descr = backend.fail_descr_arc_from_addr(descr_addr);
-    let fd = descr.as_fail_descr()?;
-    driver
-        .meta_interp()
-        .compute_recovery_layout_for_descr(fd, caller_prefix)
 }
 
 #[cfg(test)]

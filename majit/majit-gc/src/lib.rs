@@ -38,6 +38,8 @@ pub mod oldgen;
 pub mod rawrefcount;
 pub mod rewrite;
 pub mod rgil;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod rmmap;
 pub mod shadow_stack;
 pub mod trace;
 pub mod weakref;

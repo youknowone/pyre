@@ -12,7 +12,7 @@
 /// `MetaInterp.history.record*` mirroring
 /// `pyjitpl.py:2455+ self.history.record2(...)`.
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{DescrRef, GcRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 
 /// opencoder.py `cut_point()` — RPython 5-tuple
 /// `(_pos, _count, _index, len(_snapshot_data), len(_snapshot_array_data))`.
@@ -230,6 +230,13 @@ pub struct Trace {
     /// body abort whose speculative operations were cut back to the setup
     /// position (`history.cut` in `pyjitpl.py`).
     recorded_ops_total: usize,
+    /// `opencoder.py Trace._refs_dict` / `_cached_const_ptr`: one canonical
+    /// constant-ref box per non-null address for the lifetime of this trace.
+    /// The byte-stream recorder has the same pool; this copy lives
+    /// only at the legacy `Vec<Op>` boundary until that recorder is swapped
+    /// out, and prevents every repeated ConstPtr operand from allocating a
+    /// fresh `Rc<Cell<Value>>` in the meantime.
+    const_ptrs: crate::FxIndexMap<GcRef, Operand>,
 }
 
 impl Trace {
@@ -247,6 +254,7 @@ impl Trace {
             guard_count: 0,
             box_count: 0,
             recorded_ops_total: 0,
+            const_ptrs: crate::FxIndexMap::default(),
         }
     }
 
@@ -311,7 +319,7 @@ impl Trace {
     /// directly. Frame registers and the public `record_*` API stay OpRef; the
     /// optimizer bridges back with `Operand::to_opref`, which round-trips to the
     /// same `OpRef` the `from_opref` view produced.
-    fn box_args(&self, args: &[OpRef]) -> smallvec::SmallVec<[Operand; 3]> {
+    fn box_args(&mut self, args: &[OpRef]) -> smallvec::SmallVec<[Operand; 3]> {
         args.iter().map(|&a| self.box_for_operand(a)).collect()
     }
 
@@ -331,7 +339,18 @@ impl Trace {
     /// `Operand`s that compare equal under `Operand::eq` (`Rc::ptr_eq`). This is
     /// the real box object — `MIFrame.registers_r` holds these in `pyjitpl.py` —
     /// so consumers can key by box identity instead of flat `OpRef`.
-    pub(crate) fn box_for_operand(&self, r: OpRef) -> Operand {
+    pub(crate) fn box_for_operand(&mut self, r: OpRef) -> Operand {
+        if let OpRef::ConstPtr(gcref) = r {
+            if gcref.is_null() {
+                return Operand::NullRef;
+            }
+            if let Some(cached) = self.const_ptrs.get(&gcref) {
+                return cached.clone();
+            }
+            let operand = Operand::from_opref(r);
+            self.const_ptrs.insert(gcref, operand.clone());
+            return operand;
+        }
         if r.is_none() || r.is_constant() {
             return Operand::from_opref(r);
         }
@@ -578,13 +597,14 @@ impl Trace {
     /// from the snapshot via `op.store_final_boxes(liveboxes)` in the
     /// optimizer's `store_final_boxes_in_guard`.
     pub fn set_op_fail_args(&mut self, opref: OpRef, fail_args: &[OpRef]) {
+        let boxed_fail_args = self.box_args(fail_args).iter().cloned().collect();
         let op = self
             .ops
             .iter()
             .rev()
             .find(|op| op.pos.get() == opref)
             .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
-        op.setfailargs(self.box_args(fail_args).iter().cloned().collect());
+        op.setfailargs(boxed_fail_args);
     }
 
     /// Set `fail_arg_types` on the last recorded op. Used by
@@ -745,6 +765,56 @@ impl Trace {
     /// Access the recorded operations.
     pub fn ops(&self) -> &[OpRc] {
         &self.ops
+    }
+
+    /// Visit each `ConstPtr` box once and re-key `_refs_dict` after a moving
+    /// collection. RPython's `new_ref_dict` follows moved keys as part of the
+    /// translated GC; Rust's `IndexMap` does not, so the re-key is the minimal
+    /// explicit adaptation. Constants inserted by test-only direct-op helpers
+    /// are not in the pool and are visited from their operation instead.
+    pub(crate) fn walk_const_ptr_refs(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        let cached_len = self.const_ptrs.len();
+        for _ in 0..cached_len {
+            let (_, operand) = self
+                .const_ptrs
+                .swap_remove_index(0)
+                .expect("cached ConstPtr length changed during GC walk");
+            operand.walk_const_ptr_refs(visitor);
+            let Value::Ref(gcref) = operand
+                .const_value()
+                .expect("_refs_dict contains only ConstPtr operands")
+            else {
+                unreachable!("_refs_dict contains only ConstPtr operands")
+            };
+            self.const_ptrs.insert(gcref, operand);
+        }
+
+        let is_pooled_const_ptr = |arg: &Operand| {
+            let Some(Value::Ref(gcref)) = arg.const_value() else {
+                return false;
+            };
+            self.const_ptrs
+                .get(&gcref)
+                .is_some_and(|cached| cached == arg)
+        };
+        for op in &self.ops {
+            for arg in op.args.borrow().iter() {
+                if !is_pooled_const_ptr(arg) {
+                    arg.walk_const_ptr_refs(visitor);
+                }
+            }
+            if let Some(fail_args) = op.fail_args.borrow().as_ref() {
+                for arg in fail_args {
+                    if !is_pooled_const_ptr(arg) {
+                        arg.walk_const_ptr_refs(visitor);
+                    }
+                }
+            }
+            if let Some(Value::Ref(mut gcref)) = op.get_value() {
+                visitor(&mut gcref);
+                op.set_value(Value::Ref(gcref));
+            }
+        }
     }
 
     /// Test-only direct append. Production callers go through
@@ -936,6 +1006,25 @@ mod tests {
 
         // Distinct positions are distinct boxes.
         assert_ne!(rec.box_for_operand(i0), rec.box_for_operand(i1));
+    }
+
+    /// `opencoder.py Trace._cached_const_ptr`: repeated non-null pointers use
+    /// one box, and a moving collection re-keys the address dictionary.
+    #[test]
+    fn const_ptr_operands_share_the_trace_ref_pool_and_rekey_after_gc() {
+        let mut rec = Trace::new();
+        let old = GcRef(0x1000);
+        let first = rec.box_for_operand(OpRef::const_ptr(old));
+        let second = rec.box_for_operand(OpRef::const_ptr(old));
+        assert_eq!(first, second, "same address must reuse one ConstPtr box");
+
+        rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
+        let moved = rec.box_for_operand(OpRef::const_ptr(GcRef(0x2000)));
+        assert_eq!(first, moved, "moved address must resolve to the same box");
+        assert_eq!(moved.const_value(), Some(Value::Ref(GcRef(0x2000))));
+
+        let stale = rec.box_for_operand(OpRef::const_ptr(old));
+        assert_ne!(stale, moved, "the pre-move key must no longer be cached");
     }
 
     #[test]

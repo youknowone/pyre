@@ -1927,6 +1927,7 @@ name = "majit-backend"
 version = "0.0.2"
 dependencies = [
  "indexmap",
+ "libc",
  "majit-gc",
  "majit-ir",
  "majit-translate",
@@ -2016,6 +2017,7 @@ version = "0.0.2"
 dependencies = [
  "indexmap",
  "parking_lot",
+ "rustc-hash",
  "serde",
  "smallvec",
  "vecmap-rs",
@@ -3150,6 +3152,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "mimalloc",
 ]
 
 [[package]]

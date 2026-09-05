@@ -1311,7 +1311,7 @@ impl TraceCtx {
         effectinfo: Option<&majit_ir::EffectInfo>,
         argboxes: &[OpRef],
     ) {
-        if std::env::var_os("MAJIT_PROBE_SUBSCR").is_some() {
+        if probe_subscr_enabled() {
             let ei_summary = effectinfo.map(|ei| {
                 format!(
                     "extraeffect={:?} forces_vorv={} can_raise={} plain_call={} oopspec={:?}",
@@ -2089,7 +2089,7 @@ impl TraceCtx {
     /// the box-keyed dicts upstream (e.g. `heapcache.py` `cache_anything[ref_box]`).
     /// Deterministic: the same recorded position always yields an `Operand`
     /// wrapping the same producer `Rc`.
-    pub fn operand_for(&self, opref: OpRef) -> majit_ir::operand::Operand {
+    pub fn operand_for(&mut self, opref: OpRef) -> majit_ir::operand::Operand {
         self.recorder.box_for_operand(opref)
     }
 
@@ -2348,6 +2348,7 @@ impl TraceCtx {
                     Operand::Op(o) => format!("{:?}", o.pos.get()),
                     Operand::InputArg(ia) => format!("IA{}", ia.index),
                     Operand::SmallInt(_) => format!("C{:?}", a.const_value().unwrap()),
+                    Operand::NullRef => "CRef(NULL)".to_string(),
                     Operand::Const(c) => format!("C{:?}", c.get()),
                     Operand::None => "_".to_string(),
                 })
@@ -7397,4 +7398,13 @@ mod tests {
         );
         assert!(!len.is_constant());
     }
+}
+
+/// `MAJIT_PROBE_SUBSCR` startup-only diagnostic gate, read once: changes made
+/// with `set_var` / `remove_var` after the first lookup do not take effect.
+/// This sits on the path every recorded call takes, and `getenv` per operation
+/// was 4% of tracing.
+fn probe_subscr_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAJIT_PROBE_SUBSCR").is_some())
 }

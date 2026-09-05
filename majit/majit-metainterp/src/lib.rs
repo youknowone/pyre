@@ -2010,6 +2010,12 @@ fn guard_census_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("MAJIT_GUARD_CENSUS").is_some())
 }
 
+/// An `IndexMap` keyed by a small integer (a green key, a trace id, a fail
+/// index, a box position): RPython's `dict` hashes an int as itself, so the
+/// lookups the guard-failure and optimizer paths make per event cost no
+/// hashing to speak of; the default `RandomState` (SipHash) does.
+pub(crate) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
+
 pub fn guard_census_record(green_key: u64, trace_id: u64, fail_index: u32) {
     if !guard_census_enabled() {
         return;
