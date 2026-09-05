@@ -258,17 +258,26 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
     // `bridges_compiled=7`. Re-record these two alongside that baseline.
     assert_eq!(stat_value(&stderr, "compiles"), 8);
     assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 7);
-    // `emit_null_home_slots` now compresses the three qualifying trace-entry
-    // Ref-home runs into `memory.fill`.  They are not callee-frame clears: the
-    // CALL_ASSEMBLER allocation follows upstream `malloc_cond_varsize_frame`,
-    // which only bumps/reserves nursery space.  Pin the legitimate prologue
-    // census so restoring a per-CA payload fill still adds an instruction and
-    // fails this regression.
-    assert_eq!(
-        stderr.matches("memory.fill").count(),
-        3,
-        "recursive CA emitted a memory.fill outside the three Ref-home prologues:\n{stderr}"
-    );
+    let wat: Vec<_> = stderr.lines().map(str::trim).collect();
+    for (i, _) in wat
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == "memory.fill")
+    {
+        // Ref-home clears are frame-relative; the forbidden nursery refill is
+        // relative to the CALL_ASSEMBLER allocation scratch local instead.
+        let frame_home_fill = i >= 5
+            && wat[i - 5] == "local.get 0"
+            && wat[i - 4].starts_with("i32.const ")
+            && wat[i - 3] == "i32.add"
+            && wat[i - 2] == "i32.const 0"
+            && wat[i - 1].starts_with("i32.const ");
+        assert!(
+            frame_home_fill,
+            "recursive CA refills a nursery that is already zeroed near:\n{}",
+            wat[i.saturating_sub(5)..=i].join("\n")
+        );
+    }
 }
 
 #[test]

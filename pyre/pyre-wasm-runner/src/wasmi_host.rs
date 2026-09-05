@@ -18,6 +18,7 @@ use wasmi::{
 };
 
 use crate::CALL_RESULT_OFS;
+use crate::host_path::{guest_path_to_host, host_path_to_guest};
 
 /// Per-store host state, mirroring the wasmtime path's `Host`. wasmi needs the
 /// engine handle stored too, because trace modules are compiled from inside an
@@ -418,11 +419,13 @@ fn host_cwd(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -> i64 {
     let Ok(cwd) = std::env::current_dir() else {
         return -1;
     };
-    let bytes = cwd.as_os_str().as_encoded_bytes();
+    let Some(bytes) = host_path_to_guest(&cwd) else {
+        return -1;
+    };
     if bytes.len() > buf_cap as usize {
         return bytes.len() as i64;
     }
-    match memory.write(&mut *caller, buf_ptr as usize, bytes) {
+    match memory.write(&mut *caller, buf_ptr as usize, &bytes) {
         Ok(()) => bytes.len() as i64,
         Err(_) => -1,
     }
@@ -463,9 +466,9 @@ fn host_sleep_ns(nanos: i64) {
 /// Read a host path argument out of wasm linear memory as the filesystem name
 /// it spells.
 ///
-/// The guest sends the bytes its own `OsStr` is.  On unix those are the bytes
-/// the filesystem takes, and a name with no UTF-8 spelling is one
-/// `host_list_dir` can report -- so it has to be one this can take back.
+/// The guest sends the bytes its own `OsStr` is. `guest_path_to_host` keeps
+/// Unix bytes intact and decodes the absolute-path transport spelling used on
+/// Windows; see `host_path_to_guest`.
 fn host_path(
     caller: &mut Caller<'_, Host>,
     path_ptr: u32,
@@ -474,17 +477,7 @@ fn host_path(
     let memory = caller.data().memory?;
     let mut bytes = vec![0u8; path_len as usize];
     memory.read(&*caller, path_ptr as usize, &mut bytes).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        Some(std::ffi::OsString::from_vec(bytes))
-    }
-    // A Windows name is UTF-16, so bytes with no UTF-8 spelling name nothing
-    // there and are refused rather than guessed at.
-    #[cfg(not(unix))]
-    {
-        String::from_utf8(bytes).ok().map(std::ffi::OsString::from)
-    }
+    guest_path_to_host(bytes)
 }
 
 /// `pyre_host.host_stdlib_root`: write `$PYRE_STDLIB` into the wasm buffer.
@@ -492,14 +485,19 @@ fn host_stdlib_root(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -
     let Some(root) = caller.data().stdlib_root.clone() else {
         return -1;
     };
-    let bytes = root.as_bytes();
+    let Some(bytes) = host_path_to_guest(Path::new(&root)) else {
+        return -1;
+    };
     if bytes.len() > buf_cap as usize {
         return bytes.len() as i64;
     }
     let Some(memory) = caller.data().memory else {
         return -1;
     };
-    if memory.write(&mut *caller, buf_ptr as usize, bytes).is_err() {
+    if memory
+        .write(&mut *caller, buf_ptr as usize, &bytes)
+        .is_err()
+    {
         return -1;
     }
     bytes.len() as i64

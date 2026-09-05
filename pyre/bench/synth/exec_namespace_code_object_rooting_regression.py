@@ -104,6 +104,17 @@ def exec_separate_locals():
     return locals_ns.get("r")
 
 
+def eval_separate_locals():
+    # `eval` plants through `__contains__` / `__setitem__` rather than
+    # `setdefault`, and its locals argument rides the same window: the caller
+    # owns the mapping, so a relocation inside the plant leaves the frame
+    # naming the vacated block while the caller's own dict still reads back
+    # correctly.
+    globals_ns = ContainsNS()
+    locals_ns = {"src": {"x": 5}}
+    return eval("src.get('x')", globals_ns, locals_ns)
+
+
 def exec_precompiled_code():
     # A code object the caller already holds must answer the same way.
     namespace = SetdefaultNS()
@@ -131,6 +142,7 @@ def main():
     check("eval-contains", eval_contains, 1)
     check("eval-setitem", eval_setitem, 2)
     check("exec-separate-locals", exec_separate_locals, 3)
+    check("eval-separate-locals", eval_separate_locals, 5)
     check("exec-precompiled-code", exec_precompiled_code, 4)
 
     warmed = warm(200)

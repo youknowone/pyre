@@ -3,7 +3,7 @@
 
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::lower_function_with_static_addrs;
-use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
+use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
 use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
 use std::sync::OnceLock;
 
@@ -50,6 +50,13 @@ fn lower_function(
 fn interp() -> &'static Llbc {
     static LLBC: OnceLock<Llbc> = OnceLock::new();
     LLBC.get_or_init(|| Llbc::load(INTERP).expect("load pyre-interpreter.ullbc"))
+}
+
+fn is_root_scope_close(op: &OpKind) -> bool {
+    matches!(op,
+        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+            if segments.last().map(String::as_str) == Some("drop_in_place")
+                && segments.iter().any(|s| s == "RootScope"))
 }
 
 #[test]
@@ -376,6 +383,31 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
     assert_eq!(
         source_predicate_calls, 0,
         "the source PyError predicate must be gone after the drain fusion"
+    );
+
+    let reraise = graph
+        .blocks
+        .iter()
+        .find(|b| {
+            b.operations.iter().any(|op| {
+                matches!(&op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str)
+                            == Some("exception_object_matches_stop_iteration"))
+            })
+        })
+        .and_then(|b| {
+            b.exits
+                .iter()
+                .find(|link| link.exitcase == Some(ExitCase::Bool(false)))
+        })
+        .expect("fused predicate has a reraise edge");
+    assert!(
+        graph.blocks[reraise.target.0]
+            .operations
+            .iter()
+            .any(|op| is_root_scope_close(&op.kind)),
+        "drain reraise closes its RootScope"
     );
 
     let exc_kind_calls = graph

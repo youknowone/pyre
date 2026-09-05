@@ -429,7 +429,24 @@ pub unsafe fn context_add_roots(
 pub type NativeResult<T> = Result<T, (i32, String)>;
 
 fn io_error(error: std::io::Error) -> (i32, String) {
-    (error.raw_os_error().unwrap_or(-1), error.to_string())
+    // PyPy `_SSLContext.keylog_filename` raises the errno returned by
+    // `BIO_new_file`, and CPython `_Py_GetErrorHandler` likewise exposes a C
+    // errno to the OSError subclass machinery.  Rust's `raw_os_error()` is a
+    // Win32 status on Windows, so normalise the kinds used by SSL file I/O to
+    // their POSIX errno before crossing the native/interpreter boundary.
+    #[cfg(windows)]
+    let errno = match error.kind() {
+        std::io::ErrorKind::NotFound => libc::ENOENT,
+        std::io::ErrorKind::AlreadyExists => libc::EEXIST,
+        std::io::ErrorKind::PermissionDenied => libc::EACCES,
+        std::io::ErrorKind::Interrupted => libc::EINTR,
+        std::io::ErrorKind::InvalidInput => libc::EINVAL,
+        _ => error.raw_os_error().unwrap_or(libc::EIO),
+    };
+    #[cfg(not(windows))]
+    let errno = error.raw_os_error().unwrap_or(-1);
+
+    (errno, error.to_string())
 }
 
 fn pem_error(message: impl std::fmt::Display) -> (i32, String) {

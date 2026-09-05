@@ -429,15 +429,22 @@ impl MmapPattern {
     /// # Safety
     /// The caller must uphold every validity, runtime-type, aliasing, and
     /// lifetime invariant required by the object arguments for the entire call.
-    unsafe fn acquire(
-        obj: pyre_object::PyObjectRef,
-        who: &str,
-    ) -> Result<Self, crate::PyError> {
-        if !unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
-            return Err(crate::PyError::type_error(format!(
-                "{who}: pattern must be bytes-like"
-            )));
-        }
+    unsafe fn acquire(obj: pyre_object::PyObjectRef) -> Result<Self, crate::PyError> {
+        // `PyObject_GetBuffer(args[0], &view, PyBUF_SIMPLE)` both admits the
+        // pattern and reports why it is turned down, so every exporter
+        // `readbuf_w` answers is a pattern here — a `memoryview`, an
+        // `array.array` and another mapping alongside `bytes` and `bytearray`.
+        unsafe { crate::builtins::acquire_readbuf(obj) }.map_err(|err| match err.kind {
+            // [3.14-spec] CPython `PyObject_GetBuffer` quotes `tp_name` in
+            // this gateway's refusal; PyPy `ObjSpace._getarg_error`, reached
+            // by `W_MMap.find` / `rfind`, reports it without quotes (and
+            // spells its None case simply `None`).
+            crate::PyErrorKind::TypeError => crate::PyError::type_error(format!(
+                "a bytes-like object is required, not '{}'",
+                crate::error::type_name_of(obj)
+            )),
+            _ => err,
+        })?;
         let _ = pyre_object::gc_roots::pin_root(obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let held = unsafe {
@@ -453,11 +460,9 @@ impl MmapPattern {
     /// # Safety
     /// The caller must uphold every validity, runtime-type, aliasing, and
     /// lifetime invariant required by the object arguments for the entire call.
-    unsafe fn data(&self) -> &'static [u8] {
+    unsafe fn data(&self) -> Result<&'static [u8], crate::PyError> {
         unsafe {
-            pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(
-                self.slot,
-            ))
+            crate::builtins::acquire_readbuf(pyre_object::gc_roots::shadow_stack_get(self.slot))
         }
     }
 }
@@ -470,6 +475,115 @@ impl Drop for MmapPattern {
             unsafe { crate::builtins::buffer_export_decref(obj) };
         }
     }
+}
+
+/// `mmap_gfind_lock_held` — the search `find` and `rfind` share, `reverse`
+/// apart.
+///
+/// [3.14-spec] CPython's generated `mmap_mmap_find` / `mmap_mmap_rfind`
+/// gateways count the arguments and acquire the `view: Py_buffer` export
+/// before `mmap_gfind_lock_held`, so a wrong argument count is reported ahead
+/// of a wrong pattern type and both ahead of the closed-mapping check.  PyPy's
+/// gateway counts first too, but `W_MMap.find` / `rfind` check the mapping
+/// before `ObjSpace.bufferstr_w` acquires the pattern; its argument-count and
+/// rejected-pattern wording differs as well.
+///
+/// [3.14-spec] `end` is converted only when `start` is not `None`, so
+/// `m.find(b"Z", None, 5)` searches to the end of the mapping and never runs
+/// the `__index__` of `5`.  `interp_mmap.py find` converts each argument on its
+/// own and has no `None` to pass through, so it rejects an explicit one.
+#[cfg(any(unix, windows))]
+fn mmap_gfind(
+    who: &str,
+    args: &[pyre_object::PyObjectRef],
+    reverse: bool,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    // `_PyArg_CheckPositional(who, nargs, 1, 3)` over the arguments the
+    // gateway is given, the receiver the descriptor bound aside.
+    let nargs = args.len().saturating_sub(1);
+    if !(1..=3).contains(&nargs) {
+        let (bound, limit) = if nargs < 1 {
+            ("at least", 1)
+        } else {
+            ("at most", 3)
+        };
+        let plural = if limit == 1 { "" } else { "s" };
+        return Err(crate::PyError::type_error(format!(
+            "{who} expected {bound} {limit} argument{plural}, got {nargs}"
+        )));
+    }
+    let obj = args[0];
+    let _roots = pyre_object::gc_roots::push_roots();
+    // Taken before the conversions below, which run `__index__`, and released
+    // when this returns — the `Py_buffer` converter's export brackets the whole
+    // call.  `interp_mmap.py find` snapshots `space.bufferstr_w(w_tofind)` here
+    // instead, which neither sees an in-place edit made by one of those hooks
+    // nor refuses a resize.
+    let pattern = unsafe { MmapPattern::acquire(args[1]) }?;
+    // `mmap_gfind_lock_held` takes the `self->pos` and `self->size` defaults
+    // and performs its first `CHECK_VALID` before either conversion.
+    let (_, len_at_entry) = mmap_ptr(obj)?;
+    let cur = mmap_get_attr_i64(obj, "_pos") as usize;
+    let (start_raw, end_raw) = match args.get(2) {
+        Some(&start_obj) if !unsafe { pyre_object::is_none(start_obj) } => {
+            // Both upstreams finish converting the optional arguments before
+            // checking the mapping again.  In particular, an end conversion
+            // still runs after the start conversion closes the mapping.
+            let start = crate::baseobjspace::int_w(crate::baseobjspace::space_index(start_obj)?)?;
+            let end = match args.get(3) {
+                Some(&end_obj) if !unsafe { pyre_object::is_none(end_obj) } => {
+                    Some(crate::baseobjspace::int_w(
+                        crate::baseobjspace::space_index(end_obj)?,
+                    )?)
+                }
+                _ => None,
+            };
+            (Some(start), end)
+        }
+        _ => (None, None),
+    };
+    // `rmmap.find` reads `self.data` and `self.size` at this point, after the
+    // `check_valid()` that follows `getindex_w`: an `__index__` above is free
+    // to `resize()` the mapping, which installs a new view at a new address.
+    // Both the pointer and every bound are therefore taken from the mapping as
+    // it is now.
+    let (p, len) = mmap_ptr(obj)?;
+    let clamp = |v: i64| {
+        if v < 0 {
+            ((v + len as i64).max(0)) as usize
+        } else {
+            (v as usize).min(len)
+        }
+    };
+    let start = start_raw.map_or_else(|| cur.min(len), clamp);
+    // [3.14-spec] the clamp below the `end = self->size` default only ever
+    // lowers the value, so a mapping grown by one of the conversions above
+    // keeps the size it had on the way in.  `interp_mmap.py find` reads
+    // `self.mmap.size` after the start conversion instead, which reports the
+    // new one.
+    let end = end_raw.map_or_else(|| len_at_entry.min(len), clamp);
+    if start > end {
+        return Ok(pyre_object::w_int_new(-1));
+    }
+    let needle = unsafe { pattern.data() }?;
+    if needle.is_empty() {
+        let empty = if reverse { end } else { start };
+        return Ok(pyre_object::w_int_new(empty as i64));
+    }
+    let hay = unsafe { std::slice::from_raw_parts(p.add(start), end - start) };
+    if needle.len() > hay.len() {
+        return Ok(pyre_object::w_int_new(-1));
+    }
+    let last = hay.len() - needle.len();
+    let matches = |i: &usize| &hay[*i..*i + needle.len()] == needle;
+    let pos = if reverse {
+        (0..=last).rev().find(matches)
+    } else {
+        (0..=last).find(matches)
+    };
+    Ok(pyre_object::w_int_new(
+        pos.map_or(-1, |i| (start + i) as i64),
+    ))
 }
 
 /// Sweep-time counterpart of PyPy `W_MMap.__del__` / `rmmap.MMap.close`.
@@ -967,133 +1081,13 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "find",
-        crate::make_builtin_function("find", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("find() missing pattern"));
-            }
-            let obj = args[0];
-            let (_, len_at_entry) = mmap_ptr(obj)?;
-            let _roots = pyre_object::gc_roots::push_roots();
-            // Taken before the conversions below, which run `__index__`, and
-            // released when this returns — `mmap.mmap.find` reaches its pattern
-            // through the `Py_buffer` converter, whose export brackets the
-            // whole call.  `interp_mmap.py find` snapshots
-            // `space.bufferstr_w(w_tofind)` here instead, which neither sees an
-            // in-place edit made by one of those hooks nor refuses a resize.
-            let pattern = unsafe { MmapPattern::acquire(args[1], "find") }?;
-            // `interp_mmap.py find(w_tofind, w_start=None,
-            // w_end=None)` defaults w_start to `self.mmap.pos` then
-            // routes through rmmap.find which handles negative start /
-            // end by adding `size` and clamping to 0.
-            let cur = mmap_get_attr_i64(obj, "_pos") as usize;
-            let start_raw = match args.get(2) {
-                Some(&value) => Some(mmap_index_w(obj, value)?),
-                None => None,
-            };
-            let end_raw = match args.get(3) {
-                Some(&value) => Some(mmap_index_w(obj, value)?),
-                None => None,
-            };
-            // `rmmap.find` reads `self.data` and `self.size` at this point,
-            // after the `check_valid()` that follows `getindex_w`: an
-            // `__index__` above is free to `resize()` the mapping, which
-            // installs a new view at a new address.  Both the pointer and
-            // every bound are therefore taken from the mapping as it is now.
-            let (p, len) = mmap_ptr(obj)?;
-            let clamp = |v: i64| {
-                if v < 0 {
-                    ((v + len as i64).max(0)) as usize
-                } else {
-                    (v as usize).min(len)
-                }
-            };
-            let start = start_raw.map_or_else(|| cur.min(len), clamp);
-            // [3.14-spec] `mmap_gfind_lock_held` evaluates `end = self->size`
-            // at entry and the clamp below it only ever lowers the value, so a
-            // mapping grown by one of the conversions above keeps the size it
-            // had on the way in.  `interp_mmap.py find` reads `self.mmap.size`
-            // after the start conversion instead, which reports the new one.
-            let end = end_raw.map_or_else(|| len_at_entry.min(len), clamp);
-            if start > end {
-                return Ok(pyre_object::w_int_new(-1));
-            }
-            let needle = unsafe { pattern.data() };
-            if needle.is_empty() {
-                return Ok(pyre_object::w_int_new(start as i64));
-            }
-            let hay = unsafe { std::slice::from_raw_parts(p.add(start), end - start) };
-            if needle.len() > hay.len() {
-                return Ok(pyre_object::w_int_new(-1));
-            }
-            let pos = (0..=hay.len().saturating_sub(needle.len()))
-                .find(|&i| &hay[i..i + needle.len()] == needle)
-                .map(|i| (start + i) as i64)
-                .unwrap_or(-1);
-            Ok(pyre_object::w_int_new(pos))
-        }),
+        crate::make_builtin_function("find", |args| mmap_gfind("find", args, false)),
     ) };
 
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "rfind",
-        crate::make_builtin_function("rfind", |args| {
-            if args.len() < 2 {
-                return Err(crate::PyError::type_error("rfind() missing pattern"));
-            }
-            let obj = args[0];
-            let (_, len_at_entry) = mmap_ptr(obj)?;
-            let _roots = pyre_object::gc_roots::push_roots();
-            // Taken before the conversions below, which run `__index__`, and
-            // released when this returns — `mmap.mmap.rfind` reaches its pattern
-            // through the `Py_buffer` converter, whose export brackets the
-            // whole call.  `interp_mmap.py rfind` snapshots
-            // `space.bufferstr_w(w_tofind)` here instead, which neither sees an
-            // in-place edit made by one of those hooks nor refuses a resize.
-            let pattern = unsafe { MmapPattern::acquire(args[1], "rfind") }?;
-            // `interp_mmap.py rfind(w_tofind, w_start=None,
-            // w_end=None)` defaults w_start to `self.mmap.pos`, not 0.
-            // Negative args run through rmmap.find which adds `size`
-            // and clamps to 0.
-            let cur = mmap_get_attr_i64(obj, "_pos") as usize;
-            let start_raw = match args.get(2) {
-                Some(&value) => Some(mmap_index_w(obj, value)?),
-                None => None,
-            };
-            let end_raw = match args.get(3) {
-                Some(&value) => Some(mmap_index_w(obj, value)?),
-                None => None,
-            };
-            // As in `find`: the mapping `getindex_w` left behind is the one
-            // this reads, so the address and every bound come from it.
-            let (p, len) = mmap_ptr(obj)?;
-            let clamp = |v: i64| {
-                if v < 0 {
-                    ((v + len as i64).max(0)) as usize
-                } else {
-                    (v as usize).min(len)
-                }
-            };
-            let start = start_raw.map_or_else(|| cur.min(len), clamp);
-            // As in `find`: the entry size bounds the default end.
-            let end = end_raw.map_or_else(|| len_at_entry.min(len), clamp);
-            if start > end {
-                return Ok(pyre_object::w_int_new(-1));
-            }
-            let needle = unsafe { pattern.data() };
-            if needle.is_empty() {
-                return Ok(pyre_object::w_int_new(end as i64));
-            }
-            let hay = unsafe { std::slice::from_raw_parts(p.add(start), end - start) };
-            if needle.len() > hay.len() {
-                return Ok(pyre_object::w_int_new(-1));
-            }
-            let pos = (0..=hay.len().saturating_sub(needle.len()))
-                .rev()
-                .find(|&i| &hay[i..i + needle.len()] == needle)
-                .map(|i| (start + i) as i64)
-                .unwrap_or(-1);
-            Ok(pyre_object::w_int_new(pos))
-        }),
+        crate::make_builtin_function("rfind", |args| mmap_gfind("rfind", args, true)),
     ) };
 
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -1744,10 +1738,20 @@ fn mmap_new_object(
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(cls);
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let obj = W_MMap::allocate_stable(W_MMap {
+    // PyPy `mmap_new` / `W_MMap.__init__` creates the wrapper through
+    // `space.allocate_instance(W_MMap, w_subtype)`: it is an ordinary young
+    // GC object, not a non-moving side owner.  That placement is observable
+    // on Windows because the lightweight destructor closes the mapping
+    // section that otherwise prevents a mapped file from being truncated or
+    // unlinked.  The native mapping itself lives in the stable `Box` behind
+    // `backend`; no address derived from this movable wrapper is retained.
+    let pytype = unsafe {
+        &*<W_MMap as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE
+    };
+    let obj = pyre_object::lltype::malloc_typed_managed(W_MMap {
         ob: pyre_object::PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+            ob_type: pytype,
+            w_class: pyre_object::pyobject::get_instantiate(pytype),
         },
         map: 0,
         storage: std::ptr::null_mut(),
@@ -1757,10 +1761,17 @@ fn mmap_new_object(
         mode: mode as i64,
         offset,
         exports: 0,
-    });
-    crate::typedef::tag_subclass_instance(obj, unsafe {
-        pyre_object::gc_roots::shadow_stack_get(cls_slot)
-    })
+    }) as pyre_object::PyObjectRef;
+    // `tag_subclass_instance` can allocate while it installs mapdict state;
+    // reload the movable wrapper through the same root bracket that protects
+    // `cls` across the allocation above.
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    crate::typedef::tag_subclass_instance(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+    );
+    pyre_object::gc_roots::shadow_stack_get(obj_slot)
 }
 
 // `interp_mmap.py:55-130 mmap_new` / CPython 3.14's `trackfd` addition.
