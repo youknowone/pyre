@@ -2445,6 +2445,64 @@ pub fn direct_word_abi_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
     ]
 }
 
+/// Install the wasm guest-side residual-call trampoline.
+///
+/// Consumers with additional exact-function ABI knowledge can install their
+/// own hook and delegate its fallback to [`residual_host_call`].
+#[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+pub fn install_residual_host_call() {
+    majit_backend::call_stub::set_residual_host_call(Some(residual_host_call));
+}
+
+/// Call a residual target using the backend-owned call area and host import.
+///
+/// This is the wasm transport for `llmodel.py AbstractLLCPU.bh_call_i` and its
+/// siblings. Upstream uses native ABI call builders; wasm requires reflection
+/// for targets whose real signature is not the uniform word ABI. Keep that
+/// platform adaptation here until those calls carry exact typed signatures.
+#[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+pub fn residual_host_call(func_ptr: usize, args: &[i64]) -> i64 {
+    use codegen::{CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_NARGS_OFS, CALL_RESULT_OFS, MAX_CALL_ARGS};
+
+    assert!(
+        args.len() <= MAX_CALL_ARGS,
+        "residual_host_call: arity {} exceeds {MAX_CALL_ARGS}",
+        args.len()
+    );
+    if let Some(result) = direct_word_abi_call(func_ptr, args) {
+        return result;
+    }
+    let base = RESIDUAL_CALL_SCRATCH.0.get() as *mut u8;
+    unsafe {
+        (base.add(CALL_FUNC_OFS as usize) as *mut i64).write_unaligned(func_ptr as i64);
+        (base.add(CALL_NARGS_OFS as usize) as *mut i64).write_unaligned(args.len() as i64);
+        for (i, &arg) in args.iter().enumerate() {
+            (base.add(CALL_ARGS_OFS as usize + i * 8) as *mut i64).write_unaligned(arg);
+        }
+        jit_call_host(base as u32);
+        (base.add(CALL_RESULT_OFS as usize) as *const i64).read_unaligned()
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+#[link(wasm_import_module = "majit_host")]
+unsafe extern "C" {
+    fn jit_call_host(frame_ptr: u32);
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+struct ResidualCallScratch(core::cell::UnsafeCell<[u8; codegen::MIN_FRAME_BYTES]>);
+
+// A wasm module instance is single-threaded. Nested calls synchronously consume
+// their arguments before reusing the buffer and write their result before the
+// outer call reads its own result.
+#[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+unsafe impl Sync for ResidualCallScratch {}
+
+#[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+static RESIDUAL_CALL_SCRATCH: ResidualCallScratch =
+    ResidualCallScratch(core::cell::UnsafeCell::new([0; codegen::MIN_FRAME_BYTES]));
+
 /// Configure the dormant terminal-decline regression hook.
 pub fn set_force_ca_terminal_decline(selector: u64) {
     FORCE_CA_TERMINAL_DECLINE.store(selector, Ordering::Relaxed);
