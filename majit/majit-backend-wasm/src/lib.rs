@@ -3854,8 +3854,6 @@ impl majit_backend::Backend for WasmBackend {
                 })
             })
             .collect();
-        register_fail_descrs(&fail_descrs);
-        Self::register_meta_descrs(token, &fail_descrs);
         if let Some(table) = gc_table {
             Self::register_gc_table(token, table);
         }
@@ -3955,6 +3953,8 @@ impl majit_backend::Backend for WasmBackend {
             input_types: inputargs.iter().map(|ia| ia.tp).collect(),
             func_handle: std::cell::Cell::new(func_handle),
             pending_wasm_bytes: std::cell::RefCell::new(defer_host_compile.then_some(wasm_bytes)),
+            compiled_loop_token: token.compiled_loop_token_expect(),
+            descrs_registered: std::cell::Cell::new(false),
             fail_descrs: std::cell::RefCell::new(fail_descrs),
             num_inputs: inputargs.len(),
             max_output_slots,
@@ -4003,6 +4003,12 @@ impl majit_backend::Backend for WasmBackend {
             .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledWasmLoop>())
             .expect("newly compiled wasm loop is missing");
+        // Native builds accept the encoded module as a test artifact. On the
+        // real wasm host, eager compilation crossed the acceptance check
+        // above; a deferred trace registers from `materialize_func_handle`.
+        if !defer_host_compile || cfg!(not(target_arch = "wasm32")) {
+            compiled.register_descrs_once();
+        }
         // For a pending self target this is the exact map already embedded in
         // the module's CA arm. Reuse it for the published metadata so the
         // loop and its self-callee have demonstrably identical geometry. A
@@ -4821,9 +4827,6 @@ impl majit_backend::Backend for WasmBackend {
                 })
             })
             .collect();
-        register_fail_descrs(&bridge_descrs);
-        Self::register_meta_descrs(original_token, &bridge_descrs);
-
         // Register the bridge module into the shared table, then publish its
         // descrs and flip the source guard's cell. Order matters: the descrs
         // must be resolvable (appended) before the cell makes the guard dispatch
@@ -4844,6 +4847,11 @@ impl majit_backend::Backend for WasmBackend {
                     .to_string(),
             ));
         }
+        // The host accepted the bridge. Only now publish its global exit
+        // descriptors and attach their resume-data tracer to the source CLT;
+        // a rejected module can never execute and must retain neither.
+        register_fail_descrs(&bridge_descrs);
+        Self::register_meta_descrs(original_token, &bridge_descrs);
         // Past every path that can fail with no module published: from here the
         // probe exists and its callback owns the pending entry.
         pending_guard.disarm();

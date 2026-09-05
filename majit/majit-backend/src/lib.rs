@@ -2313,10 +2313,17 @@ impl AsmMemoryManagerInner {
         self.free_blocks.remove(&start);
         self.free_blocks_end.remove(&stop);
 
-        let allocated_stop = start + length;
-        if stop - allocated_stop >= ASM_MIN_FRAGMENT {
-            self.add_free_block(allocated_stop, stop);
-        }
+        let requested_stop = start + length;
+        let allocated_stop = if stop - requested_stop >= ASM_MIN_FRAGMENT {
+            self.add_free_block(requested_stop, stop);
+            requested_stop
+        } else {
+            // asmmemmgr.py `malloc`: a remainder below MIN_FRAGMENT stays
+            // part of the returned allocation.  Returning `requested_stop`
+            // here would lose that tail from both the live block and the free
+            // maps, preventing the two neighbours from coalescing on drop.
+            stop
+        };
         let mapped = (newly_mapped.is_some()).then_some(stop - start);
         Ok((start, allocated_stop, mapped))
     }
@@ -3036,7 +3043,7 @@ pub trait Backend: Send {
             is_exception_exit: descr.is_exit_frame_with_exception(),
             recovery_layout: None,
             frame_stack: None,
-            descr: None,
+            descr: Some(self.get_latest_descr_arc(frame)),
         })
     }
 
@@ -4637,6 +4644,24 @@ mod tests {
         assert_eq!(stats.get_stats(), (ASM_LARGE_ALLOC_SIZE, 300));
         drop(second);
         assert_eq!(stats.get_stats(), (ASM_LARGE_ALLOC_SIZE, 0));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn asm_memory_manager_returns_unsplittable_tail_with_block() {
+        let stats = Arc::new(AsmMemoryManagerStats::default());
+        let manager = AsmMemoryManager::new_isolated(stats);
+
+        let requested = ASM_LARGE_ALLOC_SIZE - (ASM_MIN_FRAGMENT / 2);
+        let block = manager.allocate_aligned(requested, requested, 1).unwrap();
+        let start = block.ptr();
+        assert_eq!(block.capacity(), ASM_LARGE_ALLOC_SIZE);
+        drop(block);
+
+        // Dropping the owner returns the complete mapping, so the next block
+        // starts at the same address instead of leaving a permanent gap.
+        let reused = manager.allocate_aligned(128, 128, 1).unwrap();
+        assert_eq!(reused.ptr(), start);
     }
 
     #[test]

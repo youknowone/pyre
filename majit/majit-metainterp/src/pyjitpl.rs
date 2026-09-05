@@ -15352,32 +15352,39 @@ impl<M: Clone> MetaInterp<M> {
         exception: ExceptionState,
     ) -> Option<GuardRecovery> {
         let compiled = self.compiled_loops.get(&green_key)?;
-        let (trace_id, trace) = Self::trace_for_exit(compiled, trace_id)?;
-
-        let exit_layout =
-            Self::compiled_exit_layout_from_trace(trace, green_key, trace_id, fail_index)
-                .or_else(|| {
-                    self.compiled_exit_layout_from_backend(
-                        compiled, green_key, trace_id, fail_index,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    let exit_types: ExitTypes = typed_fail_values
-                        .map(|values| values.iter().map(Value::get_type).collect())
-                        .unwrap_or_default();
-                    CompiledExitLayout {
-                        rd_loop_token: green_key, // from trace context
-                        trace_id,
-                        fail_index,
-                        source_op_index: None,
-                        is_finish: false,
-                        is_exception_exit: false,
-                        exit_types,
-                        recovery_layout: None,
-                        resume_layout: None,
-                        storage: None,
-                    }
-                });
+        let exit_layout = Self::trace_for_exit(compiled, trace_id)
+            .and_then(|(resolved_trace_id, trace)| {
+                Self::compiled_exit_layout_from_trace(
+                    trace,
+                    green_key,
+                    resolved_trace_id,
+                    fail_index,
+                )
+            })
+            // `compile.py send_bridge_to_backend` retains no frontend trace
+            // for a bridge.  Its failing descr is backend-owned, so the public
+            // recovery helper must reach that descr before considering the
+            // trace absent; otherwise every bridge guard returned `None` here.
+            .or_else(|| {
+                self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index)
+            })
+            .unwrap_or_else(|| {
+                let exit_types: ExitTypes = typed_fail_values
+                    .map(|values| values.iter().map(Value::get_type).collect())
+                    .unwrap_or_default();
+                CompiledExitLayout {
+                    rd_loop_token: green_key, // from trace context
+                    trace_id,
+                    fail_index,
+                    source_op_index: None,
+                    is_finish: false,
+                    is_exception_exit: false,
+                    exit_types,
+                    recovery_layout: None,
+                    resume_layout: None,
+                    storage: None,
+                }
+            });
         // pyjitpl.py initialize_state_from_guard_failure:
         // guard failure rebuild is stack-critical code — must not be
         // interrupted by StackOverflow, otherwise jit_virtual_refs are

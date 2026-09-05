@@ -789,15 +789,23 @@ impl Trace {
             self.const_ptrs.insert(gcref, operand);
         }
 
+        let is_pooled_const_ptr = |arg: &Operand| {
+            let Some(Value::Ref(gcref)) = arg.const_value() else {
+                return false;
+            };
+            self.const_ptrs
+                .get(&gcref)
+                .is_some_and(|cached| cached == arg)
+        };
         for op in &self.ops {
             for arg in op.args.borrow().iter() {
-                if !self.const_ptrs.values().any(|cached| cached == arg) {
+                if !is_pooled_const_ptr(arg) {
                     arg.walk_const_ptr_refs(visitor);
                 }
             }
             if let Some(fail_args) = op.fail_args.borrow().as_ref() {
                 for arg in fail_args {
-                    if !self.const_ptrs.values().any(|cached| cached == arg) {
+                    if !is_pooled_const_ptr(arg) {
                         arg.walk_const_ptr_refs(visitor);
                     }
                 }

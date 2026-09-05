@@ -406,6 +406,16 @@ is graded with.
 
 #### Re-measured 2026-09-03: 2.3-2.5x, after the per-bridge retention fixes
 
+The RSS runs in this subsection used the macOS system allocator, a release
+`dynasm` build with `alloc-census` and `fast-alloc` both off, and
+`/usr/bin/time -l`'s `maximum resident set size`.  The measured arm was run as
+`PYRE_REGEX_LENGTHS=1048576 PYRE_REGEX_ROWS=2 target/release/regex`; bridges
+were on unless the control explicitly set `MAJIT_NO_BRIDGE=1`.  The 139 MiB
+quoted in the PR summary was the intermediate reading immediately after the
+RWX-arena change.  The 124 MiB below is the later reading after the remaining
+descriptor/cell retention fixes, so it is the final same-configuration number
+rather than a conflicting measurement.
+
 With bridges on, majit's heap grew with the input -- 1,138 MiB peak RSS at
 1,048,576 characters against 15 MiB with `MAJIT_NO_BRIDGE=1` -- and the
 `and`/`or` row followed it: 10.5x slower per character at 1M than at 4K.

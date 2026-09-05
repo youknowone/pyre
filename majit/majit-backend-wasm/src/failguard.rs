@@ -873,6 +873,13 @@ pub struct CompiledWasmLoop {
     /// in the eager path.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub(crate) pending_wasm_bytes: RefCell<Option<Vec<u8>>>,
+    /// The owning token metadata receives the guard-descriptor tracer only
+    /// after the host accepts this module. Deferred root traces keep this
+    /// handle until `materialize_func_handle` crosses that acceptance point.
+    pub(crate) compiled_loop_token: Arc<majit_backend::CompiledLoopToken>,
+    /// Serializes the eager and lazy acceptance paths. The wasm runtime is
+    /// single-threaded, matching the surrounding `Cell`/`RefCell` fields.
+    pub(crate) descrs_registered: Cell<bool>,
     /// This loop's own guard/finish exit descriptors (positions `[0,
     /// num_guard_cells)`, per-trace order), followed by the descr slices of
     /// every chained bridge `compile_bridge` appended (positional bookkeeping
@@ -1006,6 +1013,24 @@ impl CompiledWasmLoop {
         self.func_handle.get()
     }
 
+    /// Publish the descriptors only for a module the host can execute.
+    pub(crate) fn register_descrs_once(&self) {
+        if self.descrs_registered.replace(true) {
+            return;
+        }
+        let descrs = self.fail_descrs.borrow();
+        register_fail_descrs(&descrs);
+        let meta: Vec<DescrRef> = descrs
+            .iter()
+            .filter_map(|descr| descr.meta_descr.clone())
+            .collect();
+        let tracer: Arc<dyn std::any::Any + Send + Sync> = Arc::new(meta);
+        self.compiled_loop_token
+            .asmmemmgr_gcreftracers
+            .lock()
+            .push(tracer);
+    }
+
     /// Materialize a lazily-installed root trace.  The wasm host is
     /// single-threaded, matching the RefCell/Cell ownership used throughout
     /// this structure, so one trace can only cross this gate once.
@@ -1032,6 +1057,7 @@ impl CompiledWasmLoop {
                     "wasm host rejected the lazily compiled trace module".into(),
                 ));
             }
+            self.register_descrs_once();
             self.func_handle.set(handle);
             drop(pending);
             self.pending_wasm_bytes.borrow_mut().take();

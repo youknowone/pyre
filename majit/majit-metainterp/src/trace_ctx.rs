@@ -7400,8 +7400,10 @@ mod tests {
     }
 }
 
-/// `MAJIT_PROBE_SUBSCR` diagnostic gate, read once: this sits on the path
-/// every recorded call takes, and `getenv` per operation was 4% of tracing.
+/// `MAJIT_PROBE_SUBSCR` startup-only diagnostic gate, read once: changes made
+/// with `set_var` / `remove_var` after the first lookup do not take effect.
+/// This sits on the path every recorded call takes, and `getenv` per operation
+/// was 4% of tracing.
 fn probe_subscr_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MAJIT_PROBE_SUBSCR").is_some())

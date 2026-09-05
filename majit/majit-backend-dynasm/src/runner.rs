@@ -2969,8 +2969,14 @@ impl Backend for DynasmBackend {
             // regardless of whether MAJIT_LOG is set, so emit via plain
             // eprintln (debug_print would silently no-op without
             // MAJIT_LOG and lose the dump).
-            let code = unsafe { std::slice::from_raw_parts(entry, compiled.buffer.len()) };
-            eprintln!("[dynasm] CODE DUMP ({} bytes at {:?}):", code.len(), entry);
+            let rawstart = codebuf::buffer_ptr(&compiled.buffer);
+            let code = unsafe { std::slice::from_raw_parts(rawstart, compiled.buffer.len()) };
+            eprintln!(
+                "[dynasm] CODE DUMP ({} bytes at {:?}, entry {:?}):",
+                code.len(),
+                rawstart,
+                entry
+            );
             for (i, chunk) in code.chunks(4).enumerate() {
                 let word = u32::from_le_bytes([
                     chunk.first().copied().unwrap_or(0),
