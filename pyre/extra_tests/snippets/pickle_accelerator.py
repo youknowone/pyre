@@ -2,6 +2,8 @@
 # public `pickle` facade it backs. Each section below was previously a separate
 # `_pickle_*` snippet; they share the `dumps` / `loads` / `roundtrip` helpers
 # and run sequentially. Behaviors are pinned to CPython 3.14.
+# Keep this filename distinct from `_pickle`: an extension-module build of
+# CPython searches this directory before the stdlib's lib-dynload directory.
 #
 # Sections that need the high-level `pickle` module (and `copyreg`) are guarded
 # by `HAVE_PICKLE`: importing `pickle` pulls in `re`, whose `_sre.MAGIC` is
