@@ -4,7 +4,8 @@
 //! call residual is not executable for an embedded interpreter because there
 //! is no monomorphisation-independent host address for its closure type.  The
 //! equivalent RPython graph already has the ordinary two exception/value
-//! branches (`translator/exceptiontransform.py`); this adapter restores that
+//! branches (`translator/exceptiontransform.py::ExceptionTransformer.transform_block`);
+//! this adapter restores that
 //! shape before `result_exc` converts an exception-carrying result to native
 //! graph exception edges.
 
@@ -152,6 +153,45 @@ fn rewire_one(
     let mut err_sources = ok_sources.clone();
     if !err_sources.contains(&env) {
         err_sources.push(env.clone());
+    }
+    // Validate the complete exception destination before adding any blocks.
+    // Like ExceptionTransformer.transform_block / insert_matching, a rejected
+    // transformation must leave the original exception graph intact. Identity
+    // inputs let the rewrap validator check the same mappings without issuing
+    // fresh SSA variables or populating orphan call_once operations.
+    if let Some(exceptional) = &saved_exception_exit {
+        let last_exception = exceptional
+            .last_exception
+            .as_ref()
+            .and_then(LinkArg::as_variable)
+            .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exception"))?;
+        let last_exc_value = exceptional
+            .last_exc_value
+            .as_ref()
+            .and_then(LinkArg::as_variable)
+            .ok_or_else(|| format!("{name}: exceptional map_err edge lacks last_exc_value"))?;
+        for arg in &exceptional.args {
+            if let LinkArg::Value(value) = arg
+                && value != last_exception
+                && value != last_exc_value
+                && !err_sources.contains(value)
+            {
+                return Err(format!(
+                    "{name}: exceptional map_err edge carries an unthreaded value"
+                ));
+            }
+        }
+        if exceptional.target != graph.exceptblock {
+            bypass_rewrap_handler_args(
+                graph,
+                exceptional,
+                &site.result_var,
+                &err_sources,
+                &err_sources,
+                &site.result_err_owner,
+                &name,
+            )?;
+        }
     }
     let (ok_block, ok_inputs) = graph.create_block_with_arg_vars(ok_sources.len());
     let (err_block, err_inputs) = graph.create_block_with_arg_vars(err_sources.len());
@@ -442,6 +482,75 @@ fn read_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_exception_edges_leave_the_graph_unchanged() {
+        for defect in ["last_exception", "last_exc_value", "unthreaded", "rewrap"] {
+            let mut graph = FunctionGraph::new("map_err_invalid_exception");
+            let entry = graph.startblock;
+            let receiver = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+            let env = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+            let result = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::method("map_err", Some("Result".into())),
+                        args: vec![receiver, env],
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .unwrap();
+            let (normal, _) = graph.create_block_with_arg_vars(1);
+            graph.set_return(normal, None);
+            let etype = graph.alloc_value_var();
+            let evalue = graph.alloc_value_var();
+            let mut exceptional = crate::model::Link::new_mixed(
+                vec![
+                    LinkArg::Value(etype.clone()),
+                    LinkArg::Value(evalue.clone()),
+                ],
+                graph.exceptblock,
+                Some(crate::model::exception_exitcase()),
+            );
+            exceptional.last_exception = Some(LinkArg::Value(etype));
+            exceptional.last_exc_value = Some(LinkArg::Value(evalue));
+            match defect {
+                "last_exception" => exceptional.last_exception = None,
+                "last_exc_value" => exceptional.last_exc_value = None,
+                "unthreaded" => exceptional
+                    .args
+                    .push(LinkArg::Value(graph.alloc_value_var())),
+                "rewrap" => exceptional.target = normal,
+                _ => unreachable!(),
+            }
+            graph.set_control_flow_metadata(
+                entry,
+                Some(crate::model::ExitSwitch::LastException),
+                vec![
+                    crate::model::Link::new_mixed(
+                        vec![LinkArg::Value(result.clone())],
+                        normal,
+                        None,
+                    ),
+                    exceptional,
+                ],
+            );
+            let mut site = fixture_site(result);
+            site.closure_env_is_trivially_dropless = true;
+            let before = format!("{graph:?}");
+            assert_eq!(
+                rewire_result_map_err_sites(
+                    &mut graph,
+                    &[site],
+                    crate::ErrorCarrierSpec::default()
+                ),
+                0,
+                "{defect}"
+            );
+            assert_eq!(format!("{graph:?}"), before, "{defect} mutated the graph");
+        }
+    }
 
     fn fixture_site(result_var: Variable) -> ResultMapErrSite {
         ResultMapErrSite {

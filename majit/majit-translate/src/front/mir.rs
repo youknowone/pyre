@@ -15667,23 +15667,22 @@ impl<'a> Lowering<'a> {
             let Some(impl_trait) = impl_row.get("impl_trait") else {
                 return false;
             };
-            let Some(trait_id) = impl_trait.get("id").and_then(serde_json::Value::as_u64) else {
-                return false;
-            };
-            if self
-                .llbc
-                .trait_by_id(trait_id)
-                .is_none_or(|decl| decl.item_meta.name_path() != "core::ops::drop::Drop")
-            {
-                return false;
-            }
-            impl_trait
+            let owner = impl_trait
                 .get("generics")
                 .and_then(|generics| generics.get("types"))
                 .and_then(serde_json::Value::as_array)
                 .and_then(|types| types.first())
-                .and_then(|owner| resolve_tyexpr_to_adt_def_id_free(self.llbc, owner))
-                == Some(def_id)
+                .and_then(|owner| resolve_tyexpr_to_adt_def_id_free(self.llbc, owner));
+            if owner != Some(def_id) {
+                return false;
+            }
+            // Missing trait metadata cannot prove this capture dropless.
+            // Keep the call residual until its destructor contract is known.
+            impl_trait
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|trait_id| self.llbc.trait_by_id(trait_id))
+                .is_none_or(|decl| decl.item_meta.name_path() == "core::ops::drop::Drop")
         })
     }
 
@@ -31550,6 +31549,67 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    #[test]
+    fn map_err_drop_detection_requires_resolved_trait_metadata() {
+        use super::{Lowering, Unstructured};
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span.clone(), "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        for (trait_name, dropless) in [(Some("Drop"), false), (None, false), (Some("Copy"), true)] {
+            let traits = trait_name
+                .map(|name| {
+                    vec![serde_json::json!({
+                        "def_id": 0, "item_meta": meta(&["core", "ops", "drop", name])
+                    })]
+                })
+                .unwrap_or_default();
+            let file = serde_json::json!({
+                "charon_version": "0.1.201", "has_errors": false,
+                "translated": {
+                    "crate_name": "fixture",
+                    "type_decls": [{"def_id": 0, "item_meta": meta(&["fixture", "Capture"]), "kind": {"Struct": []}}],
+                    "fun_decls": [], "global_decls": [], "trait_decls": traits,
+                    "trait_impls": [{"impl_trait": {"id": 0, "generics": {"types": [
+                        {"HashConsedValue": [1, {"Adt": {"id": {"Adt": 0}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}}]}
+                    ]}}}]
+                }
+            });
+            let llbc = Llbc::from_slice(file.to_string().as_bytes()).unwrap();
+            let body: Unstructured = serde_json::from_value(serde_json::json!({
+                "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span.clone()
+            }))
+            .unwrap();
+            let dont_look_inside = std::collections::HashSet::new();
+            let lowering = Lowering::new(
+                &llbc,
+                "fixture".into(),
+                &body,
+                crate::HostStaticAddrs::default(),
+                &[],
+                None,
+                &dont_look_inside,
+            )
+            .unwrap();
+            assert_eq!(
+                lowering.type_decl_is_trivially_dropless(llbc.type_by_id(0).unwrap(), 0),
+                dropless,
+                "{trait_name:?}"
+            );
+            assert!(
+                !lowering.type_decl_has_explicit_drop(99),
+                "an unrelated owner must not be rejected"
+            );
+        }
     }
 
     #[test]
