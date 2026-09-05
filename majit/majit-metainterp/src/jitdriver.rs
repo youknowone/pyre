@@ -2086,6 +2086,23 @@ impl GuardResumeDecline {
     }
 }
 
+impl<S: JitState> crate::jit::JitParameterTarget for JitDriver<S> {
+    fn set_param(&mut self, name: &str, value: i64) -> Result<(), crate::jit::JitHintError> {
+        // warmstate.py JitCounter.compute_threshold: nonpositive thresholds
+        // disable counting. The public driver setter takes unsigned values.
+        let value = match name {
+            "threshold" | "function_threshold" | "trace_eagerness" => value.max(0),
+            _ => value,
+        };
+        self.set_param(name, value);
+        Ok(())
+    }
+
+    fn set_param_enable_opts(&mut self, value: &str) {
+        self.set_param_enable_opts(value);
+    }
+}
+
 impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {

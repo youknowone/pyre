@@ -1400,6 +1400,39 @@ pub fn walk_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
     });
 }
 
+/// Visit the current context's JIT stack roots and the backend's live deadframes.
+///
+/// `shadowstack.py ShadowStackRootWalker.walk_stack_roots` owns this boundary
+/// upstream; `blackhole.py BlackholeInterpreter` and `resume.py
+/// ResumeDataDirectReader` are traced GC objects there. Here their raw register
+/// banks and libc jitframes need explicit walks, which belong to majit rather
+/// than to each embedding interpreter's collector.
+///
+/// The visitor must filter references by its heap's ownership and trace the
+/// interiors of its own managed objects. Libc jitframe interiors are exposed
+/// here through the backend's registered tracer, including the post-epilogue
+/// DEADFRAME lifetime (`llmodel.py AbstractLLCPU.get_ref_value`). Static roots,
+/// extra areas and embedding-runtime root hooks are separate root categories
+/// (`framework.py BaseRootWalker.walk_roots`) and are not called by this API.
+/// Stack sources are current-context only; the backend deadframe registry may
+/// be process-wide. As with the collector's root phase, callers must exclude
+/// concurrent mutation of visited frames. Multi-mutator collectors must also
+/// walk the other mutators' stacks through the `walk_all_*` APIs.
+pub fn walk_jit_roots(mut visitor: impl FnMut(&mut GcRef)) {
+    walk_roots(&mut visitor);
+    walk_jf_roots(|gcref| {
+        visitor(gcref);
+        if !gcref.is_null() && is_libc_jitframe(gcref.0) {
+            trace_libc_jitframe(gcref.0, &mut |slot| unsafe { visitor(&mut *slot) });
+        }
+    });
+    crate::walk_active_live_deadframes(&mut |addr| {
+        trace_libc_jitframe(addr, &mut |slot| unsafe { visitor(&mut *slot) });
+    });
+    walk_bh_regs(&mut visitor);
+    walk_resume_ref_roots(&mut visitor);
+}
+
 /// Walk every registered mutator's resume-construction roots during STW.
 pub fn walk_all_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
     debug_assert!(

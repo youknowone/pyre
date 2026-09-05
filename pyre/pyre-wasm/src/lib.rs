@@ -151,37 +151,6 @@ static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 // the callee's wasm signature and coerces each positional argument.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod residual_host {
-    use core::cell::UnsafeCell;
-
-    // Call-area layout shared with `majit-backend-wasm` codegen and the host
-    // runner's `jit_call_trampoline`; offsets are relative to the frame-pointer
-    // base passed to the import. Taken from the backend that defines the ABI
-    // rather than restated, so a layout change reaches this scratch buffer.
-    use majit_backend_wasm::codegen::{
-        CALL_ARGS_OFS as CALL_ARGS_OFS_U64, CALL_FUNC_OFS as CALL_FUNC_OFS_U64,
-        CALL_NARGS_OFS as CALL_NARGS_OFS_U64, CALL_RESULT_OFS as CALL_RESULT_OFS_U64,
-        MAX_CALL_ARGS as MAX_ARGS, MIN_FRAME_BYTES as SCRATCH_LEN,
-    };
-    const CALL_RESULT_OFS: usize = CALL_RESULT_OFS_U64 as usize;
-    const CALL_FUNC_OFS: usize = CALL_FUNC_OFS_U64 as usize;
-    const CALL_NARGS_OFS: usize = CALL_NARGS_OFS_U64 as usize;
-    const CALL_ARGS_OFS: usize = CALL_ARGS_OFS_U64 as usize;
-
-    #[link(wasm_import_module = "majit_host")]
-    unsafe extern "C" {
-        fn jit_call_host(frame_ptr: u32);
-    }
-
-    // A wasm32 module instance is single-threaded, so a shared scratch buffer
-    // needs no synchronization. Residual calls nest synchronously: each level
-    // writes its arguments, the host reads them before invoking the callee, and
-    // each level reads its result immediately after the host returns — so an
-    // inner call that reuses the buffer cannot clobber an outer call's
-    // already-consumed arguments or not-yet-written result.
-    struct Scratch(UnsafeCell<[u8; SCRATCH_LEN]>);
-    unsafe impl Sync for Scratch {}
-    static SCRATCH: Scratch = Scratch(UnsafeCell::new([0u8; SCRATCH_LEN]));
-
     /// Direct-call the blackhole helpers whose real wasm ABI is exactly the
     /// uniform `i64` signature carried by the residual call.
     ///
@@ -240,30 +209,12 @@ mod residual_host {
         ]
     }
 
-    fn residual_host_call(func_ptr: usize, args: &[i64]) -> i64 {
-        assert!(
-            args.len() <= MAX_ARGS,
-            "residual_host_call: arity {} exceeds {MAX_ARGS}",
-            args.len()
-        );
-        if let Some(result) = direct_uniform_i64_call(func_ptr, args) {
-            return result;
-        }
-        let base = SCRATCH.0.get() as *mut u8;
-        unsafe {
-            (base.add(CALL_FUNC_OFS) as *mut i64).write_unaligned(func_ptr as i64);
-            (base.add(CALL_NARGS_OFS) as *mut i64).write_unaligned(args.len() as i64);
-            for (i, &a) in args.iter().enumerate() {
-                (base.add(CALL_ARGS_OFS + i * 8) as *mut i64).write_unaligned(a);
-            }
-            jit_call_host(base as u32);
-            (base.add(CALL_RESULT_OFS) as *const i64).read_unaligned()
-        }
-    }
-
     /// Install the trampoline on the current thread. Idempotent.
     pub fn install() {
-        majit_backend::call_stub::set_residual_host_call(Some(residual_host_call));
+        majit_backend::call_stub::set_residual_host_call(Some(|func_ptr, args| {
+            direct_uniform_i64_call(func_ptr, args)
+                .unwrap_or_else(|| majit_backend_wasm::residual_host_call(func_ptr, args))
+        }));
     }
 }
 

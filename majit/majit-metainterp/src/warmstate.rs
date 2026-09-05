@@ -791,6 +791,17 @@ pub enum FunctionEntryStep {
     NotHot,
 }
 
+impl crate::jit::JitParameterTarget for WarmEnterState {
+    fn set_param(&mut self, name: &str, value: i64) -> Result<(), crate::jit::JitHintError> {
+        self.set_param(name, value);
+        Ok(())
+    }
+
+    fn set_param_enable_opts(&mut self, value: &str) {
+        self.set_param_enable_opts(value);
+    }
+}
+
 impl WarmEnterState {
     /// warmstate.py: a `JC_DONT_TRACE_HERE` cell that has never seen
     /// a procedure token is retried — immediately the first time

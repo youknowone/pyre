@@ -6819,45 +6819,7 @@ fn apply_jit_param_string(
     ws: &mut majit_metainterp::warmstate::WarmEnterState,
     text: &str,
 ) -> Result<(), ()> {
-    // rlib/jit.py:842-845
-    if text == "off" {
-        ws.set_param("threshold", -1);
-        ws.set_param("function_threshold", -1);
-    } else if text == "default" {
-        ws.set_default_params();
-    } else {
-        // rlib/jit.py:850-874 — "name=value,name=value"
-        for s in text.split(',') {
-            let s = s.trim();
-            if s.is_empty() {
-                continue;
-            }
-            // rlib/jit.py:852-856 — len(parts) != 2 → raise ValueError
-            let parts: Vec<&str> = s.split('=').collect();
-            if parts.len() != 2 {
-                return Err(());
-            }
-            let name = parts[0];
-            let value = parts[1].trim();
-            if name == "enable_opts" {
-                ws.set_param_enable_opts(value);
-                continue;
-            }
-            // rlib/jit.py — the name must be one of unroll_parameters;
-            // anything else falls through to the loop's `else: raise ValueError`.
-            let known = majit_metainterp::jit::UNROLL_PARAMETERS
-                .iter()
-                .any(|&(name1, _)| name1 == name && name1 != "enable_opts");
-            if !known {
-                return Err(());
-            }
-            let Ok(parsed) = value.parse::<i64>() else {
-                return Err(());
-            };
-            ws.set_param(name, parsed);
-        }
-    }
-    Ok(())
+    majit_metainterp::jit::set_user_param(ws, text).map_err(|_| ())
 }
 
 /// interp_jit.py — set_param(space, __args__).

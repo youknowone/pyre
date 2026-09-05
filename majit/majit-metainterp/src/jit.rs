@@ -721,44 +721,66 @@ impl std::error::Error for TraceLimitTooHigh {}
 // ── set_user_param ──
 // rlib/jit.py:836-874
 
+/// The driver argument of `rlib/jit.py set_user_param`, specialized to the
+/// parameter storage or live driver receiving the calls. Rust represents the
+/// upstream integer/string parameter overload with two setters.
+pub trait JitParameterTarget {
+    fn set_param(&mut self, name: &str, value: i64) -> Result<(), JitHintError>;
+    fn set_param_enable_opts(&mut self, value: &str);
+}
+
+impl JitParameterTarget for JitParameters {
+    fn set_param(&mut self, name: &str, value: i64) -> Result<(), JitHintError> {
+        set_param(self, name, value)
+    }
+
+    fn set_param_enable_opts(&mut self, value: &str) {
+        self.enable_opts = if value == "all" {
+            EnableOpts::All
+        } else {
+            EnableOpts::Custom(value.to_string())
+        };
+    }
+}
+
 /// Set the tunable JIT parameters from a user-supplied string
 /// following the format 'param=value,param=value', or 'off' to
 /// disable the JIT.  For programmatic setting of parameters, use
 /// directly `set_param`.
 ///
 /// rlib/jit.py:836
-pub fn set_user_param(params: &mut JitParameters, text: &str) -> Result<(), JitHintError> {
+pub fn set_user_param(
+    driver: &mut impl JitParameterTarget,
+    text: &str,
+) -> Result<(), JitHintError> {
     // rlib/jit.py:842-845
     if text == "off" {
-        set_param(params, "threshold", -1)?;
-        set_param(params, "function_threshold", -1)?;
+        driver.set_param("threshold", -1)?;
+        driver.set_param("function_threshold", -1)?;
         return Ok(());
     }
     // rlib/jit.py:846-849
     if text == "default" {
-        for (name1, _) in UNROLL_PARAMETERS {
-            set_param_to_default(params, name1)?;
+        for (name1, default) in UNROLL_PARAMETERS {
+            driver.set_param(name1, *default)?;
+            // PARAMETERS places the string-valued entry after this integer.
+            if *name1 == "disable_unrolling" {
+                driver.set_param_enable_opts("all");
+            }
         }
         return Ok(());
     }
     // rlib/jit.py:850-874
     for s in text.split(',') {
-        let s = s.trim();
-        if s.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = s.splitn(2, '=').collect();
+        let s = s.trim_matches(' ');
+        let parts: Vec<&str> = s.split('=').collect();
         if parts.len() != 2 {
             return Err(JitHintError(format!("malformed token: {s}")));
         }
-        let name = parts[0].trim();
-        let value = parts[1].trim();
+        let name = parts[0];
+        let value = parts[1];
         if name == "enable_opts" {
-            params.enable_opts = if value == "all" {
-                EnableOpts::All
-            } else {
-                EnableOpts::Custom(value.to_string())
-            };
+            driver.set_param_enable_opts(value);
             continue;
         }
         // rlib/jit.py — for name1, _ in unroll_parameters:
@@ -766,9 +788,10 @@ pub fn set_user_param(params: &mut JitParameters, text: &str) -> Result<(), JitH
         for (name1, _) in UNROLL_PARAMETERS {
             if *name1 == name && *name1 != "enable_opts" {
                 let ivalue: i64 = value
+                    .trim()
                     .parse()
                     .map_err(|_| JitHintError(format!("invalid value for {name}: {value}")))?;
-                set_param(params, name1, ivalue)?;
+                driver.set_param(name1, ivalue)?;
                 found = true;
                 break;
             }
@@ -1166,8 +1189,48 @@ mod tests {
     fn test_set_user_param_default() {
         let mut p = PARAMETERS;
         p.threshold = 999;
+        p.enable_opts = EnableOpts::Custom(String::new());
+        p.vec_all = true;
         set_user_param(&mut p, "default").unwrap();
         assert_eq!(p.threshold, 1039);
+        assert_eq!(p.enable_opts, EnableOpts::All);
+        assert!(!p.vec_all);
+    }
+
+    #[test]
+    fn test_set_user_param_oracle_grammar_and_partial_application() {
+        // Measured with pypy3 pypyjit.set_param; rlib/jit.py set_user_param.
+        for text in [
+            "",
+            "threshold=1,",
+            "threshold =1",
+            "enable_opts=a=b",
+            "vectorize=1",
+            "max_inline_depth=7",
+        ] {
+            let mut params = PARAMETERS;
+            assert!(set_user_param(&mut params, text).is_err(), "{text:?}");
+        }
+        let mut p = PARAMETERS;
+        set_user_param(&mut p, " threshold= 17 ,enable_opts=,vec=1").unwrap();
+        assert_eq!(p.threshold, 17);
+        assert_eq!(p.enable_opts, EnableOpts::Custom(String::new()));
+        assert!(p.vec);
+        assert!(set_user_param(&mut p, "threshold=23,bad=1").is_err());
+        assert_eq!(p.threshold, 23);
+    }
+
+    #[test]
+    fn test_set_user_param_live_warmstate() {
+        let mut ws = crate::warmstate::WarmEnterState::new(7);
+        set_user_param(&mut ws, "enable_opts=,vec_all=1").unwrap();
+        assert!(ws.get_enable_opts().is_empty());
+        set_user_param(&mut ws, "off").unwrap();
+        assert_eq!(ws.threshold(), 0);
+        set_user_param(&mut ws, "default").unwrap();
+        assert_eq!(ws.threshold(), PARAMETERS.threshold);
+        assert!(!ws.get_enable_opts().is_empty());
+        assert!(!ws.vec_all());
     }
 
     #[test]
