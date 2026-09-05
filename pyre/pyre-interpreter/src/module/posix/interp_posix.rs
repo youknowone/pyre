@@ -12212,11 +12212,119 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }),
         );
 
+        /// PyPy `os_symlink_impl`, including its bounded `_check_dirW` probe.
+        ///
+        /// The probe is intentionally limited to `MAX_PATH`: the upstream C
+        /// helper uses two `WCHAR[MAX_PATH]` arrays and treats an overflowing
+        /// join as "not a directory".  That boundary is observable for an
+        /// existing directory target (and is exercised by CPython 3.14's
+        /// `TestExtractionFilters.test_realpath_limit_attack`), so the
+        /// unbounded `host_nt::symlink` probe is not equivalent here.
+        fn win_symlink(
+            src: &widestring::WideCString,
+            dst: &widestring::WideCString,
+            target_is_directory: bool,
+        ) -> std::io::Result<()> {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use windows_sys::Win32::{
+                Foundation::{ERROR_INVALID_PARAMETER, GetLastError},
+                Storage::FileSystem::{
+                    CreateSymbolicLinkW, FILE_ATTRIBUTE_DIRECTORY,
+                    GetFileAttributesExW, GetFileExInfoStandard,
+                    SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+                    SYMBOLIC_LINK_FLAG_DIRECTORY, WIN32_FILE_ATTRIBUTE_DATA,
+                },
+            };
+
+            fn check_dir(
+                src: &widestring::WideCString,
+                dst: &widestring::WideCString,
+            ) -> bool {
+                let src = src.as_slice();
+                let dst = dst.as_slice();
+                let max_path = host_nt::MAX_PATH_USIZE;
+
+                // `_dirnameW` first copies the complete destination into its
+                // fixed buffer, then truncates it at the last separator.
+                if dst.len() >= max_path {
+                    return false;
+                }
+                let parent_len = dst
+                    .iter()
+                    .rposition(|&unit| unit == b'\\' as u16 || unit == b'/' as u16)
+                    .unwrap_or(0);
+                let parent = &dst[..parent_len];
+                let absolute = src.first().is_some_and(|&unit| {
+                    unit == b'\\' as u16 || unit == b'/' as u16
+                }) || (src.first().is_some_and(|&unit| unit != 0)
+                    && src.get(1) == Some(&(b':' as u16)));
+
+                let mut resolved = Vec::with_capacity(max_path);
+                if absolute {
+                    if src.len() >= max_path {
+                        return false;
+                    }
+                    resolved.extend_from_slice(src);
+                } else {
+                    let separator_len = usize::from(!parent.is_empty());
+                    if parent.len() + separator_len + src.len() >= max_path {
+                        return false;
+                    }
+                    resolved.extend_from_slice(parent);
+                    if !parent.is_empty() {
+                        resolved.push(b'\\' as u16);
+                    }
+                    resolved.extend_from_slice(src);
+                }
+                resolved.push(0);
+
+                let mut info: WIN32_FILE_ATTRIBUTE_DATA = unsafe { std::mem::zeroed() };
+                let ok = unsafe {
+                    GetFileAttributesExW(
+                        resolved.as_ptr(),
+                        GetFileExInfoStandard,
+                        (&mut info as *mut WIN32_FILE_ATTRIBUTE_DATA).cast(),
+                    )
+                };
+                ok != 0 && info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+            }
+
+            // `windows_has_symlink_unprivileged_flag` in `os_symlink_impl` is
+            // process-global semantic state, not per-thread state.
+            static HAS_UNPRIVILEGED_FLAG: AtomicBool = AtomicBool::new(true);
+            let has_unprivileged_flag = HAS_UNPRIVILEGED_FLAG.load(Ordering::Relaxed);
+            let mut flags = if has_unprivileged_flag {
+                SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+            } else {
+                0
+            };
+            if target_is_directory || check_dir(src, dst) {
+                flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+            }
+
+            let mut result = unsafe { CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(), flags) };
+            if !result
+                && has_unprivileged_flag
+                && unsafe { GetLastError() } == ERROR_INVALID_PARAMETER
+            {
+                flags &= !SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+                result = unsafe { CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(), flags) };
+                if result || unsafe { GetLastError() } != ERROR_INVALID_PARAMETER {
+                    HAS_UNPRIVILEGED_FLAG.store(false, Ordering::Relaxed);
+                }
+            }
+            if result {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+
         // os.symlink(src, dst, target_is_directory=False) -> None.
         // `CreateSymbolicLinkW` names the link first and its target second,
         // and a link to a directory is a different kind of reparse point from
-        // a link to a file — which is what `target_is_directory` picks, since
-        // the target need not exist yet for the link to be made.
+        // a link to a file. `os_symlink_impl` picks the kind from the explicit
+        // argument or its bounded existing-target probe.
         crate::module_ns_store(
             ns,
             "symlink",
@@ -12247,25 +12355,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     None => false,
                 };
                 let (wide_src, wide_dst) = (wide_path(&src.as_bytes)?, wide_path(&dst.as_bytes)?);
-                // The kind is not read off `target_is_directory` alone.
-                // `os_symlink_impl` also asks `_check_dirW`, which resolves a
-                // relative `src` against `dirname(dst)` and reports whether
-                // `GetFileAttributesExW` calls it a directory — so
-                // `os.symlink(os.path.join('a', 'bcd'), 'sym3')` makes a link
-                // that can be walked into rather than a file link nothing can
-                // list.  Creating either is a privilege the account may not
-                // hold, so the call asks for the developer-mode path and
-                // retries without it on the Windows too old to know the flag.
-                // The host wrapper carries both, including the
-                // `windows_has_symlink_unprivileged_flag` latch that stops
-                // paying for the first attempt once it is known to fail.
-                rustpython_host_env::nt::symlink(
-                    &path_from_bytes(&src.as_bytes),
-                    &path_from_bytes(&dst.as_bytes),
-                    &wide_src,
-                    &wide_dst,
-                    target_is_directory,
-                )
+                win_symlink(&wide_src, &wide_dst, target_is_directory)
                 .map_err(|e| fs_err_with_filename2(e, 0, src.w_path(), dst.w_path()))?;
                 Ok(pyre_object::w_none())
             }),

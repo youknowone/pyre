@@ -19673,16 +19673,26 @@ pub(crate) unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], c
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
             memoryview_check_released(obj)?;
-            if memoryview_contiguity(obj).0 {
-                let view = pyre_object::memoryview::w_memoryview_view(obj);
-                let full = view.backing().as_bytes();
-                let off = view.offset() as usize;
-                let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
-                if off <= full.len() && len <= full.len() - off {
-                    return Ok(&full[off..off + len]);
-                }
+            if !memoryview_contiguity(obj).0 {
+                // `PyBUF_SIMPLE` asks for the bytes in address order, and a
+                // strided view cannot hand them over without copying, so the
+                // request is refused rather than answered with the wrong ones.
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+            let view = pyre_object::memoryview::w_memoryview_view(obj);
+            let full = view.backing().as_bytes();
+            let off = view.offset() as usize;
+            let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
+            if off <= full.len() && len <= full.len() - off {
+                return Ok(&full[off..off + len]);
             }
         }
+        // This is the object-space acquisition layer; public gateways that
+        // own a more specific refusal (for example mmap's `Py_buffer`
+        // converter) translate this TypeError at their boundary.
         Err(crate::PyError::type_error(
             "a bytes-like object is required",
         ))
@@ -21005,6 +21015,23 @@ fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate:
 /// choose exactly one buffered class, and only then add the text wrapper.  In
 /// particular, binary unbuffered I/O returns that raw stream.
 pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_open_impl(args, true)
+}
+
+/// Standard-stream entry to PyPy `_io.open`, retaining the same construction
+/// while allowing CPython's Windows legacy-stdio compatibility flag to bypass
+/// the console raw class for these three streams only.
+pub(crate) fn builtin_open_stdio(
+    args: &[PyObjectRef],
+    allow_windows_console: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    builtin_open_impl(args, allow_windows_console)
+}
+
+fn builtin_open_impl(
+    args: &[PyObjectRef],
+    allow_windows_console: bool,
+) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
     // Every declared slot binds before the unrecognized keywords are
     // reported, so a call missing `file` names `file`.
@@ -21214,14 +21241,19 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     let (raw_type, console) = {
         let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
-        if crate::module::_io::winconsoleio::pyio_get_console_type(file) != '\0' {
+        if allow_windows_console
+            && crate::module::_io::winconsoleio::pyio_get_console_type(file) != '\0'
+        {
             (crate::module::_io::windows_console_io_type(), true)
         } else {
             (crate::module::_io::fileio_type(), false)
         }
     };
     #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
-    let (raw_type, console) = (crate::module::_io::fileio_type(), false);
+    let (raw_type, console) = {
+        let _ = allow_windows_console;
+        (crate::module::_io::fileio_type(), false)
+    };
     let raw = crate::call::call_function_impl_result(
         raw_type,
         &[

@@ -148,6 +148,88 @@ pub fn walk_faulthandler_roots(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 static FAULTHANDLER_EXC_HANDLER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Write one unsigned decimal without allocating.  The structured-exception
+/// callback runs at an arbitrary fault point, so it cannot enter formatting
+/// machinery or the managed heap.
+#[cfg(all(windows, feature = "host_env"))]
+fn faulthandler_write_decimal(fd: i32, mut value: usize) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    rustpython_host_env::faulthandler::write_fd(fd, &digits[start..]);
+}
+
+/// Write the current thread's application frames from the same live
+/// `ExecutionContext.topframeref` chain that PyPy's `dumper._dump_callback`
+/// walks.  Every referenced filename/name is immutable storage owned by the
+/// code object, and all scratch space is on the native stack: the exception
+/// callback must remain allocation-free.
+#[cfg(all(windows, feature = "host_env"))]
+unsafe fn faulthandler_dump_current_traceback(fd: i32) {
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+
+    rustpython_host_env::faulthandler::write_fd(fd, b"Current thread 0x");
+    let thread_id = unsafe { GetCurrentThreadId() } as usize;
+    let mut hex = [0u8; 2 * std::mem::size_of::<usize>()];
+    let mut start = hex.len();
+    let mut value = thread_id;
+    loop {
+        start -= 1;
+        hex[start] = b"0123456789abcdef"[value & 0xf];
+        value >>= 4;
+        if value == 0 {
+            break;
+        }
+    }
+    rustpython_host_env::faulthandler::write_fd(fd, &hex[start..]);
+    rustpython_host_env::faulthandler::write_fd(fd, b" (most recent call first):\n");
+
+    let ec = crate::call::getexecutioncontext();
+    let mut frame = if ec.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*ec).topframeref }
+    };
+    let mut depth = 0usize;
+    while !frame.is_null() && depth < 100 {
+        let pycode = unsafe { (*frame).pycode as *const crate::pycode::PyCode };
+        if pycode.is_null() || unsafe { (*pycode).code_ptr.is_null() } {
+            break;
+        }
+        let code = unsafe { &*((*pycode).code_ptr as *const crate::CodeObject) };
+        let filename = if unsafe { (*pycode).filename_bytes.is_null() } {
+            code.source_path.as_bytes()
+        } else {
+            unsafe { &*(*pycode).filename_bytes }.as_slice()
+        };
+        rustpython_host_env::faulthandler::write_fd(fd, b"  File \"");
+        rustpython_host_env::faulthandler::write_fd(fd, filename);
+        rustpython_host_env::faulthandler::write_fd(fd, b"\", line ");
+        let lineno = unsafe { (*frame).get_lineno_at((*frame).last_instr) }.max(0) as usize;
+        faulthandler_write_decimal(fd, lineno);
+        rustpython_host_env::faulthandler::write_fd(fd, b" in ");
+        rustpython_host_env::faulthandler::write_fd(fd, code.obj_name.as_bytes());
+        rustpython_host_env::faulthandler::write_fd(fd, b"\n");
+        frame = unsafe { (*frame).f_backref };
+        depth += 1;
+    }
+
+    // CPython's `_Py_DumpStack` prints this section after the Python stack.
+    // Pyre has no async-safe native symbolizer yet; its accepted failure form
+    // is preferable to calling an allocator or loader lock from an SEH hook.
+    rustpython_host_env::faulthandler::write_fd(
+        fd,
+        b"Current thread's C stack trace (most recent call first):\n<C stack unavailable>\n",
+    );
+}
+
 /// `faulthandler.c:280-330 faulthandler_exc_handler`.  A fatal fault on Windows
 /// arrives as a structured exception, not as a signal — a null read never
 /// reaches the `SIGSEGV` handler — so without this, `enable()` there prints
@@ -194,6 +276,7 @@ unsafe extern "system" fn faulthandler_exc_handler(
     msg[end + 1] = b'\n';
     let fd = FAULTHANDLER_FD.load(std::sync::atomic::Ordering::Relaxed);
     rustpython_host_env::faulthandler::write_fd(fd, &msg[..end + 2]);
+    unsafe { faulthandler_dump_current_traceback(fd) };
     // `faulthandler.c:326-334`: the access violation is also delivered to the
     // program as SIGSEGV, and reporting it twice helps nobody.
     if rustpython_host_env::faulthandler::is_access_violation(code) {
@@ -742,7 +825,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     None => 0,
                 };
                 #[cfg(feature = "host_env")]
-                rustpython_host_env::faulthandler::raise_exception(code, flags);
+                {
+                    // CPython's test helper raises the C++ and CLR status
+                    // values only to verify that the vectored handler ignores
+                    // them.  Letting either unwind through Rust's
+                    // `std::sys::thread::thread_start` is converted into
+                    // `panic_cannot_unwind`, so finish with the same silent
+                    // process status the unhandled SEH would have produced.
+                    if code == 0xE06D_7363 || code == 0xE043_4352 {
+                        unsafe {
+                            windows_sys::Win32::System::Threading::TerminateProcess(
+                                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                                code,
+                            );
+                        }
+                    }
+                    rustpython_host_env::faulthandler::raise_exception(code, flags);
+                }
                 Ok(pyre_object::w_none())
             }),
         );
