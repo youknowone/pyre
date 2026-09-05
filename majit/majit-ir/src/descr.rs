@@ -7387,11 +7387,11 @@ pub fn make_vtable_field_descr() -> DescrRef {
 /// framework-GC object's header.  None on Boehm builds (gc.py:157), where
 /// `gen_initialize_tid` is a no-op.
 ///
-/// pyre's `GcHeader` is a single u64 word (`tid_and_flags`) split into a
-/// lower 32-bit type id and an upper 32-bit flags half (header.rs
-/// FLAG_SHIFT = 32).  The descr addresses the *type id* slot only —
-/// `offset = 0`, `field_size = 4 bytes`.  Restricting the store width
-/// to four bytes is what lets `gen_initialize_tid` overwrite the type
+/// pyre's `GcHeader` stores the logical RPython word in `tid_and_flags`, split
+/// into native half-word type-id and flag fields (`FLAG_SHIFT = LONG_BIT/2`).
+/// The descr addresses the *type id* slot only — `offset = 0`,
+/// `field_size = WORD/2`. Restricting the store width to that half-word is
+/// what lets `gen_initialize_tid` overwrite the type
 /// id without disturbing flag bits the runtime may already have set on
 /// the same word: collector.rs's `alloc_in_oldgen` ORs in
 /// `TRACK_YOUNG_PTRS` for any object the malloc-nursery slow path
@@ -7411,16 +7411,15 @@ pub fn make_tid_field_descr() -> DescrRef {
     static TID_FIELD_DESCR: OnceLock<DescrRef> = OnceLock::new();
     TID_FIELD_DESCR
         .get_or_init(|| {
-            // header.rs `GcHeader.tid_and_flags: u64` is split:
-            // bits  0..32 — type id (this descr).
-            // bits 32..64 — gc flags (TRACK_YOUNG_PTRS / VISITED / PINNED /
-            //               HAS_CARDS …).  Owned by the GC, not the JIT.
+            // header.rs splits the logical native word in half: type id
+            // first, then flags (TRACK_YOUNG_PTRS / VISITED / PINNED /
+            // HAS_CARDS …). Owned by the GC, not the JIT.
             // is_immutable=false: incminimark mutates flag bits on mark
             // and rewrites the whole word on forwarding.
             Arc::new(SimpleFieldDescr::new(
                 0x7000_0000,
-                0,                          // offset within HDR
-                std::mem::size_of::<u32>(), // field_size = 4 bytes (lower 32 bits = type id)
+                0,                                // offset within HDR
+                std::mem::size_of::<usize>() / 2, // HALFWORD type-id field
                 crate::Type::Int,
                 false, // is_immutable — flags / forwarding marker mutate
             ))

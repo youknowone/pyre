@@ -1006,12 +1006,15 @@ pub struct MiniMarkGC {
     /// incminimark.py:388-390.  Registrations first enter the probably-young
     /// deque as `(object, finalizer-handler-index)` pairs and are promoted by
     /// the next minor collection.
-    probably_young_objects_with_finalizers: VecDeque<(usize, usize)>,
+    probably_young_objects_with_finalizers: VecDeque<(usize, isize)>,
     /// incminimark.py:392-393.  Old objects still waiting to become
     /// unreachable, paired with their translated FinalizerQueue handler.
-    old_objects_with_finalizers: VecDeque<(usize, usize)>,
+    old_objects_with_finalizers: VecDeque<(usize, isize)>,
     /// gc/base.py finalizer handlers: one death deque and trigger per queue.
     finalizer_handlers: Vec<FinalizerHandler>,
+    /// `GCBase.run_old_style_finalizers`: heavyweight finalizers use the
+    /// historical queue index -1 and are invoked after new-style triggers.
+    run_old_style_finalizers: VecDeque<usize>,
     finalizer_lock: bool,
     /// incminimark.py:394 `self.enabled = True`.
     enabled: bool,
@@ -1301,6 +1304,7 @@ impl MiniMarkGC {
             probably_young_objects_with_finalizers: VecDeque::new(),
             old_objects_with_finalizers: VecDeque::new(),
             finalizer_handlers: Vec::new(),
+            run_old_style_finalizers: VecDeque::new(),
             finalizer_lock: false,
             enabled: true,
             oldgen_nonmoving_active: false,
@@ -1482,7 +1486,13 @@ impl MiniMarkGC {
             return (0, GcFlags::empty());
         }
         let extra_words = self.card_marking_words_for_length(length);
-        let card_header_bytes = 8 * extra_words; // WORD * extra_words
+        // incminimark.py `external_malloc`: `cardheadersize = WORD *
+        // extra_words`.  On wasm32 `GcHeader` retains an eight-byte physical
+        // prefix solely to align native Rust payloads, so round the logical
+        // card bytes up to that physical alignment; the bytes adjacent to the
+        // object remain the real card bitmap and any leading bytes are pad.
+        let logical_card_bytes = std::mem::size_of::<usize>() * extra_words;
+        let card_header_bytes = logical_card_bytes.div_ceil(GcHeader::ALIGN) * GcHeader::ALIGN;
         let mut extra_flags = GcFlags::GCFLAG_HAS_CARDS | GcFlags::GCFLAG_TRACK_YOUNG_PTRS;
         // incminimark.py:1032-1035: "if 'alloc_young', then we also
         // immediately set GCFLAG_CARDS_SET, but without adding the object to
@@ -1636,6 +1646,13 @@ impl MiniMarkGC {
         let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
             return GcRef(0);
         };
+
+        // incminimark.py `malloc_fixedsize`: a heavyweight old-style
+        // finalizer can allocate, collect and resurrect, so its object must
+        // never move. `finish_alloc_in_oldgen` performs the -1 registration.
+        if self.type_has_old_style_finalizer(type_id) {
+            return self.alloc_in_oldgen_clear(type_id, total_size);
+        }
 
         if total_size < self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
@@ -1808,6 +1825,11 @@ impl MiniMarkGC {
         let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
             return GcRef(0);
         };
+
+        if !FAST && self.type_has_old_style_finalizer(type_id) {
+            unsafe { *needs_write_barrier = true };
+            return self.alloc_in_oldgen_clear(type_id, total_size);
+        }
 
         if total_size < self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
@@ -2078,6 +2100,10 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
+        if self.type_has_old_style_finalizer(type_id) {
+            return self.alloc_in_oldgen_nursery_substitute(type_id, total_size);
+        }
+
         // Both fallbacks stand in for the nursery bump below, which clears
         // nothing — the same reading `spill_to_oldgen_or_null` takes for this
         // function's fallible counterpart.
@@ -2215,6 +2241,10 @@ impl MiniMarkGC {
             return GcRef(0);
         };
 
+        if !FAST && self.type_has_old_style_finalizer(type_id) {
+            return self.spill_to_oldgen_or_null(type_id, total_size);
+        }
+
         if total_size < self.config.large_object_threshold {
             let ptr = self.nursery.alloc(total_size);
             if !ptr.is_null() {
@@ -2260,6 +2290,50 @@ impl MiniMarkGC {
         }
         if let Some(destructor) = self.types.get(type_id).destructor {
             unsafe { destructor(obj_addr) };
+        }
+    }
+
+    /// `q_is_old_style_finalizer(typeid)` from gctypelayout.py.
+    #[inline]
+    fn type_has_old_style_finalizer(&self, type_id: u32) -> bool {
+        (type_id as usize) < self.types.len()
+            && self.types.get(type_id).old_style_finalizer.is_some()
+    }
+
+    /// `GCBase.mark_finalizer_to_run` keeps the historical -1 queue index for
+    /// old-style finalizers and non-negative indexes for FinalizerQueue.
+    fn register_finalizer_index(&mut self, fq_index: isize, obj: GcRef) {
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+            return;
+        }
+        // `register_finalizer` is contracted to run at most once per object
+        // (`rgc.py:648-649`). A second deque entry survives the first
+        // `deal_with_objects_with_finalizers` pass through `new_with_finalizer`
+        // (incminimark.py:2944-2946) and delivers the object a second time on
+        // the next major collection, so honour the contract here rather than
+        // leaving it to every caller.
+        let hdr = unsafe { header_of(obj.0) };
+        if unsafe { (*hdr).has_flag(GcFlags::FINALIZER_REGISTERED) } {
+            return;
+        }
+        unsafe { (*hdr).set_flag(GcFlags::FINALIZER_REGISTERED) };
+        // `oldgen.contains` is not the "is it old" question on its own: both
+        // raw-malloc births share `try_rawmalloc_block`, so a young one is in
+        // `rawmalloced_payloads` as well and answers yes. It has to be excluded
+        // here, because filing it as old skips the GCFLAG_VISITED_RMY stamp
+        // `deal_with_young_objects_with_finalizers` owes a raw-malloced member,
+        // and `free_young_rawmalloced_objects` then releases the block at the
+        // end of that minor with its address still on the old deque.
+        if self.oldgen.contains(obj.0) && !self.is_young_rawmalloced(obj.0) {
+            // Pyre's host allocations can be born directly in old-gen and an
+            // explicit non-moving major intentionally skips the leading minor.
+            // This is the post-`_trace_drag_out1` destination of PyPy's
+            // probably-young deque, reached immediately for an already-old obj.
+            self.old_objects_with_finalizers
+                .push_back((obj.0, fq_index));
+        } else {
+            self.probably_young_objects_with_finalizers
+                .push_back((obj.0, fq_index));
         }
     }
 
@@ -2816,6 +2890,9 @@ impl MiniMarkGC {
                 self.old_objects_with_weakrefs.push(obj_addr);
             }
         }
+        if self.type_has_old_style_finalizer(type_id) {
+            self.register_finalizer_index(-1, GcRef(obj_addr));
+        }
         crate::note_bh_object(
             obj_addr,
             total_size - GcHeader::SIZE,
@@ -2961,7 +3038,11 @@ impl MiniMarkGC {
         if (type_id as usize) >= self.types.len() {
             return true;
         }
-        let contains_weakptr = self.types.get(type_id).is_weakref;
+        let info = self.types.get(type_id);
+        let contains_weakptr = info.is_weakref;
+        if info.old_style_finalizer.is_some() {
+            return false;
+        }
         debug_assert!(
             !contains_weakptr,
             "'contains_weakptr' specified for a large object"
@@ -5571,6 +5652,7 @@ impl MiniMarkGC {
         for addr in pending {
             result.push(GcRef(addr));
         }
+        result.extend(self.run_old_style_finalizers.iter().copied().map(GcRef));
         result
     }
 
@@ -5600,6 +5682,12 @@ impl MiniMarkGC {
                 .iter()
                 .flat_map(|handler| handler.deque.iter().copied())
                 .map(|addr| (GcRef(addr), "finalizer_death_queue")),
+        );
+        roots.extend(
+            self.run_old_style_finalizers
+                .iter()
+                .copied()
+                .map(|addr| (GcRef(addr), "old_style_finalizer_death_queue")),
         );
         for (gcref, site) in roots {
             self.seed_major_root(gcref, site);
@@ -7390,7 +7478,9 @@ impl MiniMarkGC {
     /// and code object is on those lists and a predicate that counted them
     /// would never answer zero.
     pub(crate) fn registered_finalizer_count(&self) -> usize {
-        self.probably_young_objects_with_finalizers.len() + self.old_objects_with_finalizers.len()
+        self.probably_young_objects_with_finalizers.len()
+            + self.old_objects_with_finalizers.len()
+            + self.run_old_style_finalizers.len()
     }
 
     /// Whether a collection could still hand control back to the program.
@@ -7516,7 +7606,13 @@ impl MiniMarkGC {
 
         while let Some((obj_addr, fq_index)) = marked.pop_front() {
             if self.finalization_state(obj_addr) == 2 {
-                self.finalizer_handlers[fq_index].deque.push_back(obj_addr);
+                if fq_index == -1 {
+                    self.run_old_style_finalizers.push_back(obj_addr);
+                } else {
+                    self.finalizer_handlers[fq_index as usize]
+                        .deque
+                        .push_back(obj_addr);
+                }
                 self.recursively_clear_finalization_ordering(obj_addr);
             } else {
                 new_with_finalizer.push_back((obj_addr, fq_index));
@@ -7534,6 +7630,22 @@ impl MiniMarkGC {
             if !handler.deque.is_empty() {
                 (handler.trigger)();
             }
+        }
+        // GCBase.execute_finalizers runs old-style callbacks only after every
+        // new-style queue trigger. Pop before calling so a nested collection
+        // cannot invoke the same object twice. PyPy's GC transform keeps the
+        // popped `obj` local alive across `call_destructor`; register the Rust
+        // local explicitly for that same re-entrant-collection contract.
+        while let Some(obj_addr) = self.run_old_style_finalizers.pop_front() {
+            let mut obj = GcRef(obj_addr);
+            unsafe { self.roots.add(&mut obj) };
+            let type_id = unsafe { (*header_of(obj.0)).type_id() };
+            if (type_id as usize) < self.types.len()
+                && let Some(finalizer) = self.types.get(type_id).old_style_finalizer
+            {
+                unsafe { finalizer(obj.0) };
+            }
+            self.roots.remove(&mut obj);
         }
         self.finalizer_lock = false;
     }
@@ -8800,7 +8912,7 @@ impl GcAllocator for MiniMarkGC {
     fn type_alloc_is_plain(&self, type_id: u32) -> bool {
         (type_id as usize) < self.types.len() && {
             let info = self.types.get(type_id);
-            info.destructor.is_none() && !info.is_weakref
+            info.destructor.is_none() && info.old_style_finalizer.is_none() && !info.is_weakref
         }
     }
 
@@ -8963,35 +9075,8 @@ impl GcAllocator for MiniMarkGC {
                 trigger,
             });
         }
-        // `register_finalizer` is contracted to run at most once per object
-        // (`rgc.py:648-649`). A second deque entry survives the first
-        // `deal_with_objects_with_finalizers` pass through `new_with_finalizer`
-        // (incminimark.py:2944-2946) and delivers the object a second time on
-        // the next major collection, so honour the contract here rather than
-        // leaving it to every caller.
-        let hdr = unsafe { header_of(obj.0) };
-        if unsafe { (*hdr).has_flag(GcFlags::FINALIZER_REGISTERED) } {
-            return;
-        }
-        unsafe { (*hdr).set_flag(GcFlags::FINALIZER_REGISTERED) };
-        // `oldgen.contains` is not the "is it old" question on its own: both
-        // raw-malloc births share `try_rawmalloc_block`, so a young one is in
-        // `rawmalloced_payloads` as well and answers yes. It has to be excluded
-        // here, because filing it as old skips the GCFLAG_VISITED_RMY stamp
-        // `deal_with_young_objects_with_finalizers` owes a raw-malloced member,
-        // and `free_young_rawmalloced_objects` then releases the block at the
-        // end of that minor with its address still on the old deque.
-        if self.oldgen.contains(obj.0) && !self.is_young_rawmalloced(obj.0) {
-            // Pyre's host allocations can be born directly in old-gen and an
-            // explicit non-moving major intentionally skips the leading minor.
-            // This is the post-`_trace_drag_out1` destination of PyPy's
-            // probably-young deque, reached immediately for an already-old obj.
-            self.old_objects_with_finalizers
-                .push_back((obj.0, fq_index));
-        } else {
-            self.probably_young_objects_with_finalizers
-                .push_back((obj.0, fq_index));
-        }
+        let fq_index = isize::try_from(fq_index).expect("finalizer queue index exceeds Signed");
+        self.register_finalizer_index(fq_index, obj);
     }
 
     fn ignore_finalizer(&mut self, obj: GcRef) {
@@ -15094,6 +15179,41 @@ cache size\t: 8192 kB\n";
         // ArenaCollection::contains is intentionally an arena-range query and
         // can stay true for a freed block while the current arena is retained.
         // The allocator's exact live count verifies reclamation here.
+        assert_eq!(gc.oldgen.object_count(), 0);
+    }
+
+    /// incminimark.py `malloc_fixedsize(..., is_finalizer_light=False)` and
+    /// GCBase.execute_finalizers: an old-style finalizer is born old, runs only
+    /// after finalization ordering, and leaves the resurrectable object alive
+    /// until a later major cycle.
+    #[test]
+    fn old_style_finalizer_is_born_old_and_runs_from_its_distinct_queue() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn finalizer(_obj_addr: usize) {
+            RUNS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        RUNS.store(0, Ordering::Relaxed);
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_old_style_finalizer(16, finalizer));
+        let obj = gc.alloc_with_type(tid, 16);
+
+        assert!(!gc.is_in_nursery(obj.0));
+        assert_eq!(
+            gc.old_objects_with_finalizers,
+            VecDeque::from([(obj.0, -1)])
+        );
+        assert!(gc.young_objects_with_destructors.is_empty());
+
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(RUNS.load(Ordering::Relaxed), 1);
+        assert!(gc.run_old_style_finalizers.is_empty());
+        assert_eq!(gc.oldgen.object_count(), 1);
+
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(RUNS.load(Ordering::Relaxed), 1);
         assert_eq!(gc.oldgen.object_count(), 0);
     }
 

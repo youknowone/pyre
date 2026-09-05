@@ -377,12 +377,17 @@ const fn immortal_type() -> CPyTypeObject {
     }
 }
 
-/// The raw block `type_alloc` hands to `type_realize` upstream. It starts
-/// with an ordinary C reference; `track_reference` adds the rawrefcount share
-/// when the `W_PyCTypeObject` is attached.
+/// The raw block `type_alloc` hands to `type_realize` upstream.
+///
+/// PyPy's `PyType_FromModuleAndSpec` returns that already-owned raw block
+/// directly (`result_is_ll=True`).  Pyre's [`from_spec`] instead returns the
+/// attached interpreter object through `object::result`, whose `make_ref`
+/// supplies the one C reference at the API boundary.  Start the wrapper-owned
+/// count at zero so that `attach_foreign_pyobj`'s rawrefcount share followed by
+/// that `make_ref` lands on `REFCNT_FROM_PYPY + 1`, exactly as upstream does.
 const fn allocated_type() -> CPyTypeObject {
     let mut tp = immortal_type();
-    tp.ob_base.ob_base.ob_refcnt = 1;
+    tp.ob_base.ob_base.ob_refcnt = 0;
     tp
 }
 
@@ -7066,6 +7071,16 @@ pub(super) fn ensure_linked() {
 
 #[cfg(test)]
 mod tests {
+    /// `PyType_FromModuleAndSpec` is `result_is_ll=True` upstream: its
+    /// `PyType_GenericAlloc` reference is the one returned to C.  Pyre routes
+    /// the interpreter object through `object::result`, so the corresponding
+    /// reference is added there and must not already be present in the raw
+    /// wrapper block.
+    #[test]
+    fn spec_type_wrapper_starts_without_a_second_c_reference() {
+        assert_eq!(super::allocated_type().ob_base.ob_base.ob_refcnt, 0);
+    }
+
     /// Every thunk in every pool must have an address of its own.
     ///
     /// The address is the only channel telling a thunk which `(owner, method)`

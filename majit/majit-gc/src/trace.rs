@@ -259,10 +259,10 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> usize {
     if !info.gc_ptr_offsets.is_empty() {
         infobits |= TypeInfoLayout::T_HAS_GCPTR;
     }
-    // `encode_type_shape` customdata / destructor / oldstyle
-    // finalizer / memory pressure. majit only models the custom
-    // tracer half of this; treat custom_trace.is_some() as the
-    // T_HAS_CUSTOM_TRACE bit (info.py:178 `q_has_custom_trace`).
+    // `encode_type_shape` customdata / destructor / oldstyle finalizer /
+    // memory pressure. `custom_trace` selects T_HAS_CUSTOM_TRACE
+    // (info.py `q_has_custom_trace`); `old_style_finalizer` selects its own
+    // mutually-exclusive bit below.
     if info.custom_trace.is_some() {
         infobits |= TypeInfoLayout::T_HAS_CUSTOM_TRACE;
         // jitframe.py registers JITFRAME via custom_trace and is also
@@ -298,6 +298,9 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> usize {
     // gctypelayout.py:245-257 destructor surface).
     if info.destructor.is_some() {
         infobits |= TypeInfoLayout::T_HAS_DESTRUCTOR;
+    }
+    if info.old_style_finalizer.is_some() {
+        infobits |= TypeInfoLayout::T_HAS_OLDSTYLE_FINALIZER;
     }
     // `encode_type_shape`: the translated type's custom data points at
     // its inherited `special_memory_pressure` field.
@@ -481,6 +484,11 @@ pub struct TypeInfo {
     /// payloads owning non-GC heap memory get their drop glue run. See
     /// [`DestructorFn`].
     pub destructor: Option<DestructorFn>,
+    /// `gctypelayout.py`'s `old_style_finalizer` custom function. Unlike a
+    /// lightweight destructor, this may run arbitrary code and resurrect its
+    /// object. IncrementalMiniMark therefore allocates the object old and
+    /// queues the callback until `GCBase.execute_finalizers`.
+    pub old_style_finalizer: Option<DestructorFn>,
     /// `gctypelayout.get_memory_pressure_ofs(TYPE)` parity. `Some(offset)`
     /// marks a fixed-size type carrying the inherited
     /// `special_memory_pressure` signed field read by
@@ -509,6 +517,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -536,6 +545,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: Some(destructor),
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -547,7 +557,34 @@ impl TypeInfo {
     /// allocation whose drop glue must run when the instance dies — e.g. the
     /// `W_MemoryView` header owning its `*const BufferView` box.
     pub fn with_destructor_fn(mut self, destructor: DestructorFn) -> Self {
+        assert!(
+            self.old_style_finalizer.is_none(),
+            "a type cannot have both a light and an old-style finalizer"
+        );
         self.destructor = Some(destructor);
+        self
+    }
+
+    /// Create a fixed-size type with PyPy's heavyweight, old-style finalizer.
+    /// The collector forces instances out of the nursery and invokes this only
+    /// after finalization ordering has kept the object graph alive.
+    pub fn with_old_style_finalizer(size: usize, finalizer: DestructorFn) -> Self {
+        Self::simple(size).with_old_style_finalizer_fn(finalizer)
+    }
+
+    /// Attach an old-style finalizer to another fixed-size type layout.
+    pub fn with_old_style_finalizer_fn(mut self, finalizer: DestructorFn) -> Self {
+        assert_eq!(self.item_size, 0, "finalizer types must be fixed-size");
+        assert!(!self.is_weakref, "a finalizer type cannot be a weakref");
+        assert!(
+            self.custom_trace.is_none(),
+            "an old-style finalizer cannot share the custom function slot"
+        );
+        assert!(
+            self.destructor.is_none(),
+            "a type cannot have both a light and an old-style finalizer"
+        );
+        self.old_style_finalizer = Some(finalizer);
         self
     }
 
@@ -614,6 +651,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: true,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -647,6 +685,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -679,6 +718,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -709,6 +749,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -748,6 +789,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -777,6 +819,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -803,6 +846,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -868,6 +912,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -894,6 +939,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -936,6 +982,7 @@ impl TypeInfo {
             subclassrange_max: 0,
             is_weakref: false,
             destructor: None,
+            old_style_finalizer: None,
             memory_pressure_offset: None,
         }
     }
@@ -1094,6 +1141,7 @@ impl TypeRegistry {
                 Self::materialize_offsets(&mut self.offset_tables, &info.var_gc_ptr_offsets);
             let customdata = if info.custom_trace.is_some()
                 || info.destructor.is_some()
+                || info.old_style_finalizer.is_some()
                 || info.memory_pressure_offset.is_some()
             {
                 // Pyre permits its Rust-side custom tracer and lightweight
@@ -1103,6 +1151,7 @@ impl TypeRegistry {
                 let customfunc = info
                     .custom_trace
                     .map(|f| f as usize)
+                    .or_else(|| info.old_style_finalizer.map(|f| f as usize))
                     .or_else(|| info.destructor.map(|f| f as usize))
                     .unwrap_or(0);
                 let data = Box::new(CustomDataLayout {
@@ -1304,6 +1353,7 @@ mod tests {
     use super::*;
 
     unsafe fn materialized_destructor(_obj_addr: usize) {}
+    unsafe fn materialized_old_style_finalizer(_obj_addr: usize) {}
 
     #[test]
     fn test_type_registry() {
@@ -1364,6 +1414,31 @@ mod tests {
         assert_eq!(unsafe { *var_offsets }, 2);
         assert_eq!(unsafe { *var_offsets.add(1) }, 0);
         assert_eq!(unsafe { *var_offsets.add(2) }, 16);
+    }
+
+    #[test]
+    fn old_style_finalizer_sets_infobit_and_custom_function() {
+        let mut reg = TypeRegistry::new();
+        let type_id = reg.register(TypeInfo::with_old_style_finalizer(
+            16,
+            materialized_old_style_finalizer,
+        ));
+        assert_ne!(
+            encode_type_shape(reg.get(type_id), type_id) & TypeInfoLayout::T_HAS_OLDSTYLE_FINALIZER,
+            0
+        );
+        assert_eq!(
+            encode_type_shape(reg.get(type_id), type_id) & TypeInfoLayout::T_HAS_DESTRUCTOR,
+            0
+        );
+
+        reg.freeze_types();
+        let row = &reg.type_info_table()[type_id as usize];
+        let custom = unsafe { &*(row.type_info.customdata as *const CustomDataLayout) };
+        assert_eq!(
+            custom.customfunc,
+            materialized_old_style_finalizer as *const () as usize
+        );
     }
 
     #[test]

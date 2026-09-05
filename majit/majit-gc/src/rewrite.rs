@@ -2864,10 +2864,10 @@ impl GcRewriterImpl {
     /// the actual store address is `obj_ptr + (-HDR_SIZE +
     /// descr.offset())`.  None disables the store (Boehm parity).
     ///
-    /// `fielddescr_tid.field_size` is 4 bytes (descr.rs
-    /// `make_tid_field_descr`): pyre's HDR packs type id into the lower
-    /// 32 bits and gc flags (TRACK_YOUNG_PTRS / VISITED / …) into the
-    /// upper 32 bits, and the slow `dynasm_nursery_slowpath` /
+    /// `fielddescr_tid.field_size` is `WORD / 2` (descr.rs
+    /// `make_tid_field_descr`): pyre's logical HDR word packs the type id
+    /// into its lower half and gc flags (TRACK_YOUNG_PTRS / VISITED / …)
+    /// into its upper half, and the slow `dynasm_nursery_slowpath` /
     /// cranelift-side malloc helpers may promote large or
     /// post-collection allocations to the old gen, where
     /// `collector.rs`'s `alloc_in_oldgen` pre-stamps `TRACK_YOUNG_PTRS`
@@ -2875,7 +2875,7 @@ impl GcRewriterImpl {
     /// wipe that bit and leave a fresh oldgen object invisible to the
     /// remembered-set machinery, dropping any subsequent young pointer
     /// written into it.  Restricting the GC_STORE width to
-    /// `field_size = 4` keeps the upper half intact.
+    /// `field_size = WORD / 2` keeps the flags half intact.
     fn gen_initialize_tid(&self, obj: Operand, tid: u32, st: &mut RewriteState) {
         let Some(tid_fd_ref) = self.fielddescr_tid.as_ref() else {
             return;
@@ -3901,9 +3901,9 @@ mod tests {
             .inline_const_bits()
             .expect("inline ConstInt");
         assert_eq!(tid_val, 7); // type_id = 7
-        // GcHeader packs type id (lower 32 bits) and gc flags (upper 32
-        // bits) into a single u64.  gen_initialize_tid must emit a
-        // 4-byte store so that the runtime-set flags
+        // GcHeader packs the type id and gc flags into the lower and upper
+        // halves of the logical native word. gen_initialize_tid must emit a
+        // HALFWORD store so that the runtime-set flags
         // (collector.rs's alloc_in_oldgen ORs in TRACK_YOUNG_PTRS for
         // oldgen-promoted allocs) survive the type id stamp.
         let store_size = result[1]
@@ -3912,9 +3912,10 @@ mod tests {
             .inline_const_bits()
             .expect("inline ConstInt");
         assert_eq!(
-            store_size, 4,
-            "gen_initialize_tid must emit a 4-byte store (type id half) so \
-             oldgen TRACK_YOUNG_PTRS in the upper 32 bits is preserved"
+            store_size,
+            (std::mem::size_of::<usize>() / 2) as i64,
+            "gen_initialize_tid must emit a HALFWORD store so oldgen \
+             TRACK_YOUNG_PTRS in the flags half is preserved"
         );
 
         for (_key, c) in &constants {

@@ -1,30 +1,36 @@
 //! Object header layout for GC-managed objects.
 //!
-//! Each GC object starts with a single machine word that stores both
-//! the type ID (lower 32 bits) and GC flags (upper 32 bits), matching
-//! incminimark's HDR.tid layout where `first_gcflag = 1 << (LONG_BIT//2)`.
+//! Each GC object starts with one logical RPython word that stores both the
+//! type ID (lower half) and GC flags (upper half), matching incminimark's
+//! `HDR.tid` layout where `first_gcflag = 1 << (LONG_BIT//2)`.
+//!
+//! The Rust storage remains `u64` on wasm32 because GC payloads include
+//! Rust values with eight-byte alignment.  Shrinking the physical prefix to
+//! four bytes would misalign those payloads.  Only the low native-word-sized
+//! part is semantically occupied there: 16 type-id bits followed by 16 flag
+//! bits, just like a translated 32-bit PyPy.  The upper four bytes are ABI
+//! padding, not an extension of either field.
 
 use crate::GcFlags;
 
 /// Number of bits reserved for the type ID in the lower half.
-pub const TYPE_ID_BITS: u32 = 32;
+pub const TYPE_ID_BITS: u32 = usize::BITS / 2;
 pub const TYPE_ID_MASK: u64 = (1u64 << TYPE_ID_BITS) - 1;
 
 /// Shift applied to `GcFlags` to position it in the upper half of the
-/// header word. `GcFlags` declares each flag at position 0..N, but in the
-/// header they live at positions 32..32+N.
+/// logical header word. `GcFlags` declares each flag at position 0..N.
 pub const FLAG_SHIFT: u32 = TYPE_ID_BITS;
 
 /// The sentinel value written into a forwarded nursery object's header.
-/// Equivalent to incminimark's tid = -42 marker (all bits set as i64 -42,
-/// but we just use a distinctive pattern).
-pub const FORWARDED_MARKER: u64 = 0xFFFF_FFFF_FFFF_FFD6; // -42 as u64
+/// Equivalent to incminimark's `tid = -42` in a native Signed word.
+pub const FORWARDED_MARKER: u64 = (usize::MAX - 41) as u64;
 
 /// GC object header, placed immediately before the object payload.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct GcHeader {
-    /// Lower 32 bits: type ID. Upper 32 bits: GC flags (shifted).
+    /// Low native-word half: type ID. Next half: GC flags (shifted).
+    /// On wasm32 the upper 32 bits are physical ABI padding and stay zero.
     pub tid_and_flags: u64,
 }
 
@@ -42,6 +48,10 @@ impl GcHeader {
 
     /// Create a new header with the given type ID and no flags set.
     pub fn new(type_id: u32) -> Self {
+        assert!(
+            u64::from(type_id) <= TYPE_ID_MASK,
+            "GC type id {type_id} does not fit the {TYPE_ID_BITS}-bit header field"
+        );
         GcHeader {
             tid_and_flags: type_id as u64,
         }
@@ -49,6 +59,15 @@ impl GcHeader {
 
     /// Create a new header with the given type ID and initial flags.
     pub fn with_flags(type_id: u32, raw_flags: GcFlags) -> Self {
+        assert!(
+            u64::from(type_id) <= TYPE_ID_MASK,
+            "GC type id {type_id} does not fit the {TYPE_ID_BITS}-bit header field"
+        );
+        assert_eq!(
+            raw_flags.bits() & !(TYPE_ID_MASK),
+            0,
+            "GC flags do not fit the {TYPE_ID_BITS}-bit header field"
+        );
         GcHeader {
             tid_and_flags: (raw_flags.bits() << FLAG_SHIFT) | (type_id as u64),
         }
@@ -292,6 +311,13 @@ mod tests {
     #[test]
     fn test_header_size() {
         assert_eq!(GcHeader::SIZE, 8);
+    }
+
+    #[test]
+    fn logical_header_halves_follow_rpython_word_size() {
+        assert_eq!(TYPE_ID_BITS, usize::BITS / 2);
+        assert_eq!(FLAG_SHIFT, usize::BITS / 2);
+        assert_eq!(FORWARDED_MARKER, (usize::MAX - 41) as u64);
     }
 
     #[test]
