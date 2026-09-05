@@ -403,6 +403,30 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         }
     }
 
+    /// Whether the index table already names `slot`, walking the same probe
+    /// `delete_by_entry_index` uses. A collection that rebuilt the table
+    /// during `entries.push` will have placed the new slot already.
+    fn slot_is_indexed(&self, hash: u64, slot: usize) -> bool {
+        if self.indexes.is_empty() {
+            return false;
+        }
+        let mask = self.indexes.len() - 1;
+        let target = slot as u32 + VALID_OFFSET;
+        let mut i = (hash as usize) & mask;
+        let mut perturb = hash;
+        for _ in 0..=self.indexes.len() {
+            if self.indexes[i] == target {
+                return true;
+            }
+            if self.indexes[i] == FREE {
+                return false;
+            }
+            i = Self::probe_next(i, perturb, mask);
+            perturb >>= PERTURB_SHIFT;
+        }
+        false
+    }
+
     /// `ll_dict_store_clean` (rordereddict.py:1128) — probe for a [`FREE`]
     /// slot only, valid when no key can already be present.
     fn insert_clean(&mut self, hash: u64, slot: u32) {
@@ -565,30 +589,34 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             reindexed = true;
             rc = self.resize_counter - 3;
         }
-        // A reindex rebuilt the whole table, so the probe's slot names nothing.
-        match index_slot.filter(|_| !reindexed) {
-            Some(index_slot) => self.indexes[index_slot] = self.next_slot() + VALID_OFFSET,
-            None => {
-                let slot = self.next_slot();
-                self.insert_clean(hash, slot);
-            }
-        }
+        // Upstream writes the index first because `d.entries` is a
+        // preallocated array (`_ll_dict_setitem_lookup_done`); the slot
+        // already exists, so the index cannot dangle. This port grows
+        // `entries` with `Vec::push`, which allocates. Writing the index
+        // before that push leaves a name for a slot that is not there yet
+        // (`_ll_dict_rescue` exists for exactly that window). Push first,
+        // then name the slot that now exists. If a collection rebuilt the
+        // table during the push, the rebuilt index already names it.
+        let slot = self.next_slot();
         self.resize_counter = rc;
-        // `ll_dict_grow` replaces `d.entries` outright when the array is full,
-        // so a growth here is the same event `entries != d.entries` reports.
-        //
-        // !! Read the *capacity*, not the data pointer: a `Vec` growth goes
-        // through `realloc`, and an allocator that extends the block in place
-        // hands back the address it already had — measured, this passed on
-        // dynasm and cranelift and left wasm answering a mutating `__eq__`
-        // without its restart.  Capacity changes on every growth whatever the
-        // allocator does.
         let entries_capacity = self.entries.capacity();
         self.entries.push(Some(Entry { hash, key, value }));
         if self.entries.capacity() != entries_capacity {
             self.generation = self.generation.wrapping_add(1);
         }
         self.num_live_items += 1;
+        if !self.slot_is_indexed(hash, slot as usize) {
+            match index_slot.filter(|_| !reindexed) {
+                Some(index_slot)
+                    if index_slot < self.indexes.len()
+                        && (self.indexes[index_slot] == FREE
+                            || self.indexes[index_slot] == DELETED) =>
+                {
+                    self.indexes[index_slot] = slot + VALID_OFFSET;
+                }
+                _ => self.insert_clean(hash, slot),
+            }
+        }
     }
 
     /// `ll_call_delete_by_entry_index` (rordereddict.py:1157) — re-probe from
@@ -931,6 +959,24 @@ mod tests {
         check_invariants(&d);
         let got: Vec<u64> = d.keys().copied().collect();
         assert_eq!(got, (0..100).filter(|i| i % 2 == 1).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn insert_after_reindex_still_names_the_new_slot() {
+        let mut d: RDict<u64, u64> = RDict::new();
+        for i in 0..32 {
+            d.insert(i, i);
+        }
+        for i in 0..24 {
+            d.remove(&i);
+        }
+        for i in 100..116 {
+            d.insert(i, i);
+        }
+        check_invariants(&d);
+        assert_eq!(d.get(&115), Some(&115));
+        assert_eq!(d.remove(&115), Some(115));
+        check_invariants(&d);
     }
 
     #[test]
