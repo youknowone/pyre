@@ -4744,8 +4744,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     // GC layouts are known, and only walks Size/Array objects already in
     // GcCache.  Materialize those (plus Field slots, which publish the
     // parent Size) without pulling `rehydrate_build_descr_raw_sets` —
-    // EffectInfo/Call rebuild — into process startup.  `_setup_once` does
-    // not mint descrs; `finish_setup_descrs` does, on the first JIT.
+    // EffectInfo/Call restoration — into process startup. PyPy populates
+    // descriptors during translation; `MetaInterpStaticData.finish_setup_descrs`
+    // enumerates them, and `_setup_once` does not mint descriptors.
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
     let _registered_synthetic_structs = majit_ir::descr::gc_cache()
         .lock()
