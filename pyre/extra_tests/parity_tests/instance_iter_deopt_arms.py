@@ -193,4 +193,4 @@ def subclass_next():
 
 assert subclass_next() == 6 * N
 
-print("PASS")
+print("OK")
