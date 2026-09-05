@@ -94,9 +94,10 @@ discipline:
 - A finding that turns out to be a false positive, or a genuine structural
   adaptation Codex mis-sorted into 1/2, gets reclassified — drop it from the
   fix list and note why. Don't fix something that isn't actually wrong.
-- After the fixes, verify the way the repo expects: `cargo check`/`cargo test`
-  with `--features dynasm`, and `python ./pyre/check.py` for end-to-end
-  correctness. Don't claim the section is closed until the checks pass.
+- After the fixes, verify the way the repo expects:
+  `cargo test --all --no-default-features --features dynasm`, and
+  `python3 pyre/check.py` for end-to-end correctness across every backend the
+  host can build. Don't claim the section is closed until the checks pass.
 
 If a section-1/2 fix is genuinely too large to land in this session (it needs an
 unported upstream dependency, or cascades across many files), say so explicitly

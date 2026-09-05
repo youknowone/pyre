@@ -84,9 +84,9 @@ Run the follow-up task with these constraints:
 
 After making changes, run the checks that would catch regressions:
 
-- `cargo test --all --features dynasm` — parity regressions in the metainterp layer often surface as unrelated test failures.
-- `cargo test --all --features cranelift` if cranelift paths are touched.
-- `python ./pyre/check.py` for end-to-end correctness.
+- `cargo test --all --no-default-features --features dynasm` — parity regressions in the metainterp layer often surface as unrelated test failures.
+- `cargo test --all --no-default-features --features cranelift` if cranelift paths are touched.
+- `python3 pyre/check.py` for end-to-end correctness.
 
 Accept temporary performance regressions. Do NOT re-introduce shortcuts to recover perf. Record the regression in MEMORY and move on.
 
