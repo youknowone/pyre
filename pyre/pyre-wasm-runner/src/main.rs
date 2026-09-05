@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use wasmtime::error::Context;
 use wasmtime::{
     AsContext, AsContextMut, Caller, Config, Engine, Error, Extern, Func, Instance, Linker, Memory,
-    Module, Ref, Result, Store, Table, Val, ValType,
+    Module, OptLevel, Ref, Result, Store, Table, Val, ValType,
 };
 
 use crate::host_path::{guest_path_to_host, host_path_to_guest};
@@ -45,8 +45,9 @@ pub(crate) const CALL_NARGS_OFS: usize = 2016;
 pub(crate) const DEFAULT_MODULE: &str = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm";
 
 /// Which wasm runtime executes the module. `wasmtime` (cranelift) is fast in
-/// steady state but compiles the whole ~14MB module on load; `wasmi` is a
-/// pure-Rust interpreter with near-zero load cost but slower hot loops.
+/// steady state but has a large cold module-compilation cost; [`load_main_module`]
+/// caches that result as `.cwasm`. `wasmi` is a pure-Rust interpreter with
+/// near-zero load cost but slower hot loops.
 /// Selected by `--engine` or `$PYRE_WASM_ENGINE` (CLI wins), default wasmtime.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WasmEngine {
@@ -327,6 +328,14 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     const WASM_STACK: usize = 256 * 1024 * 1024;
     config.max_wasm_stack(WASM_STACK);
     config.async_stack_size(WASM_STACK + 1024 * 1024);
+    // Trace modules are compiled synchronously on the Python thread, and
+    // call-heavy workloads materialize dozens of them before doing enough
+    // work to amortize that pause.  Keep Cranelift's optimizing pipeline, but
+    // ask it to optimize for size as well: smaller trace bodies reduce both
+    // synchronous compile work and instruction-cache pressure.  This setting
+    // belongs to the wasm host boundary; the shared frontend optimizer and IR
+    // are unchanged.
+    config.cranelift_opt_level(OptLevel::SpeedAndSize);
     // JIT trace modules emit `return_call_indirect` to chain a loop-closing bridge
     // back into its loop at constant stack depth (the tail-call proposal).
     config.wasm_tail_call(true);
@@ -1626,7 +1635,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
 }
 
 /// Load the main module, using a compiled `<module>.cwasm` cache to skip
-/// cranelift recompilation of the ~14MB module on every process start.
+/// Cranelift recompilation of the main module on every process start.
 ///
 /// The cache is the engine's own `Module::serialize` artifact, so it is only
 /// usable by a byte-compatible engine build; `Module::deserialize_file`
@@ -1718,10 +1727,23 @@ fn deserialize_cache(engine: &Engine, cache_path: &Path) -> Option<Module> {
 /// rewrite the file the other mode just wrote.
 fn cache_variant(meter_fuel: bool, epoch_interruption: bool) -> &'static str {
     match (meter_fuel, epoch_interruption) {
-        (false, false) => "",
-        (true, false) => ".fuel",
-        (false, true) => ".epoch",
-        (true, true) => ".fuel.epoch",
+        (false, false) => ".speed-and-size",
+        (true, false) => ".speed-and-size.fuel",
+        (false, true) => ".speed-and-size.epoch",
+        (true, true) => ".speed-and-size.fuel.epoch",
+    }
+}
+
+#[test]
+fn optimized_cache_variants_do_not_reuse_default_opt_level_artifacts() {
+    let mut variants = Vec::new();
+    for fuel in [false, true] {
+        for epoch in [false, true] {
+            let variant = cache_variant(fuel, epoch);
+            assert!(variant.contains("speed-and-size"));
+            assert!(!variants.contains(&variant));
+            variants.push(variant);
+        }
     }
 }
 

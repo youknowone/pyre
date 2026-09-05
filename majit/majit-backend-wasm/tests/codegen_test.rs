@@ -660,9 +660,8 @@ fn sparse_value_ids_declare_only_addressable_value_locals() {
 }
 
 #[test]
-fn peephole_folds_adjacent_local_set_get_to_local_tee() {
+fn same_as_reuses_its_source_local() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let tee_local = 2;
     let ops = vec![
         make_op(
             OpCode::SameAsI,
@@ -679,37 +678,37 @@ fn peephole_folds_adjacent_local_set_get_to_local_tee() {
 
     let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
     validate_wasm(&bytes);
+    assert_eq!(
+        emitted_local_count(&bytes),
+        inputargs.len() as u32 + 1 + 6 + 1,
+        "SameAsI shares input 0's local; only IntAdd allocates a result local"
+    );
+}
 
-    let mut has_tee = false;
-    let mut has_unfolded_pair = false;
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
-        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
-            let mut reader = body.get_operators_reader().unwrap();
-            let mut previous_local_set = None;
-            while !reader.eof() {
-                match reader.read().unwrap() {
-                    wasmparser::Operator::LocalSet { local_index } => {
-                        previous_local_set = Some(local_index);
-                    }
-                    wasmparser::Operator::LocalGet { local_index } => {
-                        has_unfolded_pair |=
-                            previous_local_set == Some(tee_local) && local_index == tee_local;
-                        previous_local_set = None;
-                    }
-                    wasmparser::Operator::LocalTee { local_index } => {
-                        has_tee |= local_index == tee_local;
-                        previous_local_set = None;
-                    }
-                    _ => previous_local_set = None,
-                }
-            }
-        }
-    }
+#[test]
+fn same_as_does_not_alias_a_mutable_label_local() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
+        make_op(
+            OpCode::SameAsI,
+            &[OpRef::input_arg_int(0)],
+            OpRef::int_op(1),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
+    ];
 
-    assert!(has_tee);
-    assert!(
-        !has_unfolded_pair,
-        "the local.set/local.get pair must be folded"
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(
+        emitted_local_count(&bytes),
+        inputargs.len() as u32 + 2 + 6 + 1,
+        "SameAs must not share the phi local that JUMP rebinds"
     );
 }
 
@@ -1886,6 +1885,83 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             );
         }
     }
+}
+
+#[test]
+fn call_assembler_accepts_float_and_void_result_locals() {
+    fn build(opcode: OpCode, result: OpRef, input_type: Type) -> Vec<u8> {
+        let token = 0x5a5a_u64;
+        let inputargs = vec![InputArg::from_type(input_type, 0)];
+        let call = make_op(opcode, &[OpRef::input_arg_typed(0, input_type)], result);
+        call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
+            arg_types: vec![input_type],
+            result_type: opcode.result_type(),
+            target_token: token,
+        }));
+        let finish_args = (result != OpRef::NONE).then(|| rb(result));
+        let ops = vec![
+            call,
+            Op::new(
+                OpCode::Finish,
+                finish_args.as_ref().map_or(&[][..], std::slice::from_ref),
+            ),
+        ];
+        let inputs = codegen::ModuleBuildInputs {
+            inputargs,
+            ops,
+            inlined_bridges: Vec::new(),
+            constants: indexmap::IndexMap::new(),
+            vtable_offset: Some(0),
+            classptr_to_typeid: HashMap::new(),
+            guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+            alloc: codegen::AllocHelpers::default(),
+            wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+            nursery: None,
+            invalidated_flag_addr: 0,
+            gc_table_base: 0,
+            fail_index_base: 0,
+            bridge_cells_base: 0,
+            bridge_entry_arity: None,
+            bridge_param_dispatch: false,
+            trace_entry_census: None,
+            inline_trip: None,
+            external_jump_slot: 0,
+            external_jump_wide_slot: 0,
+            external_jump_key: 0,
+            frame: codegen::FrameGeometry::fixed(),
+            ca: codegen::CaParams {
+                emit_ca: true,
+                targets: HashMap::from([(
+                    token,
+                    codegen::CaTarget {
+                        dispatch_entry: 1024,
+                    },
+                )]),
+                deopt_helper_slot: 1,
+                ca_alloc_fn_ptr: 2,
+                ca_pop_fn_ptr: 3,
+                ca_reload_fn_ptr: 4,
+                ca_reload_caller_fn_ptr: 5,
+                ..codegen::CaParams::default()
+            },
+        };
+        codegen::build_wasm_module(&inputs)
+            .expect("Float/Void CALL_ASSEMBLER should compile")
+            .0
+    }
+
+    let float = build(OpCode::CallAssemblerF, OpRef::float_op(1), Type::Int);
+    validate_wasm(&float);
+    let mut float_reinterprets = 0;
+    count_operators(&float, |op| {
+        if matches!(op, wasmparser::Operator::F64ReinterpretI64) {
+            float_reinterprets += 1;
+        }
+    });
+    assert_eq!(float_reinterprets, 1);
+
+    let void = build(OpCode::CallAssemblerN, OpRef::NONE, Type::Int);
+    validate_wasm(&void);
 }
 
 /// A region's value ids are its own trace's, so they collide with the owner's.
@@ -4066,6 +4142,7 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
                 new_array_fn_ptr: NEW_ARRAY_FN,
                 new_oldgen_fn_ptr: NEW_OLDGEN_FN,
                 new_array_oldgen_fn_ptr: NEW_ARRAY_OLDGEN_FN,
+                fmod_fn_ptr: 0,
             },
             wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
             nursery: None, // the inline bump is off, so only the helper choice shows
@@ -4856,7 +4933,7 @@ fn a_preamble_region_closing_at_a_label_past_its_guard_declines() {
     let descr1 = majit_ir::make_loop_target_descr(71, false);
 
     let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
-    label0.setdescr(descr0);
+    label0.setdescr(descr0.clone());
     let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
     label1.setdescr(descr1.clone());
     let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
@@ -4898,6 +4975,18 @@ fn a_preamble_region_closing_at_a_label_past_its_guard_declines() {
     // The region names LABEL1, which sits after the guard it hangs off.
     let region_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
     region_jump.setdescr(descr1);
+    assert!(!codegen::outside_region_labels_initialized(
+        &ops,
+        0,
+        std::slice::from_ref(&region_jump)
+    ));
+    let earlier_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    earlier_jump.setdescr(descr0);
+    assert!(codegen::outside_region_labels_initialized(
+        &ops,
+        0,
+        &[earlier_jump]
+    ));
     let inputs = inline_region_inputs(
         &vec![InputArg::from_type(Type::Int, 0)],
         ops,
@@ -6087,7 +6176,7 @@ fn call_release_gil_takes_its_callee_from_arg_one() {
     let call = make_op(
         OpCode::CallReleaseGilI,
         &[
-            OpRef::const_int(0x11),  // save_err
+            OpRef::const_int(0),     // save_err: no errno protocol
             OpRef::const_int(0x22),  // the real callee
             OpRef::input_arg_int(0), // its one argument
         ],
@@ -6104,19 +6193,20 @@ fn call_release_gil_takes_its_callee_from_arg_one() {
     let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
     let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
     validate_wasm(&bytes);
-    let mut nargs_consts = Vec::new();
-    count_operators(&bytes, |op| {
-        if let wasmparser::Operator::I64Const { value } = op {
-            nargs_consts.push(*value);
-        }
+    let mut callee_consts = Vec::new();
+    let mut call_indirects = 0;
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I32Const { value } => callee_consts.push(i64::from(*value)),
+        wasmparser::Operator::CallIndirect { .. } => call_indirects += 1,
+        _ => {}
     });
     assert!(
-        nargs_consts.contains(&0x22),
-        "the callee stored to the call area is arg 1"
+        callee_consts.contains(&0x22),
+        "the callee table index is arg 1, not the save_err immediate"
     );
     assert!(
-        nargs_consts.contains(&1),
-        "one call argument, not two: {nargs_consts:?}"
+        call_indirects >= 1,
+        "a uniform-word CALL_RELEASE_GIL must use the direct residual family"
     );
 }
 
@@ -6180,6 +6270,320 @@ fn int_between_is_two_signed_comparisons() {
         _ => {}
     });
     assert_eq!((le_s, lt_s, ands), (1, 1, 1), "a <= b, b < c, and");
+}
+
+#[test]
+fn float_mod_uses_a_guest_side_typed_helper() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Float, 0),
+        InputArg::from_type(Type::Float, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::FloatMod,
+            &[OpRef::input_arg_float(0), OpRef::input_arg_float(1)],
+            OpRef::float_op(2),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::float_op(2))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    assert!(has_table_import(&bytes));
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+    let (calls, _) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        function_type(&bytes, calls[0].0 as usize),
+        (
+            vec![wasmparser::ValType::F64, wasmparser::ValType::F64],
+            vec![wasmparser::ValType::F64],
+        )
+    );
+}
+
+#[test]
+fn check_memory_error_keeps_the_non_null_path_compiled() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::CheckMemoryError,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE,
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let mut null_tests = 0;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::I64Eqz) {
+            null_tests += 1;
+        }
+    });
+    assert_eq!(null_tests, 1);
+}
+
+#[test]
+fn same_as_and_load_effective_address_do_not_decline() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::SameAsR,
+            &[OpRef::input_arg_ref(0)],
+            OpRef::ref_op(2),
+        ),
+        make_op(
+            OpCode::LoadEffectiveAddress,
+            &[
+                OpRef::ref_op(2),
+                OpRef::input_arg_int(1),
+                OpRef::const_int(12),
+                OpRef::const_int(3),
+            ],
+            OpRef::int_op(3),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(
+        execute_simple_trace(&bytes, &[4096, 5]),
+        4096 + (5 << 3) + 12
+    );
+}
+
+fn execute_simple_trace(bytes: &[u8], inputs: &[i64]) -> i64 {
+    let engine = Engine::default();
+    let module = Module::new(&engine, bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(1, None)).expect("test memory should allocate");
+    for (index, value) in inputs.iter().enumerate() {
+        memory
+            .write(
+                &mut store,
+                codegen::FRAME_SLOT_BASE as usize + index * 8,
+                &value.to_le_bytes(),
+            )
+            .unwrap();
+    }
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+    let mut result = [0; 8];
+    memory
+        .read(&store, codegen::FRAME_SLOT_BASE as usize, &mut result)
+        .unwrap();
+    i64::from_le_bytes(result)
+}
+
+#[test]
+fn int_signext_accepts_a_runtime_width() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::IntSignext,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    for (value, width, expected) in [
+        (0xff, 1, -1),
+        (0x7fff, 2, 0x7fff),
+        (0x8000_0000, 4, -2_147_483_648),
+        (0x80, 9, 0x80),
+    ] {
+        assert_eq!(
+            execute_simple_trace(&bytes, &[value, width]),
+            expected,
+            "runtime-width int_signext({value:#x}, {width})"
+        );
+    }
+}
+
+#[test]
+fn singlefloat_casts_round_trip_through_wasm_f32() {
+    let inputargs = vec![InputArg::from_type(Type::Float, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::CastFloatToSinglefloat,
+            &[OpRef::input_arg_float(0)],
+            OpRef::int_op(1),
+        ),
+        make_op(
+            OpCode::CastSinglefloatToFloat,
+            &[OpRef::int_op(1)],
+            OpRef::float_op(2),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::float_op(2))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    let input = 1.234_567_890_123_f64;
+    let result = f64::from_bits(execute_simple_trace(&bytes, &[input.to_bits() as i64]) as u64);
+    assert_eq!(result, (input as f32) as f64);
+
+    let mut casts = (0, 0, 0, 0);
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::F32DemoteF64 => casts.0 += 1,
+        wasmparser::Operator::I32ReinterpretF32 => casts.1 += 1,
+        wasmparser::Operator::F32ReinterpretI32 => casts.2 += 1,
+        wasmparser::Operator::F64PromoteF32 => casts.3 += 1,
+        _ => {}
+    });
+    assert_eq!(casts, (1, 1, 1, 1));
+}
+
+#[test]
+fn gc_rewrite_bare_load_store_execute_with_dynamic_offset() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Int, 2),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::GcStore,
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_int(1),
+                OpRef::input_arg_int(2),
+                OpRef::const_int(4),
+            ],
+            OpRef::NONE,
+        ),
+        make_op(
+            OpCode::GcLoadI,
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_int(1),
+                OpRef::const_int(-4),
+            ],
+            OpRef::int_op(3),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(execute_simple_trace(&bytes, &[4096, 12, -123]), -123);
+}
+
+#[test]
+fn gc_rewrite_indexed_load_store_execute() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Int, 2),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::GcStoreIndexed,
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_int(1),
+                OpRef::input_arg_int(2),
+                OpRef::const_int(4),
+                OpRef::const_int(16),
+                OpRef::const_int(4),
+            ],
+            OpRef::NONE,
+        ),
+        make_op(
+            OpCode::GcLoadIndexedI,
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::input_arg_int(1),
+                OpRef::const_int(4),
+                OpRef::const_int(16),
+                OpRef::const_int(-4),
+            ],
+            OpRef::int_op(3),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(execute_simple_trace(&bytes, &[4096, 3, -456]), -456);
+}
+
+#[test]
+fn zero_array_uses_memory_fill_for_the_rewriter_range() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let store = make_op(
+        OpCode::GcStore,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::const_int(16),
+            OpRef::input_arg_int(1),
+            OpRef::const_int(8),
+        ],
+        OpRef::NONE,
+    );
+    let zero = make_op(
+        OpCode::ZeroArray,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::const_int(0),
+            OpRef::const_int(8),
+            OpRef::const_int(1),
+            OpRef::const_int(1),
+        ],
+        OpRef::NONE,
+    );
+    zero.setdescr(Arc::new(SimpleArrayDescr::new(1, 16, 1, 55, Type::Int)));
+    let load = make_op(
+        OpCode::GcLoadI,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::const_int(16),
+            OpRef::const_int(8),
+        ],
+        OpRef::int_op(2),
+    );
+    let ops = vec![
+        store,
+        zero,
+        load,
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(
+        execute_simple_trace(&bytes, &[4096, 0x1122_3344_5566_7788]),
+        0
+    );
+    let mut fills = 0;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
+            fills += 1;
+        }
+    });
+    assert_eq!(fills, 1);
 }
 
 /// `genop_discard_cond_call`: CondCallN is a real conditional call, not a no-op.
@@ -6275,6 +6679,93 @@ fn cond_call_n_emits_predicate_and_trampoline() {
     );
 }
 
+#[test]
+fn descr_proven_cond_call_n_uses_direct_table_call() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let call = make_op(
+        OpCode::CondCallN,
+        &[
+            OpRef::input_arg_int(0),
+            OpRef::const_int(42),
+            OpRef::input_arg_int(1),
+        ],
+        OpRef::NONE,
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0,
+        vec![Type::Int],
+        Type::Void,
+        false,
+        8,
+        EffectInfo::default(),
+    )));
+    let ops = vec![
+        call,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+    let (calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        function_type(&bytes, calls[0].0 as usize),
+        (
+            vec![wasmparser::ValType::I64],
+            vec![wasmparser::ValType::I64]
+        )
+    );
+    assert_eq!(drops, 1, "CondCallN ignores the dummy word result");
+}
+
+#[test]
+fn descr_proven_cond_call_value_uses_direct_table_call() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let call = make_op(
+        OpCode::CondCallValueI,
+        &[
+            OpRef::input_arg_int(0),
+            OpRef::const_int(42),
+            OpRef::input_arg_int(1),
+        ],
+        OpRef::int_op(2),
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0,
+        vec![Type::Int],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    )));
+    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+    let (calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        function_type(&bytes, calls[0].0 as usize),
+        (
+            vec![wasmparser::ValType::I64],
+            vec![wasmparser::ValType::I64]
+        )
+    );
+    assert_eq!(drops, 0);
+}
+
 /// The two metadata opcodes both native backends skip must compile here too.
 ///
 /// An opcode with no arm reaches the catch-all, and a void op's `pos` is
@@ -6294,4 +6785,415 @@ fn debug_and_record_metadata_opcodes_compile_instead_of_declining() {
         let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
         validate_wasm(&bytes);
     }
+}
+
+#[test]
+fn fused_cond_call_n_consumes_the_comparison_i32() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let compare = make_op(
+        OpCode::IntLt,
+        &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        OpRef::int_op(2),
+    );
+    let call = make_op(
+        OpCode::CondCallN,
+        &[
+            OpRef::int_op(2),
+            OpRef::const_int(0x30),
+            OpRef::input_arg_int(0),
+        ],
+        OpRef::NONE,
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0x5200_0000,
+        vec![Type::Int],
+        Type::Void,
+        true,
+        0,
+        EffectInfo::default(),
+    )));
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
+    let (bytes, _) = build_module_default(
+        &inputargs,
+        &[compare, call, finish],
+        &indexmap::IndexMap::new(),
+    );
+    validate_wasm(&bytes);
+
+    let mut i64_eqz = 0;
+    let mut i64_lt_s = 0;
+    let mut i64_extend = 0;
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Eqz => i64_eqz += 1,
+        wasmparser::Operator::I64LtS => i64_lt_s += 1,
+        wasmparser::Operator::I64ExtendI32U => i64_extend += 1,
+        _ => {}
+    });
+    assert_eq!(i64_lt_s, 1, "the comparison must still be emitted");
+    assert_eq!(
+        i64_eqz, 0,
+        "a fused CondCallN must not re-test a materialised boolean"
+    );
+    assert_eq!(
+        i64_extend, 0,
+        "a fused CondCallN must not widen the comparison into a local"
+    );
+}
+
+#[test]
+fn threadlocalref_get_does_not_read_an_unrelated_tls_allocation() {
+    for offset in [-8, 0, 7, 8, 512, i64::MAX] {
+        let mut inputs = inline_region_inputs(
+            &[],
+            vec![
+                make_op(
+                    OpCode::ThreadlocalrefGet,
+                    &[OpRef::const_int(offset)],
+                    OpRef::int_op(1),
+                ),
+                Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
+            ],
+            vec![],
+        );
+        inputs.inputargs = vec![InputArg::from_type(Type::Int, 0)];
+        assert!(matches!(
+            codegen::build_wasm_module(&inputs),
+            Err(majit_backend::BackendError::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
+fn cond_call_materializes_a_condition_reused_as_an_argument_or_callee() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+    for condition_is_callee in [false, true] {
+        let condition = OpRef::int_op(2);
+        let compare = make_op(
+            OpCode::IntLt,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            condition,
+        );
+        let call = make_op(
+            OpCode::CondCallN,
+            &[
+                condition,
+                if condition_is_callee {
+                    condition
+                } else {
+                    OpRef::const_int(1)
+                },
+                condition,
+            ],
+            OpRef::NONE,
+        );
+        call.setdescr(Arc::new(SimpleCallDescr::new(
+            0x5200_0000,
+            vec![Type::Int],
+            Type::Void,
+            true,
+            0,
+            EffectInfo::default(),
+        )));
+        let (bytes, _) = build_module_default(
+            &[
+                InputArg::from_type(Type::Int, 0),
+                InputArg::from_type(Type::Int, 1),
+            ],
+            &[compare, call, Op::new(OpCode::Finish, &[])],
+            &indexmap::IndexMap::new(),
+        );
+        validate_wasm(&bytes);
+        let mut widens = 0;
+        count_operators(&bytes, |op| {
+            if matches!(op, wasmparser::Operator::I64ExtendI32U) {
+                widens += 1;
+            }
+        });
+        assert_eq!(widens, 1, "the shared condition must be materialized");
+    }
+}
+
+#[test]
+fn unlowered_virtual_refs_and_errno_calls_decline() {
+    for opcode in [
+        OpCode::VirtualRefI,
+        OpCode::VirtualRefR,
+        OpCode::VirtualRefFinish,
+    ] {
+        let op = make_op(
+            opcode,
+            &[OpRef::input_arg_ref(0), OpRef::const_int(1)],
+            if opcode == OpCode::VirtualRefFinish {
+                OpRef::NONE
+            } else {
+                OpRef::ref_op(1)
+            },
+        );
+        let inputs = inline_region_inputs(
+            &[InputArg::from_type(Type::Ref, 0)],
+            vec![op, Op::new(OpCode::Finish, &[])],
+            vec![],
+        );
+        assert!(matches!(
+            codegen::build_wasm_module(&inputs),
+            Err(majit_backend::BackendError::Unsupported(_))
+        ));
+    }
+    for save_err in [OpRef::const_int(1), OpRef::input_arg_int(0)] {
+        let call = make_op(
+            OpCode::CallReleaseGilI,
+            &[save_err, OpRef::const_int(0x22)],
+            OpRef::int_op(1),
+        );
+        let inputs = inline_region_inputs(
+            &[InputArg::from_type(Type::Int, 0)],
+            vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])],
+            vec![],
+        );
+        assert!(matches!(
+            codegen::build_wasm_module(&inputs),
+            Err(majit_backend::BackendError::Unsupported(_))
+        ));
+    }
+}
+
+#[test]
+fn consecutive_allocations_home_and_reload_before_each_collection() {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+    let refs = [OpRef::ref_op(1), OpRef::ref_op(2), OpRef::ref_op(3)];
+    let mut ops: Vec<_> = refs
+        .iter()
+        .map(|&result| {
+            let new = make_op(OpCode::New, &[], result);
+            new.setdescr(Arc::new(SimpleSizeDescr::new(0, 16, 53)));
+            new
+        })
+        .collect();
+    ops.push(Op::new(OpCode::Finish, &refs.map(rb)));
+    let mut inputs = inline_region_inputs(&[], ops, vec![]);
+    inputs.frame = codegen::FrameGeometry::compact(5, 2, 0);
+    inputs.alloc.new_fn_ptr = 1;
+    inputs.nursery = Some(codegen::NurseryAllocParams {
+        free_addr: 0x1000,
+        top_addr: 0x1004,
+        large_threshold: 4096,
+        plain_tids: [53].into_iter().collect(),
+    });
+    let (bytes, _, homes) = codegen::build_wasm_module(&inputs).unwrap();
+    assert_eq!(
+        homes, 2,
+        "the first two objects cross a subsequent allocation"
+    );
+    validate_wasm(&bytes);
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).unwrap();
+    let mut store = Store::new(&engine, Vec::<i64>::new());
+    let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
+    let home_base = inputs.frame.home_slot_base as usize;
+    let alloc = wasmi::Func::wrap(
+        &mut store,
+        move |mut caller: wasmi::Caller<'_, Vec<i64>>, tid: i64, size: i64| -> i64 {
+            assert_eq!((tid, size), (53, 16));
+            let prior = caller.data().clone();
+            for (index, old) in prior.into_iter().enumerate() {
+                let mut bits = [0; 8];
+                memory
+                    .read(&caller, home_base + index * 8, &mut bits)
+                    .unwrap();
+                assert_eq!(
+                    i64::from_le_bytes(bits),
+                    old,
+                    "object must be homed before collecting"
+                );
+                let moved = old + 0x100;
+                memory
+                    .write(&mut caller, home_base + index * 8, &moved.to_le_bytes())
+                    .unwrap();
+                caller.data_mut()[index] = moved;
+            }
+            let result = 0x4000 + caller.data().len() as i64 * 0x1000;
+            caller.data_mut().push(result);
+            result
+        },
+    );
+    let table = Table::new(
+        &mut store,
+        TableType::new(ValType::FuncRef, 2, None),
+        Val::default(ValType::FuncRef),
+    )
+    .unwrap();
+    table.set(&mut store, 1, Val::from(alloc)).unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
+    let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .unwrap();
+    assert_eq!(store.data().len(), 3);
+    for (index, expected) in store.data().iter().enumerate() {
+        let mut bits = [0; 8];
+        memory
+            .read(
+                &store,
+                codegen::FRAME_SLOT_BASE as usize + index * 8,
+                &mut bits,
+            )
+            .unwrap();
+        assert_eq!(
+            i64::from_le_bytes(bits),
+            *expected,
+            "live local must reload its moved home"
+        );
+    }
+}
+
+#[test]
+fn consecutive_new_ops_keep_their_collecting_boundaries() {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+
+    let size_descr = || {
+        let descr = SimpleSizeDescr::new(0, 16, 53);
+        descr.set_non_moving(false);
+        Arc::new(descr)
+    };
+    let new1 = make_op(OpCode::New, &[], OpRef::ref_op(1));
+    new1.setdescr(size_descr());
+    let new2 = make_op(OpCode::New, &[], OpRef::ref_op(2));
+    new2.setdescr(size_descr());
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+
+    let mut plain_tids = std::collections::HashSet::new();
+    plain_tids.insert(53);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: vec![InputArg::from_type(Type::Int, 0)],
+        ops: vec![new1, new2, finish],
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers {
+            new_fn_ptr: 0x11,
+            new_array_fn_ptr: 0x22,
+            new_oldgen_fn_ptr: 0x33,
+            new_array_oldgen_fn_ptr: 0x44,
+            fmod_fn_ptr: 0,
+        },
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: Some(codegen::NurseryAllocParams {
+            free_addr: 0x1000,
+            top_addr: 0x1004,
+            large_threshold: 4096,
+            plain_tids,
+        }),
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+
+    let mut nursery_top_compares = 0;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::I32GtU) {
+            nursery_top_compares += 1;
+        }
+    });
+    assert_eq!(
+        nursery_top_compares, 2,
+        "typed allocation helpers must run at their original GC boundaries"
+    );
+}
+
+#[test]
+fn inline_nursery_new_keeps_the_barrier_at_the_slow_path_join() {
+    use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
+    use std::sync::Arc;
+
+    const WB_TARGET: i64 = 0x4a11;
+    let size_descr = SimpleSizeDescr::new(0, 16, 53);
+    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(1));
+    new_op.setdescr(Arc::new(size_descr));
+    let store = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::ref_op(1)), rb(OpRef::input_arg_ref(0))],
+    );
+    store.setdescr(Arc::new(SimpleFieldDescr::new(0, 8, 8, Type::Ref, false)));
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(2))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_int(2))]);
+
+    let mut plain_tids = std::collections::HashSet::new();
+    plain_tids.insert(53);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: vec![
+            InputArg::from_type(Type::Ref, 0),
+            InputArg::from_type(Type::Int, 2),
+        ],
+        ops: vec![new_op, store, finish],
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers {
+            new_fn_ptr: 0x11,
+            ..codegen::AllocHelpers::default()
+        },
+        wb: codegen::WriteBarrierHelpers::for_current_gc(WB_TARGET, 0),
+        nursery: Some(codegen::NurseryAllocParams {
+            free_addr: 0x1000,
+            top_addr: 0x1004,
+            large_threshold: 4096,
+            plain_tids,
+        }),
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::compact(5, 2, 0),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_TARGET as i32),
+        1,
+        "the slow helper may return old-gen, even when an inline arm exists"
+    );
+    let mut control = inputs;
+    control.nursery = None;
+    let (bytes, _, _) = codegen::build_wasm_module(&control).unwrap();
+    assert_eq!(direct_write_barrier_call_count(&bytes, WB_TARGET as i32), 1);
 }
