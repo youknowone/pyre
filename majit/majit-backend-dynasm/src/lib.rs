@@ -624,6 +624,38 @@ fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
     value
 }
 
+/// Read a guard's logical fail arguments from its physical JITFRAME slots.
+///
+/// `llsupport/assembler.py::store_info_on_descr` writes `0xFFFF` for a
+/// resume-data hole, and `ResumeDataDirectReader.decode_ref` (plus the other
+/// typed decoders) asks the CPU for a physical slot only in its TAGBOX arm.
+/// TAGCONST/TAGVIRTUAL values are reconstructed from resume metadata instead.
+/// Majit's [`guard::decode_rd_loc_slot`] represents the sentinel as `None`;
+/// use zero as the inert carrier, exactly as
+/// `DynasmBackend::execute_token_ints_raw` does. Only a synthetic
+/// descriptor with no `rd_locs` entry at all retains the historical
+/// identity-slot fallback used by backend tests.
+unsafe fn guard_fail_values(
+    descr: &dyn majit_ir::FailDescr,
+    frame_ptr: *mut jitframe::JitFrame,
+) -> Vec<i64> {
+    let rd_locs_len = descr.rd_locs().len();
+    descr
+        .fail_arg_types()
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            if i < rd_locs_len {
+                guard::decode_rd_loc_slot(descr, i)
+                    .map(|slot| unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 })
+                    .unwrap_or(0)
+            } else {
+                unsafe { llmodel::get_int_value_direct(frame_ptr, i) as i64 }
+            }
+        })
+        .collect()
+}
+
 /// compile.py `AbstractResumeGuardDescr.handle_fail`.
 ///
 /// Upstream:
@@ -842,6 +874,46 @@ mod tests {
             }
         }
         ptr
+    }
+
+    #[test]
+    fn test_guard_fail_values_do_not_read_resume_holes() {
+        let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
+        let fail_descr = descr.as_fail_descr().expect("resume guard descr");
+        fail_descr.set_rd_locs(vec![0xFFFF, 2]);
+
+        // Slot 0 deliberately contains a pointer-shaped poison. The first
+        // logical failarg is a resume-data hole, so recovery must not publish
+        // or root this physical word as a Ref. The mapped second argument is
+        // still read from its encoded physical slot.
+        let jf = unsafe { alloc_test_jitframe(0, &[0x1234_5678, 11, 77]) };
+        let values = unsafe { guard_fail_values(fail_descr, jf) };
+        assert_eq!(values, vec![0, 77]);
+
+        unsafe { libc::free(jf as *mut std::ffi::c_void) };
+    }
+
+    #[test]
+    fn test_guard_fail_values_all_holes_need_no_frame_slots() {
+        let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Ref; 3]);
+        let fail_descr = descr.as_fail_descr().expect("resume guard descr");
+        fail_descr.set_rd_locs(vec![0xFFFF; 3]);
+
+        // No physical slot exists for these logical positions. In particular,
+        // recovery must not perform even a speculative read of a hole.
+        let jf = unsafe { alloc_test_jitframe(0, &[]) };
+        assert_eq!(unsafe { guard_fail_values(fail_descr, jf) }, vec![0; 3]);
+        unsafe { libc::free(jf as *mut std::ffi::c_void) };
+    }
+
+    #[test]
+    fn test_guard_fail_values_synthetic_descr_keeps_identity_slots() {
+        let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Int; 2]);
+        let fail_descr = descr.as_fail_descr().expect("resume guard descr");
+        assert!(fail_descr.rd_locs().is_empty());
+        let jf = unsafe { alloc_test_jitframe(0, &[11, 77]) };
+        assert_eq!(unsafe { guard_fail_values(fail_descr, jf) }, vec![11, 77]);
+        unsafe { libc::free(jf as *mut std::ffi::c_void) };
     }
 
     // ── Bug 1 regression: unresolved target must not dereference result as pointer ──

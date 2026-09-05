@@ -458,6 +458,12 @@ thread_local! {
     /// `canonical_path` → its `ALL_JITCODES` index, resolved once per thread.
     /// The `None` answer is cached too: a helper absent from the build-time
     /// pipeline is asked for on every consult of its site.
+    ///
+    /// This is deliberately only a disposable lookup cache, not the owner of
+    /// RPython's process-wide `CallControl.jitcodes`: `jitcode_index().paths`
+    /// is frozen build data, and the cache retains only an index or `None` —
+    /// never a JitCode identity, GC reference, or semantic state. Dropping or
+    /// duplicating it on another thread can change lookup cost only.
     static PATHED_JITCODE_INDEX: std::cell::RefCell<std::collections::HashMap<&'static str, Option<usize>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
@@ -3115,6 +3121,29 @@ mod tests {
         .join()
         .unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn pathed_lookup_cache_is_disposable_without_changing_identity() {
+        let path: &'static str = jitcode_index()
+            .paths
+            .iter()
+            .find(|path| !path.is_empty())
+            .expect("at least one graph-backed JitCode")
+            .as_str();
+        let first = pathed_runtime_jitcode_cached(path).expect("canonical path");
+        PATHED_JITCODE_INDEX.with(|cache| cache.borrow_mut().clear());
+        let again = pathed_runtime_jitcode_cached(path).expect("uncached canonical path");
+        let other = std::thread::spawn(move || {
+            pathed_runtime_jitcode_cached(path).expect("canonical path on another thread")
+        })
+        .join()
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(Arc::ptr_eq(&first, &other));
+        assert!(pathed_runtime_jitcode_cached("__missing_jitcode_path__").is_none());
+        PATHED_JITCODE_INDEX.with(|cache| cache.borrow_mut().clear());
+        assert!(pathed_runtime_jitcode_cached("__missing_jitcode_path__").is_none());
     }
 
     #[test]
