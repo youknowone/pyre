@@ -3811,7 +3811,8 @@ impl<'a> Lowering<'a> {
             block_id.push(graph.create_block());
         }
         let index_write_extra_live = compute_index_write_extra_live(body, llbc);
-        let block_live_in = compute_mir_liveness(body, &index_write_extra_live);
+        let glue_call_drops = glue_call_drop_blocks(body, llbc);
+        let block_live_in = compute_mir_liveness(body, &index_write_extra_live, &glue_call_drops);
         let mut block_entry_local_var = vec![
             PackedLocalRow {
                 len: n_locals,
@@ -8232,14 +8233,25 @@ impl<'a> Lowering<'a> {
                 target,
                 on_unwind,
             } => self.lower_call(mir_bb, call, target as usize, on_unwind as usize),
-            // `Drop` is a destructor invocation — the JIT does not model
-            // destructor semantics (RPython lacks them entirely), so
-            // forward unconditionally to the success continuation and
-            // ignore the unwind path. Any side effects worth tracing
-            // (heap mutation by a `Drop` impl) become visible through
-            // the field/array ops the destructor body itself emits at
-            // a deeper inlining level.
-            TermKind::Drop { target, .. } => {
+            // RootScope drop closes the shadow-stack bracket opened by
+            // `push_roots`; erasing it made traced loops retain every pin.
+            // Other drops keep the legacy goto until their glue bodies and
+            // residual callees are available to the translator.
+            TermKind::Drop {
+                place,
+                fn_ptr,
+                target,
+                on_unwind,
+            } => {
+                if drop_lowers_as_glue_call(&place, &fn_ptr, self.llbc) {
+                    return self.lower_drop_as_glue_call(
+                        mir_bb,
+                        place,
+                        fn_ptr,
+                        target as usize,
+                        on_unwind as usize,
+                    );
+                }
                 let target_bb = self.block_id[target as usize];
                 let args = self.edge_args(mir_bb, target as usize)?;
                 self.graph.set_goto(bb_id, target_bb, args);
@@ -8249,6 +8261,32 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: unknown TermKind"
             ))),
         }
+    }
+
+    /// Lower a local `Drop` as the glue call named by its MIR terminator.
+    fn lower_drop_as_glue_call(
+        &mut self,
+        mir_bb: usize,
+        place: Place,
+        fn_ptr: RegularCall,
+        target: usize,
+        on_unwind: usize,
+    ) -> Result<(), LowerError> {
+        let PlaceKind::Local(dest_local) = &place.kind else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: Drop-as-call over a projection place"
+            )));
+        };
+        let dest_local = *dest_local;
+        let call = CallPayload {
+            func: CallFunc::Regular(fn_ptr),
+            args: vec![Operand::Move(place)],
+            dest: Place {
+                kind: PlaceKind::Local(dest_local),
+                ty: unit_tyref(),
+            },
+        };
+        self.lower_call(mir_bb, call, target, on_unwind)
     }
 
     fn lower_call(
@@ -18842,6 +18880,63 @@ fn gc_root_pin_path(name: &str) -> bool {
     segments.last() == Some(&"pin_root") && segments.iter().any(|s| *s == "gc_roots")
 }
 
+/// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
+fn gc_root_scope_drop_glue_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.last() == Some(&"drop_in_place")
+        && segments.iter().any(|s| *s == "gc_roots")
+        && segments.iter().any(|s| *s == "RootScope")
+}
+
+/// Drops supported by both lowering and its liveness analysis.
+fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) -> bool {
+    matches!(place.kind, PlaceKind::Local(_))
+        && regular_call_name_path(fn_ptr, llbc)
+            .as_deref()
+            .is_some_and(gc_root_scope_drop_glue_path)
+}
+
+/// Match the lowered RootScope close used by result/exception rewrites.
+pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some("drop_in_place")
+        && segments.iter().any(|s| s == "gc_roots")
+        && segments.iter().any(|s| s == "RootScope")
+}
+
+fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
+    let mut out = bit_set::BitSet::with_capacity(body.body.len());
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if let Ok(TermKind::Drop { place, fn_ptr, .. }) = bb.term()
+            && drop_lowers_as_glue_call(&place, &fn_ptr, llbc)
+        {
+            out.insert(bb_idx);
+        }
+    }
+    out
+}
+
+/// The `()` type expected by drop glue.
+fn unit_tyref() -> TyRef {
+    TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }))
+}
+
 /// Root-stack operations whose PyObjectRef return is the physical spelling
 /// of `llmemory.GCREF`, not a W_Root instance.  Upstream's GC transformer
 /// gives such a helper call a GCREF result and casts it back to the concrete
@@ -19383,7 +19478,11 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
     extra
 }
 
-fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<bit_set::BitSet> {
+fn compute_mir_liveness(
+    body: &Unstructured,
+    extra_live: &[Vec<usize>],
+    glue_call_drops: &bit_set::BitSet,
+) -> Vec<bit_set::BitSet> {
     use bit_set::BitSet;
 
     let n_blocks = body.body.len();
@@ -19444,7 +19543,11 @@ fn compute_mir_liveness(body: &Unstructured, extra_live: &[Vec<usize>]) -> Vec<b
                 mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx], n_locals);
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks);
             }
-            TermKind::Drop { target, .. } => {
+            TermKind::Drop { place, target, .. } => {
+                // Glue calls read the dropped local; erased drops do not.
+                if glue_call_drops.contains(bb_idx) {
+                    mark_place_use(&place, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                }
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, target, n_blocks)
             }
             TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {}
@@ -32634,6 +32737,75 @@ mod tests {
     }
 
     #[test]
+    fn root_scope_drop_is_classified_and_live() {
+        use bit_set::BitSet;
+        use majit_charon_reader::ullbc::Unstructured;
+        assert!(super::gc_root_scope_drop_glue_path(
+            "pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"
+        ));
+        assert!(!super::gc_root_scope_drop_glue_path(
+            "alloc::vec::Vec::<Impl>::drop_in_place"
+        ));
+
+        // `_1` is written in bb0 and read only by bb1's Drop.
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 0, "col": 0},
+                    "end": {"line": 0, "col": 0}
+                },
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let bb0 = serde_json::json!({
+            "statements": [stmt(serde_json::json!({
+                "Assign": [place_local(1), {"Use": {"Const": null}}]
+            }))],
+            "terminator": {"kind": {"Goto": {"target": 1}}}
+        });
+        let bb1 = serde_json::json!({
+            "statements": [],
+            "terminator": {"kind": {"Drop": {
+                "place": place_local(1),
+                "fn_ptr": {"kind": {"Fun": {"Regular": 0}}, "generics": {}},
+                "target": 2,
+                "on_unwind": 2
+            }}}
+        });
+        let bb2 = serde_json::json!({
+            "statements": [],
+            "terminator": {"kind": "Return"}
+        });
+        let body_json = serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 0, "locals": [local(0), local(1)]},
+            "body": [bb0, bb1, bb2]
+        });
+        let body: Unstructured =
+            serde_json::from_value(body_json).expect("fixture Unstructured parses");
+
+        let erased = super::compute_mir_liveness(&body, &[], &BitSet::new());
+        assert!(
+            !erased[1].contains(1),
+            "an erased drop reads nothing, so the guard is not live-in at bb1"
+        );
+
+        let mut as_call = BitSet::new();
+        as_call.insert(1);
+        let lowered = super::compute_mir_liveness(&body, &[], &as_call);
+        assert!(
+            lowered[1].contains(1),
+            "a drop lowered as its glue call reads the guard, so it is live-in at bb1"
+        );
+    }
+
+    #[test]
     fn liveness_marks_loop_carried_index_local_as_live_in() {
         use majit_charon_reader::ullbc::Unstructured;
         // A self-loop whose only read of the loop-carried local `_2` is
@@ -32702,7 +32874,7 @@ mod tests {
         // Base dataflow only: this case is closed by
         // `mark_projection_index_offset_use` in the statement scan, not by
         // the index-write `extra_live` set, so pass an empty extra_live.
-        let live = super::compute_mir_liveness(&body, &[]);
+        let live = super::compute_mir_liveness(&body, &[], &bit_set::BitSet::new());
         assert!(
             live[1].contains(2),
             "loop-carried index local _2 must be live-in at the loop block bb1"

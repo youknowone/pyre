@@ -787,10 +787,11 @@ pub enum TermKind {
         on_unwind: u64,
     },
     Drop {
-        /// Value whose destructor runs.  Charon also carries `kind` and
-        /// `fn_ptr`; the GC liveness pass needs the place so a RootScope drop
-        /// can end the bracket it opened.
+        /// Value whose destructor runs.  The GC liveness pass needs the place
+        /// so a RootScope drop can end the bracket it opened.
         place: Place,
+        /// Drop glue resolved by Charon for `place`'s type.
+        fn_ptr: RegularCall,
         target: u64,
         on_unwind: u64,
     },
