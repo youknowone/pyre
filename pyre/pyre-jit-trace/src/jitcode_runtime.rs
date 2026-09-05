@@ -1201,6 +1201,38 @@ fn rehydrated_call_descr_ref(bh: majit_translate::jitcode::BhCallDescr) -> majit
     )
 }
 
+/// Publish the GcCache-owned (non-call) opcode descrs so
+/// `GcCache::register_unresolved_struct_tids` can stamp collector tids.
+///
+/// `gc.py GcLLDescr_framework.init_size_descr` / `init_array_descr` run at
+/// translation against the Size/Array objects already in `GcCache`, not
+/// against the Field/Call universe.  `descr_ref_at` used to walk every
+/// baked slot and thereby pulled [`rehydrate_build_descr_raw_sets`] into
+/// process startup (`pyre-jit` `build_gc`). PyPy populates these objects
+/// during translation, before `GcCache.setup_descrs` enumerates them.
+/// Rust's build script cannot embed its object addresses in the executable,
+/// so pyre restores GC layouts at startup and frozen EffectInfo before the
+/// first JIT; CallDescr restoration can wait for the first slot lookup.
+/// Kind-0 slots are Size/Field/Array: Field minting publishes the parent Size
+/// the tid walk reads.
+pub fn materialize_gccache_owned_descrs() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let index = descrs_index();
+        for (i, kind) in index.kinds.iter().copied().enumerate() {
+            if kind != 0 {
+                continue;
+            }
+            let bh = load_descr_uncached(i);
+            debug_assert!(!matches!(
+                bh,
+                BhDescr::Call { .. } | BhDescr::JitCode { .. }
+            ));
+            crate::descr::make_descr_from_bh(&bh);
+        }
+    });
+}
+
 /// Rehydrate build-time EffectInfo raw descr sets before
 /// `finish_setup_descrs`. `finish_setup_done` is per-thread, but the
 /// rehydrated raw sets live in the process-global `GcCache`, so this guard is
@@ -1259,18 +1291,12 @@ pub fn rehydrate_build_descr_raw_sets() {
         // below can only land on slots that already carry their complete
         // layout.  Resolving in the other order would leave every member
         // whose struct has not been published yet unresolvable.
-        let index = descrs_index();
-        for (i, kind) in index.kinds.iter().copied().enumerate() {
-            if kind != 0 {
-                continue;
-            }
-            let bh = load_descr_uncached(i);
-            debug_assert!(!matches!(
-                bh,
-                BhDescr::Call { .. } | BhDescr::JitCode { .. }
-            ));
-            crate::descr::make_descr_from_bh(&bh);
-        }
+        //
+        // Shared with process startup (`materialize_gccache_owned_descrs`):
+        // `init_size_descr` needs those Size objects in `_cache_size` at
+        // `build_gc`, but must not pull the EffectInfo/Call half of this
+        // pass into `_setup_once`.
+        materialize_gccache_owned_descrs();
         // Members already published by the opcode-descr pass need only the
         // `compute_bitstrings` partition stamp. PyPy mutates that one cached
         // descriptor object in place; replaying the complete mint spec would
@@ -1307,17 +1333,12 @@ pub fn rehydrate_build_descr_raw_sets() {
             crate::descr::prepare_frozen_effect_info(&mut effect_info);
             majit_ir::effectinfo::intern_translated_effect_info(translated_id, effect_info);
         }
-        for (i, kind) in index.kinds.iter().copied().enumerate() {
-            if kind != 1 {
-                continue;
-            }
-            let bh = load_descr_uncached(i);
-            let calldescr = match bh {
-                BhDescr::Call { calldescr } | BhDescr::JitCode { calldescr, .. } => calldescr,
-                _ => unreachable!("descrs_index call classification disagrees with descrs.bin"),
-            };
-            rehydrated_call_descr_ref(calldescr);
-        }
+        // Call/JitCode slots stay lazy across the Rust build/runtime-image
+        // boundary. PyPy's `descr.py get_call_descr` caches these during
+        // translation, and `GcCache.setup_descrs` only enumerates them.
+        // [`descr_ref_at`] restores a requested slot through
+        // `rehydrated_call_descr_ref` after this pass publishes its frozen
+        // EffectInfo identity, preserving the canonical call-cache key.
         report_descr_spelling_gate();
     });
 }
@@ -1662,16 +1683,23 @@ fn descr_ref_cells() -> &'static [OnceLock<DescrRef>] {
 /// Resolve one trace-side descriptor without forcing any other pool entry.
 ///
 /// `rehydrate_build_descr_raw_sets` must remain first: its non-call pass
-/// publishes every container group into the gccache before the call-descr
-/// pass. Once that ordering has completed, `make_descr_from_bh` resolves the
-/// same cached `Arc` that tracing and EffectInfo raw sets use.
+/// publishes every container group into the gccache and freezes EffectInfo
+/// ids before a CallDescr can ask for one.  Once that ordering has
+/// completed, Size/Field/Array reuse the cached `Arc` and Call/JitCode
+/// mint on this first request (`descr.py get_call_descr`).
 pub fn descr_ref_at(index: usize) -> Option<DescrRef> {
     rehydrate_build_descr_raw_sets();
     let cell = descr_ref_cells().get(index)?;
     Some(
         cell.get_or_init(|| {
             let bh = load_descr_uncached(index);
-            crate::descr::make_descr_from_bh(&bh)
+            match bh {
+                BhDescr::Call { calldescr } => rehydrated_call_descr_ref(calldescr),
+                // RPython `Transformer.handle_regular_call` uses the
+                // callee's JitCode itself as the inline_call descriptor,
+                // not its residual-call signature. Preserve its body index.
+                other => crate::descr::make_descr_from_bh(&other),
+            }
         })
         .clone(),
     )

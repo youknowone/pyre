@@ -8975,6 +8975,119 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     Ok(inlined)
 }
 
+/// Inline the general user data-descriptor call selected by
+/// `Object.descr__getattribute__`:
+/// `get_and_call_function(w_get, w_descr, w_obj, w_type)`.
+///
+/// Unlike the exact-`property` arm, the callee is the descriptor type's
+/// ordinary Python `__get__` function and receives all three explicit
+/// arguments.  The receiver class/version pins the named descriptor lookup;
+/// the descriptor's own map/class/version pins both its data-descriptor status
+/// and the `__get__` lookup.  The descriptor and owner type are green, while
+/// the accessed object remains the caller's red operand and is threaded into
+/// the callee's distinct MIFrame.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_data_descriptor_get<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, w_descr, descr_type, descr_version_tag, descr_map, w_get)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::data_descriptor_get_fast_path(concrete_obj, &name)
+    }) else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_get) }) else {
+        return Ok(None);
+    };
+    // `get_and_call_function`'s exact-Function arm supplies precisely the
+    // descriptor, receiver and receiver type.
+    if nparams != 3 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !body_facts.exc_override_straight_line {
+        return Ok(None);
+    }
+
+    let get_const = ctx.trace_ctx.const_ref(w_get as i64);
+    let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let arg_concretes = vec![
+        ConcreteValue::Ref(w_get),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(w_descr),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(w_type),
+    ];
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+
+    // The descriptor itself is mutable through `__class__` assignment.  Its
+    // live map/class guard is therefore load-bearing even though the receiver
+    // type lookup produced a constant pointer to it.
+    walker_guard_mapdict_instance_shape(
+        ctx,
+        op.pc,
+        descr_const,
+        w_descr,
+        descr_type,
+        descr_version_tag,
+        descr_map,
+    )?;
+    let inlined = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        get_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        w_get,
+        get_const,
+        w_get,
+        arg_concretes,
+        vec![descr_const, obj, type_const],
+        vec![
+            ConcreteValue::Ref(w_descr),
+            ConcreteValue::Ref(concrete_obj),
+            ConcreteValue::Ref(w_type),
+        ],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((obj, concrete_obj, w_type, version_tag)),
+        None,
+        true,
+        false,
+        None,
+    )?;
+    if inlined.is_none() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+    }
+    Ok(inlined)
+}
+
 /// Inline the receiver type's `__getattr__` hook for an attribute the type and
 /// the instance both lack — the miss twin of [`try_walker_inline_property_get`].
 ///
@@ -9773,6 +9886,167 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         false,
         None,
     )
+}
+
+/// Inline a user instance's Python `__iter__` directly under GET_ITER.
+///
+/// `iter`'s instance arm dispatches the method and then runs
+/// `iter_check_is_iterator` on what it returned.  Upstream pays nothing for
+/// either: `DescrOperation.iter` resolves `__iter__` off the promoted class,
+/// and the `space.lookup(w_iter, '__next__')` that follows folds away because
+/// the returned box's class is promoted too.  Here the method stayed an opaque
+/// `CallMayForce` — one interpreter frame, plus the virtualref bracket that
+/// forces the caller's frame — for every `for x in obj` over a user iterator.
+///
+/// The check is reproduced rather than dropped: this route admits only the
+/// shape where the inlined body hands back the receiver's own box, so the
+/// class the receiver is already guarded to, under the `_version_tag?` pin the
+/// same guard takes, is the class the check would have looked `__next__` up
+/// on.  The lookup is then a record-time question, and any other returned box
+/// falls back to the residual, which runs the check itself. GET_ITER's caller
+/// image carries its consumed iterable as the one proof operand, so a seeded
+/// callee guard resumes after GET_ITER with the result slot pending just like
+/// LOAD_ATTR; that is what also admits a body whose effects are protected by
+/// the per-frame resume path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
+        return Ok(None);
+    }
+
+    let obj_op = r_args[0];
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj_op) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, w_iter)) =
+        (unsafe { pyre_interpreter::baseobjspace::iter_fast_path(concrete_obj) })
+    else {
+        return Ok(None);
+    };
+    // `iter_check_is_iterator` on the receiver itself, decided here because
+    // the guard below pins the class it reads and the version tag that would
+    // revoke the answer.  A receiver that is not its own iterator declines
+    // rather than reaching the identity test after the body has run.
+    if unsafe { pyre_interpreter::baseobjspace::next_fast_path(concrete_obj) }.is_none() {
+        return Ok(None);
+    }
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_iter) }) else {
+        return Ok(None);
+    };
+    if nparams != 1 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header || body_facts.has_exception_table {
+        return Ok(None);
+    }
+
+    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(concrete_obj);
+    let type_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let iter_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_iter);
+    let code_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+
+    let concrete_obj = pyre_object::gc_roots::shadow_stack_get(obj_root);
+    let w_type = pyre_object::gc_roots::shadow_stack_get(type_root);
+    let w_iter = pyre_object::gc_roots::shadow_stack_get(iter_root);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
+
+    let iter_const = ctx.trace_ctx.const_ref(w_iter as i64);
+    let executed_effects_before = fbw_executed_effect_count();
+    let inline = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        w_iter,
+        iter_const,
+        w_iter,
+        vec![
+            ConcreteValue::Ref(w_iter),
+            ConcreteValue::Null,
+            ConcreteValue::Ref(concrete_obj),
+        ],
+        vec![obj_op],
+        vec![ConcreteValue::Ref(concrete_obj)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((obj_op, concrete_obj, w_type, version_tag)),
+        None,
+        // GET_ITER consumes one iterable and produces one iterator. Its
+        // caller-operand shape is recorded by `caller_operand_slots`, so the
+        // seeded callee can resume forward with the pending result slot; this
+        // is the same boundary property LOAD_ATTR relies on.
+        true,
+        false,
+        None,
+        None,
+        false,
+        None,
+        None,
+    );
+    let inline_resume_pc = match inline {
+        Ok(Some((DispatchOutcome::Continue, next))) => next,
+        outcome => {
+            // The same odometer the `__next__` route reads: once the sub-walk
+            // has executed a concrete effect, `cut_trace_with_snapshots`
+            // cannot undo it, and falling through to the residual would run
+            // `__iter__` a second time.
+            if fbw_executed_effect_count() != executed_effects_before {
+                return Err(match outcome {
+                    Err(e) => e,
+                    _ => DispatchError::callee_inline_unsupported(op.pc),
+                });
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+    };
+    // A `SubRaise` routed to the caller's handler wrote no `dst`, and the
+    // check upstream would not have run either.
+    if inline_resume_pc != op.next_pc {
+        return Ok(Some((DispatchOutcome::Continue, inline_resume_pc)));
+    }
+
+    // The identity the `iter_check_is_iterator` decision above rests on, as a
+    // property of the trace rather than of this recording: the body handed
+    // back the very box the receiver guard pins, so the class the check reads
+    // is that guard's class on every entry.  Any other result reaches the
+    // residual, which runs the check itself.
+    if ctx.registers_r[dst] != obj_op {
+        if fbw_executed_effect_count() != executed_effects_before {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        }
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    ctx.vstack_last_ref = obj_op;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Inline a user instance's Python `__next__` directly under FOR_ITER.

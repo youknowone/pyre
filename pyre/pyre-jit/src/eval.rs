@@ -4741,16 +4741,13 @@ fn build_gc() -> Box<MiniMarkGC> {
 
     // `gc.py GcLLDescr_framework.init_size_descr` asks the
     // gctypelayout layoutbuilder for a collector type id after the translated
-    // GC layouts are known. The baked descriptor pool is lazy in pyre, so
-    // materialize it before walking GcCache; otherwise a synthetic struct
-    // first reached by the walker would appear only after this registration
-    // point and retain its truncated structural hash as the allocation tid.
-    let baked_descrs = pyre_jit_trace::jitcode_runtime::descr_ref_table();
-    for index in 0..baked_descrs.len() {
-        baked_descrs
-            .at(index)
-            .unwrap_or_else(|| panic!("missing baked descriptor at index {index}"));
-    }
+    // GC layouts are known, and only walks Size/Array objects already in
+    // GcCache.  Materialize those (plus Field slots, which publish the
+    // parent Size) without pulling `rehydrate_build_descr_raw_sets` —
+    // EffectInfo/Call restoration — into process startup. PyPy populates
+    // descriptors during translation; `MetaInterpStaticData.finish_setup_descrs`
+    // enumerates them, and `_setup_once` does not mint descriptors.
+    pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
     let _registered_synthetic_structs = majit_ir::descr::gc_cache()
         .lock()
         .register_unresolved_struct_tids(|size, offsets| {

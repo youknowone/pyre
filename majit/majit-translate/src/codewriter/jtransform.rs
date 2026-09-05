@@ -1687,6 +1687,14 @@ impl<'a> Transformer<'a> {
             OpKind::Call { target, args, .. } if is_jit_force_virtualizable_target(target) => {
                 self.rewrite_op_jit_force_virtualizable(args, graph_name)
             }
+            // RPython `Transformer.rewrite_op_cast_opaque_ptr` aliases
+            // only the explicit low-level operation. A ptr/int roundtrip
+            // remains two casts; it is not an opaque-pointer cast.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "cast_opaque_ptr" => RewriteResult::Identity(operand.clone()),
             // ── fold of the `_we_are_jitted` symbolic ──
             //
             // Inside the tracer / blackhole interpreter `we_are_jitted()`
@@ -13494,6 +13502,112 @@ mod tests {
         match rewritten {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// RPython `Transformer.rewrite_op_cast_opaque_ptr` aliases the
+    /// low-level operation, while `rewrite_op_cast_ptr_to_int` preserves a
+    /// GC cast. A subsequent int-to-pointer cast must remain explicit.
+    #[test]
+    fn pointer_casts_preserve_integer_roundtrip() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("pointer_casts");
+        let ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let as_int = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let as_ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        for (name, operand, result, result_ty) in [
+            (
+                "cast_ptr_to_int",
+                ptr.clone(),
+                as_int.clone(),
+                ValueType::Int,
+            ),
+            (
+                "cast_int_to_ptr",
+                as_int,
+                as_ptr.clone(),
+                ValueType::Ref(None),
+            ),
+        ] {
+            let op = SpaceOperation {
+                result: Some(result),
+                kind: OpKind::UnaryOp {
+                    op: name.into(),
+                    operand,
+                    result_ty,
+                },
+            };
+            assert!(
+                matches!(
+                    transformer.rewrite_operation(&op, "pointer_casts", &mut graph),
+                    RewriteResult::Keep
+                ),
+                "{name} must remain explicit"
+            );
+        }
+        let op = SpaceOperation {
+            result: Some(as_ptr),
+            kind: OpKind::UnaryOp {
+                op: "cast_opaque_ptr".into(),
+                operand: ptr.clone(),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        match transformer.rewrite_operation(&op, "pointer_casts", &mut graph) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, ptr),
+            _ => panic!("expected the explicit opaque cast to alias its operand"),
+        }
+    }
+
+    /// `Transformer.rewrite_op_direct_call` dispatches real calls through
+    /// CallControl; a function's leaf name does not make it a low-level cast.
+    #[test]
+    fn pointer_cast_function_names_do_not_alias() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_named_calls");
+        let ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let as_int = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let as_ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        for (name, operand, result, result_ty) in [
+            (
+                "cast_ptr_to_int",
+                ptr.clone(),
+                as_int.clone(),
+                ValueType::Int,
+            ),
+            (
+                "cast_int_to_ptr",
+                as_int,
+                as_ptr.clone(),
+                ValueType::Ref(None),
+            ),
+            ("cast_opaque_ptr", ptr, as_ptr, ValueType::Ref(None)),
+        ] {
+            let target = CallTarget::function_path(["user", name]);
+            let op = SpaceOperation {
+                result: Some(result),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: vec![operand.clone()],
+                    result_ty: result_ty.clone(),
+                },
+            };
+            assert!(
+                !matches!(
+                    transformer.rewrite_op_direct_call(
+                        &op,
+                        &target,
+                        &[operand],
+                        &result_ty,
+                        "cast_named_calls",
+                        &mut graph,
+                    ),
+                    RewriteResult::Identity(_)
+                ),
+                "ordinary call to {name} must not alias its argument"
+            );
         }
     }
 

@@ -6107,7 +6107,7 @@ pub(crate) fn try_walker_read_deref_cell<Sym: WalkSym>(
     Ok(Some(value))
 }
 
-fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
+pub(crate) fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     plain: *const pyre_interpreter::objspace::std::mapdict::PlainAttribute,
@@ -7110,6 +7110,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        // The instance arm of `iter`: a user class's `__iter__` is Python, and
+        // left residual it costs an interpreter frame and the virtualref
+        // bracket that forces the caller's, once per `for` statement.
+        if let Some(outcome) = spec_gate(SpecFold::InstanceIter, || {
+            try_walker_specialize_instance_iter(
+                ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
+            )
+        })? {
+            return Ok(outcome);
         }
     }
 
@@ -8786,6 +8796,23 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // The plain-slot fold declines a `property` (data descriptor);
                 // inline its Python getter instead of the opaque residual.
                 if let Some(inlined) = try_walker_inline_property_get(
+                    ctx,
+                    op,
+                    code,
+                    &r_args,
+                    call_descr,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                }
+                // `Object.descr__getattribute__` gives any other user data
+                // descriptor the same traced call shape, with the descriptor,
+                // receiver and owner type as explicit arguments.
+                if let Some(inlined) = try_walker_inline_data_descriptor_get(
                     ctx,
                     op,
                     code,
