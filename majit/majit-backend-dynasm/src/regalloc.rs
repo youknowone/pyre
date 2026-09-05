@@ -2730,6 +2730,9 @@ impl<'a> RegAlloc<'a> {
                     output.push(RegAllocOp::Skip);
                 }
             }
+            GuardKind::NotForced if op.opcode == OpCode::GuardNotForced2 => {
+                self.consider_guard_not_forced_2_j2(fail_args, i, output)
+            }
             GuardKind::NoException
             | GuardKind::NoOverflow
             | GuardKind::Overflow
@@ -3209,9 +3212,11 @@ impl<'a> RegAlloc<'a> {
             OpCode::GuardNoException
             | OpCode::GuardNoOverflow
             | OpCode::GuardOverflow
-            | OpCode::GuardNotForced
-            | OpCode::GuardNotForced2 => {
+            | OpCode::GuardNotForced => {
                 self.consider_guard_no_args(op, i, output);
+            }
+            OpCode::GuardNotForced2 => {
+                self.consider_guard_not_forced_2(op, i, output);
             }
             // x86/regalloc.py:458
             OpCode::GuardNotInvalidated => {
@@ -3925,6 +3930,39 @@ impl<'a> RegAlloc<'a> {
         self.perform_guard_j2(fail_args, i, vec![], None, output);
     }
 
+    /// x86/regalloc.py `consider_guard_not_forced_2` and
+    /// aarch64/regalloc.py `prepare_op_guard_not_forced_2`.
+    fn consider_guard_not_forced_2_j2(
+        &mut self,
+        fail_args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let type_index = OpTypeIndex::from_parts(
+            self.inputargs,
+            self.operations,
+            &self.inputarg_pos,
+            &self.op_pos,
+        );
+        self.rm.before_call(
+            fail_args,
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &type_index,
+        );
+        self.xrm.before_call(
+            fail_args,
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &type_index,
+        );
+        self.perform_guard_j2(fail_args, i, vec![], None, output);
+    }
+
     /// x86/regalloc.py _consider_guard_cc
     fn consider_guard_cc(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let arg = op.arg(0).to_opref();
@@ -4005,6 +4043,40 @@ impl<'a> RegAlloc<'a> {
 
     /// Guards with no arguments (guard_no_exception, guard_not_forced, etc.)
     fn consider_guard_no_args(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        self.perform_guard(op, i, vec![], None, output);
+    }
+
+    /// x86/regalloc.py `consider_guard_not_forced_2`.
+    fn consider_guard_not_forced_2(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let fail_args: Vec<OpRef> = op
+            .getfailargs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|arg| !arg.is_none())
+            .map(|arg| arg.to_opref())
+            .collect();
+        let type_index = OpTypeIndex::from_parts(
+            self.inputargs,
+            self.operations,
+            &self.inputarg_pos,
+            &self.op_pos,
+        );
+        self.rm.before_call(
+            &fail_args,
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &type_index,
+        );
+        self.xrm.before_call(
+            &fail_args,
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &type_index,
+        );
         self.perform_guard(op, i, vec![], None, output);
     }
 
@@ -6833,6 +6905,10 @@ mod tests {
                 arglocs, faillocs, ..
             } => {
                 assert_eq!(faillocs.len(), 1);
+                assert!(
+                    matches!(faillocs[0], Some(Loc::Frame(_))),
+                    "GuardNotForced2 must spill every failarg into the jitframe, got {faillocs:?}"
+                );
                 assert!(
                     !arglocs.iter().any(|l| matches!(l, Loc::Immed(_))),
                     "GuardNotForced2 must not carry a frame-depth immediate argloc, got {arglocs:?}"

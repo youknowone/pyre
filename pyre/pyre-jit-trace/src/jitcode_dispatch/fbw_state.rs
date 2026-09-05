@@ -2869,9 +2869,8 @@ pub(crate) fn fbw_store_token_in_vable<Sym: WalkSym>(
 /// Shared top-level finish path for the three value-returning arms
 /// (`ref_return` / `int_return` / `float_return`).  Re-boxes `result` to
 /// `Type::Ref`, publishes the return coordinate into `last_instr`, stores the
-/// virtualizable back into the frame, and stashes the finish payload for
-/// `full_body_walk_trace`.  The store-back is what leaves `vable_token` clear,
-/// so the `GUARD_NOT_FORCED_2` arming below it declines.  Deliberately
+/// virtualizable token through `FORCE_TOKEN` + `GUARD_NOT_FORCED_2`, and stashes
+/// the finish payload for `full_body_walk_trace`.  Deliberately
 /// does NOT record the `FINISH` op: under the gate the compile consumer
 /// (`finish_and_compile` -> `recorder.finish`, mod.rs) records it from
 /// `finish_args`, so recording it here too would double it.
@@ -2882,56 +2881,9 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 ) -> Result<(), DispatchError> {
     let finish_value = fbw_ensure_boxed_for_ca(ctx, op_pc, result)?;
     fbw_publish_exit_last_instr(ctx, op_pc);
-    fbw_force_virtualizable_before_return(ctx);
     fbw_store_token_in_vable(ctx, op_pc)?;
     FBW_FINISH_PAYLOAD.with(|c| c.set(Some((finish_value, Type::Ref))));
     Ok(())
-}
-
-/// `jit.hint(frame, force_virtualizable=True)` on the way out of the portal
-/// (`opimpl_hint_force_virtualizable` → `gen_store_back_in_vable`, pyjitpl.py).
-///
-/// `doc/jit/virtualizable.rst` names this as the remedy for exactly this shape:
-/// "If you have something equivalent of a Python generator, where the
-/// virtualizable survives for longer, you want to force it before returning.
-/// It's better to do it that way than by an external call some time later."
-///
-/// Upstream applies it to ONE exit — `interp_jit.py` `PyFrame.dispatch` reads
-/// `except Yield: … jit.hint(self, force_virtualizable=True)` against a bare
-/// `except Return: return self.popvalue()`.  A generator frame is the only one
-/// that outlives its dispatch there; every other frame is answered lazily,
-/// through the marker `store_token_in_vable` leaves behind and the deadframe it
-/// names.  So this fires on an exit upstream leaves alone, and the ordinary
-/// return gives up the `FORCE_TOKEN`/`GUARD_NOT_FORCED_2` protocol for an
-/// unconditional store-back.
-///
-/// A frame the function-entry portal compiled can outlive its trace the same
-/// way a generator's does — a traceback it hands out keeps it alive — and the
-/// lazy route is not available to narrow this back down.  Two things have to
-/// land before it is.  The dynasm backend frees the jitframe chain before
-/// `execute_token` returns, so the marker would name freed memory rather than
-/// a retained deadframe.  And arming `jf_force_descr` for a standalone
-/// trailing `GUARD_NOT_FORCED_2` is uneven: cranelift does it, dynasm folds
-/// the opcode into the no-args guard bucket and so does not, and wasm cannot
-/// yet — its `FORCE_TOKEN` is a zero sentinel, leaving no frame identity for a
-/// token to name.  Upstream arms it on every backend, from
-/// `consider_guard_not_forced_2` (x86/regalloc.py), so until dynasm and wasm
-/// follow, the armed-token test answers false for a portal exit even once the
-/// chain is retained.  Narrowing the force to the frames that actually escape
-/// needs both; the escape is a runtime property, which is what the token
-/// protocol answers.
-///
-/// Storing back here is what makes the token store unnecessary rather than
-/// merely redundant: `gen_store_back_in_vable` sets `forced_virtualizable`, and
-/// `store_token_in_vable` returns early on that (pyjitpl.py) — the two are
-/// alternatives, not a sequence — and its final store zeroes the token slot.
-pub(crate) fn fbw_force_virtualizable_before_return<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-) {
-    let Some(vbox) = ctx.trace_ctx.standard_virtualizable_box() else {
-        return;
-    };
-    ctx.trace_ctx.gen_store_back_in_vable(vbox);
 }
 
 /// Void variant of [`fbw_terminate_with_finish`] for the top-level
@@ -2947,7 +2899,6 @@ pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
     op_pc: usize,
 ) -> Result<(), DispatchError> {
     fbw_publish_exit_last_instr(ctx, op_pc);
-    fbw_force_virtualizable_before_return(ctx);
     fbw_store_token_in_vable(ctx, op_pc)?;
     FBW_FINISH_PAYLOAD.with(|c| c.set(Some((OpRef::NONE, Type::Void))));
     Ok(())
@@ -2989,10 +2940,22 @@ pub(crate) fn fbw_publish_exit_last_instr<Sym: WalkSym>(
         let session = ctx.session.borrow();
         (session.recording_frame_ptr, session.recording_jitcode_index)
     };
-    let Some(py_pc) = crate::py_coord::containing_py_pc_for_jitcode_pc_public(
-        jitcode_index,
-        opcode_position as i32,
-    ) else {
+    // `dispatch_bytecode` stores the exact opcode before executing it.  A
+    // JitCode position can sit in a later emission island owned by that same
+    // opcode (notably an exception-edge bridge), where the containing/floor
+    // coordinate still names the preceding instruction.  Use the same
+    // exact-first resolution as `record_caught_blackhole_traceback`; otherwise
+    // the traceback records the raising opcode while GUARD_NOT_FORCED_2 saves
+    // the preceding one and a later force rolls `frame.last_instr` backwards.
+    let Some(py_pc) =
+        crate::py_coord::exact_py_pc_for_jitcode_pc_public(jitcode_index, opcode_position as i32)
+            .or_else(|| {
+                crate::py_coord::containing_py_pc_for_jitcode_pc_public(
+                    jitcode_index,
+                    opcode_position as i32,
+                )
+            })
+    else {
         return;
     };
     let Some(vbox) = ctx.trace_ctx.standard_virtualizable_box() else {

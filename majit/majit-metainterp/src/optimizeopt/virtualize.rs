@@ -83,27 +83,14 @@ pub(crate) struct VirtualizableConfig {
     /// trace. What declining actually costs on this layout was measured on
     /// `tests/jit_interp_fixed_array_identity_slot.rs` and is nil: resolving the
     /// slot and declining it give the same compile count and the same trace size
-    /// (6 ops recorded, 5 after optimization), because `is_standard_ref` never
-    /// returns true there and no vable array access is ever resolved for
-    /// mirroring.
+    /// (6 ops recorded, 5 after optimization), because no sound identity
+    /// marker is installed.
     ///
     /// The decline is not total. On the bridge path (`ctx.building_bridge`)
     /// `identity_input_ref` returns `Some(input_arg_ref(ctx.inputarg_base))`
     /// before it consults this field at all, so a tracker is still installed
     /// there with this set to `None`.
     pub identity_input_index: Option<usize>,
-    /// [`VirtualizableInfo::has_vable_token`], which decides whether a
-    /// residual call may leave the tracked field/array maps stale.
-    ///
-    /// With a token, a callee that touches the virtualizable clears it and
-    /// `vable_after_residual_call` (`pyjitpl.py`) aborts the trace,
-    /// so no read after the call can observe a write the maps missed. A
-    /// `without_vable_token` machine has no such signal: the tracer writes the
-    /// fields out before the call and reads them back after
-    /// (`TraceCtx::materialize_tokenless_virtualizable_before_residual_call`
-    /// and its reload twin) and keeps tracing, so the maps must be dropped at
-    /// the call for those reads to survive.
-    pub has_vable_token: bool,
 }
 
 /// JitVirtualRef field slot indices.
@@ -117,37 +104,16 @@ pub(crate) const VREF_FORCED_FIELD_INDEX: u32 = 1;
 /// Size descriptor index for the JitVirtualRef struct.
 const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 
-/// TODO: Virtualizable field tracking in the optimizer — pyre-only, being
-/// retired.
-///
 /// RPython does NOT track virtualizable field values in the optimizer.
 /// Field tracking happens during tracing (`pyjitpl.py:virtualizable_boxes`),
 /// not in the optimization pipeline. The optimizer only removes
 /// `COND_CALL(OS_JIT_FORCE_VIRTUALIZABLE)` when the target is virtual.
 ///
-/// The tracing layer now has that model — `TraceCtx::virtualizable_boxes` is
-/// the live shadow, and both loop-close arms carry it into the JUMP — so the
-/// array-element half of this tracker is gone: `init` no longer seeds element
-/// state from the trace-entry input args, because the standard-path read
-/// answers from the shadow and records no op for a fold to match.
-///
-/// What is still here, and what retiring the rest costs:
-///
-/// - the identity `PtrInfo::Virtualizable` install. Not a deviation to
-///   remove — it is what keeps the base from being forced, which is the one
-///   virtualizable job upstream's optimizer does have.
-/// - the STATIC field map (`VirtualizableFieldState.fields`), still seeded
-///   from input args and read by the `GETFIELD_GC` fold arm below. The
-///   argument the array half got carries over unchanged:
-///   `opimpl_getfield_vable_i` and `_opimpl_getarrayitem_vable` both return
-///   `virtualizable_boxes[index]` without executing an op, and
-///   `_opimpl_setfield_vable` and `_opimpl_setarrayitem_vable` are the same
-///   two statements over a different index. The measurement is what is
-///   missing, not the argument, so the map stays until that is run.
-/// - `is_standard_ref`, which resolves the identity slot for both maps.
-/// - `mirror_setarrayitem` / `invalidate_array` / `tracked_array_element`,
-///   which follow `VirtualizableFieldState.arrays`, populated from recorded
-///   SETARRAYITEM_GC in the body rather than from the retired entry seeding.
+/// This carrier therefore does one job only: install a non-virtual identity
+/// marker so `force_box` recognizes the standard virtualizable. It must not
+/// cache redirected field or array values; those are already represented by
+/// the tracer's `virtualizable_boxes`, and ordinary `GETFIELD_GC` /
+/// `SETFIELD_GC` operations must flow through OptHeap exactly as upstream.
 pub(crate) struct VirtualizableTracker {
     config: VirtualizableConfig,
     needs_setup: bool,
@@ -194,8 +160,7 @@ impl VirtualizableTracker {
     /// mark.
     ///
     /// A bridge keeps the identity at slot 0: its input args are rebuilt from
-    /// the deadframe frame-first, which is also what `init`'s seeding gate and
-    /// `is_standard_ref` assume, so the front end's resolved offset does not
+    /// the deadframe frame-first, so the front end's resolved offset does not
     /// describe them — the bridge's layout is established by the deadframe.
     /// Every other run — loop, preamble, unrolled Phase 2 body — carries the
     /// front end's own layout, so it consults `identity_input_index` and
@@ -265,249 +230,21 @@ impl VirtualizableTracker {
             return;
         };
 
-        let mut state = VirtualizableFieldState {
+        let state = VirtualizableFieldState {
             fields: vec![],
             field_descrs: vec![],
             arrays: vec![],
             heap_fields: vec![],
             last_guard_pos: -1,
         };
-        // Input-layout seeding applies only to the initial loop/preamble entry
-        // (`inputarg_base == 0`), whose inputargs carry the
-        // `[frame, vable_scalars..., array_items...]` layout. The gate is the
-        // base and not `building_bridge` because the seeding below addresses
-        // slots with unshifted raw indices (`input_arg_typed(flat_input_idx)`),
-        // which name this run's inputargs only when the base is 0.
-        //
-        // A bridge inherits only the failing guard's live boxes as inputargs
-        // (frame first, then the surviving reds), not the unpacked vable
-        // scalar/array slots; it re-establishes the virtualizable fields from
-        // the explicit SetfieldGc/SetarrayitemGc reconstruction ops the resume
-        // path records into the bridge body. So the bridge frame is seeded as
-        // an empty Virtualizable and populated by those ops. An unrolled
-        // Phase 2 body is also shifted and skips the seeding, but keeps the
-        // resolved identity slot; see `identity_input_ref`.
-        let base = ctx.inputarg_base;
-        if base == 0 {
-            let mut flat_input_idx = 1usize + self.config.vable_input_offset;
-
-            // RPython `info.AbstractStructPtrInfo._fields` is keyed by
-            // `fielddescr.get_index()` (descr.py `index_in_parent`,
-            // populated by `cpu.fielddescrof(VTYPE, name)`).  Mirror that
-            // here so runtime queries via
-            // `op.descr.as_field_descr()?.index_in_parent() as u32` find the
-            // slot the init step seeded.
-            //
-            // `virtualizable.py:71-72 build_field_descr` assigns
-            // `index_in_parent = 1 + i` for static fields and
-            // `1 + num_static + j` for array-pointer fields; mirror that
-            // schedule for the synthetic fallback used by tests that pass
-            // empty `static_field_descrs` / `array_field_descrs`.
-            let num_static = self.config.static_field_offsets.len();
-            for (field_idx_in_vinfo, &_offset) in
-                self.config.static_field_offsets.iter().enumerate()
-            {
-                if flat_input_idx >= ctx.num_inputs() {
-                    break;
-                }
-                let descr_for_slot = self
-                    .config
-                    .static_field_descrs
-                    .get(field_idx_in_vinfo)
-                    .cloned();
-                let field_idx = descr_for_slot
-                    .as_ref()
-                    .and_then(|d| d.as_field_descr())
-                    .map(|fd| fd.index_in_parent() as u32)
-                    .unwrap_or((1 + field_idx_in_vinfo) as u32);
-                let slot_tp = ctx
-                    .inputarg_type_at(flat_input_idx)
-                    .unwrap_or(majit_ir::Type::Ref);
-                let input_ref = OpRef::input_arg_typed(flat_input_idx as u32, slot_tp);
-                let input_op = ctx.materialize_operand_at(input_ref);
-                set_field(&mut state.fields, field_idx, input_op);
-                if let Some(descr) = descr_for_slot {
-                    set_field_descr(&mut state.field_descrs, field_idx, descr);
-                }
-                flat_input_idx += 1;
-            }
-
-            // Array elements are deliberately not seeded. Every layout carries
-            // them into the loop JUMP through the tracer's live
-            // `virtualizable_boxes` shadow — the macro state-field JIT via
-            // `JitState::collect_jump_args_with_boxes`, PyFrame via
-            // `jitcode_dispatch::append_virtualizable_boxes` — and the tracer
-            // updates that shadow through `set_virtualizable_entry_at` without
-            // recording an op, so a seeded entry box is invisible to
-            // `mirror_setarrayitem` and goes stale. The standard-path read
-            // records no op either (`TraceCtx::vable_getarrayitem_*_checked`
-            // answers from the shadow, pyjitpl.py:1170-1184), so there is
-            // nothing for a seeded element to fold against in the first place.
-            // Measured before removal: check.py dynasm 434/434 with zero
-            // jit-stats counters moved.
-        }
-
         let b = ctx.materialize_operand_at(identity_ref);
         ctx.set_ptr_info(&b, PtrInfo::Virtualizable(state));
-    }
-
-    fn is_standard_ref(&self, b: &Operand, ctx: &OptContext) -> bool {
-        // pyjitpl.py `standard_box is box` — box identity against the
-        // standard virtualizable frame, then virtualizable check. The slot is
-        // resolved by `identity_input_ref`, so this reads the same answer
-        // `ensure_setup` installed on: a bridge's frame-first slot 0, or the
-        // front end's declared `identity_input_index`, both in this run's own
-        // OpRef namespace. A run with no known identity slot declines:
-        // nothing is the standard ref.
-        match self
-            .identity_input_ref(ctx)
-            .and_then(|r| ctx.get_box_replacement_operand_opt(r))
-        {
-            Some(std) => b.same_box(&std) && ctx.is_virtualizable(b),
-            None => false,
-        }
-    }
-
-    fn array_idx_for_offset(&self, offset: usize) -> Option<u32> {
-        self.config
-            .array_field_offsets
-            .iter()
-            .position(|&off| off == offset)
-            .map(|idx| idx as u32)
-    }
-
-    fn resolve_array_source(
-        &self,
-        array_box: &Operand,
-        ctx: &mut OptContext,
-    ) -> Option<(Operand, u32)> {
-        let producer = ctx.get_producing_op(array_box)?;
-        // The array-pointer field of the virtualizable frame is read with the
-        // raw field descr on the loop hot path (GetfieldRaw*), but with the
-        // virtualizable field descr during a bridge's frame reconstruction
-        // (GetfieldGc*). Both name the same array-pointer slot; the offset
-        // gate in `array_idx_for_offset` below filters to configured array
-        // fields, so accept either read form.
-        if !matches!(
-            producer.opcode,
-            OpCode::GetfieldRawI
-                | OpCode::GetfieldRawR
-                | OpCode::GetfieldRawF
-                | OpCode::GetfieldGcI
-                | OpCode::GetfieldGcR
-                | OpCode::GetfieldGcF
-        ) {
-            return None;
-        }
-        // Terminal box of the GetfieldRaw receiver — the virtualizable frame.
-        let frame_box = ctx.resolve_operand_operand(&producer.arg(0));
-        let is_standard = ctx
-            .resolve_operand_operand_opt(&producer.arg(0))
-            .is_some_and(|b| self.is_standard_ref(&b, ctx));
-        if !is_standard {
-            return None;
-        }
-        // `virtualize.py` reads `op.getdescr().offset` directly to resolve
-        // raw-field byte offsets; mirror that via `FieldDescr::offset()`.
-        let offset = producer
-            .getdescr()
-            .and_then(|d| d.as_field_descr().map(|fd| fd.offset()))?;
-        let array_idx = self.array_idx_for_offset(offset)?;
-        Some((frame_box, array_idx))
-    }
-
-    /// Mirror a setarrayitem write to the virtualizable array state.
-    fn mirror_setarrayitem(
-        &self,
-        array_box: &Operand,
-        index: i64,
-        value_ref: OpRef,
-        ctx: &mut OptContext,
-    ) {
-        if let Some((frame_box, array_idx)) = self.resolve_array_source(array_box, ctx) {
-            let elem_idx = index as usize;
-            let value_op = ctx.materialize_operand_at(value_ref);
-            ctx.with_ptr_info_mut(&frame_box, |info| {
-                if let PtrInfo::Virtualizable(vstate) = info {
-                    set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_op.clone());
-                }
-            });
-        }
-    }
-
-    /// Invalidate every tracked slot of the standard-virtualizable array
-    /// `array_box` resolves to.  Mirrors `force_lazy_setarrayitem(descr,
-    /// indexb, can_cache=False)` (heap.py:580-586): a variable-index
-    /// SETARRAYITEM_GC may overwrite any element, so every const-index slot
-    /// a later read could fold against must be dropped before the write.
-    fn invalidate_array(&self, array_box: &Operand, ctx: &mut OptContext) {
-        if let Some((frame_ref, array_idx)) = self.resolve_array_source(array_box, ctx) {
-            ctx.with_ptr_info_mut(&frame_ref, |info| {
-                if let PtrInfo::Virtualizable(vstate) = info {
-                    vstate.arrays.retain(|(i, _)| *i != array_idx);
-                }
-            });
-        }
-    }
-
-    /// Drop every tracked static field and array element of the standard
-    /// virtualizable.
-    ///
-    /// The counterpart of `clean_caches` (`heap.py`) for the two maps
-    /// this tracker keeps outside `OptHeap`. It applies only to a
-    /// `without_vable_token` machine: see
-    /// [`VirtualizableConfig::has_vable_token`] for why a token-bearing one
-    /// cannot reach a stale read.
-    ///
-    /// `field_descrs` survives — it is the descr each slot was seeded with,
-    /// not a value, and the force path still needs it after the values go.
-    fn invalidate_all(&self, ctx: &mut OptContext) {
-        if self.config.has_vable_token {
-            return;
-        }
-        let Some(identity) = self
-            .identity_input_ref(ctx)
-            .and_then(|r| ctx.get_box_replacement_operand_opt(r))
-        else {
-            return;
-        };
-        ctx.with_ptr_info_mut(&identity, |info| {
-            if let PtrInfo::Virtualizable(vstate) = info {
-                vstate.fields.clear();
-                vstate.arrays.clear();
-            }
-        });
-    }
-
-    /// Read counterpart to [`mirror_setarrayitem`]: returns the tracked
-    /// value box for `array_box[index]` on the standard virtualizable
-    /// array state (seeded from the inputarg layout, updated by
-    /// `mirror_setarrayitem`), or `None` when `array_box` is not the
-    /// standard virtualizable array field or the slot is untracked.
-    fn tracked_array_element(
-        &self,
-        array_box: &Operand,
-        index: i64,
-        ctx: &mut OptContext,
-    ) -> Option<OpRef> {
-        if index < 0 {
-            return None;
-        }
-        let (frame_box, array_idx) = self.resolve_array_source(array_box, ctx)?;
-        let elem_idx = index as usize;
-        match ctx.peek_ptr_info(&frame_box)? {
-            PtrInfo::Virtualizable(vstate) => {
-                get_array_element(&vstate.arrays, array_idx, elem_idx)
-            }
-            _ => None,
-        }
     }
 }
 
 /// The virtualize optimization pass.
 pub struct OptVirtualize {
-    /// TODO: pyre-specific virtualizable field tracker.
-    /// See `VirtualizableTracker` doc comment for convergence path.
+    /// Standard-virtualizable identity marker; carries no field-value cache.
     vable: Option<VirtualizableTracker>,
     /// optimizer.py REMOVED + virtualize.py:67-75,180,247:
     last_emitted_was_removed: bool,
@@ -562,12 +299,6 @@ impl OptVirtualize {
         ctx.get_box_replacement_operand_opt(opref)
             .as_ref()
             .is_some_and(|b| ctx.is_virtual(b))
-    }
-
-    fn is_standard_virtualizable_ref(&self, b: &Operand, ctx: &OptContext) -> bool {
-        self.vable
-            .as_ref()
-            .is_some_and(|vt| vt.is_standard_ref(b, ctx))
     }
 
     /// virtualize.py make_virtual_raw_slice
@@ -817,7 +548,6 @@ impl OptVirtualize {
             .expect("optimize_setfield_gc: field op without FieldDescr");
         let field_idx = field_descr.index_in_parent() as u32;
         let is_typeptr = field_descr.is_typeptr();
-        let is_raw_op = matches!(op.opcode, OpCode::SetfieldRaw);
         // Pre-extract constant value before mutable borrow of ptr_info.
         // Class pointer may be stored as Value::Int OR Value::Ref.
         let value_as_constant: Option<usize> = ctx
@@ -833,19 +563,10 @@ impl OptVirtualize {
         // the field, even for imported virtual heads. Body computation must
         // be able to update virtual fields (e.g., i.intval = i + step).
 
-        if is_raw_op
-            && struct_box
-                .as_ref()
-                .is_some_and(|b| self.is_standard_virtualizable_ref(b, ctx))
-        {
-            return OptimizationResult::PassOn;
-        }
-
         // RPython: if struct is NOT virtual, PassOn to OptHeap which stores
         // it as a lazy_set. The virtual value is NOT forced — OptHeap delays
         // it until guard emission (force_lazy_sets_for_guard) or JUMP.
 
-        let descr_for_vstate = Some(setfield_descr_arc.clone());
         let value_op = ctx.materialize_operand_at(value_ref);
         let early = struct_box
             .as_ref()
@@ -934,14 +655,6 @@ impl OptVirtualize {
                         }
                         Some(OptimizationResult::Remove)
                     }
-                    PtrInfo::Virtualizable(vstate) => {
-                        set_field(&mut vstate.fields, field_idx, value_op.clone());
-                        // Store original descr for force path
-                        if let Some(d) = descr_for_vstate {
-                            set_field_descr(&mut vstate.field_descrs, field_idx, d);
-                        }
-                        Some(OptimizationResult::Remove)
-                    }
                     _ => None,
                 }
             }))
@@ -980,25 +693,6 @@ impl OptVirtualize {
             op.opcode,
             OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
         );
-        let is_standard_vable_ref = struct_box
-            .as_ref()
-            .is_some_and(|b| self.is_standard_virtualizable_ref(b, ctx));
-
-        // The standard virtualizable's array-pointer field has no virtual-field
-        // value to fold to (its contents are tracked as array elements, not a
-        // scalar field), so the read passes through unchanged — both the raw
-        // hot-path form and the GetfieldGc* form a bridge's reconstruction
-        // emits. The frame is a real object (the trace's first inputarg), so
-        // reading its array-pointer field does not force it.
-        let reads_vable_array_field = is_standard_vable_ref
-            && self
-                .vable
-                .as_ref()
-                .is_some_and(|vt| vt.array_idx_for_offset(field_descr.offset()).is_some());
-        if (is_raw_op && is_standard_vable_ref) || reads_vable_array_field {
-            return OptimizationResult::PassOn;
-        }
-
         // info.py `getfield` opens with the same
         // `init_fields(fielddescr.get_parent_descr(), fielddescr.get_index())`
         // that `setfield` does, so upstream's read is what grows `_fields` and
@@ -1177,20 +871,6 @@ impl OptVirtualize {
                 _ if !slot_resolvable => None,
                 PtrInfo::Virtual(vinfo) => get_field(&vinfo.fields, field_idx),
                 PtrInfo::VirtualStruct(vinfo) => get_field(&vinfo.fields, field_idx),
-                PtrInfo::Virtualizable(vstate) => vstate
-                    .fields
-                    .iter()
-                    .find(|(idx, _)| *idx == field_idx)
-                    .filter(|(_, b)| {
-                        virtualizable_slot_identifies(
-                            vstate,
-                            field_idx,
-                            field_descr,
-                            b,
-                            op.result_type(),
-                        )
-                    })
-                    .map(|(_, b)| b.to_opref()),
                 _ => None,
             };
             if let Some(val_ref) = field_val {
@@ -1304,23 +984,6 @@ impl OptVirtualize {
             if did_virtual_write {
                 return OptimizationResult::Remove;
             }
-            if let (Some(vt), Some(ab)) = (self.vable.as_ref(), array_box.as_ref()) {
-                // Mirror into the virtualizable's tracked array state so a
-                // later const-index read folds (read-after-write). The op is
-                // KEPT (PassOn → OptHeap lazy set): the real frame array must
-                // still be written. Whether the virtual rhs is force-boxed at
-                // the export flush is decided in heap.rs `emit_lazy_setfield`,
-                // which defers writes whose target is the standard
-                // virtualizable (the value then flows virtual through the JUMP).
-                vt.mirror_setarrayitem(ab, index, value_ref, ctx);
-            }
-        } else if let (Some(vt), Some(ab)) = (self.vable.as_ref(), array_box.as_ref()) {
-            // Non-constant index: a variable-index write may overwrite any
-            // const-index slot, so invalidate the whole tracked array before
-            // a later const-index read in `optimize_getarrayitem_gc` can fold
-            // to a now-stale value.  `force_lazy_setarrayitem(can_cache=False)`
-            // (heap.py:751 variable-index branch -> heap.py:580-586).
-            vt.invalidate_array(ab, ctx);
         }
         // virtualize.py:307: self.make_nonnull(op.getarg(0))
         if !array_box.as_ref().is_some_and(|b| ctx.has_ptr_info(b))
@@ -1362,27 +1025,6 @@ impl OptVirtualize {
             let b_item = ctx
                 .get_box_replacement_operand_opt(item_ref)
                 .unwrap_or_else(|| ctx.materialize_operand_at(item_ref));
-            ctx.make_equal_to(&b_old, &b_item);
-            return OptimizationResult::Remove;
-        }
-        // Standard virtualizable array read-after-write: the value-stack /
-        // array field of the standard virtualizable frame is tracked in
-        // `vstate.arrays` (seeded from the inputarg layout, updated by
-        // `mirror_setarrayitem`).  Fold a constant-index read to the
-        // tracked box, symmetric with the static-field fold in
-        // `optimize_getfield_gc`.  Read-only: the matching setarrayitem is
-        // left emitted, so no heap write is dropped.
-        if let Some(index) = ctx
-            .resolve_operand_operand_opt(&op.arg(1))
-            .and_then(|b_| ctx.get_constant_int_box(&b_))
-            && let Some(item_ref) = self
-                .vable
-                .as_ref()
-                .zip(array_box.as_ref())
-                .and_then(|(vt, ab)| vt.tracked_array_element(ab, index, ctx))
-        {
-            let b_old = ctx.materialize_operand_at(op.pos.get());
-            let b_item = ctx.materialize_operand_at(item_ref);
             ctx.make_equal_to(&b_old, &b_item);
             return OptimizationResult::Remove;
         }
@@ -2391,17 +2033,6 @@ impl Optimization for OptVirtualize {
                         return OptimizationResult::Remove;
                     }
                 }
-                // The callee is handed the virtualizable and may write it.
-                // On a token-bearing machine that write clears the token and
-                // the trace has already aborted, so the maps stay good; a
-                // `without_vable_token` machine keeps tracing, and the reload
-                // the tracer records after the call is the only reader of what
-                // the callee wrote. Folding that reload back to the value
-                // stored before the call is the wrong answer, so drop the maps
-                // here.
-                if let Some(ref vt) = self.vable {
-                    vt.invalidate_all(ctx);
-                }
                 OptimizationResult::PassOn
             }
 
@@ -2698,7 +2329,7 @@ fn field_slot_disagreement(
 
 /// Whether `slot` and `field` name the same field.
 ///
-/// All three halves of `get_field_descr`'s identity must agree: the owning
+/// All three halves of a field descriptor's identity must agree: the owning
 /// STRUCT, `fieldname`, and byte offset (`descr.py`,
 /// `cache[STRUCT][fieldname]`).  Production field descrs carry the STRUCT as
 /// `get_parent_descr()`.  Pyre can reconstruct the same RPython STRUCT descr
@@ -2963,36 +2594,6 @@ fn field_slot_identifies(descr: &DescrRef, field_idx: u32, field: &dyn FieldDesc
         .is_some_and(|slot| slot_holds_field(slot.as_ref(), field))
 }
 
-/// Whether `field_idx` addresses `field` in a virtualizable's slot list.
-///
-/// The virtualizable half of [`field_slot_identifies`], which cannot serve
-/// here. `VirtualizableFieldState.fields` is keyed in `VirtualizableInfo::
-/// static_fields` order while the read computes `index_in_parent`
-/// (`majit-ir ptr_info.rs` spells both), so `vstate.descr`'s field list does
-/// not index that slot and cannot say what it holds. What the state does carry
-/// is the descr each store recorded, so the check runs against that; a slot no
-/// store described falls back to the value's type, which is what separates an
-/// `Int` field read from a slot holding a `Ref`.
-///
-/// A slot that does not identify the field leaves the read unfolded. That is
-/// the answer a virtualizable needs: `folds_to_zero` covers only `Virtual` and
-/// `VirtualStruct`, so the caller emits the real load instead of reading a
-/// zeroed allocation off a live frame.
-fn virtualizable_slot_identifies(
-    vstate: &VirtualizableFieldState,
-    field_idx: u32,
-    field: &dyn FieldDescr,
-    stored: &Operand,
-    result_type: Type,
-) -> bool {
-    match get_field_descr(&vstate.field_descrs, field_idx) {
-        Some(slot) => slot
-            .as_field_descr()
-            .is_some_and(|slot| slot_holds_field(slot, field)),
-        None => stored.type_() == result_type,
-    }
-}
-
 fn set_field(fields: &mut Vec<(u32, Operand)>, field_idx: u32, value: Operand) {
     for entry in fields.iter_mut() {
         if entry.0 == field_idx {
@@ -3001,23 +2602,6 @@ fn set_field(fields: &mut Vec<(u32, Operand)>, field_idx: u32, value: Operand) {
         }
     }
     fields.push((field_idx, value));
-}
-
-fn set_field_descr(field_descrs: &mut Vec<(u32, DescrRef)>, field_idx: u32, descr: DescrRef) {
-    for entry in field_descrs.iter_mut() {
-        if entry.0 == field_idx {
-            entry.1 = descr;
-            return;
-        }
-    }
-    field_descrs.push((field_idx, descr));
-}
-
-fn get_field_descr(field_descrs: &[(u32, DescrRef)], field_idx: u32) -> Option<DescrRef> {
-    field_descrs
-        .iter()
-        .find(|(idx, _)| *idx == field_idx)
-        .map(|(_, descr)| descr.clone())
 }
 
 fn get_field(fields: &[(u32, Operand)], field_idx: u32) -> Option<OpRef> {
@@ -3198,41 +2782,6 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
     }
     fn all_fielddescrs(&self) -> &[Arc<dyn majit_ir::FieldDescr>] {
         &VREF_ALL_FIELDDESCRS
-    }
-}
-
-/// Lookup helper for `PtrInfo::Virtualizable.arrays` — returns the OpRef
-/// stored at `arrays[arr_idx][elem_idx]` if present and non-NONE.
-fn get_array_element(
-    arrays: &[(u32, Vec<Operand>)],
-    arr_idx: u32,
-    elem_idx: usize,
-) -> Option<OpRef> {
-    arrays
-        .iter()
-        .find(|(i, _)| *i == arr_idx)
-        .and_then(|(_, e)| e.get(elem_idx).map(|b| b.to_opref()))
-        .filter(|r| !r.is_none())
-}
-
-/// Write helper for `PtrInfo::Virtualizable.arrays` — grows the inner Vec
-/// with `OpRef::NONE` placeholders as needed, then stores `value` at
-/// `arr_idx`/`elem_idx`.
-fn set_array_element(
-    arrays: &mut Vec<(u32, Vec<Operand>)>,
-    arr_idx: u32,
-    elem_idx: usize,
-    value: Operand,
-) {
-    if let Some((_, elems)) = arrays.iter_mut().find(|(i, _)| *i == arr_idx) {
-        if elem_idx >= elems.len() {
-            elems.resize(elem_idx + 1, Operand::None);
-        }
-        elems[elem_idx] = value;
-    } else {
-        let mut elems = vec![Operand::None; elem_idx + 1];
-        elems[elem_idx] = value;
-        arrays.push((arr_idx, elems));
     }
 }
 
@@ -3781,10 +3330,9 @@ mod tests {
     /// Test helper: build a `FieldDescr` with explicit `offset` and
     /// `index_in_parent` for the virtualizable-field test sites.  Mirrors
     /// the shape `cpu.fielddescrof(VTYPE, name)` produces (descr.py:218-239
-    /// `get_field_descr`) — pyre's `init` keys `VirtualizableFieldState.fields`
-    /// by `fielddescr.get_index()` (info.py:203-206), so the synthetic
-    /// fallback at `init` assigns `1 + field_idx_in_vinfo` for static slots
-    /// and `1 + num_static + array_idx` for array slots.
+    /// `get_field_descr`). The index remains useful for testing ordinary
+    /// virtual object field identity; standard virtualizables carry no
+    /// optimizer-owned field map.
     fn test_vable_field_descr(offset: usize, field_type: Type, index_in_parent: usize) -> DescrRef {
         let field_size = match field_type {
             Type::Int | Type::Ref | Type::Float => 8,
@@ -4289,8 +3837,8 @@ mod tests {
 
     #[test]
     fn test_standard_virtualizable_force_is_noop_in_optimizer() {
-        // Verify that Optimizer::force_box skips Virtualizable PtrInfo
-        // without destroying the tracked field state.
+        // Verify that Optimizer::force_box skips the identity-only
+        // Virtualizable PtrInfo.
         // opencoder.py:259 inputarg_from_tp — vable is the sole Ref inputarg.
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
         let vable_box = ctx.materialize_operand_at(OpRef::input_arg_ref(0));
@@ -4299,7 +3847,7 @@ mod tests {
             PtrInfo::Virtualizable(VirtualizableFieldState {
                 fields: vec![],
                 field_descrs: vec![],
-                arrays: vec![(0, vec![Operand::None])],
+                arrays: vec![],
                 heap_fields: vec![],
                 last_guard_pos: -1,
             }),
@@ -4316,7 +3864,6 @@ mod tests {
                 array_field_descrs: vec![],
                 vable_input_offset: 0,
                 identity_input_index: Some(0),
-                has_vable_token: true,
             },
         )));
         let forced = opt.force_box(OpRef::input_arg_ref(0), &mut ctx);
@@ -4347,14 +3894,11 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            has_vable_token: true,
         });
         pass.setup();
 
-        // array slot at byte offset 8; array_idx_for_offset reads the
-        // FieldDescr's `offset()` directly so the index_in_parent value is
-        // immaterial — pass `1` (= `1 + num_static + array_idx` with
-        // num_static=0) for consistency with `init`.
+        // The descriptor shape is deliberately realistic even though
+        // OptVirtualize must treat the access as an ordinary raw heap read.
         let field_descr = test_vable_field_descr(8, Type::Int, 1);
         let arr_descr = array_descr(20);
         let b = ctx.materialize_operand_at(OpRef::int_op(50));
@@ -4387,9 +3931,6 @@ mod tests {
 
         let mut ops = vec![get_array_ptr, get_item, get_item_again];
         assign_positions(&mut ops);
-        // Route raw array reads through the GetfieldRawI result so
-        // resolve_array_source() sees the producing OpRef, not the bare vable
-        // inputarg.
         // Bind the array-element reads to the GetfieldRawI producer's bound
         // result box (oparser object-identity); GetfieldRawI (ops[0]) is
         // Int-typed so its result position is `OpRef::int_op(0)`.
@@ -4447,7 +3988,6 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            has_vable_token: true,
         });
         pass.setup();
 
@@ -4496,7 +4036,6 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            has_vable_token: true,
         });
         pass.setup();
 
@@ -4527,7 +4066,6 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            has_vable_token: true,
         });
         pass.setup();
 
@@ -4561,7 +4099,6 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            has_vable_token: true,
         });
         pass.setup();
         if let Some(ref mut vt) = pass.vable {
@@ -4573,54 +4110,6 @@ mod tests {
         assert!(
             ctx.is_virtualizable(&identity),
             "ensure_setup must still mark the identity virtualizable so the base is not forced",
-        );
-    }
-
-    #[test]
-    fn test_standard_virtualizable_init_uses_parent_backed_field_descrs() {
-        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
-        info.add_field("pc", Type::Int, 8);
-        let parent = majit_ir::make_size_descr_full(900, 16, 1);
-        info.set_parent_descr(parent);
-        let config = info.to_optimizer_config();
-        let real_descr = info.static_field_descr(0);
-
-        // opencoder.py:259 inputarg_from_tp — vable Ref + the `pc` static Int
-        // field's flat-input slot 1 (init_virtualizable consumes
-        // `config.static_field_offsets.len()` slots after the vable).
-        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
-        let mut pass = OptVirtualize::with_virtualizable(config);
-        pass.setup();
-        if let Some(ref mut vt) = pass.vable {
-            vt.ensure_setup(&mut ctx);
-        }
-
-        let vbox = ctx
-            .get_box_replacement_operand_opt(OpRef::input_arg_ref(0))
-            .expect("standard virtualizable operand populated");
-        let Some(PtrInfo::Virtualizable(vstate)) = ctx.peek_ptr_info(&vbox) else {
-            panic!("expected standard virtualizable ptr info on OpRef::input_arg_ref(0)");
-        };
-        // `info.AbstractStructPtrInfo._fields` is keyed by
-        // `fielddescr.get_index()`; `virtualizable.py:71-72
-        // build_field_descr` assigns `index_in_parent = 1 + i` to the
-        // i-th static field, so the `pc` slot lands at index 1.
-        let key = real_descr
-            .as_field_descr()
-            .expect("virtualizable static_field_descr is a FieldDescr")
-            .index_in_parent() as u32;
-        let seeded = get_field_descr(&vstate.field_descrs, key)
-            .expect("virtualizable init should seed field descr");
-        assert_eq!(
-            majit_ir::descr::descr_identity(&seeded),
-            majit_ir::descr::descr_identity(&real_descr)
-        );
-        assert!(
-            seeded
-                .as_field_descr()
-                .and_then(|fd| fd.get_parent_descr())
-                .is_some(),
-            "standard virtualizable config must carry real fielddescr.parent_descr",
         );
     }
 
@@ -4637,7 +4126,6 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            has_vable_token: true,
         });
         pass.setup();
 
@@ -4683,7 +4171,6 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            has_vable_token: true,
         });
         pass.setup();
 
@@ -4718,12 +4205,10 @@ mod tests {
     }
 
     #[test]
-    fn test_standard_virtualizable_gc_getarrayitem_folds_after_setarrayitem() {
-        // GETARRAYITEM_GC on the standard virtualizable array field folds
-        // to the value written by a prior SETARRAYITEM_GC at the same
-        // const index (read-after-write), symmetric with the static-field
-        // fold.  The setarrayitem stays emitted (the heap write is kept);
-        // only the redundant read is removed.
+    fn test_standard_virtualizable_gc_getarrayitem_is_not_folded_by_virtualize() {
+        // PyPy's OptVirtualize has no standard-virtualizable field map.
+        // OptHeap may subsequently CSE this read, but this pass must preserve
+        // both operations.
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
@@ -4734,7 +4219,6 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            has_vable_token: true,
         });
         pass.setup();
 
@@ -4811,8 +4295,8 @@ mod tests {
             .filter(|op| op.opcode == OpCode::GetarrayitemGcI)
             .count();
         assert_eq!(
-            get_count, 0,
-            "GETARRAYITEM_GC on standard vable array should fold after a same-index SETARRAYITEM_GC"
+            get_count, 1,
+            "OptVirtualize must not fold standard-vable array reads"
         );
         let set_count = ctx
             .new_operations
@@ -4826,12 +4310,11 @@ mod tests {
     }
 
     #[test]
-    fn test_standard_virtualizable_variable_index_setarrayitem_invalidates_array_fold() {
-        // A SETARRAYITEM_GC with a NON-constant index may overwrite any slot,
-        // so a subsequent const-index GETARRAYITEM_GC must NOT fold to a value
-        // a prior const-index write tracked.  The variable-index write
-        // invalidates the tracked array (force_lazy_setarrayitem,
-        // can_cache=False).  Companion of the read-after-write fold test above.
+    fn test_standard_virtualizable_array_accesses_pass_through_virtualize() {
+        // PyPy's OptVirtualize owns no standard-vable array map: constant and
+        // variable writes, followed by a constant read, all pass through this
+        // optimization unchanged. OptHeap may apply its ordinary heap rules
+        // when the full pipeline runs.
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref]);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
@@ -4842,7 +4325,6 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            has_vable_token: true,
         });
         pass.setup();
 
@@ -4865,7 +4347,7 @@ mod tests {
             )],
             field_descr,
         );
-        // stack[0] = 42 (const index → tracked)
+        // stack[0] = 42
         let set_item_const = Op::with_descr(
             OpCode::SetarrayitemGc,
             &[
@@ -4875,7 +4357,7 @@ mod tests {
             ],
             arr_descr.clone(),
         );
-        // stack[i] = 99 (variable index → must invalidate the tracked array)
+        // stack[i] = 99
         let set_item_var = Op::with_descr(
             OpCode::SetarrayitemGc,
             &[
@@ -4885,7 +4367,7 @@ mod tests {
             ],
             arr_descr.clone(),
         );
-        // stack[0] (const index read — must NOT fold after the variable write)
+        // stack[0]
         let get_item = Op::with_descr(
             OpCode::GetarrayitemGcI,
             &[
@@ -4934,8 +4416,7 @@ mod tests {
             .count();
         assert_eq!(
             get_count, 1,
-            "GETARRAYITEM_GC must NOT fold after a variable-index SETARRAYITEM_GC \
-             invalidated the tracked array"
+            "OptVirtualize must preserve the standard-vable array read"
         );
         let set_count = ctx
             .new_operations
@@ -4956,7 +4437,6 @@ mod tests {
             array_field_descrs: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            has_vable_token: true,
         });
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let mut ops = vec![

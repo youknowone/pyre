@@ -107,8 +107,11 @@ fn insns_table(root: &Path) -> Vec<(String, String)> {
 /// The `BC_*` constants majit's tracer names outside a comment.
 fn majit_walker_bytecodes(root: &Path) -> BTreeSet<String> {
     let src = read(root, "majit/majit-metainterp/src/pyjitpl/dispatch.rs");
+    let at = src
+        .find("        match bytecode {")
+        .expect("the dispatch match must exist");
     let mut out = BTreeSet::new();
-    for line in src.lines() {
+    for line in braced_body(&src, at).lines() {
         let code = code_of(line);
         let mut rest = code;
         while let Some(at) = rest.find("insns::BC_") {

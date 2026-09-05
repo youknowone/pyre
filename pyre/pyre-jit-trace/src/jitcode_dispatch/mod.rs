@@ -229,6 +229,10 @@ pub use specialize::*;
 mod inline_call;
 pub use inline_call::*;
 mod residual_call;
+
+pub fn finalize_published_last_instr(frame: usize, last_instr: isize) {
+    residual_call::finalize_published_last_instr(frame, last_instr);
+}
 pub use residual_call::*;
 mod fbw_state;
 mod symbolic_fold;
@@ -958,55 +962,34 @@ fn record_inline_application_traceback<Sym: WalkSym>(
     if execute_concrete {
         // `pytraceback.py record_application_traceback(space, operror,
         // frame, last_instruction)` anchors the node on the frame that is
-        // executing.  This level has one whenever it was seeded: the sub-walk
-        // runs the callee on it, and the emitted node names the very same
+        // executing. Every admitted inline level has one: the sub-walk runs
+        // the callee on it, and the emitted node names the very same
         // object, since [`traceback_node_site`] resolves its frame operand from
         // this register and the seed stamps the concrete frame onto that
         // operand's box (`inline_call.rs`).
         //
-        // Only an unseeded level falls through to the frame-fabricating hook.
-        // It has no frame at all, so a node built from the promoted code /
-        // globals is the only one available — but it names an object nothing
-        // else can reach, and a `sys._getframe()` in the same handler answers
-        // the seeded frame, so `tb.tb_frame is sys._getframe()` reads False.
-        // That stays invisible only while the walk's concrete effects are
-        // discarded and the iteration replayed; a level whose effects are
-        // committed, as the multi-frame blackhole adopt commits them, shows it.
-        //
-        // Resolving the python pc first keeps this a choice of FRAME and
-        // nothing else: the fabricating hook drops the node outright when the
-        // coordinate does not map, while the pointer-taking recorder would
-        // substitute `frame.last_instr`.  Whether an unmappable coordinate
-        // should still contribute a node is a separate question from which
-        // frame the node names.
         let node_frame = crate::py_coord::containing_py_pc_for_jitcode_pc_public(
             consts.jitcode_index,
             opcode_position as i32,
         )
-        .and_then(|py_pc| {
-            let frame_reg = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?
+        .map(|py_pc| {
+            let frame_reg = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)
+                .expect("an inlined level must have JitCode metadata")
                 .metadata
                 .portal_frame_reg;
-            concrete_portal_frame(ctx, consts.jitcode_index).map(|frame| (frame, py_pc, frame_reg))
+            let frame = concrete_portal_frame(ctx, consts.jitcode_index)
+                .expect("an inlined MIFrame must carry its own concrete PyFrame");
+            (frame, py_pc, frame_reg)
         });
-        journaled_concrete_traceback_attach(exc_ptr, || match node_frame {
-            Some((frame_ptr, py_pc, frame_reg)) => {
-                // `dispatch_bytecode` (pyopcode.py) writes `self.last_instr`
-                // before every opcode so a frame read while it runs answers for
-                // the instruction executing.  The recording walk does not make
-                // that store, so this level's frame still holds the entry
-                // sentinel, and a frame that leaves by the exception never
-                // reaches an exit that would publish one either: `f_lineno`
-                // would answer the code object's first line for the node
-                // anchored here.  The blackhole closes the same gap for its
-                // replay in `publish_last_instr_at_live_marker`, and the
-                // fabricating hook stamps its fabricated frame for this reason.
-                //
-                // SAFETY: the portal red of this level's own register bank
-                // holds the concrete frame the sub-walk runs the callee on.
-                unsafe {
-                    (*frame_ptr).last_instr = py_pc as isize;
-                }
+        if node_frame.is_some() {
+            // `dispatch_bytecode` publishes the executing instruction through
+            // the frame field before handling the exception.  Keep all three
+            // views in step here as well: emitted IR, the recording-time frame,
+            // and heapcache knowledge used by a following `f_lasti` read.
+            residual_call::record_and_publish_inline_callee_last_instr(ctx, opcode_position);
+        }
+        journaled_concrete_traceback_attach(exc_ptr, || {
+            if let Some((frame_ptr, py_pc, frame_reg)) = node_frame {
                 // Attaching the live frame to a traceback escapes the
                 // virtualizable, so publish this callee's walk-time locals
                 // first.  `virtualizable.py write_boxes` makes that
@@ -1020,34 +1003,34 @@ fn record_inline_application_traceback<Sym: WalkSym>(
                     opcode_position as i32,
                 )
             }
-            None => majit_metainterp::record_inline_application_traceback_for_recording(
-                exc_ptr as usize as i64,
-                consts.w_code as i64,
-                consts.w_globals as i64,
-                consts.jitcode_index,
-                opcode_position as i32,
-            ),
         });
     }
-    let hook = majit_metainterp::record_inline_application_traceback_hook_address();
-    if emit_runtime && !hook.is_null() && !exc.is_none() {
-        let w_code = ctx.trace_ctx.const_ref(consts.w_code as i64);
-        let w_globals = ctx.trace_ctx.const_ref(consts.w_globals as i64);
+    let frame = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)
+        .and_then(|jitcode| {
+            ctx.registers_r
+                .get(jitcode.metadata.portal_frame_reg as usize)
+                .copied()
+        })
+        .unwrap_or(OpRef::NONE);
+    let frame_hook = majit_metainterp::record_application_traceback_hook_address();
+    if emit_runtime && !frame_hook.is_null() && !exc.is_none() {
+        assert!(
+            !frame.is_none(),
+            "an inlined MIFrame must carry its own red PyFrame"
+        );
         let jitcode = ctx.trace_ctx.const_int(i64::from(consts.jitcode_index));
         let opcode = ctx.trace_ctx.const_int(opcode_position as i64);
         ctx.trace_ctx.call_void_typed_with_effect(
-            hook,
-            &[exc, w_code, w_globals, jitcode, opcode],
-            &[Type::Ref, Type::Ref, Type::Ref, Type::Int, Type::Int],
+            frame_hook,
+            &[exc, frame, jitcode, opcode],
+            &[Type::Ref, Type::Ref, Type::Int, Type::Int],
             default_effect_info(),
         );
     }
 }
 
 /// The concrete `PyFrame` this level's portal frame register holds, or `None`
-/// when the level was inlined without a materialized frame — a branchless leaf
-/// leaves the register unseeded, and the walk then has no frame identity for
-/// it at all.
+/// when the level is not a materialized inline MIFrame.
 fn concrete_portal_frame<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode_index: i32,
@@ -3982,28 +3965,10 @@ pub fn walk<Sym: WalkSym>(
                     fbw_publish_exit_last_instr(ctx, recording_opcode_position);
                     // `pyjitpl.py compile_exit_frame_with_exception` opens
                     // with `store_token_in_vable()`, exactly as
-                    // `compile_done_with_this_frame` does — both frame exits
-                    // settle the token, and this one did not.  Every residual
-                    // call arms it (`walker_vable_and_vrefs_before_residual_call`
-                    // records FORCE_TOKEN + SETFIELD_GC through
-                    // `token_field_descr`), so an exit that leaves it armed
-                    // leaves the frame naming a jitframe the backend is about to
-                    // free in `execute_token`, and the next
-                    // `is_force_token_armed` walks `jf_forward` off freed
-                    // memory.
-                    //
-                    // Settle it the way the value/void arms do — store back,
-                    // which zeroes the token slot — rather than by arming it
-                    // like upstream.  Upstream can leave the token live because
-                    // its FORCE_TOKEN is the heap-allocated GC `JITFRAME`
-                    // (`jitframe.py` `lltype.malloc(JITFRAME, ...)`); pyre's is
-                    // the machine frame pointer (`mov Rq(r), rbp` / `mov X(r),
-                    // x29`), which stops being addressable the moment compiled
-                    // code returns.  `gen_store_back_in_vable` sets
-                    // `forced_virtualizable`, which is the same early-out
-                    // `store_token_in_vable` takes on `vbox is
-                    // self.forced_virtualizable`.
-                    fbw_force_virtualizable_before_return(ctx);
+                    // `compile_done_with_this_frame` does. Keep this exit lazy
+                    // too; a traceback reader forces it through the armed
+                    // deadframe only if redirected fields are observed.
+                    fbw_store_token_in_vable(ctx, recording_opcode_position)?;
                     // The runtime half of the node, emitted here rather than
                     // beside the recording half above: it is the only consumer
                     // of the frame on this arm, and reading the frame before

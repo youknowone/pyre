@@ -10441,6 +10441,70 @@ impl CraneliftBackend {
         // store_final_boxes_in_guard may reduce fail_args (snapshot liveboxes)
         // below input count; ensure the minimum here.
         max_output_slots = max_output_slots.max(inputargs.len());
+        // x86/regalloc.py `consider_guard_not_forced_2` spills every failarg
+        // through the frame manager before `FINISH` writes its own result
+        // slots. Reserve the equivalent disjoint tail here. Sharing the dense
+        // output slots is incorrect even with parallel source resolution:
+        // FINISH immediately overwrites slot zero with its return value.
+        let force_spill_base = max_output_slots;
+        let force_spill_slots = guard_infos
+            .iter()
+            .filter(|info| ops[info.source_op_index].opcode == OpCode::GuardNotForced2)
+            .map(|info| info.fail_arg_refs.len())
+            .max()
+            .unwrap_or(0);
+        max_output_slots += force_spill_slots;
+        let mut finish_force_ref_slots = Vec::new();
+        for info in &mut guard_infos {
+            match ops[info.source_op_index].opcode {
+                OpCode::GuardNotForced2 => {
+                    let rd_locs: Vec<u16> = info
+                        .fail_arg_refs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, arg)| {
+                            if arg.is_none() {
+                                0xFFFF
+                            } else {
+                                u16::try_from(force_spill_base + index)
+                                    .expect("GUARD_NOT_FORCED_2 spill slot must fit rd_locs")
+                            }
+                        })
+                        .collect();
+                    if let Some(fd) = fail_descrs
+                        .get(info.fail_index as usize)
+                        .and_then(|descr| descr.as_fail_descr())
+                    {
+                        fd.set_rd_locs(rd_locs.clone());
+                    }
+                    info.bridge_source_slots = rd_locs
+                        .iter()
+                        .filter(|&&slot| slot != 0xFFFF)
+                        .map(|&slot| slot as usize)
+                        .collect();
+                    info.failarg_ref_slots = info
+                        .failarg_ref_slots
+                        .iter()
+                        .map(|slot| force_spill_base + slot)
+                        .collect();
+                    info.gcmap = allocate_gcmap(&info.failarg_ref_slots);
+                    // opassembler.py `_finish_gcmap`: the map armed by
+                    // GUARD_NOT_FORCED_2 remains installed on the returned
+                    // JITFRAME.  FINISH may overwrite value slot zero, but it
+                    // must union that result root with these force-spill roots
+                    // so a later async force sees forwarded references.
+                    finish_force_ref_slots.clone_from(&info.failarg_ref_slots);
+                }
+                OpCode::Finish if !finish_force_ref_slots.is_empty() => {
+                    info.failarg_ref_slots
+                        .extend(finish_force_ref_slots.iter().copied());
+                    info.failarg_ref_slots.sort_unstable();
+                    info.failarg_ref_slots.dedup();
+                    info.gcmap = allocate_gcmap(&info.failarg_ref_slots);
+                }
+                _ => {}
+            }
+        }
         let terminal_exit_layouts = collect_terminal_exit_layouts(
             ops,
             inputargs,
@@ -10727,15 +10791,11 @@ impl CraneliftBackend {
         // `precompute_max_output_slots` because their fail-arg inputs may
         // exceed the loop's output slots.
         let mut jf_ptr = {
-            let expected_size = if source_guard.is_some() {
-                // `counter_slot_for` reserves one slot past the value area, so
-                // a bridge that parks a GUARD_VALUE operand there needs the
-                // wider frame too.
-                let counter = usize::from(counter_slot.is_some());
-                (precompute_max_output_slots(inputargs, ops) + counter + reserved_tail) as i64
-            } else {
-                (max_output_slots + reserved_tail) as i64
-            };
+            // `collect_guards` already widens `max_output_slots` for bridge
+            // inputargs, counter slots, and the GUARD_NOT_FORCED_2 force-spill
+            // tail.  Using the older precomputed bridge width here omitted
+            // that tail and let the bridge write beyond `jf_frame.length`.
+            let expected_size = (max_output_slots + reserved_tail) as i64;
             // jitframe.py:84 — `jf_frame.length` is the count of `Signed`
             // payload slots after the length word.  aarch64/assembler.py:935
             // `LDR_ri(r.ip0.value, r.fp.value, ofs)` parity.
@@ -12543,27 +12603,38 @@ impl CraneliftBackend {
                         JF_FORCE_DESCR_OFS,
                     );
 
+                    // x86/regalloc.py `consider_guard_not_forced_2` first
+                    // performs `before_call(..., save_all_regs=True)`, then
+                    // records the resulting locations. Resolve every source
+                    // before writing any positional destination: an inputarg
+                    // source can itself live in jf_frame[0..n], and a
+                    // left-to-right copy would clobber a later source.
+                    let mut force_values = Vec::with_capacity(info.fail_arg_refs.len());
+                    for &arg_ref in &info.fail_arg_refs {
+                        force_values.push((!arg_ref.is_none()).then(|| {
+                            resolve_failarg_opref(
+                                &mut builder,
+                                &constants,
+                                cur_jf,
+                                &ref_root_slots,
+                                &stale_ref_vars,
+                                &demoted_failarg_slots,
+                                ref_root_base_ofs,
+                                arg_ref,
+                            )
+                        }));
+                    }
                     // implement_guard_recovery / _update_at_exit parity:
                     // Write fail_arg values to jf_frame[0..n] in fail_args order.
-                    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
-                        if arg_ref.is_none() {
+                    for (index, raw) in force_values.into_iter().enumerate() {
+                        let Some(raw) = raw else {
                             continue;
-                        }
-                        let raw = resolve_failarg_opref(
-                            &mut builder,
-                            &constants,
-                            cur_jf,
-                            &ref_root_slots,
-                            &stale_ref_vars,
-                            &demoted_failarg_slots,
-                            ref_root_base_ofs,
-                            arg_ref,
-                        );
+                        };
                         builder.ins().store(
                             MemFlagsData::trusted(),
                             raw,
                             cur_jf,
-                            JF_FRAME_ITEM0_OFS + (index as i32) * 8,
+                            JF_FRAME_ITEM0_OFS + ((force_spill_base + index) as i32) * 8,
                         );
                     }
                     if info.gcmap != 0 {
@@ -25202,6 +25273,36 @@ mod tests {
     }
 
     #[test]
+    fn test_guard_not_forced_2_preserves_overlapping_failarg_sources() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let guard = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(1)),
+            rb(OpRef::input_arg_int(0)),
+        ]);
+        guard.set_fail_arg_types(vec![Type::Int, Type::Int]);
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(OpCode::ForceToken, &[], 2),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
+        ];
+
+        let token = JitCellToken::new(1_500_401);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let returned = backend.execute_token(&token, &[Value::Int(11), Value::Int(22)]);
+        let force_token = backend.get_ref_value(&returned, 0);
+        let forced = backend.force(force_token).expect("armed force token");
+        assert_eq!(backend.get_int_value(&forced, 0), 22);
+        assert_eq!(backend.get_int_value(&forced, 1), 11);
+    }
+
+    #[test]
     fn test_execute_token_ints_raw_preserves_savedata_and_layout_for_call_may_force() {
         let _guard = may_force_test_lock().lock();
         may_force_void_values().lock().clear();
@@ -27295,17 +27396,12 @@ mod tests {
         held.clear();
     }
 
-    /// The deadframe goes before the backend, and dropping it there is what
-    /// nulls the frame's `jf_gcmap`.
-    ///
-    /// The order is the contract, not a preference: the deadframe IS the
-    /// jitframe, so this write — like every accessor on it — goes into the
-    /// collector's heap, and a deadframe dropped after the backend that owns
-    /// that heap writes into a freed arena. The test used to assert the
-    /// opposite order was safe, from when a deadframe copied its values out and
-    /// held no address into the heap at all.
+    /// `llmodel.py force` and `execute_token` return the JITFRAME itself as the
+    /// deadframe.  Releasing our host wrapper must not clear its map: a
+    /// virtualizable token can keep the frame alive and force it after that
+    /// wrapper has gone away.
     #[test]
-    fn test_deadframe_drop_nulls_the_frames_gcmap_before_the_backend_goes() {
+    fn test_deadframe_drop_preserves_the_frames_gcmap() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -27338,9 +27434,9 @@ mod tests {
         // Nothing allocates between the release and this read, so the frame is
         // still where the root last named it.
         let gcmap = unsafe { *((jf.0 + JF_GCMAP_OFS as usize) as *const usize) };
-        assert_eq!(
+        assert_ne!(
             gcmap, 0,
-            "a released deadframe must leave no map for a later collection to custom-trace it through"
+            "a returned JITFRAME may still be owned by a virtualizable token"
         );
         drop(backend);
     }

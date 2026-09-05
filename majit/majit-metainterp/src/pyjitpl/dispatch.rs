@@ -1752,6 +1752,18 @@ where
     /// a `-live-` marker in front of every vable op (`lower_vable.rs`, mirroring
     /// `jtransform.py:764/798/814/845/926`), so `opcode_pc - SIZE_LIVE_OP`
     /// resolves the liveness the snapshot needs.
+    fn apply_pending_box_replace(&mut self, ctx: &mut TraceCtx) {
+        let Some((oldbox, newbox)) = ctx.take_pending_box_replace() else {
+            return;
+        };
+        // `pyjitpl.py replace_box` framestack walk. `TraceCtx::replace_box`
+        // already rewrote vrefs / vable boxes / heapcache; only the
+        // register banks remain.
+        for frame in self.frames.frames.iter_mut() {
+            frame.replace_active_box_in_frame(oldbox, newbox, Type::Ref);
+        }
+    }
+
     fn capture_vable_promote_guard(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1760,6 +1772,7 @@ where
         guards_before: usize,
         write: Option<VableEntryWrite>,
     ) {
+        self.apply_pending_box_replace(ctx);
         let minted = ctx.num_guards().saturating_sub(guards_before);
         if minted == 0 {
             return;
@@ -4619,7 +4632,7 @@ where
                         Some(Value::Ref(r)) => Some(r.0 as i64),
                         _ => None,
                     };
-                    debug_assert!(
+                    assert!(
                         struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
                         "_opimpl_getfield_gc_any_pureornot sanity check ({}): \
                              loaded {loaded} != cached {expected:?} \
@@ -4713,7 +4726,7 @@ where
                         Some(Value::Float(f)) => Some(f.to_bits() as i64),
                         _ => None,
                     };
-                    debug_assert!(
+                    assert!(
                         struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
                         "_opimpl_getfield_gc_any_pureornot sanity check (float): \
                              loaded {loaded:#x} != cached {expected:?} \

@@ -4908,10 +4908,19 @@ impl<'a> Assembler386<'a> {
                     faillocs,
                 );
             }
-            OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+            OpCode::GuardNotForced => {
                 dynasm!(self.mc ; .arch x64 ; cmp QWORD [rbp + JF_DESCR_OFS], 0);
                 self.guard_success_cc = Some(CC_E);
                 self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
+            }
+            OpCode::GuardNotForced2 => {
+                self.store_force_descr_with_faillocs(
                     op,
                     op_index,
                     fail_index,
@@ -5659,6 +5668,47 @@ impl<'a> Assembler386<'a> {
             self.finish_gcmap = Some(gcmap);
         }
         self.fail_descrs.push(cell);
+    }
+
+    /// x86/assembler.py `store_force_descr`: GUARD_NOT_FORCED_2 is not a
+    /// conditional exit.  It publishes the resume descriptor and finish
+    /// gcmap that FORCE_TOKEN may expose after the wrapper has returned.
+    fn store_force_descr_with_faillocs(
+        &mut self,
+        op: &Op,
+        op_index: usize,
+        fail_index: u32,
+        guard_argloc: Option<Loc>,
+        faillocs: &[Option<Loc>],
+    ) {
+        let unused_label = self.mc.new_dynamic_label();
+        self.append_guard_token_with_faillocs(
+            op,
+            op_index,
+            fail_index,
+            unused_label,
+            guard_argloc,
+            faillocs,
+        );
+        let token = self
+            .pending_guard_tokens
+            .pop()
+            .expect("GUARD_NOT_FORCED_2 descriptor token");
+        for &(slot, value) in &token.const_stores {
+            let ofs = Self::slot_offset(slot);
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            dynasm!(self.mc ; .arch x64
+                ; mov Rq(scratch), QWORD value
+                ; mov [rbp + ofs], Rq(scratch)
+            );
+        }
+        let descr_ptr = Arc::as_ptr(&token.fail_descr) as *const () as i64;
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD descr_ptr
+            ; mov [rbp + JF_FORCE_DESCR_OFS], Rq(scratch)
+        );
+        self.finish_gcmap = Some(token.gcmap);
     }
 
     // assembler.py:652 write_pending_failure_recoveries

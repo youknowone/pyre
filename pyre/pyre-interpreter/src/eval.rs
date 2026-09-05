@@ -2606,7 +2606,14 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
                 next_instr = frame.next_instr();
             }
             Ok(StepResult::Return(result)) => return Ok(result),
-            Ok(StepResult::Yield(result)) => return Ok(result),
+            Ok(StepResult::Yield(result)) => {
+                // interp_jit.py PyFrame.dispatch `except Yield`: a suspended
+                // frame outlives this portal invocation, so eagerly publish
+                // its redirected fields. Ordinary Return deliberately keeps
+                // the FORCE_TOKEN/GUARD_NOT_FORCED_2 lazy protocol.
+                let _ = majit_metainterp::jit::hint_force_virtualizable(frame as *mut PyFrame);
+                return Ok(result);
+            }
             Err(mut err) => {
                 if handle_exception(frame, &mut err, &mut next_instr) {
                     continue;

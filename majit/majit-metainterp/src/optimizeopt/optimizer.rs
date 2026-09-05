@@ -89,9 +89,9 @@ pub trait Optimization {
     /// Only OptPure consumes this; other passes ignore it.
     fn set_pureop_historylength(&mut self, _limit: usize) {}
 
-    /// `virtualize.py:140 vrefinfo =
-    /// self.optimizer.metainterp_sd.virtualref_info` parity hook.  Only
-    /// `OptVirtualize` reads this; other passes ignore it.
+    /// `metainterp_sd.virtualref_info` parity hook. `OptVirtualize` reads all
+    /// three descriptors; `OptHeap.force_from_effectinfo` reads
+    /// `descr_forced` for forcing calls.
     fn set_vrefinfo(&mut self, _vrefinfo: crate::virtualref::VirtualRefInfo) {}
 
     /// optimizer.py propagate_all_forward(trace, call_pure_results, flush).
@@ -2331,7 +2331,7 @@ impl Optimizer {
     /// `virtualize.py:140` fan-out: publish the live `VirtualRefInfo`
     /// (`MetaInterp.virtualref_info` / RPython
     /// `metainterp_sd.virtualref_info`) to every pass that consumes it
-    /// (`OptVirtualize`).  Other passes' `set_vrefinfo` is a no-op.
+    /// (`OptVirtualize` and `OptHeap`). Other passes' `set_vrefinfo` is a no-op.
     pub fn set_vrefinfo(&mut self, vrefinfo: crate::virtualref::VirtualRefInfo) {
         for pass in &mut self.passes {
             pass.set_vrefinfo(vrefinfo.clone());

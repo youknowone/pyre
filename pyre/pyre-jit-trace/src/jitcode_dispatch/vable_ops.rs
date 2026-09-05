@@ -10,6 +10,31 @@
 
 use super::*;
 
+/// `pyjitpl.py MetaInterp.replace_box` framestack half for the walker.
+///
+/// `_nonstandard_virtualizable` Step 4 already rewrote the TraceCtx
+/// records. The live register banks are this walk's `MIFrame` analogue.
+fn apply_pending_vable_box_replace<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    let Some((oldbox, newbox)) = ctx.trace_ctx.take_pending_box_replace() else {
+        return;
+    };
+    for slot in ctx.registers_r.iter_mut() {
+        if *slot == oldbox {
+            *slot = newbox;
+        }
+    }
+    for slot in ctx.registers_i.iter_mut() {
+        if *slot == oldbox {
+            *slot = newbox;
+        }
+    }
+    for slot in ctx.registers_f.iter_mut() {
+        if *slot == oldbox {
+            *slot = newbox;
+        }
+    }
+}
+
 /// Resolve the concrete half of a JitCode register operand.
 ///
 /// RPython's MIFrame banks hold Box objects, so assigning a valuebox to
@@ -205,6 +230,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
             .vable_getfield_float(cpu.as_ref(), pc, obj, vable_struct_ptr, descr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
+    apply_pending_vable_box_replace(ctx);
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     // RPython `opimpl_getfield_vable_{i,r,f}` returns
     // `virtualizable_boxes[index]` (`pyjitpl.py`) — a Box whose
@@ -358,6 +384,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     let write = ctx
         .trace_ctx
         .vable_setfield(op.pc, obj, descr, value, concrete);
+    apply_pending_vable_box_replace(ctx);
     // `MIFrame` owns one red frame per inlined call.  The trace shadow remains
     // authoritative for optimization, while the matching concrete frame is
     // its blackhole-resume image; mirror only own-frame standard-vable writes,
@@ -582,6 +609,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let nonstandard = ctx
         .trace_ctx
         .nonstandard_virtualizable(op.pc, vable, &fdescr);
+    apply_pending_vable_box_replace(ctx);
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, check_guards_before, None)?;
     let index = if nonstandard {
         index
@@ -872,6 +900,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let nonstandard = ctx
         .trace_ctx
         .nonstandard_virtualizable(op.pc, vable, &fdescr);
+    apply_pending_vable_box_replace(ctx);
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, check_guards_before, None)?;
     let index = if nonstandard {
         index
@@ -1053,6 +1082,7 @@ pub(crate) fn arraylen_vable_via_metainterp<Sym: WalkSym>(
         fdescr,
         adescr,
     );
+    apply_pending_vable_box_replace(ctx);
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     let dst = code[op.pc + 6] as usize;
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);

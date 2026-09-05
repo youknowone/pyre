@@ -821,6 +821,9 @@ impl ArrayCacheSubMap {
 /// caches survive writes to other objects. Objects that haven't escaped (not
 /// passed to calls or stored into the heap) keep their caches across calls.
 pub struct OptHeap {
+    /// heap.py `self.optimizer.metainterp_sd.virtualref_info`, published by
+    /// Optimizer together with the other metainterp-static pass inputs.
+    vrefinfo: crate::virtualref::VirtualRefInfo,
     /// Per-descr field cache: field_idx → CachedField.
     /// RPython heap.py: cached_fields OrderedDict keyed by descr.
     cached_fields: Vec<(u32, DescrRef, CachedField)>,
@@ -883,6 +886,7 @@ pub struct OptHeap {
 impl OptHeap {
     pub fn new() -> Self {
         OptHeap {
+            vrefinfo: crate::virtualref::VirtualRefInfo::new(),
             cached_fields: Vec::new(),
             cached_arrayitems: Vec::new(),
             seen_guard_not_invalidated: false,
@@ -2054,10 +2058,6 @@ impl OptHeap {
         // RPython effectinfo.py: zero bitstrings mean the call touches NO
         // tracked heap fields (e.g., I/O). Only fall back to conservative
         // invalidation for calls with ForcesVirtual/RandomEffects.
-        // heap.py:567-571: forces_virtual_or_virtualizable → force virtualref field
-        // (In RPython this forces vrefinfo.descr_forced; majit has no virtualref
-        // field tracking yet, so this is a no-op placeholder.)
-        //
         // Note: has_random_effects() calls are filtered BEFORE reaching this
         // function (emitting_operation line 460: !has_random_effects → return).
         // No special handling needed here.
@@ -2208,6 +2208,17 @@ impl OptHeap {
             .collect();
         for dict_id in array_ids_to_clear {
             self.cached_dict_reads.swap_remove(&dict_id);
+        }
+
+        // heap.py OptHeap.force_from_effectinfo:
+        //     if effectinfo.check_forces_virtual_or_virtualizable():
+        //         vrefinfo = self.optimizer.metainterp_sd.virtualref_info
+        //         self.force_lazy_set(vrefinfo.descr_forced)
+        // Only the `forced` field is a GC pointer that must become visible to
+        // the forcing residual; the token and virtual fields are not flushed.
+        if ei.check_forces_virtual_or_virtualizable() {
+            let descr_forced = self.vrefinfo.descr_forced.clone();
+            self.force_lazy_set_field(&descr_forced, true, ctx);
         }
     }
 
@@ -3764,6 +3775,10 @@ impl Optimization for OptHeap {
 
     fn name(&self) -> &'static str {
         "heap"
+    }
+
+    fn set_vrefinfo(&mut self, vrefinfo: crate::virtualref::VirtualRefInfo) {
+        self.vrefinfo = vrefinfo;
     }
 
     /// heap.py OptHeap.serialize_optheap — emit struct field triples.
@@ -7104,6 +7119,66 @@ mod tests {
         assert_eq!(
             get_count, 1,
             "CallMayForce with unrelated write bit should preserve cached GETFIELD"
+        );
+    }
+
+    #[test]
+    fn test_forcing_call_flushes_virtualref_forced_field_before_call() {
+        // heap.py force_from_effectinfo flushes exactly
+        // `vrefinfo.descr_forced` even though the descriptor is not named in
+        // the call's ordinary readonly/write sets.
+        let vrefinfo = crate::virtualref::VirtualRefInfo::new();
+        let forced_descr = vrefinfo.descr_forced.clone();
+        let call_d = call_descr(
+            75,
+            EffectInfo {
+                extraeffect: ExtraEffect::ForcesVirtualOrVirtualizable,
+                ..Default::default()
+            },
+        );
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Ref, 101),
+                ],
+                forced_descr.clone(),
+            ),
+            Op::with_descr(
+                OpCode::CallN,
+                &[rooted_inputarg_operand(Type::Ref, 200)],
+                call_d,
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(OptHeap::new()));
+        opt.set_vrefinfo(vrefinfo);
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![Type::Ref; 1024]);
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
+
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut majit_ir::ConstMap::new(), 1024);
+
+        let set_pos = result
+            .iter()
+            .position(|op| {
+                op.opcode == OpCode::SetfieldGc
+                    && op
+                        .getdescr()
+                        .is_some_and(|descr| Arc::ptr_eq(&descr, &forced_descr))
+            })
+            .expect("forcing call must flush vref.forced");
+        let call_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::CallN)
+            .expect("forcing call must remain in the trace");
+        assert!(
+            set_pos < call_pos,
+            "vref.forced must be visible to the call"
         );
     }
 

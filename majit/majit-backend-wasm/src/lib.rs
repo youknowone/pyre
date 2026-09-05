@@ -1891,7 +1891,14 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
 /// one frame before its `call_indirect` and pops after, and a deopt resume runs
 /// on the host's own shadow stack — so removing the top entry releases exactly
 /// this callee's frame.
-pub extern "C" fn wasm_jit_ca_pop_frame(_frame_base: i64) -> i64 {
+pub extern "C" fn wasm_jit_ca_pop_frame(items_base: i64) -> i64 {
+    // `genop_finish` publishes `assembler._finish_gcmap` before the call
+    // footer drops the execution root.  A CA callee returns inside generated
+    // wasm, so its footer is this helper rather than `execute_token`.
+    let jf = (items_base as usize - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+        as *mut majit_backend::jitframe::JitFrame;
+    install_post_finish_force_gcmap(jf);
+    wasm_jit_write_barrier(jf as i64);
     majit_gc::shadow_stack::pop_jf_top();
     0
 }
@@ -2098,13 +2105,6 @@ fn wasm_jitframe_tid() -> u32 {
 /// marked bit, so marking those indices exposes each home's `GcRef` (the high
 /// word stays unmarked). Returns `[data_word_count, word0, ...]` in `usize`
 /// words (GCMAP array layout: `gcmap[0]` = number of data words).
-#[cfg_attr(
-    not(target_arch = "wasm32"),
-    expect(
-        dead_code,
-        reason = "native test builds compile the wasm backend without running wasm frame entry"
-    )
-)]
 fn build_home_gcmap(frame: codegen::FrameGeometry) -> Box<[usize]> {
     let sign = std::mem::size_of::<isize>();
     let bits_per_word = std::mem::size_of::<usize>() * 8;
@@ -2121,6 +2121,24 @@ fn build_home_gcmap(frame: codegen::FrameGeometry) -> Box<[usize]> {
         buf[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
     }
     buf.into_boxed_slice()
+}
+
+/// Allocate the immutable guard-token gcmap which PyPy's
+/// `store_force_descr` retains as `_finish_gcmap`.
+fn leak_gcmap_for_indices(indices: &[u32]) -> usize {
+    let bits_per_word = usize::BITS as usize;
+    let num_words = indices
+        .iter()
+        .copied()
+        .max()
+        .map_or(1, |last| last as usize / bits_per_word + 1);
+    let mut gcmap = vec![0usize; 1 + num_words];
+    gcmap[0] = num_words;
+    for &index in indices {
+        let index = index as usize;
+        gcmap[1 + index / bits_per_word] |= 1usize << (index % bits_per_word);
+    }
+    Box::leak(gcmap.into_boxed_slice()).as_ptr() as usize
 }
 
 /// `__indirect_function_table` slot of `call_jit::wasm_ca_resume_deopt`,
@@ -3015,6 +3033,8 @@ impl WasmBackend {
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
                     is_finish: g.is_finish,
+                    force_args_offset: inputs.frame.force_slot_base as u32,
+                    force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -3582,30 +3602,49 @@ fn forced_frame_items_base(force_token: GcRef) -> usize {
     force_token.0 + majit_backend::jitframe::FIRST_ITEM_OFFSET
 }
 
-fn dead_frame_from_forced_frame(frame_ptr: usize) -> DeadFrame {
-    let frame = frame_ptr as *const i64;
-    let fail_index = unsafe { *frame } as u32;
+fn force_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> i64 {
+    let offset = fail_descr.force_args_offset as usize + index * std::mem::size_of::<i64>();
+    unsafe { *((frame_ptr + offset) as *const i64) }
+}
+
+fn dead_frame_from_forced_frame(frame_ptr: usize, fail_index: u32) -> DeadFrame {
     let fail_descr =
         global_fail_descr(fail_index).expect("invalid fail_index from a forced wasm frame");
     let num_outputs = exit_slot_count(&fail_descr);
     let types = fail_descr.fail_arg_types.as_slice();
     let raw_values: Vec<i64> = (0..num_outputs)
         .map(|i| {
-            let word = unsafe { *frame.add(1 + i) };
+            let word = force_arg_word(frame_ptr, &fail_descr, i);
             // `emit_force_arm` publishes a Ref argument as `home_offset * 2 + 1`
             // so the value is read out of the traced home slot a collection
             // inside the bracketed call forwards, rather than out of an
             // untraced copy in the exit slot. A literal is even (Ref pointers
             // are 8-aligned; a null and a non-Ref argument are published as
             // themselves).
-            if types.get(i) == Some(&majit_ir::Type::Ref) && word & 1 == 1 {
+            let value = if types.get(i) == Some(&majit_ir::Type::Ref) && word & 1 == 1 {
                 unsafe { *((frame_ptr + (word >> 1) as usize) as *const i64) }
             } else {
                 word
-            }
+            };
+            value
         })
         .collect();
     DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, 0))
+}
+
+/// Install the recovery guard's compile-time map before dropping the execution
+/// root. This is wasm's `finish_gcmap`: PyPy's `store_force_descr` retains the
+/// guard token's static gcmap and `genop_finish` publishes that same map.
+fn install_post_finish_force_gcmap(jf: *mut majit_backend::jitframe::JitFrame) {
+    let encoded = unsafe { (*jf).jf_force_descr };
+    if encoded == 0 {
+        unsafe { (*jf).jf_gcmap = std::ptr::null() };
+        return;
+    }
+    let fail_index = u32::try_from(encoded - 1).expect("wasm force descriptor index overflow");
+    let fail_descr =
+        global_fail_descr(fail_index).expect("invalid post-FINISH wasm force descriptor");
+    unsafe { (*jf).jf_gcmap = fail_descr.force_gcmap_ptr as *const u8 };
 }
 
 impl majit_backend::Backend for WasmBackend {
@@ -3622,23 +3661,22 @@ impl majit_backend::Backend for WasmBackend {
         // runner.rs `force` on the native backends: assert the frame carries the
         // bracket its call published, then mark it so the GUARD_NOT_FORCED
         // waiting past that call deopts instead of running on.
+        let jf = force_token.0 as *mut majit_backend::jitframe::JitFrame;
+        let encoded = unsafe { (*jf).jf_force_descr as usize };
+        assert_ne!(encoded, 0, "force: wasm frame carries no force descriptor");
+        let fail_index = u32::try_from(encoded - 1).expect("wasm force descriptor index overflow");
         let items_base = forced_frame_items_base(force_token);
         let slot = items_base as *mut i64;
         let word = unsafe { *slot };
-        assert_ne!(
-            word & codegen::FORCE_ARMED_BIT,
-            0,
-            "force: wasm frame 0x{items_base:x} carries no force bracket",
-        );
         unsafe { *slot = word | codegen::FORCE_TAKEN_BIT };
-        Some(dead_frame_from_forced_frame(items_base))
+        Some(dead_frame_from_forced_frame(items_base, fail_index))
     }
 
     fn is_force_token_armed(&self, force_token: GcRef) -> bool {
         force_token.0 != 0
-            && unsafe { *(forced_frame_items_base(force_token) as *const i64) }
-                & codegen::FORCE_ARMED_BIT
-                != 0
+            && unsafe {
+                (*(force_token.0 as *const majit_backend::jitframe::JitFrame)).jf_force_descr
+            } != 0
     }
 
     fn supports_efficient_uint_mul_high(&self) -> bool {
@@ -3981,6 +4019,8 @@ impl majit_backend::Backend for WasmBackend {
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
                     is_finish: g.is_finish,
+                    force_args_offset: frame.force_slot_base as u32,
+                    force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -4077,6 +4117,11 @@ impl majit_backend::Backend for WasmBackend {
         // Per-guard, per-fail-arg induction-advance flags for
         // `compile_bridge`'s livelock check (see `guard_fail_args_advanced`).
         let guard_fail_arg_advanced = guard_fail_args_advanced(ops, &guard_exits);
+        // `assembler.py` keeps `_finish_gcmap` with the compiled loop.  A
+        // GUARD_NOT_FORCED_2 frame can be reached through a virtualizable token
+        // after the host deadframe wrapper has returned, so this map cannot be
+        // scoped to one `execute_token` call.
+        let home_gcmap_ptr = Box::leak(build_home_gcmap(frame)).as_ptr() as *const usize as usize;
 
         let compiled = CompiledWasmLoop {
             token_number: token.number,
@@ -4091,6 +4136,7 @@ impl majit_backend::Backend for WasmBackend {
             max_output_slots,
             num_ref_homes,
             frame,
+            home_gcmap_ptr,
             bridge_cells_base: std::cell::Cell::new(bridge_cells_base),
             module_bytes: std::cell::Cell::new(code_size as u32),
             num_guard_cells: std::cell::Cell::new(guard_exits.len()),
@@ -4964,6 +5010,8 @@ impl majit_backend::Backend for WasmBackend {
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
                     is_finish: g.is_finish,
+                    force_args_offset: source_frame.force_slot_base as u32,
+                    force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
                     meta_descr: g.meta_descr.clone(),
                 })
             })
@@ -5335,11 +5383,11 @@ impl majit_backend::Backend for WasmBackend {
                     JitFrame::init(jf, std::ptr::null(), depth);
                 }
 
-                // Per-loop gcmap over the surviving Ref-home region. Held in this
-                // stack frame (jf_gcmap points at it) until the outputs are read
-                // after the trace returns.
-                let gcmap = build_home_gcmap(compiled.frame);
-                unsafe { (*jf).jf_gcmap = gcmap.as_ptr() as *const u8 };
+                // Per-loop gcmap over the surviving Ref-home region. It is
+                // owned for the compiled loop's lifetime, because this frame
+                // may remain reachable through a virtualizable token after
+                // the immediate outputs have been read.
+                unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr as *const u8 };
 
                 let items_base = jf as usize + FIRST_ITEM_OFFSET;
                 let fsb = codegen::FRAME_SLOT_BASE as usize;
@@ -5368,18 +5416,12 @@ impl majit_backend::Backend for WasmBackend {
                     .map(|i| unsafe { *((items_base + fsb + i * 8) as *const i64) })
                     .collect();
 
-                // Done reading the frame; release it from the jf shadow stack
-                // (it becomes collectible) and free the gcmap. Null the frame's
-                // jf_gcmap before dropping the gcmap Box: the old-gen frame can
-                // outlive this call still marked VISITED (grayed while it was a
-                // root at a major-cycle start), reachable through the major
-                // gray stack or the remembered set. A later collection would
-                // then custom-trace it and read the freed gcmap. A null gcmap
-                // makes jitframe_trace forward nothing (jitframe.py),
-                // which is correct here: the outputs were already read out.
-                unsafe { (*jf).jf_gcmap = std::ptr::null() };
+                // `assembler.py::_finish_gcmap`: after FINISH, retain only the
+                // Ref homes needed by the still-armed GUARD_NOT_FORCED_2.  The
+                // virtualizable token is an independent edge to this JITFRAME;
+                // its lazy force may arrive after the execution root is gone.
+                install_post_finish_force_gcmap(jf);
                 majit_gc::shadow_stack::pop_jf_to(saved);
-                drop(gcmap);
 
                 return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
             }
@@ -5414,10 +5456,7 @@ impl majit_backend::Backend for WasmBackend {
             let mut backing = vec![0i64; alloc_size.div_ceil(8)];
             let jf = backing.as_mut_ptr() as *mut majit_backend::jitframe::JitFrame;
             unsafe { majit_backend::jitframe::JitFrame::init(jf, std::ptr::null(), depth) };
-            // Held until the outputs are read, which is what `jf_gcmap` points
-            // at for as long as the frame is on the shadow stack.
-            let gcmap = build_home_gcmap(compiled.frame);
-            unsafe { (*jf).jf_gcmap = gcmap.as_ptr() as *const u8 };
+            unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr as *const u8 };
             let items = (jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET) as *mut i64;
             for (i, arg) in args.iter().enumerate() {
                 let v = match arg {
@@ -5457,7 +5496,6 @@ impl majit_backend::Backend for WasmBackend {
             let raw_values: Vec<i64> = (0..num_outputs)
                 .map(|i| unsafe { *items.add(1 + i) })
                 .collect();
-            drop(gcmap);
             drop(backing);
             DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
         }

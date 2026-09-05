@@ -5605,12 +5605,8 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
 fn top_level_raise_settles_the_vable_token() {
     // `pyjitpl.py compile_exit_frame_with_exception` opens with
     // `store_token_in_vable()`, the same as `compile_done_with_this_frame`.
-    // Every residual call arms the token
-    // (`walker_vable_and_vrefs_before_residual_call`), so an exception exit
-    // that settles nothing leaves the frame naming a jitframe the backend
-    // frees on the way out of `execute_token`.  pyre settles by storing back
-    // — which zeroes the token — because its FORCE_TOKEN is the machine frame
-    // pointer, not upstream's heap-allocated GC `JITFRAME`.
+    // The exit therefore leaves a lazy, armed token rather than eagerly
+    // writing every redirected field back.
     let raise_byte = *insns_opname_to_byte()
         .get("raise/r")
         .expect("`raise/r` must be in insns table");
@@ -5654,6 +5650,8 @@ fn top_level_raise_settles_the_vable_token() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
+    wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+    wc.outer_resume_marker_jit_pc = Some(0);
     fbw_finish_payload_reset();
     let (outcome, _next_pc) = walk(&code, 0, &mut wc).expect("raise/r must dispatch");
     assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -5661,16 +5659,24 @@ fn top_level_raise_settles_the_vable_token() {
     let _ = fbw_finish_payload_take();
     assert!(
         tc.num_ops() > ops_before,
-        "the exception exit must record the virtualizable store-back",
+        "the exception exit must record the virtualizable token protocol",
     );
     let last = tc.ops().last().expect("recorded op must exist").clone();
     assert_eq!(
         last.opcode,
-        majit_ir::OpCode::SetfieldGc,
-        "the store-back's tail op is the token store",
+        majit_ir::OpCode::GuardNotForced2,
+        "the token protocol must end in GUARD_NOT_FORCED_2",
     );
+    let token_store = tc
+        .ops()
+        .iter()
+        .rev()
+        .find(|op| op.opcode == majit_ir::OpCode::SetfieldGc)
+        .expect("token protocol carries a SETFIELD_GC");
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
-    let recorded_descr = last.getdescr().expect("token store carries a field descr");
+    let recorded_descr = token_store
+        .getdescr()
+        .expect("token store carries a field descr");
     let field = recorded_descr
         .as_field_descr()
         .expect("token store's descr is a FieldDescr");
@@ -5679,15 +5685,20 @@ fn top_level_raise_settles_the_vable_token() {
         info.token_offset,
         "the tail store must target the vable_token slot",
     );
-    let value = last
+    let value = token_store
         .getarglist()
         .get(1)
         .expect("SetfieldGc args are [obj, value]")
         .to_opref();
+    let token_op = tc
+        .ops()
+        .iter()
+        .find(|op| op.pos.get() == value)
+        .expect("stored token is produced by an operation");
     assert_eq!(
-        tc.box_value(value),
-        Some(majit_ir::Value::Int(0)),
-        "the exception exit must leave vable_token cleared, not armed",
+        token_op.opcode,
+        majit_ir::OpCode::ForceToken,
+        "the exception exit must store the live FORCE_TOKEN",
     );
 }
 

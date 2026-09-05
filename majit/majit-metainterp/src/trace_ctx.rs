@@ -685,6 +685,14 @@ pub struct TraceCtx {
     /// `None` outside the brief window between the dispatch-site stash
     /// and the jitdriver-side drain.
     pub(crate) pending_switch_to_blackhole: Option<crate::pyjitpl::SwitchToBlackhole>,
+    /// `pyjitpl.py _nonstandard_virtualizable` Step 4 calls
+    /// `self.metainterp.replace_box`, which rewrites every `MIFrame`
+    /// register bank before the vref / vable / heapcache walks.
+    /// `TraceCtx::replace_box` owns only those three walks; the
+    /// framestack lives on the jitcode machine / walker. Step 4 stashes
+    /// the alias here so the caller that owns the frames can finish the
+    /// same `replace_box` after the vable op returns.
+    pending_box_replace: Option<(OpRef, OpRef)>,
 
     /// `pyjitpl.py MetaInterp.virtualref_boxes`: pairs of `[virtualbox,
     /// vrefbox]` for every `opimpl_virtual_ref` ↔ `opimpl_virtual_ref_finish`
@@ -1348,6 +1356,15 @@ impl TraceCtx {
         self.pending_guard_not_invalidated_pc = pc;
     }
 
+    /// The framestack half of `pyjitpl.py MetaInterp.replace_box`.
+    ///
+    /// `_nonstandard_virtualizable` Step 4 records the alias after
+    /// `TraceCtx::replace_box`. The owner of the live `MIFrame` /
+    /// walker register banks drains it and rewrites those banks.
+    pub fn take_pending_box_replace(&mut self) -> Option<(OpRef, OpRef)> {
+        self.pending_box_replace.take()
+    }
+
     /// pyjitpl.py:1776-1780: jit.isvirtual(obj) — check if an object
     /// is likely virtual (allocated during this trace and not escaped).
     pub fn is_likely_virtual(&self, obj: OpRef) -> bool {
@@ -1801,6 +1818,7 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             pending_switch_to_blackhole: None,
+            pending_box_replace: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
@@ -1900,6 +1918,7 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             pending_switch_to_blackhole: None,
+            pending_box_replace: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
@@ -3974,14 +3993,11 @@ impl TraceCtx {
             }
         }
 
-        // Final token-null store (`record2`, so it records no profiler
-        // counters). The token slot holds a raw force marker, and this
-        // store resets it to zero. Use an integer-zero null rather than a
-        // Ref `const_null`: introducing a Ref constant here routes the
-        // store through the ref-const path, which miscompiles on backends
-        // that bake ref consts as raw addresses (wasm) or emit a GC write
-        // barrier under a differing calling convention.
-        let null = self.const_int(0);
+        // virtualizable.py `vable_token` is llmemory.GCREF.  Use the same
+        // ConstPtr null here so the descriptor remains a pointer field for GC
+        // rewriting; wasm in particular must barrier the preceding non-null
+        // FORCE_TOKEN store into an old PyFrame.
+        let null = self.const_null();
         self.record_op_with_descr(
             OpCode::SetfieldGc,
             &[vable_opref, null],
@@ -4310,17 +4326,13 @@ impl TraceCtx {
                 // owns, so an alias of `vable_opref` sitting in a register
                 // would keep naming the nonstandard box.
                 //
-                // That gap is unreachable rather than tolerated: this arm
-                // needs a vable op whose base is an OpRef other than the
-                // declared virtualizable variable but pointing at the same
-                // frame, and no lowering mints one — a field access becomes
-                // a vable op only for the declared variable, and every
-                // seeding site takes it from the standard box itself, so
-                // the identity check above returns first. A NEW SEEDING
-                // SITE ARMS THIS ARM, and closing the register half then
-                // has to come with it: `TraceCtx` owns no frame registers,
-                // so the pair has to reach whichever walker does.
+                // `self.metainterp.replace_box` also walks every
+                // `MIFrame` register bank. This method owns only the
+                // vref / vable / heapcache half; the jitcode machine
+                // and the walker drain `take_pending_box_replace` to
+                // finish the same walk on the frames they own.
                 self.replace_box(vable_opref, standard_box);
+                self.pending_box_replace = Some((vable_opref, standard_box));
                 return false;
             }
         }
@@ -6213,6 +6225,22 @@ mod tests {
         assert_eq!(ctx.opref_to_box(i0), OcBox::ResOp(0));
         assert_eq!(ctx.opref_to_box(i1), OcBox::ResOp(1));
         assert_eq!(ctx.opref_to_box(add), OcBox::ResOp(add.raw()));
+    }
+
+    #[test]
+    fn replace_box_does_not_by_itself_queue_a_framestack_rewrite() {
+        // `pyjitpl.py replace_box` always walks frames, but
+        // `TraceCtx::replace_box` is only the vref/vable/heapcache half.
+        // The framestack pending is armed only by `_nonstandard_virtualizable`
+        // Step 4, which is the one caller that used to skip the walk.
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let old = OpRef::input_arg_ref(0);
+        let new = OpRef::input_arg_ref(1);
+        ctx.replace_box(old, new);
+        assert!(
+            ctx.take_pending_box_replace().is_none(),
+            "a bare replace_box must not invent a framestack alias"
+        );
     }
 
     /// `heapcache.py is_nullity_known` answers truthy for a non-`Const` box

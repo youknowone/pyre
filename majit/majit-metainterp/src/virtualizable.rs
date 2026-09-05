@@ -17,7 +17,7 @@
 use indexmap::IndexMap;
 use std::sync::{Arc, Weak};
 
-use majit_ir::{DescrRef, Type, descr::descr_identity};
+use majit_ir::{descr::descr_identity, DescrRef, Type};
 
 /// `virtualizable.py TOKEN_TRACING_RESCALL`: the GCREF address of the
 /// prebuilt `JITFRAME_DUMMY` object shared with virtual references.
@@ -392,8 +392,8 @@ impl VirtualizableInfo {
         self.vable_token_descr = Some(Self::build_field_descr(
             descr,
             self.token_offset,
-            item_size_for_type(Type::Int),
-            Type::Int,
+            item_size_for_type(Type::Ref),
+            Type::Ref,
             majit_ir::ArrayFlag::Unsigned,
             0,
             vinfo.clone(),
@@ -970,7 +970,6 @@ impl VirtualizableInfo {
                 None => Some(0),
                 Some(_) => self.identity_live_index,
             },
-            has_vable_token: self.has_vable_token(),
         }
     }
 
@@ -1250,25 +1249,7 @@ impl VirtualizableInfo {
         item_index: usize,
     ) -> i64 {
         unsafe {
-            let ai = &self.array_fields[array_index];
-            let array_ptr = ai.data_ptr(obj_ptr);
-            let item_offset = ai.items_offset + item_index * ai.item_size;
-            match ai.item_type {
-                Type::Float => {
-                    let ptr = array_ptr.add(item_offset) as *const f64;
-                    f64::to_bits(*ptr) as i64
-                }
-                // Pointer-width item: 4 bytes on wasm32. Reading 8 bytes
-                // would fold in the next item's bytes.
-                Type::Ref => {
-                    let ptr = array_ptr.add(item_offset) as *const usize;
-                    *ptr as i64
-                }
-                _ => {
-                    let ptr = array_ptr.add(item_offset) as *const i64;
-                    *ptr
-                }
-            }
+            vable_read_array_item(obj_ptr, &self.array_fields[array_index], item_index as i64)
         }
     }
 
@@ -1286,38 +1267,12 @@ impl VirtualizableInfo {
         value: i64,
     ) {
         unsafe {
-            let ai = &self.array_fields[array_index];
-            let array_ptr = ai.data_ptr(obj_ptr.cast_const()) as *mut u8;
-            let item_offset = ai.items_offset + item_index * ai.item_size;
-            match ai.item_type {
-                Type::Float => {
-                    let ptr = array_ptr.add(item_offset) as *mut f64;
-                    *ptr = f64::from_bits(value as u64);
-                }
-                // Pointer-width item: 4 bytes on wasm32. Writing 8 bytes
-                // would clobber the next item (or run past the array end on
-                // the last item, corrupting the adjacent heap chunk).
-                Type::Ref => {
-                    let ptr = array_ptr.add(item_offset) as *mut usize;
-                    *ptr = value as usize;
-                    // The ref may be nursery-young while the array/frame are
-                    // old-gen and run detached from the walked frame chain
-                    // (virtualizable.py write_boxes runs under the
-                    // translated write barrier). Arm whichever side the GC
-                    // owns: a GC array re-traces its own items; a stationary
-                    // block is re-walked through the owning frame's custom
-                    // trace.
-                    if majit_gc::gc_owns_object(array_ptr as usize) {
-                        majit_gc::gc_write_barrier(majit_ir::GcRef(array_ptr as usize));
-                    } else if majit_gc::gc_owns_object(obj_ptr as usize) {
-                        majit_gc::gc_write_barrier(majit_ir::GcRef(obj_ptr as usize));
-                    }
-                }
-                _ => {
-                    let ptr = array_ptr.add(item_offset) as *mut i64;
-                    *ptr = value;
-                }
-            }
+            vable_write_array_item(
+                obj_ptr,
+                &self.array_fields[array_index],
+                item_index as i64,
+                value,
+            )
         }
     }
 
@@ -2663,6 +2618,49 @@ mod tests {
             let (boxes, lengths) = info.load_list_of_boxes(obj);
             assert_eq!(lengths, vec![3]);
             assert_eq!(boxes, vec![42, 10, 20, 30]);
+        }
+    }
+
+    #[test]
+    fn read_write_array_item_uses_item_size_for_int() {
+        // `unwrap(ARRAYITEMTYPE)` reads the real item width. A 4-byte
+        // signed slot must not be loaded as i64 (that would fold in the
+        // next item, or write past the last one).
+        #[repr(C)]
+        struct ArrayHeader {
+            length: usize,
+            items: [i32; 3],
+        }
+
+        #[repr(C)]
+        struct Frame {
+            token: u64,
+            arr_ptr: *const u8,
+        }
+
+        let mut arr = ArrayHeader {
+            length: 3,
+            items: [10, 20, 30],
+        };
+        let mut frame = Frame {
+            token: 0,
+            arr_ptr: &mut arr as *mut ArrayHeader as *const u8,
+        };
+
+        let mut info = VirtualizableInfo::new(0);
+        let items_offset = std::mem::offset_of!(ArrayHeader, items);
+        let descr = majit_ir::make_array_descr_signed(items_offset, 4, Type::Int, true);
+        info.add_array_field("arr", Type::Int, 8, 0, items_offset, descr);
+
+        let obj = &mut frame as *mut Frame as *mut u8;
+        unsafe {
+            assert_eq!(info.read_array_item(obj, 0, 0), 10);
+            assert_eq!(info.read_array_item(obj, 0, 1), 20);
+            assert_eq!(info.read_array_item(obj, 0, 2), 30);
+            info.write_array_item(obj, 0, 1, -7);
+            assert_eq!(info.read_array_item(obj, 0, 0), 10);
+            assert_eq!(info.read_array_item(obj, 0, 1), -7);
+            assert_eq!(info.read_array_item(obj, 0, 2), 30);
         }
     }
 

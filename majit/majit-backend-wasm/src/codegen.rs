@@ -30,23 +30,16 @@ const SLOT_SIZE: u64 = 8;
 /// stamps on its way out. Two bits above that index carry the force protocol
 /// jitframe.py splits across two fields.
 ///
-/// [`FORCE_ARMED_BIT`] stands in for `jf_force_descr`:
-/// `_store_force_index_if_next_guard` publishes the bracketing
-/// GUARD_NOT_FORCED's coordinate before a call that may force, and
-/// `Backend::force` refuses a frame carrying none.
-///
 /// [`FORCE_TAKEN_BIT`] stands in for what `force` then writes into `jf_descr`,
 /// the mark `genop_guard_guard_not_forced` reads with
 /// `CMP [rbp + jf_descr], 0` to turn a force that landed inside the call into a
 /// deopt.
 ///
-/// Keeping both in `frame[0]` rather than in the real `JitFrame` header keeps
-/// the protocol inside the local-0-relative data region, which is the one part
-/// of the layout both the orthodox JitFrame path and the legacy host-Vec path
-/// share. The host reads `frame[0] as u32`, so neither bit disturbs the index,
-/// and a guard exit's own store clears both.
+/// The armed descriptor itself lives in the real JitFrame `jf_force_descr`
+/// header, as it does in PyPy.  In particular GUARD_NOT_FORCED_2 is followed by
+/// FINISH, whose exit-index store overwrites `frame[0]`; putting the arm bit in
+/// that word loses the only descriptor a later virtualizable force can use.
 pub(crate) const FORCE_TAKEN_BIT: i64 = 1 << 32;
-pub(crate) const FORCE_ARMED_BIT: i64 = 1 << 33;
 
 /// Scratch i64 locals reserved past the value locals for `emit_umulhi`
 /// (al, ah, bl, bh, mid1).
@@ -326,6 +319,10 @@ pub struct FrameGeometry {
     /// therefore survive execution of a chained bridge, whose own home map may
     /// use the low slots.  The whole home region remains covered by jf_gcmap.
     pub label_ref_slots: usize,
+    /// Start of the GUARD_NOT_FORCED(_2) failarg spill area. It contains one
+    /// i64 slot per value slot and is disjoint from exits, dispatch, homes and
+    /// the residual-call area.
+    pub force_slot_base: u64,
     /// Bytes through the end of Ref homes. CA callee frames allocate exactly
     /// this many item bytes; the unused tail call area is intentionally omitted.
     pub ca_frame_bytes: u32,
@@ -351,13 +348,14 @@ impl FrameGeometry {
             home_slot_base: HOME_SLOT_BASE,
             home_slots: 0,
             label_ref_slots: 0,
-            ca_frame_bytes: HOME_SLOT_BASE as u32,
-            frame_bytes: (MIN_FRAME_BYTES + SLOT_SIZE as usize) as u32,
+            force_slot_base: (MIN_FRAME_BYTES + SLOT_SIZE as usize) as u64,
+            ca_frame_bytes: (MIN_FRAME_BYTES * 2 + SLOT_SIZE as usize) as u32,
+            frame_bytes: (MIN_FRAME_BYTES * 2 + SLOT_SIZE as usize) as u32,
         }
     }
 
     /// Compact frozen geometry for one token:
-    /// `[value slots | dispatch key | Ref homes | call area]`.
+    /// `[value slots | dispatch key | Ref homes | force slots | call area]`.
     /// `value_slots` includes frame[0].  The trailing call area is always
     /// present, even for direct-only source traces, because later bridges are
     /// compiled against this immutable geometry.
@@ -366,7 +364,8 @@ impl FrameGeometry {
         let value_slots = value_slots.max(1);
         let dispatch_key_ofs = (value_slots as u64) * SLOT_SIZE;
         let home_slot_base = dispatch_key_ofs + SLOT_SIZE;
-        let ca_frame_bytes = home_slot_base + home_slots as u64 * SLOT_SIZE;
+        let force_slot_base = home_slot_base + home_slots as u64 * SLOT_SIZE;
+        let ca_frame_bytes = force_slot_base + value_slots as u64 * SLOT_SIZE;
         let call_result_ofs = ca_frame_bytes;
         let call_func_ofs = call_result_ofs + SLOT_SIZE;
         let call_nargs_ofs = call_func_ofs + SLOT_SIZE;
@@ -382,6 +381,7 @@ impl FrameGeometry {
             home_slot_base,
             home_slots,
             label_ref_slots,
+            force_slot_base,
             ca_frame_bytes: ca_frame_bytes as u32,
             frame_bytes: frame_bytes as u32,
         }
@@ -2025,6 +2025,44 @@ fn emit_write_barrier(
     emit_jit_call(sink, jit_call);
 }
 
+/// Publish Ref-home writes made since the preceding safepoint.  A live old
+/// JitFrame is scanned directly while it is on the shadow stack, but after a
+/// minor collection its remembered-state flag must be re-established before a
+/// later home store can survive the next collection.
+fn emit_jitframe_write_barrier(
+    sink: &mut PeepSink<'_, '_>,
+    jit_call_idx: Option<u32>,
+    residual_type_base: Option<u32>,
+    wb: &WriteBarrierHelpers,
+) {
+    if let Some(base) = residual_type_base {
+        sink.local_get(0);
+        sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+        sink.i32_sub();
+        sink.i64_extend_i32_u();
+        sink.i32_const(wb.fn_ptr as i32);
+        sink.call_indirect(0, base + 1);
+        sink.drop();
+        return;
+    }
+    let Some(jit_call) = jit_call_idx else {
+        return;
+    };
+    emit_call_area_addr(sink);
+    sink.i64_const(wb.fn_ptr);
+    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+    emit_call_area_addr(sink);
+    sink.i64_const(1);
+    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+    emit_call_area_addr(sink);
+    sink.local_get(0);
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+    sink.i64_extend_i32_u();
+    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
+    emit_jit_call(sink, jit_call);
+}
+
 /// Per-value def / last-use op positions over the trace, used to filter the
 /// post-collection Ref reloads ([`emit_reload_refs_from_homes`]) down to
 /// values that are both already defined and still read — the wasm-shaped
@@ -2450,6 +2488,12 @@ pub struct GuardExit {
     pub fail_arg_refs: Vec<OpRef>,
     pub fail_arg_types: Vec<Type>,
     pub is_finish: bool,
+    /// Signed-item indices of the Ref homes kept alive by
+    /// GUARD_NOT_FORCED(_2).  This is the wasm equivalent of the guard token's
+    /// compile-time `gcmap` which `store_force_descr` saves as
+    /// `assembler._finish_gcmap`; it must not be reconstructed from runtime
+    /// fail-argument words after FINISH.
+    pub force_ref_home_indices: Vec<u32>,
     /// The GUARD_VALUE operand this exit parks in the trace's counter slot,
     /// for `make_a_counter_per_value`. `None` when the guard is not a
     /// GUARD_VALUE, or when its operand is already one of the fail arguments
@@ -3068,6 +3112,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
                 fail_arg_refs: fail_args,
                 fail_arg_types,
                 is_finish: op.opcode == OpCode::Finish,
+                force_ref_home_indices: Vec::new(),
                 counter_value_spill,
                 meta_descr,
             });
@@ -3906,6 +3951,34 @@ pub fn build_wasm_module(
         &region_spans,
     );
     let num_ref_homes = ref_homes.len();
+    // x86 `store_force_descr` keeps the guard token's already-computed gcmap
+    // as `_finish_gcmap`.  Record the same static locations now that RefHomes
+    // has assigned them.  Runtime values are deliberately not inspected:
+    // constants and GcRefs are values, not tagged frame coordinates.
+    let sign = std::mem::size_of::<isize>();
+    for (guard, op) in guards.iter_mut().zip(
+        analysis_ops
+            .iter()
+            .filter(|op| op.opcode.is_guard() || op.opcode == OpCode::Finish),
+    ) {
+        if !matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2) {
+            continue;
+        }
+        let live = live_fail_arg_extent(guard.meta_descr.as_ref(), guard.fail_arg_refs.len());
+        for (&arg, &tp) in guard
+            .fail_arg_refs
+            .iter()
+            .zip(&guard.fail_arg_types)
+            .take(live)
+        {
+            if tp == Type::Ref
+                && let Some(home) = ref_homes.home(arg)
+            {
+                let offset = frame.home_slot_base as usize + home as usize * SLOT_SIZE as usize;
+                guard.force_ref_home_indices.push((offset / sign) as u32);
+            }
+        }
+    }
     let shortage = if num_ref_homes > frame.ordinary_home_slots() {
         Some(super::FrameShortage::new(
             super::FrameShortageKind::OrdinaryRefHomes,
@@ -4899,6 +4972,9 @@ fn build_function(
     let mut wb_applied = indexmap::IndexSet::<OpRef>::new();
     let mut known_lengths = KnownArrayLengths::default();
     let same_as_forwardings = same_as_forwardings(ops, num_vars);
+    let frame_can_escape = ops
+        .iter()
+        .any(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2));
 
     // A merged region whose closing JUMP names a LABEL published by another
     // module leaves this function the way its out-of-line bridge did — by
@@ -4923,6 +4999,9 @@ fn build_function(
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label || op.opcode.can_malloc() {
             wb_applied.clear();
+        }
+        if frame_can_escape && ref_homes.len() != 0 && op.opcode.can_malloc() {
+            emit_jitframe_write_barrier(&mut sink, jit_call_idx, residual_type_base, wb);
         }
         known_lengths.observe(op, constants);
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
@@ -7295,14 +7374,7 @@ fn build_function(
                 // LIFO) via `wasm_jit_ca_pop_frame` — same direct-vs-trampoline
                 // split as the alloc above (the pop only shrinks the shadow
                 // stack; it never allocates or collects).
-                if let (Some(_base), Some(inline)) = (residual_type_base, ca.inline) {
-                    sink.i32_const(inline.jf_top_addr as i32);
-                    sink.i32_const(inline.jf_top_addr as i32);
-                    sink.i32_load(mem32(0));
-                    sink.i32_const(8);
-                    sink.i32_sub();
-                    sink.i32_store(mem32(0));
-                } else if let Some(base) = residual_type_base {
+                if let Some(base) = residual_type_base {
                     sink.local_get(ca_cfp_local);
                     sink.i64_extend_i32_u();
                     sink.i32_const(ca.ca_pop_fn_ptr as i32);
@@ -9550,12 +9622,12 @@ fn emit_force_bracket_before_call(
 /// lands while this frame is still reachable reads its state from — upstream
 /// writes the guard's descr into `jf_force_descr` and its fail arguments into
 /// the frame. Publish the same coordinate here: the guard's exit index plus
-/// [`FORCE_ARMED_BIT`] in `frame[0]`, and its fail arguments in the exit slots.
+/// one in `jf_force_descr`, and its fail arguments in force-only locations.
 /// This is written unconditionally, not on a failure branch, because the reader
 /// runs while the bracketed call is still on the stack.
 ///
 /// A Ref argument is published as its **home slot offset**, tagged
-/// `offset * 2 + 1`, rather than as its value. The exit slots are not in
+/// `offset * 2 + 1`, rather than as its value. The force slots are not in
 /// `build_home_gcmap`'s traced set — that set is type-precise, and blanket
 /// marking a slot that holds a scalar would offer the collector an integer to
 /// mistake for a nursery address — so a Ref value copied here would not be
@@ -9596,10 +9668,25 @@ fn emit_force_arm(
         } else {
             emit_resolve(sink, constants, value_types, arg_ref);
         }
-        sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+        sink.i64_store(mem64(frame.force_slot_base + i as u64 * SLOT_SIZE));
     }
+    // x86 `store_force_descr`: keep the descriptor in the JitFrame header,
+    // separate from `jf_descr`/frame[0].  `local 0` is the items base, so
+    // recover the object base before addressing the pointer-width wasm32
+    // header field.  Store `index + 1`; zero remains the unarmed sentinel.
     sink.local_get(0);
-    sink.i64_const(exit_idx as i64 | FORCE_ARMED_BIT);
+    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+    sink.i32_sub();
+    sink.i32_const(exit_idx.wrapping_add(1) as i32);
+    sink.i32_store(memarg(
+        majit_backend::jitframe::JF_FORCE_DESCR_OFS as u64,
+        2,
+    ));
+
+    // `jf_descr` remains the guard's exit index.  A synchronous force sets
+    // FORCE_TAKEN_BIT here; GUARD_NOT_FORCED tests that bit after the call.
+    sink.local_get(0);
+    sink.i64_const(exit_idx as i64);
     sink.i64_store(mem64(0));
 }
 
@@ -10543,10 +10630,11 @@ mod tests {
         let frame = FrameGeometry::compact(32, 16, 0);
         assert_eq!(frame.dispatch_key_ofs, 32 * SLOT_SIZE);
         assert_eq!(frame.home_slot_base, 33 * SLOT_SIZE);
-        assert_eq!(frame.ca_frame_bytes, 392);
+        assert_eq!(frame.force_slot_base, 49 * SLOT_SIZE);
+        assert_eq!(frame.ca_frame_bytes, 648);
         assert_eq!(frame.call_result_ofs, frame.ca_frame_bytes as u64);
-        assert_eq!(frame.call_args_ofs, 416);
-        assert_eq!(frame.frame_bytes, 544);
+        assert_eq!(frame.call_args_ofs, 672);
+        assert_eq!(frame.frame_bytes, 800);
     }
 
     /// The constant-operand bound must answer exactly what the wrapping

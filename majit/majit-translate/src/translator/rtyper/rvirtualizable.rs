@@ -9,67 +9,21 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
 
 /// RPython `class VirtualizableInstanceRepr(InstanceRepr)`.
 ///
-/// Pyre's `InstanceRepr` is a single Rust struct rather than a Python
-/// subclass hierarchy. This carrier records the extra state introduced by
-/// `rvirtualizable.py`.
+/// Pyre's `InstanceRepr` is a single Rust struct rather than a Python subclass
+/// hierarchy. This carrier records the extra state introduced by
+/// `rvirtualizable.py`; production redirected-field identity comes from
+/// `pyre-jit-trace/src/virtualizable_spec.rs` and is installed in
+/// `GraphTransformConfig` by the prepass.
 ///
-/// It has no production caller, and the reason is not a missing piece of
-/// `rclass.py`. Upstream discovers the redirected field set by reading
-/// `classdesc.get_param('_virtualizable_')` off an RPython class and then
-/// injects a `jit_force_virtualizable` per redirected access
-/// (`hook_access_field`, rvirtualizable.py) into the FLOWGRAPHS it is
-/// about to rtype. Pyre's interpreter is hand-written Rust, so no class
-/// carries that parameter — nothing writes the key — and the rtyper's
-/// lowered op stream is not what the production jitcode is built from.
-/// An injected op would land in a list the production path discards.
-///
-/// The field set itself is therefore declared out of band, as a data table
-/// (`pyre-jit-trace/src/virtualizable_spec.rs`), the same way
-/// `_immutable_fields_` is handled.
-///
-/// That table is also what arms this crate. `pyre-jit-trace`'s build script
-/// builds `GraphTransformConfig::vable_fields` and `vable_arrays` out of it
-/// (`build/prepass.rs`, behind the default-on `prepass` feature), and that
-/// run is the production translation. The emitted artefacts show the whole
-/// protocol firing: the instruction table carries `getfield_vable_i/r`,
-/// `setfield_vable_i/r`, `getarrayitem_vable_r`, `setarrayitem_vable_r` and
-/// `arraylen_vable`, and the descr table carries all five
-/// `BhDescr::VableField` indices, which `assembler.rs` mints only from the
-/// `VableFieldRead` / `VableFieldWrite` arms.
-///
-/// This crate's own `generated::build` still passes
-/// `GraphTransformConfig::default()`, leaving `vable_fields` and
-/// `vable_arrays` empty, so along that path `jtransform.rs
-/// check_no_vable_array` returns at its `vable_array_vars.is_empty()` guard
-/// and `rewrite_op_getfield`'s `VableFieldRead` arm never fires. That path
-/// is a test fixture — the only caller of `generated::with_all_jitcodes` is
-/// `tests/test_make_jitcodes_produces_graph_keyed_output.rs` — so it
-/// diverges from the production config, not from upstream.
-///
-/// What has no counterpart either way is the force injection, and it cannot
-/// get one from this crate. `hook_access_field` injects while rtyping, which
-/// puts the marker into every graph at once; `replace_force_virtualizable_with_call`
-/// then turns it into a real call across `translator.graphs` — the copy the
-/// INTERPRETER runs — and `jtransform.py rewrite_op_jit_force_virtualizable`
-/// deletes it again from the copy the codewriter looks inside. The two halves
-/// are what tell a residual access from a traced one.
-///
-/// Pyre has only one of those two copies. Its interpreter is native Rust that
-/// no majit stage emits, so an injected op can reach the jitcode and nothing
-/// else, and the jitcode is exactly where upstream deletes it: injecting here
-/// would be cancelled by the very stage it feeds. That holds wherever in this
-/// crate the injection is placed — rtyper or codewriter — so the missing
-/// generator is not a stage that has yet to be ported.
-///
-/// The discriminator survives the loss because it is the marker, not the
-/// injector. `executioncontext::jit_force_virtualizable` is placed by hand in
-/// the Rust that reads a redirected field, and `rewrite_op_jit_force_virtualizable`
-/// deletes that call from a looked-inside graph, so the residual copy forces
-/// and the traced copy does not. It keys on the CALL TARGET's name rather than
-/// on `vable_fields`, so the two halves are armed independently of each other.
-/// What a hand-placed marker cannot do is reach a graph the codewriter never
-/// looks inside — there it is an ordinary force, deleted from nothing — so
-/// each placement is only as good as that graph's jitcode.
+/// The rest of the production path follows the same division as upstream:
+/// the annotator stores `access_directly` / `fresh_virtualizable` on
+/// `Variable.annotation` as `SomeInstance.flags`; the codewriter's
+/// `rematerialize_vable_flags_for_access` performs the
+/// `VirtualizableInstanceRepr.hook_access_field` step for every configured
+/// redirected access; and `rewrite_op_jit_force_virtualizable` deletes the
+/// residual force marker from looked-inside graphs. The compiled interpreter
+/// retains that marker at the gateway, so residual execution forces while the
+/// generated JIT path does not.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VirtualizableInstanceRepr {
     pub top_of_virtualizable_hierarchy: bool,

@@ -4275,6 +4275,30 @@ impl<M: Clone> MetaInterp<M> {
             std::borrow::Cow::Borrowed(live_values)
         };
 
+        // pyjitpl.py MetaInterp.initialize_virtualizable:
+        //     # First force the virtualizable if needed!
+        //     vinfo.clear_vable_token(virtualizable)
+        // This must precede every heap read below.  A surviving Active token
+        // means the registers are newer than the heap image; a surviving
+        // TOKEN_TRACING_RESCALL would also violate the next residual call's
+        // token-none precondition.  The blackhole helper implements the same
+        // two force_now arms and reaches the host's ResumeGuardForcedDescr
+        // force hook for an Active token.
+        let virtualizable_ptr = if !self.vable_ptr.is_null() {
+            self.vable_ptr as *mut u8
+        } else {
+            match original_boxes.get(index) {
+                Some(Value::Ref(r)) => r.as_usize() as *mut u8,
+                Some(Value::Int(v)) => *v as *mut u8,
+                _ => std::ptr::null_mut(),
+            }
+        };
+        if !virtualizable_ptr.is_null() {
+            unsafe {
+                crate::virtualizable::bh_clear_vable_token(info, virtualizable_ptr);
+            }
+        }
+
         let num_static = info.num_static_extra_boxes;
         // virtualizable.py `read_boxes` iterates `for i in range(len(lst))`
         // over the heap array. `trace_entry_vable_lengths` is the pyre-side
@@ -4287,11 +4311,7 @@ impl<M: Clone> MetaInterp<M> {
             if !reported.is_empty() {
                 reported
             } else if info.can_read_all_array_lengths_from_heap() {
-                let vable_ptr = match original_boxes.get(index) {
-                    Some(Value::Ref(r)) => r.as_usize() as *const u8,
-                    Some(Value::Int(v)) => *v as *const u8,
-                    _ => std::ptr::null(),
-                };
+                let vable_ptr = virtualizable_ptr as *const u8;
                 if vable_ptr.is_null() {
                     Vec::new()
                 } else {
@@ -4433,8 +4453,8 @@ impl<M: Clone> MetaInterp<M> {
         // JIT `original_boxes[index]` is the first scalar (stackpos), NOT the
         // `&state` identity, so prefer `vable_ptr` when it is set
         // (`virtualizable_heap_ptr` cached it in `sync_before`).
-        let virtualizable_value = if !self.vable_ptr.is_null() {
-            majit_ir::Value::Ref(majit_ir::GcRef(self.vable_ptr as usize))
+        let virtualizable_value = if !virtualizable_ptr.is_null() {
+            majit_ir::Value::Ref(majit_ir::GcRef(virtualizable_ptr as usize))
         } else {
             original_boxes[index]
         };
@@ -5868,6 +5888,31 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py `opimpl_getfield_vable_i(box, fielddescr, pc)`.
     ///
+    /// `pyjitpl.py MetaInterp.replace_box` framestack half. Step 4 of
+    /// `_nonstandard_virtualizable` already rewrote the TraceCtx records;
+    /// this finishes the same walk on every live `MIFrame`.
+    fn apply_pending_box_replace(&mut self) {
+        let Some((oldbox, newbox)) = self
+            .tracing
+            .as_mut()
+            .and_then(|ctx| ctx.take_pending_box_replace())
+        else {
+            return;
+        };
+        for frame in self.framestack.frames.iter_mut() {
+            frame.replace_active_box_in_frame(oldbox, newbox, Type::Ref);
+        }
+    }
+
+    fn with_tracing_vable<R>(&mut self, f: impl FnOnce(&mut TraceCtx) -> R) -> R {
+        let result = f(self
+            .tracing
+            .as_mut()
+            .expect("vable op requires active tracing"));
+        self.apply_pending_box_replace();
+        result
+    }
+
     /// `vable_struct_ptr` is the live struct pointer for the
     /// cache-hit sanity check (pyjitpl.py:934-945); callers without a
     /// live pointer pass `0` to leave the resolver disabled.
@@ -5879,10 +5924,9 @@ impl<M: Clone> MetaInterp<M> {
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
         let cpu = self.cpu.clone();
-        self.tracing
-            .as_mut()
-            .expect("opimpl_getfield_vable_int requires active tracing")
-            .vable_getfield_int(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
+        self.with_tracing_vable(|ctx| {
+            ctx.vable_getfield_int(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
+        })
     }
 
     /// pyjitpl.py `opimpl_getfield_vable_r(box, fielddescr, pc)`.
@@ -5894,10 +5938,9 @@ impl<M: Clone> MetaInterp<M> {
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
         let cpu = self.cpu.clone();
-        self.tracing
-            .as_mut()
-            .expect("opimpl_getfield_vable_ref requires active tracing")
-            .vable_getfield_ref(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
+        self.with_tracing_vable(|ctx| {
+            ctx.vable_getfield_ref(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
+        })
     }
 
     /// pyjitpl.py `opimpl_getfield_vable_f(box, fielddescr, pc)`.
@@ -5909,10 +5952,9 @@ impl<M: Clone> MetaInterp<M> {
         fielddescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
         let cpu = self.cpu.clone();
-        self.tracing
-            .as_mut()
-            .expect("opimpl_getfield_vable_float requires active tracing")
-            .vable_getfield_float(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
+        self.with_tracing_vable(|ctx| {
+            ctx.vable_getfield_float(cpu.as_ref(), pc, vable_opref, vable_struct_ptr, fielddescr)
+        })
     }
 
     /// pyjitpl.py `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
@@ -5924,10 +5966,9 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         concrete: Value,
     ) {
-        self.tracing
-            .as_mut()
-            .expect("opimpl_setfield_vable_int requires active tracing")
-            .vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
+        self.with_tracing_vable(|ctx| {
+            ctx.vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
+        });
     }
 
     /// pyjitpl.py `_opimpl_setfield_vable` — ref variant.
@@ -5939,10 +5980,9 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         concrete: Value,
     ) {
-        self.tracing
-            .as_mut()
-            .expect("opimpl_setfield_vable_ref requires active tracing")
-            .vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
+        self.with_tracing_vable(|ctx| {
+            ctx.vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
+        });
     }
 
     /// pyjitpl.py `_opimpl_setfield_vable` — float variant.
@@ -5954,10 +5994,9 @@ impl<M: Clone> MetaInterp<M> {
         value: OpRef,
         concrete: Value,
     ) {
-        self.tracing
-            .as_mut()
-            .expect("opimpl_setfield_vable_float requires active tracing")
-            .vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
+        self.with_tracing_vable(|ctx| {
+            ctx.vable_setfield(pc, vable_opref, fielddescr, value, Some(concrete));
+        });
     }
 
     /// pyjitpl.py `_opimpl_getarrayitem_vable` — int variant.
@@ -5970,10 +6009,8 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        self.tracing
-            .as_mut()
-            .expect("opimpl_getarrayitem_vable_int requires active tracing")
-            .vable_getarrayitem_int_indexed(
+        self.with_tracing_vable(|ctx| {
+            ctx.vable_getarrayitem_int_indexed(
                 pc,
                 vable_opref,
                 index,
@@ -5981,6 +6018,7 @@ impl<M: Clone> MetaInterp<M> {
                 fdescr,
                 adescr,
             )
+        })
     }
 
     /// pyjitpl.py `_opimpl_getarrayitem_vable` — ref variant.
@@ -5993,10 +6031,8 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        self.tracing
-            .as_mut()
-            .expect("opimpl_getarrayitem_vable_ref requires active tracing")
-            .vable_getarrayitem_ref_indexed(
+        self.with_tracing_vable(|ctx| {
+            ctx.vable_getarrayitem_ref_indexed(
                 pc,
                 vable_opref,
                 index,
@@ -6004,6 +6040,7 @@ impl<M: Clone> MetaInterp<M> {
                 fdescr,
                 adescr,
             )
+        })
     }
 
     /// pyjitpl.py `_opimpl_getarrayitem_vable` — float variant.
@@ -6016,10 +6053,8 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        self.tracing
-            .as_mut()
-            .expect("opimpl_getarrayitem_vable_float requires active tracing")
-            .vable_getarrayitem_float_indexed(
+        self.with_tracing_vable(|ctx| {
+            ctx.vable_getarrayitem_float_indexed(
                 pc,
                 vable_opref,
                 index,
@@ -6027,6 +6062,7 @@ impl<M: Clone> MetaInterp<M> {
                 fdescr,
                 adescr,
             )
+        })
     }
 
     /// pyjitpl.py `_opimpl_setarrayitem_vable` — int variant.
@@ -6041,11 +6077,8 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        let stored = self
-            .tracing
-            .as_mut()
-            .expect("opimpl_setarrayitem_vable_int requires active tracing")
-            .vable_setarrayitem_indexed(
+        let stored = self.with_tracing_vable(|ctx| {
+            ctx.vable_setarrayitem_indexed(
                 pc,
                 vable_opref,
                 index,
@@ -6055,7 +6088,8 @@ impl<M: Clone> MetaInterp<M> {
                 value,
                 concrete,
                 false,
-            );
+            )
+        });
         assert!(
             matches!(stored, crate::trace_ctx::VableArrayStore::Stored(_)),
             "opimpl_setarrayitem_vable_int: virtualizable array slot missing"
@@ -6074,11 +6108,8 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        let stored = self
-            .tracing
-            .as_mut()
-            .expect("opimpl_setarrayitem_vable_ref requires active tracing")
-            .vable_setarrayitem_indexed(
+        let stored = self.with_tracing_vable(|ctx| {
+            ctx.vable_setarrayitem_indexed(
                 pc,
                 vable_opref,
                 index,
@@ -6088,7 +6119,8 @@ impl<M: Clone> MetaInterp<M> {
                 value,
                 concrete,
                 false,
-            );
+            )
+        });
         assert!(
             matches!(stored, crate::trace_ctx::VableArrayStore::Stored(_)),
             "opimpl_setarrayitem_vable_ref: virtualizable array slot missing"
@@ -6107,11 +6139,8 @@ impl<M: Clone> MetaInterp<M> {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) {
-        let stored = self
-            .tracing
-            .as_mut()
-            .expect("opimpl_setarrayitem_vable_float requires active tracing")
-            .vable_setarrayitem_indexed(
+        let stored = self.with_tracing_vable(|ctx| {
+            ctx.vable_setarrayitem_indexed(
                 pc,
                 vable_opref,
                 index,
@@ -6121,7 +6150,8 @@ impl<M: Clone> MetaInterp<M> {
                 value,
                 concrete,
                 false,
-            );
+            )
+        });
         assert!(
             matches!(stored, crate::trace_ctx::VableArrayStore::Stored(_)),
             "opimpl_setarrayitem_vable_float: virtualizable array slot missing"
@@ -6138,10 +6168,8 @@ impl<M: Clone> MetaInterp<M> {
         adescr: DescrRef,
     ) -> OpRef {
         let cpu = self.cpu.clone();
-        self.tracing
-            .as_mut()
-            .expect("opimpl_arraylen_vable requires active tracing")
-            .vable_arraylen_vable(
+        self.with_tracing_vable(|ctx| {
+            ctx.vable_arraylen_vable(
                 cpu.as_ref(),
                 pc,
                 vable_opref,
@@ -6149,6 +6177,7 @@ impl<M: Clone> MetaInterp<M> {
                 fdescr,
                 adescr,
             )
+        })
     }
 
     /// pyjitpl.py `opimpl_hint_force_virtualizable(box)`.
@@ -25820,6 +25849,23 @@ mod tests {
     struct ResidualCallVableObj {
         token: u64,
         pc: i64,
+        _padding: i64,
+        arr: *const i64,
+        _arr_owner: Box<[i64; 4]>,
+    }
+
+    impl ResidualCallVableObj {
+        fn new(token: u64, pc: i64) -> Self {
+            let arr_owner = Box::new([0; 4]);
+            let arr = arr_owner.as_ptr();
+            Self {
+                token,
+                pc,
+                _padding: 0,
+                arr,
+                _arr_owner: arr_owner,
+            }
+        }
     }
 
     fn start_tracing_with_virtualizable(
@@ -25827,11 +25873,27 @@ mod tests {
         info: VirtualizableInfo,
         live_values: &[Value],
         array_lengths: Vec<usize>,
-    ) {
+    ) -> Box<ResidualCallVableObj> {
+        // `initialize_virtualizable` begins with `clear_vable_token`, so the
+        // standard virtualizable must be a real, aligned object for the whole
+        // test, just as it is in every translated caller.  Older fixtures used
+        // 0x1234 because initialization previously never touched the heap.
+        let pc = match live_values.get(1) {
+            Some(Value::Int(value)) => *value,
+            _ => 0,
+        };
+        let mut vable = Box::new(ResidualCallVableObj::new(0, pc));
+        for (slot, value) in vable._arr_owner.iter_mut().zip(live_values.iter().skip(1)) {
+            if let Value::Int(value) = value {
+                *slot = *value;
+            }
+        }
+        meta.set_vable_ptr((&mut *vable as *mut ResidualCallVableObj).cast());
         meta.set_virtualizable_info(std::sync::Arc::new(info));
         meta.set_vable_array_lengths(array_lengths);
         let action = meta.force_start_tracing(777, (0, 0), None, live_values);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
+        vable
     }
 
     fn take_recorded_ops(meta: &mut MetaInterp<()>) -> Vec<Op> {
@@ -25928,7 +25990,7 @@ mod tests {
         let info = std::sync::Arc::new(test_vable_info_static_only());
         meta.set_virtualizable_info(info.clone());
 
-        let mut obj = ResidualCallVableObj { token: 0, pc: 41 };
+        let mut obj = ResidualCallVableObj::new(0, 41);
         meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
 
         let descriptor = JitDriverStaticData::with_virtualizable(
@@ -25956,12 +26018,41 @@ mod tests {
     }
 
     #[test]
+    fn initialize_virtualizable_clears_tracing_token_before_reading_heap() {
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let info = std::sync::Arc::new(test_vable_info_static_only());
+        meta.set_virtualizable_info(info);
+
+        let mut obj = ResidualCallVableObj::new(crate::virtualizable::token_tracing_rescall(), 41);
+        meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
+        let descriptor = JitDriverStaticData::with_virtualizable(
+            vec![],
+            vec![("frame", Type::Ref)],
+            Some("frame"),
+        );
+        let frame = Value::Ref(majit_ir::GcRef(
+            (&mut obj as *mut ResidualCallVableObj) as usize,
+        ));
+
+        let action = meta.force_start_tracing(778, (0, 0), Some(descriptor), &[frame]);
+
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        assert_eq!(obj.token, 0);
+        let ctx = meta.trace_ctx().expect("expected active trace context");
+        assert_eq!(
+            ctx.virtualizable_entry_at(0),
+            Some((OpRef::input_arg_int(1), Value::Int(41)))
+        );
+    }
+
+    #[test]
     fn opimpl_getfield_vable_int_reads_standard_box_without_heap_op() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_static_only();
         let fd8 = info.static_field_descr(0);
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             info,
             &[Value::Int(0x1234), Value::Int(41)],
@@ -25981,7 +26072,7 @@ mod tests {
         meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_static_only();
         let fd8 = info.static_field_descr(0);
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             info,
             &[Value::Int(0x1234), Value::Int(7)],
@@ -26013,7 +26104,7 @@ mod tests {
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
         let adesc = info.array_item_descr(0);
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             info,
             &[Value::Int(0x1234), Value::Int(11), Value::Int(22)],
@@ -26039,7 +26130,7 @@ mod tests {
         let info = test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
         let adesc = info.array_item_descr(0);
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             info,
             &[Value::Int(0x1234), Value::Int(11), Value::Int(22)],
@@ -26056,7 +26147,7 @@ mod tests {
     fn opimpl_getfield_vable_int_nonstandard_falls_back_to_heap_op() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
             &[Value::Int(0x1234), Value::Int(41)],
@@ -26093,7 +26184,7 @@ mod tests {
     fn opimpl_getarrayitem_vable_int_nonstandard_falls_back_to_heap_ops() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_with_array(),
             &[Value::Int(0x1234), Value::Int(11), Value::Int(22)],
@@ -26131,7 +26222,7 @@ mod tests {
     fn opimpl_hint_force_virtualizable_standard_emits_store_back_only_once() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
             &[Value::Int(0x1234), Value::Int(41)],
@@ -26151,7 +26242,7 @@ mod tests {
     fn opimpl_hint_force_virtualizable_ignores_nonstandard_virtualizable() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
             &[Value::Int(0x1234), Value::Int(41)],
@@ -26172,13 +26263,13 @@ mod tests {
     fn do_jit_force_virtual_preserves_standard_concrete_value() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
             &[Value::Int(0x1234), Value::Int(41)],
             Vec::new(),
         );
-        let mut obj = ResidualCallVableObj { token: 0, pc: 41 };
+        let mut obj = ResidualCallVableObj::new(0, 41);
         meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
         let vref_box = {
             let ctx = meta.trace_ctx().unwrap();
@@ -26213,13 +26304,13 @@ mod tests {
     fn load_fields_from_virtualizable_reloads_heap_values_into_boxes() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
             &[Value::Int(0x1234), Value::Int(41)],
             Vec::new(),
         );
-        let mut obj = ResidualCallVableObj { token: 0, pc: 99 };
+        let mut obj = ResidualCallVableObj::new(0, 99);
         meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
 
         meta.load_fields_from_virtualizable();
@@ -26429,7 +26520,7 @@ mod tests {
     fn hint_force_virtualizable_state_is_reset_between_traces() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
             &[Value::Int(0x1234), Value::Int(41)],
@@ -26438,7 +26529,7 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
         let _ = meta.finish_trace_for_parity(&[]);
 
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
             &[Value::Int(0x1234), Value::Int(41)],
@@ -26458,7 +26549,7 @@ mod tests {
         meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_static_only();
         let fd8 = info.static_field_descr(0);
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             info,
             &[Value::Int(0x1234), Value::Int(41)],
@@ -26488,7 +26579,7 @@ mod tests {
         // virtualstate.py NotVirtualStateInfoPtr contract. A bare
         // Value::Int here makes `enum_forced_boxes_for_entry` reject the
         // label via the Box.type strict check.
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             info,
             &[
@@ -26576,14 +26667,20 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_with_array();
-        meta.set_virtualizable_info(std::sync::Arc::new(info.clone()));
         assert!(
             meta.current_virtualizable_optimizer_config().is_none(),
             "virtualizable config should only exist while tracing is active"
         );
 
-        let action = meta.force_start_tracing(777, (0, 0), None, &[Value::Int(0x1234)]);
-        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        let _vable = start_tracing_with_virtualizable(
+            &mut meta,
+            info,
+            &[Value::Int(0x1234), Value::Int(10), Value::Int(20)],
+            vec![2],
+        );
+        // Exercise the defensive branch directly: config requires the
+        // standard-box section even when the active driver owns vinfo.
+        meta.trace_ctx().expect("active trace").virtualizable_boxes = None;
         assert!(
             meta.current_virtualizable_optimizer_config().is_none(),
             "virtualizable config should require standard virtualizable boxes"
@@ -26595,7 +26692,7 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
         let info = test_vable_info_with_array();
-        start_tracing_with_virtualizable(
+        let _vable = start_tracing_with_virtualizable(
             &mut meta,
             info.clone(),
             &[Value::Int(0x1234), Value::Int(10), Value::Int(20)],
