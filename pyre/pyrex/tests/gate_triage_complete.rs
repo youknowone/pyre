@@ -102,6 +102,12 @@ fn collect_sources(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 /// brakes at once — read but reported as unread, documented but reported as
 /// undocumented. Its sibling `read_float_from_env` is not here because no gate
 /// name reaches it; add it the day one does.
+///
+/// Every form is matched on an identifier boundary: the character before it
+/// must not continue a name, so `my_read_uint_from_env` is not the helper and
+/// `pyre_env::var` is not `std::env::var`. The qualifiers the real read sites
+/// carry — `::` before `env::var`, `getenv` and `host_os::var`, `.` before
+/// `getenv` and `environ.get` — all clear that boundary.
 const READ_FORMS: [&str; 5] = [
     "env::var",
     "host_os::var",
@@ -152,10 +158,22 @@ fn namespace_of(name: &str) -> Option<&'static GateNamespace> {
 /// Matches the read forms above rather than every mention of the name, so a gate
 /// discussed in a comment or held in a Rust const does not count as live. That
 /// is the same distinction `gate-triage.md` §2 draws by hand.
+/// Whether the character before `at` continues an identifier, which makes the
+/// form a tail of a longer name rather than the name itself.
+fn continues_an_identifier(text: &str, at: usize) -> bool {
+    text[..at]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
 fn gates_read_by(text: &str) -> Vec<&str> {
     let mut found = Vec::new();
     for form in READ_FORMS {
         for (at, _) in text.match_indices(form) {
+            if continues_an_identifier(text, at) {
+                continue;
+            }
             let rest = &text[at + form.len()..];
             // `env::var_os` is the same read wearing a suffix.
             let rest = rest.strip_prefix("_os").unwrap_or(rest);
@@ -204,6 +222,9 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
         os.getenv("PYRE_G")
         println!("cargo::rerun-if-env-changed=PYRE_H");
         read_uint_from_env("PYRE_I").unwrap_or(0);
+        // a longer name ending in a read form is not that read form
+        my_read_uint_from_env("PYRE_NOT_THE_HELPER");
+        pyre_env::var("PYRE_NOT_STD_ENV");
         # a gate written into a child's environment is not a read of ours
         env["PYRE_NOT_A_READ_EITHER"] = "1"
         // PYRE_MENTIONED_IN_A_COMMENT
