@@ -26233,9 +26233,9 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 2);
+        // Unmodified static boxes are skipped; only the token reset remains.
+        assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
     }
 
     #[test]
@@ -26538,9 +26538,9 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 2);
+        // Second trace is a fresh init, so the token store is recorded again.
+        assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
     }
 
     #[test]
@@ -26561,11 +26561,12 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 4);
+        // First hint writes the token; getfield_vable consumes forced
+        // state; second hint writes the token again. Static boxes are
+        // unmodified so they are not stored.
+        assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
         assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
-        assert_eq!(ops[2].opcode, OpCode::SetfieldGc);
-        assert_eq!(ops[3].opcode, OpCode::SetfieldGc);
     }
 
     #[test]
