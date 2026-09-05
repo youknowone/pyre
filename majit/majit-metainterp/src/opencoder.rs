@@ -3,7 +3,7 @@
 //! the meta-interpreter.
 use indexmap::IndexMap;
 use majit_ir::operand::Operand;
-use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{InputArg, OPCODE_COUNT, OpCode, OpRc, OpRef, Type, Value};
 
 #[allow(dead_code)]
 fn u16_to_opcode(v: u16) -> OpCode {
@@ -600,11 +600,11 @@ where
 /// inputarg list for the op stream between `start` and
 /// `trace._pos`.
 ///
-/// `CutTrace` borrows its parent trace shared-read; the bridge
-/// compilation path produces one per guard failure that triggers a
-/// sub-trace retrace.
+/// `CutTrace.cut_at` mutates the parent, so the view owns an exclusive
+/// borrow. Each iterator reborrows it for its own lifetime; the parent
+/// cannot be cut while a byte-stream reader is still using it.
 pub struct CutTrace<'a> {
-    pub trace: *mut TraceRecordBuffer,
+    pub trace: &'a mut TraceRecordBuffer,
     pub start: usize,
     pub count: u32,
     pub index: u32,
@@ -617,7 +617,6 @@ pub struct CutTrace<'a> {
     /// carries `Box.type` (`history.py:182 AbstractValue.type`) which
     /// pyre encodes as the typed `OpRef` variant tag.
     pub inputargs: Vec<OpRef>,
-    _marker: std::marker::PhantomData<&'a TraceRecordBuffer>,
 }
 
 impl BaseTrace for CutTrace<'_> {}
@@ -626,9 +625,9 @@ impl<'a> CutTrace<'a> {
     /// opencoder.py `CutTrace.cut_at(cut)` — delegate to the
     /// parent trace after asserting the cut lies beyond this cut-trace's
     /// starting count.
-    pub fn cut_at(&self, cut: crate::recorder::TracePosition) {
+    pub fn cut_at(&mut self, cut: crate::recorder::TracePosition) {
         assert!(cut._count > self.count, "cut must lie after CutTrace start");
-        unsafe { (&mut *self.trace).cut_at(cut) };
+        self.trace.cut_at(cut);
     }
 
     /// opencoder.py `CutTrace.get_iter` — build a
@@ -636,8 +635,8 @@ impl<'a> CutTrace<'a> {
     /// `trace._pos`, with `_cache` / `inputargs` seeded from the cut's
     /// inputarg templates.
     #[allow(dead_code)]
-    pub(crate) fn get_iter(&self) -> ByteTraceIter<'a> {
-        let trace = unsafe { &*self.trace };
+    pub(crate) fn get_iter(&self) -> ByteTraceIter<'_> {
+        let trace = &*self.trace;
         ByteTraceIter::new_for_cut(
             trace,
             self.start,
@@ -1440,21 +1439,18 @@ pub struct Trace {
     pub _descrs: Vec<Option<majit_ir::DescrRef>>,
     /// opencoder.py:482 self._refs — `_refs[0]` is always nullptr (index
     /// 0 reserved for the 0-length snapshot array). Non-null GC refs
-    /// append; Rust adaptation roots them on the shadow stack via
-    /// `rooted_ref_indices` so a moving GC can update the pointers
+    /// append; Rust adaptation roots them through `rooted_refs`
+    /// so a moving GC can update the pointers
     /// in-place (gcreftracer.py parity).
     pub _refs: Vec<u64>,
-    /// Rust adaptation: `(_refs index, shadow stack index)` for each
-    /// non-null entry pushed through `_encode_ptr`. RPython's `_refs` is
-    /// a Python list tracked by the host GC; `Vec<u64>` is not, so we
-    /// register each pointer with `majit_gc::shadow_stack` and copy
-    /// updated values back via `refresh_from_gc`. Dropped via
-    /// `release_roots` on `Drop` so the shadow stack returns to its
-    /// creation-time depth.
-    rooted_ref_indices: Vec<(usize, usize)>,
-    /// Shadow-stack depth captured at `Trace::new` — `release_roots`
-    /// pops back to this level.
-    shadow_stack_base: usize,
+    /// `opencoder.py Trace._refs` is a GC-traced list. Rust's raw-word
+    /// vector needs explicit roots, one per non-null entry (slot i roots
+    /// `_refs[i + 1]`). Use independently owned slots: a Trace can outlive
+    /// a lexical root scope or be dropped before roots registered later,
+    /// so it must never truncate somebody else's shadow-stack frame.
+    /// The guards also keep this owner thread-bound. Copy forwarded values
+    /// back at the tracing GC boundary with `refresh_from_gc`.
+    rooted_refs: Vec<majit_gc::shadow_stack::OwnerRootGuard>,
     /// opencoder.py:483 self._refs_dict — caches addr → index into
     /// `_refs`. Cleared by `tracing_done`.
     pub _refs_dict: indexmap::IndexMap<u64, u32>,
@@ -1537,8 +1533,7 @@ impl Trace {
             // opencoder.py:482 — `_refs = [lltype.nullptr(GCREF.TO)]` so
             // index 0 is the null reference / empty-array sentinel.
             _refs: vec![0u64],
-            rooted_ref_indices: Vec::new(),
-            shadow_stack_base: majit_gc::shadow_stack::depth(),
+            rooted_refs: Vec::new(),
             _refs_dict: indexmap::IndexMap::new(),
             _bigints: Vec::new(),
             _bigints_dict: indexmap::IndexMap::new(),
@@ -1636,51 +1631,23 @@ impl Trace {
     // same call shapes; each helper is a single ByteTraceIter walk.
 
     /// Materialize every recorded op in order. O(n) byte walk.
-    pub fn ops(&self) -> Vec<Op> {
-        let mut iter = ByteTraceIter::new(
-            self,
-            self._start as usize,
-            self._pos,
-            self.max_num_inputargs,
-        );
-        let mut ops = Vec::new();
-        for op in iter {
-            ops.push((*op).clone());
-        }
-        ops
+    /// `opencoder.py TraceIterator.next` returns the same ResOperation
+    /// installed in `_cache`: cloning the payload here would split a
+    /// returned producer from the object its consumers' arguments reference.
+    pub fn ops(&self) -> Vec<OpRc> {
+        self.get_byte_iter().collect()
     }
 
     /// Return the first materialized op whose `.pos == pos`. O(n) byte
     /// walk; `None` if no op claims that position.
-    pub fn get_op_by_pos(&self, pos: OpRef) -> Option<Op> {
-        let mut iter = ByteTraceIter::new(
-            self,
-            self._start as usize,
-            self._pos,
-            self.max_num_inputargs,
-        );
-        for op in iter {
-            if op.pos.get() == pos {
-                return Some((*op).clone());
-            }
-        }
-        None
+    pub fn get_op_by_pos(&self, pos: OpRef) -> Option<OpRc> {
+        self.get_byte_iter().find(|op| op.pos.get() == pos)
     }
 
     /// Return the last recorded op, or `None` if the trace is empty.
     /// O(n) byte walk — opencoder's byte layout has no back-pointer.
-    pub fn last_op(&self) -> Option<Op> {
-        let mut iter = ByteTraceIter::new(
-            self,
-            self._start as usize,
-            self._pos,
-            self.max_num_inputargs,
-        );
-        let mut last = None;
-        for op in iter {
-            last = Some((*op).clone());
-        }
-        last
+    pub fn last_op(&self) -> Option<OpRc> {
+        self.get_byte_iter().last()
     }
 
     /// opencoder.py _double_ops — double the byte buffer when
@@ -1798,17 +1765,16 @@ impl Trace {
     /// guard's fail_args (which reference ops recorded before the cut)
     /// acting as fresh inputargs for the resumed trace.
     pub fn cut_trace_from(
-        &self,
+        &mut self,
         cut: crate::recorder::TracePosition,
         inputargs: Vec<OpRef>,
     ) -> CutTrace<'_> {
         CutTrace {
-            trace: self as *const _ as *mut _,
+            trace: self,
             start: cut._pos,
             count: cut._count,
             index: cut._index,
             inputargs,
-            _marker: std::marker::PhantomData,
         }
     }
 
@@ -1895,8 +1861,8 @@ impl Trace {
     /// return `tag(TAGCONSTPTR, idx)`. Index 0 is reserved for nullptr
     /// (seeded by the constructor).
     ///
-    /// Rust adaptation: non-null `addr` is registered on the shadow
-    /// stack so a moving GC can update the entry in-place. RPython's
+    /// Rust adaptation: non-null `addr` gets an independently owned root
+    /// so a moving GC can update the entry in-place. RPython's
     /// `_refs` list is natively GC-tracked; `Vec<u64>` is not.
     pub fn _encode_ptr(&mut self, addr: u64) -> i64 {
         self._consts_ptr += 1;
@@ -1908,8 +1874,10 @@ impl Trace {
         } else {
             let idx = self._refs.len() as u32;
             self._refs.push(addr);
-            let ss_idx = majit_gc::shadow_stack::push(majit_ir::GcRef(addr as usize));
-            self.rooted_ref_indices.push((idx as usize, ss_idx));
+            self.rooted_refs
+                .push(majit_gc::shadow_stack::OwnerRootGuard::new(
+                    majit_ir::GcRef(addr as usize),
+                ));
             self._refs_dict.insert(addr, idx);
             idx
         };
@@ -2878,7 +2846,7 @@ impl Trace {
     }
 
     /// Rust adaptation: mirror pointer moves performed by the GC back
-    /// into `_refs`. The shadow stack holds the authoritative post-move
+    /// into `_refs`. The owner roots hold the authoritative post-move
     /// pointer for each entry pushed by `_encode_ptr`; copy those
     /// values into `_refs` so TAGCONSTPTR decodes land on the current
     /// address. This helper is the required write-back point for the
@@ -2887,24 +2855,23 @@ impl Trace {
     /// (`MetaInterp::walk_active_trace_refs`).
     #[allow(dead_code)]
     pub(crate) fn refresh_from_gc(&mut self) {
-        for &(ref_idx, ss_idx) in &self.rooted_ref_indices {
-            self._refs[ref_idx] = majit_gc::shadow_stack::get(ss_idx).0 as u64;
+        let mut moved = false;
+        for (reference, root) in self._refs[1..].iter_mut().zip(&self.rooted_refs) {
+            let current = root.get().0 as u64;
+            moved |= *reference != current;
+            *reference = current;
         }
-    }
-
-    /// Pop the shadow stack back to the depth captured at construction
-    /// and forget the rooted-index table. Idempotent.
-    fn release_roots(&mut self) {
-        if !self.rooted_ref_indices.is_empty() {
-            majit_gc::shadow_stack::pop_to(self.shadow_stack_base);
-            self.rooted_ref_indices.clear();
+        // `history.py new_ref_dict/rd_hash` hashes stable object identities.
+        // Our address keys need rehashing after movement. Rebuild only after
+        // updating ALL entries (new addresses can overlap old keys), preserving
+        // pool indexes already written into the byte stream. A dictionary
+        // cleared by `tracing_done` must remain cleared.
+        if moved && !self._refs_dict.is_empty() {
+            self._refs_dict.clear();
+            for (index, &reference) in self._refs.iter().enumerate().skip(1) {
+                self._refs_dict.insert(reference, index as u32);
+            }
         }
-    }
-}
-
-impl Drop for Trace {
-    fn drop(&mut self) {
-        self.release_roots();
     }
 }
 
@@ -2919,6 +2886,68 @@ mod tests {
     /// hold in `self.metainterp_sd`.
     fn empty_sd() -> Arc<crate::MetaInterpStaticData> {
         Arc::new(crate::MetaInterpStaticData::new())
+    }
+
+    #[test]
+    fn trace_drop_preserves_later_lexical_roots() {
+        let base = majit_gc::shadow_stack::depth();
+        let mut trace = TraceRecordBuffer::new(0, empty_sd());
+        trace._encode_ptr(0x1000);
+        let lexical = majit_gc::shadow_stack::push(majit_ir::GcRef(0x2000));
+        drop(trace);
+        let remaining = (majit_gc::shadow_stack::depth() > lexical)
+            .then(|| majit_gc::shadow_stack::get(lexical));
+        majit_gc::shadow_stack::pop_to(base);
+        assert_eq!(remaining, Some(majit_ir::GcRef(0x2000)));
+    }
+
+    #[test]
+    fn trace_refresh_rekeys_moved_constants_without_changing_encoded_indexes() {
+        let mut trace = TraceRecordBuffer::new(0, empty_sd());
+        let first = trace._encode_ptr(0x1000);
+        let second = trace._encode_ptr(0x2000);
+        majit_gc::shadow_stack::walk_roots(|reference| reference.0 += 0x1000);
+        trace.refresh_from_gc();
+        assert_eq!(trace._refs, vec![0, 0x2000, 0x3000]);
+        assert_eq!(trace._encode_ptr(0x2000), first);
+        assert_eq!(trace._encode_ptr(0x3000), second);
+        assert_eq!(trace._refs.len(), 3);
+        assert!(!trace._refs_dict.contains_key(&0x1000));
+    }
+
+    #[test]
+    fn trace_roots_outlive_lexical_scopes_and_other_traces() {
+        let base = majit_gc::shadow_stack::depth();
+        majit_gc::shadow_stack::push(majit_ir::GcRef(0x1000));
+        let mut first = TraceRecordBuffer::new(0, empty_sd());
+        first._encode_ptr(0x2000);
+        let mut second = TraceRecordBuffer::new(0, empty_sd());
+        second._encode_ptr(0x3000);
+        majit_gc::shadow_stack::pop_to(base);
+        drop(first);
+        let mut roots = Vec::new();
+        majit_gc::shadow_stack::walk_roots(|reference| roots.push(*reference));
+        assert_eq!(roots, vec![majit_ir::GcRef(0x3000)]);
+        drop(second);
+        roots.clear();
+        majit_gc::shadow_stack::walk_roots(|reference| roots.push(*reference));
+        assert!(roots.is_empty());
+        assert_eq!(majit_gc::shadow_stack::depth(), base);
+    }
+
+    #[test]
+    fn trace_refresh_after_tracing_done_does_not_retain_a_lookup_dictionary() {
+        let mut trace = TraceRecordBuffer::new(0, empty_sd());
+        trace.record_op1(OpCode::SameAsR, Box::ConstPtr(0x1000), None);
+        trace.tracing_done().unwrap();
+        majit_gc::shadow_stack::walk_roots(|reference| reference.0 += 0x1000);
+        trace.refresh_from_gc();
+        assert!(trace._refs_dict.is_empty());
+        let op = trace.get_byte_iter().next().unwrap();
+        assert_eq!(
+            op.arg(0).to_opref().as_const_ptr(),
+            Some(majit_ir::GcRef(0x2000))
+        );
     }
 
     #[test]
@@ -4193,6 +4222,18 @@ mod tests {
         assert_eq!(ops[1].opcode, OpCode::IntMul);
     }
 
+    #[test]
+    fn ops_materializer_returns_the_decoder_producer_identity() {
+        let mut trace = TraceRecordBuffer::new(1, empty_sd());
+        trace.record_input_arg(Type::Int);
+        let position = trace.record_op2(OpCode::IntAdd, Box::ResOp(0), Box::ConstInt(1), None);
+        trace.record_op2(OpCode::IntMul, Box::ResOp(position), Box::ConstInt(2), None);
+        let ops = trace.ops();
+        let producer = ops[1].arg(0).bound_op().unwrap();
+        let first: &majit_ir::Op = std::borrow::Borrow::borrow(&ops[0]);
+        assert!(std::ptr::eq(first, producer.as_ref()));
+    }
+
     /// `get_op_by_pos` returns the Op whose `.pos` equals the
     /// requested OpRef. `ByteTraceIter` seeds `_fresh` at
     /// `max_num_inputargs` and then bumps it once per inputarg before
@@ -4677,6 +4718,27 @@ mod tests {
         // Second op is the guard; third is the INT_SUB tail.
         assert_eq!(ops[1].opcode, OpCode::GuardTrue);
         assert_eq!(ops[2].opcode, OpCode::IntSub);
+    }
+
+    #[test]
+    fn cut_trace_reborrows_for_each_walk_and_delegates_the_rewind() {
+        let mut trace = TraceRecordBuffer::new(1, empty_sd());
+        let input = trace.record_input_arg(Type::Int);
+        let start = trace.cut_point();
+        let first = trace.record_op2(OpCode::IntAdd, Box::ResOp(0), Box::ConstInt(1), None);
+        let end = trace.cut_point();
+        trace.record_op2(OpCode::IntMul, Box::ResOp(first), Box::ConstInt(2), None);
+        {
+            let mut cut = trace.cut_trace_from(start, vec![input]);
+            assert_eq!(cut.get_iter().count(), 2);
+            // `opencoder.py CutTrace.cut_at` delegates to the same parent
+            // that the next get_iter reads, after the old reader has ended.
+            cut.cut_at(end);
+            assert_eq!(cut.get_iter().count(), 1);
+        }
+        assert_eq!(trace.cut_point(), end);
+        trace.record_op2(OpCode::IntSub, Box::ResOp(first), Box::ConstInt(3), None);
+        assert_eq!(trace.ops().last().unwrap().opcode, OpCode::IntSub);
     }
 
     /// test_opencoder.py `TestOpencoder.test_virtualizable_virtualref` —

@@ -37,10 +37,6 @@ impl JitCodeSym for StaticRefusalSym {
     fn loop_header_pc(&self) -> usize {
         0
     }
-
-    fn fail_args(&self) -> Option<Vec<OpRef>> {
-        Some(Vec::new())
-    }
 }
 
 /// The generated dispatch loop re-runs its source arm when a trace start

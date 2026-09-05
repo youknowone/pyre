@@ -47,7 +47,7 @@ use majit_ir::{OpRef, Type, Value};
 use majit_metainterp::jitcode::JitCodeBuilder;
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use majit_metainterp::{
-    ClosureRuntime, JitCode, JitCodeMachine, JitCodeSym, MIFrame, MIFrameStack, TraceCtx,
+    ClosureRuntime, JitCode, JitCodeMachine, JitCodeSym, MIFrame, MIFrameStack,
 };
 
 /// The minimum a `JitCodeSym` has to answer for the dispatcher to run one
@@ -61,10 +61,6 @@ impl JitCodeSym for MinimalSym {
 
     fn loop_header_pc(&self) -> usize {
         0
-    }
-
-    fn fail_args(&self) -> Option<Vec<OpRef>> {
-        None
     }
 }
 
@@ -128,8 +124,17 @@ const VALUE_REG: u16 = 1;
 const DEST_REG: u16 = 1;
 const ARRAY_IDX: u16 = 0;
 
-fn build_jitcode(arm: Arm) -> (Arc<JitCode>, usize) {
+fn build_jitcode(
+    arm: Arm,
+) -> (
+    Arc<JitCode>,
+    usize,
+    majit_translate::codewriter::assembler::Assembler,
+) {
+    let mut asm = majit_translate::codewriter::assembler::Assembler::new();
     let mut builder = JitCodeBuilder::new();
+    let live_ints: &[u8] = if arm == Arm::Set { &[0, 1] } else { &[0] };
+    builder.live(&mut asm, live_ints, &[0], &[]);
     let pc = builder.current_pos();
     match arm {
         Arm::Get => {
@@ -141,7 +146,7 @@ fn build_jitcode(arm: Arm) -> (Arc<JitCode>, usize) {
     }
     let jitcode = Arc::new(builder.finish());
     jitcode.set_index(0);
-    (jitcode, pc)
+    (jitcode, pc, asm)
 }
 
 /// Whether the vable register holds a recorded box or a prebuilt constant.
@@ -158,7 +163,18 @@ enum VableBox {
 /// names the index box, whether Step 4's PTR_EQ was recorded)`.
 fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     let info = one_int_array_vinfo();
-    let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+    let (jitcode, pc, asm) = build_jitcode(arm);
+    let mut staticdata = majit_metainterp::MetaInterpStaticData::new();
+    staticdata.op_live = majit_metainterp::jitcode::insns::BC_LIVE as i32;
+    staticdata.liveness_info = asm.all_liveness().to_vec();
+    let mut meta = majit_metainterp::MetaInterp::<()>::new(200);
+    meta.staticdata = Arc::new(staticdata);
+    meta.finish_setup_descrs_for_jitdrivers();
+    meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(majit_ir::GcRef(2))]);
+    let ctx = meta.trace_ctx().expect("force-started fixture trace");
+    // This is an IR-shape fixture with symbolic pointer sentinels, as with
+    // TraceCtx::for_test_types; do not ask a native CPU to dereference them.
+    ctx.set_cpu(None);
 
     // The STANDARD virtualizable, i.e. `virtualizable_boxes[-1]`
     // (`pyjitpl.py:1195 virtualizable_boxes[-1]`).
@@ -207,8 +223,10 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     );
     let stored = ctx.const_int(7);
 
-    let (jitcode, pc) = build_jitcode(arm);
     let mut frame = MIFrame::new(jitcode, pc);
+    // This fixture executes the array opcode once, not its preceding LIVE.
+    // MIFrame::new initializes the bytecode cursor independently of `pc`.
+    frame.code_cursor = pc;
     frame.ref_regs[VABLE_REG as usize] = Some(other_vable);
     frame.ref_values[VABLE_REG as usize] = Some(2);
     frame.int_regs[INDEX_REG as usize] = Some(index);
@@ -224,7 +242,7 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     let runtime = ClosureRuntime::new(|pc: usize| pc);
     let mut sym = MinimalSym;
     let mut machine = JitCodeMachine::<MinimalSym, _>::with_framestack(&mut frames, &[], &[]);
-    machine.run_one_step(&mut ctx, &mut sym, &runtime);
+    machine.run_one_step(ctx, &mut sym, &runtime);
     drop(machine);
 
     let promoted_index = ctx.ops().iter().any(|recorded| {
