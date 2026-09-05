@@ -8,6 +8,8 @@
 
 #[path = "../src/call_spec.rs"]
 mod call_spec;
+#[path = "../src/codegen_cache.rs"]
+mod codegen_cache;
 #[path = "../src/llbc_fingerprint.rs"]
 mod llbc_fingerprint;
 #[path = "../src/pypyjit_driver_layout.rs"]
@@ -26,7 +28,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v17";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v19";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × release/dev) inside 300 MB.
@@ -561,11 +563,12 @@ fn llbc_current_fingerprint(
 ///
 /// The prepass reads `build/llbc/*.ullbc`, never the Rust sources
 /// (AGENTS.md:48), so a field inserted anywhere but last in a `#[repr(C)]`
-/// struct shifts every following descr offset while the build stays green.
-/// The existence test in `preflight_llbc_or_fail` cannot see this, and
-/// `codegen_cache_key` makes it worse rather than better: it hashes every
-/// `<crate>/src`, so a source edit reliably invalidates the codegen cache and
-/// re-runs the prepass — over the same unchanged artefact.
+/// struct shifts every following descr offset while the build stays green
+/// if the artefact is not re-extracted. The existence test in
+/// `preflight_llbc_or_fail` cannot see this. The cache key hashes the
+/// artefact bytes, not the interpreter sources, so a source-only edit
+/// still hits the cache — this check is what refuses that hit when the
+/// artefact is stale.
 ///
 /// The oracle is the extractor's own stamp. The extraction engine already
 /// skips a crate whose stamp still matches, so this is the comparison the
@@ -1943,10 +1946,16 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     for path in source_paths {
         println!("cargo::rerun-if-changed={path}");
     }
-    emit_rerun_if_changed_recursive(&format!("{repo_root}/majit/majit-translate/src"));
-    println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
-    println!("cargo::rerun-if-changed=src/call_spec.rs");
-    println!("cargo::rerun-if-changed=src/llbc_fingerprint.rs");
+    let inputs = codegen_cache::discover(
+        std::path::Path::new(repo_root),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+    );
+    for rel in &inputs.src_trees {
+        emit_rerun_if_changed_recursive(&format!("{repo_root}/{rel}"));
+    }
+    for rel in inputs.extra_files.iter().chain(&inputs.manifests) {
+        println!("cargo::rerun-if-changed={repo_root}/{rel}");
+    }
     // Neither reaches `codegen_cache_key` -- they choose where the cache lives
     // and how much of it is kept, not what it contains -- but cargo still has
     // to re-run this script when they move so the outputs land in, and are
@@ -2022,25 +2031,28 @@ fn llbc_layout_sidecars() -> Vec<String> {
 /// `cargo clean`, a fresh `CARGO_TARGET_DIR`, or a profile switch does not
 /// re-pay the translation prepass — the same reason the prepass's own inputs
 /// (`build/llbc/*.ullbc`) live there. `codegen_cache_key` already folds
-/// HOST/TARGET/PROFILE/OPT_LEVEL, the feature set, the build-script binary's
-/// own bytes and the LLBC content, so an entry is only ever served back to the
+/// HOST/TARGET/PROFILE/OPT_LEVEL, the feature set, the translator sources
+/// and the LLBC content, so an entry is only ever served back to the
 /// configuration that produced it.
 /// The cache root when several checkouts are pointed at one, or `None` for the
 /// per-worktree default.
 ///
 /// Sharing is sound because `codegen_cache_key` derives the key from content
-/// alone -- workspace sources, `Cargo.lock`, the rustc version string, the LLBC
-/// inputs -- and never from a path, so an entry stored by one checkout is
-/// legible to every other. The store is already safe to race on: it stages into
-/// a pid-suffixed sibling and renames, and concedes without error when another
-/// process got there first.
+/// alone -- translator sources, `Cargo.lock`, the rustc version string, the
+/// LLBC inputs -- and from repo-relative paths, so an entry stored by one
+/// checkout is legible to every other on the same sources and artefacts. The
+/// store is already safe to race on: it stages into a pid-suffixed sibling
+/// and renames, and concedes without error when another process got there
+/// first.
 ///
-/// What that buys is capacity, not deduplication. Checkouts on different
-/// branches disagree on the key -- twelve of them held 77 distinct keys with
-/// none in common -- because the extracted LLBC alone differs wherever the
-/// interpreter does. The win is that one LRU pool hands its slots to whichever
-/// checkouts are building, instead of every idle one holding a local quota that
-/// nothing is going to ask for.
+/// What that buys is capacity, not (usually) deduplication. Checkouts on
+/// different branches disagree on the key -- twelve of them held 77 distinct
+/// keys with none in common -- because the extracted LLBC alone differs
+/// wherever the interpreter does. Two checkouts of the same tree now share
+/// an entry: the key uses repo-relative paths. The remaining win of the
+/// shared pool is that one LRU hands its slots to whichever checkouts are
+/// building, instead of every idle one holding a local quota that nothing
+/// is going to ask for.
 ///
 /// Deliberately absent from `codegen_cache_key`: keying on where the cache
 /// lives would give each worktree its own key again and defeat the point.
@@ -2370,6 +2382,7 @@ fn store_codegen_cache(cache_dir: &std::path::Path, out_dir: &str) -> std::io::R
 
 fn codegen_cache_key(manifest_dir: &str, repo_root: &str, source_paths: &[String]) -> String {
     let mut h = CacheHasher::new();
+    let repo_root = std::path::Path::new(repo_root);
     h.write_str(CODEGEN_CACHE_VERSION);
     for key in ["HOST", "TARGET", "PROFILE", "OPT_LEVEL"] {
         h.write_str(key);
@@ -2391,65 +2404,61 @@ fn codegen_cache_key(manifest_dir: &str, repo_root: &str, source_paths: &[String
         h.write_os(std::env::var_os(key));
     }
 
-    // The codegen output also depends on every crate linked into this
-    // build-script binary — `majit-translate`'s own dependencies
-    // (`majit-ir`, `majit-charon-reader`, `rustpython-compiler-core`, …)
-    // and their serde wire formats — whose sources `majit-translate/src`
-    // below does not cover. Without them the key would stay identical across
-    // such a change and restore a stale snapshot (e.g. `*.bin` written under
-    // an older `majit-ir` bincode layout).
+    // Hash the sources the prepass actually reads, not every workspace crate
+    // the build-script binary happens to link. A walk of `majit/*/src` and
+    // `pyre/*/src` rekeyed the cache on a `majit-gc` comment and re-ran the
+    // analysis over unchanged LLBC. Interpreter/object/jit bodies reach the
+    // prepass only through the artefacts `hash_llbc_inputs` hashes;
+    // `fail_if_llbc_stale` refuses a source/artefact mismatch before the
+    // key is consulted.
     //
-    // Hash their *sources* rather than the build-script executable's bytes.
-    // The binary is not reproducible: recompiling it from unchanged sources —
-    // which `cargo clean`, a fresh `CARGO_TARGET_DIR`, or a touched `build.rs`
-    // all force — yields different bytes, so keying on them rekeyed the cache
-    // on almost every build and made it serve only reruns that skipped the
-    // recompile. Workspace sources plus `Cargo.lock` (external crate
-    // versions) and the compiler's version string cover the same change
-    // surface and are stable across recompiles.
-    hash_file_content(&mut h, &std::path::Path::new(repo_root).join("Cargo.lock"));
+    // Hash sources rather than the build-script executable's bytes. The
+    // binary is not reproducible: recompiling it from unchanged sources —
+    // which `cargo clean`, a fresh `CARGO_TARGET_DIR`, or a touched
+    // `build.rs` all force — yields different bytes, so keying on them
+    // rekeyed the cache on almost every build. `Cargo.lock` covers external
+    // crate versions (`rustpython-compiler-core`, serde, bincode); the
+    // compiler version string covers a toolchain that changes a type layout.
+    hash_file_content(&mut h, repo_root, &repo_root.join("Cargo.lock"));
     h.write_str(&rustc_version_string());
-    for workspace_dir in ["majit", "pyre"] {
-        let root = std::path::Path::new(repo_root).join(workspace_dir);
-        let Ok(crates) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        let mut src_dirs: Vec<std::path::PathBuf> = crates
-            .flatten()
-            .map(|entry| entry.path().join("src"))
-            .filter(|src| src.is_dir())
-            .collect();
-        src_dirs.sort();
-        for src in src_dirs {
-            hash_rs_dir_content(&mut h, &src);
-        }
-    }
-
-    hash_file_content(&mut h, &std::path::Path::new(manifest_dir).join("build.rs"));
+    hash_file_content(
+        &mut h,
+        repo_root,
+        &std::path::Path::new(manifest_dir).join("build.rs"),
+    );
     // The whole `build/` directory, not `build.rs` alone. This prepass now
     // lives in `build/prepass.rs`, `#[path]`-included by that wrapper rather
-    // than sitting under `src/`, so neither the line above nor the `*/src`
-    // walk reaches its bytes. Editing it recompiles the build script and
+    // than sitting under `src/`, so neither the line above nor the discovered
+    // trees reach its bytes. Editing it recompiles the build script and
     // makes Cargo rerun it -- and then an unchanged key restores the previous
     // generated tables over the ones the rerun just wrote. Hashing the
     // directory covers a second module added beside it too.
-    hash_rs_dir_content(&mut h, &std::path::Path::new(manifest_dir).join("build"));
-    hash_file_content(
-        &mut h,
-        &std::path::Path::new(manifest_dir).join("src/virtualizable_spec.rs"),
-    );
-    hash_file_content(
-        &mut h,
-        &std::path::Path::new(manifest_dir).join("src/call_spec.rs"),
-    );
-
-    for path in source_paths {
-        hash_file_content(&mut h, std::path::Path::new(path));
-    }
     hash_rs_dir_content(
         &mut h,
-        &std::path::Path::new(repo_root).join("majit/majit-translate/src"),
+        repo_root,
+        &std::path::Path::new(manifest_dir).join("build"),
     );
+    let inputs = codegen_cache::discover(repo_root, std::path::Path::new(manifest_dir));
+    for rel in &inputs.src_trees {
+        hash_rs_dir_content(&mut h, repo_root, &repo_root.join(rel));
+    }
+    for rel in inputs.extra_files.iter().chain(&inputs.manifests) {
+        hash_file_content(&mut h, repo_root, &repo_root.join(rel));
+    }
+
+    // Paths only. The analyzer derives `module_path` from the filename; the
+    // graph bodies come from LLBC. Hashing contents here re-ran the prepass
+    // on every interpreter edit even when the artefact was unchanged.
+    // Repo-relative so two checkouts of the same tree share a key.
+    let mut rel_sources: Vec<String> = source_paths
+        .iter()
+        .map(|path| codegen_cache::repo_relative(repo_root, std::path::Path::new(path)))
+        .collect();
+    rel_sources.sort();
+    h.write_str("source-paths");
+    for path in &rel_sources {
+        h.write_str(path);
+    }
     hash_llbc_inputs(&mut h, repo_root);
 
     format!("{:016x}", h.finish())
@@ -2470,7 +2479,7 @@ fn rustc_version_string() -> String {
         .unwrap_or_else(|| "rustc-version-unavailable".to_string())
 }
 
-fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &str) {
+fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &std::path::Path) {
     // Hash the LLBC by content, not by (len, mtime) signature. The
     // analysis (`analyze_multiple_pipeline_with_modules`) derives every
     // generated artefact from these graph bodies, so a content change that
@@ -2483,7 +2492,7 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &str) {
     if let Some(paths) = std::env::var_os("MAJIT_MIR_FRONTEND_LLBC") {
         for path in std::env::split_paths(&paths) {
             if !path.as_os_str().is_empty() {
-                hash_file_content(h, &path);
+                hash_file_content(h, repo_root, &path);
             }
         }
         return;
@@ -2493,7 +2502,8 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &str) {
     for crate_name in LLBC_CRATES {
         hash_file_content(
             h,
-            &std::path::Path::new(repo_root)
+            repo_root,
+            &repo_root
                 .join("build")
                 .join("llbc")
                 .join(format!("{crate_name}.ullbc")),
@@ -2508,15 +2518,13 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &str) {
     for sidecar in llbc_layout_sidecars() {
         hash_file_content(
             h,
-            &std::path::Path::new(repo_root)
-                .join("build")
-                .join("llbc")
-                .join(&sidecar),
+            repo_root,
+            &repo_root.join("build").join("llbc").join(&sidecar),
         );
     }
 }
 
-fn hash_rs_dir_content(h: &mut CacheHasher, dir: &std::path::Path) {
+fn hash_rs_dir_content(h: &mut CacheHasher, repo_root: &std::path::Path, dir: &std::path::Path) {
     let mut paths = Vec::new();
     for entry in WalkDir::new(dir) {
         let Ok(entry) = entry else { continue };
@@ -2527,12 +2535,12 @@ fn hash_rs_dir_content(h: &mut CacheHasher, dir: &std::path::Path) {
     }
     paths.sort();
     for path in paths {
-        hash_file_content(h, &path);
+        hash_file_content(h, repo_root, &path);
     }
 }
 
-fn hash_file_content(h: &mut CacheHasher, path: &std::path::Path) {
-    h.write_path(path);
+fn hash_file_content(h: &mut CacheHasher, repo_root: &std::path::Path, path: &std::path::Path) {
+    h.write_str(&codegen_cache::repo_relative(repo_root, path));
     let Ok(mut file) = std::fs::File::open(path) else {
         h.write_str("missing");
         return;
@@ -2559,7 +2567,7 @@ fn hash_file_content(h: &mut CacheHasher, path: &std::path::Path) {
 /// produced by one build matches the same build's stored entry. std does
 /// not promise the algorithm is stable across Rust releases, so a toolchain
 /// upgrade changes every key; that is fine here (a miss just regenerates,
-/// and the build-script executable is already in the key, so a toolchain
+/// and `rustc_version_string` is already in the key, so a toolchain
 /// bump rekeys regardless). Inputs are length-prefixed so adjacent fields
 /// cannot run together: `("ab", "c")` and `("a", "bc")` hash differently.
 struct CacheHasher(std::collections::hash_map::DefaultHasher);
@@ -2589,10 +2597,6 @@ impl CacheHasher {
             Some(value) => self.write_str(&value.to_string_lossy()),
             None => self.write_str("<unset>"),
         }
-    }
-
-    fn write_path(&mut self, path: &std::path::Path) {
-        self.write_str(&path.to_string_lossy());
     }
 }
 
