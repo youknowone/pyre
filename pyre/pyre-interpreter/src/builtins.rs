@@ -16519,7 +16519,6 @@ pub(crate) fn exec_or_eval(
     // anything that can collect: it is a property of the arguments and not of
     // the addresses they hold, which the plant below can change.
     let globals_supplied = !is_none_or_null(globals_arg);
-    let locals_supplied = !is_none_or_null(locals_arg);
     let w_globals = if globals_supplied {
         globals_arg
     } else if !caller_frame.is_null() {
