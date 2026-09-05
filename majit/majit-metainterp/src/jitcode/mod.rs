@@ -1,5 +1,6 @@
 mod assembler;
 mod embedded;
+mod frozen_effects;
 
 pub(crate) use assembler::scalar_size;
 pub use assembler::{JitCodeBuilder, JitCodeIntOperand, live_slots_for_state_field_jit};

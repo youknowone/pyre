@@ -495,6 +495,14 @@ cover the condition they diagnose.
 - What it does: Setting it to `1` reports structure IDs that resolve to multiple spellings or conflicting concrete layouts during translation, as `conflict`, `variant` and `summary` lines. Unset is inert.
 - Retirement condition: Remove when one structure ID cannot collect conflicting layouts by construction.
 
+### `MAJIT_TEST_SHELL_REGISTRY_CHILD`
+
+- Read sites: 1 — `majit/majit-metainterp/src/optimizeopt/virtualize.rs`, test-only and native-only
+- Accessor: `explicit_sum_inheritance_rejects_a_registered_lookalike()`
+- What it does: Marks the isolated child process that runs the fixture replacing the process-global type registry. The parent sets it only for its exact-test child, preventing recursive child spawning without making production registry identity thread-local.
+- Default polarity: **OFF**; unset launches the isolated child, any present value runs the fixture in that child. It is not a runtime optimization switch.
+- Retirement condition: Remove when this fixture has a dedicated test executable or another process-isolation mechanism that does not need a child marker.
+
 ### `MAJIT_TLDBG`
 
 - Read sites: 1 — `majit/majit-metainterp/src/lib.rs`

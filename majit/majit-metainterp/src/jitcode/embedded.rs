@@ -64,6 +64,47 @@ unsafe impl Send for EmbeddedJitCodeTable {}
 unsafe impl Sync for EmbeddedJitCodeTable {}
 
 impl EmbeddedJitCodeTable {
+    /// Restore an embedded image's complete effect-descriptor population.
+    ///
+    /// `pyjitpl.py::finish_setup_descrs` uses all of GcCache, not merely the
+    /// opcode descriptor table. Publish opcode-owned layouts first, then the
+    /// analyzer-only members and their frozen `compute_bitstrings` stamps.
+    pub fn materialize_with_frozen_effects(
+        canonical: &[Arc<CanonicalJitCode>],
+        mut descrs: Vec<CanonicalBhDescr>,
+        symbolic_paths: &[(i64, String)],
+        runtime_bindings: &[(&str, i64)],
+        effect_mints: &[majit_ir::effectinfo::DescrMintEntry],
+    ) -> &'static Self {
+        for descr in &descrs {
+            if matches!(descr, CanonicalBhDescr::Field { .. }) {
+                crate::pyjitpl::dispatch::field_descr_ref_from_bh(descr);
+            }
+        }
+        super::frozen_effects::publish_mints(effect_mints);
+        for descr in &mut descrs {
+            if let CanonicalBhDescr::Call { calldescr }
+            | CanonicalBhDescr::JitCode { calldescr, .. } = descr
+            {
+                super::frozen_effects::prepare(&mut calldescr.extra_info);
+            }
+        }
+        let canonical: Vec<_> = canonical
+            .iter()
+            .map(|code| {
+                let mut code = (**code).clone();
+                super::frozen_effects::prepare(&mut code.body_mut().calldescr.extra_info);
+                Arc::new(code)
+            })
+            .collect();
+        Self::materialize_with_symbolic_fnaddrs(
+            &canonical,
+            descrs,
+            symbolic_paths,
+            runtime_bindings,
+        )
+    }
+
     /// Join the two serialized lists into runtime shells and their pool.
     ///
     /// `canonical` must be `all_jitcodes` in allocation order, which
@@ -227,6 +268,127 @@ impl RuntimeDescrTable for EmbeddedJitCodeTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A native helper mutating a field must invalidate the very descriptor
+    /// read by a getfield opcode, after serialization has erased raw Arcs.
+    #[test]
+    fn frozen_effects_rejoin_the_opcode_field_after_serialization() {
+        use majit_ir::effectinfo::{DescrMintEntry, DescrMintSpec, DescrSetKeys, DescrSetMember};
+        use majit_ir::{EffectInfo, ExtraEffect, Type};
+        use majit_translate::jitcode::{BhCallDescr, BhFieldSpec, BhSizeSpec};
+        let member = DescrSetMember::Field {
+            struct_id: 0x475241494e454649,
+            field_name: "depth".into(),
+        };
+        let mut writer =
+            EffectInfo::const_new(ExtraEffect::CannotRaise, majit_ir::OopSpecIndex::None);
+        writer.descr_set_keys = Some(
+            DescrSetKeys {
+                write_fields: vec![member.clone()],
+                ..Default::default()
+            }
+            .into(),
+        );
+        let mut reader =
+            EffectInfo::const_new(ExtraEffect::CannotRaise, majit_ir::OopSpecIndex::None);
+        reader.descr_set_keys = Some(
+            DescrSetKeys {
+                readonly_fields: vec![member.clone()],
+                ..Default::default()
+            }
+            .into(),
+        );
+        let layout =
+            majit_ir::effectinfo::compute_frozen_bitstrings(&mut [&mut writer, &mut reader]);
+        let stamp = layout.descr_indices[0][&member];
+        let mint = DescrMintEntry {
+            member,
+            spec: DescrMintSpec::Field {
+                struct_size: 8,
+                offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
+                flag: majit_ir::descr::ArrayFlag::Unsigned,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+            },
+            ei_index: stamp,
+        };
+        let field = CanonicalBhDescr::Field {
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Unsigned,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: Some(Arc::new(BhSizeSpec {
+                size: 8,
+                type_id: 0x475241494e454649,
+                vtable: 0,
+                is_gc_managed: false,
+                headerless: true,
+                all_fielddescrs: vec![BhFieldSpec {
+                    index: 0,
+                    field_key: "depth".into(),
+                    name: "Frame.depth".into(),
+                    offset: 0,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    field_flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    is_field_signed: false,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: None,
+                }],
+            })),
+            name: "depth".into(),
+            owner: "Frame".into(),
+        };
+        let descrs = vec![
+            field,
+            CanonicalBhDescr::Call {
+                calldescr: BhCallDescr {
+                    extra_info: writer,
+                    ..Default::default()
+                },
+            },
+            CanonicalBhDescr::Call {
+                calldescr: BhCallDescr {
+                    extra_info: reader,
+                    ..Default::default()
+                },
+            },
+        ];
+        let descrs = bincode::deserialize(&bincode::serialize(&descrs).unwrap()).unwrap();
+        let mints: Vec<DescrMintEntry> =
+            bincode::deserialize(&bincode::serialize(&vec![mint]).unwrap()).unwrap();
+        let table =
+            EmbeddedJitCodeTable::materialize_with_frozen_effects(&[], descrs, &[], &[], &mints);
+        let field = table.descrs()[0].as_optimizer_descr().unwrap();
+        assert_eq!(field.get_ei_index(), stamp);
+        let effect = |i: usize| {
+            let CanonicalBhDescr::Call { calldescr } = table.descrs()[i].as_bh_descr().unwrap()
+            else {
+                panic!()
+            };
+            &calldescr.extra_info
+        };
+        assert!(effect(1).check_write_descr_field(field.get_ei_index()));
+        assert!(!effect(2).check_write_descr_field(field.get_ei_index()));
+        assert!(Arc::ptr_eq(
+            field,
+            &effect(1)._write_descrs_fields.as_ref().unwrap()[0]
+        ));
+        assert_ne!(
+            effect(1),
+            effect(2),
+            "typed-call re-interning must not merge different effects"
+        );
+    }
 
     /// Two jitcodes, the second reachable from the first through a `j` slot.
     fn fixture() -> (Vec<Arc<CanonicalJitCode>>, Vec<CanonicalBhDescr>) {
