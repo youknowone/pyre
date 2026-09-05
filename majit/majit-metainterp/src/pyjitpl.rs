@@ -4747,8 +4747,9 @@ impl<M: Clone> MetaInterp<M> {
     /// (`index == None`), so its real driver is elected without one. That vinfo
     /// still belongs to the host's single logical driver, so it is adopted via
     /// the linear scan — but only while no *registered* driver owns a vinfo.
-    /// Once one does (pyre: jd0 at slot 1), a later registered driver that
-    /// carries none is genuinely novable (pyre: jd1 at slot 2) and gets `None`.
+    /// Once one does (pyre: jd0, which replaces the placeholder at slot 0), a
+    /// later registered driver that carries none is genuinely novable (pyre:
+    /// jd1 at slot 1) and gets `None`.
     fn resolve_active_jitdriver_sd_with_vinfo(&self) -> Option<usize> {
         if let Some(idx) = self.active_jitdriver_sd {
             if let Some(jd) = self.staticdata.jitdrivers_sd.get(idx)
@@ -5581,6 +5582,14 @@ impl<M: Clone> MetaInterp<M> {
                                 green_values: &[i64]|
          -> Option<(Arc<JitCellToken>, u64)> {
             let jd = staticdata.jitdrivers_sd.get(jd_index)?.clone();
+            // `warmspot.py` installs `portal_runner_adr` before
+            // `WarmEnterState.get_assembler_token` can synthesize a temporary
+            // callback.  Macro-only drivers do not yet have that installation
+            // seam, so preserve their clean trace abort instead of letting
+            // `compile_tmp_callback` bake the absent address into `funcbox`.
+            if jd.portal_runner_adr == 0 {
+                return None;
+            }
             let spec = jd.green_args_spec();
             // Resolve to the callee's CELL key before consulting either
             // index: the token comes off the celltable and the key travels
@@ -18739,13 +18748,15 @@ pub enum InlineDecision {
     Inline,
     /// Emit a CALL_ASSEMBLER: callee has compiled code.
     CallAssembler,
-    /// Callee not compiled and no on-demand token machinery.  pyjitpl.py:1417
-    /// (`inlining` true) would build the token via `compile_tmp_callback`
-    /// (warmstate.py:714-722) and still emit CALL_ASSEMBLER; lacking that here,
-    /// this variant means "no token yet" and the dispatcher aborts/retries
-    /// until the callee compiles.  It is not pyjitpl.py's `inlining`-false
-    /// residual call.  See `should_inline_core` for the same
-    /// `compile_tmp_callback` gap.
+    /// No callee token was PROVEN when the decision was taken.  Not
+    /// pyjitpl.py's `inlining`-false residual call: with `inlining` true
+    /// `_opimpl_recursive_call` still takes `assembler_call = True` here and
+    /// builds the token on demand via `compile_tmp_callback` (warmstate.py).
+    /// This variant exists because `decide_recursive_inline` is pure in its
+    /// five scalars and so cannot reach a synthesiser; the emitter it feeds
+    /// asks the seam that can (`Runtime::recursive_call_assembler_target`) and
+    /// treats this exactly as [`Self::CallAssembler`], aborting only if that
+    /// seam also comes back empty.
     ResidualCall,
 }
 
@@ -18784,9 +18795,11 @@ pub(crate) fn decide_recursive_inline(
     // this predicate: it is pure in the five scalars, and token synthesis
     // belongs to the emitter.  So the not-compiled case is labelled
     // `ResidualCall` — a stand-in meaning "no token proven yet, do not commit
-    // to CALL_ASSEMBLER from here" — which the dispatcher turns into
-    // abort/retry when its own seam (`Runtime::recursive_call_assembler_target`)
-    // also comes back empty.  It is NOT pyjitpl.py's `inlining`-false residual
+    // to CALL_ASSEMBLER from here".  The emitter reads it as the same
+    // `assembler_call = True` upstream takes: it asks
+    // `Runtime::recursive_call_assembler_target`, whose production resolver
+    // does synthesise, and aborts only when that seam also comes back empty.
+    // It is NOT pyjitpl.py's `inlining`-false residual
     // (`assembler_call = False`) path.
     let non_inline = if callee_compiled {
         InlineDecision::CallAssembler
@@ -21431,7 +21444,7 @@ mod metainterp_static_data_tests {
         // `majit-macros/src/lib.rs`): the f64 result is
         // pre-packed via `f64::to_bits` and the wrapper returns through
         // the integer return register.  Same ABI shape as
-        // `bh_portal_runner` (pyre-jit/src/call_jit.rs).
+        // `bh_portal_runner_c` (pyre-jit/src/call_jit.rs).
         let value = a as f64 * 0.5;
         value.to_bits() as i64
     }
@@ -21442,7 +21455,7 @@ mod metainterp_static_data_tests {
         // (do_recursive_call → portal_runner_adr, force-virtual
         // do_residual_call_full) materialises `funcbox.2` as a function
         // pointer with i64-return ABI — either the hand-written
-        // `bh_portal_runner` or `#[jit_module]`'s `concrete_ptr` wrapper
+        // `bh_portal_runner_c` or `#[jit_module]`'s `concrete_ptr` wrapper
         // that pre-packs the f64 result via `f64::to_bits`.  The f64-ABI
         // `trace_ptr` is consumed only by pyre-jit-trace's
         // `TraceCtx::call_may_force_*` family, which has its own seam
@@ -26345,6 +26358,43 @@ mod tests {
             .expect("CALL_ASSEMBLER_I recorded");
         let call_token2 = call.with_call_descr(|cd| cd.call_target_token()).flatten();
         assert_eq!(call_token2, Some(token_number));
+    }
+
+    #[test]
+    fn recursive_target_without_a_portal_runner_declines_before_tmp_callback() {
+        // `#[jit_interp]`-installed example drivers currently have no host
+        // hook that can publish `warmspot.py`'s `ll_portal_runner` address.
+        // A non-inline recursive decision must therefore remain a clean trace
+        // abort; entering `compile_tmp_callback` would assert in debug builds
+        // and record a call to address zero in release builds.
+        let mut meta = MetaInterp::<()>::new(10);
+        {
+            let staticdata = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
+            staticdata
+                .jitdrivers_sd
+                .push(JitDriverStaticData::new(vec![], vec![]));
+            staticdata.finish_setup_descrs_for_jitdrivers(&mut meta.backend);
+        }
+        assert_eq!(meta.staticdata.jitdrivers_sd[0].portal_runner_adr, 0);
+        let action = meta.force_start_tracing(889, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        let target = meta
+            .with_trace_ctx_and_token_resolver(
+                |_ctx,
+                 _resolve,
+                 recursive_target,
+                 _decision,
+                 _exec,
+                 _exec_ref,
+                 _exec_float,
+                 _exec_void| { recursive_target(0, &[]) },
+            )
+            .expect("trace is active");
+        assert!(
+            target.is_none(),
+            "a driver without portal_runner_adr must decline before callback synthesis",
+        );
     }
 
     #[test]

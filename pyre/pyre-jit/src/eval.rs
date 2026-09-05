@@ -279,9 +279,10 @@ impl FrameView {
     }
 }
 
-/// Restores `ExecutionContext.topframeref` after compiled execution, including
-/// panic unwinds.  The saved pointer lives on the shadow stack so a moving
-/// collection can forward it in place, matching `CurrentFrameGuard`.
+/// Restores compiled execution's frame-chain and activation bookkeeping,
+/// including on guard exits and panic unwinds. The saved frame pointer lives
+/// on the shadow stack so a moving collection can forward it in place,
+/// matching `CurrentFrameGuard`.
 ///
 /// Every door that runs a frame-bearing compiled trace has to take it, not just
 /// the one a given trace happened to be entered through: the reason it exists
@@ -293,23 +294,34 @@ impl FrameView {
 /// leaks one `JitVirtualRef` per unbalanced run into the live `topframeref`
 /// slot, and every later `enter` chains its `f_backref` onto that abandoned
 /// frame — a chain that grows without bound and that the root walker traverses
-/// on every minor collection.
+/// on every minor collection. The same skipped `finally` leaves a synthesized
+/// activation charge in `py_recursion_depth`; restoring both EC seams here is
+/// what lets every compiled Python callee be charged without repeated raising
+/// calls eventually producing a false `RecursionError`.
 struct TopFrameRefGuard {
     ec: *mut PyExecutionContext,
     saved_root: Option<usize>,
+    saved_recursion: Option<(usize, usize)>,
 }
 
 impl TopFrameRefGuard {
     fn new(ec: *mut PyExecutionContext) -> Self {
-        let saved_root = if ec.is_null() {
-            None
+        let (saved_root, saved_recursion) = if ec.is_null() {
+            (None, None)
         } else {
             let saved = unsafe { (*ec).topframeref };
-            Some(majit_gc::shadow_stack::push(majit_ir::GcRef(
-                saved as usize,
-            )))
+            (
+                Some(majit_gc::shadow_stack::push(majit_ir::GcRef(
+                    saved as usize,
+                ))),
+                Some(unsafe { ((*ec).py_recursion_depth, (*ec).accounted_activation) }),
+            )
         };
-        Self { ec, saved_root }
+        Self {
+            ec,
+            saved_root,
+            saved_recursion,
+        }
     }
 }
 
@@ -322,6 +334,10 @@ impl Drop for TopFrameRefGuard {
         majit_gc::shadow_stack::pop_to(saved_root);
         unsafe {
             (*self.ec).topframeref = saved.0 as *mut PyFrame;
+            if let Some((depth, accounted)) = self.saved_recursion {
+                (*self.ec).py_recursion_depth = depth;
+                (*self.ec).accounted_activation = accounted;
+            }
         }
     }
 }
@@ -5552,8 +5568,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // same `portal_finishtoken` / `propagate_exc_descr` via the
     // `finish_setup_descrs_for_jitdrivers` tail. jd1 is novable
     // (`virtualizable_info` stays `None`), so `elect_active_jitdriver_sd`'s
-    // vinfo-scan keeps electing jd0 and jd1 stays inert until its merge point
-    // is traced in a later slice.
+    // vinfo-scan would elect jd0 for a jd1 trace; what keeps that from
+    // happening is `drive_unpack_iterable_trace` handing the door this
+    // registration's own slot.
     let jd1 = pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
     d.meta_interp_mut().register_jitdriver_sd(jd1);
     // `warmspot.py metainterp_sd.finish_setup(codewriter)` always installs
@@ -7846,15 +7863,19 @@ fn drive_unpack_iterable_trace(
         majit_ir::Value::Ref(majit_ir::GcRef(items as usize)),
     ];
 
-    // jd1's registered descriptor lives at `jitdrivers_sd[2]` (registered right
-    // after jd0 in `build_jit_driver_pair`). `elect_active_jitdriver_sd` honours
-    // `descriptor.index` first, which is how the novable jd1 is elected over jd0
-    // (whose `virtualizable_info` would otherwise win the fallback scan). Only
-    // the index is read here; the wired descriptor at that slot carries the
-    // finish/exc tokens.
+    // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
+    // the novable jd1 is elected over jd0 (whose `virtualizable_info` would
+    // otherwise win the fallback scan). Only the index is read here; the wired
+    // descriptor at that slot carries the finish/exc tokens.  It comes from the
+    // registration rather than from counting registrations at this end:
+    // call.py `CallControl.grab_initial_jitcodes` stamps the owning driver on
+    // its main JitCode, and the extracted jd1 portal carries that same baked
+    // index.  The door ignores an out-of-range index instead of refusing it,
+    // so a guessed number that names no slot reads as a jd0 election rather
+    // than as an error.
     let mut descriptor =
         pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
-    descriptor.index = Some(2);
+    descriptor.index = jitcode.jitdriver_sd();
 
     // The `(code_ptr, pc)` pair `green_key` was hashed from, not `(0, 0)`: a
     // zero `code_ptr` is the sentinel for "no raw pair available", and a
@@ -9727,6 +9748,18 @@ pub(crate) fn pyre_portal_runner(
         );
     }
     frame.set_last_instr_from_next_instr(next_instr);
+    // Same correction every other blackhole resume leg applies: the frame still
+    // carries the FAILING GUARD's recorded operand depth, and this handoff
+    // resumes at the CRN's merge-point pc instead, so that depth over-counts
+    // and the header's pushes overflow the frame at its peak stack use.
+    // Re-derive it from the pc actually resumed at.
+    //
+    // Spelled here rather than through `apply_blackhole_crn_handoff`, which
+    // pairs the same two calls: that helper takes its pc from `green_int` alone
+    // and does nothing when it is empty, while this leg reads the MERGED
+    // `all_i`.  Routing through it would change which value becomes the resume
+    // pc, which is a separate question from the depth this fixes.
+    correct_resume_vsd(frame, next_instr);
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);

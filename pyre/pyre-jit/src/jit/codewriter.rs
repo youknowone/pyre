@@ -9497,22 +9497,27 @@ impl CodeWriter {
                             // still young at build time and relocated afterwards
                             // (e.g. a `memo` dict mutated in the loop) leaves a
                             // dangling pointer the blackhole resume then reads.
-                            // The register-form namespace (`getfield_vable_r`,
-                            // field 5 = the live `w_globals`) lets
+                            // The namespace operand (r0) is emitted as a NULL
+                            // `ConstRef` placeholder and resolved by the walker
+                            // (`replace_movable_load_global_namespace_with_frame_globals`,
+                            // jitcode_dispatch) from the live frame of the level
+                            // being walked.  That lets
                             // `try_walker_load_global_cell_fold` hoist the lookup
                             // to a GC-safe live cell read (`QuasiimmutField` +
                             // `jit_namespace_cell_lookup`), so the value is read
                             // through the forwarded dict every iteration; the
-                            // `bh_load_global_fn` residual fallback derives the
-                            // namespace from `w_code`'s live `w_globals`.  pycode
+                            // `bh_load_global_fn` residual fallback never reads
+                            // the operand, deriving the namespace from the live
+                            // frame when that frame owns this `w_code` and from
+                            // `w_code`'s own live `w_globals` otherwise.  pycode
                             // (r1) is the jitcode's own promoted `W_Code`; the
                             // frame (r2) feeds `get_builtin()`.
                             //
-                            // The register-form namespace is portal-only.  In a
-                            // non-portal callee the frame register aliases the
-                            // outermost frame on a chained / inlined-callee
-                            // resume, and the extra `getfield_vable_r` graph op
-                            // misallocates against the inlined locals.  A
+                            // This placeholder-plus-frame form is portal-only.
+                            // In a non-portal callee the frame register aliases
+                            // the outermost frame on a chained / inlined-callee
+                            // resume, so the residual's frame operand names the
+                            // wrong activation.  A
                             // non-portal callee instead keeps the
                             // `flowcontext.py find_global` const-fold,
                             // which the inliner needs as a foldable constant call
@@ -16296,19 +16301,27 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 ///     has pycode as its sole ref arg; the ConstRef value IS the same
 ///     pointer the walker would read from `getfield_vable_r`, so the
 ///     QuasiimmutField key matches — and the same holds for the migrated
-///     LoadGlobal pycode operand.  **Why LoadGlobal `ns` ConstRef fails**:
-///     `load_global_fn(ns, code, frame, namei)` has ns as a ref arg
-///     whose traced form (GetfieldVableR result) differs from the raw
-///     constant form in the optimizer's value-identity tracking.
-///     **Resolution**: migrate only the fold-safe pycode operand to
-///     ConstRef; `ns`/`frame` keep the register-form emit
-///     (getfield_vable_r + Register operands) so the trace walker
-///     produces proper traced variables.  A cross-module inlined
-///     `LOAD_GLOBAL` is therefore still latently wrong (ns reads the
-///     portal frame's globals); function_calls is single-module so this
-///     does not surface.  Fully retiring the register-form `ns`/`frame`
-///     reads requires separating the walker path from the blackhole
-///     path — a structural prerequisite not yet in place.
+///     LoadGlobal pycode operand.  **Why a RESOLVED `ns` ConstRef
+///     fails**: `load_global_fn(ns, code, frame, namei)` has ns as a
+///     ref arg whose traced form — the box the walker substitutes for
+///     the placeholder — differs from a baked constant in the
+///     optimizer's value-identity tracking.
+///     **Resolution**: migrate only the fold-safe pycode operand to a
+///     resolved ConstRef.  `frame` keeps its Register operand and `ns`
+///     is emitted as a NULL `ConstRef` placeholder, which the walker
+///     rewrites before recording
+///     (`replace_movable_load_global_namespace_with_frame_globals`,
+///     jitcode_dispatch) with the namespace of the level being walked —
+///     `inline_callee_consts` inside an inlined callee — so a
+///     cross-module inlined `LOAD_GLOBAL` reads its own module's
+///     globals rather than the caller's.  `bh_load_global_fn` never
+///     reads the operand at all: it resolves `w_globals` from the live
+///     frame when that frame owns this `w_code` and from the `w_code`'s
+///     own `w_globals` otherwise.  What is still declined rather than
+///     compiled is a callee whose code object was rebound to a second
+///     namespace (`frame_stores_global`), because this inline-frame
+///     encoder does not put `FrameDebugData.w_globals` into resume
+///     data.
 ///   * `bh_call_fn` / `bh_call_fn_N(callable, null_or_self, args...)` —
 ///     frame-less residual call ABI matching RPython
 ///     `bhimpl_residual_call_r_r` (`cpu.bh_call_r(func, None, args_r,

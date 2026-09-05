@@ -1181,10 +1181,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // so `populate_frame_int_regs` can fill the corresponding
     // `MIFrame.int_values` slot without re-reading the live state at guard time
     // TODO:
-    // accurate iff the user's varray Vec does not reallocate during
-    // tracing — true for the 6 macro examples
-    // (`vec![0i64; program.len()]` is fixed-capacity).  Dynamic
-    // varrays would need per-mutation refresh hooks.
+    // accurate iff the varray's length does not change during tracing — true
+    // for the 6 macro examples, whose backings are all sized once at
+    // construction (`vec![0i64; program.len()]`, `VirtArray::filled`).  A
+    // varray the source resizes or clears mid-walk would need per-mutation
+    // refresh hooks: the capacity is read off this symbolic state by
+    // `recursive_fresh_entry_vable_capacities`, which has no live state to
+    // re-measure from, so the refresh has to reach the mirror at the mutation.
     let initialize_sym_virt_array_parts: Vec<TokenStream> = virt_arrays
         .iter()
         .map(|(_, f)| {

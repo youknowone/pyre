@@ -1064,7 +1064,7 @@ pub struct OptContext {
     pub pending_invalid_loop: std::cell::Cell<Option<crate::optimize::InvalidLoop>>,
 }
 
-/// heaptracker.py:66: `if name == 'typeptr': continue`
+/// `heaptracker.all_fielddescrs`: `if name == 'typeptr': continue`
 /// Uses FieldDescr.is_typeptr() which checks `field_name() == "typeptr"`,
 /// matching RPython's name-based filtering.
 #[inline(always)]
@@ -1956,7 +1956,7 @@ impl OptContext {
     /// previous OptContext's `inputarg_refs` no longer names. Re-binding here restores
     /// `Forwarded::InputArg(_)` reachability for every InputArg operand the
     /// optimizer will hand to `make_equal_to` (`optimizer.py
-    /// op.set_forwarded(newop)`, unroll.py:497). Idempotent — re-running
+    /// op.set_forwarded(newop)`, `OptUnroll.import_state`). Idempotent — re-running
     /// re-mirrors each slot to the same `InputArgRc`.
     pub(crate) fn ensure_inputarg_bindings(&mut self) {
         // Derive the materialized InputArg positions from `ctx` state.
@@ -3178,7 +3178,7 @@ impl OptContext {
 
     /// Make `o` reachable as the canonical host for its own position.
     ///
-    /// `unroll.py:497` forwards a Phase-2 source to the literal carried Box,
+    /// `OptUnroll.import_state` forwards a Phase-2 source to the literal carried Box,
     /// and RPython needs no analog because the op IS its box
     /// (`resoperation.py:233-248`). pyre resolves an `OpRef` through a producer
     /// registry instead, so a Box that reaches a rebuilt context only as a
@@ -5076,7 +5076,7 @@ impl OptContext {
     /// host at `inputarg_base + i`. Reading slot `i` alone finds the
     /// unforwarded recorder host and loses the import, so a slot the
     /// preamble proved constant would reach the body as an unknown.
-    /// `unroll.py` `source.set_forwarded(target)` writes onto the very
+    /// `OptUnroll.import_state`'s `source.set_forwarded(target)` writes onto the very
     /// box the body operations hold; the flat `OpRef` namespace splits that
     /// one box in two, and this rejoins them.
     ///
@@ -5110,7 +5110,7 @@ impl OptContext {
         // `head = Node(i, head)` would store the node the body just allocated
         // into that node's own `next`.
         //
-        // `unroll.py source.set_forwarded(target)` unifies the label arg
+        // `OptUnroll.import_state`'s `source.set_forwarded(target)` unifies the label arg
         // with the value the preamble jumps with, and those name one runtime
         // value only at loop entry.
         //
@@ -10252,7 +10252,7 @@ mod boxref_forwarding_tests {
     }
 
     /// A peeled body names its input args by the recorder slot, while
-    /// `import_state` (unroll.py `source.set_forwarded(target)`) writes
+    /// `OptUnroll.import_state` (`source.set_forwarded(target)`) writes
     /// that iteration's value onto the host at `inputarg_base + slot`.
     /// RPython writes onto the one box the body operations hold; the flat
     /// `OpRef` namespace splits it in two, so reading the recorder slot on
@@ -10290,7 +10290,7 @@ mod boxref_forwarding_tests {
     /// A slot whose import forwards to a value the BODY produces must keep
     /// naming the label arg.
     ///
-    /// `unroll.py source.set_forwarded(target)` unifies the label arg with
+    /// `OptUnroll.import_state`'s `source.set_forwarded(target)` unifies the label arg with
     /// the value the preamble jumps with, and those are one runtime value only
     /// at loop entry. A result produced inside the trace is redefined every
     /// iteration, so substituting it for a body operand turns "the value this

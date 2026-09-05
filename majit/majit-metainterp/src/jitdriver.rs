@@ -8615,7 +8615,11 @@ impl<S: JitState> JitDriver<S> {
 
     /// Begin inlining a function call during tracing.
     ///
-    /// Records EnterPortalFrame and pushes an inline frame.
+    /// Pushes an inline frame. No ENTER_PORTAL_FRAME is recorded — an inline
+    /// call is not a portal transition, and [`MetaInterp::enter_inline_frame`]
+    /// carries the reasoning. A recursive PORTAL entry is the shape that does
+    /// record one, in `exec_recursive_call`.
+    ///
     /// Returns `true` if inlining started successfully.
     pub fn enter_inline_frame(&mut self, callee_raw: (usize, usize)) -> bool {
         self.meta.enter_inline_frame(callee_raw)
@@ -8623,7 +8627,8 @@ impl<S: JitState> JitDriver<S> {
 
     /// End an inlined function call during tracing.
     ///
-    /// Records LeavePortalFrame and pops the inline frame.
+    /// Pops the inline frame. No LEAVE_PORTAL_FRAME, for the reason its
+    /// [`Self::enter_inline_frame`] counterpart gives.
     pub fn leave_inline_frame(&mut self) {
         self.meta.leave_inline_frame()
     }

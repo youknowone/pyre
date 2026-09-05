@@ -4250,15 +4250,19 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // the descriptor without going through the buffer, so a descriptor the
     // host does not open — the sandbox controller mounts no real files —
     // leaves the buffer absent instead of removing `sys.stdout` outright.
-    let buffer = crate::builtins::builtin_open(&[
-        w_int_new(i64::from(fd)),
-        w_str_new(if writable { "wb" } else { "rb" }),
-        w_int_new(if unbuffered { 0 } else { -1 }),
-        w_none(),
-        w_none(),
-        w_none(),
-        w_bool_from(false),
-    ])
+    let allow_windows_console = !crate::importing::legacy_windows_stdio_flag();
+    let buffer = crate::builtins::builtin_open_stdio(
+        &[
+            w_int_new(i64::from(fd)),
+            w_str_new(if writable { "wb" } else { "rb" }),
+            w_int_new(if unbuffered { 0 } else { -1 }),
+            w_none(),
+            w_none(),
+            w_none(),
+            w_bool_from(false),
+        ],
+        allow_windows_console,
+    )
     .unwrap_or_else(|_| w_none());
     let _roots = pyre_object::gc_roots::push_roots();
     let buffer = pyre_object::gc_roots::pin_root(buffer);

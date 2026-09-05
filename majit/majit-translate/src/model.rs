@@ -3574,8 +3574,8 @@ pub fn lower_struct_ptr_writes(
 /// the STRUCT, not of the instance — and pyre cannot lower it: the type word
 /// travels only on the allocation, since `optimize_setfield_gc` removes a
 /// `setfield_gc` whose descr `is_typeptr()` and keeps only a constant value,
-/// as `known_class` (`heaptracker.py:66-67`, which drops `typeptr` from every
-/// field list).  Lowering it anyway ships an object whose type word is never
+/// as `known_class` (`heaptracker.all_fielddescrs` drops `typeptr` from every
+/// field list). Lowering it anyway ships an object whose type word is never
 /// written.
 ///
 /// The payload store is inserted *after* the `NewWithVtable` (which reuses the
@@ -3692,9 +3692,19 @@ pub fn fuse_boxing_alloc(
     // `STRUCT`. `malloc_typed(value)` instead recovers it from
     // `value.ob_header.ob_type`; it must match `w_class`, since values may carry
     // a subclass there.
-    fn store_value(graph: &FunctionGraph, base: &Variable, field_name: &str) -> Option<Variable> {
-        let (_, value, _) = unique_store(graph, base, field_name)?;
-        value.as_variable().cloned()
+    fn store_value(
+        graph: &FunctionGraph,
+        base: &Variable,
+        field_name: &str,
+        site: (usize, usize),
+    ) -> Option<Variable> {
+        let store = unique_store(graph, base, field_name)?;
+        store
+            .locations
+            .iter()
+            .any(|&(block, op)| store_dominates_site(graph, base, (block, op), site))
+            .then(|| store.value.as_variable().cloned())
+            .flatten()
     }
     /// Whether the graph writes `base.field_name` at all, however many times.
     /// [`unique_store`] collapses "never written" and "written inconsistently"
@@ -3707,38 +3717,109 @@ pub fn fuse_boxing_alloc(
                 if b == base && field.name.as_str() == field_name)
         })
     }
-    /// The unique graph-wide store to `base.field_name`, or `None` if absent
-    /// or conflicting. Without reaching-definition analysis, choosing among
-    /// disagreeing stores would depend on block order, so the pass declines.
-    /// This matches `rpython/translator/backendopt/malloc.py:176-186`, which
+    /// The unique graph-wide value stored to `base.field_name`, or `None` if
+    /// absent or conflicting. Without reaching-definition analysis, choosing
+    /// among disagreeing stores would depend on block order, so the pass
+    /// declines. This matches `BaseMallocRemover.compute_lifetimes`, which
     /// disables malloc optimization for multiple creation points ("aliasing
-    /// problems").
+    /// problems"). Identical redundant writes retain all their locations so
+    /// the dominance check can accept whichever one reaches the allocation.
+    struct UniqueStore<'g> {
+        field: &'g FieldDescriptor,
+        value: &'g LinkArg,
+        ty: &'g ValueType,
+        locations: Vec<(usize, usize)>,
+    }
     fn unique_store<'g>(
         graph: &'g FunctionGraph,
         base: &Variable,
         field_name: &str,
-    ) -> Option<(&'g FieldDescriptor, &'g LinkArg, &'g ValueType)> {
-        let mut found: Option<(&FieldDescriptor, &LinkArg, &ValueType)> = None;
-        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
-            let OpKind::FieldWrite {
-                base: b,
-                field,
-                value,
-                ty,
-            } = &op.kind
-            else {
-                continue;
-            };
-            if b != base || field.name.as_str() != field_name {
-                continue;
-            }
-            match found {
-                None => found = Some((field, value, ty)),
-                Some((_, seen, _)) if seen == value => {}
-                Some(_) => return None,
+    ) -> Option<UniqueStore<'g>> {
+        let mut found: Option<UniqueStore<'g>> = None;
+        for (block_idx, block) in graph.blocks.iter().enumerate() {
+            for (op_idx, op) in block.operations.iter().enumerate() {
+                let OpKind::FieldWrite {
+                    base: b,
+                    field,
+                    value,
+                    ty,
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if b != base || field.name.as_str() != field_name {
+                    continue;
+                }
+                match &mut found {
+                    None => {
+                        found = Some(UniqueStore {
+                            field,
+                            value,
+                            ty,
+                            locations: vec![(block_idx, op_idx)],
+                        })
+                    }
+                    Some(store) if store.value == value => {
+                        store.locations.push((block_idx, op_idx));
+                    }
+                    Some(_) => return None,
+                }
             }
         }
         found
+    }
+    /// Whether this write must execute between `base`'s construction and the
+    /// allocation site.  A graph-wide unique write is not enough: when the
+    /// same aggregate crosses both arms of a branch, a write on only one arm
+    /// does not initialize the allocation reached at the join.
+    ///
+    /// Compute dominance relative to the producer of `base`, rather than the
+    /// function entry.  That preserves the valid sibling shape where each arm
+    /// constructs and initializes its own header before the two header values
+    /// merge: the other arm is not reachable from that producer and therefore
+    /// is not a path along which that particular header can arrive uninitialized.
+    fn store_dominates_site(
+        graph: &FunctionGraph,
+        base: &Variable,
+        store: (usize, usize),
+        site: (usize, usize),
+    ) -> bool {
+        let Some(definition) = graph.blocks.iter().enumerate().find_map(|(bi, block)| {
+            block
+                .operations
+                .iter()
+                .position(|op| op.result.as_ref() == Some(base))
+                .map(|oi| (bi, oi))
+        }) else {
+            return false;
+        };
+        if store.0 == definition.0 && store.1 <= definition.1 {
+            return false;
+        }
+
+        let reaches = |from: usize, to: usize, avoid: Option<usize>| {
+            let mut seen = vec![false; graph.blocks.len()];
+            let mut pending = vec![from];
+            while let Some(block) = pending.pop() {
+                if seen[block] || (avoid == Some(block) && block != from) {
+                    continue;
+                }
+                if block == to {
+                    return true;
+                }
+                seen[block] = true;
+                pending.extend(graph.blocks[block].exits.iter().map(|link| link.target.0));
+            }
+            false
+        };
+
+        if store.0 == site.0 {
+            return store.1 < site.1 && reaches(definition.0, store.0, None);
+        }
+        if !reaches(definition.0, store.0, None) || !reaches(store.0, site.0, None) {
+            return false;
+        }
+        store.0 == definition.0 || !reaches(definition.0, site.0, Some(store.0))
     }
     /// Resolve `var` to producer variables through `Block.inputargs` phis.
     /// Stores name producers rather than phis, and every incoming root must
@@ -3890,17 +3971,18 @@ pub fn fuse_boxing_alloc(
             _ => None,
         })
     }
-    /// Whether the header named by `root` declares no class word in its layout.
+    /// Whether the header named by `root` declares `field_name` in its layout.
     ///
     /// `root` is a `SyntheticTransparentCtor` result, so the header struct is
     /// the ctor's own name. An unresolvable owner or an unregistered layout
-    /// answers `false`: neither is evidence that a field is missing. Callers
-    /// separately reject a `w_class` store that contradicts this layout.
-    fn header_declares_no_class_word(
+    /// answers `None`: neither is evidence that a field is missing. Callers
+    /// separately reject stores that contradict a registered layout.
+    fn header_declares_field(
         graph: &FunctionGraph,
         root: &Variable,
+        field_name: &str,
         struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
-    ) -> bool {
+    ) -> Option<bool> {
         let owner = graph
             .blocks
             .iter()
@@ -3911,9 +3993,9 @@ pub fn fuse_boxing_alloc(
                 }
                 _ => None,
             });
-        let Some(owner) = owner else { return false };
+        let owner = owner?;
         registered_struct_layout(&owner, struct_field_attrs)
-            .is_some_and(|rows| rows.iter().all(|(name, _)| name != "w_class"))
+            .map(|rows| rows.iter().any(|(name, _)| name == field_name))
     }
     struct Payload {
         field: FieldDescriptor,
@@ -3944,9 +4026,9 @@ pub fn fuse_boxing_alloc(
         vtable: Option<i64>,
         w_class: Option<Payload>,
     }
-    let resolve_header_plan = |graph: &FunctionGraph, agg: &Variable| -> Option<HeaderPlan> {
-        let Some(header) =
-            store_value(graph, agg, "ob_header").or_else(|| store_value(graph, agg, "ob"))
+    let resolve_header_plan = |graph: &FunctionGraph, agg: &Variable, site: (usize, usize)| {
+        let Some(header) = store_value(graph, agg, "ob_header", site)
+            .or_else(|| store_value(graph, agg, "ob", site))
         else {
             crate::decline::record(
                 VTABLE_GATE,
@@ -3978,15 +4060,34 @@ pub fn fuse_boxing_alloc(
             // (`heaptracker.get_vtable_for_gcstruct`), and forks on whether the
             // struct has one at all: `new_with_vtable` when it does, plain
             // `new` when it does not.  Neither arm ever writes the type word as
-            // a field — `heaptracker.py:66` drops `typeptr` from every field
-            // list ("dealt otherwise"), so no setfield for it is ever built.
+            // a field — `heaptracker.all_fielddescrs` drops `typeptr` from
+            // every field list ("dealt otherwise"), so no setfield for it is
+            // ever built.
             //
-            // pyre recovers that same static answer by data flow, its rtyper
-            // carrying no `_hints`: a root that writes no type word at all is
-            // the `new` case, one that writes a constant is `new_with_vtable`.
-            let root_vtable = match unique_store(graph, root, "ob_type") {
-                Some((_, value, _)) => {
-                    let Some(vtable) = value
+            // pyre recovers that same static answer from the registered header
+            // layout, its rtyper carrying no `_hints`. Data flow then proves
+            // that a declared type word has a dominating constant store; only
+            // a layout that omits the word is the plain `new` case.
+            let Some(declares_type_word) =
+                header_declares_field(graph, root, "ob_type", struct_field_attrs)
+            else {
+                crate::decline::record(
+                    VTABLE_GATE,
+                    "header-layout-unregistered-or-ambiguous",
+                    format_args!("{}", graph.name),
+                );
+                return None;
+            };
+            let type_store = unique_store(graph, root, "ob_type");
+            let root_vtable = match type_store {
+                Some(store)
+                    if declares_type_word
+                        && store.locations.iter().any(|&(block, op)| {
+                            store_dominates_site(graph, root, (block, op), site)
+                        }) =>
+                {
+                    let Some(vtable) = store
+                        .value
                         .as_variable()
                         .and_then(|v| const_ref_addr(graph, v, 8))
                     else {
@@ -3995,8 +4096,8 @@ pub fn fuse_boxing_alloc(
                         // option: `optimize_setfield_gc` removes a `setfield_gc`
                         // whose descr `is_typeptr()`, keeping only a CONSTANT
                         // value and only as `known_class` — the same
-                        // `heaptracker.py:66-67` rule that keeps the type word
-                        // out of the field lists.  A plain `new` here would
+                        // `heaptracker.all_fielddescrs` rule that keeps the
+                        // type word out of the field lists. A plain `new` here would
                         // therefore ship an object whose type word is never
                         // written at all.  RPython cannot reach this shape,
                         // its typeptr being a property of the STRUCT rather
@@ -4017,26 +4118,43 @@ pub fn fuse_boxing_alloc(
                     };
                     Some(vtable)
                 }
-                // `unique_store` answers `None` both for a root that never
-                // writes the word and for one that writes it inconsistently.
-                // Only the first is upstream's `new`.
-                None if any_store(graph, root, "ob_type") => {
+                Some(_) if !declares_type_word => {
                     crate::decline::record(
                         VTABLE_GATE,
-                        "ob_type-stores-conflict",
+                        "ob_type-store-contradicts-layout",
+                        format_args!("{}", graph.name),
+                    );
+                    return None;
+                }
+                // A declared type word must have one reaching constant store.
+                // Absence, conflicting writes, or a write that does not
+                // dominate the allocation are all incomplete initialization,
+                // never evidence for upstream's plain `new` arm.
+                _ if declares_type_word => {
+                    crate::decline::record(
+                        VTABLE_GATE,
+                        if any_store(graph, root, "ob_type") {
+                            "ob_type-store-conflicting-or-nondominating"
+                        } else {
+                            "declared-ob_type-store-missing"
+                        },
                         format_args!("{}", graph.name),
                     );
                     return None;
                 }
                 None => None,
+                Some(_) => unreachable!("layout contradiction handled above"),
             };
-            let declares_no_class_word =
-                header_declares_no_class_word(graph, root, struct_field_attrs);
+            let Some(declares_class_word) =
+                header_declares_field(graph, root, "w_class", struct_field_attrs)
+            else {
+                return None;
+            };
             let store = match unique_store(graph, root, "w_class") {
                 // A store to a field absent from the registered layout makes
                 // the layout evidence self-contradictory, so keep the original
                 // allocation rather than guessing which source is correct.
-                Some(_) if declares_no_class_word => {
+                Some(_) if !declares_class_word => {
                     crate::decline::record(
                         VTABLE_GATE,
                         "w_class-store-contradicts-layout",
@@ -4044,16 +4162,21 @@ pub fn fuse_boxing_alloc(
                     );
                     return None;
                 }
-                Some((field, value, ty)) => {
+                Some(store)
+                    if store.locations.iter().any(|&(block, op)| {
+                        store_dominates_site(graph, root, (block, op), site)
+                    }) =>
+                {
                     // With no vtable on the allocation there is nothing the
                     // class store could fold into, so it is always kept.
                     let folds = root_vtable.is_some_and(|root_vtable| {
-                        value
+                        store
+                            .value
                             .as_variable()
                             .and_then(|value| get_instantiate_arg_addr(graph, value, 8))
                             == Some(root_vtable)
                     });
-                    (!folds).then(|| (field.clone(), value.clone(), ty.clone()))
+                    (!folds).then(|| (store.field.clone(), store.value.clone(), store.ty.clone()))
                 }
                 // RPython's root OBJECT declares only `typeptr`. With no
                 // per-instance class word, there is nothing that can disagree
@@ -4062,10 +4185,10 @@ pub fn fuse_boxing_alloc(
                 // keys on a field descriptor named `w_class`
                 // (`descr.rs FieldDescr::is_w_class`), which a struct that
                 // never declares the field cannot produce.
-                None if declares_no_class_word => None,
+                None if !declares_class_word => None,
                 // A layout that declares `w_class` still needs a unique store
                 // proving that the vtable stands for that per-instance class.
-                None => {
+                Some(_) | None => {
                     crate::decline::record(
                         VTABLE_GATE,
                         "no-unique-w_class-store",
@@ -4245,8 +4368,13 @@ pub fn fuse_boxing_alloc(
             let mut payloads = Vec::with_capacity(fields.len());
             let mut complete = true;
             for (field_name, payload_ty) in &fields {
-                let found = unique_store(graph, agg, field_name.as_str())
-                    .map(|(field, value, _)| (field.clone(), value.clone()));
+                let found = unique_store(graph, agg, field_name.as_str()).and_then(|store| {
+                    store
+                        .locations
+                        .iter()
+                        .any(|&(block, op)| store_dominates_site(graph, agg, (block, op), (bi, oi)))
+                        .then(|| (store.field.clone(), store.value.clone()))
+                });
                 match found {
                     Some((field, value)) => payloads.push(Payload {
                         field,
@@ -4286,7 +4414,7 @@ pub fn fuse_boxing_alloc(
             // `model::resolve_header_plan` rows are where that is recorded,
             // and this row is the count of clusters the fuse gave up on for
             // any header reason at all.
-            let Some(header) = resolve_header_plan(graph, agg) else {
+            let Some(header) = resolve_header_plan(graph, agg, (bi, oi)) else {
                 crate::decline::record(
                     FUSE_GATE,
                     "vtable-unresolved",
@@ -4346,8 +4474,9 @@ pub fn fuse_boxing_alloc(
         // The kept stores follow the allocation, in struct order: the header's
         // `w_class` where the vtable does not stand for it, then the payloads.
         // Each is a plain `FieldWrite` the assembler lowers to its own
-        // `setfield_gc`, which is the shape `jtransform.py:1044` leaves every
-        // field the allocation itself does not carry.
+        // `setfield_gc`, which is the shape
+        // `Transformer.rewrite_op_malloc` leaves every field the allocation
+        // itself does not carry.
         for (k, payload) in site.w_class.into_iter().chain(site.payloads).enumerate() {
             block.operations.insert(
                 site.op + 1 + k,
@@ -8541,6 +8670,13 @@ mod tests {
     fn numeric_boxing_attrs() -> std::collections::HashMap<String, Vec<(String, ValueType)>> {
         std::collections::HashMap::from([
             (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
                 "W_FloatObject".to_string(),
                 vec![
                     ("ob_header".to_string(), ValueType::Ref(None)),
@@ -8992,7 +9128,7 @@ mod tests {
         // (bytesobject.rs) stores the base `ob_type` beside a `w_class` read
         // back off the shadow stack, where re-synthesising would answer the
         // base type for `type(B(b'x'))`.  Both still lower — the store is kept
-        // as its own `FieldWrite`, which is what `jtransform.py:1044` leaves
+        // as its own `FieldWrite`, which is what `Transformer.rewrite_op_malloc` leaves
         // every field the allocation does not carry.
         type Var = crate::flowspace::model::Variable;
         const FLOAT_TYPE_ADDR: i64 = 4357049520;
@@ -9697,6 +9833,44 @@ mod tests {
                 "{row}: malloc_typed residual must survive exactly when the cluster declines"
             );
         }
+
+        // A single graph-wide store is still insufficient when it lives on
+        // only one branch. Move the otherwise-valid type-word write out of the
+        // dominator and onto the true arm; the false arm reaches the same
+        // malloc with the shared header uninitialized.
+        let (mut graph, join) = cluster(&untouched);
+        let entry = graph.startblock;
+        let store_pos = graph
+            .block(entry)
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::FieldWrite { field, .. }
+                    if field.name.as_str() == "ob_type")
+            })
+            .expect("fixture has a dominating ob_type store");
+        let branch_only_store = graph.block_mut(entry).operations.remove(store_pos);
+        let true_arm = graph
+            .block(entry)
+            .exits
+            .iter()
+            .find(|link| link.exitcase == Some(ExitCase::Bool(true)))
+            .expect("fixture has a true arm")
+            .target;
+        graph.push_op_var(true_arm, branch_only_store.kind, false);
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            0,
+            "an ob_type store on only one arm must not initialize the joined malloc"
+        );
+        assert!(graph.block(join).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("malloc_typed")
+            )
+        }));
     }
 
     #[test]
@@ -10185,15 +10359,24 @@ mod tests {
 
         // Synthetic fixtures have no StructId registry, so use the ctor's
         // exact owner spelling. Production qualified aliases resolve by id.
-        let attrs = std::collections::HashMap::from([(
-            "W_SetObject".to_string(),
-            vec![
-                ("ob_header".to_string(), ValueType::Ref(None)),
-                ("items".to_string(), ValueType::Ref(None)),
-                ("len".to_string(), ValueType::Int),
-                ("hash".to_string(), ValueType::Int),
-            ],
-        )]);
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_SetObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("len".to_string(), ValueType::Int),
+                    ("hash".to_string(), ValueType::Int),
+                ],
+            ),
+        ]);
         let fused = fuse_boxing_alloc(&mut graph, &attrs);
         assert_eq!(fused, 1, "the non-numeric boxing cluster must fuse");
 
@@ -10495,7 +10678,7 @@ mod tests {
         // present but not constant cannot travel on the allocation, and it
         // cannot follow as its own store either: `optimize_setfield_gc` removes
         // a `setfield_gc` whose descr `is_typeptr()` and keeps only a constant
-        // value, as `known_class` (`heaptracker.py:66-67`).  Emitting `new` for
+        // value, as `known_class` (`heaptracker.all_fielddescrs`). Emitting `new` for
         // it ships an object whose type word is never written.
         type Var = crate::flowspace::model::Variable;
         const CLASS_ADDR: i64 = 4357049520;
@@ -10504,6 +10687,8 @@ mod tests {
         enum ObType {
             /// No store at all — upstream's struct with no vtable to take.
             Unstored,
+            /// The layout declares a type word, but this path never writes it.
+            DeclaredUnstored,
             /// A constant type pointer.
             Constant,
             /// A class read back off the shadow stack: present, but no
@@ -10539,7 +10724,7 @@ mod tests {
                 )
                 .unwrap();
             let stored = match ob_type {
-                ObType::Unstored => None,
+                ObType::Unstored | ObType::DeclaredUnstored => None,
                 ObType::Constant => Some(
                     graph
                         .push_op_var(entry, OpKind::ConstRefAddr(CLASS_ADDR), true)
@@ -10618,7 +10803,7 @@ mod tests {
         /// `Some(None)` expects a plain `New`; `Some(Some(addr))` expects a
         /// `NewWithVtable` carrying that address; `None` expects no fusion.
         type Expected = Option<Option<i64>>;
-        let rows: [(&str, ObType, &str, Expected); 6] = [
+        let rows: [(&str, ObType, &str, Expected); 7] = [
             (
                 "a constant type word rides on the allocation",
                 ObType::Constant,
@@ -10655,11 +10840,23 @@ mod tests {
                 "malloc",
                 None,
             ),
+            (
+                "a declared type word that is not stored never becomes plain new",
+                ObType::DeclaredUnstored,
+                "malloc",
+                None,
+            ),
         ];
 
         for (label, ob_type, flavor, expected) in rows {
             let mut graph = cluster(&ob_type, flavor);
             let entry = graph.startblock;
+            let header_layout = match ob_type {
+                ObType::Unstored => vec![],
+                ObType::DeclaredUnstored | ObType::Constant | ObType::ShadowStack => {
+                    vec![("ob_type".to_string(), ValueType::Ref(None))]
+                }
+            };
             let attrs = std::collections::HashMap::from([
                 (
                     "W_IntObject".to_string(),
@@ -10668,10 +10865,7 @@ mod tests {
                         ("intval".to_string(), ValueType::Int),
                     ],
                 ),
-                (
-                    "TypeOnlyHeader".to_string(),
-                    vec![("ob_type".to_string(), ValueType::Ref(None))],
-                ),
+                ("TypeOnlyHeader".to_string(), header_layout),
             ]);
             assert_eq!(
                 fuse_boxing_alloc(&mut graph, &attrs),
@@ -10703,7 +10897,7 @@ mod tests {
             });
             assert_eq!(emitted, expected, "{label}: wrong allocation opcode");
             // Whichever arm ran, the type word is never re-emitted as a store
-            // onto the allocation: `heaptracker.py:66` keeps `typeptr` out of
+            // onto the allocation: `heaptracker.all_fielddescrs` keeps `typeptr` out of
             // every field list, and a `setfield_gc` for it would be removed
             // downstream anyway.  (The dropped `ob_header` subtree keeps its
             // own store until the later remnant sweep, so this asks about the

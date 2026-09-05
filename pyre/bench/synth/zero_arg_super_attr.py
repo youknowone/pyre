@@ -1,61 +1,23 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
 # pyre-check: spec-folds=load_deref,load_super_attr,super_attr_unwrap
-# Zero-argument `super().val()` with the loop INSIDE the super-bearing method,
-# in the `for` spelling — the `for` twin of `load_super_attr.py`.
+# Zero-argument super inside a FOR_ITER body.  N keeps the pypy reference above
+# check.py's timing floor; CPython is skipped because that N is impractical.
 #
-# The loop form is the point.  `eval.rs for_iter_body_op_is_jit_safe` is an
-# allow-list over the opcodes a FOR_ITER body may hold, and `LOAD_SUPER_ATTR`
-# was not on it, so the whole `run` frame was refused at the back edge:
-# `gate_declined_for_iter_region` counted once per iteration and the only
-# compiled loop was `val`'s own function-entry trace.  At 2,000,000 iterations
-# that ran 2.28s, against 0.03s for the identical body calling a plain
-# `self.plain()`.  The `while` twin never reaches the gate and so never showed
-# it.
+# `load_super_attr_descent` still declines at unpublished `w_method_new`.
+# Publishing it in a throwaway dynasm binary exposed an unclosed RootScope
+# bracket: before `7d57e55a2dc` the shadow stack grew each iteration.  Best of
+# three runs per N, in ns/iteration (`fold` disables only the descent):
 #
-# The body is also the LOAD_DEREF carrier: `super()` with no arguments reads
-# `__class__` out of the closure, so the compiler emits LOAD_GLOBAL super,
-# LOAD_DEREF __class__, LOAD_FAST self, LOAD_SUPER_ATTR — three of the four
-# were already admitted.
+#                  descent           fold          `PYRE_NO_JIT=1`
+#         N     before  after     before  after     before  after
+#   250,000      3131    265        353    182       1516    860
+#   500,000      3445    169        170     91       1315    774
+# 1,000,000      4372    119         87     46       1243    730
+# 2,000,000      8009     95         45     23       1181    709
 #
-# N is sized for pypy, not for cpython.  This file used to run 10,000
-# iterations, at which pypy's execution-only time is a few microseconds --
-# under `EXEC_TIME_FLOOR_S`, so check.py printed the ratio with a `~`, whose
-# legend says "ratio is not a measurement, and no ratio gate is applied to
-# it".  What that column showed was warmup: the same file reads 12.6ns per
-# iteration at 1,000,000 and 0.9ns at 20,000,000.  pypy settles at ~0.6ns per
-# iteration here, so 250,000,000 is what puts its execution time (~0.17s) far
-# enough above `FLOOR_GATE_MIN_BASELINE_S` for the ratio to be a measurement
-# and for the ceiling below to be enforced.  cpython cannot usefully run that
-# many, hence `skip-cpython`; pypy stays the oracle the backends' output is
-# compared against.
-#
-# The ceiling is fitted to what that measurement reads: 1.5x on dynasm and
-# 1.7x on cranelift, carried with room for a slower host.
-# `load_super_attr.py` carries the same 3 for the same family.
-#
-# `load_super_attr_descent` is not among them, and adding it is not the
-# improvement it looks like.  The descent walks the MRO suffix and declines at
-# `pyre_object::function::w_method_new`, the unpublished descriptor bind that
-# ends the walk, so it is consulted once per trace and fires zero times.  The
-# earlier `wtf8_key_is_utf8` wall this comment used to name is gone; that one
-# moved rather than resolved anything.
-#
-# The wall has since been lifted experimentally, and what is behind it is a
-# regression.  With the descent firing on this body it read 7.71s against
-# 0.06s for the hand-written `load_super_attr` fold at N=2,000,000 -- 128x,
-# A/B'd on ONE binary with `PYRE_FBW_NO_SPECIALIZE=load_super_attr_descent`,
-# with identical output and with both arms reporting `loops_compiled=2
-# loops_aborted=0`.  No abort, no bailout, no compile failure: the compiled
-# trace itself is what is worse, and nothing explains why yet.
-#
-# The preference is what makes that reachable.
-# `try_walker_specialize_load_super_attr` consults the descent first and
-# returns on success, so a firing descent takes a site AWAY from the fold
-# rather than adding one.  On
-# `extra_tests/snippets/class_super_zero_arg_inlined_callee.py` the fold alone
-# covers 5 of 5 super sites; with the descent firing, coverage splits 3+2,
-# `loops_compiled` drops 6 -> 4 and `loops_aborted` rises 0 -> 6.
+# The fixed descent is linear (about 0.049s + 71ns/iteration), but remains 4.2x
+# slower than the fold at N=2,000,000, so `w_method_new` stays unpublished.
 #
 try:
     import pypyjit

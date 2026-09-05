@@ -3527,6 +3527,7 @@ static SYS_BYTES_WARNING: AtomicI64 = AtomicI64::new(0);
 static SYS_DONT_WRITE_BYTECODE: AtomicBool = AtomicBool::new(false);
 static SYS_FAULTHANDLER: AtomicBool = AtomicBool::new(false);
 static SYS_UNBUFFERED: AtomicBool = AtomicBool::new(false);
+static SYS_LEGACY_WINDOWS_STDIO: AtomicBool = AtomicBool::new(false);
 // pypy/interpreter/app_main.py keeps the raw `-X` strings in
 // `options['_xoptions']` (a list) until sys initialization builds the public
 // dict.  Preserve that owner/storage shape rather than introducing a map here.
@@ -3584,6 +3585,7 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     SYS_FAULTHANDLER.store(flags.faulthandler, Ordering::Relaxed);
     *SYS_PYCACHE_PREFIX.lock() = flags.pycache_prefix.clone();
     SYS_UNBUFFERED.store(flags.unbuffered, Ordering::Relaxed);
+    SYS_LEGACY_WINDOWS_STDIO.store(flags.legacy_windows_stdio, Ordering::Relaxed);
     *SYS_XOPTIONS.lock() = flags.xoptions.clone();
     *SYS_WARNOPTIONS.lock() = flags.warnoptions.clone();
     *SYS_STDIO_ENCODING.lock() = flags.stdio_encoding.clone();
@@ -3641,6 +3643,10 @@ pub fn load_pyc_script(bytes: &[u8]) -> Result<pyre_object::PyObjectRef, crate::
 
 pub fn unbuffered_flag() -> bool {
     SYS_UNBUFFERED.load(Ordering::Relaxed)
+}
+
+pub fn legacy_windows_stdio_flag() -> bool {
+    SYS_LEGACY_WINDOWS_STDIO.load(Ordering::Relaxed)
 }
 
 pub fn warnoptions() -> Vec<std::ffi::OsString> {

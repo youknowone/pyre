@@ -620,15 +620,19 @@ fn lower_result_exc_returns_inner(
         // be dropped and the JIT would raise earlier than the interpreter.
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
-        // call otherwise.
-        let forward_err: Option<String> = if is_err {
-            forwards_to_returnblock(graph, bi, &ctor_var)
-                .err()
-                .map(|e| format!("Err shell: {e}"))
+        // call otherwise. RootScope closes are preserved on the rewritten edge.
+        let (forward_err, root_scope_closes): (Option<String>, Vec<OpKind>) = if is_err {
+            match root_scope_closes_to_returnblock(graph, bi, &ctor_var) {
+                Ok(closes) => (None, closes),
+                Err(e) => (Some(format!("Err shell: {e}")), Vec::new()),
+            }
         } else {
-            verify_forwards_to_returnblock_general(graph, bi, &ctor_var)
-                .err()
-                .map(|e| format!("Ok shell: {e}"))
+            (
+                verify_forwards_to_returnblock_general(graph, bi, &ctor_var)
+                    .err()
+                    .map(|e| format!("Ok shell: {e}")),
+                Vec::new(),
+            )
         };
         let forwards_ok = forward_err.is_none();
         if !well_formed_return || !forwards_ok {
@@ -685,6 +689,9 @@ fn lower_result_exc_returns_inner(
             // value — a single owned word — so the payload is forwarded
             // into the raise unchanged and no call is emitted at all.
             let v_exc = materialize_error_to_exc_object(graph, block_id, payload, spec);
+            for close in root_scope_closes {
+                graph.push_op_var(block_id, close, true);
+            }
             // `graph.set_raise_values(block, etype, evalue)`. The `etype`
             // link arg is write-only: `make_return`'s 2-arg arm emits
             // `raise <args[1]>` and never reads `args[0]`
@@ -2058,7 +2065,7 @@ fn verify_drain_reraise_returns_err_payload(
     reraise_target: usize,
     e_payload: &Variable,
     name: &str,
-) -> Result<(), String> {
+) -> Result<Vec<OpKind>, String> {
     let ops = &graph.blocks[reraise_target].operations;
     // `outer = Result::Err()` shell ctor.
     let ctor = ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
@@ -2097,20 +2104,12 @@ fn verify_drain_reraise_returns_err_payload(
         "reraise",
         name,
     )?;
-    // The shell flows to `returnblock` by a STRICT tail forward: block `R`
-    // deletes this whole reraise tail and substitutes an unconditional
-    // `raise vb`, so the arm must be an unconditional `return Err(e)` — a single
-    // exit, no exitswitch, only empty alias-hop blocks en route.  The tolerant
-    // forwarder would license a conditional tail (`if flag { return Err(e) }
-    // else { … }`) whose non-reraise branch the substitution silently drops.
-    if forwards_to_returnblock(graph, reraise_target, &outer).is_ok() {
-        Ok(())
-    } else {
-        Err(format!(
+    root_scope_closes_to_returnblock(graph, reraise_target, &outer).map_err(|_| {
+        format!(
             "{name}: reraise arm block {reraise_target} does not forward the Err shell \
              unconditionally to returnblock"
-        ))
-    }
+        )
+    })
 }
 
 /// Drain-loop `match next()` fusion — the hand-written `match` at
@@ -2361,7 +2360,21 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
         .ok_or_else(|| format!("{name}: drain fuse: bool-switch drops the Err payload"))?;
     let e_reraise = forward_alias(graph, &e_bswitch, &reraise_link)
         .ok_or_else(|| format!("{name}: drain fuse: reraise link drops the Err payload"))?;
-    verify_drain_reraise_returns_err_payload(graph, reraise_target, &e_reraise, &name)?;
+    let reraise_closes =
+        verify_drain_reraise_returns_err_payload(graph, reraise_target, &e_reraise, &name)?;
+    let a_to_b = graph.blocks[a].exits[0].clone();
+    let close_hops = [
+        (reraise_target, &reraise_link),
+        (bswitch, &err_to_bswitch),
+        (err_target, &err_link),
+        (b, &a_to_b),
+    ];
+    let reraise_closes_a: Vec<OpKind> = reraise_closes
+        .iter()
+        .map(|close| {
+            remap_root_scope_close_through_links(graph, close, &close_hops, "drain reraise close")
+        })
+        .collect::<Result<_, _>>()?;
 
     // --- Build the normal (Ok) edge args (A scope), no mutation yet.
     // Mirrors `rewire_one_call_site`'s continue-arm handling: r → payload,
@@ -2608,6 +2621,20 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
             }
         }
     }
+    let mut close_vars_a = Vec::new();
+    for close in &reraise_closes_a {
+        let OpKind::Call { args, .. } = close else {
+            unreachable!("validated RootScope close is a call")
+        };
+        for arg in args {
+            if !close_vars_a.contains(arg) {
+                close_vars_a.push(arg.clone());
+            }
+            if !forwarded.contains(arg) {
+                forwarded.push(arg.clone());
+            }
+        }
+    }
 
     // --- All validation + arg-building passed; mutate. -----------------
     // Block H's inputargs: [forwarded loop vars..., va(etype,unused), vb(evalue)].
@@ -2624,8 +2651,8 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
             .expect("forwarded contains av");
         h_inputs[idx].clone()
     };
-    // Block R's inputarg: [vb].
-    let (r_id, r_inputs) = graph.create_block_with_arg_vars(1);
+    // Block R's inputargs: [vb, RootScope close args...].
+    let (r_id, r_inputs) = graph.create_block_with_arg_vars(1 + close_vars_a.len());
     let r_vb = r_inputs[0].clone();
 
     // H: run the object-level StopIteration predicate on `vb`. `set_branch`
@@ -2656,12 +2683,41 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
         "drain fuse: H references its unused etype inputarg"
     );
 
-    // R: `goto exceptblock [etype, vb]`, i.e. the drain's `return Err(e)`.
-    // The `etype` slot is write-only (`make_return` emits `raise <args[1]>`
+    // R: close the local root scope, then re-raise `vb`. The `etype` slot is
+    // write-only (`make_return` emits `raise <args[1]>`
     // and never reads `args[0]`, `flatten.rs`), so pass `vb` rather
     // than the int-kinded `va` — the raise operand must be the ref-kinded
     // exception value, and a second ref-kinded producer would only add a dead
     // residual to the arm a guard-failure resume walks.
+    for close in reraise_closes_a {
+        let OpKind::Call {
+            target,
+            args,
+            result_ty,
+        } = close
+        else {
+            unreachable!("validated RootScope close is a call")
+        };
+        let args = args
+            .iter()
+            .map(|arg| {
+                close_vars_a
+                    .iter()
+                    .position(|v| v == arg)
+                    .map(|i| r_inputs[i + 1].clone())
+                    .ok_or_else(|| format!("{name}: drain reraise close lost an argument"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        graph.push_op_var(
+            r_id,
+            OpKind::Call {
+                target,
+                args,
+                result_ty,
+            },
+            true,
+        );
+    }
     graph.set_raise_values(r_id, r_vb.clone(), r_vb);
 
     // Break edge args in H scope (all forwarded Variables; the dead threads
@@ -2689,13 +2745,15 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
     // H: branch on the object-level predicate — true → break target; false →
     // R (reraise `raise vb`). `set_branch` wraps `matched` in `bool` and
     // installs arity-checked links (MUST-ADD#2).
+    let mut reraise_args = vec![h_vb.clone()];
+    reraise_args.extend(close_vars_a.iter().map(h_of));
     graph.set_branch(
         h_id,
         matched,
         BlockId(break_target),
         break_vars,
         r_id,
-        vec![h_vb.clone()],
+        reraise_args,
     );
 
     // A: LastException exits — normal → Ok arm; exception → H (catch-all).
@@ -2796,6 +2854,46 @@ pub(crate) fn build_shell(
     shell
 }
 
+fn remap_root_scope_close_through_links(
+    graph: &FunctionGraph,
+    close: &OpKind,
+    hops: &[(usize, &Link)],
+    name: &str,
+) -> Result<OpKind, String> {
+    let OpKind::Call {
+        target,
+        args,
+        result_ty,
+    } = close
+    else {
+        return Err(format!("{name}: expected a RootScope close call"));
+    };
+    let mut remapped = Vec::with_capacity(args.len());
+    for arg in args {
+        let mut current = arg.clone();
+        for &(target_block, link) in hops {
+            if link.target.0 != target_block {
+                return Err(format!("{name}: forwarding link targets the wrong block"));
+            }
+            let pos = graph.blocks[target_block]
+                .inputargs
+                .iter()
+                .position(|v| *v == current)
+                .ok_or_else(|| format!("{name}: close argument is not forwarded"))?;
+            current = match link.args.get(pos) {
+                Some(LinkArg::Value(v)) => v.clone(),
+                _ => return Err(format!("{name}: close argument is not a value")),
+            };
+        }
+        remapped.push(current);
+    }
+    Ok(OpKind::Call {
+        target: target.clone(),
+        args: remapped,
+        result_ty: result_ty.clone(),
+    })
+}
+
 /// Probe: does `var` flow from `block`'s exit through pure positional
 /// forwarding into `returnblock`?  Any non-conforming hop means "not a
 /// tail forward" rather than a build failure (the site is then matched as
@@ -2808,8 +2906,28 @@ fn forwards_to_returnblock(
     block: usize,
     var: &Variable,
 ) -> Result<(), String> {
+    forwards_to_returnblock_inner(graph, block, var, false).map(|_| ())
+}
+
+/// Return the RootScope closes that an exceptional rewrite must preserve.
+fn root_scope_closes_to_returnblock(
+    graph: &FunctionGraph,
+    block: usize,
+    var: &Variable,
+) -> Result<Vec<OpKind>, String> {
+    forwards_to_returnblock_inner(graph, block, var, true)
+}
+
+fn forwards_to_returnblock_inner(
+    graph: &FunctionGraph,
+    block: usize,
+    var: &Variable,
+    past_bracket_closes: bool,
+) -> Result<Vec<OpKind>, String> {
     let mut current = block;
     let mut tracked = var.clone();
+    let mut closes = Vec::new();
+    let mut hops: Vec<(usize, Link)> = Vec::new();
     for _ in 0..graph.blocks.len() {
         // A pure tail forward only crosses empty, unconditional blocks
         // after the producer `block`; an intermediate block with
@@ -2817,7 +2935,14 @@ fn forwards_to_returnblock(
         // a tail forward.
         if current != block {
             let b = &graph.blocks[current];
-            if !b.operations.is_empty() {
+            let carries_work = if past_bracket_closes {
+                !b.operations
+                    .iter()
+                    .all(|op| crate::front::mir::is_root_scope_drop_glue_call(&op.kind))
+            } else {
+                !b.operations.is_empty()
+            };
+            if carries_work {
                 return Err(format!(
                     "forwarding block {current} carries {} operation(s), \
                      first {:?}, {} exit(s), exitswitch {}, {} predecessor(s)",
@@ -2827,6 +2952,21 @@ fn forwards_to_returnblock(
                     b.exitswitch.is_some(),
                     graph.predecessors(BlockId(current)).len(),
                 ));
+            }
+            if past_bracket_closes {
+                let reverse_hops: Vec<(usize, &Link)> = hops
+                    .iter()
+                    .rev()
+                    .map(|(target, link)| (*target, link))
+                    .collect();
+                for op in &b.operations {
+                    closes.push(remap_root_scope_close_through_links(
+                        graph,
+                        &op.kind,
+                        &reverse_hops,
+                        "return close",
+                    )?);
+                }
             }
             if b.exitswitch.is_some() {
                 return Err(format!("forwarding block {current} has a conditional exit"));
@@ -2848,7 +2988,7 @@ fn forwards_to_returnblock(
             ));
         };
         if link.target == graph.returnblock {
-            return Ok(());
+            return Ok(closes);
         }
         let target = link.target.0;
         let Some(next_var) = graph.blocks[target].inputargs.get(pos) else {
@@ -2857,6 +2997,7 @@ fn forwards_to_returnblock(
             ));
         };
         tracked = next_var.clone();
+        hops.push((target, link.clone()));
         current = target;
     }
     Err("forwarding chain is longer than the block count".to_string())

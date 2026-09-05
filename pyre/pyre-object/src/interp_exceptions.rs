@@ -1905,14 +1905,16 @@ pub fn standard_exc_instance(kind: ExcKind) -> PyObjectRef {
 /// Uses `ll_isinstance` against the `BaseException` root
 /// (`EXCEPTION_TYPE`); every per-kind exception `PyType` is registered
 /// as a descendant via `all_foreign_pytypes`, so the
-/// `subclassrange_{min,max}` check (`rclass.py:1133-1137`) matches
+/// `subclassrange_{min,max}` check (`rclass.py ll_issubclass`) matches
 /// every subclass without pointer-identity coupling.
+///
+/// Subclass ranges are stamped by interpreter/JIT startup before Python runs,
+/// matching RPython's rtyper-time initialization.
 ///
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_exception(obj: PyObjectRef) -> bool {
-    crate::pyobject::ensure_object_subclass_ranges_initialized();
     // `ll_issubclass` reads the ranges under the seqlock, so a concurrent
     // one-time batch re-stamp cannot make this spuriously false.
     unsafe { ll_isinstance(obj, &EXCEPTION_TYPE) }
@@ -2181,8 +2183,14 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
 mod tests {
     use super::*;
 
+    // The standalone pyre-object test binary does not run interpreter startup.
+    fn seed_subclass_ranges() {
+        crate::pyobject::ensure_object_subclass_ranges_initialized();
+    }
+
     #[test]
     fn test_exception_create_and_read() {
+        seed_subclass_ranges();
         let obj = w_exception_new(ExcKind::ValueError, "bad value");
         unsafe {
             assert!(is_exception(obj));
@@ -2208,6 +2216,7 @@ mod tests {
     /// null, so either of the earlier screens could be the one that rejects.
     #[test]
     fn test_kind_checked_rejects_out_of_range_tag() {
+        seed_subclass_ranges();
         let live = w_exception_new(ExcKind::ValueError, "bad value");
         let mut copy: W_BaseException = unsafe { std::ptr::read(live as *const W_BaseException) };
         let obj = std::ptr::addr_of_mut!(copy) as PyObjectRef;
@@ -2231,6 +2240,7 @@ mod tests {
     /// without ever loading the tail field the tag lives in.
     #[test]
     fn test_kind_checked_rejects_non_exception_header() {
+        seed_subclass_ranges();
         let buf = [0usize; std::mem::size_of::<W_BaseException>() / 8];
         assert_eq!(
             unsafe { w_exception_kind_checked(buf.as_ptr() as PyObjectRef) },
@@ -2244,6 +2254,7 @@ mod tests {
 
     #[test]
     fn test_kind_checked_accepts_real_exception() {
+        seed_subclass_ranges();
         for kind in [ExcKind::ValueError, ExcKind::EOFError] {
             let obj = w_exception_new(kind, "bad value");
             assert_eq!(unsafe { w_exception_kind_checked(obj) }, Some(kind));
@@ -2339,6 +2350,7 @@ mod tests {
 
     #[test]
     fn memory_error_singleton_is_idempotent_and_typed() {
+        seed_subclass_ranges();
         let a = memory_error_singleton();
         let b = memory_error_singleton();
         assert_eq!(a as usize, b as usize, "singleton must be stable");
@@ -2352,6 +2364,7 @@ mod tests {
 
     #[test]
     fn standard_exc_instance_is_idempotent_and_per_kind_distinct() {
+        seed_subclass_ranges();
         // RPython `get_standard_ll_exc_instance` returns the same
         // prebuilt instance pointer across repeated lookups (it's the
         // `_reusable_prebuilt_instance` slot on the InstanceRepr).
@@ -2380,6 +2393,7 @@ mod tests {
 
     #[test]
     fn immortal_singleton_enumeration_reports_created_and_forces_none() {
+        seed_subclass_ranges();
         // The root walker forwards each reported singleton's reference slots,
         // so the enumeration must cover every singleton that exists — and must
         // never itself create one, since it runs from inside a collection.

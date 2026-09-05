@@ -96,7 +96,7 @@ pub(crate) struct VirtualizableConfig {
     /// residual call may leave the tracked field/array maps stale.
     ///
     /// With a token, a callee that touches the virtualizable clears it and
-    /// `vable_after_residual_call` (`pyjitpl.py:3373-3375`) aborts the trace,
+    /// `vable_after_residual_call` (`pyjitpl.py`) aborts the trace,
     /// so no read after the call can observe a write the maps missed. A
     /// `without_vable_token` machine has no such signal: the tracer writes the
     /// fields out before the call and reads them back after
@@ -453,7 +453,7 @@ impl VirtualizableTracker {
     /// Drop every tracked static field and array element of the standard
     /// virtualizable.
     ///
-    /// The counterpart of `clean_caches` (`heap.py:519-531`) for the two maps
+    /// The counterpart of `clean_caches` (`heap.py`) for the two maps
     /// this tracker keeps outside `OptHeap`. It applies only to a
     /// `without_vable_token` machine: see
     /// [`VirtualizableConfig::has_vable_token`] for why a token-bearing one

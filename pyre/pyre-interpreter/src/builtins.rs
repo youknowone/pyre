@@ -13515,9 +13515,14 @@ fn nonascii_bytes_literal_span(source: &str, raw_index: usize) -> Option<(usize,
 fn incompatible_string_prefix_error(
     source: &str,
     raw_index: usize,
+    tokenizer_stop: Option<usize>,
 ) -> Option<(String, usize, usize)> {
     let bytes = source.as_bytes();
-    first_string_prefix_pair_error(bytes, raw_index.min(bytes.len()))
+    first_string_prefix_pair_error(
+        bytes,
+        raw_index.min(bytes.len()),
+        tokenizer_stop.map(|stop| stop.min(bytes.len())),
+    )
 }
 
 /// The first string token in `bytes` whose prefix is an incompatible pair.
@@ -13534,23 +13539,44 @@ fn incompatible_string_prefix_error(
 /// that field rather than by the tokenizer, so it only stands where it
 /// precedes the error already reported at `anchor`: `s = f'{ub"y"}'; f() = 1`
 /// names the prefix and `f() = 1; s = f'{ub"y"}'` names the assignment.
-fn first_string_prefix_pair_error(bytes: &[u8], anchor: usize) -> Option<(String, usize, usize)> {
-    /// One literal the walk is inside, and how many braces are open in it --
-    /// a replacement field, and any display written within that field.
+fn first_string_prefix_pair_error(
+    bytes: &[u8],
+    anchor: usize,
+    tokenizer_stop: Option<usize>,
+) -> Option<(String, usize, usize)> {
+    /// One replacement field inside an interpolated literal.  Delimiters are
+    /// the expression's own displays/calls/subscripts; an empty stack is what
+    /// makes `:` enter the format specification rather than a slice or dict.
+    struct ReplacementField {
+        delimiters: Vec<u8>,
+        format_spec: bool,
+    }
+
+    /// One literal the walk is inside, plus the nested replacement fields the
+    /// tokenizer has entered.  A format specification is literal text until
+    /// another `{` opens its own replacement field.
     struct OpenLiteral {
         delimiter: u8,
         triple: bool,
         interpolated: bool,
-        braces: usize,
+        fields: Vec<ReplacementField>,
     }
 
     let mut open: Vec<OpenLiteral> = Vec::new();
     let mut cursor = 0;
     while cursor < bytes.len() {
+        if tokenizer_stop.is_some_and(|stop| cursor > stop) {
+            return None;
+        }
         let byte = bytes[cursor];
-        // The innermost literal's own text, unless a brace of it is open --
-        // inside one the walk is reading tokens again.
-        if let Some(literal) = open.last_mut().filter(|literal| literal.braces == 0) {
+        // The innermost literal's own text, or the literal format-spec text of
+        // its current field.  A nested replacement field switches back to
+        // token mode until its own `}`.
+        if let Some(literal) = open
+            .last_mut()
+            .filter(|literal| literal.fields.last().is_none_or(|field| field.format_spec))
+        {
+            let in_format_spec = !literal.fields.is_empty();
             match byte {
                 // A backslash closes no literal, raw included: `r'\''` keeps
                 // the escape in its text and the quote after it in the token.
@@ -13565,14 +13591,26 @@ fn first_string_prefix_pair_error(bytes: &[u8], anchor: usize) -> Option<(String
                 }
                 b'\\' => cursor += 2,
                 b'\n' if !literal.triple => return None,
-                // `{{` and `}}` each write one brace and open no field.
+                // `{{` in the outer literal writes one brace.  In a format
+                // specification every `{` starts the nested replacement field
+                // that makes its contents tokenized expression text.
                 b'{' if literal.interpolated => {
-                    let doubled = bytes.get(cursor + 1) == Some(&b'{');
+                    let doubled = !in_format_spec && bytes.get(cursor + 1) == Some(&b'{');
                     cursor += 1 + usize::from(doubled);
-                    literal.braces += usize::from(!doubled);
+                    if !doubled {
+                        literal.fields.push(ReplacementField {
+                            delimiters: Vec::new(),
+                            format_spec: false,
+                        });
+                    }
                 }
                 b'}' if literal.interpolated => {
-                    cursor += 1 + usize::from(bytes.get(cursor + 1) == Some(&b'}'));
+                    if in_format_spec {
+                        literal.fields.pop();
+                        cursor += 1;
+                    } else {
+                        cursor += 1 + usize::from(bytes.get(cursor + 1) == Some(&b'}'));
+                    }
                 }
                 _ if byte == literal.delimiter => {
                     if literal.triple && !bytes[cursor..].starts_with(&[byte; 3]) {
@@ -13587,21 +13625,48 @@ fn first_string_prefix_pair_error(bytes: &[u8], anchor: usize) -> Option<(String
             continue;
         }
         match byte {
-            // A comment runs to the end of its line.  Only outside a literal:
-            // what a replacement field writes is not one.
-            b'#' if open.is_empty() => {
+            // A comment runs to the end of its line both at module level and
+            // in a replacement expression.  Literal and format-spec text took
+            // the branch above and never reaches this token-mode arm.
+            b'#' => {
                 cursor = bytes[cursor..]
                     .iter()
                     .position(|byte| *byte == b'\n')
                     .map_or(bytes.len(), |newline| cursor + newline + 1);
             }
-            b'{' | b'}' => {
-                if let Some(literal) = open.last_mut() {
-                    literal.braces = if byte == b'{' {
-                        literal.braces + 1
-                    } else {
-                        literal.braces - 1
+            b'(' | b'[' | b'{' => {
+                if let Some(field) = open
+                    .last_mut()
+                    .and_then(|literal| literal.fields.last_mut())
+                {
+                    field.delimiters.push(byte);
+                }
+                cursor += 1;
+            }
+            b')' | b']' | b'}' => {
+                if let Some(literal) = open.last_mut()
+                    && let Some(field) = literal.fields.last_mut()
+                {
+                    let opening = match byte {
+                        b')' => b'(',
+                        b']' => b'[',
+                        _ => b'{',
                     };
+                    if field.delimiters.last() == Some(&opening) {
+                        field.delimiters.pop();
+                    } else if byte == b'}' && field.delimiters.is_empty() {
+                        literal.fields.pop();
+                    }
+                }
+                cursor += 1;
+            }
+            b':' => {
+                if let Some(field) = open
+                    .last_mut()
+                    .and_then(|literal| literal.fields.last_mut())
+                    && field.delimiters.is_empty()
+                {
+                    field.format_spec = true;
                 }
                 cursor += 1;
             }
@@ -13621,7 +13686,7 @@ fn first_string_prefix_pair_error(bytes: &[u8], anchor: usize) -> Option<(String
                     delimiter: byte,
                     triple,
                     interpolated,
-                    braces: 0,
+                    fields: Vec::new(),
                 });
                 cursor += if triple { 3 } else { 1 };
             }
@@ -15230,7 +15295,41 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     }
     let prefix_error = match &e {
         crate::compile::CompileError::Parse(parse_error) => {
-            incompatible_string_prefix_error(source, parse_error.raw_location.start().to_usize())
+            let raw_index = parse_error.raw_location.start().to_usize();
+            // A fatal tokenizer error means no later token exists.  Ruff still
+            // leaves the remaining source available to this diagnostic pass,
+            // so bound the recovery walk at the error it actually reported.
+            // Grammar errors are different: CPython tokenizes the whole input
+            // before parsing it, and a later incompatible prefix can therefore
+            // precede an earlier assignment error.
+            let tokenizer_stopped = parse_error.is_unclosed_bracket
+                || matches!(
+                    &parse_error.error,
+                    ParseErrorType::Lexical(_)
+                        | ParseErrorType::FStringError(_)
+                        | ParseErrorType::TStringError(_)
+                )
+                || matches!(
+                    &parse_error.error,
+                    ParseErrorType::OtherError(message)
+                        if message.starts_with("unmatched ")
+                            || message.starts_with("closing parenthesis ")
+                )
+                // Ruff recovers some malformed number tokens into an
+                // `OtherError` parser shape, but the CPython-shaped message
+                // above has already identified the tokenizer failure.
+                || matches!(
+                    msg.as_str(),
+                    "invalid decimal literal"
+                        | "invalid hexadecimal literal"
+                        | "invalid octal literal"
+                        | "invalid binary literal"
+                );
+            incompatible_string_prefix_error(
+                source,
+                raw_index,
+                tokenizer_stopped.then_some(raw_index),
+            )
         }
         _ => None,
     };
@@ -16437,6 +16536,35 @@ pub(crate) fn exec_or_eval(
         let _ = ns_roots.pin_root(w_globals);
         slot
     });
+    // `locals_arg` is what `setdictscope` binds far below, and the plant on the
+    // next lines runs user Python: a dict-subclass `setdefault` /
+    // `__contains__` / `__setitem__` can collect, and the nursery relocates the
+    // caller's mapping.  The caller's own reference is forwarded, so its dict
+    // keeps reading correctly while this local copy is left naming the vacated
+    // block; the frame then runs against a stale mapping and every LOAD_NAME /
+    // STORE_NAME through it faults on a header that no longer describes a dict.
+    // Publish it here beside `w_globals` and read it back where it is consumed.
+    //
+    // The two identity questions are answered here for the same reason: asked
+    // after the move, `std::ptr::eq` would compare a forwarded pointer against
+    // a stale one and report two objects where there is one.
+    //
+    // Dict and non-dict mapping arms share the `setdictscope` path — for exact
+    // dict locals this matches the `code.exec_code(space, w_globals, w_locals)`
+    // chain in pyopcode.py `exec_`, which feeds `space.setitem(w_locals, name,
+    // value)` to STORE_NAME.  Pyre's earlier `is_dict_w` arm built a
+    // storage copy and drained it back through a `Vec<String>` snapshot to
+    // mirror DELETE_GLOBAL while preserving alias mutations; routing through
+    // `setdictscope` retires the copy + snapshot entirely.
+    let locals_is_absent = is_none_or_null(locals_arg);
+    let globals_is_absent = is_none_or_null(globals_arg);
+    let locals_is_globals =
+        !locals_is_absent && !globals_is_absent && std::ptr::eq(locals_arg, globals_arg);
+    let locals_object_slot = (!locals_is_absent && !locals_is_globals).then(|| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = ns_roots.pin_root(locals_arg);
+        slot
+    });
     // The validated closure is the caller's tuple, and it is consumed last of
     // all -- after `ensure_*_builtins`, the two namespace pins and the
     // snapshot allocation.  It goes on the same scope as they do rather than
@@ -16503,7 +16631,7 @@ pub(crate) fn exec_or_eval(
     // locals=globals and pyre's existing same-dict path handles it.
     let mut implicit_caller_locals: pyre_object::PyObjectRef = std::ptr::null_mut();
     let caller_frame = caller_anchor.live();
-    if is_none_or_null(globals_arg) && is_none_or_null(locals_arg) && !caller_frame.is_null() {
+    if globals_is_absent && locals_is_absent && !caller_frame.is_null() {
         // The caller's locals as `locals()` reports them: its real namespace
         // for a module or class frame, an independent snapshot for an
         // optimized one.  The snapshot is what keeps `exec("y = 1")` inside a
@@ -16513,29 +16641,6 @@ pub(crate) fn exec_or_eval(
     let implicit_locals_slot = (!implicit_caller_locals.is_null()).then(|| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = ns_roots.pin_root(implicit_caller_locals);
-        slot
-    });
-    let mut locals_object_arg: pyre_object::PyObjectRef = std::ptr::null_mut();
-    if !is_none_or_null(locals_arg) {
-        let same_as_globals =
-            !is_none_or_null(globals_arg) && std::ptr::eq(locals_arg, globals_arg);
-        if !same_as_globals {
-            // Dict and non-dict mapping arms share the
-            // setdictscope path — for exact dict locals this
-            // matches PyPy's `code.exec_code(space, w_globals,
-            // w_locals)` chain (pyopcode.py:776) which feeds
-            // `space.setitem(w_locals, name, value)` to STORE_NAME.
-            // Pyre's earlier `is_dict_w` arm built a storage copy and
-            // drained it back through a `Vec<String>` snapshot to
-            // mirror DELETE_GLOBAL while preserving alias mutations;
-            // routing through `setdictscope` retires the copy +
-            // snapshot entirely.
-            locals_object_arg = locals_arg;
-        }
-    }
-    let locals_object_slot = (!locals_object_arg.is_null()).then(|| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = ns_roots.pin_root(locals_object_arg);
         slot
     });
     // function.py Function.__init__ — build the closure carrier for
@@ -19673,16 +19778,26 @@ pub(crate) unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], c
         }
         if pyre_object::memoryview::is_w_memoryview(obj) {
             memoryview_check_released(obj)?;
-            if memoryview_contiguity(obj).0 {
-                let view = pyre_object::memoryview::w_memoryview_view(obj);
-                let full = view.backing().as_bytes();
-                let off = view.offset() as usize;
-                let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
-                if off <= full.len() && len <= full.len() - off {
-                    return Ok(&full[off..off + len]);
-                }
+            if !memoryview_contiguity(obj).0 {
+                // `PyBUF_SIMPLE` asks for the bytes in address order, and a
+                // strided view cannot hand them over without copying, so the
+                // request is refused rather than answered with the wrong ones.
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+            let view = pyre_object::memoryview::w_memoryview_view(obj);
+            let full = view.backing().as_bytes();
+            let off = view.offset() as usize;
+            let len = pyre_object::memoryview::w_memoryview_length(obj) as usize;
+            if off <= full.len() && len <= full.len() - off {
+                return Ok(&full[off..off + len]);
             }
         }
+        // This is the object-space acquisition layer; public gateways that
+        // own a more specific refusal (for example mmap's `Py_buffer`
+        // converter) translate this TypeError at their boundary.
         Err(crate::PyError::type_error(
             "a bytes-like object is required",
         ))
@@ -21005,6 +21120,23 @@ fn fileio_set_non_inheritable(fd: i32, w_name: PyObjectRef) -> Result<(), crate:
 /// choose exactly one buffered class, and only then add the text wrapper.  In
 /// particular, binary unbuffered I/O returns that raw stream.
 pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_open_impl(args, true)
+}
+
+/// Standard-stream entry to PyPy `_io.open`, retaining the same construction
+/// while allowing CPython's Windows legacy-stdio compatibility flag to bypass
+/// the console raw class for these three streams only.
+pub(crate) fn builtin_open_stdio(
+    args: &[PyObjectRef],
+    allow_windows_console: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    builtin_open_impl(args, allow_windows_console)
+}
+
+fn builtin_open_impl(
+    args: &[PyObjectRef],
+    allow_windows_console: bool,
+) -> Result<PyObjectRef, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
     // Every declared slot binds before the unrecognized keywords are
     // reported, so a call missing `file` names `file`.
@@ -21214,14 +21346,19 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     let (raw_type, console) = {
         let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
-        if crate::module::_io::winconsoleio::pyio_get_console_type(file) != '\0' {
+        if allow_windows_console
+            && crate::module::_io::winconsoleio::pyio_get_console_type(file) != '\0'
+        {
             (crate::module::_io::windows_console_io_type(), true)
         } else {
             (crate::module::_io::fileio_type(), false)
         }
     };
     #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
-    let (raw_type, console) = (crate::module::_io::fileio_type(), false);
+    let (raw_type, console) = {
+        let _ = allow_windows_console;
+        (crate::module::_io::fileio_type(), false)
+    };
     let raw = crate::call::call_function_impl_result(
         raw_type,
         &[
