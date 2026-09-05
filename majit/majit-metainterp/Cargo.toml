@@ -66,6 +66,7 @@ majit-backend-dynasm = { workspace = true, optional = true }
 majit-backend-wasm = { path = "../majit-backend-wasm", version = "0.0.2", default-features = false }
 
 [dev-dependencies]
+bincode = { workspace = true }
 majit-macros = { workspace = true }
 majit-gc = { workspace = true }
 smallvec = { workspace = true }
