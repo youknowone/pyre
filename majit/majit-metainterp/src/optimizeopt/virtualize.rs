@@ -2786,6 +2786,32 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
     // from the qualified owners.  Two *different* variants of one enum are not
     // that edge -- their payloads are different fields sharing an address --
     // and neither is a same-name/same-offset field from an arbitrary struct.
+    fn is_registered_std_shell(owner: &str) -> bool {
+        // Same anchors `codewriter/assembler.rs is_explicit_shell_variant_owner`
+        // uses, plus the enum roots the inherited-tag edge names. A name
+        // registered to any other StructId is a lookalike and must not ride
+        // the shell inheritance exception.
+        const ANCHORS: [&str; 10] = [
+            "core::result::Result::Ok",
+            "std::result::Result::Ok",
+            "core::result::Result::Err",
+            "std::result::Result::Err",
+            "core::option::Option::Some",
+            "std::option::Option::Some",
+            "core::result::Result",
+            "std::result::Result",
+            "core::option::Option",
+            "std::option::Option",
+        ];
+        let Some(owner_id) = majit_ir::descr::struct_template_id_for_name(owner) else {
+            return false;
+        };
+        ANCHORS.iter().any(|anchor| {
+            majit_ir::descr::struct_template_id_for_name(anchor) == Some(owner_id)
+                || majit_ir::descr::StructId::from_canonical(anchor) == owner_id
+        })
+    }
+
     fn explicit_sum_inherits(slot_owner: &str, field_owner: &str) -> bool {
         let (Some((slot_enum, slot_variant)), Some((field_enum, field_variant))) = (
             shelled_sum_owner(slot_owner),
@@ -2793,10 +2819,31 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         ) else {
             return false;
         };
-        slot_enum == field_enum
-            && (slot_variant == field_variant
+        if slot_enum != field_enum
+            || !(slot_variant == field_variant
                 || slot_variant.is_empty()
                 || field_variant.is_empty())
+        {
+            return false;
+        }
+        // Spelling is not identity. When the StructId table is populated,
+        // both owners must resolve to a core/std shell; a user type that
+        // collapses to `result::Result` keeps its own StructId and must
+        // not inherit a standard-library tag or payload slot.
+        //
+        // An empty table is the pre-registry test shape: nothing has been
+        // published, so there is no lookalike to distinguish and the
+        // textual edge stands.
+        match (
+            majit_ir::descr::struct_template_id_for_name(slot_owner),
+            majit_ir::descr::struct_template_id_for_name(field_owner),
+        ) {
+            (None, None) => true,
+            (slot_id, field_id) => {
+                slot_id.is_none_or(|_| is_registered_std_shell(slot_owner))
+                    && field_id.is_none_or(|_| is_registered_std_shell(field_owner))
+            }
+        }
     }
 
     // `rclass.InstanceRepr._setup_repr` gives a sum-type variant subclass the
@@ -4007,6 +4054,60 @@ mod tests {
         )
         .with_parent_descr(template_parent, 1);
         assert!(!slot_holds_field(&ok, &err));
+    }
+
+    #[test]
+    fn explicit_sum_inheritance_rejects_a_registered_lookalike() {
+        static REGISTRY: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _registry = REGISTRY.lock();
+        let core_some = majit_ir::descr::StructId::from_canonical("core::option::Option::Some");
+        let user_some =
+            majit_ir::descr::StructId::from_canonical("user_crate::option::Option::Some");
+        let mut ids = std::collections::HashMap::new();
+        for name in [
+            "Option::Some",
+            "core::option::Option::Some",
+            "std::option::Option::Some",
+        ] {
+            ids.insert(name.to_string(), Some(core_some));
+        }
+        ids.insert("option::Option::Some".to_string(), Some(user_some));
+        majit_ir::descr::register_struct_ids(ids);
+
+        let mut user_size = majit_ir::descr::SimpleSizeDescr::new(0, 8, 1);
+        user_size.set_cache_key(user_some.as_u64());
+        let user_parent = Arc::new(user_size) as DescrRef;
+        let mut core_size = majit_ir::descr::SimpleSizeDescr::new(1, 16, 2);
+        core_size.set_cache_key(core_some.as_u64());
+        let core_parent = Arc::new(core_size) as DescrRef;
+
+        let lookalike = majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "option::Option::Some.__pos_0".to_string(),
+            "__pos_0".to_string(),
+        )
+        .with_parent_descr(user_parent, 0);
+        let shell = majit_ir::SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "Option::Some.__pos_0".to_string(),
+            "__pos_0".to_string(),
+        )
+        .with_parent_descr(core_parent, 1);
+        assert!(
+            !slot_holds_field(&lookalike, &shell),
+            "a user type registered under option::Option::Some must not inherit the std shell"
+        );
+        majit_ir::descr::register_struct_ids(std::collections::HashMap::new());
     }
 
     fn assign_positions(ops: &mut [Op]) {

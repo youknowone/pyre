@@ -3681,24 +3681,6 @@ impl Backend for DynasmBackend {
         self.read_int_at_mem(struct_ptr, offset as i64, size, sign)
     }
 
-    fn bh_getfield_gc_r(
-        &self,
-        struct_ptr: i64,
-        fielddescr: &majit_translate::jitcode::BhDescr,
-    ) -> GcRef {
-        let offset = fielddescr.as_offset();
-        if matches!(
-            fielddescr,
-            majit_translate::jitcode::BhDescr::Field {
-                field_flag: majit_ir::descr::ArrayFlag::Struct,
-                ..
-            }
-        ) {
-            return GcRef((struct_ptr as usize).wrapping_add(offset));
-        }
-        GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
-    }
-
     /// `llmodel.py bh_setfield_gc_i` →
     /// `write_int_at_mem(struct, ofs, size, value)`.  Sign discarded by
     /// `unpack_fielddescr_size` consumer (`llmodel.py`); only

@@ -12323,6 +12323,9 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && name == "map_err"
+            && callee_name_path
+                .as_deref()
+                .is_some_and(is_core_result_map_err_path)
             && let Some(site) = self.recognize_result_map_err_site(
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
@@ -26020,6 +26023,18 @@ fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
             .all(|(s, t)| s.as_str() == *t)
 }
 
+/// `core::result::<Impl>::map_err` / `std::result::Result::map_err`.
+///
+/// The leaf name `map_err` is not enough: an extension trait can publish
+/// the same method on `Result` and Charon still emits `CallTarget::Method`.
+/// Gate on the resolved callee path so a foreign `map_err` stays residual.
+fn is_core_result_map_err_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core" | "std", "result", "<Impl>" | "Result", "map_err"]
+    )
+}
+
 /// `<[T]>::to_vec` — Rust MIR `alloc::slice::<Impl>::to_vec`, a slice→owned-Vec
 /// copy. Retargeted to the `list` builtin (`rtype_bltn_list` -> `ll_copy`).
 fn is_slice_to_vec(segments: &[String]) -> bool {
@@ -28229,12 +28244,33 @@ mod tests {
         DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
         cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
         checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
-        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
-        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
-        tyref_is_raw_byte_ptr, tyref_to_value_type,
+        is_core_result_map_err_path, json_ty_is_thin_pointer_element,
+        json_ty_scalar_element_spelling, push_ptr_to_unsigned_cast, shaped_array_parts,
+        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr, tyref_to_value_type,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
+
+    #[test]
+    fn map_err_capture_requires_the_core_result_callee() {
+        for path in [
+            "core::result::<Impl>::map_err",
+            "std::result::<Impl>::map_err",
+            "core::result::Result::map_err",
+            "std::result::Result::map_err",
+        ] {
+            assert!(is_core_result_map_err_path(path), "{path}");
+        }
+        for path in [
+            "map_err",
+            "Result::map_err",
+            "mycrate::result::<Impl>::map_err",
+            "core::result::ResultExt::<Impl>::map_err",
+            "foo::bar::map_err",
+        ] {
+            assert!(!is_core_result_map_err_path(path), "{path}");
+        }
+    }
 
     #[test]
     fn checked_unsigned_capture_rejects_narrow_integer_atoms() {

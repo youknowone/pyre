@@ -38,6 +38,9 @@ static STRUCT_REGISTRY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::n
 /// remove — while still compiling, and still passing in isolation.
 #[must_use = "the returned guard holds the registry lock for the rest of \
               the test; dropping it immediately re-opens the race"]
+/// Do not hold this guard while calling another registrar: the lock is not
+/// reentrant. A test that must publish both tables should use
+/// [`register_struct_registries_serialized`].
 pub(crate) fn register_struct_ids_serialized(
     table: HashMap<String, Option<majit_ir::descr::StructId>>,
 ) -> parking_lot::MutexGuard<'static, ()> {
@@ -56,5 +59,19 @@ pub(crate) fn register_struct_origins_serialized(
 ) -> parking_lot::MutexGuard<'static, ()> {
     let guard = STRUCT_REGISTRY_TEST_LOCK.lock();
     majit_ir::descr::register_struct_origins(table);
+    guard
+}
+
+/// Publish both global struct-name registries under one acquisition of their
+/// non-reentrant test lock. A test that needs both tables must use this helper
+/// instead of retaining one single-table guard while requesting the other.
+#[must_use = "the returned guard holds the registry lock for the rest of the test"]
+pub(crate) fn register_struct_registries_serialized(
+    ids: HashMap<String, Option<majit_ir::descr::StructId>>,
+    origins: HashMap<String, String>,
+) -> parking_lot::MutexGuard<'static, ()> {
+    let guard = STRUCT_REGISTRY_TEST_LOCK.lock();
+    majit_ir::descr::register_struct_ids(ids);
+    majit_ir::descr::register_struct_origins(origins);
     guard
 }

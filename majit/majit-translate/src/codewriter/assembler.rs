@@ -6391,10 +6391,13 @@ mod tests {
     fn native_enum_variant_inherited_tag_uses_the_canonical_base_path() {
         use crate::call::CallControl;
 
-        let _registry = crate::test_support::register_struct_origins_serialized(HashMap::from([
-            ("BinOperand".to_string(), "grain::bytecode::op".to_string()),
-            ("Union".to_string(), "types::dynamic".to_string()),
-        ]));
+        let _registry = crate::test_support::register_struct_registries_serialized(
+            HashMap::new(),
+            HashMap::from([
+                ("BinOperand".to_string(), "grain::bytecode::op".to_string()),
+                ("Union".to_string(), "types::dynamic".to_string()),
+            ]),
+        );
         let mut cc = CallControl::new();
         let mut struct_fields = crate::front::StructFieldRegistry::default();
         for (base, variant) in [
