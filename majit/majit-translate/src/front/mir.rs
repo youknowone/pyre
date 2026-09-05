@@ -20043,6 +20043,146 @@ fn block_dominators(body: &Unstructured) -> Vec<bit_set::BitSet> {
     dom
 }
 
+/// Prove that a pin is the first push after its own scope opened and is
+/// executed at most once per opening. `ShadowStackFrameworkGCTransformer`
+/// `push_roots` and `shadowcolor.expand_one_pop_roots` pair a particular
+/// live value with a particular slot; static call counts cannot prove that
+/// pairing when a nested bracket or a backedge changes the stack depth.
+fn root_pin_is_first_and_single(
+    body: &Unstructured,
+    opener: usize,
+    pin: usize,
+    scope: usize,
+    aliases: &std::collections::HashMap<usize, usize>,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> bool {
+    // A path back to the pin must first open a new scope. Otherwise one
+    // syntactic pin can append arbitrarily many slots under the same base.
+    let mut seen = bit_set::BitSet::new();
+    let mut work = block_successors(body, pin);
+    while let Some(bb) = work.pop() {
+        if bb == opener || !seen.insert(bb) {
+            continue;
+        }
+        if bb == pin {
+            return false;
+        }
+        work.extend(block_successors(body, bb));
+    }
+
+    // Before the pin, only the scope's own base read may run as a call.
+    // In particular, another scope's pin may occupy this scope's base even
+    // though neither operation mentions the other guard's MIR local.
+    seen.make_empty();
+    let mut work = block_successors(body, opener);
+    while let Some(bb) = work.pop() {
+        if bb == pin || !seen.insert(bb) {
+            continue;
+        }
+        match body.body[bb].term() {
+            Ok(TermKind::Call { call, .. }) => {
+                let CallFunc::Regular(reg) = &call.func else {
+                    return false;
+                };
+                if !name_of(reg).is_some_and(|path| gc_root_scope_base_path(&path))
+                    || operand_local(call.args.first())
+                        .and_then(|receiver| aliases.get(&receiver).copied())
+                        != Some(scope)
+                {
+                    return false;
+                }
+            }
+            Ok(TermKind::Drop { .. }) => return false,
+            _ => {}
+        }
+        work.extend(block_successors(body, bb));
+    }
+    true
+}
+
+/// Whether a MIR local denotes one immutable value throughout this body.
+/// Arguments have an entry definition; call destinations count as writes too.
+/// Taking the address of the local could write it indirectly, so that shape
+/// cannot stand in for the saved SSA value in `expand_one_pop_roots`.
+fn root_pin_value_is_stable(body: &Unstructured, local: usize) -> bool {
+    let mut definitions = usize::from(local > 0 && local <= body.locals.arg_count as usize);
+    let watched: bit_set::BitSet = std::iter::once(local).collect();
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() {
+                if matches!(place.kind, PlaceKind::Local(dest) if dest as usize == local) {
+                    definitions += 1;
+                }
+                if matches!(value, Rvalue::Ref { .. } | Rvalue::RawPtr { .. })
+                    && mentions_local(&stmt.kind, &watched)
+                {
+                    return false;
+                }
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term()
+            && matches!(call.dest.kind, PlaceKind::Local(dest) if dest as usize == local)
+        {
+            definitions += 1;
+        }
+    }
+    definitions == 1
+}
+
+/// Prove the whole bracket's stack effects, not just uses of its guard.
+/// `ShadowStackFrameworkGCTransformer.push_roots/pop_roots` owns every saved
+/// slot. A free `pin_root` or a callee can also change our source stack without
+/// mentioning the guard, so absence from the receiver map does not prove an
+/// empty bracket. Keep such brackets until interprocedural stack effects are
+/// known; otherwise erasing the close leaks their pins or changes a later get.
+fn root_bracket_stack_effects_are_known(
+    body: &Unstructured,
+    opener: usize,
+    scope: usize,
+    aliases: &std::collections::HashMap<usize, usize>,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> bool {
+    let mut seen = bit_set::BitSet::new();
+    let mut work = block_successors(body, opener);
+    while let Some(bb) = work.pop() {
+        if !seen.insert(bb) {
+            continue;
+        }
+        for stmt in &body.body[bb].statements {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_)) => {}
+                Ok(StmtKind::Assign(place, _)) if matches!(place.kind, PlaceKind::Local(_)) => {}
+                // An indirect write could overwrite a saved slot too.
+                _ => return false,
+            }
+        }
+        match body.body[bb].term() {
+            Ok(TermKind::Drop { place, .. }) if matches!(place.kind, PlaceKind::Local(local) if local as usize == scope) =>
+            {
+                continue;
+            }
+            Ok(TermKind::Call { call, .. }) => {
+                let CallFunc::Regular(reg) = &call.func else {
+                    return false;
+                };
+                let own_leaf = name_of(reg).is_some_and(|path| {
+                    path.split("::").any(|part| part == "gc_roots")
+                        && matches!(path.rsplit("::").next(), Some("base" | "pin_root" | "get"))
+                }) && operand_local(call.args.first())
+                    .and_then(|receiver| aliases.get(&receiver).copied())
+                    == Some(scope);
+                if !own_leaf {
+                    return false;
+                }
+            }
+            Ok(TermKind::Goto { .. } | TermKind::Switch { .. } | TermKind::Abort(_)) => {}
+            _ => return false,
+        }
+        work.extend(block_successors(body, bb));
+    }
+    true
+}
+
 /// Every MIR local a statement or terminator names, however deeply.
 fn mentions_local(v: &serde_json::Value, wanted: &bit_set::BitSet) -> bool {
     match v {
@@ -20357,8 +20497,18 @@ fn analyze_root_brackets_with(
     let mut get_sites: Vec<(usize, usize)> = Vec::new();
     let surviving: Vec<usize> = candidates.iter().collect();
     for scope in surviving {
+        if !root_bracket_stack_effects_are_known(
+            body,
+            opener_block[&scope],
+            scope,
+            &aliases,
+            &name_of,
+        ) {
+            continue;
+        }
         match pins.get(&scope) {
-            // No pin at all: nothing was published, so nothing can read back.
+            // No receiver pin, and the whole-bracket proof excluded free pins
+            // and unknown callees too: nothing was published.
             None => {
                 if gets.iter().any(|(_, s, _)| *s == scope) {
                     continue;
@@ -20366,6 +20516,18 @@ fn analyze_root_brackets_with(
             }
             Some(scope_pins) if scope_pins.len() == 1 => {
                 let (pin_bb, value_local) = scope_pins[0];
+                if !root_pin_value_is_stable(body, value_local)
+                    || !root_pin_is_first_and_single(
+                        body,
+                        opener_block[&scope],
+                        pin_bb,
+                        scope,
+                        &aliases,
+                        &name_of,
+                    )
+                {
+                    continue;
+                }
                 let mut sites = Vec::new();
                 let mut ok = true;
                 for (get_bb, get_scope, index_local) in &gets {
@@ -34399,7 +34561,7 @@ mod tests {
         };
         let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
         // Callee ids: 1 = push_roots, 2 = base, 3 = pin_root, 4 = get,
-        // 5 = an unrelated function.
+        // 5 = an unrelated function, 6 = the receiver-free pin_root.
         let name_of = |reg: &RegularCall| -> Option<String> {
             let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
                 return None;
@@ -34410,6 +34572,7 @@ mod tests {
                     2 => "pyre_object::gc_roots::{impl RootScope}::base",
                     3 => "pyre_object::gc_roots::{impl RootScope}::pin_root",
                     4 => "pyre_object::gc_roots::{impl RootScope}::get",
+                    6 => "pyre_object::gc_roots::pin_root",
                     _ => "pyre_interpreter::misc::as_long",
                 }
                 .to_string(),
@@ -34441,6 +34604,38 @@ mod tests {
         assert_eq!(plan.base_results.get(&4), Some(&2));
         assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
 
+        // A free pin does not name the guard, but its slot still belongs to
+        // that guard's rewind. This is the real unpackiterable drain shape.
+        let free_pin: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 2, 1)),
+                block(vec![], call(6, vec![copy(1)], 6, 2)),
+                block(vec![], drop_guard(2, 3)),
+                block(vec![], serde_json::json!("Return")),
+            ]
+        }))
+        .unwrap();
+        let plan = super::analyze_root_brackets_with(&free_pin, &bit_set::BitSet::new(), name_of);
+        assert!(!plan.scopes.contains(2), "a free pin still needs its close");
+
+        // The same problem can follow a known method pin. An unmodelled
+        // callee may append or overwrite a slot without borrowing this guard.
+        for callee in [5, 6] {
+            let mut foreign = body_of(4, 4);
+            foreign.body[2].terminator.kind = call(3, vec![copy(5), copy(1)], 6, 6);
+            foreign.body.push(
+                serde_json::from_value(block(vec![], call(callee, vec![copy(1)], 9, 3))).unwrap(),
+            );
+            let plan =
+                super::analyze_root_brackets_with(&foreign, &bit_set::BitSet::new(), name_of);
+            assert!(
+                !plan.scopes.contains(2),
+                "unknown stack effects keep the bracket"
+            );
+        }
+
         // The shape the real MIR has: a call argument is a fresh temporary,
         // so the index `get` names is `_9 = copy _4` rather than `_4`.
         let through_copy: Unstructured = serde_json::from_value(serde_json::json!({
@@ -34470,6 +34665,78 @@ mod tests {
         );
         assert_eq!(plan.base_results.get(&9), Some(&2));
         assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
+
+        // A pin saves the value, not the mutable MIR carrier that supplied
+        // it. An assignment after the pin must not change get(base).
+        let mut reassigned = body_of(4, 4);
+        reassigned.body[2].terminator.kind = call(3, vec![copy(5), copy(1)], 6, 6);
+        reassigned
+            .body
+            .push(serde_json::from_value(block(vec![], call(5, vec![], 1, 3))).unwrap());
+        let plan = super::analyze_root_brackets_with(&reassigned, &bit_set::BitSet::new(), name_of);
+        assert!(
+            !plan.scopes.contains(2),
+            "pin input must retain its saved value"
+        );
+
+        // One call site in a loop is several runtime pushes. The first slot
+        // stays the first value even as the pin's local receives later ones.
+        let mut repeated = body_of(4, 4);
+        repeated.locals.arg_count = 0;
+        // The loop's producer returns a new value into _1 each iteration.
+        // It is one static definition, so definition counting alone cannot
+        // distinguish the first saved value from later ones.
+        repeated.body[1].terminator.kind = call(2, vec![copy(3)], 4, 6);
+        repeated.body[3].terminator.kind = call(4, vec![copy(7), copy(4)], 8, 6);
+        repeated
+            .body
+            .push(serde_json::from_value(block(vec![], call(5, vec![], 1, 2))).unwrap());
+        let plan = super::analyze_root_brackets_with(&repeated, &bit_set::BitSet::new(), name_of);
+        assert!(
+            !plan.scopes.contains(2),
+            "a pin may not repeat under one base"
+        );
+
+        // An inner pin before the outer pin occupies the outer base. Each
+        // guard has exactly one static pin, but outer.get(base) reads the
+        // inner value. The actual drops still run in LIFO order.
+        let mut nested = body_of(4, 4);
+        nested
+            .locals
+            .locals
+            .push(serde_json::from_value(local(10)).unwrap());
+        nested
+            .locals
+            .locals
+            .push(serde_json::from_value(local(11)).unwrap());
+        let pin_outer = std::mem::replace(
+            &mut nested.body[2],
+            serde_json::from_value(block(vec![], call(1, vec![], 9, 6))).unwrap(),
+        );
+        nested.body.push(
+            serde_json::from_value(block(
+                vec![borrow(10, 9)],
+                call(3, vec![copy(10), copy(0)], 11, 7),
+            ))
+            .unwrap(),
+        );
+        nested.body.push(pin_outer);
+        nested.body[4].terminator.kind = drop_guard(9, 8);
+        nested
+            .body
+            .push(serde_json::from_value(block(vec![], drop_guard(2, 5))).unwrap());
+        // Produce the inner value before either scope opens, so _0 is a
+        // defined pointer distinct from the outer pin's input _1.
+        let open_outer = std::mem::replace(
+            &mut nested.body[0],
+            serde_json::from_value(block(vec![], call(5, vec![], 0, 9))).unwrap(),
+        );
+        nested.body.push(open_outer);
+        let plan = super::analyze_root_brackets_with(&nested, &bit_set::BitSet::new(), name_of);
+        assert!(
+            !plan.scopes.contains(2),
+            "outer base may already hold an inner pin"
+        );
 
         // Read back through a slot this pass cannot name: the whole bracket
         // stays.

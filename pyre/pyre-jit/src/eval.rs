@@ -5893,12 +5893,31 @@ unsafe fn active_trace_root_walker_area(
         // `pyre_libc_jitframe_tracer`.  Read the value back after the visitor so
         // a relocated one is what the walk follows.
         let mut with_immortal_children = |gcref: &mut majit_ir::GcRef| {
-            visitor(gcref);
-            let value = gcref.0 as pyre_object::PyObjectRef;
-            unsafe { pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor) };
+            unsafe { walk_active_trace_ref(gcref, visitor) };
         };
         pair.0.walk_active_trace_refs(&mut with_immortal_children);
     }
+}
+
+/// Forward a recorded reference and the managed children of an immortal value.
+///
+/// # Safety
+/// Apart from `NO_CONCRETE`, the slot must satisfy `walk_raw_immortal_roots`'s
+/// reference contract before and after forwarding.
+unsafe fn walk_active_trace_ref(
+    gcref: &mut majit_ir::GcRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    // resoperation.py RefOp.forget_value clears the concrete reference to
+    // null. Our recorder/virtualizable shadow distinguishes an unknown value
+    // with NO_CONCRETE; that marker is not a root or a PyObjectRef. Decode it
+    // at this boundary before either visiting or inspecting an object header.
+    if *gcref == majit_ir::GcRef::NO_CONCRETE {
+        return;
+    }
+    visitor(gcref);
+    let value = gcref.0 as pyre_object::PyObjectRef;
+    unsafe { pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor) };
 }
 
 /// GC walker for ConstPtr GcRefs extracted from snapshot maps
@@ -15223,6 +15242,22 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_trace_root_walk_skips_unknown_concrete_values() {
+        let mut unknown = majit_ir::GcRef::NO_CONCRETE;
+        unsafe {
+            walk_active_trace_ref(&mut unknown, &mut |_| {
+                panic!("an unknown concrete value is not a GC root")
+            });
+        }
+        assert_eq!(unknown, majit_ir::GcRef::NO_CONCRETE);
+
+        let mut null = majit_ir::GcRef::NULL;
+        let mut visits = 0;
+        unsafe { walk_active_trace_ref(&mut null, &mut |_| visits += 1) };
+        assert_eq!(visits, 1, "a known null remains distinct from unknown");
+    }
 
     #[test]
     fn bridge_descr_storage_replays_pending_field_and_array_writes() {

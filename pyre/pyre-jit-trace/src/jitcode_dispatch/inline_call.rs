@@ -3273,9 +3273,6 @@ fn cut_declined_subwalk<Sym: WalkSym>(
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
 ) {
     ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-    // The cut retires every OpRef recorded after `pre_fold_pos`, so the pin
-    // table's answers, which are OpRefs, have to go with them.
-    ctx.session.borrow_mut().root_pins.clear();
     ctx.trace_ctx.heap_cache_mut().reset();
 }
 

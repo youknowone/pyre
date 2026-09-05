@@ -675,26 +675,6 @@ pub struct WalkSession {
     /// [`fbw_state::BinopRewindInlineGuard`] and cleared when it unwinds, so it
     /// never carries a position from a region that has already ended.
     pub binop_rewind_fresh_from: Option<u32>,
-    /// The box each shadow-stack slot this walk pinned was pinned with, keyed
-    /// by absolute slot index.
-    ///
-    /// A source root bracket spells its read-back as `RootScope::get(slot)`,
-    /// which reads what `RootScope::pin_root` wrote there.  Inside a trace the
-    /// two are the same word: the JitFrame gcmap rewrites a reference when its
-    /// object moves, so the read-back's forwarding query has nothing left to
-    /// resolve — the same reason `try_gc_current_object_address` is erased at
-    /// translation.  Remembering the pinned box is what lets the read-back
-    /// hand it back instead of recording a residual whose result is opaque to
-    /// every guard after it.
-    ///
-    /// Keyed absolutely rather than per scope, because a bracket addresses its
-    /// slots as `base + i` over one thread-wide stack and a bracket a residual
-    /// opens under this one only ever claims slots above its top.  The table
-    /// lives on the session for the reason [`WalkSession::last_exc_value`]
-    /// does: the pin and its read-back can sit any number of inline levels
-    /// apart, and it is created per walk attempt, so no walk inherits another
-    /// walk's slots.
-    pub root_pins: std::collections::HashMap<(OpRef, usize), OpRef>,
 }
 
 impl Default for WalkSession {
@@ -719,7 +699,6 @@ impl Default for WalkSession {
             binop_rewind_depth: 0,
             binop_rewind_refused: false,
             binop_rewind_fresh_from: None,
-            root_pins: std::collections::HashMap::new(),
         }
     }
 }

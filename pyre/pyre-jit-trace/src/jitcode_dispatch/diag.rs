@@ -462,7 +462,6 @@ spec_folds! {
     LocalsTraceLimitCut  => ("builtin_locals_trace_limit_cut", "specialize", "builtin_locals"),
     LoadSpecialMethod    => ("load_special_method",      "residual_call", "-"),
     LoadFastCheck        => ("load_fast_check",          "residual_call", "-"),
-    GcRootScopeGet       => ("gc_root_scope_get",        "residual_call", "-"),
 }
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();
