@@ -3982,7 +3982,7 @@ fn _flat_pycall(
             w_globals,
             crate::call::getexecutioncontext(),
             closure,
-            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         ) {
             Ok(f) => f,
             Err(e) => {
@@ -3997,13 +3997,11 @@ fn _flat_pycall(
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
-    // The callee's locals array is old-gen (`OldGenGc`) and the arguments
-    // just written into it are young. RPython's GC transform emits the
-    // old-to-young `write_barrier` (minimark.py) after such a store;
-    // pyre has no transform pass, so the batch barrier runs here. Until the
-    // callee frame is installed on the `f_backref` chain nothing else exposes
-    // these slots, so a minor collection before then would leave every
-    // argument stale.
+    // `PyFrame.__init__` allocates `locals_cells_stack_w` as a fresh
+    // `[None] * size` nursery array.  Arguments just written into it are
+    // also young.  `remember_frame_locals_array` still runs: a full nursery
+    // can spill the array to old-gen, and until the callee sits on
+    // `f_backref` nothing else exposes these slots.
     crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
@@ -4061,7 +4059,7 @@ fn _flat_pycall_defaults(
             w_globals,
             crate::call::getexecutioncontext(),
             closure,
-            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         ) {
             Ok(f) => f,
             Err(e) => {

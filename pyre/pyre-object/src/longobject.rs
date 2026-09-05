@@ -553,9 +553,11 @@ pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
 /// keeps the call's inputs the immutable bigints, so the optimizer forwards the
 /// field read and never reorders this elidable call ahead of the boxing
 /// `setfield_gc` that initializes the fresh result wrapper. Allocates the result
-/// via the COLLECTING nursery (the call is a gcmap-rooted residual `CallR`
-/// holding no unrooted pointer across the alloc), so dead bigints are reclaimed
-/// by minor collections instead of accumulating in old-gen. Returns a freshly
+/// via the COLLECTING nursery. The residual `CallR`'s gcmap roots its operand
+/// payloads in the caller, and `rbigint::gc::add_payloads_collecting` restores
+/// the native callee copies around `_x_add`'s digit-list allocation, matching
+/// RPython's `push_roots(livevars)`. Thus dead bigints are reclaimed by minor
+/// collections instead of accumulating in old-gen. Returns a freshly
 /// heap-allocated `*mut BigInt` (as i64). Allocates → `EF_ELIDABLE_OR_MEMORYERROR`.
 ///
 /// # Safety note: `extern "C"` over `i64`-encoded `*const BigInt`. The pointers
@@ -573,7 +575,7 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
         if (&*b).get_sign() == 0 {
             return a as i64;
         }
-        alloc_bigint_nursery_collecting(&*a + &*b) as i64
+        alloc_bigint_nursery_collecting(majit_rlib::rbigint::add_payloads_collecting(a, b)) as i64
     }
 }
 
@@ -596,7 +598,7 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
         if (&*b).get_sign() == 0 {
             return a as i64;
         }
-        alloc_bigint_nursery_collecting(&*a - &*b) as i64
+        alloc_bigint_nursery_collecting(majit_rlib::rbigint::sub_payloads_collecting(a, b)) as i64
     }
 }
 
@@ -612,7 +614,9 @@ pub extern "C" fn jit_bigint_sub_int_int(a: i64, b: i64) -> i64 {
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { alloc_bigint_nursery_collecting(&*a * &*b) as i64 }
+    unsafe {
+        alloc_bigint_nursery_collecting(majit_rlib::rbigint::mul_payloads_collecting(a, b)) as i64
+    }
 }
 
 /// `rbigint.mul_int_int_bigint_result` (`rpython/rlib/rbigint.py`,
@@ -627,21 +631,27 @@ pub extern "C" fn jit_bigint_mul_int_int(a: i64, b: i64) -> i64 {
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_and(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { alloc_bigint_nursery_collecting(&*a & &*b) as i64 }
+    unsafe {
+        alloc_bigint_nursery_collecting(majit_rlib::rbigint::and_payloads_collecting(a, b)) as i64
+    }
 }
 
 /// `rbigint.or_` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_or(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { alloc_bigint_nursery_collecting(&*a | &*b) as i64 }
+    unsafe {
+        alloc_bigint_nursery_collecting(majit_rlib::rbigint::or_payloads_collecting(a, b)) as i64
+    }
 }
 
 /// `rbigint.xor_` on bare payloads (collecting). See [`jit_bigint_add`].
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
-    unsafe { alloc_bigint_nursery_collecting(&*a ^ &*b) as i64 }
+    unsafe {
+        alloc_bigint_nursery_collecting(majit_rlib::rbigint::xor_payloads_collecting(a, b)) as i64
+    }
 }
 
 /// `rbigint` comparison — returns the sign of `a <=> b` as `-1` / `0` / `1`.
