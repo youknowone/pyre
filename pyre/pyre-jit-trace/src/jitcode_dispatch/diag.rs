@@ -835,8 +835,10 @@ pub fn spec_census_summary() -> String {
     } else {
         spec_suppress_unknown().join(",")
     };
+    let (direct_resume, call_replay) = super::inline_call::subwalk_resume_counts();
+    let heap_clones = super::inline_call::subwalk_heap_clone_count();
     let mut summary = format!(
-        "[spec-census] folds={} consulted_total={consulted_total} fired_total={fired_total} suppressed_total={suppressed_total} suppressed_names={suppressed_names} suppress_unknown={suppress_unknown}\n",
+        "[spec-census] folds={} consulted_total={consulted_total} fired_total={fired_total} suppressed_total={suppressed_total} suppressed_names={suppressed_names} suppress_unknown={suppress_unknown} subwalk_direct_resume={direct_resume} subwalk_call_replay={call_replay} subwalk_heap_clones={heap_clones}\n",
         rows.len(),
     );
     summary.push_str(&format!(
