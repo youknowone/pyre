@@ -948,7 +948,33 @@ fn variable_has_bool_repr(
     variable: &crate::flowspace::model::Variable,
 ) -> bool {
     use crate::flowspace::model::ConstValue;
+    use crate::model::BlockId;
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+    // One linear pass builds the producer / phi / predecessor indexes.
+    // `classify` then answers in the size of the reachable DAG: a memoized
+    // walk that used to re-enter every diamond (and every `bool()` query
+    // rebuilt the walk from scratch) exploded the prepass into a multi-hour
+    // hang on interpreter graphs.
+    let mut producer: std::collections::HashMap<u64, &crate::model::SpaceOperation> =
+        std::collections::HashMap::new();
+    let mut inputarg: std::collections::HashMap<u64, (BlockId, usize)> =
+        std::collections::HashMap::new();
+    let mut incoming: std::collections::HashMap<BlockId, Vec<&crate::model::Link>> =
+        std::collections::HashMap::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let Some(result) = op.result.as_ref() {
+                producer.insert(result.id(), op);
+            }
+        }
+        for (slot, arg) in block.inputargs.iter().enumerate() {
+            inputarg.insert(arg.id(), (block.id, slot));
+        }
+        for link in &block.exits {
+            incoming.entry(link.target).or_default().push(link);
+        }
+    }
 
     fn op_result_has_bool_repr(kind: &OpKind) -> bool {
         if matches!(
@@ -1057,9 +1083,16 @@ fn variable_has_bool_repr(
         }
     }
 
+    struct BoolReprIndex<'g> {
+        producer: std::collections::HashMap<u64, &'g crate::model::SpaceOperation>,
+        inputarg: std::collections::HashMap<u64, (BlockId, usize)>,
+        incoming: std::collections::HashMap<BlockId, Vec<&'g crate::model::Link>>,
+    }
+
     fn classify(
-        graph: &FunctionGraph,
+        index: &BoolReprIndex<'_>,
         variable: &crate::flowspace::model::Variable,
+        cache: &mut std::collections::HashMap<u64, Option<bool>>,
         visiting: &mut std::collections::HashSet<u64>,
     ) -> Option<bool> {
         if matches!(
@@ -1068,35 +1101,27 @@ fn variable_has_bool_repr(
         ) {
             return Some(true);
         }
+        if let Some(&cached) = cache.get(&variable.id()) {
+            return cached;
+        }
         if !visiting.insert(variable.id()) {
             // A loop-carried phi may point back to itself. The other incoming
             // roots decide its representation; a pure cycle has no evidence.
             return None;
         }
 
-        let producer = graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .find(|op| op.result.as_ref() == Some(variable));
-        let classified = if let Some(op) = producer {
+        let classified = if let Some(op) = index.producer.get(&variable.id()) {
             match &op.kind {
                 // These operations preserve their operand representation.
-                OpKind::Hint { value, .. } => classify(graph, value, visiting),
+                OpKind::Hint { value, .. } => classify(index, value, cache, visiting),
                 OpKind::UnaryOp { op, operand, .. }
                     if matches!(op.as_str(), "same_as" | "deref") =>
                 {
-                    classify(graph, operand, visiting)
+                    classify(index, operand, cache, visiting)
                 }
                 kind => Some(op_result_has_bool_repr(kind)),
             }
-        } else if let Some((target, slot)) = graph.blocks.iter().find_map(|block| {
-            block
-                .inputargs
-                .iter()
-                .position(|arg| arg == variable)
-                .map(|slot| (block.id, slot))
-        }) {
+        } else if let Some(&(target, slot)) = index.inputarg.get(&variable.id()) {
             // RPythonAnnotator.follow_link/mergeinputargs unions each link
             // argument with the matching Block.inputarg. Recover that
             // relation from the graph: every non-cyclic incoming root must
@@ -1106,15 +1131,16 @@ fn variable_has_bool_repr(
             let mut saw_incoming = false;
             let mut saw_bool_root = false;
             let mut contradicted = false;
-            for link in graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.exits)
-                .filter(|link| link.target == target)
-            {
+            let empty: [&crate::model::Link; 0] = [];
+            let links = index
+                .incoming
+                .get(&target)
+                .map(|links| links.as_slice())
+                .unwrap_or(&empty);
+            for link in links {
                 saw_incoming = true;
                 let incoming = match link.args.get(slot) {
-                    Some(LinkArg::Value(value)) => classify(graph, value, visiting),
+                    Some(LinkArg::Value(value)) => classify(index, value, cache, visiting),
                     Some(LinkArg::Const(constant)) => Some(
                         constant.concretetype.as_ref() == Some(&LowLevelType::Bool)
                             || matches!(&constant.value, ConstValue::Bool(_)),
@@ -1141,10 +1167,21 @@ fn variable_has_bool_repr(
             Some(false)
         };
         visiting.remove(&variable.id());
+        cache.insert(variable.id(), classified);
         classified
     }
 
-    classify(graph, variable, &mut std::collections::HashSet::new()) == Some(true)
+    let index = BoolReprIndex {
+        producer,
+        inputarg,
+        incoming,
+    };
+    classify(
+        &index,
+        variable,
+        &mut std::collections::HashMap::new(),
+        &mut std::collections::HashSet::new(),
+    ) == Some(true)
 }
 
 /// Preserve the MIR distinction between reading a by-value field and taking
@@ -9938,6 +9975,81 @@ mod tests {
             block.exitswitch,
             Some(ExitSwitch::Value(phi)),
             "the loop header must branch on its Bool inputarg directly"
+        );
+    }
+
+    /// A chain of two-predecessor phis is a DAG, not a cycle. Without a
+    /// memo the BoolRepr walk re-enters every diamond, which is what hung
+    /// the pyre-jit-trace prepass on interpreter graphs.
+    #[test]
+    fn bool_repr_on_a_phi_diamond_chain_does_not_explode() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+
+        let mut graph = FunctionGraph::new("bool_repr_phi_diamonds");
+        let mut current = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "flag".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        current.set_concretetype(Some(LlType::Signed));
+        let mut pred = graph.startblock;
+        for _ in 0..32 {
+            let (left, left_args) = graph.create_block_with_arg_vars(1);
+            let (right, right_args) = graph.create_block_with_arg_vars(1);
+            let (join, join_args) = graph.create_block_with_arg_vars(1);
+            left_args[0].set_concretetype(Some(LlType::Signed));
+            right_args[0].set_concretetype(Some(LlType::Signed));
+            let phi = join_args[0].clone();
+            phi.set_concretetype(Some(LlType::Signed));
+            graph.set_control_flow_metadata(
+                pred,
+                Some(ExitSwitch::Value(current.clone())),
+                vec![
+                    Link::new_mixed(
+                        vec![LinkArg::Value(current.clone())],
+                        left,
+                        Some(ExitCase::Bool(false)),
+                    ),
+                    Link::new_mixed(
+                        vec![LinkArg::Value(current.clone())],
+                        right,
+                        Some(ExitCase::Bool(true)),
+                    ),
+                ],
+            );
+            graph.set_goto(left, join, vec![left_args[0].clone()]);
+            graph.set_goto(right, join, vec![right_args[0].clone()]);
+            current = phi;
+            pred = join;
+        }
+        let truthified = graph
+            .push_op_var(
+                pred,
+                OpKind::UnaryOp {
+                    op: "bool".into(),
+                    operand: current.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        truthified.set_concretetype(Some(LlType::Signed));
+        graph.set_return(pred, Some(truthified.clone()));
+
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let block = transformed.graph.block(pred);
+        assert!(
+            !block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&truthified)),
+            "the Bool identity over the phi chain must still fold"
         );
     }
 
