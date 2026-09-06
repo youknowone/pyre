@@ -110,13 +110,8 @@ fn semlock_ismine(obj: PyObjectRef) -> bool {
 
 #[cfg(all(unix, feature = "host_env"))]
 fn semlock_post(handle: SemRaw) -> Result<(), crate::PyError> {
-    if unsafe { libc::sem_post(handle) } != 0 {
-        return Err(crate::PyError::os_error_with_errno(
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-            "sem_post",
-        ));
-    }
-    Ok(())
+    host_mp::sem_post(handle)
+        .map_err(|error| crate::PyError::os_error_with_errno(error.raw_os_error(), "sem_post"))
 }
 
 /// `interp_semaphore.py semlock_getvalue`.  Not built on darwin, where
@@ -124,16 +119,11 @@ fn semlock_post(handle: SemRaw) -> Result<(), crate::PyError> {
 /// `interp_semaphore.py`) and the `sem_trywait` fallbacks run instead.
 #[cfg(all(unix, feature = "host_env", not(target_vendor = "apple")))]
 fn semlock_getvalue(handle: SemRaw) -> Result<i64, crate::PyError> {
-    let mut val: libc::c_int = 0;
-    if unsafe { libc::sem_getvalue(handle, &mut val) } != 0 {
-        return Err(crate::PyError::os_error_with_errno(
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-            "sem_getvalue",
-        ));
-    }
-    // some posix implementations use negative numbers to indicate the number of
-    // waiting threads
-    Ok(if val < 0 { 0 } else { val as i64 })
+    // The host helper also clamps implementations that report the number of
+    // waiters as a negative value.
+    unsafe { host_mp::get_semaphore_value(handle) }
+        .map(i64::from)
+        .map_err(|error| crate::PyError::os_error_with_errno(error.raw_os_error(), "sem_getvalue"))
 }
 
 /// `interp_semaphore.py semlock_iszero`.
@@ -141,15 +131,21 @@ fn semlock_getvalue(handle: SemRaw) -> Result<i64, crate::PyError> {
 fn semlock_iszero(handle: SemRaw) -> Result<bool, crate::PyError> {
     #[cfg(target_vendor = "apple")]
     {
-        if unsafe { libc::sem_trywait(handle) } == 0 {
-            semlock_post(handle)?;
-            return Ok(false);
+        match host_mp::sem_trywait_status(handle) {
+            host_mp::TryAcquireStatus::Acquired => {
+                semlock_post(handle)?;
+                Ok(false)
+            }
+            host_mp::TryAcquireStatus::WouldBlock => Ok(true),
+            host_mp::TryAcquireStatus::Interrupted => Err(crate::PyError::os_error_with_errno(
+                libc::EINTR,
+                "sem_trywait",
+            )),
+            host_mp::TryAcquireStatus::Error(error) => Err(crate::PyError::os_error_with_errno(
+                error.raw_os_error(),
+                "sem_trywait",
+            )),
         }
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        if errno != libc::EAGAIN {
-            return Err(crate::PyError::os_error_with_errno(errno, "sem_trywait"));
-        }
-        Ok(true)
     }
     #[cfg(not(target_vendor = "apple"))]
     {
@@ -367,35 +363,44 @@ fn semlock_acquire(
     // returning (`_check_signals(space)`).
     if block && timeout.is_none() {
         loop {
-            let (r, errno) =
-                crate::module::thread::call_external_function(|| unsafe { libc::sem_wait(handle) });
-            if r == 0 {
-                break;
+            let status = {
+                let _blocked = crate::module::thread::before_external_block();
+                host_mp::sem_wait_status(handle, None)
+            };
+            match status {
+                host_mp::WaitStatus::Acquired => break,
+                host_mp::WaitStatus::Interrupted => {
+                    crate::module::signal::interp_signal::checksignals_now()?;
+                }
+                host_mp::WaitStatus::TimedOut => unreachable!("untimed sem_wait timed out"),
+                host_mp::WaitStatus::Error(error) => {
+                    return Err(crate::PyError::os_error_with_errno(
+                        error.raw_os_error(),
+                        "sem_wait",
+                    ));
+                }
             }
-            if errno == libc::EINTR {
-                crate::module::signal::interp_signal::checksignals_now()?;
-                continue;
-            }
-            return Err(crate::PyError::os_error_with_errno(errno, "sem_wait"));
         }
         crate::module::signal::interp_signal::checksignals_now()?;
         Ok(true)
     } else if !block {
         loop {
-            let r = unsafe { libc::sem_trywait(handle) };
-            if r == 0 {
-                crate::module::signal::interp_signal::checksignals_now()?;
-                return Ok(true);
+            match host_mp::sem_trywait_status(handle) {
+                host_mp::TryAcquireStatus::Acquired => {
+                    crate::module::signal::interp_signal::checksignals_now()?;
+                    return Ok(true);
+                }
+                host_mp::TryAcquireStatus::WouldBlock => return Ok(false),
+                host_mp::TryAcquireStatus::Interrupted => {
+                    crate::module::signal::interp_signal::checksignals_now()?;
+                }
+                host_mp::TryAcquireStatus::Error(error) => {
+                    return Err(crate::PyError::os_error_with_errno(
+                        error.raw_os_error(),
+                        "sem_trywait",
+                    ));
+                }
             }
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            if errno == libc::EINTR {
-                crate::module::signal::interp_signal::checksignals_now()?;
-                continue;
-            }
-            if errno == libc::EAGAIN {
-                return Ok(false);
-            }
-            return Err(crate::PyError::os_error_with_errno(errno, "sem_trywait"));
         }
     } else {
         let deadline = rustpython_host_env::multiprocessing::deadline_from_timeout(
@@ -467,16 +472,27 @@ fn semlock_release(handle: SemRaw, kind: i64, maxvalue: i64) -> Result<(), crate
         // checked properly.
         if maxvalue == 1 {
             // make sure that already locked
-            if unsafe { libc::sem_trywait(handle) } == 0 {
-                // it was not locked so undo wait and raise
-                let _ = unsafe { libc::sem_post(handle) };
-                return Err(crate::PyError::value_error(
-                    "semaphore or lock released too many times",
-                ));
-            }
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            if errno != libc::EAGAIN {
-                return Err(crate::PyError::os_error_with_errno(errno, "sem_trywait"));
+            match host_mp::sem_trywait_status(handle) {
+                host_mp::TryAcquireStatus::Acquired => {
+                    // it was not locked so undo wait and raise
+                    let _ = host_mp::sem_post(handle);
+                    return Err(crate::PyError::value_error(
+                        "semaphore or lock released too many times",
+                    ));
+                }
+                host_mp::TryAcquireStatus::WouldBlock => {}
+                host_mp::TryAcquireStatus::Interrupted => {
+                    return Err(crate::PyError::os_error_with_errno(
+                        libc::EINTR,
+                        "sem_trywait",
+                    ));
+                }
+                host_mp::TryAcquireStatus::Error(error) => {
+                    return Err(crate::PyError::os_error_with_errno(
+                        error.raw_os_error(),
+                        "sem_trywait",
+                    ));
+                }
             }
             // it is already locked as expected
         }

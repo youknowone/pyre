@@ -10,11 +10,17 @@
 //! bytes the shared converter produces have forgotten which it was.
 
 use pyre_object::PyObjectRef;
+use rustpython_host_env::winsound as host_winsound;
 
 /// Play from a buffer rather than from a name.
 const SND_MEMORY: i32 = 0x0004;
 /// Return before the sound finishes.
 const SND_ASYNC: i32 = 0x0001;
+
+enum PreparedSound {
+    Memory(Vec<u16>),
+    Name(Vec<u16>),
+}
 
 /// The wide, NUL-terminated name `PlaySoundW` takes.
 ///
@@ -138,7 +144,7 @@ crate::py_module! {
         fn PlaySound(sound: PyObjectRef, flags: PyIndexCInt) -> Result<(), crate::PyError> {
             // `None` answers first, so it silences the device whatever else
             // the flags asked for.
-            let name = if unsafe { pyre_object::is_none(sound) } {
+            let source = if unsafe { pyre_object::is_none(sound) } {
                 None
             } else if flags & SND_MEMORY != 0 {
                 if flags & SND_ASYNC != 0 {
@@ -154,43 +160,52 @@ crate::py_module! {
                         crate::gateway::short_type_name(sound)
                     ))
                 })?;
-                // `PlaySoundW` takes the buffer through its `LPCWSTR`
-                // parameter, so the bytes are repacked into wide units with
-                // their order kept.  An odd length gains a trailing zero
-                // byte, which the RIFF header's own length keeps out of the
-                // sound.
                 let bytes = data.as_bytes().to_vec();
                 data.release();
-                // `PlaySoundW` reads a header at the pointer it is given, and
-                // an empty `Vec`'s pointer is the alignment sentinel rather
-                // than storage, so an empty buffer is backed by one zeroed
-                // unit: the header fails to parse and the call answers the
-                // failure an unplayable sound answers.
                 let mut units = vec![0u16; bytes.len().div_ceil(2).max(1)];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         bytes.as_ptr(),
-                        units.as_mut_ptr() as *mut u8,
+                        units.as_mut_ptr().cast::<u8>(),
                         bytes.len(),
                     );
                 }
-                Some(units)
+                Some(PreparedSound::Memory(units))
             } else {
-                Some(sound_name(sound)?)
+                Some(PreparedSound::Name(sound_name(sound)?))
             };
-            let played = {
+            let result = {
                 // A synchronous play runs to the end of the sound, so the
                 // thread that will stop it has to be able to run.
                 let _blocked = crate::module::thread::before_external_block();
-                unsafe {
-                    windows_sys::Win32::Media::Audio::PlaySoundW(
-                        name.as_ref().map_or(std::ptr::null(), |units| units.as_ptr()),
-                        std::ptr::null_mut(),
-                        flags as u32,
-                    )
+                match source.as_ref() {
+                    None => host_winsound::play_sound(
+                        host_winsound::PlaySoundSource::Stop,
+                        (flags & !SND_MEMORY) as u32,
+                    ),
+                    Some(PreparedSound::Memory(units)) => {
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                units.as_ptr().cast::<u8>(),
+                                units.len() * std::mem::size_of::<u16>(),
+                            )
+                        };
+                        host_winsound::play_sound(
+                            host_winsound::PlaySoundSource::Memory(bytes),
+                            flags as u32,
+                        )
+                    }
+                    Some(PreparedSound::Name(name)) => {
+                        let name = widestring::WideCStr::from_slice(name)
+                            .expect("sound_name returns one trailing NUL");
+                        host_winsound::play_sound(
+                            host_winsound::PlaySoundSource::Name(name),
+                            flags as u32,
+                        )
+                    }
                 }
             };
-            if played == 0 {
+            if result.is_err() {
                 return Err(crate::PyError::runtime_error("Failed to play sound"));
             }
             Ok(())
@@ -205,14 +220,9 @@ crate::py_module! {
             }
             let beeped = {
                 let _blocked = crate::module::thread::before_external_block();
-                unsafe {
-                    windows_sys::Win32::System::Diagnostics::Debug::Beep(
-                        frequency as u32,
-                        duration as u32,
-                    )
-                }
+                host_winsound::beep(frequency as u32, duration as u32)
             };
-            if beeped == 0 {
+            if !beeped {
                 return Err(crate::PyError::runtime_error("Failed to beep"));
             }
             Ok(())
@@ -222,20 +232,12 @@ crate::py_module! {
             // `save_err=rffi.RFFI_SAVE_LASTERROR` does: reacquiring goes
             // through `mutex2_lock_timeout`, whose timed wait leaves
             // `ERROR_TIMEOUT` behind on a poll that expired.
-            let (beeped, error) = {
+            let result = {
                 let _blocked = crate::module::thread::before_external_block();
-                let beeped = unsafe {
-                    windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(type_ as u32)
-                };
-                let error = if beeped == 0 {
-                    unsafe { windows_sys::Win32::Foundation::GetLastError() }
-                } else {
-                    0
-                };
-                (beeped, error)
+                host_winsound::message_beep(type_ as u32)
             };
-            if beeped == 0 {
-                return Err(win32_runtime_error(error));
+            if let Err(error) = result {
+                return Err(win32_runtime_error(error.raw_os_error().unwrap_or(0) as u32));
             }
             Ok(())
         }

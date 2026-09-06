@@ -3997,7 +3997,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         #[cfg(all(windows, feature = "host_env"))]
         {
-            use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::Foundation::{FILETIME, INVALID_HANDLE_VALUE};
             use windows_sys::Win32::Storage::FileSystem::{
                 CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
                 SetFileTime,
@@ -4074,7 +4074,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }
             let wrote = unsafe { SetFileTime(handle, std::ptr::null(), &atime, &mtime) };
             let error = (wrote == 0).then(std::io::Error::last_os_error);
-            unsafe { CloseHandle(handle) };
+            let _ = rustpython_host_env::winapi::close_handle(handle);
             if let Some(error) = error {
                 return Err(fs_err_with_filename(error, path.w_path()));
             }
@@ -4645,7 +4645,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Some(w) => crate::baseobjspace::c_int_w(w)?,
                 None => 1,
             };
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "host_env"))]
+            {
+                let (columns, lines) = rustpython_host_env::posix::get_terminal_size(fd)
+                    .map_err(|e| errno_err(e.raw_os_error().unwrap_or(0), ""))?;
+                Ok(make_terminal_size(columns as i64, lines as i64))
+            }
+            #[cfg(all(unix, not(feature = "host_env")))]
             {
                 let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
                 if crate::builtins::crt_call!(libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws)) != 0 {
@@ -4706,7 +4712,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             if rc == 0 { st.st_flags } else { 0 }
         }
     }
-    #[cfg(all(target_os = "macos", not(feature = "sandbox")))]
+    #[cfg(all(
+        target_os = "macos",
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
+    fn macos_fd_st_flags(fd: i32) -> u32 {
+        let fd = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+        rustpython_host_env::fileutils::fstat(fd)
+            .map(|st| st.st_flags)
+            .unwrap_or(0)
+    }
+    #[cfg(all(
+        target_os = "macos",
+        not(feature = "host_env"),
+        not(feature = "sandbox")
+    ))]
     fn macos_fd_st_flags(fd: i32) -> u32 {
         unsafe {
             let mut st: libc::stat = std::mem::zeroed();
@@ -8582,10 +8603,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             wrap: impl Fn(i32) -> crate::PyError,
         ) -> Result<(), crate::PyError> {
             loop {
-                if crate::builtins::crt_call!(libc::ftruncate(fd, length)) == 0 {
+                #[cfg(feature = "host_env")]
+                let result = {
+                    let fd = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+                    rustpython_host_env::crt_fd::ftruncate(fd, length)
+                };
+                #[cfg(not(feature = "host_env"))]
+                let result = if crate::builtins::crt_call!(libc::ftruncate(fd, length)) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::from_raw_os_error(
+                        crate::builtins::crt_errno(),
+                    ))
+                };
+                if result.is_ok() {
                     return Ok(());
                 }
-                let errno = crate::builtins::crt_errno();
+                let errno = result
+                    .unwrap_err()
+                    .raw_os_error()
+                    .unwrap_or(0);
                 crate::builtins::eintr_retry_with(std::io::Error::from_raw_os_error(errno), |e| {
                     wrap(e.raw_os_error().unwrap_or(0))
                 })?;
@@ -9000,10 +9037,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // interp_posix.py `@unwrap_spec(pgid=c_int, signal=c_int)`.
                     let pgid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                     let sig = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
-                    let r = unsafe { libc::killpg(pgid, sig) };
-                    if r < 0 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
-                    }
+                    host_posix::killpg(pgid, sig).map_err(|err| io_err(err, ""))?;
                     Ok(pyre_object::w_none())
                 },
                 2,
@@ -9958,22 +9992,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     #[cfg(target_os = "linux")]
                     {
-                        // host_env doesn't expose a NULL-offset variant; call
-                        // libc::sendfile directly with a null pointer, matching
-                        // rposix.sendfile_no_offset (rposix.py).
+                        // rposix.sendfile_no_offset uses the input descriptor's
+                        // live position; the retry and signal check stay here.
                         let count = count_raw as libc::size_t;
+                        let out_b = fd_borrow(out_fd)?;
+                        let in_b = fd_borrow(in_fd)?;
                         loop {
-                            let (res, errno) =
-                                crate::module::thread::call_external_function(|| unsafe {
-                                    libc::sendfile(out_fd, in_fd, core::ptr::null_mut(), count)
-                                });
-                            if res >= 0 {
-                                return Ok(pyre_object::w_int_new(res as i64));
-                            }
-                            crate::builtins::eintr_retry_with(
-                                std::io::Error::from_raw_os_error(errno),
-                                |e| io_err(e, ""),
-                            )?;
+                            let result = {
+                                let _blocked = crate::module::thread::before_external_block();
+                                host_posix::sendfile_no_offset(out_b, in_b, count)
+                            };
+                            match result {
+                                Ok(res) => return Ok(pyre_object::w_int_new(res as i64)),
+                                Err(error) => crate::builtins::eintr_retry_with(error, |e| io_err(e, ""))?,
+                            };
                         }
                     }
                 }
@@ -10136,24 +10168,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             not(feature = "sandbox")
         ))]
         {
-            struct SpawnScheduler {
-                #[allow(dead_code)]
-                policy: Option<libc::c_int>,
-                #[allow(dead_code)]
-                param: libc::sched_param,
-            }
+            #[cfg(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "musl")))]
+            use rustpython_host_env::posix::PosixSpawnScheduler as SpawnScheduler;
+            #[cfg(not(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "musl"))))]
+            type SpawnScheduler = ();
 
-            /// The `POSIX_SPAWN_SETSID` spawn attribute, or `None` where the
-            /// platform has no such flag — which is what makes `setsid=True`
-            /// report an unavailable argument rather than being ignored.
-            #[cfg(target_os = "linux")]
-            const POSIX_SPAWN_SETSID: Option<libc::c_int> = Some(libc::POSIX_SPAWN_SETSID);
-            /// `<sys/spawn.h>` defines the flag, but the `libc` binding for
-            /// this target does not export it.
-            #[cfg(target_vendor = "apple")]
-            const POSIX_SPAWN_SETSID: Option<libc::c_int> = Some(0x0400);
-            #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-            const POSIX_SPAWN_SETSID: Option<libc::c_int> = None;
 
             fn build_posix_spawn(
                 args: &[pyre_object::PyObjectRef],
@@ -10235,7 +10254,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     .map(crate::baseobjspace::is_true)
                     .transpose()?
                     .unwrap_or(false);
-                if setsid && POSIX_SPAWN_SETSID.is_none() {
+                if setsid && !host_posix::supports_posix_spawn_setsid() {
                     return Err(argument_unavailable(func, "setsid"));
                 }
                 let setsigmask = match crate::builtins::kwarg_get(kwargs(), "setsigmask") {
@@ -10246,7 +10265,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     Some(value) => Some(sigset_arg(value)?),
                     None => None,
                 };
-                let scheduler = parse_spawn_scheduler(func, kwargs())?;
+                let _scheduler = parse_spawn_scheduler(func, kwargs())?;
                 let file_actions_obj = crate::builtins::kwarg_get(kwargs(), "file_actions");
                 let actions: Vec<rustpython_host_env::posix::PosixSpawnFileAction> =
                     if let Some(fa) = file_actions_obj {
@@ -10258,7 +10277,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     } else {
                         Vec::new()
                     };
-                let config = LocalPosixSpawnConfig {
+                let config = host_posix::PosixSpawnConfig {
                     path: c_path.as_c_str(),
                     args: &argv,
                     env: &env,
@@ -10268,10 +10287,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     resetids,
                     setsid,
                     setsigmask: setsigmask.as_deref(),
-                    scheduler: scheduler.as_ref(),
+                    #[cfg(all(any(target_os = "linux", target_os = "freebsd"), not(target_env = "musl")))]
+                    scheduler: _scheduler,
                     spawnp,
                 };
-                let pid = local_posix_spawn(config)
+                let result = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    host_posix::posix_spawn(config)
+                };
+                let pid = result
                     .map_err(|e| io_err_with_filename(e, path.w_path()))?;
                 Ok(pyre_object::w_int_new(pid as i64))
             }
@@ -10540,218 +10564,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
             }
 
-            struct LocalPosixSpawnConfig<'a> {
-                path: &'a std::ffi::CStr,
-                args: &'a [std::ffi::CString],
-                env: &'a [std::ffi::CString],
-                file_actions: &'a [rustpython_host_env::posix::PosixSpawnFileAction],
-                setsigdef: Option<&'a [i32]>,
-                setpgroup: Option<libc::pid_t>,
-                resetids: bool,
-                setsid: bool,
-                setsigmask: Option<&'a [i32]>,
-                scheduler: Option<&'a SpawnScheduler>,
-                spawnp: bool,
-            }
-
-            fn errno_result(ret: libc::c_int) -> std::io::Result<()> {
-                if ret == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::from_raw_os_error(ret))
-                }
-            }
-
-            unsafe fn fill_sigset(set: *mut libc::sigset_t, sigs: &[i32]) -> std::io::Result<()> {
-                if unsafe { libc::sigemptyset(set) } != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                for signum in sigs {
-                    if unsafe { libc::sigaddset(set, *signum) } != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            }
-
-            fn build_spawn_file_actions(
-                actions: &[rustpython_host_env::posix::PosixSpawnFileAction],
-            ) -> std::io::Result<Option<libc::posix_spawn_file_actions_t>> {
-                use rustpython_host_env::posix::PosixSpawnFileAction;
-                if actions.is_empty() {
-                    return Ok(None);
-                }
-                let mut raw = unsafe { core::mem::zeroed::<libc::posix_spawn_file_actions_t>() };
-                errno_result(unsafe { libc::posix_spawn_file_actions_init(&mut raw) })?;
-                for action in actions {
-                    let result = match action {
-                        PosixSpawnFileAction::Open {
-                            fd,
-                            path,
-                            oflag,
-                            mode,
-                        } => unsafe {
-                            libc::posix_spawn_file_actions_addopen(
-                                &mut raw,
-                                *fd,
-                                path.as_ptr(),
-                                *oflag,
-                                *mode as libc::mode_t,
-                            )
-                        },
-                        PosixSpawnFileAction::Close { fd } => unsafe {
-                            libc::posix_spawn_file_actions_addclose(&mut raw, *fd)
-                        },
-                        PosixSpawnFileAction::Dup2 { fd, newfd } => unsafe {
-                            libc::posix_spawn_file_actions_adddup2(&mut raw, *fd, *newfd)
-                        },
-                    };
-                    if let Err(error) = errno_result(result) {
-                        unsafe { libc::posix_spawn_file_actions_destroy(&mut raw) };
-                        return Err(error);
-                    }
-                }
-                Ok(Some(raw))
-            }
-
-            fn build_spawn_attrs(
-                config: &LocalPosixSpawnConfig<'_>,
-            ) -> std::io::Result<libc::posix_spawnattr_t> {
-                let mut raw = unsafe { core::mem::zeroed::<libc::posix_spawnattr_t>() };
-                errno_result(unsafe { libc::posix_spawnattr_init(&mut raw) })?;
-                let mut flags = 0i32;
-                if let Some(pgid) = config.setpgroup {
-                    if let Err(error) =
-                        errno_result(unsafe { libc::posix_spawnattr_setpgroup(&mut raw, pgid) })
-                    {
-                        unsafe { libc::posix_spawnattr_destroy(&mut raw) };
-                        return Err(error);
-                    }
-                    flags |= libc::POSIX_SPAWN_SETPGROUP as i32;
-                }
-                if config.resetids {
-                    flags |= libc::POSIX_SPAWN_RESETIDS as i32;
-                }
-                if config.setsid {
-                    let Some(setsid_flag) = POSIX_SPAWN_SETSID else {
-                        unsafe { libc::posix_spawnattr_destroy(&mut raw) };
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            "posix_spawn: setsid unavailable on this platform",
-                        ));
-                    };
-                    flags |= setsid_flag as i32;
-                }
-                if let Some(sigs) = config.setsigmask {
-                    let mut set = unsafe { core::mem::zeroed::<libc::sigset_t>() };
-                    if let Err(error) = unsafe { fill_sigset(&mut set, sigs) }.and_then(|_| {
-                        errno_result(unsafe { libc::posix_spawnattr_setsigmask(&mut raw, &set) })
-                    }) {
-                        unsafe { libc::posix_spawnattr_destroy(&mut raw) };
-                        return Err(error);
-                    }
-                    flags |= libc::POSIX_SPAWN_SETSIGMASK as i32;
-                }
-                if let Some(sigs) = config.setsigdef {
-                    let mut set = unsafe { core::mem::zeroed::<libc::sigset_t>() };
-                    if let Err(error) = unsafe { fill_sigset(&mut set, sigs) }.and_then(|_| {
-                        errno_result(unsafe { libc::posix_spawnattr_setsigdefault(&mut raw, &set) })
-                    }) {
-                        unsafe { libc::posix_spawnattr_destroy(&mut raw) };
-                        return Err(error);
-                    }
-                    flags |= libc::POSIX_SPAWN_SETSIGDEF as i32;
-                }
-                if let Some(scheduler) = config.scheduler {
-                    #[cfg(target_os = "linux")]
-                    {
-                        if let Some(policy) = scheduler.policy {
-                            if let Err(error) = errno_result(unsafe {
-                                libc::posix_spawnattr_setschedpolicy(&mut raw, policy)
-                            }) {
-                                unsafe { libc::posix_spawnattr_destroy(&mut raw) };
-                                return Err(error);
-                            }
-                            flags |= libc::POSIX_SPAWN_SETSCHEDULER as i32;
-                        }
-                        if let Err(error) = errno_result(unsafe {
-                            libc::posix_spawnattr_setschedparam(&mut raw, &scheduler.param)
-                        }) {
-                            unsafe { libc::posix_spawnattr_destroy(&mut raw) };
-                            return Err(error);
-                        }
-                        flags |= libc::POSIX_SPAWN_SETSCHEDPARAM as i32;
-                    }
-                }
-                if let Err(error) =
-                    errno_result(unsafe { libc::posix_spawnattr_setflags(&mut raw, flags as _) })
-                {
-                    unsafe { libc::posix_spawnattr_destroy(&mut raw) };
-                    return Err(error);
-                }
-                Ok(raw)
-            }
-
-            fn local_posix_spawn(
-                config: LocalPosixSpawnConfig<'_>,
-            ) -> std::io::Result<libc::pid_t> {
-                let mut actions = build_spawn_file_actions(config.file_actions)?;
-                // `actions` is initialized C state, not a Rust value a drop
-                // reclaims, so a later failure has to destroy it explicitly.
-                let mut attrs = match build_spawn_attrs(&config) {
-                    Ok(attrs) => attrs,
-                    Err(error) => {
-                        if let Some(actions) = actions.as_mut() {
-                            unsafe { libc::posix_spawn_file_actions_destroy(actions) };
-                        }
-                        return Err(error);
-                    }
-                };
-                let mut argv: Vec<*mut libc::c_char> = config
-                    .args
-                    .iter()
-                    .map(|arg| arg.as_ptr() as *mut libc::c_char)
-                    .collect();
-                argv.push(std::ptr::null_mut());
-                let mut env: Vec<*mut libc::c_char> = config
-                    .env
-                    .iter()
-                    .map(|entry| entry.as_ptr() as *mut libc::c_char)
-                    .collect();
-                env.push(std::ptr::null_mut());
-                let actionsp = actions
-                    .as_mut()
-                    .map_or(std::ptr::null(), |actions| actions as *mut _ as *const _);
-                let mut pid: libc::pid_t = 0;
-                let ret = crate::module::thread::call_external_function(|| unsafe {
-                    if config.spawnp {
-                        libc::posix_spawnp(
-                            &mut pid,
-                            config.path.as_ptr(),
-                            actionsp,
-                            &attrs,
-                            argv.as_ptr(),
-                            env.as_ptr(),
-                        )
-                    } else {
-                        libc::posix_spawn(
-                            &mut pid,
-                            config.path.as_ptr(),
-                            actionsp,
-                            &attrs,
-                            argv.as_ptr(),
-                            env.as_ptr(),
-                        )
-                    }
-                })
-                .0;
-                unsafe { libc::posix_spawnattr_destroy(&mut attrs) };
-                if let Some(actions) = actions.as_mut() {
-                    unsafe { libc::posix_spawn_file_actions_destroy(actions) };
-                }
-                errno_result(ret)?;
-                Ok(pid)
-            }
             crate::module_ns_store(
                 ns,
                 "posix_spawn",

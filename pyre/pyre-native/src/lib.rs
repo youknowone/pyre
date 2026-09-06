@@ -10,7 +10,6 @@
 pub mod cffi;
 pub mod hash;
 pub mod locale;
-pub mod lzma;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ssl;
 #[cfg(feature = "wasm_vfs")]
