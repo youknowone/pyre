@@ -7127,6 +7127,19 @@ fn plain_new(result: u32, type_id: u32) -> Op {
     op
 }
 
+fn plain_new_array(result: u32, type_id: u32, length: i64) -> Op {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+    let descr = SimpleArrayDescr::new(1, 16, 8, type_id, Type::Int);
+    let op = make_op(
+        OpCode::NewArray,
+        &[OpRef::const_int(length)],
+        OpRef::ref_op(result),
+    );
+    op.setdescr(Arc::new(descr));
+    op
+}
+
 #[test]
 fn consecutive_new_ops_share_one_nursery_bump() {
     let inputs = nursery_new_inputs(
@@ -7197,6 +7210,80 @@ fn setfield_between_news_keeps_one_nursery_bump() {
         nursery_top_compare_count(&bytes),
         1,
         "non-collecting stores must not flush gen_malloc_nursery"
+    );
+}
+
+#[test]
+fn new_and_const_newarray_share_one_nursery_bump() {
+    let mut inputs = nursery_new_inputs(
+        vec![
+            plain_new(1, 53),
+            plain_new_array(2, 55, 3),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    if let Some(na) = inputs.nursery.as_mut() {
+        na.plain_tids.insert(55);
+    }
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        1,
+        "constant-size NewArray joins gen_malloc_nursery with New"
+    );
+}
+
+#[test]
+fn consecutive_const_newarrays_share_one_nursery_bump() {
+    let inputs = nursery_new_inputs(
+        vec![
+            plain_new_array(1, 55, 2),
+            plain_new_array(2, 55, 4),
+            finish_int_arg0(),
+        ],
+        55,
+    );
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        1,
+        "consecutive constant-size NewArray ops share one bump"
+    );
+}
+
+#[test]
+fn runtime_newarray_flushes_the_nursery_batch() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let descr = SimpleArrayDescr::new(1, 16, 8, 55, Type::Int);
+    let runtime = make_op(
+        OpCode::NewArray,
+        &[OpRef::input_arg_int(0)],
+        OpRef::ref_op(2),
+    );
+    runtime.setdescr(Arc::new(descr));
+    let mut inputs = nursery_new_inputs(
+        vec![
+            plain_new(1, 53),
+            runtime,
+            plain_new(3, 53),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    if let Some(na) = inputs.nursery.as_mut() {
+        na.plain_tids.insert(55);
+    }
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        3,
+        "a runtime-length NewArray stays on the varsize path and flushes"
     );
 }
 

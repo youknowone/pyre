@@ -3259,38 +3259,63 @@ fn aligned_nursery_size(payload: i64) -> Option<usize> {
 }
 
 /// One member of a rewrite.py `gen_malloc_nursery` run: consecutive
-/// inline-eligible `New`/`NewWithVtable` ops share one bump of `batch_total`.
-/// Followers are `NURSERY_PTR_INCREMENT` — `prev + prev_size` — on the
-/// fast path. The slow path still allocates each object through the
-/// collecting helper, because a follower's frame home is only written at
-/// its own op.
+/// inline-eligible `New`/`NewWithVtable` and constant-size `NewArray*`
+/// ops share one bump of `batch_total`. Followers are
+/// `NURSERY_PTR_INCREMENT` — `prev + prev_size` — on the fast path. The
+/// slow path still allocates each object through the collecting helper,
+/// because a follower's frame home is only written at its own op.
 #[derive(Clone, Copy)]
 enum NurseryBatchRole {
     Leader { batch_total: usize },
     Follower { prev_result: u32, prev_size: usize },
 }
 
-/// `New`/`NewWithVtable` that the inline nursery arm would accept.
-/// Constant results are excluded: a follower needs the previous payload
-/// pointer in a local.
-fn new_inline_nursery_member(op: &Op, na: &NurseryAllocParams) -> Option<(usize, u32)> {
-    if !matches!(op.opcode, OpCode::New | OpCode::NewWithVtable) {
-        return None;
-    }
+/// `New`/`NewWithVtable` or a constant-size `NewArray*` that the inline
+/// nursery arm would accept. Constant results are excluded: a follower
+/// needs the previous payload pointer in a local. A runtime-length
+/// array stays on the varsize path and is not a batch member.
+fn new_inline_nursery_member(
+    op: &Op,
+    na: &NurseryAllocParams,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<(usize, u32)> {
     let result_id = op.pos.get().raw();
     if OpRef::raw_is_constant(result_id) {
         return None;
     }
-    let descr = op.getdescr()?;
-    let sd = descr.as_size_descr()?;
-    if sd.non_moving() {
-        return None;
+    match op.opcode {
+        OpCode::New | OpCode::NewWithVtable => {
+            let descr = op.getdescr()?;
+            let sd = descr.as_size_descr()?;
+            if sd.non_moving() {
+                return None;
+            }
+            if !na.plain_tids.contains(&sd.type_id()) {
+                return None;
+            }
+            let total = aligned_nursery_size(sd.size() as i64)?;
+            (total < na.large_threshold).then_some((total, result_id))
+        }
+        OpCode::NewArray | OpCode::NewArrayClear => {
+            let descr = op.getdescr()?;
+            let ad = descr.as_array_descr()?;
+            if ad.non_moving() {
+                return None;
+            }
+            if !na.plain_tids.contains(&ad.type_id()) {
+                return None;
+            }
+            let length = const_operand_value(constants, op.arg(0).to_opref())?;
+            if length < 0 {
+                return None;
+            }
+            let payload = (ad.base_size() as i64)
+                .checked_add((ad.item_size() as i64).checked_mul(length)?)?;
+            let total = aligned_nursery_size(payload)?;
+            (total < na.large_threshold).then_some((total, result_id))
+        }
+        _ => None,
     }
-    if !na.plain_tids.contains(&sd.type_id()) {
-        return None;
-    }
-    let total = aligned_nursery_size(sd.size() as i64)?;
-    (total < na.large_threshold).then_some((total, result_id))
 }
 
 /// rewrite.py `gen_malloc_nursery` merge window: keep extending a run
@@ -3302,6 +3327,7 @@ fn new_inline_nursery_member(op: &Op, na: &NurseryAllocParams) -> Option<(usize,
 fn collect_nursery_batches(
     ops: &[Op],
     nursery: Option<&NurseryAllocParams>,
+    constants: &indexmap::IndexMap<u32, i64>,
 ) -> Vec<Option<NurseryBatchRole>> {
     let mut out = vec![None; ops.len()];
     let Some(na) = nursery else {
@@ -3323,7 +3349,7 @@ fn collect_nursery_batches(
         run.clear();
     };
     for (i, op) in ops.iter().enumerate() {
-        if let Some((total, result_id)) = new_inline_nursery_member(op, na) {
+        if let Some((total, result_id)) = new_inline_nursery_member(op, na, constants) {
             if !run.is_empty() && run_total + total < na.large_threshold {
                 run.push((i, total, result_id));
                 run_total += total;
@@ -3341,6 +3367,33 @@ fn collect_nursery_batches(
     }
     flush(&mut out, &mut run);
     out
+}
+
+/// rewrite.py `NURSERY_PTR_INCREMENT(prev, prev_size)` plus the interior
+/// object's tid header. Leaves the payload pointer as i64.
+fn emit_nursery_ptr_increment(
+    sink: &mut PeepSink<'_, '_>,
+    value_types: &ValueLocals,
+    alloc_scratch_local: u32,
+    prev_result: u32,
+    prev_size: usize,
+    type_id: i64,
+) {
+    sink.local_get(value_types.local(prev_result));
+    sink.i32_wrap_i64();
+    sink.i32_const(prev_size as i32);
+    sink.i32_add();
+    sink.local_tee(alloc_scratch_local);
+    sink.i32_const(GcHeader::SIZE as i32);
+    sink.i32_sub();
+    sink.i64_const(type_id);
+    sink.i64_store(MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    });
+    sink.local_get(alloc_scratch_local);
+    sink.i64_extend_i32_u();
 }
 
 /// `__indirect_function_table` indices of the allocation helpers a compiled
@@ -4692,7 +4745,7 @@ fn build_function(
     // took the bump so followers can `NURSERY_PTR_INCREMENT` instead of
     // calling the helper.
     let nursery_batches = if residual_type_base.is_some() {
-        collect_nursery_batches(ops, nursery)
+        collect_nursery_batches(ops, nursery, constants)
     } else {
         Vec::new()
     };
@@ -7779,21 +7832,14 @@ fn build_function(
                     // call the helper. The follower's home is written below.
                     sink.local_get(alloc_batch_flag_local);
                     sink.if_(BlockType::Result(ValType::I64));
-                    sink.local_get(value_types.local(*prev_result));
-                    sink.i32_wrap_i64();
-                    sink.i32_const(*prev_size as i32);
-                    sink.i32_add();
-                    sink.local_tee(alloc_scratch_local);
-                    sink.i32_const(GcHeader::SIZE as i32);
-                    sink.i32_sub();
-                    sink.i64_const(type_id);
-                    sink.i64_store(MemArg {
-                        offset: 0,
-                        align: 3,
-                        memory_index: 0,
-                    });
-                    sink.local_get(alloc_scratch_local);
-                    sink.i64_extend_i32_u();
+                    emit_nursery_ptr_increment(
+                        &mut sink,
+                        value_types,
+                        alloc_scratch_local,
+                        *prev_result,
+                        *prev_size,
+                        type_id,
+                    );
                     sink.else_();
                     sink.i64_const(type_id);
                     sink.i64_const(size);
@@ -8106,10 +8152,73 @@ fn build_function(
                 } else {
                     None
                 };
-                if let (Some(base), Some((total_size, length, na))) =
+                let batch_role = nursery_batches.get(op_idx).and_then(|role| role.as_ref());
+                if let (
+                    Some(base),
+                    Some((length, _)),
+                    Some(NurseryBatchRole::Follower {
+                        prev_result,
+                        prev_size,
+                    }),
+                ) = (
+                    residual_type_base,
+                    inline_nursery_total.map(|(total, length, _na)| (length, total)),
+                    batch_role,
+                ) {
+                    sink.local_get(alloc_batch_flag_local);
+                    sink.if_(BlockType::Result(ValType::I64));
+                    emit_nursery_ptr_increment(
+                        &mut sink,
+                        value_types,
+                        alloc_scratch_local,
+                        *prev_result,
+                        *prev_size,
+                        type_id,
+                    );
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(length as i32);
+                    sink.i32_store(MemArg {
+                        offset: len_offset as u64,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.else_();
+                    sink.i64_const(type_id);
+                    sink.i64_const(base_size);
+                    sink.i64_const(item_size);
+                    sink.i64_const(length as i64);
+                    sink.i64_const(len_offset);
+                    sink.i32_const(alloc_array_fn_ptr as i32);
+                    sink.call_indirect(0, base + 5);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
+                    sink.end();
+                    if !OpRef::raw_is_constant(vi) {
+                        sink.local_set(value_types.local(vi));
+                    } else {
+                        sink.drop();
+                    }
+                } else if let (Some(base), Some((total_size, length, na))) =
                     (residual_type_base, inline_nursery_total)
                 {
-                    // free = *nursery_free; new_free = free + total
+                    let bump_size = match batch_role {
+                        Some(NurseryBatchRole::Leader { batch_total }) => *batch_total,
+                        _ => total_size,
+                    };
+                    // free = *nursery_free; new_free = free + bump
                     sink.i32_const(na.free_addr as i32);
                     sink.i32_load(MemArg {
                         offset: 0,
@@ -8117,7 +8226,7 @@ fn build_function(
                         memory_index: 0,
                     });
                     sink.local_tee(alloc_scratch_local);
-                    sink.i32_const(total_size as i32);
+                    sink.i32_const(bump_size as i32);
                     sink.i32_add();
                     // The sum is the committed `nursery_free`, so keep it
                     // rather than adding it again on the arm that takes it.
@@ -8155,8 +8264,12 @@ fn build_function(
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
                     );
+                    if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
+                        sink.i32_const(0);
+                        sink.local_set(alloc_batch_flag_local);
+                    }
                     sink.else_();
-                    // Commit: *nursery_free = free + total.
+                    // Commit: *nursery_free = free + bump.
                     sink.i32_const(na.free_addr as i32);
                     sink.local_get(alloc_size_local);
                     sink.i32_store(MemArg {
@@ -8181,6 +8294,10 @@ fn build_function(
                         align: 2,
                         memory_index: 0,
                     });
+                    if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
+                        sink.i32_const(1);
+                        sink.local_set(alloc_batch_flag_local);
+                    }
                     // Result payload pointer = free + header size.
                     sink.local_get(alloc_scratch_local);
                     sink.i32_const(majit_gc::header::GcHeader::SIZE as i32);
