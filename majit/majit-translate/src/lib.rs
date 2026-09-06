@@ -22,6 +22,7 @@
     )
 )]
 pub mod annotator;
+pub mod artifacts;
 #[cfg_attr(
     test,
     expect(

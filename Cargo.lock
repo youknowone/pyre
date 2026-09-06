@@ -1991,6 +1991,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "majit-backend-wasm-host"
+version = "0.0.2"
+dependencies = [
+ "majit-backend-wasm",
+ "wasmtime",
+]
+
+[[package]]
 name = "majit-charon-reader"
 version = "0.0.2"
 dependencies = [
@@ -2088,6 +2096,7 @@ dependencies = [
 name = "majit-translate"
 version = "0.0.2"
 dependencies = [
+ "bincode",
  "bit-set",
  "indexmap",
  "libc",
@@ -2909,6 +2918,7 @@ name = "pyre-wasm-runner"
 version = "0.0.2"
 dependencies = [
  "getrandom 0.4.3",
+ "majit-backend-wasm-host",
  "parking_lot",
  "rustc-demangle",
  "sha2 0.10.9",
