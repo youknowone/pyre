@@ -48,7 +48,8 @@ unsafe fn pyre_libc_jitframe_tracer(obj_addr: usize, update: &mut dyn FnMut(*mut
                 update(slot_ptr as *mut majit_ir::GcRef);
             },
         );
-        // A traced Ref may be a `malloc_typed`-immortal object, whose managed
+        // jitframe.py `jitframe_trace` forwards the slots above. A traced Ref
+        // here may be a `malloc_typed`-immortal object, whose managed
         // children the visit above does not reach — the same hole the shadow
         // stack closes in `pyre_object_root_walker_area`, asked here of the
         // other channel that roots a live reference.
@@ -5114,15 +5115,13 @@ fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// process-global rather than per-mutator for the same reason: each outlives
 /// the thread that filled it. `w_globals` (`pycode.py:159-165
 /// frame_stores_global`) is first-store-wins, `_mapdict_caches[i].w_method`
-/// (mapdict.py:1418) is filled once, and a compiled `W_SRE_Pattern` outlives
-/// its compiling thread — as per-mutator areas their slots would lose their
+/// (mapdict.py:1418) is filled once — as per-mutator areas their slots would lose their
 /// root at that thread's `unregister_mutator` while the holder stayed live.
 fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_rbigint_parts_cache(visitor);
     pyre_interpreter::module::_io::walk_autoflusher_roots(|slot| {
         visit_pyobject_root(slot, visitor)
     });
-    sre_pattern_root_walker(visitor);
     w_globals_stamped_code_root_walker(visitor);
     mapdict_method_cache_root_walker(visitor);
 }
@@ -6205,12 +6204,6 @@ fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir
 #[allow(dead_code)]
 fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
-        visit_pyobject_root(slot, visitor);
-    });
-}
-
-fn sre_pattern_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_object::interp_sre::walk_sre_pattern_roots(|slot| {
         visit_pyobject_root(slot, visitor);
     });
 }
