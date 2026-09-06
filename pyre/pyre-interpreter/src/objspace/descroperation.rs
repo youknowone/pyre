@@ -3671,6 +3671,19 @@ unsafe fn same_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
     std::ptr::eq(rpy_type_of(a), rpy_type_of(b))
 }
 
+/// `_make_binop_impl` / `_make_comparison_impl` first-arm gate:
+/// `type(w1) is type(w2) and not w1.user_overridden_class`.
+///
+/// A pyre user subclass keeps the builtin `ob_type` and only retags
+/// `w_class` (`tag_subclass_instance` / `w_int_subclass_new`), so
+/// `rpy_type_of` cannot tell `7` from `IntOperand(3)`. Checking both
+/// operands restores the observable: the shortcut fires only for a pair
+/// of exact builtins.
+#[majit_macros::always_inline]
+unsafe fn same_unoverridden_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
+    same_rpy_type(a, b) && !user_overridden_class(a) && !user_overridden_class(b)
+}
+
 /// `typedef.py use_special_method_shortcut('__add__')` as installed on
 /// `W_IntObject` / `W_FloatObject`: the type-specific descr, not the
 /// generic lookup.  `@try_inline` (`objectmodel.py`) so the backend
@@ -3779,7 +3792,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // `_make_binop_impl`: `type(w1) is type(w2) and not user_overridden_class`
     // then the `use_special_method_shortcut` body.
     unsafe {
-        if same_rpy_type(a, b) && !user_overridden_class(a) {
+        if same_unoverridden_rpy_type(a, b) {
             if let Some(w_res) = shortcut_add(a, b)?
                 && !is_not_implemented(w_res)
             {
@@ -3955,7 +3968,7 @@ pub(crate) fn matmul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
 
 pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_rpy_type(a, b) && !user_overridden_class(a) {
+        if same_unoverridden_rpy_type(a, b) {
             if let Some(w_res) = shortcut_sub(a, b)?
                 && !is_not_implemented(w_res)
             {
@@ -4018,7 +4031,7 @@ pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 
 pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_rpy_type(a, b) && !user_overridden_class(a) {
+        if same_unoverridden_rpy_type(a, b) {
             if let Some(w_res) = shortcut_mul(a, b)?
                 && !is_not_implemented(w_res)
             {
@@ -4164,7 +4177,7 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 
 pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_rpy_type(a, b) && !user_overridden_class(a) {
+        if same_unoverridden_rpy_type(a, b) {
             if let Some(w_res) = shortcut_floordiv(a, b)?
                 && !is_not_implemented(w_res)
             {
@@ -4230,7 +4243,7 @@ unsafe fn try_subclass_binop_override(
 
 pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_rpy_type(a, b) && !user_overridden_class(a) {
+        if same_unoverridden_rpy_type(a, b) {
             if let Some(w_res) = shortcut_mod(a, b)?
                 && !is_not_implemented(w_res)
             {
@@ -5339,7 +5352,7 @@ fn float_pow_impl(x: f64, y: f64) -> PyResult {
 
 pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_rpy_type(a, b) && !user_overridden_class(a) {
+        if same_unoverridden_rpy_type(a, b) {
             if let Some(w_res) = shortcut_lshift(a, b)?
                 && !is_not_implemented(w_res)
             {
@@ -5382,7 +5395,7 @@ pub(crate) fn lshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
 
 pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_rpy_type(a, b) && !user_overridden_class(a) {
+        if same_unoverridden_rpy_type(a, b) {
             if let Some(w_res) = shortcut_rshift(a, b)?
                 && !is_not_implemented(w_res)
             {
@@ -5425,7 +5438,7 @@ pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
 
 pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_rpy_type(a, b) && !user_overridden_class(a) {
+        if same_unoverridden_rpy_type(a, b) {
             if let Some(w_res) = shortcut_and(a, b)?
                 && !is_not_implemented(w_res)
             {
@@ -5503,7 +5516,7 @@ pub(crate) fn unionable(obj: PyObjectRef) -> bool {
 
 pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_rpy_type(a, b) && !user_overridden_class(a) {
+        if same_unoverridden_rpy_type(a, b) {
             if let Some(w_res) = shortcut_or(a, b)?
                 && !is_not_implemented(w_res)
             {
@@ -5621,7 +5634,7 @@ pub(crate) fn or_impl(a: PyObjectRef, b: PyObjectRef, symbol: &str) -> PyResult 
 
 pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
-        if same_rpy_type(a, b) && !user_overridden_class(a) {
+        if same_unoverridden_rpy_type(a, b) {
             if let Some(w_res) = shortcut_xor(a, b)?
                 && !is_not_implemented(w_res)
             {
@@ -5687,10 +5700,7 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // `_make_comparison_impl`: only `__eq__`/`__ne__` have `left == right`,
     // so only they take the same-type shortcut.
     unsafe {
-        if matches!(op, CompareOp::Eq | CompareOp::Ne)
-            && same_rpy_type(a, b)
-            && !user_overridden_class(a)
-        {
+        if matches!(op, CompareOp::Eq | CompareOp::Ne) && same_unoverridden_rpy_type(a, b) {
             return compare_slot(a, b, op);
         }
     }
@@ -7363,6 +7373,20 @@ mod tests {
     fn test_int_bitand() {
         let result = and_(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0x0F) };
+    }
+
+    #[test]
+    fn same_unoverridden_rpy_type_rejects_user_int_subclass() {
+        unsafe {
+            let exact = w_int_new(7);
+            let user = w_int_subclass_new(3);
+            // `get_instantiate` is still null in this unit-test process;
+            // retag `w_class` the way `tag_subclass_instance` would.
+            (*user).w_class = &FLOAT_TYPE as *const PyType as PyObjectRef;
+            assert!(same_rpy_type(exact, user));
+            assert!(!same_unoverridden_rpy_type(exact, user));
+            assert!(same_unoverridden_rpy_type(exact, w_int_new(3)));
+        }
     }
 
     #[test]
