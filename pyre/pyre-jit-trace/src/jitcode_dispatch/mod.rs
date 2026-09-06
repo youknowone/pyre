@@ -10482,6 +10482,59 @@ fn walker_numeric_builtin_class(obj: pyre_object::PyObjectRef) -> pyre_object::P
     }
 }
 
+/// Whether `op` is already the constant `expected`.
+///
+/// A freshly recorded GETFIELD carries the live class as its concrete
+/// snapshot (`field_sanity_load`), so `box_value` matching is not a proof
+/// — that is exactly the case that still needs `GUARD_VALUE`.  After
+/// `implement_guard_value` the heapcache must serve the *constant* box
+/// (`is_constant()`), and only then is a second pin a tautology.
+fn walker_ref_box_is<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op: OpRef,
+    expected: pyre_object::PyObjectRef,
+) -> bool {
+    op.is_constant()
+        && matches!(
+            ctx.trace_ctx.box_value(op),
+            Some(majit_ir::Value::Ref(r)) if r.0 == expected as usize
+        )
+}
+
+/// Read `obj.w_class` through the heapcache and pin it to `expected_typeobj`.
+///
+/// `pyjitpl.py` `_opimpl_getfield_gc_any_pureornot` records the load once
+/// (`upd.getfield_now_known`), then `implement_guard_value` makes that box
+/// the constant.  A later reader of the same field must reuse the cached
+/// box and emit no second GETFIELD / GUARD_VALUE.  The uncached
+/// `GETFIELD_GC_R` spelling used to skip that cache, so
+/// `walker_emit_super_proxy` and `walker_emit_super_attr_lookup_guards`
+/// each recorded the same receiver-class proof — the name-bound
+/// `s = super(C, self); s.val` spelling paid it twice per iteration.
+fn walker_pin_instance_w_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    expected_typeobj: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let descr = crate::descr::w_class_descr();
+    let field_index = descr.index();
+    let actual = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
+    let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
+    if walker_ref_box_is(ctx, actual, expected_typeobj) {
+        return Ok(expected);
+    }
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[actual, expected])?;
+    // `pyjitpl.py` `MIFrame.implement_guard_value`'s second half: the guard
+    // has proved the read equals the constant, so later GETFIELDs of this
+    // slot must return that constant, not the GETFIELD box whose concrete
+    // snapshot merely happened to match at record time.
+    ctx.trace_ctx.heap_cache_mut().replace_box(actual, expected);
+    ctx.trace_ctx
+        .heapcache_getfield_now_known(obj, field_index, expected);
+    Ok(expected)
+}
+
 /// Walker-native mirror of the trait `trace_guard_exact_w_class`
 /// (`trace_opcode.rs`): emit `getfield_gc_r(w_class)` →
 /// `guard_value(expected)` so the spec_ii fast path only stays live for an
@@ -10523,14 +10576,7 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
         }),
         "guard_exact_w_class at pc={op_pc} would pin a `w_class` its recorded operand does not carry",
     );
-    let actual =
-        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
-    let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[actual, expected])?;
-    // `pyjitpl.py` `MIFrame.implement_guard_value`'s second half: the guard
-    // has proved the read equals the constant, so the heapcache serves the
-    // constant to every later reader of the same box.
-    ctx.trace_ctx.heap_cache_mut().replace_box(actual, expected);
+    walker_pin_instance_w_class(ctx, op_pc, obj, expected_typeobj)?;
     Ok(())
 }
 
