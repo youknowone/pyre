@@ -452,6 +452,7 @@ enum PendingInstruction {
     LocalSet(u32),
     I64Const(i64),
     I32Const(i32),
+    I64ExtendI32U,
 }
 
 macro_rules! forward_zero {
@@ -511,6 +512,9 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
                 }
                 PendingInstruction::I32Const(value) => {
                     self.sink.i32_const(value);
+                }
+                PendingInstruction::I64ExtendI32U => {
+                    self.sink.i64_extend_i32_u();
                 }
             }
         }
@@ -648,13 +652,33 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         // does: `pending` is a lookbehind buffer, not an operand stack, so a
         // tail this fold does not consume still owes its instruction to
         // `flush`.
-        if let Some(PendingInstruction::I64Const(value)) = self.pending.last().copied() {
+        match self.pending.last().copied() {
+            Some(PendingInstruction::I64Const(value)) => {
+                self.pending.pop();
+                self.pending
+                    .push(PendingInstruction::I32Const(value as u64 as u32 as i32));
+            }
+            Some(PendingInstruction::I64ExtendI32U) => {
+                // wrap(extend_u(x)) == x for an i32 address already on the
+                // stack.
+                self.pending.pop();
+            }
+            _ => {
+                self.flush();
+                self.sink.i32_wrap_i64();
+            }
+        }
+        self
+    }
+
+    fn i64_extend_i32_u(&mut self) -> &mut Self {
+        if let Some(PendingInstruction::I32Const(value)) = self.pending.last().copied() {
             self.pending.pop();
             self.pending
-                .push(PendingInstruction::I32Const(value as u64 as u32 as i32));
+                .push(PendingInstruction::I64Const(value as u32 as u64 as i64));
         } else {
             self.flush();
-            self.sink.i32_wrap_i64();
+            self.pending.push(PendingInstruction::I64ExtendI32U);
         }
         self
     }
@@ -798,7 +822,6 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         i64_eqz,
         i64_extend32_s,
         i64_extend_i32_s,
-        i64_extend_i32_u,
         i64_ge_s,
         i64_ge_u,
         i64_gt_s,
@@ -961,12 +984,14 @@ fn emit_raw_addr(
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
-) {
-    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
-    sink.i32_wrap_i64();
-    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
-    sink.i32_wrap_i64();
-    sink.i32_add();
+) -> u64 {
+    emit_gc_offset_addr(
+        sink,
+        constants,
+        value_types,
+        op.arg(0).to_opref(),
+        op.arg(1).to_opref(),
+    )
 }
 
 /// Address the GC rewrite's descriptor-free `base + offset` memory form.
@@ -6474,24 +6499,24 @@ fn build_function(
             OpCode::RawLoadI | OpCode::RawLoadF => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_raw_addr(&mut sink, constants, value_types, op);
+                    let offset = emit_raw_addr(&mut sink, constants, value_types, op);
                     if op.opcode == OpCode::RawLoadF {
-                        sink.f64_load(mem64(0));
+                        sink.f64_load(mem64(offset));
                     } else {
                         let (item_size, signed) = array_item_size_sign_from_descr(op);
-                        emit_sized_int_load(&mut sink, 0, item_size, signed);
+                        emit_sized_int_load(&mut sink, offset, item_size, signed);
                     }
                     sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::RawStore => {
-                emit_raw_addr(&mut sink, constants, value_types, op);
+                let offset = emit_raw_addr(&mut sink, constants, value_types, op);
                 // `emit_resolve` hands back a Float operand as the `i64` its
                 // bits spell, so the width-sized integer store writes the same
                 // eight bytes an `f64.store` would.
                 emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
                 let (item_size, _signed) = array_item_size_sign_from_descr(op);
-                emit_sized_int_store(&mut sink, 0, item_size);
+                emit_sized_int_store(&mut sink, offset, item_size);
             }
 
             // ── Exception handling ──

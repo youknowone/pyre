@@ -6240,6 +6240,41 @@ fn raw_load_f_loads_a_double() {
     assert_eq!(f64_loads, 1, "the float raw load is an f64.load");
 }
 
+#[test]
+fn raw_load_const_offset_uses_memarg_displacement() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    const OFFSET: u64 = 24;
+    let descr = Arc::new(SimpleArrayDescr::new(1, 0, 8, 55, Type::Int));
+    let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+    let load = make_op(
+        OpCode::RawLoadI,
+        &[OpRef::input_arg_ref(0), OpRef::const_int(OFFSET as i64)],
+        OpRef::int_op(1),
+    );
+    load.setdescr(descr);
+    let ops = vec![load, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let mut adds = 0;
+    let mut displaced = 0;
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I32Add => adds += 1,
+        wasmparser::Operator::I64Load { memarg } | wasmparser::Operator::I64Load32U { memarg }
+            if memarg.offset == OFFSET =>
+        {
+            displaced += 1;
+        }
+        _ => {}
+    });
+    assert_eq!(displaced, 1, "the constant offset rides in MemArg");
+    assert_eq!(
+        adds, 0,
+        "a nonnegative constant offset must not emit i32.add"
+    );
+}
+
 /// resoperation.py `int_between(a, b, c)` is `a <= b < c`, signed.
 #[test]
 fn int_between_is_two_signed_comparisons() {
