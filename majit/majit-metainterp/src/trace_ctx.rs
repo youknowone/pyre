@@ -282,6 +282,13 @@ pub struct TraceCtx {
     /// (RPython parity: `virtualizable_boxes[-1]`). Used by gen_store_back_in_vable
     /// to distinguish standard vs nonstandard virtualizable.
     pub(crate) virtualizable_boxes: Option<Vec<OpRef>>,
+    /// Snapshot of `virtualizable_boxes` at `init_virtualizable_boxes` /
+    /// `set_virtualizable_boxes_with_info`. `gen_store_back_in_vable` skips
+    /// a static field or array slot whose live box is still this opref —
+    /// the `xxx only write back the fields really modified` note on
+    /// `pyjitpl.py gen_store_back_in_vable`. `replace_box` updates the live
+    /// list only, so a renamed box is still written back.
+    virtualizable_boxes_at_entry: Option<Vec<OpRef>>,
     /// Concrete shadow of `virtualizable_boxes`. Same layout, each slot carries
     /// the current runtime `Value` (RPython Box ≡ OpRef + concrete value).
     /// Seeded from `original_boxes` in `initialize_virtualizable` and kept in
@@ -1769,6 +1776,7 @@ impl TraceCtx {
             green_key_values: None,
             driver_descriptor: None,
             virtualizable_boxes: None,
+            virtualizable_boxes_at_entry: None,
             virtualizable_values: None,
             virtualizable_live_null_slots: None,
             virtualizable_info: None,
@@ -1868,6 +1876,7 @@ impl TraceCtx {
             green_key_values: Some(green_key_values),
             driver_descriptor: None,
             virtualizable_boxes: None,
+            virtualizable_boxes_at_entry: None,
             virtualizable_values: None,
             virtualizable_live_null_slots: None,
             virtualizable_info: None,
@@ -2548,6 +2557,7 @@ impl TraceCtx {
     ) {
         let mut boxes = input_oprefs.to_vec();
         boxes.push(vable_ref); // RPython: virtualizable_boxes[-1] = vable identity
+        self.virtualizable_boxes_at_entry = Some(boxes.clone());
         self.virtualizable_boxes = Some(boxes);
         if input_values.is_empty() {
             // Caller has no live concrete values (e.g. bridge-entry rebuild
@@ -3706,6 +3716,7 @@ impl TraceCtx {
     /// resume data before the bridge replays any vable op.
     pub fn clear_virtualizable_boxes(&mut self) {
         self.virtualizable_boxes = None;
+        self.virtualizable_boxes_at_entry = None;
     }
 
     /// Set virtualizable_boxes with VirtualizableInfo and array lengths.
@@ -3736,6 +3747,7 @@ impl TraceCtx {
             self.virtualizable_values = None;
             self.virtualizable_live_null_slots = None;
         }
+        self.virtualizable_boxes_at_entry = Some(boxes.clone());
         self.virtualizable_boxes = Some(boxes);
         self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
@@ -3966,11 +3978,23 @@ impl TraceCtx {
         // pyjitpl.py:3478 self.forced_virtualizable = vbox
         self.forced_virtualizable = Some(vable_opref);
 
-        // pyjitpl.py `gen_store_back_in_vable` writes every field. Its
-        // "only write back the fields really modified" comment is a TODO,
-        // not an implemented entry-snapshot optimization.
+        // pyjitpl.py `xxx only write back the fields really modified`.
+        // A slot whose live box is still the entry snapshot is the heap
+        // value `initialize_virtualizable` read; writing it is a no-op
+        // and, unlike upstream, OptHeap cannot cancel it: the portal
+        // fields ride as inputargs, not GETFIELD, so the lazy-set cache
+        // is empty. `replace_box` leaves the snapshot alone, so a
+        // renamed box is still stored.
+        let entry = self.virtualizable_boxes_at_entry.clone();
+        let box_unchanged = |i: usize, value: OpRef| -> bool {
+            entry.as_deref().and_then(|e| e.get(i).copied()) == Some(value)
+        };
+
         for field_index in 0..info.static_fields.len() {
             if let Some(&value) = boxes.get(field_index) {
+                if box_unchanged(field_index, value) {
+                    continue;
+                }
                 // pyjitpl.py `gen_store_back_in_vable` records SETFIELD_GC
                 // with `vinfo.static_field_descrs[i]`. Upstream that list
                 // is `cpu.fielddescrof(VTYPE, name)` — the same FieldDescr
@@ -3998,22 +4022,34 @@ impl TraceCtx {
         let mut flat_box_index = info.static_fields.len();
         for array_index in 0..info.array_fields.len() {
             let len = lengths.get(array_index).copied().unwrap_or(0);
-            let field_descr = info.array_pointer_struct_descr(array_index);
-            let array_descr = info.array_item_descr(array_index);
-            let array_ref = self.vable_getfield_ref_descr(vable_opref, field_descr);
-            for item_index in 0..len {
-                if let Some(&value) = boxes.get(flat_box_index) {
-                    let index = self.const_int(item_index as i64);
-                    self.execute_and_record(
-                        None,
-                        OpCode::SetarrayitemGc,
-                        Some(array_descr.clone()),
-                        &[array_ref, index, value],
-                        None,
-                        0,
-                    );
+            let array_start = flat_box_index;
+            let any_item_changed = (0..len).any(|item_index| {
+                boxes
+                    .get(array_start + item_index)
+                    .is_some_and(|&value| !box_unchanged(array_start + item_index, value))
+            });
+            if any_item_changed {
+                let field_descr = info.array_pointer_struct_descr(array_index);
+                let array_descr = info.array_item_descr(array_index);
+                let array_ref = self.vable_getfield_ref_descr(vable_opref, field_descr);
+                for item_index in 0..len {
+                    if let Some(&value) = boxes.get(flat_box_index)
+                        && !box_unchanged(flat_box_index, value)
+                    {
+                        let index = self.const_int(item_index as i64);
+                        self.execute_and_record(
+                            None,
+                            OpCode::SetarrayitemGc,
+                            Some(array_descr.clone()),
+                            &[array_ref, index, value],
+                            None,
+                            0,
+                        );
+                    }
+                    flat_box_index += 1;
                 }
-                flat_box_index += 1;
+            } else {
+                flat_box_index += len;
             }
         }
 
@@ -7232,7 +7268,7 @@ mod tests {
         ctx.gen_store_back_in_vable(vable);
 
         let ops = take_all_ops(ctx);
-        assert_eq!(ops.len(), 5);
+        assert_eq!(ops.len(), 4);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
         assert_eq!(
             ops[0].getdescr().map(|d| d.index()),
@@ -7248,20 +7284,15 @@ mod tests {
             ops[2].getdescr().map(|d| d.index()),
             Some(info.array_item_descr(0).index())
         );
-        assert_eq!(ops[3].opcode, OpCode::SetarrayitemGc);
+        assert_eq!(ops[3].opcode, OpCode::SetfieldGc);
         assert_eq!(
             ops[3].getdescr().map(|d| d.index()),
-            Some(info.array_item_descr(0).index())
-        );
-        assert_eq!(ops[4].opcode, OpCode::SetfieldGc);
-        assert_eq!(
-            ops[4].getdescr().map(|d| d.index()),
             Some(info.token_field_descr().index())
         );
     }
 
     #[test]
-    fn gen_store_back_in_vable_writes_unmodified_fields_too() {
+    fn gen_store_back_in_vable_skips_unmodified_fields() {
         let mut info = crate::virtualizable::VirtualizableInfo::new(0);
         info.add_field("pc", Type::Int, 8);
         info.add_array_field(
@@ -7295,17 +7326,10 @@ mod tests {
         ctx.gen_store_back_in_vable(vable);
 
         let ops = take_all_ops(ctx);
-        assert_eq!(ops.len(), 4);
+        assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
         assert_eq!(
             ops[0].getdescr().map(|d| d.index()),
-            Some(info.static_field_struct_descr(0).index())
-        );
-        assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
-        assert_eq!(ops[2].opcode, OpCode::SetarrayitemGc);
-        assert_eq!(ops[3].opcode, OpCode::SetfieldGc);
-        assert_eq!(
-            ops[3].getdescr().map(|d| d.index()),
             Some(info.token_field_descr().index())
         );
     }

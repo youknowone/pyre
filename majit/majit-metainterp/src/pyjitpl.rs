@@ -26084,11 +26084,9 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        // pyjitpl.py gen_store_back_in_vable writes the static field and
-        // resets the token. Repeating the hint does not repeat either store.
-        assert_eq!(ops.len(), 2);
+        // Unmodified static boxes are skipped; only the token reset remains.
+        assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
     }
 
     #[test]
@@ -26391,10 +26389,9 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        // A fresh trace records the static field and token stores again.
-        assert_eq!(ops.len(), 2);
+        // Second trace is a fresh init, so the token store is recorded again.
+        assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
     }
 
     #[test]
@@ -26415,10 +26412,12 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        // Each hint writes the static field and token because getfield_vable
-        // consumes the forced state between the two hints.
-        assert_eq!(ops.len(), 4);
-        assert!(ops.iter().all(|op| op.opcode == OpCode::SetfieldGc));
+        // First hint writes the token; getfield_vable consumes forced
+        // state; second hint writes the token again. Static boxes are
+        // unmodified so they are not stored.
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
     }
 
     #[test]
