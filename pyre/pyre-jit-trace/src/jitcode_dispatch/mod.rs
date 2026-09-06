@@ -2276,9 +2276,9 @@ fn create_segmented_trace<Sym: WalkSym>(
         census_record("SegmentTrace::LatchRefused");
         return Ok(None);
     }
-    // The latch answers for the snapshot-array stack source; this leg publishes
-    // from the walker mirror, whose own height check runs only in the adopter.
-    // Ask it here, while a refusal is still free.
+    // The latch already preflighted the synchronized snapshot-array stack used
+    // at this post-step boundary. Only require the single-frame image which
+    // this leg can adopt; an opcode-entry mirror describes an earlier state.
     //
     // The refusal has to unstage what the latch just wrote, and from BOTH slots:
     // `latch_abort_blackhole` routes an inline sub-walk to the multi-frame one,
@@ -2286,9 +2286,9 @@ fn create_segmented_trace<Sym: WalkSym>(
     // staged, that image answers `abort_blackhole_latched()` for a later abort,
     // which then records none of its own and adopts this merge point instead of
     // its own stop — dropping everything executed in between.
-    if !latched_single_frame_mirror_publishable() {
+    if !single_frame_blackhole_latched() {
         reset_single_frame_blackhole();
-        census_record("SegmentTrace::MirrorStackRefused");
+        census_record("SegmentTrace::SingleFrameRefused");
         return Ok(None);
     }
     // pyjitpl.py `generate_guard(rop.GUARD_ALWAYS_FAILS)`. The resume
@@ -11545,7 +11545,7 @@ fn latch_taken_python_branch_abort_stack<Sym: WalkSym>(
 }
 
 fn goto_if_not_branch_on<Sym: WalkSym>(
-    code: &[u8],
+    _code: &[u8],
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
     condbox: OpRef,
@@ -11561,29 +11561,17 @@ fn goto_if_not_branch_on<Sym: WalkSym>(
             value: condbox,
         });
     }
-    let (guard_opcode, taken_pc, other_pc) = if switchcase != 0 {
-        (OpCode::GuardTrue, op.next_pc, target)
+    let guard_opcode = if switchcase != 0 {
+        OpCode::GuardTrue
     } else {
-        (OpCode::GuardFalse, target, op.next_pc)
+        OpCode::GuardFalse
     };
-
-    // `generate_guard` in `pyjitpl.py opimpl_goto_if_not` skips Const boxes.
-    // No register replacement occurs here; fused comparisons pass
-    // `replace=False`, preserving loop-variant conditions.
-    if condbox.is_constant() {
-        branch_without_guard(op, ctx, taken_pc, None)
-    } else {
-        guarded_branch_core(
-            code,
-            op,
-            ctx,
-            guard_opcode,
-            &[condbox],
-            taken_pc,
-            other_pc,
-            None,
-        )
+    if !condbox.is_constant() {
+        ctx.trace_ctx.record_guard(guard_opcode, &[condbox], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
+    let next_pc = if switchcase != 0 { op.next_pc } else { target };
+    Ok((DispatchOutcome::Continue, next_pc))
 }
 
 fn int_ovf_jump<Sym: WalkSym>(
@@ -13022,10 +13010,7 @@ fn handle<Sym: WalkSym>(
                 OpCode::NewWithVtable,
                 majit_metainterp::counters::RECORDED_OPS,
             );
-            let resbox =
-                ctx.trace_ctx
-                    .record_op_with_descr(OpCode::NewWithVtable, &[], descr.clone());
-            ctx.trace_ctx.heap_cache_mut().new_object(resbox);
+            let resbox = ctx.trace_ctx.execute_new_with_vtable(descr.clone());
             crate::helpers::note_class_word_after_new(ctx.trace_ctx, resbox, &descr);
             let dst = code[op.pc + 3] as usize;
             if let Some(value) = concrete {

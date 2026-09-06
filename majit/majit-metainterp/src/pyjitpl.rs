@@ -16085,6 +16085,7 @@ impl<M: Clone> MetaInterp<M> {
             None => self.get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)?,
         };
 
+
         // compile.py:994: force_from_resumedata(metainterp_sd, self, deadframe, vinfo, ginfo)
         // The stack-critical section lives on
         // `ResumeGuardForcedDescr.force_now`, which wraps
@@ -16130,7 +16131,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
         let all_liveness = self.staticdata.liveness_info.as_slice();
-        let (all_virtuals_ptr, all_virtuals_int, virtualizable_ptr) =
+        let (all_virtuals_ptr, all_virtuals_int, _virtualizable_ptr) =
             crate::resume::force_from_resumedata(
                 &self.staticdata.profiler,
                 rd_numb,
@@ -16217,6 +16218,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         });
     }
+
 
     pub fn is_force_token_armed(&self, token: u64) -> bool {
         self.backend.is_force_token_armed(GcRef(token as usize))
@@ -27504,9 +27506,11 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        // Unmodified static boxes are skipped; only the token reset remains.
-        assert_eq!(ops.len(), 1);
+        // pyjitpl.py gen_store_back_in_vable writes the static field and
+        // resets the token. Repeating the hint does not repeat either store.
+        assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
     }
 
     #[test]
@@ -27800,9 +27804,10 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        // Second trace is a fresh init, so the token store is recorded again.
-        assert_eq!(ops.len(), 1);
+        // A fresh trace records the static field and token stores again.
+        assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
     }
 
     #[test]
@@ -27823,12 +27828,10 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        // First hint writes the token; getfield_vable consumes forced
-        // state; second hint writes the token again. Static boxes are
-        // unmodified so they are not stored.
-        assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
+        // Each hint writes the static field and token because getfield_vable
+        // consumes the forced state between the two hints.
+        assert_eq!(ops.len(), 4);
+        assert!(ops.iter().all(|op| op.opcode == OpCode::SetfieldGc));
     }
 
     #[test]

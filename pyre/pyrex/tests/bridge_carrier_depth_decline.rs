@@ -153,7 +153,7 @@ fn the_answer_is_the_same_at_every_carrier_depth_cap() {
 }
 
 #[test]
-fn a_recursive_carrier_bypasses_the_generic_depth_decline() {
+fn a_recursive_carrier_capture_avoids_depth_decline_and_dirty_abort() {
     // Non-vacuity: `the_answer_is_the_same_at_every_carrier_depth_cap` would
     // also pass if the generic cap silently stopped applying to this program.
     // The lowered cap must not record `OverMultiframeDepth`, and the escape

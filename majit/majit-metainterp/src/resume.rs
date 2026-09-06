@@ -4463,7 +4463,9 @@ impl ResumeDataLoopMemo {
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
         let mut frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 16]> = SmallVec::new();
-        if let Some(sizes) = frame_sizes.filter(|sizes| sizes.len() > 1) {
+        // An explicitly empty framestack is the terminal force snapshot
+        // (opencoder.py create_empty_top_snapshot), not an absent layout.
+        if let Some(sizes) = frame_sizes {
             let mut offset = 0;
             for (i, &size) in sizes.iter().enumerate() {
                 let end = (offset + size).min(snapshot_boxes.len());
@@ -5434,6 +5436,30 @@ mod tests {
         let (val, tagbits) = untag(items[9] as i16);
         assert_eq!(tagbits, TAGBOX);
         assert_eq!(val, 1);
+    }
+
+    #[test]
+    fn number_from_parts_preserves_an_empty_framestack_with_vable_state() {
+        // opencoder.py create_empty_top_snapshot, reached after
+        // pyjitpl.py finishframe has popped the last MIFrame.
+        let snapshot = Snapshot {
+            framestack: Vec::new(),
+            vable_array: vec![
+                SnapshotBox::from(OpRef::ref_op(0)),
+                SnapshotBox::from(OpRef::const_int(7)),
+            ],
+            vref_array: Vec::new(),
+        };
+        let env = SimpleBoxEnv::new();
+        let expected = ResumeDataLoopMemo::new()
+            .number(&snapshot, &env, -1)
+            .unwrap()
+            .create_numbering();
+        let actual = ResumeDataLoopMemo::new()
+            .number_from_parts(&[], Some(&[]), &[], &snapshot.vable_array, &[], &env, -1)
+            .unwrap()
+            .create_numbering();
+        assert_eq!(actual, expected, "no synthetic (0, 0, 0) frame at FINISH");
     }
 
     #[test]

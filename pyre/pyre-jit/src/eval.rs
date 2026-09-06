@@ -7926,7 +7926,7 @@ fn drive_unpack_iterable_trace(
                     .expect("a guard exit carrying resume storage carries its layout"),
                 guard_exc,
                 // jd1 is novable: it has no virtualizable to force.
-                std::ptr::null(),
+                None,
                 true,
                 None,
             );
@@ -11346,10 +11346,9 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
     guard_exc: i64,
-    // `forced_guard_cache_owner` of the failing guard: the frame whose
-    // forced-virtual cache this resume may fish, null for any guard that is
-    // not a GUARD_NOT_FORCED.
-    forced_cache_owner: *const pyre_interpreter::PyFrame,
+    // `cpu.get_savedata_ref(deadframe)` for GUARD_NOT_FORCED; None for every
+    // other guard kind.
+    savedata: Option<majit_ir::GcRef>,
     // True when the failing guard belongs to a novable jitdriver (jd1
     // `unpackiterable_driver`): its resume data has no vable section, so the
     // decode must not consume one. jd0 guards pass `false`.
@@ -11359,6 +11358,17 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // jitframe savedata word.
     savedata: Option<majit_ir::GcRef>,
 ) -> crate::call_jit::BlackholeResult {
+    // compile.py ResumeGuardForcedDescr.handle_fail keeps `deadframe` alive
+    // while it reads `cpu.get_savedata_ref(deadframe)` and passes the revealed
+    // AllVirtuals cache into resume.py.  The native raw-exit adaptation has
+    // already copied that field out of the JITFRAME, so give the copied GCREF
+    // the same precise root lifetime.  In particular, re-read the slot after
+    // entering it: a collection while the blackhole is being prepared may
+    // forward AllVirtuals and write the new address here.
+    let savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+    let _savedata_root = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| savedata.is_some())
+    };
     // Same deadframe rooting as `handle_fail`: `decode_ref`'s TAGBOX arm reads
     // these slots after the resume construction has already allocated.  The
     // scope is handed to `blackhole_resume_via_rd_numb` below rather than held
@@ -11798,7 +11808,7 @@ fn execute_assembler(
                         raw_values,
                         exit_layout,
                         guard_exc,
-                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
+                        descr_arc.is_guard_forced().then_some(savedata).flatten(),
                         false,
                         savedata,
                     );
@@ -12174,7 +12184,7 @@ fn bound_reached(
                         raw_values,
                         exit_layout,
                         guard_exc,
-                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
+                        descr_arc.is_guard_forced().then_some(savedata).flatten(),
                         false,
                         savedata,
                     );
@@ -12493,7 +12503,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                         raw_values,
                         exit_layout,
                         guard_exc,
-                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
+                        descr_arc.is_guard_forced().then_some(savedata).flatten(),
                         false,
                         savedata,
                     );

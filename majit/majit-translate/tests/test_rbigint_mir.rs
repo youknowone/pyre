@@ -312,13 +312,13 @@ fn mapped_rbigint_methods_and_helpers_follow_upstream_source_order() {
             "fn args_from_rarith_uint1(",
             "fn args_from_rarith_uint(",
             "fn args_from_long(",
-            "fn _x_add",
+            "fn _x_add<'a>(",
             "fn _x_int_add(",
-            "fn _x_sub",
+            "fn _x_sub<'a>(",
             "fn _x_int_sub(",
-            "fn _x_mul(",
+            "fn _x_mul<'a>(",
             "fn _kmul_split(",
-            "fn _k_mul(",
+            "fn _k_mul<'a>(",
             "fn _inplace_divrem1(",
             "fn _divrem1(",
             "fn _int_rem_core(",
@@ -358,9 +358,9 @@ fn mapped_rbigint_methods_and_helpers_follow_upstream_source_order() {
             "fn _format_recursive_general(",
             "fn _format_lowest_level_divmod_int_results(",
             "fn _format(",
-            "fn _bitwise_and(",
-            "fn _bitwise_or(",
-            "fn _bitwise_xor(",
+            "fn _bitwise_and<'a>(",
+            "fn _bitwise_or<'a>(",
+            "fn _bitwise_xor<'a>(",
             "fn _int_bitwise_and(",
             "fn _int_bitwise_or(",
             "fn _int_bitwise_xor(",
@@ -1007,9 +1007,13 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
     }
     for name in ["_bitwise_and", "_bitwise_or", "_bitwise_xor"] {
         let types = input_types(name, None);
+        // `framework.py push_roots`: the GC-transformed native body carries
+        // an optional root span in addition to the two bigint payloads. It
+        // is a Ref, not a runtime operation discriminator; and/or/xor must
+        // remain distinct specialized graphs (`rbigint.py _bitwise`).
         assert!(
-            matches!(types.as_slice(), [ValueType::Ref(_), ValueType::Ref(_)]),
-            "specialized bigint bitwise graph must not carry an operation discriminator: \
+            matches!(types.as_slice(), [ValueType::Ref(_), ValueType::Ref(_), ValueType::Ref(_)]),
+            "specialized bigint bitwise graph must carry two payloads and the GC root span: \
              {types:?}"
         );
     }
@@ -1762,7 +1766,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
 }
 
 #[test]
-fn rbigint_operator_calls_retarget_to_gc_reference_residuals() {
+fn rbigint_add_residual_calls_the_gc_transformed_payload_body_once() {
     let Some(llbcs) = load_rbigint_llbcs() else {
         return;
     };
@@ -1778,7 +1782,8 @@ fn rbigint_operator_calls_retarget_to_gc_reference_residuals() {
         .find(|function| function.name == "jit_bigint_add" && function.module_path == "longobject")
         .expect("longobject::jit_bigint_add graph");
 
-    let mut residual_calls = 0;
+    let mut transformed_body_calls = 0;
+    let mut calls = Vec::new();
     for block in &wrapper.graph.blocks {
         for operation in &block.operations {
             if let OpKind::Call {
@@ -1786,28 +1791,23 @@ fn rbigint_operator_calls_retarget_to_gc_reference_residuals() {
                 ..
             } = &operation.kind
             {
+                calls.push(segments.clone());
                 assert!(
                     !matches!(segments.as_slice(), [.., owner, leaf]
                         if owner == "<Impl>" && leaf == "add"),
                     "the Rust by-value RBigInt trait shim must not enter the JIT graph: \
                      {segments:?}"
                 );
-                if segments
-                    == &[
-                        "pyre_interpreter",
-                        "objspace",
-                        "descroperation",
-                        "jit_bigint_add",
-                    ]
-                {
-                    residual_calls += 1;
+                if segments == &["majit_rlib", "rbigint", "gc", "add_payloads_collecting"] {
+                    transformed_body_calls += 1;
                 }
             }
         }
     }
     assert_eq!(
-        residual_calls, 1,
-        "RBigInt addition must be one GC-reference residual call"
+        transformed_body_calls, 1,
+        "the GC-reference residual must enter exactly one GC-transformed \
+         rbigint.add body: {calls:?}"
     );
 
     let constructor_caller = program
