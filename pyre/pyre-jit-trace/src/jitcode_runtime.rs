@@ -441,11 +441,36 @@ pub(crate) fn compute_pathed_jitcode_index(canonical_path: &str) -> Option<usize
     if canonical_path.is_empty() {
         return None;
     }
-    jitcode_index()
-        .paths
-        .iter()
-        .position(|path| path == canonical_path)
+    PATHED_JITCODE_INDEX.get(canonical_path).copied()
 }
+
+/// Process-wide `CallControl.jitcodes` keyed by `CallPath::canonical_key`.
+///
+/// RPython keeps one dict on `CallControl` (`call.py get_jitcode`); pyre's
+/// frozen `jitcode_index().paths` is that dict's key column, allocation-aligned
+/// with `ALL_JITCODES`. This map is the reverse lookup, built once, shared by
+/// every thread. Empty paths are omitted: those jitcodes were minted without a
+/// graph key. A duplicate path is a broken `IndexMap<CallPath, _>` invariant.
+static PATHED_JITCODE_INDEX: LazyLock<indexmap::IndexMap<&'static str, usize>> =
+    LazyLock::new(|| {
+        let paths = &jitcode_index().paths;
+        let mut by_path = indexmap::IndexMap::with_capacity(paths.len());
+        for (index, path) in paths.iter().enumerate() {
+            if path.is_empty() {
+                continue;
+            }
+            match by_path.entry(path.as_str()) {
+                indexmap::map::Entry::Vacant(slot) => {
+                    slot.insert(index);
+                }
+                indexmap::map::Entry::Occupied(_) => panic!(
+                    "pyre-jit-trace: build-time pipeline has more than one jitcode \
+                     under path `{path}`; CallControl.jitcodes keys each graph once"
+                ),
+            }
+        }
+        by_path
+    });
 
 /// The JitCode allocated under `canonical_path`, or `None` when the build-time
 /// pipeline does not contain that graph. See [`compute_pathed_jitcode_index`].
@@ -454,31 +479,11 @@ pub(crate) fn pathed_jitcode(canonical_path: &str) -> Option<Arc<JitCode>> {
     get_jitcode_by_index(compute_pathed_jitcode_index(canonical_path)?)
 }
 
-thread_local! {
-    /// `canonical_path` → its `ALL_JITCODES` index, resolved once per thread.
-    /// The `None` answer is cached too: a helper absent from the build-time
-    /// pipeline is asked for on every consult of its site.
-    ///
-    /// This is deliberately only a disposable lookup cache, not the owner of
-    /// RPython's process-wide `CallControl.jitcodes`: `jitcode_index().paths`
-    /// is frozen build data, and the cache retains only an index or `None` —
-    /// never a JitCode identity, GC reference, or semantic state. Dropping or
-    /// duplicating it on another thread can change lookup cost only.
-    static PATHED_JITCODE_INDEX: std::cell::RefCell<std::collections::HashMap<&'static str, Option<usize>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-/// [`pathed_jitcode`] for a descent's fixed target, cached per thread.  The
-/// descents this serves are rows of a table (`specialize.rs UnaryDescent`),
-/// so the path is a literal and the cache is keyed by it.
-pub(crate) fn pathed_jitcode_cached(canonical_path: &'static str) -> Option<Arc<JitCode>> {
-    let idx = PATHED_JITCODE_INDEX.with(|cache| {
-        *cache
-            .borrow_mut()
-            .entry(canonical_path)
-            .or_insert_with(|| compute_pathed_jitcode_index(canonical_path))
-    })?;
-    get_jitcode_by_index(idx)
+/// [`pathed_jitcode`] for a descent's fixed target.  The descents this
+/// serves are rows of a table (`specialize.rs UnaryDescent`); the path
+/// is a literal and [`PATHED_JITCODE_INDEX`] is the process-wide dict.
+pub(crate) fn pathed_jitcode_cached(canonical_path: &str) -> Option<Arc<JitCode>> {
+    pathed_jitcode(canonical_path)
 }
 
 /// Runtime-wrapper sibling of [`pathed_jitcode_cached`], for a codewriter
@@ -486,15 +491,9 @@ pub(crate) fn pathed_jitcode_cached(canonical_path: &'static str) -> Option<Arc<
 /// `AbstractDescr`; pyre keeps the serializable canonical body separate from
 /// the runtime descr pool, so this is the single identity-preserving join.
 pub fn pathed_runtime_jitcode_cached(
-    canonical_path: &'static str,
+    canonical_path: &str,
 ) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
-    let idx = PATHED_JITCODE_INDEX.with(|cache| {
-        *cache
-            .borrow_mut()
-            .entry(canonical_path)
-            .or_insert_with(|| compute_pathed_jitcode_index(canonical_path))
-    })?;
-    get_runtime_jitcode_by_index(idx)
+    get_runtime_jitcode_by_index(compute_pathed_jitcode_index(canonical_path)?)
 }
 
 /// Resolve an ordinary portal-closure JitCode by its unique graph leaf name.
@@ -3124,7 +3123,7 @@ mod tests {
     }
 
     #[test]
-    fn pathed_lookup_cache_is_disposable_without_changing_identity() {
+    fn pathed_lookup_is_the_process_wide_callcontrol_dict() {
         let path: &'static str = jitcode_index()
             .paths
             .iter()
@@ -3132,8 +3131,7 @@ mod tests {
             .expect("at least one graph-backed JitCode")
             .as_str();
         let first = pathed_runtime_jitcode_cached(path).expect("canonical path");
-        PATHED_JITCODE_INDEX.with(|cache| cache.borrow_mut().clear());
-        let again = pathed_runtime_jitcode_cached(path).expect("uncached canonical path");
+        let again = pathed_runtime_jitcode_cached(path).expect("same path again");
         let other = std::thread::spawn(move || {
             pathed_runtime_jitcode_cached(path).expect("canonical path on another thread")
         })
@@ -3141,9 +3139,15 @@ mod tests {
         .unwrap();
         assert!(Arc::ptr_eq(&first, &again));
         assert!(Arc::ptr_eq(&first, &other));
+        assert_eq!(
+            compute_pathed_jitcode_index(path),
+            jitcode_index()
+                .paths
+                .iter()
+                .position(|candidate| candidate == path)
+        );
         assert!(pathed_runtime_jitcode_cached("__missing_jitcode_path__").is_none());
-        PATHED_JITCODE_INDEX.with(|cache| cache.borrow_mut().clear());
-        assert!(pathed_runtime_jitcode_cached("__missing_jitcode_path__").is_none());
+        assert!(compute_pathed_jitcode_index("").is_none());
     }
 
     #[test]
