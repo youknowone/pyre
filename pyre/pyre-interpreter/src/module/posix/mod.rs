@@ -13,6 +13,9 @@ crate::pyre_module_init!(interp_posix);
 #[cfg(not(target_arch = "wasm32"))]
 pub use interp_posix::{W_DirEntry, W_ScandirIterator};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use interp_posix::rebind_fork_callback_mutex;
+
 // wasm32 has no operating system to wrap: the only filesystem the guest can
 // see is the embedder's, reached through the import machinery's
 // `SourceProvider`.  That leaves a `posix` too narrow to be a `cfg` pass over

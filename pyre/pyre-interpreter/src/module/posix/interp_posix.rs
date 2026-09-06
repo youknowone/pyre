@@ -111,6 +111,23 @@ static APPLEVEL_FORK_CALLBACKS: LazyLock<Mutex<ApplevelForkCallbacks>> =
 // corresponding process operation has its own narrow serializer.
 static FORK_SERIALIZER: Mutex<()> = Mutex::new(());
 
+/// See [`crate::module::thread::rebind_parking_lot_mutex`].
+pub(crate) fn rebind_fork_callback_mutex() {
+    unsafe {
+        crate::module::thread::rebind_parking_lot_mutex(&*APPLEVEL_FORK_CALLBACKS);
+    }
+}
+
+/// Drop an inherited `FORK_SERIALIZER` guard without unlocking the parent's
+/// waiter table, then install a fresh unlocked mutex.  The child is
+/// single-threaded, so nothing else can be waiting.
+pub(crate) fn forget_fork_serializer(guard: parking_lot::MutexGuard<'_, ()>) {
+    std::mem::forget(guard);
+    unsafe {
+        crate::module::thread::rebind_parking_lot_mutex(&FORK_SERIALIZER);
+    }
+}
+
 // `_in_next`'s test-and-set is indivisible under PyPy's GIL. Pyre is
 // free-threaded, so every borrow of the native scandir iterator takes this
 // narrow serializer. Claiming, taking, and releasing are separate serialized
@@ -7885,7 +7902,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             // owns unregistered Rust-stack temporaries, and a
                             // moving full collection would be unsafe.
                             pyre_object::gc_interp::request_oldgen_collection();
-                            drop(fork_serial);
+                            forget_fork_serializer(fork_serial);
                             Ok(pyre_object::w_int_new(0))
                         }
                         Ok(pid) => {
@@ -7949,7 +7966,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         Ok(0) => {
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
-                            drop(fork_serial);
+                            forget_fork_serializer(fork_serial);
                             Ok(pyre_object::w_tuple_new(vec![
                                 pyre_object::w_int_new(0),
                                 pyre_object::w_int_new(master_fd as i64),

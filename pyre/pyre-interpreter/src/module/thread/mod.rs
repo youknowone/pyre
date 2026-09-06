@@ -632,6 +632,26 @@ pub(crate) fn current_exceptions() -> PyObjectRef {
     result
 }
 
+/// Replace a process-global `parking_lot` mutex with a fresh one around the
+/// same payload.  After a multithreaded `fork` the inherited mutex names the
+/// parent's waiter table; `.lock()` then waits on a Linux futex whose owner
+/// is a tid that does not exist in the child
+/// (`ThreadJoinOnShutdown.test_3_join_in_forked_from_thread`).
+///
+/// The old mutex is overwritten, not dropped: `Mutex::drop` would touch that
+/// same waiter table.
+///
+/// # Safety
+/// The caller is the sole surviving thread and no other code holds a
+/// `MutexGuard` into `mutex`.
+#[allow(invalid_reference_casting)]
+pub(crate) unsafe fn rebind_parking_lot_mutex<T>(mutex: &Mutex<T>) {
+    // Same exclusive-after-fork cast as `W_ThreadHandle::after_fork_reinit`.
+    let mutex = mutex as *const Mutex<T> as *mut Mutex<T>;
+    let value = unsafe { std::ptr::read((*mutex).get_mut()) };
+    unsafe { std::ptr::write(mutex, Mutex::new(value)) };
+}
+
 /// `pypy/module/thread/os_thread.py:reinit_threads`.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn after_fork_child() {
@@ -646,6 +666,17 @@ pub(crate) fn after_fork_child() {
     // and an STW root walk would read their vanished root areas.
     majit_gc::shadow_stack::after_fork_child();
     majit_gc::gc_sync::after_fork_child();
+    // Rebind the process-global parking_lot mutexes before taking any of
+    // them.  `rgil::atfork_child_reinit_mutexes` only covers the two GIL
+    // mutexes; these tables are the next thing this function locks.
+    unsafe {
+        rebind_parking_lot_mutex(&*EXECUTION_CONTEXTS);
+        rebind_parking_lot_mutex(&ACTIVE_HANDLES);
+        rebind_parking_lot_mutex(&SHUTDOWN_HANDLES);
+        rebind_parking_lot_mutex(&TRACE_ALL_HOOK);
+        rebind_parking_lot_mutex(&PROFILE_ALL_HOOK);
+    }
+    crate::module::posix::rebind_fork_callback_mutex();
     {
         let mut contexts = EXECUTION_CONTEXTS.lock();
         // threadlocals.py `reinit_threads`: a fork can leave a worker
@@ -2704,7 +2735,14 @@ crate::py_module! {
         "exit"                   / 0 = exit_thread,
         "exit_thread"            / 0 = exit_thread,
         "_excepthook"            / 1 = thread_excepthook,
-        "_get_main_thread_ident" / 0 = |_| Ok(w_int_new(current_ident())),
+        "_get_main_thread_ident" / 0 = |_| {
+            let ident = MAIN_THREAD_IDENT.load(Ordering::Acquire);
+            Ok(w_int_new(if ident == 0 {
+                current_ident()
+            } else {
+                ident
+            }))
+        },
         "start_joinable_thread"  / * = start_joinable_thread,
         "start_new_thread"       / * = start_new_thread,
         "start_new"              / * = start_new_thread,
