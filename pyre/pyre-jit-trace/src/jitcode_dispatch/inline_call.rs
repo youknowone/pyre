@@ -788,57 +788,6 @@ fn descent_static_decline_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DESCENT_SCAN_OFF").is_none())
 }
 
-/// Bodies whose descent was attempted and aborted, so the next call to the
-/// same body leaves a residual instead of descending again.
-///
-/// `warmstate.py` `disable_noninlinable_function` sets `JC_DONT_TRACE_HERE`
-/// on a callee an abort is attributable to, and `pyjitpl.py:2818-2828`
-/// retraces the enclosing loop rather than penalising it.  This is that rule
-/// for the builtin descent, keyed on the body the descent enters rather than
-/// on a `CodeObject`, because a descent is entered at a JitCode and nowhere
-/// else.  Without it the abort is a property of the shape, which the next
-/// attempt rebuilds identically — the reading
-/// [`crate::jitcode_dispatch::fbw_state::fbw_decline_inline_callee`] states
-/// for its own deny.
-///
-/// ⚠ Off by default, behind `PYRE_FBW_DESCENT_DENY`, because remembering is
-/// not yet sound: it produces a process in which one trace of a body descends
-/// and the next does not, and `synth/pickle_ctor_args` compiles a wrong loop
-/// out of that mixture (`Unpickler.load` raises `EOFError: Ran out of input`;
-/// `loops_compiled` 3 -> 66). Attempting every descent is independently
-/// unsound in the CPython pickle and hashlib suites, so only the static refusal
-/// is a correctness boundary today. `PYRE_WALKABORT_OFF=1` does not change the
-/// mixed failure, so the blackhole forward resume is not what carries it.
-///
-/// Per-thread for the reason `FBW_HAZARDOUS_INLINE_DENY` is: pyre's walk
-/// state is per-thread, and an abort observed while tracing is a property of
-/// the tracing thread's framestack.
-thread_local! {
-    static FBW_DESCENT_DENY: std::cell::RefCell<std::collections::HashSet<usize>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-}
-
-/// Whether the learned deny is consulted at all.
-fn descent_deny_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DESCENT_DENY").is_some())
-}
-
-/// Whether an earlier descent into `jitcode_index` aborted on this thread.
-fn descent_denied(jitcode_index: usize) -> bool {
-    descent_deny_enabled() && FBW_DESCENT_DENY.with(|c| c.borrow().contains(&jitcode_index))
-}
-
-/// Remember that a descent into `jitcode_index` aborted.
-fn deny_descent(jitcode_index: usize) {
-    if !descent_deny_enabled() {
-        return;
-    }
-    FBW_DESCENT_DENY.with(|c| {
-        c.borrow_mut().insert(jitcode_index);
-    });
-}
-
 /// Print every un-lowered helper the descent into `jitcode_index` could reach,
 /// once per body, under `PYRE_FBW_INLINE_DIAG`.
 ///
@@ -4304,10 +4253,6 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         builtin_inline_decline!("wrapper body has no ref register", fnaddr);
         return Ok(None);
     }
-    if descent_denied(jitcode.index()) {
-        builtin_inline_decline!("descent into this body aborted earlier", fnaddr);
-        return Ok(None);
-    }
     if let Some(decline) = descent_decline(jitcode.index()) {
         if matches!(decline, DescentDecline::Helper(_)) {
             log_descent_unlowered_helper_blockers(jitcode.index());
@@ -4696,11 +4641,6 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             return Ok(None);
         }
         Err(error) => {
-            // The arm above withdrew its descent and returned the call to the
-            // ordinary residual, so it is not an abort and leaves the body
-            // eligible.  Reaching here does not: the walk stops, and the next
-            // attempt would rebuild the same shape and stop again.
-            deny_descent(jitcode.index());
             if let DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic } = &error {
                 if fbw_inline_diag_enabled() {
                     eprintln!(

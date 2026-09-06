@@ -303,7 +303,7 @@ configuration.
 `PYRE_DEOPT_PROBE`, `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
 `MAJIT_DETERMINISM_TRACE`, `MAJIT_DTRACE_CONST_BT`,
 `MAJIT_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_DEPTH_CENSUS`,
-`PYRE_FBW_DESCENT_DENY`, `PYRE_FBW_DESCENT_SCAN_OFF`, `PYRE_FBW_INLINE_DIAG`,
+`PYRE_FBW_DESCENT_SCAN_OFF`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
 `PYRE_FBW_MF_DIAG`, `PYRE_FBW_REPLAY_DIRTY_BODY`, `PYRE_FBW_SPEC_CENSUS`,
 `PYRE_FBW_STRICT_DIAG`,
@@ -336,15 +336,6 @@ Metering charges every guest instruction, which makes the host cranelift
 compile that `compile_ms` and `compile_bytes` measure slower than it is in a
 production run; `nofuel` is how those two fields are read. `wasm_ops` is the
 fuel subtraction and reports -1 under it.
-
-`PYRE_FBW_DESCENT_DENY` makes a descent that aborted remember the body it
-aborted in, so the next call leaves a residual instead of descending again —
-`warmstate.py` `disable_noninlinable_function` for the builtin descent. It is
-off because the mixture it creates is not sound: with it,
-`synth/pickle_ctor_args` compiles a wrong loop and its `Unpickler.load` raises
-`EOFError: Ran out of input`. Attempting every descent is independently unsound
-in the CPython pickle and hashlib suites, so the static refusal remains the
-default. It retires when both dynamic paths preserve per-frame state.
 
 `PYRE_FBW_DESCENT_SCAN_OFF` disables the descent's un-lowered-helper scan
 (`descent_static_decline_enabled`), so a builtin body holding a symbolic-fnaddr
