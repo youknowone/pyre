@@ -3869,6 +3869,14 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    if let Some(insn) = build_orthodox_inline_call_ir_r(
+        "pyre_interpreter::opcode_ops::binary_value_from_tag",
+        vec![Operand::ConstInt(op_val)],
+        vec![lhs_operand.clone(), rhs_operand.clone()],
+        result_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_ir_r_insn_from_operands(
         ctx.binary_op_fn_idx,
         op_val,
@@ -4066,6 +4074,14 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    if let Some(insn) = build_orthodox_inline_call_ir_r(
+        "pyre_interpreter::opcode_ops::compare_value_from_tag",
+        vec![Operand::ConstInt(op_val)],
+        vec![lhs_operand.clone(), rhs_operand.clone()],
+        result_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_ir_r_insn_from_operands(
         ctx.compare_op_fn_idx,
         op_val,
@@ -6485,6 +6501,13 @@ fn fully_bound_callee_body(
     if !jitcode.reachable_symbolic_residuals().targets.is_empty() {
         return None;
     }
+    // `blackhole.py bhimpl_inline_call_*` calls `jitcode.fnaddr`.  A
+    // fully-bound body with no host address aborts the frame on every
+    // guard-failure resume (`reject_unresolved_inline_call`).
+    if jitcode.fnaddr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(jitcode.fnaddr)
+    {
+        return None;
+    }
     Some(jitcode)
 }
 
@@ -6499,6 +6522,26 @@ fn build_orthodox_inline_call_r_r(
         vec![
             Operand::descr(DescrOperand::JitCode(jitcode)),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![value])),
+        ],
+        dst_reg,
+    ))
+}
+
+/// `jtransform.py handle_regular_call` for a `(Ref, Ref, Int) → Ref` body:
+/// `inline_call_ir_r(JitCode, ListI(ints), ListR(refs)) → reg`.
+fn build_orthodox_inline_call_ir_r(
+    canonical_path: &'static str,
+    ints: Vec<Operand>,
+    refs: Vec<Operand>,
+    dst_reg: Register,
+) -> Option<Insn> {
+    let jitcode = fully_bound_callee_body(canonical_path)?;
+    Some(Insn::op_with_result(
+        "inline_call_ir_r",
+        vec![
+            Operand::descr(DescrOperand::JitCode(jitcode)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, ints)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, refs)),
         ],
         dst_reg,
     ))
@@ -9693,6 +9736,14 @@ mod tests {
                 opname,
                 args,
                 result: Some(reg),
+            } if opname == "inline_call_ir_r" => {
+                assert_eq!(reg, Register::new(Kind::Ref, 2));
+                assert_eq!(args.len(), 3);
+            }
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
             } => {
                 assert_eq!(opname, "residual_call_ir_r");
                 assert_eq!(reg, Register::new(Kind::Ref, 2));
@@ -9771,13 +9822,10 @@ mod tests {
     }
 
     #[test]
-    fn lower_binary_op_hlop_matches_dual_write_residual_call_shape() {
-        // Byte-equivalence cross-check: the Insn produced from the
-        // BINARY_OP HLOp via `lower_binary_op_hlop_to_insn` must match
-        // the Insn produced by feeding the equivalent dual-write
-        // `residual_call_ir_r` SpaceOperation through
-        // `flatten_op_to_insn`.  This is the foundational invariant
-        // for retiring the dual-write + inline emit.
+    fn lower_binary_op_hlop_emits_inline_call_when_body_is_bound() {
+        // `binary_value_from_tag` is fully bound, so the HLOp lowers to
+        // `jtransform.py handle_regular_call`'s `inline_call_ir_r` rather
+        // than the MayForce residual the walker used to re-recognise.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
         let result = Variable::new(VariableId(2), Kind::Ref);
@@ -9793,47 +9841,32 @@ mod tests {
             lower_binary_op_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
                 .expect("BINARY_OP HLOp must lower");
 
-        // Build the equivalent dual-write residual_call SpaceOperation
-        // by hand — same shape as `record_residual_call_graph_op`
-        // produces in codewriter.rs's `Instruction::BinaryOp` arm for `sub`:
-        //   `[ConstInt(fn_idx), ListI([ConstInt(op_val)]),
-        //     ListR([lhs, rhs]), Descr]`.
-        // (`record_residual_call_graph_op` in codewriter.rs
-        // pushes `args_i` before `args_r` per the upstream
-        // `i,r,f` order; the `op_val` is bucketed into args_i because
-        // its `Kind` is `Int` per arg_kinds.)
-        // BINARY_OP helper carries the `BinaryOp` oopspec so the
-        // full-body walker can recognize + specialize it (#57); the
-        // hand-built dual-write descr must mirror that tag.
-        let mut may_force_ei = effect_info_for_call_flavor(CallFlavor::MayForce);
-        may_force_ei.runtime_helper = majit_ir::RuntimeHelperKind::BinaryOp;
-        let descr = intern_call_descr_stub(
-            may_force_ei,
-            vec![Kind::Ref, Kind::Ref, Kind::Int],
-            Some(Kind::Ref),
-        );
-        let dual_op = SpaceOperation::new(
-            "residual_call_ir_r",
-            vec![
-                Constant::signed(11).into(),
-                FlowListOfKind::new(Kind::Int, vec![Constant::signed(1).into()]).into(),
-                FlowListOfKind::new(Kind::Ref, vec![lhs.into(), rhs.into()]).into(),
-                descr.into(),
-            ],
-            Some(result.into()),
-            0,
-        );
-        let dual = flatten_op_to_insn(
-            &dual_op,
-            &mut get_register,
-            &mut flatten_constant_operand_for_test,
-        )
-        .expect("residual_call SpaceOperation must lower");
-
-        // Compare via Debug formatting — Insn does not derive Eq, but
-        // the Debug output is structurally faithful for the variants
-        // we touch (Op, Operand::*, Register).
-        assert_eq!(format!("{lowered:?}"), format!("{dual:?}"));
+        match lowered {
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
+            } => {
+                assert_eq!(opname, "inline_call_ir_r");
+                assert_eq!(reg, Register::new(Kind::Ref, 2));
+                assert_eq!(args.len(), 3);
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Int);
+                        assert!(matches!(list.content.as_slice(), [Operand::ConstInt(1)]));
+                    }
+                    other => panic!("expected ListI([1]), got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 2);
+                    }
+                    other => panic!("expected ListR([lhs, rhs]), got {other:?}"),
+                }
+            }
+            other => panic!("expected inline_call_ir_r, got {other:?}"),
+        }
     }
 
     #[test]
@@ -9897,6 +9930,14 @@ mod tests {
                 opname,
                 args,
                 result: Some(reg),
+            } if opname == "inline_call_ir_r" => {
+                assert_eq!(reg, Register::new(Kind::Ref, 2));
+                assert_eq!(args.len(), 3);
+            }
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
             } => {
                 assert_eq!(opname, "residual_call_ir_r");
                 assert_eq!(reg, Register::new(Kind::Ref, 2));
@@ -9953,8 +9994,16 @@ mod tests {
 
         match insn {
             Insn::Op { opname, args, .. } => {
-                assert_eq!(opname, "residual_call_ir_r");
-                match &args[1] {
+                assert!(
+                    opname == "inline_call_ir_r" || opname == "residual_call_ir_r",
+                    "unexpected compare lowering {opname}"
+                );
+                let tag_list = if opname == "inline_call_ir_r" {
+                    &args[1]
+                } else {
+                    &args[1]
+                };
+                match tag_list {
                     Operand::ListOfKind(list) => match &list.content[0] {
                         Operand::ConstInt(v) => assert_eq!(*v, 8, "is → tag 8"),
                         other => panic!("expected ConstInt(8) in ListI, got {other:?}"),
@@ -10004,8 +10053,13 @@ mod tests {
         let lowered =
             lower_compare_op_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
                 .expect("COMPARE_OP HLOp must lower");
-        let prod = build_compare_op_residual_call_ir_r_insn(17, 4, 0, 1, 2);
-        assert_eq!(format!("{lowered:?}"), format!("{prod:?}"));
+        match &lowered {
+            Insn::Op { opname, .. } if opname == "inline_call_ir_r" => {}
+            _ => {
+                let prod = build_compare_op_residual_call_ir_r_insn(17, 4, 0, 1, 2);
+                assert_eq!(format!("{lowered:?}"), format!("{prod:?}"));
+            }
+        }
     }
 
     #[test]
