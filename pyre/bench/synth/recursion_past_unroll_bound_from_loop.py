@@ -1,8 +1,4 @@
-# pyre-check: max-pypy-ratio=9.1
-# Run 33860926996 measured the generated-descent cranelift path at 7.9x on a
-# usable pypy baseline; 9.1x is that reading plus 15%. The recovery is the
-# canonical codewriter inline call from `ArithmeticOpcodeHandler::binary_value`
-# to the selected object-space body, not restoring the retired binary-op fold.
+# pyre-check: max-pypy-ratio=6
 # A recursion deeper than the inline unroll bound, driven from a loop body.
 #
 # `step` recurses nine frames deep, two past `FBW_MAX_INLINE_RECURSION`, so the

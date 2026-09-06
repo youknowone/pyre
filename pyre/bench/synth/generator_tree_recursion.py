@@ -1,17 +1,14 @@
-# pyre-check: max-pypy-ratio=23
+# pyre-check: max-pypy-ratio=14
 # pyre-check: jitstats-band=guard_failures=8
 # Successful bridge closure and a pre-trace Decline are not aborts in
 # `MetaInterp._interpret`. Charging both to pyre's local abort ceiling held this
 # fixture at 29 bridges / 3600 guard failures; the corrected lifecycle reaches
 # 33 / 4382. The PyPy oracle compiles still more (65 bridges) with forcings=0,
 # virtualizables forced=0 and nvirtuals=721, so the higher count is coverage,
-# not a regression to suppress. Once the manual arithmetic folds were retired
-# onto generated interpreter descents, branch runs 33692288311, 33813140363 and
-# 33860926996 measured cranelift at 13.6x..19.7x and dynasm at 10.2x..13.8x
-# while the exact 3-loop / 33-bridge / 4382-guard shape stayed fixed. 23x is the
-# cross-host high plus 15%. The recovery target is PyPy's canonical codewriter
-# inline call to the arithmetic body and its zero-forcing per-`MIFrame`
-# recursive-frame/blackhole path, not either retired shortcut.
+# not a regression to suppress. 14x is the gate; a slower host is a missing
+# upstream opt, not a reason to raise it. The path is PyPy's codewriter
+# inline call into the arithmetic body and the same-type
+# `use_special_method_shortcut`, not a retired hand fold.
 # Jitcounter decay is 0.96 every 32 minor collections
 # (majit-trace/src/counter.rs), so guard_failures tracks collection count during
 # each guard's warm-up rather than a compile decision. One host measured
