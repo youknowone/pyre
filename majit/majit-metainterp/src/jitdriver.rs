@@ -9681,8 +9681,13 @@ mod tests {
             vec![pc as i64, 0, code as i64],
             vec![Type::Int, Type::Int, Type::Ref],
         );
-        let hash = key.get_uhash();
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        // A real frontend constructs its JitDriver before hashing any Ref
+        // greens: WarmEnterState::new installs the GC-owned identity-hash
+        // resolver.  Keep the fixture in that order too, otherwise `hash`
+        // uses raw pointer bits while the compiled-entry door recomputes the
+        // same key through the installed, move-stable identity hash.
+        let hash = key.get_uhash();
         // `resume.py blackhole_from_resumedata` indexes
         // `metainterp_sd.jitcodes[jitcode_pos]` unconditionally.  The guard
         // snapshot below names jitcode 0, so give the fixture the same

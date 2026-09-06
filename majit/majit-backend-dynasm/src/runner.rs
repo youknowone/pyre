@@ -1780,21 +1780,11 @@ impl DynasmBackend {
         // (matching PyPy's `setup_once` ordering, which builds
         // trampolines after `finish_setup` has installed every CPU
         // descr).
-        let void: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new());
-        let int: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrInt::new());
-        let r: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrRef::new());
-        let float: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new());
-        let exit_exc: majit_ir::DescrRef =
-            Arc::new(majit_backend::ExitFrameWithExceptionDescrRef::new());
+        majit_backend::make_and_attach_done_descrs(&mut [self as &mut dyn Backend]);
         // `compile.py PropagateExceptionDescr` parity: backend-only
         // tests still need the same descr class identity that production
         // `MetaInterpStaticData.finish_setup` installs.
         let propagate: majit_ir::DescrRef = Arc::new(majit_backend::PropagateExceptionDescr::new());
-        <Self as Backend>::set_done_with_this_frame_descr_void(self, void);
-        <Self as Backend>::set_done_with_this_frame_descr_int(self, int);
-        <Self as Backend>::set_done_with_this_frame_descr_ref(self, r);
-        <Self as Backend>::set_done_with_this_frame_descr_float(self, float);
-        <Self as Backend>::set_exit_frame_with_exception_descr_ref(self, exit_exc);
         <Self as Backend>::set_propagate_exception_descr(self, propagate);
         // `pyjitpl.py self.cpu.setup_once()` parity — production
         // reaches `cpu.setup_once()` via `MetaInterpStaticData::_setup_once`

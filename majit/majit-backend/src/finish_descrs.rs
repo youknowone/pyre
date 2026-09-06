@@ -13,7 +13,73 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use majit_ir::{Descr, FailDescr, Type};
+use crate::Backend;
+use majit_ir::{Descr, DescrRef, FailDescr, Type};
+
+/// `compile.py` `def make_and_attach_done_descrs(targets)`.
+///
+/// Creates one instance of each `DoneWithThisFrameDescr*` +
+/// `ExitFrameWithExceptionDescrRef` and attaches them to each target
+/// under the attributes `done_with_this_frame_descr_{void,int,ref,float}`
+/// and `exit_frame_with_exception_descr_ref`.
+///
+/// pyre's `DescrContainer` trait (implemented by `MetaInterpStaticData`
+/// and the CPU stand-in) exposes the five `set_*` hooks that mirror
+/// the RPython `setattr(target, name, descr)` loop.
+pub fn make_and_attach_done_descrs<T: DescrContainer + ?Sized>(targets: &mut [&mut T]) {
+    let void: DescrRef = Arc::new(DoneWithThisFrameDescrVoid::new());
+    let int: DescrRef = Arc::new(DoneWithThisFrameDescrInt::new());
+    let ref_: DescrRef = Arc::new(DoneWithThisFrameDescrRef::new());
+    let float: DescrRef = Arc::new(DoneWithThisFrameDescrFloat::new());
+    let exc_ref: DescrRef = Arc::new(ExitFrameWithExceptionDescrRef::new());
+    for target in targets.iter_mut() {
+        target.set_done_with_this_frame_descr_void(void.clone());
+        target.set_done_with_this_frame_descr_int(int.clone());
+        target.set_done_with_this_frame_descr_ref(ref_.clone());
+        target.set_done_with_this_frame_descr_float(float.clone());
+        target.set_exit_frame_with_exception_descr_ref(exc_ref.clone());
+    }
+}
+
+/// Trait hooked by `make_and_attach_done_descrs`.
+///
+/// `compile.py` `setattr(target, name, descr)` — in RPython each
+/// target is a Python object with settable attributes; in Rust the
+/// five setters make the contract explicit.  `MetaInterpStaticData`
+/// and `dyn Backend` both implement this trait. Calls with
+/// heterogeneous targets use an explicit `&mut [&mut dyn DescrContainer]`.
+/// Homogeneous CPU targets can use `&mut [&mut dyn Backend]` directly.
+pub trait DescrContainer {
+    fn set_done_with_this_frame_descr_void(&mut self, descr: DescrRef);
+    fn set_done_with_this_frame_descr_int(&mut self, descr: DescrRef);
+    fn set_done_with_this_frame_descr_ref(&mut self, descr: DescrRef);
+    fn set_done_with_this_frame_descr_float(&mut self, descr: DescrRef);
+    fn set_exit_frame_with_exception_descr_ref(&mut self, descr: DescrRef);
+}
+
+/// `DescrContainer` blanket impl for `dyn Backend`.  Each setter
+/// forwards to the corresponding `Backend::set_*` trait method so
+/// backends that care about FINISH descr identity (dynasm / cranelift)
+/// can override and store the `Arc`.  Backends that don't override
+/// fall through to the no-op defaults — identity parity is still
+/// maintained on the `MetaInterpStaticData` side.
+impl DescrContainer for dyn Backend + '_ {
+    fn set_done_with_this_frame_descr_void(&mut self, descr: DescrRef) {
+        Backend::set_done_with_this_frame_descr_void(self, descr);
+    }
+    fn set_done_with_this_frame_descr_int(&mut self, descr: DescrRef) {
+        Backend::set_done_with_this_frame_descr_int(self, descr);
+    }
+    fn set_done_with_this_frame_descr_ref(&mut self, descr: DescrRef) {
+        Backend::set_done_with_this_frame_descr_ref(self, descr);
+    }
+    fn set_done_with_this_frame_descr_float(&mut self, descr: DescrRef) {
+        Backend::set_done_with_this_frame_descr_float(self, descr);
+    }
+    fn set_exit_frame_with_exception_descr_ref(&mut self, descr: DescrRef) {
+        Backend::set_exit_frame_with_exception_descr_ref(self, descr);
+    }
+}
 
 /// `compile.py` `class _DoneWithThisFrameDescr(AbstractFailDescr):
 /// final_descr = True`.

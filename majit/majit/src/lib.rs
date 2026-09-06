@@ -33,6 +33,9 @@ pub use majit_trace as trace;
 /// Backend abstraction: Backend trait, JitCellToken, DeadFrame.
 pub use majit_backend as backend;
 
+/// Explicit compilation of backend-ready IR without tracing or warmup.
+pub use majit_backend::eager;
+
 /// Cranelift backend: native code generation. Present under the `cranelift`
 /// feature, which is what pulls the backend crate in.
 #[cfg(feature = "cranelift")]

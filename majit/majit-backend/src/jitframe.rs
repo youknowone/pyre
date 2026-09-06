@@ -346,6 +346,31 @@ pub fn malloc_entry_jitframe(
     }
 }
 
+/// [`malloc_entry_jitframe`] for a caller whose Rust-stack inputs are not
+/// rooted across a collecting allocation.
+///
+/// This is the compiled-entry counterpart of [`malloc_jitframe_no_collect`]:
+/// it preserves that function's non-collecting nursery allocation while
+/// keeping the entry allocator's narrower initialization contract.  The
+/// generated entry writes every live spill before publishing its GC map, so
+/// clearing trailing frame slots here has no upstream counterpart.
+pub fn malloc_entry_jitframe_no_collect(
+    gc: &mut dyn majit_gc::GcAllocator,
+    size_bytes: usize,
+) -> *mut JitFrame {
+    match gc.jitframe_type_id() {
+        Some(type_id) => {
+            let gcref = if jitframe_prefer_oldgen() {
+                gc.alloc_oldgen_typed(type_id, size_bytes)
+            } else {
+                gc.alloc_nursery_no_collect_typed(type_id, size_bytes)
+            };
+            entry_gc_frame(gcref)
+        }
+        None => malloc_host_jitframe(size_bytes),
+    }
+}
+
 /// `llmodel.py:298` `frame = self.gc_ll_descr.malloc_jitframe(frame_info)`,
 /// reached through `GcLLDescription.malloc_jitframe` (gc.py:132) and
 /// `jitframe_allocate` (`jitframe.py:48`).
@@ -908,6 +933,19 @@ mod tests {
         assert!(
             gc.is_in_nursery(frame as usize),
             "a false prefer-oldgen flag must not land the frame in mark-sweep old-gen"
+        );
+    }
+
+    #[test]
+    fn noncollecting_entry_jitframe_stays_in_the_nursery() {
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let tid = gc.register_type(jitframe_type_info());
+        gc.set_jitframe_type_id(tid);
+        let frame = malloc_entry_jitframe_no_collect(&mut gc, JitFrame::alloc_size(8));
+        assert!(!frame.is_null());
+        assert!(
+            gc.is_in_nursery(frame as usize),
+            "the non-collecting entry allocator must keep the ordinary nursery placement"
         );
     }
 }

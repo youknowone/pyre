@@ -2361,8 +2361,8 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
 
 // `rpython/jit/metainterp/compile.py:623-674` — finish/propagate descrs.
 //
-// These are ported as backend-agnostic `FailDescr` impls on the
-// `majit-metainterp` side so `compile_tmp_callback` and
+// These are ported as backend-agnostic `FailDescr` impls in the
+// shared backend crate so `compile_tmp_callback` and
 // `finish_setup` can reference the same singletons RPython does.
 //
 // `pyjitpl.py` `compile.make_and_attach_done_descrs([self, cpu])` —
@@ -2371,8 +2371,8 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
 // backend observes is the same Arc the metainterp reads back in
 // `handle_fail`. pyre mirrors the same shape through the
 // `DescrContainer` trait implemented on both `MetaInterpStaticData`
-// (pyjitpl.rs) and `Backend` (majit-backend/lib.rs via the blanket
-// impl below), so `MetaInterp::new` installs a single `Arc` on both
+// (pyjitpl.rs) and `dyn Backend` (majit-backend/finish_descrs.rs),
+// so `MetaInterp::new` installs a single `Arc` on both
 // halves; `attach_descrs_to_cpu` forwards the clones to the backend.
 
 // `compile.py, 1092-1099` `_DoneWithThisFrameDescr` family /
@@ -2386,70 +2386,12 @@ pub use majit_backend::{
     DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
 };
 
-/// `compile.py` `def make_and_attach_done_descrs(targets)`.
-///
-/// Creates one instance of each `DoneWithThisFrameDescr*` +
-/// `ExitFrameWithExceptionDescrRef` and attaches them to each target
-/// under the attributes `done_with_this_frame_descr_{void,int,ref,float}`
-/// and `exit_frame_with_exception_descr_ref`.
-///
-/// pyre's `DescrContainer` trait (implemented by `MetaInterpStaticData`
-/// and the CPU stand-in) exposes the five `set_*` hooks that mirror
-/// the RPython `setattr(target, name, descr)` loop.
+pub use majit_backend::DescrContainer;
+
+/// Compatibility entry point for `compile.py` `make_and_attach_done_descrs`.
+/// The shared backend implementation preserves the same descriptor identities.
 pub fn make_and_attach_done_descrs(targets: &mut [&mut dyn DescrContainer]) {
-    let void: DescrRef = Arc::new(DoneWithThisFrameDescrVoid::new());
-    let int: DescrRef = Arc::new(DoneWithThisFrameDescrInt::new());
-    let ref_: DescrRef = Arc::new(DoneWithThisFrameDescrRef::new());
-    let float: DescrRef = Arc::new(DoneWithThisFrameDescrFloat::new());
-    let exc_ref: DescrRef = Arc::new(ExitFrameWithExceptionDescrRef::new());
-    for target in targets.iter_mut() {
-        target.set_done_with_this_frame_descr_void(void.clone());
-        target.set_done_with_this_frame_descr_int(int.clone());
-        target.set_done_with_this_frame_descr_ref(ref_.clone());
-        target.set_done_with_this_frame_descr_float(float.clone());
-        target.set_exit_frame_with_exception_descr_ref(exc_ref.clone());
-    }
-}
-
-/// Trait hooked by `make_and_attach_done_descrs`.
-///
-/// `compile.py` `setattr(target, name, descr)` — in RPython each
-/// target is a Python object with settable attributes; in Rust the
-/// five setters make the contract explicit.  `MetaInterpStaticData`
-/// and `dyn Backend` both implement this trait so a single call to
-/// `make_and_attach_done_descrs(&mut [&mut sd, &mut *backend])`
-/// mirrors RPython's `make_and_attach_done_descrs([self, cpu])`
-/// exactly.
-pub trait DescrContainer {
-    fn set_done_with_this_frame_descr_void(&mut self, descr: DescrRef);
-    fn set_done_with_this_frame_descr_int(&mut self, descr: DescrRef);
-    fn set_done_with_this_frame_descr_ref(&mut self, descr: DescrRef);
-    fn set_done_with_this_frame_descr_float(&mut self, descr: DescrRef);
-    fn set_exit_frame_with_exception_descr_ref(&mut self, descr: DescrRef);
-}
-
-/// `DescrContainer` blanket impl for `dyn Backend`.  Each setter
-/// forwards to the corresponding `Backend::set_*` trait method so
-/// backends that care about FINISH descr identity (dynasm / cranelift)
-/// can override and store the `Arc`.  Backends that don't override
-/// fall through to the no-op defaults — identity parity is still
-/// maintained on the `MetaInterpStaticData` side.
-impl DescrContainer for dyn Backend + '_ {
-    fn set_done_with_this_frame_descr_void(&mut self, descr: DescrRef) {
-        Backend::set_done_with_this_frame_descr_void(self, descr);
-    }
-    fn set_done_with_this_frame_descr_int(&mut self, descr: DescrRef) {
-        Backend::set_done_with_this_frame_descr_int(self, descr);
-    }
-    fn set_done_with_this_frame_descr_ref(&mut self, descr: DescrRef) {
-        Backend::set_done_with_this_frame_descr_ref(self, descr);
-    }
-    fn set_done_with_this_frame_descr_float(&mut self, descr: DescrRef) {
-        Backend::set_done_with_this_frame_descr_float(self, descr);
-    }
-    fn set_exit_frame_with_exception_descr_ref(&mut self, descr: DescrRef) {
-        Backend::set_exit_frame_with_exception_descr_ref(self, descr);
-    }
+    majit_backend::make_and_attach_done_descrs(targets);
 }
 
 /// `rpython/jit/metainterp/compile.py` `compile_tmp_callback`.
