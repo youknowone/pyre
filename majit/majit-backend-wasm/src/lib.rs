@@ -110,10 +110,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 ///
 /// 57-63 split slot 1, which says only that some CALL_ASSEMBLER target did not
 /// resolve and leaves the trace unsupported. Each answers one of the questions
-/// `general_int_call_assembler_target` asks before it admits a target: 57 = the
-/// operation is a CALL_ASSEMBLER whose result is neither Int nor Ref; 58 = it
-/// carries no call descr, or no target token; 59 = an argument or result type
-/// is outside Int/Ref; 60 = the target token is not in the registry at all;
+/// `general_call_assembler_target` asks before it admits a target: 57 is the
+/// historical result-kind decline slot; 58 = it carries no call descr, or no
+/// target token; 59 = a descriptor/opcode result mismatch or invalid argument
+/// kind; 60 = the target token is not in the registry at all;
 /// 61 = a registered target's deferred module failed to materialize a func
 /// handle; 62 = the registered geometry disagrees with the operation (input
 /// types, zero callee frame bytes, absent gcmap, absent compiled loop); 63 =
@@ -344,6 +344,19 @@ static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Off for the loop-body half of the class. See `inline_nonheader_enable`.
 static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Above this many exits, duplicating a parameter bridge arm at every guard is
+/// larger and slower to compile than the shared frame-entry epilogue.
+///
+/// The parameter arm is the right shape for the small hot loops it was added
+/// for: once a bridge exists it tail-calls it without spilling through the
+/// frame.  Large application-level traces are different.  Each guard carries
+/// a cell load, an indirect-call arm containing every live fail argument, and
+/// the ordinary spill fallback; the two ~850-guard modules in
+/// `pickle_terminal_raise_resume` grew by 78KB and made host Cranelift spend
+/// about 100ms more compiling paths which acquired no bridge. Keep the fast
+/// arm for ordinary traces and use the one shared frame dispatch once that
+/// replication is no longer bounded.
+const MAX_BRIDGE_PARAM_GUARDS: usize = 256;
 /// Entries a merge must earn per byte of the module it re-emits. See
 /// `inline_trip_threshold_for`. Zero leaves `INLINE_TRIP_THRESHOLD` as the
 /// whole rule.
@@ -556,6 +569,14 @@ pub fn bridge_params_disable() {
 
 fn bridge_params_enabled() -> bool {
     BRIDGE_PARAMS_ENABLED.load(Ordering::Relaxed)
+}
+
+fn bridge_param_dispatch_profitable(enabled: bool, guard_count: usize) -> bool {
+    enabled && guard_count <= MAX_BRIDGE_PARAM_GUARDS
+}
+
+fn bridge_param_dispatch_for(guard_count: usize) -> bool {
+    bridge_param_dispatch_profitable(bridge_params_enabled(), guard_count)
 }
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
@@ -1760,15 +1781,23 @@ pub extern "C" fn wasm_jit_alloc_array_oldgen(
     oom_signal_if_zero(obj)
 }
 
-/// Table indices of the four allocation trampolines, for the `New*` /
-/// `NewArray*` codegen. Taking each address here is what keeps the function in
-/// the module's `__indirect_function_table`, so a trace can `call_indirect` it.
+/// Exact guest-side implementation for the JIT IR's `FloatMod`. Keeping this
+/// in the interpreter module avoids both an incorrect arithmetic expansion
+/// (wasm has no remainder instruction) and a guest→host→guest call.
+extern "C" fn wasm_jit_fmod(a: f64, b: f64) -> f64 {
+    a % b
+}
+
+/// Table indices of runtime trampolines used by trace codegen. Taking each
+/// address here is what keeps the function in the module's
+/// `__indirect_function_table`, so a trace can `call_indirect` it.
 fn alloc_helpers() -> codegen::AllocHelpers {
     codegen::AllocHelpers {
         new_fn_ptr: wasm_jit_alloc as *const () as usize as i64,
         new_array_fn_ptr: wasm_jit_alloc_array as *const () as usize as i64,
         new_oldgen_fn_ptr: wasm_jit_alloc_oldgen as *const () as usize as i64,
         new_array_oldgen_fn_ptr: wasm_jit_alloc_array_oldgen as *const () as usize as i64,
+        fmod_fn_ptr: wasm_jit_fmod as *const () as usize as i64,
     }
 }
 
@@ -2950,6 +2979,17 @@ impl WasmBackend {
             .map(|region| codegen::guard_exit_count(&region.inputargs, &region.ops))
             .collect();
         let merged_guard_count = own_guard_count + region_guard_counts.iter().sum::<usize>();
+        if inputs.bridge_param_dispatch
+            && !bridge_param_dispatch_profitable(true, merged_guard_count)
+        {
+            // compile_bridge has already published functions with the source
+            // guards' parameter ABI. Flipping this flag would call those
+            // functions with the frame-only type and trap. Retain the existing
+            // owner and out-of-line bridge instead of growing past the bound.
+            return Err(BackendError::Unsupported(
+                "wasm backend: merged owner exceeds parameter-bridge guard limit".into(),
+            ));
+        }
         inputs.fail_index_base = reserve_fail_descrs(merged_guard_count);
         let (new_cells_base, new_cells_owner) = codegen::alloc_bridge_cells(merged_guard_count);
         inputs.bridge_cells_base = new_cells_base;
@@ -3148,10 +3188,10 @@ fn wasm_unsupported_trace_reason(ops: &[Op], allow_ca: bool) -> Option<String> {
     for op in ops {
         if op.opcode.is_call_assembler() && !allow_ca {
             // CALL_ASSEMBLER inlines a loop-bearing callee by jumping into another
-            // trace's compiled token. `general_int_call_assembler_target` resolves
+            // trace's compiled token. `general_call_assembler_target` resolves
             // that token to a published guest function the CA arm reaches with a
             // `call_indirect`, so reaching here means some target did not resolve
-            // — an unpublished token, a signature outside Int/Ref, or a missing
+            // — an unpublished token, an invalid signature, or a missing
             // deopt-helper slot — and there is nothing to call.
             return Some(format!(
                 "wasm backend: {:?} (loop-callee inline)",
@@ -3245,18 +3285,11 @@ fn resolve_cross_loop_jump_target(
 /// trace.  PyPy's `compile_tmp_callback` always supplies a real compiled token
 /// while the final loop is pending, so every target here must likewise be an
 /// installed `CompiledWasmLoop`; there is no bodyless self-placeholder case.
-fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
+fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
     let mut resolved = Vec::new();
     let mut saw_ca = false;
     for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
         saw_ca = true;
-        if !matches!(
-            op.opcode,
-            majit_ir::OpCode::CallAssemblerI | majit_ir::OpCode::CallAssemblerR
-        ) {
-            diag_bump(57);
-            return None;
-        }
         let Some(descr_ref) = op.getdescr() else {
             diag_bump(58);
             return None;
@@ -3266,13 +3299,16 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
             return None;
         };
         let arg_types = descr.arg_types();
-        if !arg_types
-            .iter()
-            .all(|&tp| matches!(tp, majit_ir::Type::Int | majit_ir::Type::Ref))
-            || !matches!(
-                descr.result_type(),
-                majit_ir::Type::Int | majit_ir::Type::Ref
+        // A JitFrame slot is an i64 bit carrier for every scalar kind. Float
+        // inputs/results therefore need no distinct CALL_ASSEMBLER ABI: the
+        // callee entry and caller result arm reinterpret at the local boundary.
+        // Void has no result local but follows the same finish-index protocol.
+        if !arg_types.iter().all(|&tp| {
+            matches!(
+                tp,
+                majit_ir::Type::Int | majit_ir::Type::Ref | majit_ir::Type::Float
             )
+        }) || descr.result_type() != op.opcode.result_type()
         {
             diag_bump(59);
             return None;
@@ -3354,8 +3390,8 @@ fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssembl
     (saw_ca && !resolved.is_empty()).then_some(resolved)
 }
 
-fn bridge_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
-    general_int_call_assembler_target(ops)
+fn bridge_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
+    general_call_assembler_target(ops)
 }
 
 fn ca_codegen_targets(
@@ -3851,7 +3887,7 @@ impl majit_backend::Backend for WasmBackend {
         // the descr.  While this loop is pending, PyPy puts a separately
         // compiled tmp callback in that cell; the bodyless pending-token
         // shortcut previously used by wasm is intentionally absent.
-        let ca_targets = general_int_call_assembler_target(ops);
+        let ca_targets = general_call_assembler_target(ops);
         let allow_ca = ca_deopt_helper_slot() != 0 && ca_targets.is_some();
 
         // Decline traces the wasm backend cannot compile correctly, so the
@@ -3886,6 +3922,7 @@ impl majit_backend::Backend for WasmBackend {
         let guard_exit_count = codegen::guard_exit_count(inputargs, ops);
         let fail_index_base = reserve_fail_descrs(guard_exit_count);
         let (bridge_cells_base, bridge_cells_owner) = codegen::alloc_bridge_cells(guard_exit_count);
+        let bridge_param_dispatch = bridge_param_dispatch_for(guard_exit_count);
         let module_inputs = codegen::ModuleBuildInputs {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             // Keep these rewritten operations exactly as intern_ref_constants
@@ -3904,7 +3941,7 @@ impl majit_backend::Backend for WasmBackend {
             fail_index_base,
             bridge_cells_base,
             bridge_entry_arity: None,
-            bridge_param_dispatch: bridge_params_enabled(),
+            bridge_param_dispatch,
             trace_entry_census,
             inline_trip: None,
             // A real loop's JUMP is a local back-edge `br`; an entry bridge
@@ -4069,7 +4106,7 @@ impl majit_backend::Backend for WasmBackend {
                     )
                 })
                 .collect(),
-            bridge_param_dispatch: bridge_params_enabled(),
+            bridge_param_dispatch,
             bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
             chained_trace_meta: std::cell::RefCell::new(std::collections::HashMap::new()),
             _bridge_owned_cells: std::cell::RefCell::new(bridge_cells_owner.into_iter().collect()),
@@ -4228,7 +4265,7 @@ impl majit_backend::Backend for WasmBackend {
         // The CA arm must be able to complete a callee deopt; without the
         // registered `wasm_ca_resume_deopt` slot it could not, so decline the
         // lift (the host round-trip path still handles the CALL_ASSEMBLER).
-        let ca_targets = bridge_int_call_assembler_target(ops);
+        let ca_targets = bridge_call_assembler_target(ops);
         let ca_candidate = ca_deopt_helper_slot() != 0 && ca_targets.is_some();
         // The source guard this bridge attaches to. `fail_index` is its index in
         // the source loop's `fail_descrs` / cell array; `trace_id` identifies the
@@ -4324,13 +4361,7 @@ impl majit_backend::Backend for WasmBackend {
                 "wasm backend: bridge source guard index has no dispatch cell".into(),
             ));
         }
-        let bridge_entry_arity = if bridge_params_enabled() {
-            if !source_bridge_param_dispatch {
-                diag_bump(45);
-                return Err(BackendError::Unsupported(
-                    "wasm backend: source guard has no parameter bridge dispatch".into(),
-                ));
-            }
+        let bridge_entry_arity = if source_bridge_param_dispatch {
             if source_fail_arg_count != Some(inputargs.len()) {
                 diag_bump(46);
                 return Err(BackendError::Unsupported(
@@ -4699,7 +4730,22 @@ impl majit_backend::Backend for WasmBackend {
                     };
                     self.collect_constants_from_ops(ops);
                     let has_invalidation_guard = codegen::has_invalidation_guard(ops);
-                    if has_invalidation_guard && outside_loop {
+                    let outside_labels_initialized =
+                        !outside_loop || region_external.is_some() || {
+                            let mut owner_ops = candidate.ops.clone();
+                            for region in &candidate.inlined_bridges {
+                                owner_ops.extend(region.ops.iter().cloned());
+                            }
+                            codegen::outside_region_labels_initialized(
+                                &owner_ops,
+                                merged_fail_index,
+                                ops,
+                            )
+                        };
+                    if !outside_labels_initialized {
+                        diag_bump(48);
+                        decline("uninitialized_label");
+                    } else if has_invalidation_guard && outside_loop {
                         // A quasi-immutable fold's dependencies are registered
                         // once, against whatever flag the token names when this
                         // compile returns — the bridge's own, because deferring
@@ -4881,6 +4927,7 @@ impl majit_backend::Backend for WasmBackend {
         // `GUARD_NOT_INVALIDATED` operations.
         let bridge_flag = original_token.mint_bridge_invalidation_flag();
         let (bridge_cells_base, bridge_cells_owner) = codegen::alloc_bridge_cells(guard_exit_count);
+        let bridge_param_dispatch = bridge_param_dispatch_for(guard_exit_count);
         let module_inputs = codegen::ModuleBuildInputs {
             inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
             ops: ops_owned.clone(),
@@ -4897,7 +4944,7 @@ impl majit_backend::Backend for WasmBackend {
             fail_index_base: base,
             bridge_cells_base,
             bridge_entry_arity,
-            bridge_param_dispatch: bridge_params_enabled(),
+            bridge_param_dispatch,
             trace_entry_census,
             inline_trip,
             external_jump_slot,
@@ -5022,7 +5069,7 @@ impl majit_backend::Backend for WasmBackend {
                             )
                         })
                         .collect(),
-                    bridge_param_dispatch: bridge_params_enabled(),
+                    bridge_param_dispatch,
                 },
             );
             // The bridge module lives as long as this source loop, so hand its
@@ -5620,6 +5667,19 @@ mod tests {
     use majit_gc::collector::MiniMarkGC;
     use majit_gc::trace::TypeInfo;
     use majit_ir::forwarding::bound_operand_from_opref as rb;
+
+    #[test]
+    fn parameter_bridge_dispatch_is_bounded_by_guard_population() {
+        assert!(bridge_param_dispatch_profitable(
+            true,
+            MAX_BRIDGE_PARAM_GUARDS
+        ));
+        assert!(!bridge_param_dispatch_profitable(
+            true,
+            MAX_BRIDGE_PARAM_GUARDS + 1
+        ));
+        assert!(!bridge_param_dispatch_profitable(false, 1));
+    }
 
     #[test]
     fn typed_blackhole_allocation_never_falls_back_to_raw_memory() {

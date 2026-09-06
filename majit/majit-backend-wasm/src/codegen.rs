@@ -155,12 +155,83 @@ impl ValueLocals {
             }
         }
 
-        let mut types = Vec::new();
-        for (id, slot) in by_id.iter_mut().enumerate() {
-            if slot.is_some() {
-                *slot = Some(types.len() as u32 + first_local);
-                types.push(id_types[id]);
+        // RPython's SAME_AS is a location remap, not a move. Preserve that
+        // identity at the wasm-local boundary: an SSA alias can share
+        // its source local for its whole lifetime. Ref homes remain value-id
+        // based below, so an aliased Ref that needs a distinct force/resume
+        // home still mirrors this shared local into that home after the op.
+        // LABEL args are mutable phi locations in this backend: terminal JUMP
+        // rebinds them on every iteration. Never coalesce either side with a
+        // label local, because two equal values at SAME_AS can diverge after
+        // the back-edge assignment.
+        let mut label_value_ids = vec![false; num_vars as usize];
+        for id in ops
+            .iter()
+            .filter(|op| op.opcode == OpCode::Label)
+            .flat_map(|op| op.getarglist().into_iter().map(|arg| arg.to_opref()))
+            .filter(|arg| *arg != OpRef::NONE && !arg.is_constant())
+            .map(OpRef::raw)
+        {
+            label_value_ids[id as usize] = true;
+        }
+        let mut alias_source = vec![None; num_vars as usize];
+        for op in ops {
+            if !matches!(
+                op.opcode,
+                OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
+            ) {
+                continue;
             }
+            let result = op.pos.get();
+            let source = op.arg(0).to_opref();
+            if result == OpRef::NONE
+                || result.is_constant()
+                || source == OpRef::NONE
+                || source.is_constant()
+                || label_value_ids[result.raw() as usize]
+                || label_value_ids[source.raw() as usize]
+            {
+                continue;
+            }
+            let dst = result.raw() as usize;
+            let src = source.raw() as usize;
+            if dst < alias_source.len()
+                && src < by_id.len()
+                && by_id[src].is_some()
+                && id_types[dst] == id_types[src]
+            {
+                alias_source[dst] = Some(src);
+            }
+        }
+
+        let mut types = Vec::new();
+        let mut root_locals = vec![None; num_vars as usize];
+        for id in 0..by_id.len() {
+            if by_id[id].is_none() {
+                continue;
+            }
+            let mut root = id;
+            let mut remaining = alias_source.len();
+            while let Some(source) = alias_source[root] {
+                // SAME_AS edges are SSA-backward and therefore acyclic.  Keep
+                // the bound nevertheless so malformed IR fails closed into a
+                // distinct local instead of looping in backend compilation.
+                if remaining == 0 || source >= alias_source.len() {
+                    root = id;
+                    break;
+                }
+                root = source;
+                remaining -= 1;
+            }
+            let local = if let Some(local) = root_locals[root] {
+                local
+            } else {
+                let local = types.len() as u32 + first_local;
+                root_locals[root] = Some(local);
+                types.push(id_types[root]);
+                local
+            };
+            by_id[id] = Some(local);
         }
         Self {
             by_id,
@@ -465,8 +536,110 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
     }
 
     fn i64_const(&mut self, value: i64) -> &mut Self {
-        self.flush();
+        if !matches!(self.pending.as_slice(), [PendingInstruction::I64Const(_)]) {
+            self.flush();
+        }
         self.pending.push(PendingInstruction::I64Const(value));
+        self
+    }
+
+    /// Fold two adjacent i64 constants, or remove an identity constant that
+    /// is the right operand of a value already committed to the sink.
+    fn fold_i64_binary(
+        &mut self,
+        right_identity: Option<i64>,
+        fold: impl FnOnce(i64, i64) -> i64,
+    ) -> bool {
+        if let [
+            PendingInstruction::I64Const(lhs),
+            PendingInstruction::I64Const(rhs),
+        ] = self.pending.as_slice()
+        {
+            let value = fold(*lhs, *rhs);
+            self.pending.clear();
+            self.pending.push(PendingInstruction::I64Const(value));
+            true
+        } else if let [PendingInstruction::I64Const(rhs)] = self.pending.as_slice()
+            && right_identity == Some(*rhs)
+        {
+            self.pending.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn i64_add(&mut self) -> &mut Self {
+        if !self.fold_i64_binary(Some(0), i64::wrapping_add) {
+            self.flush();
+            self.sink.i64_add();
+        }
+        self
+    }
+
+    fn i64_sub(&mut self) -> &mut Self {
+        if !self.fold_i64_binary(Some(0), i64::wrapping_sub) {
+            self.flush();
+            self.sink.i64_sub();
+        }
+        self
+    }
+
+    fn i64_mul(&mut self) -> &mut Self {
+        if !self.fold_i64_binary(Some(1), i64::wrapping_mul) {
+            self.flush();
+            self.sink.i64_mul();
+        }
+        self
+    }
+
+    fn i64_and(&mut self) -> &mut Self {
+        if !self.fold_i64_binary(Some(-1), |lhs, rhs| lhs & rhs) {
+            self.flush();
+            self.sink.i64_and();
+        }
+        self
+    }
+
+    fn i64_or(&mut self) -> &mut Self {
+        if !self.fold_i64_binary(Some(0), |lhs, rhs| lhs | rhs) {
+            self.flush();
+            self.sink.i64_or();
+        }
+        self
+    }
+
+    fn i64_xor(&mut self) -> &mut Self {
+        if !self.fold_i64_binary(Some(0), |lhs, rhs| lhs ^ rhs) {
+            self.flush();
+            self.sink.i64_xor();
+        }
+        self
+    }
+
+    fn i64_shl(&mut self) -> &mut Self {
+        if !self.fold_i64_binary(Some(0), |lhs, rhs| lhs.wrapping_shl(rhs as u32 & 63)) {
+            self.flush();
+            self.sink.i64_shl();
+        }
+        self
+    }
+
+    fn i64_shr_s(&mut self) -> &mut Self {
+        if !self.fold_i64_binary(Some(0), |lhs, rhs| lhs >> (rhs as u32 & 63)) {
+            self.flush();
+            self.sink.i64_shr_s();
+        }
+        self
+    }
+
+    fn i64_shr_u(&mut self) -> &mut Self {
+        if !self.fold_i64_binary(Some(0), |lhs, rhs| {
+            ((lhs as u64) >> (rhs as u32 & 63)) as i64
+        }) {
+            self.flush();
+            self.sink.i64_shr_u();
+        }
         self
     }
 
@@ -494,26 +667,90 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         self
     }
 
-    fn i32_mul(&mut self) -> &mut Self {
+    fn fold_i32_binary(
+        &mut self,
+        right_identity: Option<i32>,
+        fold: impl FnOnce(i32, i32) -> i32,
+    ) -> bool {
         if let [
             PendingInstruction::I32Const(lhs),
             PendingInstruction::I32Const(rhs),
         ] = self.pending.as_slice()
         {
-            let value = lhs.wrapping_mul(*rhs);
+            let value = fold(*lhs, *rhs);
             self.pending.clear();
             self.pending.push(PendingInstruction::I32Const(value));
+            true
+        } else if let [PendingInstruction::I32Const(rhs)] = self.pending.as_slice()
+            && right_identity == Some(*rhs)
+        {
+            self.pending.clear();
+            true
         } else {
+            false
+        }
+    }
+
+    fn i32_mul(&mut self) -> &mut Self {
+        if !self.fold_i32_binary(Some(1), i32::wrapping_mul) {
             self.flush();
             self.sink.i32_mul();
         }
         self
     }
 
+    fn i32_sub(&mut self) -> &mut Self {
+        if !self.fold_i32_binary(Some(0), i32::wrapping_sub) {
+            self.flush();
+            self.sink.i32_sub();
+        }
+        self
+    }
+
+    fn i32_and(&mut self) -> &mut Self {
+        if !self.fold_i32_binary(Some(-1), |lhs, rhs| lhs & rhs) {
+            self.flush();
+            self.sink.i32_and();
+        }
+        self
+    }
+
+    fn i32_or(&mut self) -> &mut Self {
+        if !self.fold_i32_binary(Some(0), |lhs, rhs| lhs | rhs) {
+            self.flush();
+            self.sink.i32_or();
+        }
+        self
+    }
+
+    fn i32_xor(&mut self) -> &mut Self {
+        if !self.fold_i32_binary(Some(0), |lhs, rhs| lhs ^ rhs) {
+            self.flush();
+            self.sink.i32_xor();
+        }
+        self
+    }
+
+    fn i32_shl(&mut self) -> &mut Self {
+        if !self.fold_i32_binary(Some(0), |lhs, rhs| lhs.wrapping_shl(rhs as u32 & 31)) {
+            self.flush();
+            self.sink.i32_shl();
+        }
+        self
+    }
+
+    fn i32_shr_u(&mut self) -> &mut Self {
+        if !self.fold_i32_binary(Some(0), |lhs, rhs| {
+            ((lhs as u32) >> (rhs as u32 & 31)) as i32
+        }) {
+            self.flush();
+            self.sink.i32_shr_u();
+        }
+        self
+    }
+
     fn i32_add(&mut self) -> &mut Self {
-        if matches!(self.pending.as_slice(), [PendingInstruction::I32Const(0)]) {
-            self.pending.clear();
-        } else {
+        if !self.fold_i32_binary(Some(0), i32::wrapping_add) {
             self.flush();
             self.sink.i32_add();
         }
@@ -548,19 +785,14 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         f64_neg,
         f64_reinterpret_i64,
         f64_sub,
-        i32_and,
+        f32_demote_f64,
+        f32_reinterpret_i32,
+        f64_promote_f32,
         i32_eq,
         i32_eqz,
         i32_gt_u,
         i32_lt_u,
         i32_ne,
-        i32_or,
-        i32_shl,
-        i32_shr_u,
-        i32_sub,
-        i32_xor,
-        i64_add,
-        i64_and,
         i64_div_s,
         i64_eq,
         i64_eqz,
@@ -575,17 +807,11 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         i64_le_u,
         i64_lt_s,
         i64_lt_u,
-        i64_mul,
         i64_ne,
-        i64_or,
+        i32_reinterpret_f32,
         i64_reinterpret_f64,
         i64_rem_s,
-        i64_shl,
-        i64_shr_s,
-        i64_shr_u,
-        i64_sub,
         i64_trunc_sat_f64_s,
-        i64_xor,
         return_,
         select,
         unreachable,
@@ -741,6 +967,99 @@ fn emit_raw_addr(
     emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
     sink.i32_wrap_i64();
     sink.i32_add();
+}
+
+/// Address the GC rewrite's descriptor-free `base + offset` memory form.
+/// A non-negative constant that fits wasm's unsigned `MemArg` displacement is
+/// returned to the caller; dynamic and negative offsets are folded into the
+/// i32 address with wasm32 wrapping semantics.
+fn emit_gc_offset_addr(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    base: OpRef,
+    offset: OpRef,
+) -> u64 {
+    emit_resolve(sink, constants, value_types, base);
+    sink.i32_wrap_i64();
+    if let Some(offset) = const_operand_value(constants, offset) {
+        if let Ok(offset) = u32::try_from(offset) {
+            return offset as u64;
+        }
+        sink.i32_const(offset as i32);
+    } else {
+        emit_resolve(sink, constants, value_types, offset);
+        sink.i32_wrap_i64();
+    }
+    sink.i32_add();
+    0
+}
+
+/// Address the GC rewrite's `base + index * scale + offset` form.  Scale and
+/// base offset are rewriter immediates; the index itself remains a runtime
+/// value.  Negative offsets (notably accesses into the GC header) cannot use a
+/// wasm `MemArg`, so they are added to the address explicitly.
+fn emit_gc_indexed_addr(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    op: &Op,
+    scale_arg: usize,
+    offset_arg: usize,
+) -> Result<u64, BackendError> {
+    let scale = const_operand_value(constants, op.arg(scale_arg).to_opref()).ok_or_else(|| {
+        BackendError::Unsupported(format!(
+            "wasm codegen: {:?} scale is not constant",
+            op.opcode
+        ))
+    })?;
+    let scale = u64::try_from(scale).map_err(|_| {
+        BackendError::Unsupported(format!(
+            "wasm codegen: {:?} has negative scale {scale}",
+            op.opcode
+        ))
+    })?;
+    let offset =
+        const_operand_value(constants, op.arg(offset_arg).to_opref()).ok_or_else(|| {
+            BackendError::Unsupported(format!(
+                "wasm codegen: {:?} base offset is not constant",
+                op.opcode
+            ))
+        })?;
+
+    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+    sink.i32_wrap_i64();
+    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+    sink.i32_wrap_i64();
+    emit_scale_index(sink, scale);
+    sink.i32_add();
+    if let Ok(offset) = u32::try_from(offset) {
+        return Ok(offset as u64);
+    }
+    sink.i32_const(offset as i32);
+    sink.i32_add();
+    Ok(0)
+}
+
+fn gc_rewrite_access_size(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+    arg: usize,
+) -> Result<(usize, bool), BackendError> {
+    let encoded = const_operand_value(constants, op.arg(arg).to_opref()).ok_or_else(|| {
+        BackendError::Unsupported(format!(
+            "wasm codegen: {:?} item size is not constant",
+            op.opcode
+        ))
+    })?;
+    let size = encoded.unsigned_abs() as usize;
+    if !matches!(size, 1 | 2 | 4 | 8) {
+        return Err(BackendError::Unsupported(format!(
+            "wasm codegen: {:?} has unsupported item size {encoded}",
+            op.opcode
+        )));
+    }
+    Ok((size, encoded < 0))
 }
 
 fn array_item_is_float_from_descr(op: &Op) -> bool {
@@ -1282,8 +1601,9 @@ fn ref_store_value_arg(op: &Op) -> Option<usize> {
 
 /// If `op` stores a (non-constant) reference into a GC object, return the base
 /// object operand that must be passed through the write barrier; otherwise
-/// `None`. A value is a reference exactly when it has a Ref home slot
-/// (`ref_homes` keys every Ref-typed input/result). This mirrors the native
+/// `None`. [`RefValues`] records every non-constant Ref-typed input/result;
+/// [`RefHomes`] deliberately records only values that must survive a collecting
+/// position or be published for force/resume. This mirrors the native
 /// `handle_write_barrier_setfield` gate `v.type == 'r' and not ConstPtr`: a
 /// constant reference is an immortal/old object whose store never makes the base
 /// point to young, so it needs no barrier (rewrite.py:930-931).
@@ -1862,9 +2182,7 @@ fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize
         .filter_map(|(i, op)| {
             ((op.opcode.is_call() && call_can_collect(op)) || op.opcode.is_malloc())
                 .then_some(i)
-                .or_else(|| {
-                    (include_ca_collects && op.opcode == OpCode::CallAssemblerR).then_some(i)
-                })
+                .or_else(|| (include_ca_collects && op.opcode.is_call_assembler()).then_some(i))
         })
         .collect()
 }
@@ -2240,20 +2558,83 @@ fn residual_call_abi() -> ResidualCallAbi {
 
 /// Whether `op`'s callee may be called with the wasm type its descr's word
 /// types imply, rather than through the reflecting trampoline.
-fn residual_callee_abi_is_word(op: &Op, constants: &indexmap::IndexMap<u32, i64>) -> bool {
+fn residual_callee_abi_is_word_at(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+    func_arg: usize,
+) -> bool {
     match residual_call_abi() {
         ResidualCallAbi::Word => true,
         ResidualCallAbi::Vouched => {
             // Only a compile-time callee can be checked against the list; a
             // register-form func pointer is a different target on every
             // execution.
-            let Some(func_ptr) = op.getarglist().first().map(|arg| arg.to_opref()) else {
+            let Some(func_ptr) = op.getarglist().get(func_arg).map(|arg| arg.to_opref()) else {
                 return false;
             };
             func_ptr.is_constant()
                 && crate::residual_call_descr_is_faithful(resolve_const_bits(constants, func_ptr))
         }
     }
+}
+
+fn residual_callee_abi_is_word(op: &Op, constants: &indexmap::IndexMap<u32, i64>) -> bool {
+    residual_callee_abi_is_word_at(op, constants, residual_func_ofs(op.opcode))
+}
+
+/// Direct uniform-word shapes for COND_CALL. Conditional calls place the
+/// predicate at arg 0 and the callee at arg 1, unlike ordinary residual CALLs.
+/// Returning `(arity, returns_word)` distinguishes COND_CALL_VALUE from the
+/// void form whose descr may still carry the historical dummy-word ABI.
+fn conditional_call_word_shape(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<(usize, bool)> {
+    if !matches!(
+        op.opcode,
+        OpCode::CondCallN | OpCode::CondCallValueI | OpCode::CondCallValueR
+    ) {
+        return None;
+    }
+    let descr = op.getdescr()?;
+    let cd = descr.as_call_descr()?;
+    let returns_word = matches!(op.opcode, OpCode::CondCallValueI | OpCode::CondCallValueR);
+    if returns_word {
+        if !matches!(cd.result_type(), Type::Int | Type::Ref)
+            || cd.result_type() != op.result_type()
+        {
+            return None;
+        }
+    } else if cd.result_type() != Type::Void || !matches!(cd.result_size(), 0 | 8) {
+        return None;
+    }
+    if cd
+        .arg_types()
+        .iter()
+        .any(|ty| !matches!(ty, Type::Int | Type::Ref))
+    {
+        return None;
+    }
+    let nargs = op.getarglist().len().saturating_sub(2);
+    if cd.arg_types().len() != nargs || !residual_callee_abi_is_word_at(op, constants, 1) {
+        return None;
+    }
+    Some((nargs, returns_word || cd.result_size() == 8))
+}
+
+fn conditional_call_i64_arity(op: &Op, constants: &indexmap::IndexMap<u32, i64>) -> Option<usize> {
+    conditional_call_word_shape(op, constants)
+        .filter(|(_, returns_word)| *returns_word)
+        .map(|(arity, _)| arity)
+}
+
+fn conditional_call_true_void_arity(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<usize> {
+    conditional_call_word_shape(op, constants)
+        .filter(|(_, returns_word)| !*returns_word)
+        .map(|(arity, _)| arity)
 }
 
 /// If `op` is a residual CALL whose ABI is uniformly i64 (all Int/Ref args and
@@ -2265,9 +2646,18 @@ fn residual_callee_abi_is_word(op: &Op, constants: &indexmap::IndexMap<u32, i64>
 /// This includes `CallMayForce{I,R}` when their ABI is uniformly i64: the force
 /// protocol rides the frame's own data region
 /// (`emit_force_bracket_before_call` before the call, `GuardNotForced` after),
-/// which neither lowering touches, so a direct call is sound. Float /
-/// release-GIL / cond / assembler calls and non-reflectable descrs remain on
+/// which neither lowering touches, so a direct call is sound. `CallReleaseGilI`
+/// is the same ABI with the callee at arg 1 (`direct_call_release_gil`);
+/// wasm32 has no GIL to drop, so the call itself is an ordinary residual.
+/// Float / cond / assembler calls and non-reflectable descrs remain on
 /// the trampoline.
+fn residual_func_ofs(opcode: OpCode) -> usize {
+    usize::from(matches!(
+        opcode,
+        OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN
+    ))
+}
+
 fn residual_call_i64_arity(op: &Op, constants: &indexmap::IndexMap<u32, i64>) -> Option<usize> {
     use OpCode::*;
     if !matches!(
@@ -2280,6 +2670,7 @@ fn residual_call_i64_arity(op: &Op, constants: &indexmap::IndexMap<u32, i64>) ->
             | CallLoopinvariantR
             | CallMayForceI
             | CallMayForceR
+            | CallReleaseGilI
     ) {
         return None;
     }
@@ -2295,9 +2686,10 @@ fn residual_call_i64_arity(op: &Op, constants: &indexmap::IndexMap<u32, i64>) ->
     {
         return None;
     }
-    // `getarglist()[0]` is the func pointer; the call args are `[1..]`. The
-    // descr's `arg_types` describes those call args, so the counts must match.
-    let nargs = op.num_args().saturating_sub(1);
+    // Ordinary CALL: func at arg 0, call args at `[1..]`.
+    // CALL_RELEASE_GIL: savebox at 0, func at 1, call args at `[2..]`.
+    let func_ofs = residual_func_ofs(op.opcode);
+    let nargs = op.num_args().saturating_sub(func_ofs + 1);
     if arg_types.len() != nargs {
         return None;
     }
@@ -2332,16 +2724,16 @@ fn residual_call_typed_sig(
     use OpCode::*;
     if !matches!(
         op.opcode,
-        CallF | CallPureF | CallLoopinvariantF | CallMayForceF
+        CallF | CallPureF | CallLoopinvariantF | CallMayForceF | CallReleaseGilF
     ) && !matches!(
         op.opcode,
-        CallI | CallPureI | CallLoopinvariantI | CallMayForceI
+        CallI | CallPureI | CallLoopinvariantI | CallMayForceI | CallReleaseGilI
     ) && !matches!(
         op.opcode,
         CallR | CallPureR | CallLoopinvariantR | CallMayForceR
     ) && !matches!(
         op.opcode,
-        CallN | CallPureN | CallLoopinvariantN | CallMayForceN
+        CallN | CallPureN | CallLoopinvariantN | CallMayForceN | CallReleaseGilN
     ) {
         return None;
     }
@@ -2386,10 +2778,11 @@ fn residual_call_typed_sig(
     // result over float arguments -- is only as good as the descr, so the
     // callee has to be named by `set_faithful_residual_call_addrs`.
     let all_float = result == Some(ValType::F64) && arg_types.iter().all(|t| *t == Type::Float);
+    let func_ofs = residual_func_ofs(op.opcode);
     if !all_float {
         // Only a compile-time callee can be checked against the allow-list; a
         // register-form func pointer is a different target on every execution.
-        let func_ptr = op.arg(0).to_opref();
+        let func_ptr = op.arg(func_ofs).to_opref();
         if !func_ptr.is_constant() {
             return None;
         }
@@ -2405,9 +2798,8 @@ fn residual_call_typed_sig(
             Type::Void => return None,
         });
     }
-    // `getarglist()[0]` is the func pointer; the call args are `[1..]`. The
-    // descr's `arg_types` describes those call args, so the counts must match.
-    let nargs = op.num_args().saturating_sub(1);
+    // Ordinary CALL: func at arg 0. CALL_RELEASE_GIL: func at arg 1.
+    let nargs = op.num_args().saturating_sub(func_ofs + 1);
     if params.len() != nargs {
         return None;
     }
@@ -2432,7 +2824,7 @@ fn residual_call_void_word_arity(
     use OpCode::*;
     if !matches!(
         op.opcode,
-        CallN | CallPureN | CallLoopinvariantN | CallMayForceN
+        CallN | CallPureN | CallLoopinvariantN | CallMayForceN | CallReleaseGilN
     ) {
         return None;
     }
@@ -2448,7 +2840,8 @@ fn residual_call_void_word_arity(
     {
         return None;
     }
-    let nargs = op.num_args().saturating_sub(1);
+    let func_ofs = residual_func_ofs(op.opcode);
+    let nargs = op.num_args().saturating_sub(func_ofs + 1);
     if arg_types.len() != nargs {
         return None;
     }
@@ -2471,7 +2864,7 @@ fn residual_call_void_true_arity(
     use OpCode::*;
     if !matches!(
         op.opcode,
-        CallN | CallPureN | CallLoopinvariantN | CallMayForceN
+        CallN | CallPureN | CallLoopinvariantN | CallMayForceN | CallReleaseGilN
     ) {
         return None;
     }
@@ -2487,7 +2880,8 @@ fn residual_call_void_true_arity(
     {
         return None;
     }
-    let nargs = op.num_args().saturating_sub(1);
+    let func_ofs = residual_func_ofs(op.opcode);
+    let nargs = op.num_args().saturating_sub(func_ofs + 1);
     if arg_types.len() != nargs {
         return None;
     }
@@ -2509,6 +2903,9 @@ fn direct_helper_i64_arity(
     ref_values: &RefValues,
     constants: &indexmap::IndexMap<u32, i64>,
 ) -> Option<usize> {
+    if let Some(n) = conditional_call_i64_arity(op, constants) {
+        return Some(n);
+    }
     if let Some(n) = residual_call_i64_arity(op, constants) {
         return Some(n);
     }
@@ -2545,6 +2942,10 @@ fn has_trampoline_calls(
         // CALL arm, lowering it directly to the callee-loop table slot. It
         // therefore never uses the host call area.
         opcode if opcode.is_call_assembler() && emit_ca => false,
+        // These live in resoperation's CALL range for effect classification,
+        // but neither emission arm calls anything: CheckMemoryError is an
+        // inline null/exit test and RecordKnownResult is optimizer metadata.
+        OpCode::CheckMemoryError | OpCode::RecordKnownResult => false,
         // No direct helper lowering — and in fact no lowering at all: a trace
         // carrying either is declined. Kept as a conservative superset.
         OpCode::Newstr | OpCode::Newunicode => true,
@@ -2554,6 +2955,7 @@ fn has_trampoline_calls(
             direct_helper_i64_arity(op, &ref_values, constants).is_none()
                 && residual_call_typed_sig(op, constants).is_none()
                 && residual_call_void_true_arity(op, constants).is_none()
+                && conditional_call_true_void_arity(op, constants).is_none()
         }
         // `New*` and ref-store write barriers are covered by
         // `direct_helper_i64_arity`, so their direct-family arms do not touch
@@ -2861,6 +3263,7 @@ pub struct AllocHelpers {
     pub new_array_fn_ptr: i64,
     pub new_oldgen_fn_ptr: i64,
     pub new_array_oldgen_fn_ptr: i64,
+    pub fmod_fn_ptr: i64,
 }
 
 type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize);
@@ -3015,6 +3418,26 @@ pub fn source_guard_precedes_loop_label(ops: &[Op], fail_index: u32) -> bool {
         (Some(pos), Some(label_idx)) => pos < label_idx,
         _ => false,
     }
+}
+
+/// An outside-loop region skips its target LABEL's capture loader. The
+/// source path must therefore have crossed that LABEL already. Share this
+/// structural check between emission and deferred-inline eligibility: a
+/// doomed merge must not arm a trip that clears a working bridge cell.
+pub fn outside_region_labels_initialized(
+    owner_ops: &[Op],
+    source_fail_index: u32,
+    region_ops: &[Op],
+) -> bool {
+    let Some(guard_pos) = exit_op_index(owner_ops, source_fail_index) else {
+        return false;
+    };
+    region_ops
+        .iter()
+        .filter(|op| op.opcode == OpCode::Jump)
+        .all(|jump| {
+            find_jump_target_label_index(owner_ops, jump).is_some_and(|label| label < guard_pos)
+        })
 }
 
 /// Whether these ops carry a `GUARD_NOT_INVALIDATED`, so their validity is
@@ -3563,12 +3986,21 @@ pub fn build_wasm_module(
             typed_residual_sigs.push(sig);
         }
     }
+    if analysis_ops.iter().any(|op| op.opcode == OpCode::FloatMod) {
+        let sig = (vec![ValType::F64, ValType::F64], Some(ValType::F64));
+        if !typed_residual_sigs.contains(&sig) {
+            typed_residual_sigs.push(sig);
+        }
+    }
     // True-void residual calls use `(i64×n) -> ()`, a separate family from the
     // i64- and f64-result types. As with the uniform i64 family, declaring
     // `0..=max` makes each type index a base plus the call arity.
     let true_void_residual_max_arity = analysis_ops
         .iter()
-        .filter_map(|op| residual_call_void_true_arity(op, constants))
+        .filter_map(|op| {
+            residual_call_void_true_arity(op, constants)
+                .or_else(|| conditional_call_true_void_arity(op, constants))
+        })
         .max();
     // The shared indirect-function table backs direct residual helpers as well
     // as host-trampoline dispatch, chained bridges, and CA recursion.
@@ -4110,28 +4542,22 @@ fn build_function(
     {
         let mut start = outside_start;
         for bridge in &inlined_bridges[body_region_count..] {
-            let guard_pos = exit_op_index(ops, bridge.source_fail_index).ok_or_else(|| {
-                BackendError::Unsupported(
-                    "wasm backend: inlined bridge source guard is outside the owner stream".into(),
-                )
-            })?;
             if bridge.external_jump.is_some() {
                 // A region that leaves by a cross-module tail call re-enters
                 // no LABEL of this function, so it crosses none of them.
                 start += bridge.ops.len();
                 continue;
             }
-            for op in &ops[start..start + bridge.ops.len()] {
-                if op.opcode != OpCode::Jump {
-                    continue;
-                }
-                if find_jump_target_label_index(ops, op).is_none_or(|idx| idx >= guard_pos) {
-                    return Err(BackendError::Unsupported(
-                        "wasm backend: an outside-loop inline region closes at a LABEL its \
+            if !outside_region_labels_initialized(
+                ops,
+                bridge.source_fail_index,
+                &ops[start..start + bridge.ops.len()],
+            ) {
+                return Err(BackendError::Unsupported(
+                    "wasm backend: an outside-loop inline region closes at a LABEL its \
                          own entry path had not crossed"
-                            .into(),
-                    ));
-                }
+                        .into(),
+                ));
             }
             start += bridge.ops.len();
         }
@@ -4464,6 +4890,7 @@ fn build_function(
     let mut labels_passed = 0usize;
     let mut ovf_flag_live = false;
     let mut fused_guard_at: Option<usize> = None;
+    let mut fused_condcall_at: Option<usize> = None;
     // rewrite.py:41-45 `_write_barrier_applied`, represented by
     // RewriteState::wb_applied in rewrite.rs.  A base enters this set after
     // its barrier is emitted or when a nursery allocation produces it; clear
@@ -4668,6 +5095,14 @@ fn build_function(
                 label_resume,
                 ref_homes,
             ) {
+                Some(next) if next.opcode == OpCode::CondCallN => {
+                    // Leave the comparison's i32 on the stack. CondCallN
+                    // calls when the predicate is nonzero, which is this
+                    // value; the arm opens `if` on it instead of
+                    // re-resolving and `i64.eqz`.
+                    push_cond(&mut sink, constants, value_types, op, kind);
+                    fused_condcall_at = Some(op_idx + 1);
+                }
                 Some(guard) => {
                     push_guard_failure_cond(
                         &mut sink,
@@ -5353,16 +5788,25 @@ fn build_function(
 
             // `float_mod` is C `fmod`: the interpreter evaluates it as Rust's
             // `a % b`, which truncates toward zero. Wasm has no float
-            // remainder instruction, and `a - (a/b).floor() * b` answers
-            // Python's floored `%` instead — a different result for mixed
-            // signs, and inexact for a large quotient either way. Decline
-            // until there is a host helper to call.
+            // remainder instruction, and synthesizing it from div/floor is
+            // observably wrong. Call the interpreter module's exact helper
+            // through the shared table, staying guest-side rather than
+            // declining the whole trace or crossing the host trampoline.
             OpCode::FloatMod => {
-                return Err(BackendError::Unsupported(
-                    "wasm backend: FloatMod is unsupported (fmod has no wasm \
-                     instruction); declining the trace"
-                        .to_string(),
-                ));
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    let sig = (vec![ValType::F64, ValType::F64], Some(ValType::F64));
+                    let type_idx = typed_residual_type_indices.get(&sig).ok_or_else(|| {
+                        BackendError::Unsupported(
+                            "wasm codegen: FloatMod helper signature was not declared".into(),
+                        )
+                    })?;
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
+                    sink.i32_const(alloc.fmod_fn_ptr as i32);
+                    sink.call_indirect(0, *type_idx);
+                    sink.local_set(value_types.local(vi));
+                }
             }
 
             // ── Extended integer ops ──
@@ -5370,26 +5814,40 @@ fn build_function(
                 // int_signext(val, num_bytes): sign-extend from num_bytes width
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    // The static shift below needs num_bytes (arg(1)) as an
-                    // emit-time constant. A non-constant width is still a valid
-                    // IR shape — int_signext/ii>i is a two-operand blackhole op
-                    // and the cranelift backend resolves arg(1) as a runtime
-                    // operand — just one this backend does not lower, so decline
-                    // for interpreter fallback rather than aborting the compile.
                     let arg1 = op.arg(1).to_opref();
-                    let Some(num_bytes) = const_operand_value(constants, arg1) else {
-                        return Err(BackendError::Unsupported(format!(
-                            "wasm int_signext: non-constant num_bytes operand (raw={})",
-                            arg1.raw()
-                        )));
-                    };
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    let shift = 64 - num_bytes * 8;
-                    if shift > 0 && shift < 64 {
-                        sink.i64_const(shift);
+                    if let Some(num_bytes) = const_operand_value(constants, arg1) {
+                        emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                        let shift = 64 - num_bytes * 8;
+                        if shift > 0 && shift < 64 {
+                            sink.i64_const(shift);
+                            sink.i64_shl();
+                            sink.i64_const(shift);
+                            sink.i64_shr_s();
+                        }
+                    } else {
+                        // support.py `int_signext`: widths 1..=8 sign-extend;
+                        // larger positive widths are the identity.  The IR
+                        // producer guarantees a positive width. Wasm shifts
+                        // mask their count, so compute both candidates and
+                        // select the shifted one only inside the valid range.
+                        let value = op.arg(0).to_opref();
+                        let emit_shift = |sink: &mut PeepSink<'_, '_>| {
+                            sink.i64_const(8);
+                            emit_resolve(sink, constants, value_types, arg1);
+                            sink.i64_sub();
+                            sink.i64_const(3);
+                            sink.i64_shl();
+                        };
+                        emit_resolve(&mut sink, constants, value_types, value);
+                        emit_shift(&mut sink);
                         sink.i64_shl();
-                        sink.i64_const(shift);
+                        emit_shift(&mut sink);
                         sink.i64_shr_s();
+                        emit_resolve(&mut sink, constants, value_types, value);
+                        emit_resolve(&mut sink, constants, value_types, arg1);
+                        sink.i64_const(8);
+                        sink.i64_le_s();
+                        sink.select();
                     }
                     sink.local_set(value_types.local(vi));
                 }
@@ -5456,6 +5914,26 @@ fn build_function(
                     sink.local_set(value_types.local(vi));
                 }
             }
+            OpCode::CastFloatToSinglefloat => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.f32_demote_f64();
+                    sink.i32_reinterpret_f32();
+                    sink.i64_extend_i32_u();
+                    sink.local_set(value_types.local(vi));
+                }
+            }
+            OpCode::CastSinglefloatToFloat => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i32_wrap_i64();
+                    sink.f32_reinterpret_i32();
+                    sink.f64_promote_f32();
+                    sink.local_set(value_types.local(vi));
+                }
+            }
 
             // ── Pointer/Int conversions ──
             OpCode::CastPtrToInt => {
@@ -5488,19 +5966,40 @@ fn build_function(
                 }
             }
 
+            OpCode::VirtualRefI | OpCode::VirtualRefR | OpCode::VirtualRefFinish => {
+                // OptSimplify.optimize_VIRTUAL_REF owns this rewrite; backend
+                // aliases would conceal a missing frontend transformation.
+                return Err(BackendError::Unsupported(format!(
+                    "wasm backend: {:?} must be lowered by the optimizer",
+                    op.opcode
+                )));
+            }
+
             // ── SameAs (forwarding) ──
             OpCode::SameAsI | OpCode::SameAsR => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.local_set(value_types.local(vi));
+                    let source = op.arg(0).to_opref();
+                    if source.is_none()
+                        || source.is_constant()
+                        || value_types.local(source.raw()) != value_types.local(vi)
+                    {
+                        emit_resolve(&mut sink, constants, value_types, source);
+                        sink.local_set(value_types.local(vi));
+                    }
                 }
             }
             OpCode::SameAsF => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_resolve_f64(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.local_set(value_types.local(vi));
+                    let source = op.arg(0).to_opref();
+                    if source.is_none()
+                        || source.is_constant()
+                        || value_types.local(source.raw()) != value_types.local(vi)
+                    {
+                        emit_resolve_f64(&mut sink, constants, value_types, source);
+                        sink.local_set(value_types.local(vi));
+                    }
                 }
             }
 
@@ -5732,38 +6231,95 @@ fn build_function(
                 )));
             }
 
-            // ── GC memory ops ──
-            // The indexed forms have the same sole producer as the bare ones
-            // below — `GcRewriterImpl`, which this backend does not run — and
-            // no opimpl records them, so nothing carries them here. The
-            // blackhole wiring for `gc_load_indexed_{i,f}` /
-            // `gc_store_indexed_{i,f}` executes them, it does not trace them.
-            // Decline (interpreter fallback) rather than aborting the whole
-            // compile.
-            OpCode::GcLoadIndexedI
-            | OpCode::GcLoadIndexedR
-            | OpCode::GcLoadIndexedF
-            | OpCode::GcStoreIndexed => {
-                return Err(BackendError::Unsupported(format!(
-                    "wasm codegen: indexed GC op {:?} (no descr-driven layout)",
-                    op.opcode
-                )));
+            // ── GC rewrite memory ops ──
+            // These descriptor-free forms carry their complete layout in
+            // operands. Supporting them here lets wasm consume the same
+            // `GcRewriterImpl` output as the native backends.
+            OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    if op.num_args() < 5 {
+                        return Err(BackendError::Unsupported(format!(
+                            "wasm codegen: {:?} expects [base, index, scale, offset, size]",
+                            op.opcode
+                        )));
+                    }
+                    let offset = emit_gc_indexed_addr(&mut sink, constants, value_types, op, 2, 3)?;
+                    let (size, signed) = gc_rewrite_access_size(op, constants, 4)?;
+                    if op.opcode == OpCode::GcLoadIndexedF {
+                        if size != 8 {
+                            return Err(BackendError::Unsupported(format!(
+                                "wasm codegen: {:?} float load has size {size}",
+                                op.opcode
+                            )));
+                        }
+                        sink.f64_load(mem64(offset));
+                    } else {
+                        emit_sized_int_load(&mut sink, offset, size, signed);
+                    }
+                    sink.local_set(value_types.local(vi));
+                }
             }
-            // The bare GC_LOAD/GC_STORE forms are produced only by the GC rewrite's
-            // load/store lowering (majit-gc/src/rewrite.rs): the true semantics are
-            // offset=arg1, size=arg2 (load) / value=arg2, size=arg3 (store), with no
-            // FieldDescr attached. The wasm backend runs only the rewrite's
-            // reference-constant half (`remove_ref_constants`) and lowers loads,
-            // stores, allocations and barriers itself, so these never reach here.
-            // The prior lowering read a nonexistent field_offset_from_descr (→ 0)
-            // and, for GcStore, stored arg(1) (the offset operand) as the value — a
-            // silent miscompile. Panic loudly rather than emit a wrong memory access.
-            OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF | OpCode::GcStore => {
-                panic!(
-                    "wasm backend: {:?} is unsupported (GC_LOAD/GC_STORE); \
-                     the load/store GC rewrite must not run for wasm",
-                    op.opcode
+            OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    if op.num_args() < 3 {
+                        return Err(BackendError::Unsupported(format!(
+                            "wasm codegen: {:?} expects [base, offset, size]",
+                            op.opcode
+                        )));
+                    }
+                    let offset = emit_gc_offset_addr(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
+                    );
+                    let (size, signed) = gc_rewrite_access_size(op, constants, 2)?;
+                    if op.opcode == OpCode::GcLoadF {
+                        if size != 8 {
+                            return Err(BackendError::Unsupported(format!(
+                                "wasm codegen: {:?} float load has size {size}",
+                                op.opcode
+                            )));
+                        }
+                        sink.f64_load(mem64(offset));
+                    } else {
+                        emit_sized_int_load(&mut sink, offset, size, signed);
+                    }
+                    sink.local_set(value_types.local(vi));
+                }
+            }
+            OpCode::GcStore => {
+                if op.num_args() < 4 {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: GcStore expects [base, offset, value, size]".into(),
+                    ));
+                }
+                let offset = emit_gc_offset_addr(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
                 );
+                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
+                let (size, _) = gc_rewrite_access_size(op, constants, 3)?;
+                emit_sized_int_store(&mut sink, offset, size);
+            }
+            OpCode::GcStoreIndexed => {
+                if op.num_args() < 6 {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: GcStoreIndexed expects \
+                         [base, index, value, scale, offset, size]"
+                            .into(),
+                    ));
+                }
+                let offset = emit_gc_indexed_addr(&mut sink, constants, value_types, op, 3, 4)?;
+                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
+                let (size, _) = gc_rewrite_access_size(op, constants, 5)?;
+                emit_sized_int_store(&mut sink, offset, size);
             }
 
             // ── Raw memory access ──
@@ -5843,37 +6399,69 @@ fn build_function(
             OpCode::CondCallN => {
                 // x86/assembler.py `genop_discard_cond_call`: TEST cond; JZ
                 // skip; CALL. The predicate is arg 0, the callee is arg 1, and
-                // the rest are the call's own arguments. The callee reaches the
-                // host through the same trampoline `CallN` uses; none of the
-                // residual `call_indirect` families admits this opcode, so
-                // `has_trampoline_calls` always imports `jit_call` for it.
+                // the rest are the call's own arguments. A descr-proven word
+                // ABI reaches the shared table directly; only unresolved or
+                // mixed signatures retain the host trampoline.
                 //
                 // `do_conditional_call` asserts the callee forces no virtual or
                 // virtualizable, so unlike the CALL arm this needs no force
                 // bracket.
-                let jit_call =
-                    jit_call_idx.expect("COND_CALL op present but jit_call not imported");
                 let func = op.arg(1).to_opref();
                 let call_args = &op.getarglist()[2..];
-                // The predicate is a full word: `i32.wrap_i64` would read a
-                // value whose only set bits are above 32 as false, so the test
-                // has to be `i64.eqz` and the call has to sit in the else arm.
-                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                sink.i64_eqz();
-                sink.if_(BlockType::Empty);
-                sink.else_();
-                emit_call_area_addr(&mut sink);
-                emit_resolve(&mut sink, constants, value_types, func);
-                sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-                emit_call_area_addr(&mut sink);
-                sink.i64_const(call_args.len() as i64);
-                sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-                for (i, arg) in call_args.iter().enumerate() {
-                    emit_call_area_addr(&mut sink);
-                    emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
+                let cond_on_stack = fused_condcall_at == Some(op_idx);
+                if cond_on_stack {
+                    fused_condcall_at = None;
                 }
-                emit_jit_call(&mut sink, jit_call);
+                // A fused comparison already left the nonzero-means-call i32
+                // on the stack. The unfused word test cannot `i32.wrap_i64`
+                // (bits above 32 would read as false), so it uses `i64.eqz`
+                // and puts the call in the else arm.
+                if cond_on_stack {
+                    sink.if_(BlockType::Empty);
+                } else {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i64_eqz();
+                    sink.if_(BlockType::Empty);
+                    sink.else_();
+                }
+                if let (Some(base), Some(nargs)) = (
+                    residual_type_base,
+                    conditional_call_i64_arity(op, constants),
+                ) {
+                    for arg in call_args {
+                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                    }
+                    emit_resolve(&mut sink, constants, value_types, func);
+                    sink.i32_wrap_i64();
+                    sink.call_indirect(0, base + nargs as u32);
+                    // COND_CALL_N ignores the historical dummy word.
+                    sink.drop();
+                } else if let (Some(base), Some(nargs)) = (
+                    true_void_residual_type_base,
+                    conditional_call_true_void_arity(op, constants),
+                ) {
+                    for arg in call_args {
+                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                    }
+                    emit_resolve(&mut sink, constants, value_types, func);
+                    sink.i32_wrap_i64();
+                    sink.call_indirect(0, base + nargs as u32);
+                } else {
+                    let jit_call =
+                        jit_call_idx.expect("COND_CALL op present but jit_call not imported");
+                    emit_call_area_addr(&mut sink);
+                    emit_resolve(&mut sink, constants, value_types, func);
+                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+                    emit_call_area_addr(&mut sink);
+                    sink.i64_const(call_args.len() as i64);
+                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+                    for (i, arg) in call_args.iter().enumerate() {
+                        emit_call_area_addr(&mut sink);
+                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                        sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
+                    }
+                    emit_jit_call(&mut sink, jit_call);
+                }
                 // COND_CALL sits inside the CALL opcode range, so a Ref living
                 // across it already owns a home. Only the arm that called can
                 // have collected, so the reload belongs on it: after the `if`
@@ -5915,8 +6503,6 @@ fn build_function(
                 // `do_conditional_call` asserts the callee forces no virtual or
                 // virtualizable, so unlike the CALL arm this needs no force
                 // bracket.
-                let jit_call =
-                    jit_call_idx.expect("COND_CALL_VALUE op present but jit_call not imported");
                 let vi = op.pos.get().raw();
                 let has_result = !OpRef::raw_is_constant(vi);
                 let cond = op.arg(0).to_opref();
@@ -5933,25 +6519,44 @@ fn build_function(
                 emit_resolve(&mut sink, constants, value_types, cond);
                 sink.i64_eqz();
                 sink.if_(BlockType::Empty);
-                emit_call_area_addr(&mut sink);
-                emit_resolve(&mut sink, constants, value_types, func);
-                sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-                emit_call_area_addr(&mut sink);
-                sink.i64_const(call_args.len() as i64);
-                sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-                for (i, arg) in call_args.iter().enumerate() {
+                if let (Some(base), Some(nargs)) = (
+                    residual_type_base,
+                    conditional_call_i64_arity(op, constants),
+                ) {
+                    for arg in call_args {
+                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                    }
+                    emit_resolve(&mut sink, constants, value_types, func);
+                    sink.i32_wrap_i64();
+                    sink.call_indirect(0, base + nargs as u32);
+                    if has_result {
+                        sink.local_set(value_types.local(vi));
+                    } else {
+                        sink.drop();
+                    }
+                } else {
+                    let jit_call =
+                        jit_call_idx.expect("COND_CALL_VALUE op present but jit_call not imported");
                     emit_call_area_addr(&mut sink);
-                    emit_resolve(&mut sink, constants, value_types, arg.to_opref());
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
-                }
-                emit_jit_call(&mut sink, jit_call);
-                if has_result {
-                    // Int and Ref are the only result types
-                    // `do_conditional_call` mints this opcode for, so the
-                    // trampoline's word needs no float reinterpretation.
+                    emit_resolve(&mut sink, constants, value_types, func);
+                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
+                    emit_call_area_addr(&mut sink);
+                    sink.i64_const(call_args.len() as i64);
+                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+                    for (i, arg) in call_args.iter().enumerate() {
+                        emit_call_area_addr(&mut sink);
+                        emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                        sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
+                    }
+                    emit_jit_call(&mut sink, jit_call);
+                    // Int and Ref are the only result types minted here.
                     emit_call_area_addr(&mut sink);
                     sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
-                    sink.local_set(value_types.local(vi));
+                    if has_result {
+                        sink.local_set(value_types.local(vi));
+                    } else {
+                        sink.drop();
+                    }
                 }
                 // Only the arm that called can have collected, so the reload
                 // sits on it rather than after the `if`.
@@ -6312,37 +6917,76 @@ fn build_function(
                     sink.local_set(value_types.local(vi));
                 }
             }
-            // Emitted by `RawBufferPtrInfo::_force_elements` after a
-            // `RAW_MALLOC_VARSIZE_CHAR`. The sole carrier of that oopspec is
-            // `_cffi_backend::cdataobj::raw_malloc_varsize_char`, and
-            // `_cffi_backend` is not compiled for wasm32, so this does not
-            // reach a wasm trace. Declined rather than skipped:
-            // the allocation helpers do return 0 on OOM (that is how
-            // `alloc_with_type` drives this op on the native backends), and an
-            // unchecked null is worse on wasm than on native — address 0 is
-            // ordinary linear memory, so the following stores would corrupt it
-            // silently instead of trapping.
+            // `GcRewriterImpl::_gen_call_malloc_gc` emits this after a residual
+            // malloc. Use the same propagate-exception exit as the wasm
+            // backend's inline `New*` lowering. This is especially important
+            // on wasm: address zero is valid linear memory, so merely omitting
+            // the check would turn OOM into silent heap corruption.
             OpCode::CheckMemoryError => {
-                return Err(BackendError::Unsupported(
-                    "wasm backend: CheckMemoryError is unsupported (a null allocation \
-                     result would be stored into valid linear memory at address 0); \
-                     declining the trace"
-                        .to_string(),
-                ));
+                emit_memory_error_check(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.arg(0).to_opref(),
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
             }
-            // Emitted only by the GC rewrite pass (`_gen_zero_array`), which
-            // wasm does not run, so this cannot reach here. Skipping it used to
-            // be harmless only by accident: wasm allocation hands back zeroed
-            // memory on both routes (`nursery.rs` memsets the whole nursery on
-            // reset under `target_arch = "wasm32"`, and `finish_alloc_in_oldgen`
-            // zero-fills the payload). That is a property of the allocator, not
-            // of this op, so do not silently rely on it.
             OpCode::ZeroArray => {
-                return Err(BackendError::Unsupported(
-                    "wasm backend: ZeroArray is unsupported (it is a GC-rewrite op and \
-                     wasm does not run the rewrite); declining the trace"
-                        .to_string(),
-                ));
+                if op.num_args() < 5 {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: ZeroArray expects \
+                         [base, start, size, scale_start, scale_size]"
+                            .into(),
+                    ));
+                }
+                let descr = op.getdescr().ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm codegen: ZeroArray is missing its ArrayDescr".into(),
+                    )
+                })?;
+                let ad = descr.as_array_descr().ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm codegen: ZeroArray descr is not an ArrayDescr".into(),
+                    )
+                })?;
+                let scale_start =
+                    const_operand_value(constants, op.arg(3).to_opref()).ok_or_else(|| {
+                        BackendError::Unsupported(
+                            "wasm codegen: ZeroArray scale_start is not constant".into(),
+                        )
+                    })?;
+                let scale_size =
+                    const_operand_value(constants, op.arg(4).to_opref()).ok_or_else(|| {
+                        BackendError::Unsupported(
+                            "wasm codegen: ZeroArray scale_size is not constant".into(),
+                        )
+                    })?;
+                let scale_start = u64::try_from(scale_start).map_err(|_| {
+                    BackendError::Unsupported(
+                        "wasm codegen: ZeroArray has a negative start scale".into(),
+                    )
+                })?;
+                let scale_size = u64::try_from(scale_size).map_err(|_| {
+                    BackendError::Unsupported(
+                        "wasm codegen: ZeroArray has a negative size scale".into(),
+                    )
+                })?;
+
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                sink.i32_wrap_i64();
+                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                sink.i32_wrap_i64();
+                emit_scale_index(&mut sink, scale_start);
+                sink.i32_add();
+                sink.i32_const(ad.base_size() as i32);
+                sink.i32_add();
+                sink.i32_const(0);
+                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
+                sink.i32_wrap_i64();
+                emit_scale_index(&mut sink, scale_size);
+                sink.memory_fill(0);
             }
             OpCode::LoadFromGcTable => {
                 // `assembler.py` `genop_load_from_gc_table`: the arg is a
@@ -6360,6 +7004,30 @@ fn build_function(
                         base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
                     sink.i32_const(slot as i32);
                     sink.i64_load32_u(memarg(0, 2));
+                    sink.local_set(value_types.local(vi));
+                }
+            }
+            OpCode::ThreadlocalrefGet => {
+                // AbstractLLCPU.execute_token passes the live execution's
+                // threadlocal_addr. Our trace ABI does not carry it yet; an
+                // unrelated fixed-size TLS allocation is not that context.
+                return Err(BackendError::Unsupported(
+                    "wasm backend: ThreadlocalrefGet requires an execution-context address".into(),
+                ));
+            }
+            // resoperation.py `LoadEffectiveAddress`:
+            // base + (index << shift) + base_offset. Keep the calculation in
+            // the IR's i64 address carrier; memory ops wrap only when loading.
+            OpCode::LoadEffectiveAddress => {
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                    emit_resolve(&mut sink, constants, value_types, op.arg(3).to_opref());
+                    sink.i64_shl();
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i64_add();
+                    emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
+                    sink.i64_add();
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -6600,11 +7268,21 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.local_set(0);
                 }
-                // store-on-def homes the result Ref (from whichever branch).
-                if !OpRef::raw_is_constant(vi) {
-                    sink.local_set(value_types.local(vi));
-                } else {
-                    sink.drop();
+                // The frame ABI carries every scalar result as i64 bits. Ref
+                // and Int use those bits directly; Float crosses the local
+                // boundary with a reinterpret; Void discards the placeholder
+                // produced by the common clean/deopt expression.
+                match op.opcode.result_type() {
+                    Type::Float if !OpRef::raw_is_constant(vi) => {
+                        sink.f64_reinterpret_i64();
+                        sink.local_set(value_types.local(vi));
+                    }
+                    Type::Int | Type::Ref if !OpRef::raw_is_constant(vi) => {
+                        sink.local_set(value_types.local(vi));
+                    }
+                    Type::Void | Type::Int | Type::Ref | Type::Float => {
+                        sink.drop();
+                    }
                 }
                 // Pop the callee frame off the jitframe shadow stack (strict
                 // LIFO) via `wasm_jit_ca_pop_frame` — same direct-vs-trampoline
@@ -6685,6 +7363,15 @@ fn build_function(
             | OpCode::CallMayForceF
             | OpCode::CallAssemblerF
             | OpCode::CallReleaseGilF => {
+                if residual_func_ofs(op.opcode) == 1
+                    && const_operand_value(constants, op.arg(0).to_opref()) != Some(0)
+                {
+                    // AbstractLLCPU's CALL_RELEASE_GIL also owns save_err;
+                    // no GIL on wasm does not remove errno save/restore.
+                    return Err(BackendError::Unsupported(
+                        "wasm backend: CALL_RELEASE_GIL save_err is not implemented".into(),
+                    ));
+                }
                 emit_force_bracket_before_call(
                     &mut sink,
                     constants,
@@ -7107,8 +7794,9 @@ fn build_function(
                 // address the result directly and must not run on a NULL.
                 emit_memory_error_check(
                     &mut sink,
+                    constants,
                     value_types,
-                    vi,
+                    op.pos.get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -7178,23 +7866,10 @@ fn build_function(
                         frame,
                     );
                 }
-                // No `remember_wb` for the result. rewrite.rs's `handle_new`
-                // and `gen_malloc_nursery` seed it only on the branches that
-                // reached `can_use_nursery`; the `gen_malloc_fixedsize`
-                // decline does not, and `gen_malloc_nursery` spells out why
-                // — "the first result can come
-                // from an old-gen slow path whose TRACK_YOUNG_PTRS flag
-                // gen_initialize_tid intentionally preserves". Here the
-                // generation is not a codegen-time fact at all: a
-                // `non_moving` descr routes to `new_oldgen_fn_ptr`, whose
-                // `alloc_in_oldgen` stamps TRACK_YOUNG_PTRS, and the plain
-                // helper picks nursery or old-gen at runtime (the GC spells
-                // that out through `alloc_nursery_collecting_typed_rooted`'s
-                // `needs_write_barrier` out-parameter). Eliding here would
-                // drop the barrier on a fresh old object, losing an
-                // old-to-young edge. The inline flag test already makes the
-                // young case a load and a not-taken branch, so the elision
-                // this forgoes is the cheap one.
+                // GcRewriterAssembler.gen_malloc_nursery remembers a result
+                // whose slow path also guarantees nursery placement. Our
+                // typed helper may fall back to old-gen (e.g. a nursery
+                // smaller than this object), so keep the runtime flag test.
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
                 let vi = op.pos.get().raw();
@@ -7553,8 +8228,9 @@ fn build_function(
                 // rather than into a store this arm emits.
                 emit_memory_error_check(
                     &mut sink,
+                    constants,
                     value_types,
-                    vi,
+                    op.pos.get(),
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
@@ -7581,9 +8257,10 @@ fn build_function(
                         frame,
                     );
                 }
-                // No `remember_wb` for the result, for the reason the
-                // New/NewWithVtable arm above gives: a `non_moving` array
-                // descr routes to `new_array_oldgen_fn_ptr`.
+                // GcRewriterAssembler.gen_malloc_nursery_varsize only remembers
+                // a proven nursery allocation. A runtime length can take our
+                // external/old-generation helper arm, so eligibility for the
+                // inline arm is not a generation proof at this join.
             }
 
             // ── Misc ──
@@ -7664,7 +8341,6 @@ fn build_function(
             | OpCode::IncrementDebugCounter
             | OpCode::EnterPortalFrame
             | OpCode::LeavePortalFrame
-            | OpCode::VirtualRefFinish
             | OpCode::ForceSpill
             | OpCode::Keepalive => {
                 // `JitDebug` realizes its effect in the recorded trace, not in
@@ -8517,8 +9193,11 @@ fn emit_guard_false(
 /// the guard's `if` tests it, so the `i64.extend_i32_u`/`local.set` and the
 /// guard's own `local.get`/re-test disappear.
 ///
-/// Narrower than the dynasm port on purpose: only `GuardTrue`/`GuardFalse`,
-/// whose wasm arms do nothing but re-test the boolean.
+/// Narrower than the dynasm port on purpose: `GuardTrue`/`GuardFalse`,
+/// whose wasm arms do nothing but re-test the boolean, and `CondCallN`,
+/// whose predicate is the same word and whose arm can consume the i32
+/// directly (`x86/regalloc.py` `next_op_can_accept_cc` also admits
+/// `COND_CALL`).
 fn next_op_can_accept_cc<'a>(
     ops: &'a [Op],
     i: usize,
@@ -8531,7 +9210,10 @@ fn next_op_can_accept_cc<'a>(
         return None;
     }
     let next_op = ops.get(i + 1)?;
-    if !matches!(next_op.opcode, OpCode::GuardTrue | OpCode::GuardFalse) {
+    if !matches!(
+        next_op.opcode,
+        OpCode::GuardTrue | OpCode::GuardFalse | OpCode::CondCallN
+    ) {
         return None;
     }
     // history.py `Const.is_constant()` — a Const operand is not an
@@ -8540,6 +9222,13 @@ fn next_op_can_accept_cc<'a>(
         return None;
     }
     if next_op.arg(0).to_opref().raw() != result.raw() {
+        return None;
+    }
+    // BaseRegalloc.next_op_can_accept_cc: COND_CALL's callee and arguments
+    // still read locals, even when their last use is this same operation.
+    if next_op.opcode == OpCode::CondCallN
+        && (1..next_op.num_args()).any(|arg| next_op.arg(arg).to_opref() == result)
+    {
         return None;
     }
     // Any later reader (including this guard's own fail args, which
@@ -9046,16 +9735,14 @@ fn exit_fail_args(op: &Op) -> Vec<OpRef> {
 /// frontend's re-raise.
 fn emit_memory_error_check(
     sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
-    vi: u32,
+    value: OpRef,
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
 ) {
-    if OpRef::raw_is_constant(vi) {
-        return;
-    }
-    sink.local_get(value_types.local(vi));
+    emit_resolve(sink, constants, value_types, value);
     sink.i64_eqz();
     sink.if_(BlockType::Empty);
     if crate::failguard::exit_frame_with_exception_attached() {
@@ -9749,6 +10436,52 @@ mod tests {
         }
 
         assert_eq!(bytes, [0x22, 0x01]);
+    }
+
+    #[test]
+    fn peep_sink_folds_i64_constants_and_right_identities() {
+        let mut bytes = Vec::new();
+        {
+            let mut raw_sink = InstructionSink::new(&mut bytes);
+            let mut sink = PeepSink::new(&mut raw_sink);
+
+            sink.i64_const(6)
+                .i64_const(7)
+                .i64_add()
+                .i64_const(1)
+                .i64_mul()
+                .i64_const(0)
+                .i64_xor()
+                .local_get(3)
+                .i64_const(0)
+                .i64_add();
+            sink.flush();
+        }
+
+        assert_eq!(bytes, [0x42, 0x0d, 0x20, 0x03]);
+    }
+
+    #[test]
+    fn peep_sink_folds_i32_constants_and_right_identities() {
+        let mut bytes = Vec::new();
+        {
+            let mut raw_sink = InstructionSink::new(&mut bytes);
+            let mut sink = PeepSink::new(&mut raw_sink);
+
+            sink.i32_const(6)
+                .i32_const(7)
+                .i32_add()
+                .i32_const(1)
+                .i32_mul()
+                .i32_const(0)
+                .i32_or()
+                .local_get(3)
+                .i32_const(0)
+                .i32_shl();
+            sink.flush();
+        }
+
+        assert_eq!(bytes, [0x41, 0x0d, 0x20, 0x03]);
     }
 
     /// A guard exit that jumps into a merged region counts only the frames its
