@@ -3724,6 +3724,46 @@ unsafe fn shortcut_mod(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObject
     Ok(None)
 }
 
+#[majit_macros::always_inline_try]
+unsafe fn shortcut_lshift(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_int(a) {
+        return Ok(Some(int_lshift(a, b)?));
+    }
+    Ok(None)
+}
+
+#[majit_macros::always_inline_try]
+unsafe fn shortcut_rshift(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_int(a) {
+        return Ok(Some(int_rshift(a, b)?));
+    }
+    Ok(None)
+}
+
+#[majit_macros::always_inline_try]
+unsafe fn shortcut_and(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_int(a) {
+        return Ok(Some(int_bitand(a, b)?));
+    }
+    Ok(None)
+}
+
+#[majit_macros::always_inline_try]
+unsafe fn shortcut_or(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_int(a) {
+        return Ok(Some(int_bitor(a, b)?));
+    }
+    Ok(None)
+}
+
+#[majit_macros::always_inline_try]
+unsafe fn shortcut_xor(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_int(a) {
+        return Ok(Some(int_bitxor(a, b)?));
+    }
+    Ok(None)
+}
+
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // `_make_binop_impl`: `type(w1) is type(w2) and not user_overridden_class`
     // then the `use_special_method_shortcut` body.
@@ -5287,6 +5327,15 @@ fn float_pow_impl(x: f64, y: f64) -> PyResult {
 /// Left shift dispatch (`<<` operator).
 
 pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if same_rpy_type(a, b) && !user_overridden_class(a) {
+            if let Some(w_res) = shortcut_lshift(a, b)?
+                && !is_not_implemented(w_res)
+            {
+                return Ok(w_res);
+            }
+        }
+    }
     lshift_impl(a, b, "<<")
 }
 
@@ -5321,6 +5370,15 @@ pub(crate) fn lshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
 /// Right shift dispatch (`>>` operator).
 
 pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if same_rpy_type(a, b) && !user_overridden_class(a) {
+            if let Some(w_res) = shortcut_rshift(a, b)?
+                && !is_not_implemented(w_res)
+            {
+                return Ok(w_res);
+            }
+        }
+    }
     rshift_impl(a, b, ">>")
 }
 
@@ -5355,6 +5413,15 @@ pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
 /// Bitwise AND dispatch (`&` operator).
 
 pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if same_rpy_type(a, b) && !user_overridden_class(a) {
+            if let Some(w_res) = shortcut_and(a, b)?
+                && !is_not_implemented(w_res)
+            {
+                return Ok(w_res);
+            }
+        }
+    }
     and_impl(a, b, "&")
 }
 
@@ -5424,6 +5491,15 @@ pub(crate) fn unionable(obj: PyObjectRef) -> bool {
 /// Bitwise OR dispatch (`|` operator).
 
 pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if same_rpy_type(a, b) && !user_overridden_class(a) {
+            if let Some(w_res) = shortcut_or(a, b)?
+                && !is_not_implemented(w_res)
+            {
+                return Ok(w_res);
+            }
+        }
+    }
     or_impl(a, b, "|")
 }
 
@@ -5533,6 +5609,15 @@ pub(crate) fn or_impl(a: PyObjectRef, b: PyObjectRef, symbol: &str) -> PyResult 
 /// Bitwise XOR dispatch (`^` operator).
 
 pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if same_rpy_type(a, b) && !user_overridden_class(a) {
+            if let Some(w_res) = shortcut_xor(a, b)?
+                && !is_not_implemented(w_res)
+            {
+                return Ok(w_res);
+            }
+        }
+    }
     xor_impl(a, b, "^")
 }
 
@@ -5588,6 +5673,16 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 /// Comparison operation dispatch.
 
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    // `_make_comparison_impl`: only `__eq__`/`__ne__` have `left == right`,
+    // so only they take the same-type shortcut.
+    unsafe {
+        if matches!(op, CompareOp::Eq | CompareOp::Ne)
+            && same_rpy_type(a, b)
+            && !user_overridden_class(a)
+        {
+            return compare_slot(a, b, op);
+        }
+    }
     // A builtin subclass overriding the comparison dunder dispatches the
     // override first (with reflected-subclass priority); exact builtins and
     // non-overriding subclasses fall through to the by-layout comparison slot,
