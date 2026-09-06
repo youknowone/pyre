@@ -7437,6 +7437,8 @@ fn build_function(
                     residual_type_base,
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
+                    wb,
+                    gc_maps,
                 );
             }
             OpCode::ZeroArray => {
