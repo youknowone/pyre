@@ -2937,11 +2937,6 @@ mod cert_store {
     use pyre_object::{PyObjectRef, gc_roots::RootedItems};
     use rustpython_host_env::cert_store::{self as host, CertificateUses, EncodingType};
 
-    fn store_name(args: &[PyObjectRef]) -> Result<std::ffi::CString, crate::PyError> {
-        std::ffi::CString::new(crate::baseobjspace::str_utf8_w(args[0])?)
-            .map_err(|_| crate::PyError::value_error("embedded null character"))
-    }
-
     fn win32_error(error: std::io::Error) -> crate::PyError {
         crate::PyError::os_error_win32_syscall2(
             error.raw_os_error().unwrap_or(0),
@@ -2959,10 +2954,15 @@ mod cert_store {
     }
 
     pub fn enum_certificates(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let entries =
-            host::enum_certificates_local_machine(&store_name(args)?).map_err(win32_error)?;
+        let name = crate::baseobjspace::str_utf8_w(args[0])?;
+        let certs = host::enum_certificates(name);
+        if !certs.had_open_store {
+            return Err(crate::PyError::os_error(format!(
+                "failed to open certificate store {name:?}"
+            )));
+        }
         let mut items = RootedItems::new();
-        for entry in entries {
+        for entry in certs.entries {
             let tuple = {
                 let mut fields = RootedItems::new();
                 fields.push(pyre_object::w_bytes_from_bytes(&entry.der));
@@ -2988,7 +2988,10 @@ mod cert_store {
     }
 
     pub fn enum_crls(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let entries = host::enum_crls_local_machine(&store_name(args)?).map_err(win32_error)?;
+        let name = crate::baseobjspace::str_utf8_w(args[0])?;
+        let entries = host::enum_crls(name).map_err(|_| {
+            crate::PyError::os_error(format!("failed to open certificate store {name:?}"))
+        })?;
         let mut items = RootedItems::new();
         for entry in entries {
             let tuple = {

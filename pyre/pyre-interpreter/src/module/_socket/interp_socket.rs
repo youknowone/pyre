@@ -1650,8 +1650,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "if_nameindex",
                 |_| {
                     #[cfg(all(feature = "host_env", any(target_os = "dragonfly", target_os = "freebsd", target_os = "fuchsia", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "netbsd", target_os = "openbsd")))]
-                    let interfaces = rustpython_host_env::socket::if_nameindex_bytes()
-                        .map_err(socket_io_err)?;
+                    let interfaces = rustpython_host_env::socket::if_nameindex()
+                        .map_err(socket_io_err)?
+                        .into_iter()
+                        .map(|(index, name)| (index, name.into_bytes()))
+                        .collect::<Vec<_>>();
                     #[cfg(not(all(feature = "host_env", any(target_os = "dragonfly", target_os = "freebsd", target_os = "fuchsia", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "netbsd", target_os = "openbsd"))))]
                     let interfaces = unsafe {
                         let head = libc::if_nameindex();
@@ -1746,8 +1749,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         )
                     })?;
                     #[cfg(feature = "host_env")]
-                    let name = rustpython_host_env::socket::if_indextoname_bytes(idx)
-                        .map_err(socket_io_err)?;
+                    let name = rustpython_host_env::socket::if_indextoname_checked(idx)
+                        .map_err(socket_io_err)?
+                        .into_bytes();
                     #[cfg(not(feature = "host_env"))]
                     let name = {
                         let mut buf = [0u8; libc::IF_NAMESIZE];
@@ -2645,17 +2649,6 @@ fn socket_call<R>(f: impl FnOnce() -> R) -> (R, i32) {
     #[cfg(not(windows))]
     {
         crate::module::thread::call_external_function(f)
-    }
-}
-
-/// Keep thread blocking and signal retries in the interpreter while the host
-/// provider captures the syscall error before returning across that boundary.
-#[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
-fn socket_host_call(f: impl FnOnce() -> std::io::Result<usize>) -> (isize, i32) {
-    let _blocked = crate::module::thread::before_external_block();
-    match f() {
-        Ok(count) => (count as isize, 0),
-        Err(error) => (-1, error.raw_os_error().unwrap_or(0)),
     }
 }
 
@@ -5136,13 +5129,6 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                     msg.msg_controllen = ancbufsize as _;
                 }
-                #[cfg(all(feature = "host_env", not(target_os = "redox")))]
-                let (r, errno) = socket_host_call(|| unsafe {
-                    rustpython_host_env::socket::recvmsg_into(
-                        std::os::fd::BorrowedFd::borrow_raw(fd), &mut msg, flags,
-                    )
-                });
-                #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
                 let (r, errno) = socket_call(|| unsafe {
                     libc::recvmsg(fd, &mut msg, flags)
                 });
@@ -5312,13 +5298,6 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                     msg.msg_controllen = ancbufsize as _;
                 }
-                #[cfg(all(feature = "host_env", not(target_os = "redox")))]
-                let (r, errno) = socket_host_call(|| unsafe {
-                    rustpython_host_env::socket::recvmsg_into(
-                        std::os::fd::BorrowedFd::borrow_raw(fd), &mut msg, flags,
-                    )
-                });
-                #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
                 let (r, errno) = socket_call(|| unsafe {
                     libc::recvmsg(fd, &mut msg, flags)
                 });
@@ -5592,13 +5571,6 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
 
             socket_wait_writable(obj, fd)?;
             let sent = loop {
-                #[cfg(all(feature = "host_env", not(target_os = "redox")))]
-                let (r, errno) = socket_host_call(|| unsafe {
-                    rustpython_host_env::socket::sendmsg(
-                        std::os::fd::BorrowedFd::borrow_raw(fd), &msg, flags,
-                    )
-                });
-                #[cfg(any(not(feature = "host_env"), target_os = "redox"))]
                 let (r, errno) = socket_call(|| unsafe {
                     libc::sendmsg(fd, &msg, flags)
                 });

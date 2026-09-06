@@ -9992,20 +9992,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     #[cfg(target_os = "linux")]
                     {
-                        // rposix.sendfile_no_offset uses the input descriptor's
-                        // live position; the retry and signal check stay here.
+                        // host_env::posix::sendfile always takes an offset
+                        // cell. The None-offset form is rposix.sendfile_no_offset:
+                        // a null pointer, so the kernel uses the input
+                        // descriptor's live position.
                         let count = count_raw as libc::size_t;
-                        let out_b = fd_borrow(out_fd)?;
-                        let in_b = fd_borrow(in_fd)?;
                         loop {
-                            let result = {
-                                let _blocked = crate::module::thread::before_external_block();
-                                host_posix::sendfile_no_offset(out_b, in_b, count)
-                            };
-                            match result {
-                                Ok(res) => return Ok(pyre_object::w_int_new(res as i64)),
-                                Err(error) => crate::builtins::eintr_retry_with(error, |e| io_err(e, ""))?,
-                            };
+                            let (res, errno) =
+                                crate::module::thread::call_external_function(|| unsafe {
+                                    libc::sendfile(out_fd, in_fd, core::ptr::null_mut(), count)
+                                });
+                            if res >= 0 {
+                                return Ok(pyre_object::w_int_new(res as i64));
+                            }
+                            crate::builtins::eintr_retry_with(
+                                std::io::Error::from_raw_os_error(errno),
+                                |e| io_err(e, ""),
+                            )?;
                         }
                     }
                 }

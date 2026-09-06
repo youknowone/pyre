@@ -23,6 +23,7 @@ use parking_lot::Mutex;
 #[derive(Default)]
 pub struct W_LZMACompressor {
     backend: *mut Mutex<backend::Compressor>,
+    flushed: bool,
 }
 
 /// `Decompressor`, object-owned the same way.  The unconsumed input and the
@@ -223,10 +224,12 @@ fn parse_filter_chain(filters: PyObjectRef) -> Result<Vec<backend::FilterSpec>, 
     let filters = || shadow_stack_get(filters_slot);
 
     let count = crate::runtime_ops::sequence_len(filters())?;
-    if count > backend::FILTERS_MAX {
+    // rustpython-common keeps LZMA_FILTERS_MAX private; liblzma's
+    // chain length is four, and rustpython-stdlib checks the same bound.
+    const LZMA_FILTERS_MAX: usize = 4;
+    if count > LZMA_FILTERS_MAX {
         return Err(crate::PyError::value_error(format!(
-            "Too many filters - liblzma supports a maximum of {}",
-            backend::FILTERS_MAX
+            "Too many filters - liblzma supports a maximum of {LZMA_FILTERS_MAX}"
         )));
     }
     let mut specs = Vec::with_capacity(count);
@@ -346,21 +349,26 @@ mod compressor_methods {
 
         /// `_lzma_LZMACompressor_compress_impl`.
         fn compress(&mut self, data: PyBufferStr) -> Result<Vec<u8>, crate::PyError> {
-            let mut compressor = self.compressor()?.lock();
-            if compressor.is_flushed() {
+            if self.flushed {
                 return Err(crate::PyError::value_error("Compressor has been flushed"));
             }
-            compressor.compress(&data).map_err(lzma_error)
+            self.compressor()?
+                .lock()
+                .compress(&data)
+                .map_err(lzma_error)
         }
 
         /// `_lzma_LZMACompressor_flush_impl` — the object may not be used
         /// afterwards.
         fn flush(&mut self) -> Result<Vec<u8>, crate::PyError> {
-            let mut compressor = self.compressor()?.lock();
-            if compressor.is_flushed() {
+            if self.flushed {
                 return Err(crate::PyError::value_error("Repeated call to flush()"));
             }
-            compressor.flush().map_err(lzma_error)
+            // `LZMACompressor.flush` marks the stream finished before the
+            // encoder runs, so a second call is "Repeated" even if the first
+            // one raised.
+            self.flushed = true;
+            self.compressor()?.lock().flush().map_err(lzma_error)
         }
 
         fn __getstate__(&self) -> Result<PyObjectRef, crate::PyError> {
