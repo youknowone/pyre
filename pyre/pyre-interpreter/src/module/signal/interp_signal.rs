@@ -730,9 +730,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             if fd != -1 {
                 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
-                    let fd = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
-                    let blocking = rustpython_host_env::fileutils::fstat(fd)
-                        .and_then(|_| rustpython_host_env::fcntl::get_blocking(fd.into()));
+                    let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+                    let blocking = rustpython_host_env::fileutils::fstat(borrowed)
+                        .and_then(|_| rustpython_host_env::fcntl::get_blocking(borrowed.into()));
                     let blocking = match blocking {
                         Ok(blocking) => blocking,
                         Err(error) => {
@@ -746,9 +746,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         }
                     };
                     if blocking {
-                        return Err(crate::PyError::value_error(
-                            "the fd must be in non-blocking mode",
-                        ));
+                        return Err(crate::PyError::value_error(format!(
+                            "the fd {fd} must be in non-blocking mode"
+                        )));
                     }
                 }
                 #[cfg(all(
