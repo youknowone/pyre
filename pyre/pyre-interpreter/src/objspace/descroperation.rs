@@ -5721,10 +5721,7 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // `_make_comparison_impl`: only `__eq__`/`__ne__` have `left == right`,
     // so only they take the same-type shortcut.
     unsafe {
-        if matches!(op, CompareOp::Eq | CompareOp::Ne)
-            && same_rpy_type(a, b)
-            && !user_overridden_class(a)
-        {
+        if matches!(op, CompareOp::Eq | CompareOp::Ne) && same_unoverridden_rpy_type(a, b) {
             return compare_slot(a, b, op);
         }
     }
@@ -7397,6 +7394,20 @@ mod tests {
     fn test_int_bitand() {
         let result = and_(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0x0F) };
+    }
+
+    #[test]
+    fn same_unoverridden_rpy_type_rejects_user_int_subclass() {
+        unsafe {
+            let exact = w_int_new(7);
+            let user = w_int_subclass_new(3);
+            // `get_instantiate` is still null in this unit-test process;
+            // retag `w_class` the way `tag_subclass_instance` would.
+            (*user).w_class = &FLOAT_TYPE as *const PyType as PyObjectRef;
+            assert!(same_rpy_type(exact, user));
+            assert!(!same_unoverridden_rpy_type(exact, user));
+            assert!(same_unoverridden_rpy_type(exact, w_int_new(3)));
+        }
     }
 
     #[test]
