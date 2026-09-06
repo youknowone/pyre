@@ -14,7 +14,7 @@ crate::pyre_module_init!(interp_posix);
 pub use interp_posix::{W_DirEntry, W_ScandirIterator};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use interp_posix::rebind_fork_callback_mutex;
+pub(crate) use interp_posix::reinit_fork_tables_after_fork;
 
 // wasm32 has no operating system to wrap: the only filesystem the guest can
 // see is the embedder's, reached through the import machinery's
