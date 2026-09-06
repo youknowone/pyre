@@ -7400,6 +7400,20 @@ mod tests {
     }
 
     #[test]
+    fn test_bool_bitwise_shortcuts_return_bool_singletons() {
+        unsafe {
+            let tand = and_(w_bool_from(true), w_bool_from(true)).unwrap();
+            let tand_f = and_(w_bool_from(true), w_bool_from(false)).unwrap();
+            let tor = or_(w_bool_from(false), w_bool_from(true)).unwrap();
+            let txor = xor(w_bool_from(true), w_bool_from(false)).unwrap();
+            assert!(std::ptr::eq(tand, w_bool_from(true)));
+            assert!(std::ptr::eq(tand_f, w_bool_from(false)));
+            assert!(std::ptr::eq(tor, w_bool_from(true)));
+            assert!(std::ptr::eq(txor, w_bool_from(true)));
+        }
+    }
+
+    #[test]
     fn test_int_bitor() {
         let result = or_(w_int_new(0xF0), w_int_new(0x0F)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0xFF) };
