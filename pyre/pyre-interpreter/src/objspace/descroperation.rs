@@ -3742,6 +3742,11 @@ unsafe fn shortcut_rshift(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObj
 
 #[majit_macros::always_inline_try]
 unsafe fn shortcut_and(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    // `is_int` accepts BOOL_TYPE; W_BoolObject.descr_and returns the
+    // bool singleton, W_IntObject.descr_and always boxes an int.
+    if is_bool(a) {
+        return Ok(Some(bool_descr_and(a, b)));
+    }
     if is_int(a) {
         return Ok(Some(int_bitand(a, b)?));
     }
@@ -3750,6 +3755,9 @@ unsafe fn shortcut_and(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObject
 
 #[majit_macros::always_inline_try]
 unsafe fn shortcut_or(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_bool(a) {
+        return Ok(Some(bool_descr_or(a, b)));
+    }
     if is_int(a) {
         return Ok(Some(int_bitor(a, b)?));
     }
@@ -3758,6 +3766,9 @@ unsafe fn shortcut_or(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectR
 
 #[majit_macros::always_inline_try]
 unsafe fn shortcut_xor(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_bool(a) {
+        return Ok(Some(bool_descr_xor(a, b)));
+    }
     if is_int(a) {
         return Ok(Some(int_bitxor(a, b)?));
     }
@@ -7352,6 +7363,20 @@ mod tests {
     fn test_int_bitand() {
         let result = and_(w_int_new(0xFF), w_int_new(0x0F)).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 0x0F) };
+    }
+
+    #[test]
+    fn test_bool_bitwise_shortcuts_return_bool_singletons() {
+        unsafe {
+            let tand = and_(w_bool_from(true), w_bool_from(true)).unwrap();
+            let tand_f = and_(w_bool_from(true), w_bool_from(false)).unwrap();
+            let tor = or_(w_bool_from(false), w_bool_from(true)).unwrap();
+            let txor = xor(w_bool_from(true), w_bool_from(false)).unwrap();
+            assert!(std::ptr::eq(tand, w_bool_from(true)));
+            assert!(std::ptr::eq(tand_f, w_bool_from(false)));
+            assert!(std::ptr::eq(tor, w_bool_from(true)));
+            assert!(std::ptr::eq(txor, w_bool_from(true)));
+        }
     }
 
     #[test]
