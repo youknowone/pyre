@@ -151,6 +151,15 @@ unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
 /// to dispatch GETFIELD/SETFIELD to `InstancePtrInfo` / `StructPtrInfo`.
 pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
     let mut info = crate::virtualizable_gen::build_virtualizable_info();
+    // virtualizable.py `VirtualizableInfo.__init__` obtains the array item
+    // descriptor from `cpu.arraydescrof(getattr(VTYPE, name).TO)`.  Reuse the
+    // same GcArray(PyObjectRef) descriptor as ordinary frame construction and
+    // materialization; the macro-generated layout-only descriptor is merely a
+    // bootstrap value.  Descriptor identity is observable to OptHeap: using
+    // two descriptors for `locals_cells_stack_w` prevents it from recognizing
+    // the unchanged slots written by `gen_store_back_in_vable` and leaves a
+    // full array writeback in recursive bridges.
+    info.replace_array_descrs(vec![crate::state::pyobject_gcarray_descr()]);
     // rpython/jit/metainterp/virtualizable.py `clear_vable_ptr`
     // + `clear_vable_descr`. The descr must carry
     // EffectInfo.MOST_GENERAL + OopSpecIndex.JitForceVirtualizable
@@ -173,6 +182,17 @@ pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
 #[cfg(test)]
 mod tests {
     use super::build_pyframe_virtualizable_info;
+
+    #[test]
+    fn pyframe_vable_reuses_the_gcarray_descriptor() {
+        let info = build_pyframe_virtualizable_info();
+        let canonical = crate::state::pyobject_gcarray_descr();
+        assert_eq!(info.array_item_descr(0).index(), canonical.index());
+        assert!(std::sync::Arc::ptr_eq(
+            &info.array_item_descr(0),
+            &canonical
+        ));
+    }
     use super::{PYFRAME_VABLE_TOKEN_OFFSET, pyre_clear_vable_token};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

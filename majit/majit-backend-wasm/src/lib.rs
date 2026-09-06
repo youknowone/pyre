@@ -1168,6 +1168,12 @@ fn with_wasm_active_gc_mut<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Opti
 /// box in TLS) and `install_gc_standalone` (production: hooks only, no box
 /// — the trampolines then route to the `gc_sync` singleton).
 fn register_active_hooks(supports_guard_gc_type: bool) {
+    // llmodel.py execute_token returns the live JITFRAME as its deadframe.
+    // The host-entry fallback is off-GC, so its retained frame needs the
+    // common precise walker after it leaves the JF shadow stack.
+    majit_gc::set_active_gc_deadframe_hooks(majit_gc::ActiveGcDeadFrameHooks {
+        walk_live_deadframes: Some(majit_backend::libc_deadframe::walk_live_deadframes),
+    });
     majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
         check_is_object: Some(wasm_check_is_object),
         is_tagged_immediate: Some(wasm_is_tagged_immediate),
@@ -1192,6 +1198,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_collecting_typed(Some(wasm_alloc_nursery_collecting_typed));
     majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
         wasm_alloc_nursery_collecting_typed_rooted,
+    ));
+    majit_gc::set_active_alloc_nursery_collecting_typed_roots(Some(
+        wasm_alloc_nursery_collecting_typed_roots,
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
     majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
@@ -1382,14 +1391,12 @@ fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
 /// Whether the host entry runs a trace on a `JitFrame` it pushed onto the
 /// jitframe shadow stack.
 ///
-/// `execute_token` allocates that frame only once a `JitFrame` type id has been
-/// registered; with none it runs the trace on a plain host buffer, which no
-/// collection moves and which the shadow stack never describes. Every frame
-/// reload a trace body emits answers out of that shadow stack, so an embedder
-/// that registered no type id must get no reloads at all — a reload there would
-/// replace the running frame pointer with whatever root happens to sit on top.
+/// Both wasm execute_token paths push a real header: the collector-owned
+/// frame, or the common off-GC JITFRAME allocation. The latter never moves but
+/// still needs the force/exit gcmap and remains described by the same stack.
+/// Native codegen-only tests have no host entry unless they install a GC.
 fn host_entry_frame_is_jitframe() -> bool {
-    wasm_jitframe_tid() != 0
+    cfg!(target_arch = "wasm32") || wasm_jitframe_tid() != 0
 }
 
 /// Address of the active jitframe shadow-stack top cell for ordinary trace
@@ -1650,6 +1657,25 @@ unsafe fn wasm_alloc_nursery_collecting_typed_rooted(
 ) -> GcRef {
     with_wasm_active_gc_mut(|gc| unsafe {
         gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+    })
+    .unwrap_or(GcRef(0))
+}
+
+unsafe fn wasm_alloc_nursery_collecting_typed_roots(
+    type_id: u32,
+    size: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    with_wasm_active_gc_mut(|gc| unsafe {
+        gc.alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
     })
     .unwrap_or(GcRef(0))
 }
@@ -3295,13 +3321,15 @@ impl WasmBackend {
         // Key-0 still clears the full used-label range.
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
-        let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
-            codegen::build_wasm_module(&inputs)?;
+        let (wasm_bytes, guard_exits, module_data) = codegen::build_wasm_module(&inputs)?;
+        let merged_ref_homes = module_data.num_ref_homes;
+        let merged_labels = module_data.used_label_homes;
         let code_size = wasm_bytes.len();
         let descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
+            .zip(module_data.fail_descrs)
             .enumerate()
-            .map(|(index, g)| {
+            .map(|(index, (g, d))| {
                 let mut region_start = own_guard_count;
                 let trace_id = inputs
                     .inlined_bridges
@@ -3317,6 +3345,7 @@ impl WasmBackend {
                     fail_index: g.fail_index,
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
+                    rd_locs: d.rd_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: inputs.frame.force_slot_base as u32,
                     force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
@@ -3375,6 +3404,11 @@ impl WasmBackend {
         // in the same lifetime ledger as an ordinary compiled module.
         let block = self.asm_memory_stats.record_block(code_size, code_size);
         self.asm_memory_blocks.push(block);
+        compiled.gc_maps.borrow_mut().extend(module_data.gc_maps);
+        compiled
+            .force_descrs
+            .borrow_mut()
+            .extend(descrs.iter().filter(|d| d.rd_locs.is_some()).cloned());
         // Keep still-standalone bridge descriptors after the rebuilt merged
         // prefix. Adding regions grows that prefix, so every old positional
         // range moves by exactly the difference in guard-cell counts.
@@ -3984,13 +4018,15 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
     let raw_values: Vec<i64> = (0..num_outputs)
         .map(|i| unsafe { *frame.add(1 + i) })
         .collect();
-    DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
+    let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+    let jf = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+        as *const majit_backend::jitframe::JitFrame;
+    data.set_savedata_ref(GcRef(unsafe { (*jf).jf_savedata }));
+    DeadFrame::Boxed(data)
 }
 
-/// Reconstruct a [`DeadFrame`] for a frame a FORCE interrupted while its call
-/// is still on the stack, from the coordinate `emit_force_bracket_before_call`
-/// published into it: `frame[0]` the bracketing GUARD_NOT_FORCED's exit index,
-/// `frame[1..]` that guard's fail arguments.
+/// llmodel.py force / `_decode_pos`: read the forced descriptor's saved
+/// physical locations, including after FINISH has overwritten its result slot.
 ///
 /// Twin of [`dead_frame_from_ran_frame`] with one difference: a force is not an
 /// exit, so it must not consume the pending-exception cell. `jit_exc_take`
@@ -4030,7 +4066,11 @@ fn dead_frame_from_forced_frame(frame_ptr: usize, fail_index: u32) -> DeadFrame 
             value
         })
         .collect();
-    DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, 0))
+    let mut data = WasmFrameData::boxed(raw_values, fail_descr, 0);
+    unsafe {
+        data.attach_forced_jitframe(GcRef(jf as usize));
+    }
+    DeadFrame::Boxed(data)
 }
 
 /// Install the recovery guard's compile-time map before dropping the execution
@@ -4427,7 +4467,7 @@ impl majit_backend::Backend for WasmBackend {
                 },
             ),
         };
-        let (wasm_bytes, guard_exits, num_ref_homes, _used_labels) =
+        let (wasm_bytes, guard_exits, module_data) =
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
                 Err(err) => {
@@ -4436,16 +4476,19 @@ impl majit_backend::Backend for WasmBackend {
                     return Err(err);
                 }
             };
+        let num_ref_homes = module_data.num_ref_homes;
         let home_gcmap_ptr = leak_home_gcmap(frame, num_ref_homes, used_label_homes);
 
         // Build fail descriptors
         let fail_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
-            .map(|g| {
+            .zip(module_data.fail_descrs)
+            .map(|(g, d)| {
                 Arc::new(WasmFailDescr {
                     fail_index: g.fail_index,
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
+                    rd_locs: d.rd_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: frame.force_slot_base as u32,
                     force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
@@ -4551,6 +4594,14 @@ impl majit_backend::Backend for WasmBackend {
         // scoped to one `execute_token` call.
 
         let compiled = CompiledWasmLoop {
+            gc_maps: std::cell::RefCell::new(module_data.gc_maps),
+            force_descrs: std::cell::RefCell::new(
+                fail_descrs
+                    .iter()
+                    .filter(|d| d.rd_locs.is_some())
+                    .cloned()
+                    .collect(),
+            ),
             token_number: token.number,
             trace_id,
             input_types: inputargs.iter().map(|ia| ia.tp).collect(),
@@ -4561,8 +4612,10 @@ impl majit_backend::Backend for WasmBackend {
             fail_descrs: std::cell::RefCell::new(fail_descrs),
             num_inputs: inputargs.len(),
             max_output_slots,
-            num_ref_homes: std::cell::Cell::new(num_ref_homes),
-            used_label_homes: std::cell::Cell::new(used_label_homes),
+            num_ref_homes: std::cell::Cell::new(module_data.num_ref_homes),
+            used_label_homes: std::cell::Cell::new(
+                used_label_homes.max(module_data.used_label_homes),
+            ),
             frame,
             home_gcmap_ptr: std::cell::Cell::new(home_gcmap_ptr),
             bridge_cells_base: std::cell::Cell::new(bridge_cells_base),
@@ -5473,7 +5526,7 @@ impl majit_backend::Backend for WasmBackend {
             frame: source_frame,
             ca: ca_params,
         };
-        let (wasm_bytes, guard_exits, _num_ref_homes, _used_labels) =
+        let (wasm_bytes, guard_exits, module_data) =
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
                 Err(err) => {
@@ -5485,11 +5538,13 @@ impl majit_backend::Backend for WasmBackend {
         // Bridge exit descrs (fail_index already base-offset by build_wasm_module).
         let bridge_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
-            .map(|g| {
+            .zip(module_data.fail_descrs)
+            .map(|(g, d)| {
                 Arc::new(WasmFailDescr {
                     fail_index: g.fail_index,
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
+                    rd_locs: d.rd_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: source_frame.force_slot_base as u32,
                     force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
@@ -5562,6 +5617,13 @@ impl majit_backend::Backend for WasmBackend {
                 .get()
                 .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
                 .expect("source loop disappeared between borrows");
+            source_loop.gc_maps.borrow_mut().extend(module_data.gc_maps);
+            source_loop.force_descrs.borrow_mut().extend(
+                bridge_descrs
+                    .iter()
+                    .filter(|d| d.rd_locs.is_some())
+                    .cloned(),
+            );
             // Append the bridge's exit descrs to the source loop's flat
             // `fail_descrs` and record the slice they occupy, keyed by the
             // source guard's `fail_index`. `compiled_bridge_fail_descr_layouts`
@@ -5923,6 +5985,9 @@ impl majit_backend::Backend for WasmBackend {
                 }
 
                 let saved = majit_gc::shadow_stack::push_jf(jf_ref);
+                // assembler.py `_reload_frame_if_necessary`: the host entry
+                // frame is old-generation before its first Ref-home spill.
+                wasm_active_gc_write_barrier(jf_ref);
                 glue::execute(func_handle, items_base as u32);
 
                 let exc_value = jit_exc_take();
@@ -5944,7 +6009,7 @@ impl majit_backend::Backend for WasmBackend {
                 install_post_finish_force_gcmap(jf);
                 remember_and_drop_execution_frame(jf, saved);
 
-                return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
+                return DeadFrame::Boxed(data);
             }
 
             // Host-buffer frame path, for an embedder that registered no
@@ -5952,8 +6017,7 @@ impl majit_backend::Backend for WasmBackend {
             // item[1 + i], surviving Ref homes rooted across the trace. A home
             // slot only ever holds null (entry init) or a valid GcRef
             // (store-on-def), so forwarding is safe. No collection moves this
-            // buffer, which is what `host_entry_frame_is_jitframe` reports to
-            // codegen so the body emits no frame reload. The release below is
+            // buffer; a body reload simply reads the same stack root. The release below is
             // straight-line and the wasm32 build is `panic=abort`, so
             // `glue::execute` cannot unwind and leak roots.
             //
@@ -5972,10 +6036,8 @@ impl majit_backend::Backend for WasmBackend {
             let sign = std::mem::size_of::<isize>();
             let depth = frame_size * 8 / sign;
             let alloc_size = majit_backend::jitframe::JitFrame::alloc_size(depth);
-            // An `i64` element type for the alignment a `JitFrame` needs and
-            // for the zero fill `JitFrame::init` requires.
-            let mut backing = vec![0i64; alloc_size.div_ceil(8)];
-            let jf = backing.as_mut_ptr() as *mut majit_backend::jitframe::JitFrame;
+            let jf = majit_backend::jitframe::alloc_off_gc_jitframe(alloc_size);
+            assert!(!jf.is_null(), "wasm host JITFRAME allocation failed");
             unsafe { majit_backend::jitframe::JitFrame::init(jf, std::ptr::null(), depth) };
             unsafe { (*jf).jf_gcmap = compiled.home_gcmap_ptr.get() as *const u8 };
             let items = (jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET) as *mut i64;
@@ -6000,10 +6062,6 @@ impl majit_backend::Backend for WasmBackend {
                 glue::execute(func_handle, items as usize as u32);
             }
             majit_gc::shadow_stack::pop_jf_to(saved);
-            majit_gc::shadow_stack::unregister_libc_jitframe(jf as usize);
-            // Nothing reads the frame's interior through the gcmap any more,
-            // and the gcmap is about to go out of scope.
-            unsafe { (*jf).jf_gcmap = std::ptr::null() };
             for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);
@@ -6099,6 +6157,23 @@ impl majit_backend::Backend for WasmBackend {
             .and_then(|d| d.downcast_ref::<WasmFrameData>())
             .expect("not WasmFrameData");
         GcRef(data.exc_value as usize)
+    }
+
+    fn set_savedata_ref(&self, frame: &mut DeadFrame, value: GcRef) {
+        let data = frame
+            .boxed_data_mut()
+            .and_then(|d| d.downcast_mut::<WasmFrameData>())
+            .expect("not WasmFrameData");
+        data.set_savedata_ref(value);
+    }
+
+    fn get_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
+        let data = frame
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<WasmFrameData>())
+            .expect("not WasmFrameData");
+        let value = data.get_savedata_ref();
+        (!value.is_null()).then_some(value)
     }
 
     fn clear_stored_exception(&self) {

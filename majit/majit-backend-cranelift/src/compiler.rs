@@ -377,6 +377,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
         alloc_nursery_collecting_typed_rooted_via_active_runtime,
     ));
+    majit_gc::set_active_alloc_nursery_collecting_typed_roots(Some(
+        alloc_nursery_collecting_typed_roots_via_active_runtime,
+    ));
     majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
     majit_gc::set_active_collect_generation(Some(collect_generation_via_active_runtime));
     majit_gc::set_active_collect_step(Some(collect_step_via_active_runtime));
@@ -1751,6 +1754,25 @@ unsafe fn alloc_nursery_collecting_typed_rooted_via_active_runtime(
     .unwrap_or(GcRef(0))
 }
 
+unsafe fn alloc_nursery_collecting_typed_roots_via_active_runtime(
+    type_id: u32,
+    size: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    with_cranelift_gc(|gc| unsafe {
+        gc.alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
+    })
+    .unwrap_or(GcRef(0))
+}
+
 /// `majit_gc::AllocOldgenTypedFn` installed by `set_gc_allocator`.
 /// Routes host-side allocations that need a stable (non-moving)
 /// pointer through the active cranelift-owned GC's old-gen. Used by
@@ -3120,6 +3142,7 @@ pub fn set_savedata_ref_on_deadframe(
     let jf = frame
         .as_jitframe_mut()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    majit_gc::gc_write_barrier(jf.jf_gcref());
     jf.set_savedata_ref(data);
     Ok(())
 }
@@ -3194,6 +3217,18 @@ fn grab_exc_value_from_jf_ptr(jf_ptr: usize) -> i64 {
         return 0;
     }
     unsafe { *((jf_ptr + JF_GUARD_EXC_OFS as usize) as *const usize) as i64 }
+}
+
+/// `cpu.get_savedata_ref(deadframe)` for the raw JITFRAME handed to the
+/// CALL_ASSEMBLER guard helper.  Unlike [`grab_exc_value_from_jf_ptr`], this
+/// field is not consumed: `ResumeGuardForcedDescr.handle_fail` reveals it
+/// during the immediately following blackhole resume.
+#[inline]
+fn get_savedata_from_jf_ptr(jf_ptr: usize) -> usize {
+    if jf_ptr == 0 {
+        return 0;
+    }
+    unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *const usize) }
 }
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
@@ -3805,10 +3840,12 @@ fn call_assembler_guard_failure_inner(
     // into garbage-frame territory.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let guard_exc = grab_exc_value_from_jf_ptr(frame_ptr as usize);
+        let savedata = get_savedata_from_jf_ptr(frame_ptr as usize);
         if let Some(result) = bh_fn(
             fail_descr_ptr as usize,
             frame_ptr as *mut majit_backend::jitframe::JitFrame,
             guard_exc,
+            savedata,
         ) {
             // warmspot.py:988-996: DoneWithThisFrame{Int,Ref,Float} returns
             // e.result as-is. warmspot.py:982: ContinueRunningNormally
@@ -7389,7 +7426,7 @@ fn emit_guard_exit(
 
     let mut publish = PairedSlotStores::default();
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
-        let offset = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
+        let offset = JF_FRAME_ITEM0_OFS + (info.fail_locs[slot] as i32) * 8;
 
         // resume.py failargs may contain None holes.  Keep the slot numbering
         // positional, while leaving the dead slot unwritten like PyPy's
@@ -8566,6 +8603,11 @@ struct GuardInfo {
     fail_index: u32,
     can_have_bridge: bool,
     fail_arg_refs: Vec<OpRef>,
+    /// assembler.py `store_info_on_descr`: physical frame locations, in
+    /// logical fail-argument order. GUARD_NOT_FORCED_2 keeps slot zero free
+    /// for `genop_finish`'s return value, like a spilled FrameLoc rather than
+    /// the return register's save slot.
+    fail_locs: Vec<usize>,
     /// The GUARD_VALUE operand this exit stores in the trace's counter slot
     /// so `make_a_counter_per_value` has a slot to name, paired with that
     /// slot. See `counter_value_spill`.
@@ -16322,6 +16364,7 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
         } else {
             num_inputs
         };
+        let n = n + usize::from(op.opcode == OpCode::GuardNotForced2);
         if n > max_slots {
             max_slots = n;
         }
@@ -16350,6 +16393,10 @@ fn collect_guards(
 ) -> Result<(), BackendError> {
     let type_index = OpTypeIndex::new(inputargs, ops);
     let (type_overrides, op_def_positions) = build_type_overrides(ops, &type_index);
+
+    // assembler.py `store_force_descr` / `genop_finish`: the terminal
+    // force guard's reference spills remain roots after FINISH.
+    let mut finish_gcmap_slots = Vec::new();
 
     // Map Label descr index → block arity, used to distinguish internal vs
     // external JUMPs.  rewriter.py LABEL/JUMP redirect parity: a JUMP whose
@@ -16459,7 +16506,11 @@ fn collect_guards(
         let counter_value_spill = counter_value_spill(op, &fail_arg_refs)
             .zip(counter_slot)
             .inspect(|&(_, slot)| *max_output_slots = (*max_output_slots).max(slot + 1));
-        let n = fail_arg_refs.len();
+        let fail_loc_base = usize::from(op.opcode == OpCode::GuardNotForced2);
+        let fail_locs: Vec<usize> = (0..fail_arg_refs.len())
+            .map(|index| fail_loc_base + index)
+            .collect();
+        let n = fail_arg_refs.len() + fail_loc_base;
         if n > *max_output_slots {
             *max_output_slots = n;
         }
@@ -16858,7 +16909,7 @@ fn collect_guards(
                         is_finish || is_external_jump || !arg_ref.is_constant(),
                         "regalloc.py:1206: guard fail_args must not contain Const (slot={i}, opref={arg_ref:?})"
                     );
-                    slots.push(i);
+                    slots.push(fail_locs[i]);
                 }
             }
             slots
@@ -17110,6 +17161,29 @@ fn collect_guards(
         } else {
             None
         };
+        if op.opcode == OpCode::GuardNotForced2 {
+            // llsupport/assembler.py `store_info_on_descr`: force() reads
+            // exactly the locations written by the register allocator.
+            as_fd(&descr).set_rd_locs(
+                fail_arg_refs
+                    .iter()
+                    .zip(&fail_locs)
+                    .map(|(arg, &loc)| {
+                        if arg.is_none() {
+                            0xFFFF
+                        } else {
+                            u16::try_from(loc)
+                                .expect("force failarg frame location exceeds rd_locs")
+                        }
+                    })
+                    .collect(),
+            );
+            finish_gcmap_slots.clone_from(&failarg_ref_slots);
+        }
+        let mut gcmap_slots = failarg_ref_slots.clone();
+        if is_finish {
+            gcmap_slots.append(&mut finish_gcmap_slots);
+        }
         fail_descrs.push(descr);
         fail_descr_cells.push(cell);
         // assembler.py must_save_exception parity:
@@ -17140,6 +17214,7 @@ fn collect_guards(
             fail_index,
             can_have_bridge,
             fail_arg_refs,
+            fail_locs,
             counter_value_spill,
             must_save_exception,
             // llsupport/assembler.py `GuardToken.compute_gcmap` walks
@@ -17149,7 +17224,7 @@ fn collect_guards(
             // ports the same split (`guard_gcmap_from_faillocs`). Anything a
             // guard exit does not itself write must stay out of this map.
             bridge_source_slots,
-            gcmap: allocate_gcmap(&failarg_ref_slots),
+            gcmap: allocate_gcmap(&gcmap_slots),
             failarg_ref_slots,
             fail_descr_ptr,
             bridge_cache_addrs,
@@ -26920,33 +26995,33 @@ mod tests {
     #[test]
     fn test_deadframe_drop_preserves_the_frames_gcmap() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
-            nursery_size: 160,
-            large_object_threshold: 1024,
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
             ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
 
         let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xF012_CED;
+        }
         let mut backend = backend_with_gc(gc);
 
         let inputargs = vec![InputArg::new_ref(0)];
+        let guard = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_ref(0))]);
         let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_ref(0)],
-                OpRef::NONE.raw(),
-            ),
+            mk_op(OpCode::ForceToken, &[], 1),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
 
         let token = JitCellToken::new(1509);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
-        let jf = frame
-            .as_jitframe()
-            .expect("cranelift deadframes are JitFrameDeadFrame")
-            .jf_gcref();
+        let jf = backend.get_ref_value(&frame, 0);
+        let escaped = majit_gc::shadow_stack::OwnerRootGuard::new(jf);
         drop(frame);
         // Nothing allocates between the release and this read, so the frame is
         // still where the root last named it.
@@ -27139,6 +27214,34 @@ mod tests {
     // Guard-bearing callee with force_token finish shape:
     // Callee has ForceToken + GuardNotForced2 + Finish(force_token).
     // Caller uses CallAssemblerR and gets the force_token result.
+
+    #[test]
+    fn test_guard_not_forced_2_keeps_failargs_after_finish() {
+        // runner_test.py `test_guard_not_forced_2`: force a returned token,
+        // not just a token inside a still-running CALL_MAY_FORCE. FINISH's
+        // result slot must not overwrite the guard's frame locations.
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let guard = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(2))]);
+        let ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(OpCode::ForceToken, &[], 3),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9017);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(10)]);
+        let force_token = backend.get_ref_value(&frame, 0);
+        assert!(!force_token.is_null());
+        let forced = force_token_to_dead_frame(force_token);
+        assert_eq!(get_int_from_deadframe(&forced, 0).unwrap(), 30);
+    }
 
     #[test]
     fn test_all_guards_have_recovery_layout() {

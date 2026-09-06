@@ -107,6 +107,7 @@ pub fn __majit_struct_type_id_path(module_path: &str, type_path: &str, is_gc_man
     hasher.finish()
 }
 
+pub mod allvirtuals;
 pub mod blackhole;
 pub mod box_trace;
 pub(crate) mod call_descr;
