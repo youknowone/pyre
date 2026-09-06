@@ -75,6 +75,10 @@ pub fn _share_methods(_copycls: PyObjectRef, _subcls: PyObjectRef) {
     let _ = (_copycls, _subcls);
 }
 
+/// `typedef.py use_special_method_shortcut` registrar.  The decorator that
+/// rewrites a descroperation into `call_shortcut` is not a Rust function;
+/// the JIT-visible first arm is `same_rpy_type` + `!user_overridden_class`
+/// then `shortcut_add` / `shortcut_sub` / … in `descroperation.rs`.
 pub fn use_special_method_shortcut(_name: &str, _checkerfunc: Option<PyObjectRef>) -> bool {
     let _ = (_name, _checkerfunc);
     false

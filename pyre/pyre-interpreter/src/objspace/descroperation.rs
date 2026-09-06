@@ -3645,7 +3645,97 @@ unsafe fn bytes_concat_type_error(lhs: PyObjectRef, rhs: PyObjectRef) -> PyError
     PyError::type_error(format!("can't concat {rhs_name} to {lhs_name}"))
 }
 
+/// `W_Root.user_overridden_class` (`baseobjspace.py`).  An exact builtin
+/// payload keeps the flag false; a user subclass of that payload is true.
+#[majit_macros::always_inline]
+unsafe fn user_overridden_class(obj: PyObjectRef) -> bool {
+    !is_exact_builtin_instance(obj)
+}
+
+/// RPython `type(w_obj)` for the `type(w1) is type(w2)` test in
+/// `descroperation.py _make_binop_impl`: the interp-level class, not the
+/// app-level `w_class`.  Tagged immediates are `W_IntObject`.
+#[majit_macros::always_inline]
+unsafe fn rpy_type_of(obj: PyObjectRef) -> *const PyType {
+    if tagged_int::CAN_BE_TAGGED && tagged_int::is_tagged_int(obj) {
+        return &INT_TYPE;
+    }
+    if obj.is_null() {
+        return std::ptr::null();
+    }
+    (*obj).ob_type
+}
+
+#[majit_macros::always_inline]
+unsafe fn same_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
+    std::ptr::eq(rpy_type_of(a), rpy_type_of(b))
+}
+
+/// `typedef.py use_special_method_shortcut('__add__')` as installed on
+/// `W_IntObject` / `W_FloatObject`: the type-specific descr, not the
+/// generic lookup.  `@try_inline` (`objectmodel.py`) so the backend
+/// inliner can fold this into `add` / `add_impl`'s first arm.
+#[majit_macros::always_inline_try]
+unsafe fn shortcut_add(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_int(a) {
+        return Ok(Some(int_add(a, b)?));
+    }
+    if is_float(a) {
+        return Ok(Some(float_add(a, b)?));
+    }
+    Ok(None)
+}
+
+#[majit_macros::always_inline_try]
+unsafe fn shortcut_sub(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_int(a) {
+        return Ok(Some(int_sub(a, b)?));
+    }
+    if is_float(a) {
+        return Ok(Some(float_sub(a, b)?));
+    }
+    Ok(None)
+}
+
+#[majit_macros::always_inline_try]
+unsafe fn shortcut_mul(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_int(a) {
+        return Ok(Some(int_mul(a, b)?));
+    }
+    Ok(None)
+}
+
+#[majit_macros::always_inline_try]
+unsafe fn shortcut_floordiv(
+    a: PyObjectRef,
+    b: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    if is_int(a) {
+        return Ok(Some(int_floordiv(a, b)?));
+    }
+    Ok(None)
+}
+
+#[majit_macros::always_inline_try]
+unsafe fn shortcut_mod(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    if is_int(a) {
+        return Ok(Some(int_mod(a, b)?));
+    }
+    Ok(None)
+}
+
 pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    // `_make_binop_impl`: `type(w1) is type(w2) and not user_overridden_class`
+    // then the `use_special_method_shortcut` body.
+    unsafe {
+        if same_rpy_type(a, b) && !user_overridden_class(a) {
+            if let Some(w_res) = shortcut_add(a, b)?
+                && !is_not_implemented(w_res)
+            {
+                return Ok(w_res);
+            }
+        }
+    }
     add_impl(a, b, "+")
 }
 
@@ -3813,6 +3903,15 @@ pub(crate) fn matmul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
 }
 
 pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if same_rpy_type(a, b) && !user_overridden_class(a) {
+            if let Some(w_res) = shortcut_sub(a, b)?
+                && !is_not_implemented(w_res)
+            {
+                return Ok(w_res);
+            }
+        }
+    }
     sub_impl(a, b, "-")
 }
 
@@ -3867,6 +3966,15 @@ pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 }
 
 pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if same_rpy_type(a, b) && !user_overridden_class(a) {
+            if let Some(w_res) = shortcut_mul(a, b)?
+                && !is_not_implemented(w_res)
+            {
+                return Ok(w_res);
+            }
+        }
+    }
     mul_impl(a, b, "*")
 }
 
@@ -4004,6 +4112,15 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 }
 
 pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if same_rpy_type(a, b) && !user_overridden_class(a) {
+            if let Some(w_res) = shortcut_floordiv(a, b)?
+                && !is_not_implemented(w_res)
+            {
+                return Ok(w_res);
+            }
+        }
+    }
     floordiv_impl(a, b, "//")
 }
 
@@ -4061,6 +4178,15 @@ unsafe fn try_subclass_binop_override(
 }
 
 pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    unsafe {
+        if same_rpy_type(a, b) && !user_overridden_class(a) {
+            if let Some(w_res) = shortcut_mod(a, b)?
+                && !is_not_implemented(w_res)
+            {
+                return Ok(w_res);
+            }
+        }
+    }
     mod_impl(a, b, "%")
 }
 
