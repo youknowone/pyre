@@ -67,6 +67,8 @@ fn dispatch_accum(program: &Bytecode, threshold: u32) -> i64 {
                 if state.regs[0] == 0 {
                     break;
                 }
+                // Blocker 3 — `pc` is green; a mid-arm write cannot be
+                // carried back out of this lowering path.
                 pc = pc + 1;
             }
             _ => break,
@@ -112,11 +114,12 @@ fn both_blockers_are_reported() {
         vec![
             RefusalKind::UnlowerableStmt,
             RefusalKind::EnclosedBreakContinue,
+            RefusalKind::GreenWriteback,
             RefusalKind::EnclosedBreakContinue
         ],
         "the arm's blockers must all be reported, reallocation first \
-         (statement order), then the enclosing `if` and the `break` inside it; \
-         reason={reason:?}"
+         (statement order), then the enclosing `if`, the green `pc` write, \
+         and the `break` inside the `if`; reason={reason:?}"
     );
     assert!(
         reason.contains("state.regs = vec!") && reason.contains("break"),
