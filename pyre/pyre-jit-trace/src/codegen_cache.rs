@@ -135,11 +135,13 @@ pub fn discover(repo_root: &Path, manifest_dir: &Path) -> CacheInputs {
 pub fn repo_relative(repo_root: &Path, path: &Path) -> String {
     let canonical_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.into());
     let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+    // Forward slashes: Windows `Path::to_string_lossy` emits `\`, and a
+    // backslash key would miss a Unix-built cache entry of the same tree.
     canonical_path
         .strip_prefix(&canonical_root)
         .unwrap_or(&canonical_path)
         .to_string_lossy()
-        .into_owned()
+        .replace('\\', "/")
 }
 
 fn rel(repo_root: &Path, path: &Path) -> String {
@@ -468,6 +470,22 @@ mod tests {
             repo_relative(&root, &crate_root().join("build.rs")),
             "pyre/pyre-jit-trace/build.rs"
         );
+    }
+
+    #[test]
+    fn discover_paths_use_forward_slashes() {
+        let inputs = discover(&repo_root(), &crate_root());
+        for path in inputs
+            .src_trees
+            .iter()
+            .chain(&inputs.extra_files)
+            .chain(&inputs.manifests)
+        {
+            assert!(
+                !path.contains('\\'),
+                "cache key path must be host-independent: {path}"
+            );
+        }
     }
 
     #[test]
