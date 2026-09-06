@@ -5718,6 +5718,16 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 /// Comparison operation dispatch.
 
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    // `_make_comparison_impl`: only `__eq__`/`__ne__` have `left == right`,
+    // so only they take the same-type shortcut.
+    unsafe {
+        if matches!(op, CompareOp::Eq | CompareOp::Ne)
+            && same_rpy_type(a, b)
+            && !user_overridden_class(a)
+        {
+            return compare_slot(a, b, op);
+        }
+    }
     // A builtin subclass overriding the comparison dunder dispatches the
     // override first (with reflected-subclass priority); exact builtins and
     // non-overriding subclasses fall through to the by-layout comparison slot,
