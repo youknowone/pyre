@@ -14,21 +14,23 @@ use fallback::execute_query;
 
 #[cfg(feature = "host_env")]
 fn execute_query(query: Vec<u16>) -> Result<Vec<u16>, crate::PyError> {
-    use rustpython_host_env::wmi::{BUFFER_SIZE, ExecQueryError, exec_query_wide};
-    let query = widestring::U16CString::from_vec(query)
-        .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+    use rustpython_host_env::wmi::{BUFFER_SIZE, ExecQueryError, exec_query};
+    let query = String::from_utf16(&query)
+        .map_err(|_| crate::PyError::value_error("query is not valid UTF-16"))?;
     let result = {
         let _blocked = crate::module::thread::before_external_block();
-        exec_query_wide(&query)
+        exec_query(&query)
     };
-    result.map_err(|error| match error {
-        ExecQueryError::MoreData => {
-            crate::PyError::os_error(format!("Query returns more than {BUFFER_SIZE} characters"))
-        }
-        ExecQueryError::Code(code) => {
-            crate::PyError::os_error_win32_syscall2(code as i32, PY_NULL, PY_NULL)
-        }
-    })
+    result
+        .map(|text| text.encode_utf16().collect())
+        .map_err(|error| match error {
+            ExecQueryError::MoreData => crate::PyError::os_error(format!(
+                "Query returns more than {BUFFER_SIZE} characters"
+            )),
+            ExecQueryError::Code(code) => {
+                crate::PyError::os_error_win32_syscall2(code as i32, PY_NULL, PY_NULL)
+            }
+        })
 }
 
 // Preserve builds that explicitly omit the host provider.
