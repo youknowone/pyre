@@ -3575,6 +3575,11 @@ pub fn step<Sym: WalkSym>(
     // unless the full-body walk owns the virtualizable shadow and the
     // mirror is still valid.
     step_vstack_mirror(ctx, pc);
+    if let Some(finished) =
+        inline_call::try_finish_replayed_call_subreturn(ctx, code, &op)
+    {
+        return finished;
+    }
     let effects_before = fbw_executed_effect_count();
     let result = handle(&op, code, ctx);
     if matches!(
