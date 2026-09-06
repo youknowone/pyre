@@ -33,9 +33,17 @@ type CollationArg = std::ffi::CString;
 pub(crate) fn locale_encoding() -> String {
     // The active ANSI code page, spelled `cp<n>` whatever it is: code page
     // 65001 answers `cp65001`, not `utf-8`.
-    format!("cp{}", unsafe {
-        windows_sys::Win32::Globalization::GetACP()
-    })
+    format!("cp{}", active_acp())
+}
+
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+fn active_acp() -> u32 {
+    rustpython_host_env::locale::acp()
+}
+
+#[cfg(all(windows, not(feature = "host_env"), not(feature = "sandbox")))]
+fn active_acp() -> u32 {
+    unsafe { windows_sys::Win32::Globalization::GetACP() }
 }
 
 #[cfg(all(
@@ -409,7 +417,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // code page 65001 answers `cp65001`, not `utf-8`.  Mapping it
                 // to a codec name is `locale.getdefaultlocale`'s job, not this
                 // hook's.
-                let codepage = unsafe { windows_sys::Win32::Globalization::GetACP() };
+                let codepage = active_acp();
                 let encoding = pyre_object::w_str_new(&format!("cp{codepage}"));
                 Ok(pyre_object::w_tuple_new(vec![locale, encoding]))
             },
@@ -443,29 +451,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         }
                         v
                     };
-                    // The bytes come from `rlocale::charp2str`, the same read
-                    // `numeric_formatting` groups by, rather than from the host
-                    // helper, which stops at the first `CHAR_MAX` and drops it.
-                    #[cfg(unix)]
-                    let (grouping, mon_grouping) = {
-                        let raw = unsafe { libc::localeconv() };
-                        if raw.is_null() {
-                            (Vec::new(), Vec::new())
-                        } else {
-                            unsafe {
-                                (
-                                    grouping_of(super::rlocale::charp2str((*raw).grouping)),
-                                    grouping_of(super::rlocale::charp2str((*raw).mon_grouping)),
-                                )
-                            }
-                        }
-                    };
-                    // `libc` declares neither `lconv` nor `localeconv` for a
-                    // Windows target, so the host helper's read is the only
-                    // one there. Its stop at `CHAR_MAX` costs nothing: of the
-                    // 198 locale names this runtime accepts, every grouping is
-                    // `[3]` or `[3, 2]` and none carries the element.
-                    #[cfg(windows)]
+                    // The host copy retains CHAR_MAX. The Python adapter
+                    // still owns PyPy's trailing-zero list convention.
                     let (grouping, mon_grouping) = (
                         grouping_of(lc.grouping.iter().map(|&size| size as u8).collect()),
                         grouping_of(lc.mon_grouping.iter().map(|&size| size as u8).collect()),

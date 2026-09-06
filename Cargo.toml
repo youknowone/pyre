@@ -88,17 +88,18 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # parser from #8646, lazy capath loading from #8648, and native trust-store
 # loading plus default certificate-path discovery in rustpython-host_env from
 # #8649 were merged.
+# Repinned through #8655: shared hashlib engine, POSIX helpers, and AppendLog.
 #
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "zlib"] }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
 ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
-rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "cc990d0f4c5c4db8ff9754aba52e3695db3aabe7" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "55cebcd904bf496064d51df9685334d2f8599dad" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
@@ -187,14 +188,6 @@ rustc-hash = "2.1.3"
 md-5 = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
-sha3 = "0.10"
-blake2b_simd = { version = "1.0.4" }
-blake2s_simd = { version = "1.0.4" }
-scrypt = { version = "0.11", default-features = false }
-# liblzma backend (pyre-native only): xz-core is the pure-Rust port of
-# liblzma, with the same entry points `Modules/_lzmamodule.c` calls, so
-# `_lzma` needs no C toolchain and builds for wasm32 like the others.
-xz-core = "0.1.0-rc.0"
 
 # TLS backend (pyre-native only).  The interpreter sees opaque, non-inlined
 # entry points so rustls and its crypto provider stay outside Charon/LLBC.

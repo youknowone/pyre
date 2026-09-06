@@ -4,14 +4,14 @@
 //! through cffi and the applevel `lzma.py` stands on that, so the C module is
 //! the structure this follows, the same footing `_heapq` sits on.
 //!
-//! The codec lives in `pyre_native::lzma` — the `xz-core` port of liblzma —
+//! The codec lives in `rustpython_common::compression::lzma`, using xz-core,
 //! outside the LLBC extraction, exactly as `zlib` and `_bz2` keep theirs.
 //! What is left here is the object glue: the two stream objects, the filter
 //! dicts, the argument surface, and `LZMAError`.
 
-use pyre_native::lzma as backend;
 use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 use pyre_object::*;
+use rustpython_common::compression::lzma as backend;
 
 use parking_lot::Mutex;
 
@@ -51,23 +51,13 @@ fn lzma_exception(msg: impl Into<String>) -> crate::PyError {
 
 /// `catch_lzma_error`, plus the three failures the filter conversion reports
 /// before liblzma is reached.
-fn lzma_error(error: backend::LzmaError) -> crate::PyError {
-    use backend::LzmaError as E;
+fn lzma_error(error: backend::Error) -> crate::PyError {
+    use backend::Error as E;
     match error {
-        E::UnsupportedCheck => lzma_exception("Unsupported integrity check"),
-        E::Mem => crate::PyError::memory_error("out of memory"),
-        E::MemLimit => lzma_exception("Memory usage limit exceeded"),
-        E::Format => lzma_exception("Input format not supported by decoder"),
-        E::Options => lzma_exception("Invalid or unsupported options"),
-        E::Data => lzma_exception("Corrupt input data"),
-        E::Buf => lzma_exception("Insufficient buffer space"),
-        E::Prog => lzma_exception("Internal error"),
-        E::Unrecognized(ret) => lzma_exception(format!("Unrecognized error from liblzma: {ret}")),
-        E::InvalidPreset(preset) => lzma_exception(format!("Invalid compression preset: {preset}")),
-        E::InvalidFilterId(id) => crate::PyError::value_error(format!("Invalid filter ID: {id}")),
-        E::AloneChainNotSingleLzma1 => crate::PyError::value_error(
-            "Invalid filter chain for FORMAT_ALONE - must be a single LZMA1 filter",
-        ),
+        E::Memory => crate::PyError::memory_error("out of memory"),
+        E::Value(message) => crate::PyError::value_error(message),
+        E::Lzma(message) => lzma_exception(message),
+        E::Eof => crate::PyError::new(crate::PyErrorKind::EOFError, "Already at end of stream"),
     }
 }
 
@@ -332,7 +322,7 @@ mod compressor_methods {
             // names nothing that can be written.
             let check = match (format, check) {
                 (backend::FORMAT_XZ, -1) => backend::CHECK_CRC64,
-                (backend::FORMAT_XZ, check) => check as u32,
+                (backend::FORMAT_XZ, check) => check,
                 (backend::FORMAT_ALONE | backend::FORMAT_RAW, _) => backend::CHECK_NONE,
                 _ => {
                     return Err(crate::PyError::value_error(format!(
@@ -346,8 +336,8 @@ mod compressor_methods {
                 ));
             }
             let specs = optional_filter_chain(filters())?;
-            let compressor = backend::Compressor::new(format, check, preset, specs.as_deref())
-                .map_err(lzma_error)?;
+            let compressor =
+                backend::Compressor::new(format, check, preset, specs).map_err(lzma_error)?;
             Ok(W_LZMACompressor::allocate_stable(W_LZMACompressor {
                 backend: Box::into_raw(Box::new(Mutex::new(compressor))),
                 ..W_LZMACompressor::default()
@@ -436,8 +426,9 @@ mod decompressor_methods {
                 )));
             }
             let specs = optional_filter_chain(filters())?;
-            let decompressor = backend::Decompressor::new(format, memlimit, specs.as_deref())
-                .map_err(lzma_error)?;
+            let memlimit = (format != backend::FORMAT_RAW).then_some(memlimit);
+            let decompressor =
+                backend::Decompressor::new(format, memlimit, specs).map_err(lzma_error)?;
             Ok(W_LZMADecompressor::allocate_stable(W_LZMADecompressor {
                 backend: Box::into_raw(Box::new(Mutex::new(decompressor))),
                 ..W_LZMADecompressor::default()
@@ -585,7 +576,7 @@ crate::py_module! {
     inline_functions: {
         // `_lzma_is_check_supported_impl`.
         fn is_check_supported(check_id: PyIndexCInt) -> bool {
-            backend::is_check_supported(check_id as u32)
+            backend::is_check_supported(check_id as i32)
         }
         // `_lzma__encode_filter_properties_impl` — the options of one filter,
         // without the filter id itself.
@@ -593,7 +584,21 @@ crate::py_module! {
             filter: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
             let spec = parse_filter_spec(filter)?;
-            let properties = backend::encode_filter_properties(&spec).map_err(lzma_error)?;
+            let properties = backend::encode_filter_properties(&spec).map_err(|error| {
+                // lib_pypy._lzma._encode_filter_properties exposes liblzma's
+                // LZMA_PROG_ERROR for invalid LZMA1 properties. The common
+                // API names this validation failure "Invalid or unsupported
+                // options"; keep Python's observable error at this boundary.
+                match error {
+                    backend::Error::Lzma(message)
+                        if spec.id == backend::FILTER_LZMA1
+                            && message == "Invalid or unsupported options" =>
+                    {
+                        lzma_error(backend::Error::Lzma("Internal error".to_owned()))
+                    }
+                    error => lzma_error(error),
+                }
+            })?;
             Ok(bytesobject::w_bytes_from_bytes(&properties))
         }
         // `_lzma__decode_filter_properties_impl` — the spec dict those options
@@ -617,9 +622,15 @@ crate::py_module! {
             let dict = || shadow_stack_get(dict_slot);
             let id = w_int_new(decoded.id as i64);
             unsafe { w_dict_setitem_str(dict(), "id", id) };
-            for (name, value) in &decoded.fields {
-                let value = w_int_new(*value as i64);
-                unsafe { w_dict_setitem_str(dict(), name, value) };
+            for (name, value) in [
+                ("lc", decoded.lc), ("lp", decoded.lp), ("pb", decoded.pb),
+                ("dict_size", decoded.dict_size), ("dist", decoded.dist),
+                ("start_offset", decoded.start_offset),
+            ] {
+                if let Some(value) = value {
+                    let value = w_int_new(value as i64);
+                    unsafe { w_dict_setitem_str(dict(), name, value) };
+                }
             }
             Ok(dict())
         }

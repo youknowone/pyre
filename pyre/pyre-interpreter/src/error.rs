@@ -1156,7 +1156,11 @@ impl PyError {
         // translated to, so it would describe an unrelated system error (17 is
         // EEXIST but also ERROR_NOT_SAME_DEVICE).  The C runtime keeps the
         // errno-keyed table `strerror` reports from.
-        #[cfg(windows)]
+        #[cfg(all(windows, feature = "host_env"))]
+        if let Some(msg) = rustpython_host_env::errno::strerror_string(errno) {
+            return msg;
+        }
+        #[cfg(all(windows, not(feature = "host_env")))]
         {
             let msg = unsafe { libc::strerror(errno) };
             if !msg.is_null() {
