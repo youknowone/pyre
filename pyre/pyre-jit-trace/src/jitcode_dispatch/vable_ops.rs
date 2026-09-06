@@ -130,7 +130,7 @@ fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox
 ///
 /// `_nonstandard_virtualizable` Step 4 already rewrote the TraceCtx
 /// records. The live register banks are this walk's `MIFrame` analogue.
-fn apply_pending_vable_box_replace<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+pub(super) fn apply_pending_vable_box_replace<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
     let Some((oldbox, newbox)) = ctx.trace_ctx.take_pending_box_replace() else {
         return;
     };
@@ -229,6 +229,47 @@ mod frame_replacement_tests {
             assert_eq!(ctx.vstack_boxes, vec![standard]);
             assert_eq!(ctx.callee_shadow.as_ref().unwrap().frame_box, standard);
             assert!(owner.0.pending.borrow().is_empty());
+
+            // The traceback emitter is another vable writer, outside the
+            // bytecode arms. An alias promoted there must rewrite registers
+            // before the next writer can replace the single pending slot.
+            owner.set_listening(false);
+            ctx.registers_r[0] = old;
+            ctx.vstack_boxes[0] = old;
+            let mut info =
+                majit_metainterp::virtualizable::VirtualizableInfo::without_vable_token();
+            info.add_field("last_instr", Type::Int, 0);
+            info.set_parent_descr(majit_ir::descr::make_size_descr(8));
+            let initial = ctx.trace_ctx.const_int(0);
+            let pointer = Value::Ref(majit_ir::GcRef(0x1000));
+            ctx.trace_ctx.set_opref_concrete(old, pointer);
+            ctx.trace_ctx.set_virtualizable_boxes_with_info(
+                vec![initial, standard],
+                vec![Value::Int(0), pointer],
+                &info,
+                &[],
+            );
+            let site = TracebackNodeSite {
+                frame: old,
+                w_code: 0,
+                last_instruction: 7,
+                lineno: 8,
+            };
+            let tail = ctx.trace_ctx.const_ref(0);
+            let guards_before = ctx.trace_ctx.num_guards();
+            emit_traceback_node(
+                &mut ctx,
+                middle,
+                pyre_object::interp_exceptions::ExcKind::ValueError,
+                &site,
+                tail,
+                0,
+            )
+            .unwrap();
+            assert!(ctx.trace_ctx.num_guards() > guards_before);
+            assert_eq!(ctx.registers_r, &[standard]);
+            assert_eq!(ctx.vstack_boxes, vec![standard]);
+            assert!(ctx.trace_ctx.take_pending_box_replace().is_none());
         }
         // Re-entering after the frames die does not retain their aliases.
         let _next = FrameBoxReplacements::new(&session);

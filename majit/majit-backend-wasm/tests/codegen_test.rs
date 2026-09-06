@@ -809,6 +809,35 @@ fn build_module_with_write_barrier_target(
 }
 
 #[test]
+fn jitframe_barrier_reserves_arity_one_for_zero_argument_residuals() {
+    const WB_TARGET: i64 = 127;
+    let call = make_op(
+        OpCode::CallMayForceI,
+        &[OpRef::const_int(42)],
+        OpRef::int_op(1),
+    );
+    call.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        vec![],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    ));
+    let guard = Op::new(OpCode::GuardNotForced, &[]);
+    guard.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+    let bytes = build_module_with_write_barrier_target(
+        &[InputArg::from_type(Type::Ref, 0)],
+        &[call, guard, finish],
+        WB_TARGET,
+    );
+    assert_eq!(direct_write_barrier_call_count(&bytes, WB_TARGET as i32), 1);
+    validate_wasm(&bytes);
+}
+
+#[test]
 fn write_barrier_elision_keeps_one_barrier_per_base() {
     use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
     use std::sync::Arc;

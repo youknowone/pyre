@@ -4033,6 +4033,18 @@ pub fn build_wasm_module(
             .iter()
             .filter_map(|op| direct_helper_i64_arity(op, &ref_values, constants))
             .max();
+        // `emit_jitframe_write_barrier` is a generated one-argument helper,
+        // not a trace operation visible to the ordinary residual census.
+        let scanned = if num_ref_homes != 0
+            && analysis_ops
+                .iter()
+                .any(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2))
+            && analysis_ops.iter().any(|op| op.opcode.can_malloc())
+        {
+            Some(scanned.map_or(1, |arity| arity.max(1)))
+        } else {
+            scanned
+        };
         if ca.emit_ca {
             // The CA arm's frame helpers (`wasm_jit_ca_reload_frame()`,
             // `wasm_jit_ca_pop_frame(frame_base)`, and

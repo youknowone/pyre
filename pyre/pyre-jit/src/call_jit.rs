@@ -249,6 +249,24 @@ mod tests {
         assert_eq!(descrs.jf_frame_baseitemofs, FIRST_ITEM_OFFSET);
         assert_eq!(descrs.jf_frame_lengthofs, JF_FRAME_OFS);
     }
+
+    #[test]
+    fn blackhole_leave_rejects_a_red_outside_the_open_frame_scope() {
+        std::thread::spawn(|| {
+            let mut ec = pyre_interpreter::PyExecutionContext::default();
+            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
+            // A malformed recovered red must never be dereferenced merely
+            // because it is nonzero. There is no matching execution scope.
+            bh.virtualizable_ptr = 2;
+            super::leave_resumed_blackhole_frame(&bh, false);
+            super::leave_resumed_blackhole_frame(&bh, true);
+            assert!(ec.topframeref.is_null());
+            pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
+        })
+        .join()
+        .unwrap();
+    }
 }
 
 #[cfg(feature = "cranelift")]
@@ -2406,11 +2424,6 @@ fn leave_resumed_blackhole_frame(
     if frame_ptr.is_null() {
         return;
     }
-    // `pyjitpl.py finishframe` reaches `PyFrame.finish_value`, and
-    // `pyopcode.py handle_operation_error` marks a no-handler frame finished
-    // before propagating it.  A blackhole level has left Python execution at
-    // every caller of this helper, so preserve the same lifecycle transition.
-    unsafe { (*frame_ptr).set_frame_finished_execution(true) };
     leave_compiled_frame_chain(frame_ptr, got_exception);
 }
 
@@ -2476,6 +2489,10 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
     // resume-data frame chain itself is not the application frame chain, and
     // releasing a BlackholeInterpreter does not restore `topframeref`.
     unsafe {
+        // `PyFrame.dispatch_bytecode` / `handle_operation_error` marks the leaving
+        // frame finished. Only dereference the recovered red after proving
+        // that it names this execution context's still-open frame scope.
+        (*frame_ptr).set_frame_finished_execution(true);
         (*ec).topframeref = (*frame_ptr).f_backref;
         if (*frame_ptr).escaped() || got_exception {
             // `f_back = frame.f_backref()` — with the parens, so an inlined

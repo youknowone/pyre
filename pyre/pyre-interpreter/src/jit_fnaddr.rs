@@ -2835,13 +2835,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_list_append",
         w_list_append,
     );
-    let w_list_pop_end_inner: unsafe fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef =
-        pyre_object::listobject::w_list_pop_end_inner;
-    upa1(
+    let w_list_pop_end_inner: unsafe fn(
+        pyre_object::PyObjectRef,
+    ) -> Option<pyre_object::PyObjectRef> = pyre_object::listobject::w_list_pop_end_inner;
+    // ABI-UNSOUND: same two-word Option as `w_list_pop_end` below. The empty
+    // check now lives in this descended body (`W_ListObject.descr_pop`).
+    push_abi_unsound_alias_pair(
         &mut entries,
         "pyre_object::listobject::w_list_pop_end_inner",
         "pyre_object::w_list_pop_end_inner",
-        w_list_pop_end_inner,
+        w_list_pop_end_inner as *const (),
     );
     let w_list_pop_end: unsafe fn(pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> =
         pyre_object::listobject::w_list_pop_end;

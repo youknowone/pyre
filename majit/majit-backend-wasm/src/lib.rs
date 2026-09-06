@@ -1891,12 +1891,14 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, gcmap_ptr: i64) -> i
 /// one frame before its `call_indirect` and pops after, and a deopt resume runs
 /// on the host's own shadow stack — so removing the top entry releases exactly
 /// this callee's frame.
-pub extern "C" fn wasm_jit_ca_pop_frame(items_base: i64) -> i64 {
+pub extern "C" fn wasm_jit_ca_pop_frame(_items_base: i64) -> i64 {
     // `genop_finish` publishes `assembler._finish_gcmap` before the call
     // footer drops the execution root.  A CA callee returns inside generated
     // wasm, so its footer is this helper rather than `execute_token`.
-    let jf = (items_base as usize - majit_backend::jitframe::FIRST_ITEM_OFFSET)
-        as *mut majit_backend::jitframe::JitFrame;
+    // `_reload_frame_if_necessary`: the deopt helper can collect after the
+    // generated caller last refreshed its callee local. The shadow-stack root
+    // is forwarded by that collection; the argument may still name old space.
+    let jf = majit_gc::shadow_stack::jf_top_ptr().0 as *mut majit_backend::jitframe::JitFrame;
     install_post_finish_force_gcmap(jf);
     wasm_jit_write_barrier(jf as i64);
     majit_gc::shadow_stack::pop_jf_top();
@@ -5717,6 +5719,38 @@ mod tests {
             MAX_BRIDGE_PARAM_GUARDS + 1
         ));
         assert!(!bridge_param_dispatch_profitable(false, 1));
+    }
+
+    #[test]
+    fn ca_pop_publishes_the_forwarded_shadow_stack_frame() {
+        use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame, jitframe_type_info};
+        use majit_gc::GcAllocator;
+
+        let mut gc = MiniMarkGC::new();
+        let tid = gc.register_type(jitframe_type_info());
+        let old = gc.alloc_oldgen_typed(tid, JitFrame::alloc_size(1));
+        let forwarded = gc.alloc_oldgen_typed(tid, JitFrame::alloc_size(1));
+        let map = [1_usize, 0];
+        for value in [old, forwarded] {
+            unsafe {
+                let jf = value.0 as *mut JitFrame;
+                JitFrame::init(jf, std::ptr::null(), 1);
+                (*jf).jf_gcmap = map.as_ptr().cast();
+            }
+        }
+        let saved = majit_gc::shadow_stack::push_jf(old);
+        // Model the root-slot forwarding performed by a collection in deopt.
+        majit_gc::shadow_stack::walk_jf_roots(|root| {
+            if *root == old {
+                *root = forwarded;
+            }
+        });
+        wasm_jit_ca_pop_frame((old.0 + FIRST_ITEM_OFFSET) as i64);
+        assert_eq!(majit_gc::shadow_stack::jf_depth(), saved);
+        unsafe {
+            assert!((*(forwarded.0 as *const JitFrame)).jf_gcmap.is_null());
+            assert_eq!((*(old.0 as *const JitFrame)).jf_gcmap, map.as_ptr().cast());
+        }
     }
 
     #[test]

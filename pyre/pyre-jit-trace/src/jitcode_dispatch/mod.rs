@@ -1438,6 +1438,7 @@ fn emit_traceback_node<Sym: WalkSym>(
         last_instr_value,
         Some(Value::Int(i64::from(site.last_instruction))),
     );
+    vable_ops::apply_pending_vable_box_replace(ctx);
     walker_capture_inline_nonstandard_vable_guard(ctx, opcode_position, guards_before, write)?;
 
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
