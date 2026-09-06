@@ -2000,9 +2000,9 @@ impl Optimizer {
                 // no guess-on-miss path in RPython. Match strict parity by
                 // requiring `opref_type` to resolve; a None here is a
                 // bookkeeping bug, not a recoverable case.
-                let arg_type = ctx.opref_type(orig).expect(
-                    "propagate_from_pass_range SameAs: source OpRef missing Box.type",
-                );
+                let arg_type = ctx
+                    .opref_type(orig)
+                    .expect("propagate_from_pass_range SameAs: source OpRef missing Box.type");
                 let same_as = OpCode::same_as_for_type(arg_type);
                 let fresh = ctx.alloc_op_position_typed(arg_type);
                 let arg0 = ctx.materialize_operand_at(orig);
@@ -2137,9 +2137,9 @@ impl Optimizer {
         // `optimize_trace_with_constants_and_inputs_vable_out`) catches
         // and reroutes instead of crashing the worker thread.
         let (preview_label_args, preview_virtuals, preview_label_source_positions) =
-            match preview_virtual_state.make_inputargs_and_virtuals_with_source_positions(
-                vs_args, self, &mut ctx, false,
-            ) {
+            match preview_virtual_state
+                .make_inputargs_and_virtuals_with_source_positions(vs_args, self, &mut ctx, false)
+            {
                 Ok(pair) => pair,
                 Err(_) => {
                     return Err(crate::optimize::InvalidLoop(
@@ -2150,9 +2150,7 @@ impl Optimizer {
         let mut preview_short_args = preview_label_args.clone();
         preview_short_args.extend_from_slice(&preview_virtuals);
         let mut short_boxes =
-            crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(
-                &preview_short_args,
-            );
+            crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&preview_short_args);
         for &arg in &preview_short_args {
             // RPython shortpreamble.py:255-259 parity: each label arg
             // is `box.type`, where Box objects intrinsically carry one
@@ -2338,16 +2336,13 @@ impl Optimizer {
                     same_as_source: produced.same_as_source.clone(),
                 })
             };
-        let exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp> =
-            produced
-                .into_iter()
-                .filter_map(|(result, produced)| convert_produced(result, produced, false))
-                .collect();
+        let exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp> = produced
+            .into_iter()
+            .filter_map(|(result, produced)| convert_produced(result, produced, false))
+            .collect();
         let exported_const_short_boxes = produced_const
             .into_iter()
-            .filter_map(|produced| {
-                convert_produced(produced.res.to_opref(), produced, true)
-            })
+            .filter_map(|produced| convert_produced(produced.res.to_opref(), produced, true))
             .collect();
         ctx.exported_const_short_boxes = exported_const_short_boxes;
         if crate::majit_log_enabled() {
@@ -2386,8 +2381,7 @@ impl Optimizer {
         });
         let jump_arglist_oprefs: Vec<OpRef> =
             jump.getarglist().iter().map(|a| a.to_opref()).collect();
-        let exported_int_bounds =
-            self.collect_exported_int_bounds(&jump_arglist_oprefs, &mut ctx);
+        let exported_int_bounds = self.collect_exported_int_bounds(&jump_arglist_oprefs, &mut ctx);
         // RPython unroll.py:186-193 + compile.py: `info.renamed_inputargs`
         // are the fresh per-iteration boxes from `trace.get_iter()`. They
         // live in this run's iteration namespace, not the original
@@ -5093,13 +5087,8 @@ impl Optimizer {
                 self.quasi_immutable_deps.clone(),
                 Some(terminal_jump.clone()),
             );
-            let mut state = self.export_state(
-                &terminal_jump,
-                None,
-                num_inputs,
-                &mut loop_info,
-                &mut ctx,
-            )?;
+            let mut state =
+                self.export_state(&terminal_jump, None, num_inputs, &mut loop_info, &mut ctx)?;
             state.runtime_boxes = runtime_boxes.to_vec();
             state.patchguardop = self.patchguardop.clone();
             self.exported_loop_state = Some(state);
