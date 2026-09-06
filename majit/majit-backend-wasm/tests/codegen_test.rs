@@ -7164,6 +7164,68 @@ fn consecutive_new_ops_keep_their_collecting_boundaries() {
     );
 }
 
+fn call_malloc_nursery(result: u32, size: i64) -> Op {
+    make_op(
+        OpCode::CallMallocNursery,
+        &[OpRef::const_int(size)],
+        OpRef::ref_op(result),
+    )
+}
+
+#[test]
+fn call_malloc_nursery_uses_one_inline_bump() {
+    let inputs = nursery_new_inputs(vec![call_malloc_nursery(1, 32), finish_int_arg0()], 53);
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(nursery_top_compare_count(&bytes), 1);
+}
+
+#[test]
+fn call_malloc_nursery_and_ptr_increment_share_one_bump() {
+    let incr = make_op(
+        OpCode::NurseryPtrIncrement,
+        &[OpRef::ref_op(1), OpRef::const_int(32)],
+        OpRef::ref_op(2),
+    );
+    let inputs = nursery_new_inputs(
+        vec![call_malloc_nursery(1, 72), incr, finish_int_arg0()],
+        53,
+    );
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        1,
+        "rewrite already combined the batch; increment is pointer math"
+    );
+    let mut adds = 0;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::I64Add) {
+            adds += 1;
+        }
+    });
+    assert!(adds >= 1, "NURSERY_PTR_INCREMENT is an i64 add");
+}
+
+#[test]
+fn unlowered_call_malloc_nursery_variants_decline() {
+    for opcode in [
+        OpCode::CallMallocNurseryHeaderless,
+        OpCode::CallMallocNurseryVarsize,
+        OpCode::CallMallocNurseryVarsizeFrame,
+    ] {
+        let op = make_op(opcode, &[OpRef::const_int(32)], OpRef::ref_op(1));
+        let inputs = nursery_new_inputs(vec![op, finish_int_arg0()], 53);
+        assert!(
+            matches!(
+                codegen::build_wasm_module(&inputs),
+                Err(majit_backend::BackendError::Unsupported(_))
+            ),
+            "{opcode:?} must decline until it has a malloc_cond arm"
+        );
+    }
+}
+
 #[test]
 fn inline_nursery_new_keeps_the_barrier_at_the_slow_path_join() {
     use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};

@@ -2958,7 +2958,7 @@ fn direct_helper_i64_arity(
     }
     match op.opcode {
         // wasm_jit_alloc(type_id, size)
-        OpCode::New | OpCode::NewWithVtable => Some(2),
+        OpCode::New | OpCode::NewWithVtable | OpCode::CallMallocNursery => Some(2),
         // wasm_jit_alloc_array(type_id, base_size, item_size, length, len_offset)
         OpCode::NewArray | OpCode::NewArrayClear => Some(5),
         // wasm_jit_write_barrier(base)
@@ -7014,6 +7014,135 @@ fn build_function(
                     sink.i64_add();
                     sink.local_set(value_types.local(vi));
                 }
+            }
+            // rewrite.py `CALL_MALLOC_NURSERY(ConstInt(size))`: size is the
+            // already-rounded header+payload total. Fast path is malloc_cond
+            // (bump, zero the header word, return free+HDR). Slow path is
+            // `wasm_jit_alloc(0, payload)` — tid is written afterwards by
+            // `gen_initialize_tid`.
+            OpCode::CallMallocNursery => {
+                let vi = op.pos.get().raw();
+                let size_const = const_operand_value(constants, op.arg(0).to_opref());
+                let bump_size = size_const.and_then(|size| u32::try_from(size).ok());
+                let payload =
+                    bump_size.map(|size| i64::from(size.saturating_sub(GcHeader::SIZE as u32)));
+                let Some(base) = residual_type_base else {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: CallMallocNursery needs a residual alloc helper".into(),
+                    ));
+                };
+                let inlined = matches!((nursery, bump_size, payload), (Some(_), Some(_), Some(_)));
+                if let (Some(na), Some(bump_size), Some(payload)) = (nursery, bump_size, payload) {
+                    sink.i32_const(na.free_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_tee(alloc_scratch_local);
+                    sink.i32_const(bump_size as i32);
+                    sink.i32_add();
+                    sink.local_tee(alloc_size_local);
+                    sink.i32_const(na.top_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    sink.i64_const(0);
+                    sink.i64_const(payload);
+                    sink.i32_const(alloc.new_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
+                    sink.else_();
+                    sink.i32_const(na.free_addr as i32);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    // Fast path clears the header word; rewrite then stores tid.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_const(0);
+                    sink.i64_store(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i64_extend_i32_u();
+                    sink.end();
+                } else {
+                    sink.i64_const(0);
+                    if let Some(payload) = payload {
+                        sink.i64_const(payload);
+                    } else {
+                        emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                        sink.i64_const(GcHeader::SIZE as i64);
+                        sink.i64_sub();
+                    }
+                    sink.i32_const(alloc.new_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                }
+                if !OpRef::raw_is_constant(vi) {
+                    sink.local_set(value_types.local(vi));
+                } else {
+                    sink.drop();
+                }
+                emit_memory_error_check(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.pos.get(),
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
+                if !inlined {
+                    let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        skip,
+                        frame,
+                    );
+                }
+            }
+            OpCode::CallMallocNurseryHeaderless
+            | OpCode::CallMallocNurseryVarsize
+            | OpCode::CallMallocNurseryVarsizeFrame => {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm codegen: {:?} is not lowered yet",
+                    op.opcode
+                )));
             }
             // `GcRewriterImpl::_gen_call_malloc_gc` emits this after a residual
             // malloc. Use the same propagate-exception exit as the wasm
