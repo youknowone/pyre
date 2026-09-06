@@ -12197,6 +12197,23 @@ fn builtin_set_add_items_impl(
 /// Zero-arg super() finds __class__ and self from the calling frame.
 /// CPython: Objects/typeobject.c super_init
 pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let args = super_init_args(args)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in args {
+        let _ = pyre_object::gc_roots::pin_root(arg);
+    }
+    let w_self = pyre_object::descriptor::w_super_new(PY_NULL, PY_NULL, PY_NULL);
+    let _ = pyre_object::gc_roots::pin_root(w_self);
+    let mut args_w = [PY_NULL; 2];
+    for (i, arg) in args_w[..args.len()].iter_mut().enumerate() {
+        *arg = unsafe { pyre_object::gc_roots::shadow_stack_get(save_point + i) };
+    }
+    super_descr_init(w_self, &args_w[..args.len()])?;
+    Ok(unsafe { pyre_object::gc_roots::shadow_stack_get(save_point + args.len()) })
+}
+
+fn super_init_args(args: &[PyObjectRef]) -> Result<&[PyObjectRef], crate::PyError> {
     let (args, kwargs) = split_builtin_kwargs(args);
     if has_real_kwargs(kwargs) {
         return Err(crate::PyError::type_error(
@@ -12209,53 +12226,64 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             args.len()
         )));
     }
-    if args.len() == 1 {
-        let cls = args[0];
-        if !unsafe { pyre_object::is_type(cls) } {
+    Ok(args)
+}
+
+/// `descriptor.py W_Super.descr_init`: validate before replacing self's fields.
+pub(crate) fn super_descr_init(
+    w_self: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<(), crate::PyError> {
+    let args = super_init_args(args)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_self);
+    let (w_starttype, w_obj_or_type) = if !args.is_empty() {
+        let w_starttype = args[0];
+        if !unsafe { pyre_object::is_type(w_starttype) } {
             return Err(crate::PyError::type_error(format!(
                 "super() argument 1 must be a type, not {}",
-                crate::baseobjspace::object_functionstr_type_name(cls)
+                crate::baseobjspace::object_functionstr_type_name(w_starttype)
             )));
         }
-        return Ok(pyre_object::descriptor::w_super_new(
-            cls,
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
-        ));
-    }
-    if args.len() == 2 {
-        let cls = args[0];
-        let obj = args[1];
-        if !unsafe { pyre_object::is_type(cls) } {
-            return Err(crate::PyError::type_error(format!(
-                "super() argument 1 must be a type, not {}",
-                crate::baseobjspace::object_functionstr_type_name(cls)
-            )));
+        (w_starttype, args.get(1).copied().unwrap_or(PY_NULL))
+    } else {
+        // `_super_from_frame` reads the live EC chain, including inlined frames.
+        let execution_context =
+            crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+        if execution_context.is_null() {
+            return Err(crate::PyError::runtime_error("super(): no current frame"));
         }
-        // descriptor.py:28-30 — `None` for the second argument builds the
-        // *unbound* super object (`super_init_impl`'s `if (obj == Py_None)
-        // obj = NULL`), so `_super_check` never runs on it.
-        if unsafe { pyre_object::is_none(obj) } {
-            return Ok(pyre_object::descriptor::w_super_new(
-                cls,
-                pyre_object::PY_NULL,
-                pyre_object::PY_NULL,
-            ));
+        let frame_ptr = unsafe { (*execution_context).gettopframe() };
+        if frame_ptr.is_null() {
+            return Err(crate::PyError::runtime_error("super(): no current frame"));
         }
-        let obj_type = super_check(cls, obj)?;
-        return Ok(pyre_object::descriptor::w_super_new(cls, obj_type, obj));
+        let (self_is_cell, class_slot) =
+            bare_super_frame_layout_words(unsafe { (*frame_ptr).code() });
+        super_operands_from_frame_layout(frame_ptr, self_is_cell, class_slot)?
+    };
+    let w_obj_or_type = if w_obj_or_type.is_null() || unsafe { pyre_object::is_none(w_obj_or_type) }
+    {
+        PY_NULL
+    } else {
+        w_obj_or_type
+    };
+    let _ = pyre_object::gc_roots::pin_root(w_starttype);
+    let _ = pyre_object::gc_roots::pin_root(w_obj_or_type);
+    let w_type = if w_obj_or_type.is_null() {
+        PY_NULL
+    } else {
+        super_check(w_starttype, w_obj_or_type)?
+    };
+    unsafe {
+        pyre_object::descriptor::w_super_set_fields(
+            pyre_object::gc_roots::shadow_stack_get(save_point),
+            pyre_object::gc_roots::shadow_stack_get(save_point + 1),
+            w_type,
+            pyre_object::gc_roots::shadow_stack_get(save_point + 2),
+        );
     }
-    // descriptor.py / `_super_from_frame`: zero-arg super() reads
-    // `space.getexecutioncontext().gettopframe()`.  This must come from the
-    // per-frame EC chain, not pyre's portal-level CURRENT_FRAME TLS anchor: an
-    // inlined callee has its own red frame/vref at `topframeref`, while the TLS
-    // slot can still name the outer portal frame.
-    let execution_context = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
-    if execution_context.is_null() {
-        return Err(crate::PyError::runtime_error("super(): no current frame"));
-    }
-    let frame_ptr = unsafe { (*execution_context).gettopframe() };
-    builtin_super_from_frame(frame_ptr)
+    Ok(())
 }
 
 /// `descriptor.py:_super_from_frame(space, frame)` — the frame-explicit half
@@ -12289,10 +12317,7 @@ pub fn builtin_super_from_frame_layout(
     class_slot: isize,
 ) -> Result<PyObjectRef, crate::PyError> {
     let (w_class, w_self) = super_operands_from_frame_layout(frame_ptr, self_is_cell, class_slot)?;
-    let obj_type = super_check(w_class, w_self)?;
-    Ok(pyre_object::descriptor::w_super_new(
-        w_class, obj_type, w_self,
-    ))
+    builtin_super(&[w_class, w_self])
 }
 
 /// Where zero-argument `super()` finds its two operands in `code`'s slots.
@@ -12459,9 +12484,14 @@ pub(crate) fn super_check(
     if let Some(obj_type) = super_check_python_free(start_type, obj_or_type) {
         return Ok(obj_type);
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let save_point = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(start_type);
+    let _ = pyre_object::gc_roots::pin_root(obj_or_type);
     unsafe {
         match crate::baseobjspace::getattr_str(obj_or_type, "__class__") {
             Ok(apparent_type) => {
+                let start_type = pyre_object::gc_roots::shadow_stack_get(save_point);
                 if pyre_object::is_type(apparent_type)
                     && crate::baseobjspace::issubtype_w(apparent_type, start_type)
                 {
@@ -12475,6 +12505,8 @@ pub(crate) fn super_check(
             Err(e) => return Err(e),
         }
     }
+    let start_type = unsafe { pyre_object::gc_roots::shadow_stack_get(save_point) };
+    let obj_or_type = unsafe { pyre_object::gc_roots::shadow_stack_get(save_point + 1) };
     // typeobject.c super_init: a type obj names its own class ("type str"),
     // otherwise the message names the instance's class ("instance of str").
     let obj_desc = if unsafe { pyre_object::is_type(obj_or_type) } {
