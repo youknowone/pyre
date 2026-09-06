@@ -8259,9 +8259,9 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
         large_threshold: 4096,
         plain_tids: [53].into_iter().collect(),
     });
-    let (bytes, _, homes, _) = codegen::build_wasm_module(&inputs).unwrap();
+    let (bytes, _, data) = codegen::build_wasm_module(&inputs).unwrap();
     assert_eq!(
-        homes, 2,
+        data.num_ref_homes, 2,
         "the first two objects cross a subsequent allocation"
     );
     validate_wasm(&bytes);
