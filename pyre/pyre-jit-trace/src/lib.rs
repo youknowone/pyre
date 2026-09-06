@@ -124,6 +124,8 @@ mod allocation_counter {
 
 pub mod assembler;
 pub mod callbacks;
+#[cfg(test)]
+mod codegen_cache;
 pub mod ctor_continuation;
 pub mod descr;
 pub mod driver;
