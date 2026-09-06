@@ -1391,6 +1391,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::pos",
         crate::opcode_ops::jit_descroperation_pos,
     );
+    // Same binding for the BINARY/COMPARE codewriter `inline_call_ir_r`
+    // graphs: the walker descends `binary_value_from_tag` /
+    // `compare_value_from_tag`, and guard-failure blackholing calls the
+    // matching one-word C-ABI wrapper.
+    cp3(
+        &mut entries,
+        "pyre_interpreter::opcode_ops::binary_value_from_tag",
+        crate::opcode_ops::jit_binary_value_from_tag,
+    );
+    cp3(
+        &mut entries,
+        "pyre_interpreter::opcode_ops::compare_value_from_tag",
+        crate::opcode_ops::jit_compare_value_from_tag,
+    );
     cpa2(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_getitem",
@@ -5121,7 +5135,7 @@ mod tests {
     }
 
     #[test]
-    fn jit_trace_fnaddrs_covers_codewriter_unary_graphs_with_word_abi_bridges() {
+    fn jit_trace_fnaddrs_covers_codewriter_inline_call_graphs_with_word_abi_bridges() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         for (path, expected) in [
             (
@@ -5135,6 +5149,14 @@ mod tests {
             (
                 "pyre_interpreter::objspace::descroperation::pos",
                 crate::opcode_ops::jit_descroperation_pos as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::opcode_ops::binary_value_from_tag",
+                crate::opcode_ops::jit_binary_value_from_tag as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::opcode_ops::compare_value_from_tag",
+                crate::opcode_ops::jit_compare_value_from_tag as *const () as usize as i64,
             ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");

@@ -3394,6 +3394,59 @@ mod tests {
     }
 
     #[test]
+    fn assemble_inline_call_ir_r_accepts_constint_in_ilist() {
+        // `jtransform.py handle_regular_call` + `assembler.py write_insn`
+        // ListOfKind: a Constant in the I-list is `emit_const`, encoded as
+        // `count_regs['int'] + pool_idx`.  BINARY/COMPARE flatten emit
+        // `ListI([ConstInt(tag)])`; the frozen-regalloc path must not
+        // treat that tag as a real int register (`touch_reg`).
+        let target = Arc::new(JitCodeBuilder::default().finish());
+        let mut ssarepr = SSARepr::new("inline_call_ir_r");
+        ssarepr.insns.push(Insn::op_with_result(
+            "inline_call_ir_r",
+            vec![
+                Operand::descr(DescrOperand::JitCode(Arc::clone(&target))),
+                Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(2)])),
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Ref,
+                    vec![
+                        Operand::Register(Register::new(Kind::Ref, 0)),
+                        Operand::Register(Register::new(Kind::Ref, 1)),
+                    ],
+                )),
+            ],
+            Register::new(Kind::Ref, 2),
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 1,
+                ref_: 3,
+                ..NumRegs::default()
+            }),
+        );
+
+        // I-list item is the first int-pool slot: num_regs_i(1) + 0.
+        assert_eq!(
+            jitcode.code,
+            vec![
+                majit_translate::insns::BC_INLINE_CALL_IR_R,
+                0,
+                0,
+                1,
+                1,
+                2,
+                0,
+                1,
+                2,
+            ]
+        );
+        assert_eq!(jitcode.constants_i.as_slice(), &[2]);
+    }
+
+    #[test]
     fn residual_call_r_v_preserves_word_returning_and_genuine_void_abis() {
         let mut word_builder = JitCodeBuilder::default();
         let word_fn_idx = word_builder.add_fn_ptr(0x7777usize as *const ());

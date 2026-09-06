@@ -3613,10 +3613,15 @@ impl JitCodeBuilder {
         }
         self.push_u8(args.len() as u8);
         for &src in args {
+            // `assembler.py write_insn` ListOfKind items: `emit_reg` for a
+            // Register, `emit_const` for a Constant.  pyre fuses those at
+            // this surface — `expect_list_regs_or_pool` numbers a ConstInt
+            // `num_regs_i + pool_idx`, which is outside the frozen real
+            // register window `touch_reg` accepts.
             match kind {
-                JitArgKind::Int => self.touch_reg(src),
-                JitArgKind::Ref => self.touch_ref_reg(src),
-                JitArgKind::Float => self.touch_float_reg(src),
+                JitArgKind::Int => self.touch_int_reg_or_pool_slot(src),
+                JitArgKind::Ref => self.touch_ref_reg_or_pool_slot(src),
+                JitArgKind::Float => self.touch_float_reg_or_pool_slot(src),
             }
             self.push_reg_u8(src, "canonical inline_call argument");
         }
