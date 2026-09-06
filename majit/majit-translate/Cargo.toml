@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Rust port of RPython's translation pipeline (flowspace → annotator → rtyper → translator → jit/codewriter)"
 
 [dependencies]
+bincode = "1.3"
 parking_lot = { workspace = true }
 syn = { workspace = true, features = ["parsing"] }
 quote = { workspace = true }

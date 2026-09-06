@@ -25,14 +25,7 @@ use majit_ir::DescrRef;
 use majit_translate::CompiledJitDriver;
 use majit_translate::jitcode::{BhDescr, DescrTable, JitCode};
 
-struct JitCodeIndex {
-    names: Vec<String>,
-    /// The `CallPath` each jitcode was allocated under, `::`-joined by
-    /// `CallPath::canonical_key`, index-aligned with `names`. Empty for a
-    /// jitcode the codewriter minted without a graph key.
-    paths: Vec<String>,
-    offsets: Vec<u32>,
-}
+use majit_translate::artifacts::JitCodeIndex;
 
 /// Runtime-frozen canonical JitCode.
 ///
@@ -84,36 +77,7 @@ static INDIRECTCALLTARGETS: LazyLock<Box<[Arc<majit_metainterp::jitcode::JitCode
 fn load_jitcode_index() -> JitCodeIndex {
     const INDEX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes_index.bin"));
     const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes.bin"));
-    let (names, paths, offsets): (Vec<String>, Vec<String>, Vec<u32>) =
-        bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
-            panic!(
-                "pyre-jit-trace: failed to deserialize jitcodes_index.bin \
-                 ({} bytes): {e}",
-                INDEX_BYTES.len(),
-            )
-        });
-    assert_eq!(
-        offsets.len(),
-        names.len() + 1,
-        "pyre-jit-trace: jitcode index has {} names but {} offsets",
-        names.len(),
-        offsets.len(),
-    );
-    assert_eq!(
-        paths.len(),
-        names.len(),
-        "pyre-jit-trace: jitcode index has {} names but {} graph keys",
-        names.len(),
-        paths.len(),
-    );
-    assert_eq!(offsets.first().copied(), Some(0));
-    assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
-    assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
-    JitCodeIndex {
-        names,
-        paths,
-        offsets,
-    }
+    JitCodeIndex::decode(INDEX_BYTES, BODY_BYTES).expect("pyre JitCode index")
 }
 
 fn jitcode_index() -> &'static JitCodeIndex {
@@ -126,15 +90,8 @@ pub fn jitcode_count() -> usize {
 
 fn load_jitcode(index: usize) -> Arc<JitCode> {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jitcodes.bin"));
-    let offsets = &jitcode_index().offsets;
-    let start = offsets[index] as usize;
-    let end = offsets[index + 1] as usize;
-    let mut jitcode: Arc<JitCode> = bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
-        panic!(
-            "pyre-jit-trace: failed to deserialize jitcodes.bin entry {index} \
-             ({start}..{end} of {} bytes): {e}",
-            BYTES.len()
-        )
+    let mut jitcode = jitcode_index().load(BYTES, index).unwrap_or_else(|e| {
+        panic!("pyre-jit-trace: failed to deserialize jitcodes.bin entry {index}: {e}")
     });
     // RPython's translator AOT-compiles every helper into the same binary so
     // `JitCode.fnaddr` / `constants_i` funcptrs are linker-resolved.  Pyre's

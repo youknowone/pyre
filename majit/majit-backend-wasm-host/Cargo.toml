@@ -1,0 +1,11 @@
+[package]
+name = "majit-backend-wasm-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared native Wasmtime execution host for majit wasm traces"
+
+[dependencies]
+wasmtime = { workspace = true }
+majit-backend-wasm = { version = "0.0.2", path = "../majit-backend-wasm", default-features = false }

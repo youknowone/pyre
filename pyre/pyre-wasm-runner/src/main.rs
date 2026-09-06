@@ -8,7 +8,7 @@
 //!     `majit_host.{jit_compile_wasm, jit_execute_wasm, jit_free_wasm}` and
 //!     exports `memory`, `__indirect_function_table`, `pyre_alloc`,
 //!     `pyre_dealloc`, and `pyre_run_python`;
-//!   * each JIT-emitted trace module imports `env.memory` (shared with the
+//!   * each JIT-emitted trace module imports `env.jit.memory` (shared with the
 //!     main module) plus an optional `env.jit_call` trampoline, and exports a
 //!     `trace` function `(i32) -> i32`;
 //!   * the trampoline reads func_ptr / args from the frame call area, dispatches
@@ -27,15 +27,15 @@ use std::path::{Path, PathBuf};
 
 use wasmtime::error::Context;
 use wasmtime::{
-    AsContext, AsContextMut, Caller, Config, Engine, Error, Extern, Func, Instance, Linker, Memory,
-    Module, OptLevel, Ref, Result, Store, Table, Val, ValType,
+    AsContext, Caller, Config, Engine, Error, Func, Instance, Linker, Memory, Module, OptLevel,
+    Result, Store, Table,
 };
 
 use crate::host_path::{guest_path_to_host, host_path_to_guest};
 
 // Frame call-area offsets — must match `majit-backend-wasm/src/codegen.rs`.
 // Shared with `wasmi_host`, which mirrors the same call-area protocol.
-pub(crate) const CALL_RESULT_OFS: usize = 2000;
+pub(crate) const CALL_RESULT_OFS: usize = majit_backend_wasm_host::CALL_RESULT_OFS as usize;
 // The arg count also lives at offset 2016, but the trampoline derives arity
 // (and the exact value types) from the resolved function's wasm signature
 // instead, which is authoritative on wasm32. Kept for layout documentation.
@@ -68,21 +68,7 @@ impl WasmEngine {
 /// Per-store host state shared by all import callbacks.
 #[derive(Default)]
 struct Host {
-    /// The main module's exported linear memory, shared with every trace.
-    memory: Option<Memory>,
-    /// The main module's `__indirect_function_table`, used by the trampoline.
-    table: Option<Table>,
-    /// First `__indirect_function_table` slot that is a JIT trace. The main
-    /// module's table is pre-populated with its own functions (`[0,
-    /// trace_base)`); `jit_compile` only ever appends (`table.grow`), so every
-    /// slot `>= trace_base` is a trace. That, plus the table itself (a freed
-    /// trace's slot is reset to `Func(None)`), is the sole record of trace
-    /// liveness — no id→trace map is kept, since the slot IS the id and the
-    /// table is the single source of truth: `jit_execute` accepts an `id >=
-    /// trace_base` whose slot is still a function, and `jit_free` clears only
-    /// such slots (nulling a runtime slot would corrupt dispatch). The table
-    /// also roots each trace's instance for the `Store`'s lifetime.
-    trace_base: u64,
+    jit: majit_backend_wasm_host::TraceState,
     /// Real stdlib root the wasm module's `pyre_host.*` imports read source
     /// from (`$PYRE_STDLIB`, forwarded by `pyre/check.py`). The wasm side
     /// seeds it on `sys.path`, so the host serves genuine absolute paths.
@@ -142,13 +128,15 @@ struct Host {
     /// Epoch samples whose innermost frame was anywhere else — the interpreter
     /// itself, and any sample taken with no wasm frame on the stack.
     trace_samples_elsewhere: u64,
-    /// Trace slots whose compile exported a `trace_wide`, and whose `slot + 1`
-    /// is therefore a published call target. The reserved spare slot holds the
-    /// narrow function when a compile had no wide entry, so the table alone
-    /// cannot tell the two apart; a replacement that would drop the wide entry
-    /// is rejected against this set rather than leaving `slot + 1` pointing at
-    /// the replaced compile.
-    wide_slots: std::collections::HashSet<u32>,
+}
+
+impl majit_backend_wasm_host::HostState for Host {
+    fn traces(&self) -> &majit_backend_wasm_host::TraceState {
+        &self.jit
+    }
+    fn traces_mut(&mut self) -> &mut majit_backend_wasm_host::TraceState {
+        &mut self.jit
+    }
 }
 
 /// Report `PYRE_*` / `MAJIT_*` settings the guest cannot see.
@@ -467,9 +455,9 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // return, i.e. the first JIT-trace id; everything below it is a main-module
     // function that must never be dispatched as, or freed like, a trace.
     let trace_base = table.size(&store);
-    store.data_mut().memory = Some(memory);
-    store.data_mut().table = Some(table);
-    store.data_mut().trace_base = trace_base;
+    store.data_mut().jit.memory = Some(memory);
+    store.data_mut().jit.table = Some(table);
+    store.data_mut().jit.trace_base = trace_base;
 
     let alloc = instance.get_typed_func::<u32, u32>(&mut store, "pyre_alloc")?;
     let run_python = instance.get_typed_func::<(u32, u32), u64>(&mut store, "pyre_run_python")?;
@@ -1881,23 +1869,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
         "majit_host",
         "jit_free_wasm",
         |mut caller: Caller<'_, Host>, func_id: u32| {
-            // Only a trace slot may be cleared; nulling a main-module slot
-            // (`id < trace_base`) would corrupt the shared dispatch table.
-            if (func_id as u64) >= caller.data().trace_base {
-                // Release the table's hold on the trace function; the slots
-                // themselves stay (wasm tables cannot shrink).  `jit_compile`
-                // appends the entry as a pair, so `func_id + 1` holds this
-                // same trace — the wide entry where one was published, the
-                // spare copy of the narrow function otherwise.  Clearing only
-                // the first half leaves the freed trace reachable through
-                // `call_indirect func_id + 1` and rooted for the store's
-                // lifetime, so both halves and the wide record go together.
-                caller.data_mut().wide_slots.remove(&func_id);
-                if let Some(table) = caller.data().table {
-                    let _ = table.set(&mut caller, func_id as u64, Ref::Func(None));
-                    let _ = table.set(&mut caller, func_id as u64 + 1, Ref::Func(None));
-                }
-            }
+            let _ = majit_backend_wasm_host::free(&mut caller, func_id);
         },
     )?;
 
@@ -2011,7 +1983,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
 /// wasm32-unknown-unknown has no OS entropy of its own, so `os.urandom`,
 /// `secrets` and the string hash key all end up here.
 fn host_random(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -> i32 {
-    let Some(memory) = caller.data().memory else {
+    let Some(memory) = caller.data().jit.memory else {
         return -1;
     };
     let mut bytes = vec![0u8; buf_cap as usize];
@@ -2027,7 +1999,7 @@ fn host_random(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -> i32
 /// `pyre_host.host_cwd`: write the runner's working directory into the guest
 /// buffer, reporting its length whether or not it fitted.
 fn host_cwd(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -> i64 {
-    let Some(memory) = caller.data().memory else {
+    let Some(memory) = caller.data().jit.memory else {
         return -1;
     };
     let Ok(cwd) = std::env::current_dir() else {
@@ -2088,7 +2060,7 @@ fn host_path(
     path_ptr: u32,
     path_len: u32,
 ) -> Option<std::ffi::OsString> {
-    let memory = caller.data().memory?;
+    let memory = caller.data().jit.memory?;
     let mut bytes = vec![0u8; path_len as usize];
     memory.read(&*caller, path_ptr as usize, &mut bytes).ok()?;
     guest_path_to_host(bytes)
@@ -2106,7 +2078,7 @@ fn host_stdlib_root(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -
         // Report the needed length without writing; the caller can retry.
         return bytes.len() as i64;
     }
-    let Some(memory) = caller.data().memory else {
+    let Some(memory) = caller.data().jit.memory else {
         return -1;
     };
     if memory
@@ -2134,7 +2106,7 @@ fn host_read(
         Err(_) => return -1,
     };
     let n = data.len().min(buf_cap as usize);
-    let Some(memory) = caller.data().memory else {
+    let Some(memory) = caller.data().jit.memory else {
         return -1;
     };
     if memory
@@ -2183,7 +2155,7 @@ fn host_list_dir(
     if packed.len() > buf_cap as usize {
         return packed.len() as i64;
     }
-    let Some(memory) = caller.data().memory else {
+    let Some(memory) = caller.data().jit.memory else {
         return -1;
     };
     if memory
@@ -2206,9 +2178,14 @@ fn jit_compile_trace(
     caller.data_mut().jit_compile_count += 1;
     let memory = caller
         .data()
+        .jit
         .memory
         .context("main memory not initialized")?;
-    let table = caller.data().table.context("main table not initialized")?;
+    let table = caller
+        .data()
+        .jit
+        .table
+        .context("main table not initialized")?;
 
     let mut bytes = vec![0u8; bytes_len as usize];
     memory
@@ -2249,49 +2226,10 @@ fn jit_compile_trace(
         }
     };
 
-    // A fresh trampoline per trace; it reads all state from `caller.data()`.
-    let jit_call = Func::wrap(
-        &mut *caller,
-        |mut inner: Caller<'_, Host>, frame_ptr: i32| {
-            if let Err(e) = jit_call_trampoline(
-                &mut inner,
-                frame_ptr as u32,
-                CALL_RESULT_OFS as u32,
-                "trace",
-            ) {
-                eprintln!("[jit_call] {e:?}");
-            }
-        },
-    );
-    let jit_call_compact = Func::wrap(
-        &mut *caller,
-        |mut inner: Caller<'_, Host>, frame_ptr: i32, call_area_ofs: i32| {
-            if let Err(e) =
-                jit_call_trampoline(&mut inner, frame_ptr as u32, call_area_ofs as u32, "trace")
-            {
-                eprintln!("[jit_call_compact] {e:?}");
-            }
-        },
-    );
-
-    // Supply imports in the module's declared order.
-    let mut externs: Vec<Extern> = Vec::new();
-    for import in module.imports() {
-        match (import.module(), import.name()) {
-            ("env", "memory") => externs.push(Extern::Memory(memory)),
-            ("env", "jit_call") => externs.push(Extern::Func(jit_call)),
-            ("env", "jit_call_compact") => externs.push(Extern::Func(jit_call_compact)),
-            ("env", "__indirect_function_table") => externs.push(Extern::Table(table)),
-            (m, n) => {
-                return Err(Error::msg(format!(
-                    "trace module has unexpected import {m}.{n}"
-                )));
-            }
-        }
-    }
-
-    let instance =
-        Instance::new(&mut *caller, &module, &externs).context("instantiate trace module")?;
+    let (trace, trace_wide, instance) =
+        majit_backend_wasm_host::instantiate(caller, &module, |caller, frame, offset| {
+            jit_call_trampoline(caller, frame, offset, "trace")
+        })?;
     if std::env::var_os("PYRE_WASM_DUMP_ALL_TRACES").is_some() {
         let trace_id = instance
             .get_global(&mut *caller, "trace_entry_census_id")
@@ -2306,39 +2244,16 @@ fn jit_compile_trace(
             Err(pe) => eprintln!("[jit_compile_wasm] wat print failed: {pe}"),
         }
     }
-    let trace = instance
-        .get_func(&mut *caller, "trace")
-        .context("trace module is missing its `trace` export")?;
-    let trace_wide = instance.get_func(&mut *caller, "trace_wide");
-
     Ok((table, trace, trace_wide, module))
 }
-
 /// Compile and instantiate a trace, then append its export to the trace table.
 fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
-    let (table, trace, trace_wide, module) =
+    let (_table, trace, trace_wide, module) =
         jit_compile_trace(caller, bytes_ptr, bytes_len, "compile")?;
-    // Register the trace into the shared indirect function table so it is
-    // reachable by table index. `grow` returns the newly appended slot.
-    //
-    // The pair is appended even for a narrow module. An emitted module names
-    // its wide entry `handle + 1`, and `jit_replace` may install a wide entry
-    // where this compile had none; without the reservation that write would
-    // land on the next trace's own entry. The spare slot holds the narrow
-    // function, which nothing calls: absence is encoded as `wide_slot == 0`.
-    let slot = table
-        .grow(&mut *caller, 2, Ref::Func(Some(trace)))
-        .context("register trace into shared table")? as u32;
-    if let Some(wide) = trace_wide {
-        table
-            .set(&mut *caller, slot as u64 + 1, Ref::Func(Some(wide)))
-            .context("register wide trace entry into shared table")?;
-        caller.data_mut().wide_slots.insert(slot);
-    }
+    let slot = majit_backend_wasm_host::publish(caller, trace, trace_wide)?;
     record_trace_module(caller, module, slot);
     Ok(slot)
 }
-
 /// Name a freshly installed trace module by its table slot, so an epoch sample
 /// taken inside it can say which trace it was in. Only the profiling mode keeps
 /// the list; every other run leaves it empty and pays nothing.
@@ -2358,76 +2273,22 @@ fn jit_replace(
     bytes_ptr: u32,
     bytes_len: u32,
 ) -> Result<u32> {
-    if (func_id as u64) < caller.data().trace_base {
-        return Err(Error::msg(format!(
-            "jit_replace_wasm: id {func_id} is not a trace slot"
-        )));
+    if (func_id as u64) < caller.data().jit.trace_base {
+        return Err(Error::msg("cannot replace a guest function"));
     }
-    let (table, trace, trace_wide, module) =
+    let (_table, trace, trace_wide, module) =
         jit_compile_trace(caller, bytes_ptr, bytes_len, "replace")?;
-    if !matches!(
-        table.get(&mut *caller, func_id as u64),
-        Some(Ref::Func(Some(_)))
-    ) {
-        return Err(Error::msg(format!(
-            "jit_replace_wasm: id {func_id} is not a live trace"
-        )));
-    }
-    // Modules emitted while this slot was wide carry `call_indirect func_id +
-    // 1` baked in. A narrow replacement cannot retract those, so accepting one
-    // would leave the pair straddling two compiles: `func_id` on the new trace
-    // and `func_id + 1` still on the old. Reject the shape change before
-    // either table is touched; a narrow-to-wide replacement stays allowed.
-    if trace_wide.is_none() && caller.data().wide_slots.contains(&func_id) {
-        return Err(Error::msg(format!(
-            "jit_replace_wasm: id {func_id} has a published wide entry the replacement does not"
-        )));
-    }
-    // The Store retains every instantiated module. Replacing this table entry
-    // therefore leaves an old trace live when a non-tail indirect call still
-    // has one of its frames on the guest stack.
-    table
-        .set(&mut *caller, func_id as u64, Ref::Func(Some(trace)))
-        .context("replace trace in shared table")?;
-    if let Some(wide) = trace_wide {
-        table
-            .set(&mut *caller, func_id as u64 + 1, Ref::Func(Some(wide)))
-            .context("replace wide trace entry in shared table")?;
-        caller.data_mut().wide_slots.insert(func_id);
-    }
-    record_trace_module(caller, module, func_id);
-    Ok(func_id)
+    let slot = majit_backend_wasm_host::replace(caller, func_id, trace, trace_wide)?;
+    record_trace_module(caller, module, slot);
+    Ok(slot)
 }
-
 /// Run a previously compiled trace, returning its guard-exit index.
 fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> Result<u32> {
     caller.data_mut().jit_execute_count += 1;
-    if (func_id as u64) < caller.data().trace_base {
-        return Err(Error::msg(format!(
-            "jit_execute_wasm: id {func_id} is not a trace slot"
-        )));
-    }
-    let table = caller.data().table.context("main table not initialized")?;
-    // The id IS the table slot; dispatch through the shared table by index —
-    // the same lookup an in-module `call_indirect` would perform. A freed trace
-    // (slot reset to `Func(None)`) or out-of-range id misses here.
-    let trace = match table.get(&mut *caller, func_id as u64) {
-        Some(Ref::Func(Some(f))) => f,
-        _ => {
-            return Err(Error::msg(format!(
-                "jit_execute_wasm: id {func_id} is not a live trace (unknown or freed)"
-            )));
-        }
-    };
-    let mut results = [Val::I32(0)];
-    trace.call(&mut *caller, &[Val::I32(frame_ptr as i32)], &mut results)?;
-    let ret = match results[0] {
-        Val::I32(x) => x as u32,
-        _ => 0,
-    };
+    let ret = majit_backend_wasm_host::execute(caller, func_id, frame_ptr)?;
     // Diagnostic: record which (trace, guard-exit fail_index) round-tripped.
     if std::env::var_os("PYRE_WASM_EXEC_TRACE").is_some()
-        && let Some(mem) = caller.data().memory
+        && let Some(mem) = caller.data().jit.memory
     {
         let fail_index = read_u32(&mem, &*caller, frame_ptr as usize);
         *caller
@@ -2438,7 +2299,6 @@ fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> R
     }
     Ok(ret)
 }
-
 /// Name a call-area FUNC field that indexes no live function, once per value.
 ///
 /// The zero sentinel above is the only slot that legitimately has no function
@@ -2628,82 +2488,19 @@ fn jit_call_trampoline_inner(
     source: &'static str,
 ) -> Result<()> {
     caller.data_mut().jit_call_count += 1;
-    let memory = caller.data().memory.context("memory")?;
-    let table = caller.data().table.context("table")?;
-    let call_area = frame_ptr as usize + call_area_ofs as usize;
-
-    let func_ptr = read_u32(&memory, &*caller, call_area + 8);
-    if probe_call_hist_enabled() {
-        let mut g = PROBE_CALL_HIST.lock();
-        *g.get_or_insert_with(Default::default)
-            .entry((source, func_ptr))
-            .or_insert(0) += 1;
-    }
-
-    // `func_ptr == 0` is the "newstr" sentinel; without a host string
-    // allocator (matching the browser glue's null table slot) it yields 0.
-    if func_ptr == 0 {
-        write_i64(&memory, &mut *caller, call_area, 0)?;
-        return Ok(());
-    }
-
-    let func = match table.get(&mut *caller, func_ptr as u64) {
-        Some(Ref::Func(Some(f))) => f,
-        _ => {
-            report_dead_call_slot(func_ptr);
-            write_i64(&memory, &mut *caller, call_area, 0)?;
-            return Ok(());
+    majit_backend_wasm_host::residual_call(caller, frame_ptr, call_area_ofs, |slot, live| {
+        if probe_call_hist_enabled() {
+            *PROBE_CALL_HIST
+                .lock()
+                .get_or_insert_with(Default::default)
+                .entry((source, slot))
+                .or_insert(0) += 1;
         }
-    };
-
-    let ty = func.ty(&*caller);
-    let params: Vec<ValType> = ty.params().collect();
-    let mut args: Vec<Val> = Vec::with_capacity(params.len());
-    for (i, pty) in params.iter().enumerate() {
-        let raw = read_i64(&memory, &*caller, call_area + 24 + i * 8);
-        args.push(match pty {
-            ValType::I32 => Val::I32(raw as i32),
-            ValType::I64 => Val::I64(raw),
-            // Floats cross the call area as their raw bit pattern in an i64 slot.
-            ValType::F32 => Val::F32(raw as u32),
-            ValType::F64 => Val::F64(raw as u64),
-            other => {
-                return Err(Error::msg(format!(
-                    "unsupported residual-call param type {other:?}"
-                )));
-            }
-        });
-    }
-
-    let mut results: Vec<Val> = ty
-        .results()
-        .map(|t| match t {
-            ValType::I64 => Val::I64(0),
-            ValType::F32 => Val::F32(0),
-            ValType::F64 => Val::F64(0),
-            _ => Val::I32(0),
-        })
-        .collect();
-
-    // Mirror the browser glue's try/catch: a trapping residual target is
-    // reported as a zero result rather than aborting the whole run.
-    if let Err(e) = func.call(&mut *caller, &args, &mut results) {
-        eprintln!("[jit_call] residual target trapped: {e:?}");
-        write_i64(&memory, &mut *caller, call_area, 0)?;
-        return Ok(());
-    }
-
-    let result = match results.first() {
-        Some(Val::I32(x)) => (*x as u32) as i64, // zero-extend; high word stays 0
-        Some(Val::I64(x)) => *x,
-        Some(Val::F64(x)) => *x as i64,
-        Some(Val::F32(x)) => (*x as u64) as i64,
-        _ => 0,
-    };
-    write_i64(&memory, &mut *caller, call_area, result)?;
-    Ok(())
+        if !live && slot != 0 {
+            report_dead_call_slot(slot);
+        }
+    })
 }
-
 /// Drain the guest's fd-2 buffer through `pyre_take_stderr`.
 ///
 /// The guest has no descriptors, so everything it writes to fd 2 accumulates in
@@ -2771,17 +2568,6 @@ fn read_u32(mem: &Memory, store: impl AsContext, off: usize) -> u32 {
     let mut b = [0u8; 4];
     let _ = mem.read(store, off, &mut b);
     u32::from_le_bytes(b)
-}
-
-fn read_i64(mem: &Memory, store: impl AsContext, off: usize) -> i64 {
-    let mut b = [0u8; 8];
-    let _ = mem.read(store, off, &mut b);
-    i64::from_le_bytes(b)
-}
-
-fn write_i64(mem: &Memory, mut store: impl AsContextMut, off: usize, v: i64) -> Result<()> {
-    mem.write(&mut store, off, &v.to_le_bytes())
-        .context("write call-area result")
 }
 
 /// Dump the module's imports and exports, for debugging the host contract.

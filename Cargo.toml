@@ -17,6 +17,7 @@ members = [
     "majit/majit-backend-cranelift",
     "majit/majit-backend-dynasm",
     "majit/majit-backend-wasm",
+    "majit/majit-backend-wasm-host",
     "majit/majit-gc",
     "majit/majit-macros",
     "majit/majit-metainterp",
@@ -105,6 +106,7 @@ majit-backend = { version = "0.0.2", path = "majit/majit-backend" }
 majit-backend-cranelift = { version = "0.0.2", path = "majit/majit-backend-cranelift" }
 majit-backend-dynasm = { version = "0.0.2", path = "majit/majit-backend-dynasm" }
 majit-backend-wasm = { version = "0.0.2", path = "majit/majit-backend-wasm" }
+majit-backend-wasm-host = { version = "0.0.2", path = "majit/majit-backend-wasm-host" }
 majit-gc = { version = "0.0.2", path = "majit/majit-gc" }
 majit-macros = { version = "0.0.2", path = "majit/majit-macros" }
 majit-rlib = { version = "0.0.2", path = "majit/majit-rlib" }

@@ -64,6 +64,14 @@ unsafe impl Send for EmbeddedJitCodeTable {}
 unsafe impl Sync for EmbeddedJitCodeTable {}
 
 impl EmbeddedJitCodeTable {
+    /// Codewriter support functions shared by every embedded interpreter.
+    /// `support.py _ll_2_int_floordiv/_ll_2_int_mod` use truncating word arithmetic.
+    pub fn builtin_fnaddrs() -> [(&'static str, i64); 2] {
+        let div = crate::blackhole::_ll_2_int_floordiv as *const () as usize as i64;
+        let rem = crate::blackhole::_ll_2_int_mod as *const () as usize as i64;
+        [("_ll_2_int_floordiv", div), ("_ll_2_int_mod", rem)]
+    }
+
     /// Restore an embedded image's complete effect-descriptor population.
     ///
     /// `pyjitpl.py::finish_setup_descrs` uses all of GcCache, not merely the
@@ -134,11 +142,13 @@ impl EmbeddedJitCodeTable {
         symbolic_paths: &[(i64, String)],
         runtime_bindings: &[(&str, i64)],
     ) -> &'static Self {
+        let builtins = Self::builtin_fnaddrs();
         let replacements: Vec<(i64, i64)> = symbolic_paths
             .iter()
             .filter_map(|(symbolic, path)| {
                 runtime_bindings
                     .iter()
+                    .chain(builtins.iter())
                     .find(|(binding_path, _)| *binding_path == path)
                     .map(|(_, runtime)| *runtime)
                     .map(|runtime| (*symbolic, runtime))
@@ -493,5 +503,34 @@ mod tests {
         assert_eq!(loaded.fnaddr, runtime);
         assert_eq!(loaded.body().constants_i, vec![runtime, 11]);
         assert!(Arc::ptr_eq(loaded, table.descrs()[0].as_jitcode().unwrap()));
+    }
+
+    #[test]
+    fn support_bindings_are_automatic_but_allow_runtime_override() {
+        for (path, address) in EmbeddedJitCodeTable::builtin_fnaddrs() {
+            for override_address in [None, Some(0x1234_i64)] {
+                let symbolic = -97;
+                let mut code = CanonicalJitCode::new("support");
+                code.fnaddr = symbolic;
+                code.set_index(0);
+                code.set_body(majit_translate::jitcode::JitCodeBody {
+                    constants_i: vec![symbolic],
+                    ..Default::default()
+                });
+                let bindings: Vec<_> = override_address.map(|a| (path, a)).into_iter().collect();
+                let table = EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs(
+                    &[Arc::new(code)],
+                    Vec::new(),
+                    &[(symbolic, path.into())],
+                    &bindings,
+                );
+                let loaded = table.by_index(0).unwrap();
+                assert_eq!(loaded.fnaddr, override_address.unwrap_or(address));
+                assert_eq!(
+                    loaded.body().constants_i,
+                    [override_address.unwrap_or(address)]
+                );
+            }
+        }
     }
 }
