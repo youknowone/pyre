@@ -48,7 +48,8 @@ unsafe fn pyre_libc_jitframe_tracer(obj_addr: usize, update: &mut dyn FnMut(*mut
                 update(slot_ptr as *mut majit_ir::GcRef);
             },
         );
-        // A traced Ref may be a `malloc_typed`-immortal object, whose managed
+        // jitframe.py `jitframe_trace` forwards the slots above. A traced Ref
+        // here may be a `malloc_typed`-immortal object, whose managed
         // children the visit above does not reach — the same hole the shadow
         // stack closes in `pyre_object_root_walker_area`, asked here of the
         // other channel that roots a live reference.

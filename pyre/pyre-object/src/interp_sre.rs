@@ -45,7 +45,11 @@ pub fn w_sre_pattern_new(
     let w_pattern = crate::gc_roots::pin_root(w_pattern);
     let w_groupindex = crate::gc_roots::pin_root(w_groupindex);
     let w_indexgroup = crate::gc_roots::pin_root(w_indexgroup);
-    let obj = W_SRE_Pattern::allocate(W_SRE_Pattern {
+    // interp_sre.py `SRE_Pattern__new__` leaves ownership to the app-level
+    // cache and ordinary references. The generated class descriptor traces
+    // this managed object's fields; an address-only global list would outlive
+    // a collected pattern and later trace reclaimed storage as its fields.
+    W_SRE_Pattern::allocate(W_SRE_Pattern {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -57,8 +61,7 @@ pub fn w_sre_pattern_new(
         num_groups,
         w_groupindex,
         w_indexgroup,
-    });
-    obj
+    })
 }
 
 /// # Safety
