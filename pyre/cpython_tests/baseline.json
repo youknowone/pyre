@@ -175,43 +175,43 @@
       "dynasm": "PASS"
     },
     "test.test_codeccallbacks": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecencodings_cn": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecencodings_hk": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecencodings_iso2022": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecencodings_jp": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecencodings_kr": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecencodings_tw": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecmaps_cn": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecmaps_hk": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecmaps_jp": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecmaps_kr": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecmaps_tw": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codecs": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_codeop": {
       "dynasm": "FAIL"
@@ -756,7 +756,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_multibytecodec": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_multiprocessing_fork": {
       "dynasm": "SKIP"
@@ -1262,7 +1262,7 @@
       "dynasm": "PASS"
     },
     "test.test_ucn": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_unary": {
       "cranelift": "PASS",
@@ -1279,7 +1279,7 @@
       "dynasm": "PASS"
     },
     "test.test_unicodedata": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_unittest": {
       "dynasm": "PASS"
