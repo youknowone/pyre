@@ -249,8 +249,8 @@ pub use pyjitpl::{
     CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, InlineDecision,
     JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack,
     MetaInterp, MetaInterpGlobalData, MetaInterpStaticData, PortalGreenKey, RawCompileResult,
-    StandaloneFrameStack, SymbolicFnaddrPathResolver, build_state_field_snapshot,
-    call_int_function, call_ref_function, call_void_function, counters,
+    StandaloneFrameStack, SwitchToBlackhole, SymbolicFnaddrPathResolver,
+    build_state_field_snapshot, call_int_function, call_ref_function, call_void_function, counters,
     record_application_traceback_for_recording, record_application_traceback_hook_address,
     record_discarded_level_traceback_for_recording, record_discarded_level_traceback_hook_address,
     record_inline_application_traceback_for_recording,
@@ -1293,6 +1293,10 @@ pub enum TraceAction {
     SegmentedBridge { exception_box: OpRef },
     /// Abort the current trace (recoverable — may retry later).
     Abort,
+    /// pyjitpl.py `raise SwitchToBlackhole(reason)`: carry the decision to
+    /// the cancel-tracing catch without running another interpreter step or
+    /// another trace-length check while unwinding.
+    SwitchToBlackhole(pyjitpl::SwitchToBlackhole),
     /// Decline the current trace before compilation and return to residual
     /// execution without charging a trace abort.
     Decline,

@@ -1384,6 +1384,14 @@ pub struct JitDriverStaticData {
     /// unrelated jitcodes that decode at the same pc and silently return a
     /// mistyped count. A successful decode is not evidence of the right store.
     pub frame_value_count_fn: Option<fn(i32, i32) -> usize>,
+    /// warmstate.py `WarmEnterState.get_unique_id(greenkey)`.
+    ///
+    /// `newframe` records `ENTER_PORTAL_FRAME(jd_no, unique_id)` from this
+    /// hook when a greenkey is present. The greens are the typed key's
+    /// values in declaration order — `interp_jit.py get_unique_id(next_instr,
+    /// is_being_profiled, bytecode)`. `None` leaves the portal-frame unique
+    /// id as the greenkey hash, the previous fallback.
+    pub get_unique_id: Option<fn(&[i64]) -> i64>,
 }
 
 impl JitDriverStaticData {
@@ -1465,6 +1473,7 @@ impl JitDriverStaticData {
             assembler_helper_adr: 0,
             vable_token_descr: None,
             frame_value_count_fn: None,
+            get_unique_id: None,
         };
         // warmspot.py:529/538 — keep `index_of_virtualizable` in sync
         // with the `virtualizable_arg_index()` derived from `reds`.
@@ -2771,6 +2780,19 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn is_tracing(&self) -> bool {
         self.meta.is_tracing()
+    }
+
+    /// warmstate.py `cell.flags & JC_TRACING` for this green key.
+    ///
+    /// `maybe_compile_and_run` skips only a cell that is already being
+    /// traced in an outer invocation of the same greens. A live session
+    /// on another key or another driver does not suppress this cell.
+    #[inline]
+    pub fn cell_is_tracing(&self, green_key: u64) -> bool {
+        self.meta
+            .warm_state_ref()
+            .get_cell(green_key)
+            .is_some_and(|cell| cell.is_tracing())
     }
 
     /// Single-pass tracing: take the `(walk_final_pc, walk_final_reds)`
@@ -4850,7 +4872,9 @@ impl<S: JitState> JitDriver<S> {
                 // (PyreMetaInterp::step_inline_frame pops the inline frame and
                 // records the CALL_ASSEMBLER); it never reaches the jitdriver.
                 // Defensive: treat an escaped instance as a plain Abort.
-                action @ (TraceAction::RecursiveCallAssembler { .. } | TraceAction::Abort) => {
+                action @ (TraceAction::RecursiveCallAssembler { .. }
+                | TraceAction::Abort
+                | TraceAction::SwitchToBlackhole(_)) => {
                     if self.meta.bridge_info().is_some() {
                         crate::debug::log_one("jit-abort", "Abort during bridge tracing");
                     }
@@ -4901,60 +4925,42 @@ impl<S: JitState> JitDriver<S> {
                         // by bridge symbolic init before the body walker runs.
                         self.meta.record_declined_bridge_guard(&source_descr);
                     }
-                    // `pyjitpl.py:2491` `except SwitchToBlackhole as stb:
-                    // self.aborted_tracing(stb.reason)` — the
-                    // `aborted_tracing(reason)` accounting half of RPython's
-                    // abort handling.  Dispatch-side
-                    // `finalize_standard_virtualizable_may_force` stashes
-                    // `SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)`
-                    // (`pyjitpl.py:3389-3390`) on
-                    // `TraceCtx::pending_switch_to_blackhole`; drain it
-                    // here so `stb.reason` flows into
-                    // `aborted_tracing(reason)`.  Falls back to the
-                    // `blackhole_if_trace_too_long`-derived
-                    // `AbortReason::Generic` for the
-                    // `SwitchToBlackhole(ABORT_TOO_LONG)`
-                    // path (`pyjitpl.py:2807`).
-                    //
-                    // The other half of `pyjitpl.py:2949
-                    // run_blackhole_interp_to_cancel_tracing(stb)` —
-                    // `convert_and_run_from_pyjitpl(self, stb.raising_exception)`
-                    // — is staged below into `MetaInterp::pending_abort_blackhole`
-                    // and run by [`JitDriver::run_pending_abort_blackhole`], which
-                    // is the first point that also holds native `state`.  Both
-                    // halves read the same drained `stb`, so take it whole rather
-                    // than just its reason.
-                    let pending_stb = self
-                        .meta
-                        .tracing
-                        .as_mut()
-                        .and_then(|t| t.pending_switch_to_blackhole.take());
+                    // pyjitpl.py `run_blackhole_interp_to_cancel_tracing(stb)`
+                    // consumes both the reason and raising_exception from the
+                    // same signal. The Python worker returns it with the action;
+                    // legacy dispatch sites still put it on the trace context.
+                    let pending_stb = match &action {
+                        TraceAction::SwitchToBlackhole(stb) => Some(*stb),
+                        _ => self
+                            .meta
+                            .tracing
+                            .as_mut()
+                            .and_then(|t| t.pending_switch_to_blackhole.take()),
+                    };
                     // `history.py:37-43`: false unless the abort site raised at a
                     // point where `last_exc_value` still has to be raised
                     // (`pyjitpl.py:3389-3390` vable escape, `pyjitpl.py:3714-3716`
-                    // `do_not_in_trace_call`).  The `ABORT_TOO_LONG` path below has
-                    // no `stb` at all and defaults to false, as upstream's
-                    // `SwitchToBlackhole(ABORT_TOO_LONG)` does.
+                    // `do_not_in_trace_call`). A too-long signal carries false,
+                    // as upstream's `SwitchToBlackhole(ABORT_TOO_LONG)` does.
                     let abort_raising_exception = pending_stb
                         .as_ref()
                         .is_some_and(|stb| stb.raising_exception);
-                    // A walker raise site outside this crate cannot reach
-                    // `TraceCtx::pending_switch_to_blackhole`, so its
-                    // `Counters.ABORT_*` travels in `stage_abort_reason` instead.
-                    // It ranks with `stb.reason` rather than below the too-long
-                    // fallback: upstream raises at the site and never reaches the
-                    // `blackhole_if_trace_too_long` check on that unwind.
+                    // Explicit SwitchToBlackhole signals bypass the legacy
+                    // length classification. In particular, the too-long raise
+                    // has already disabled its callee and retired the log.
                     let reason_int = match pending_stb
                         .map(|stb| stb.reason)
                         .or_else(|| self.meta.take_pending_abort_reason())
                     {
                         Some(r) => r,
+                        // The standalone JitCodeMachine still returns plain
+                        // Abort for its post-step overflow. Keep its legacy
+                        // classification here until it owns the MetaInterp
+                        // decision. A SwitchToBlackhole always takes the Some
+                        // arm, as pyjitpl.py's exception catch does.
                         None => match self.meta.blackhole_if_trace_too_long() {
                             Some(r) => r.as_int(),
                             None => {
-                                // Neither a staged reason nor a too-long
-                                // verdict: unclassified, not a bridge giveup.
-                                // Counted here because slot 41 holds both.
                                 crate::mc_diag_bump(71);
                                 AbortReason::Generic.as_int()
                             }
@@ -4980,10 +4986,12 @@ impl<S: JitState> JitDriver<S> {
                     // frames are the sole record of where that left the
                     // interpreter, so this bridge needs the handoff for the
                     // same reason a fresh trace does.
-                    if matches!(action, TraceAction::Abort)
-                        && (self.meta.bridge_info().is_none()
-                            || self.bridge_attempt_declined
-                            || self.bridge_entered_at_guard_resume)
+                    if matches!(
+                        action,
+                        TraceAction::Abort | TraceAction::SwitchToBlackhole(_)
+                    ) && (self.meta.bridge_info().is_none()
+                        || self.bridge_attempt_declined
+                        || self.bridge_entered_at_guard_resume)
                     {
                         // This gate asks whether the session still has a bridge
                         // artifact to resume into, which is the PHASE, not the
@@ -9167,7 +9175,12 @@ impl<S: JitState> JitDriver<S> {
             .as_mut()
             .expect("bridge: tracing context must be live after start_retrace_from_guard");
         ctx.header_pc = resume_pc;
-        if let Some(descriptor) = bridge_driver_descriptor {
+        // `ResumeGuardDescr._trace_and_compile_from_bridge` keeps the source
+        // loop's outermost driver. Only descriptor-less host entries need the
+        // state hook; it must not replace a driver recovered from the guard.
+        if ctx.driver_descriptor().is_none()
+            && let Some(descriptor) = bridge_driver_descriptor
+        {
             ctx.set_driver_descriptor((*descriptor).clone());
         }
         // pyjitpl.py `if not self.partial_trace:` — bridge
@@ -10524,6 +10537,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cell_is_tracing_is_per_green_key() {
+        const A: u64 = 11;
+        const B: u64 = 22;
+        let mut driver = JitDriver::<ScalarWalkState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut state = ScalarWalkState::default();
+        driver.force_start_tracing(A, A as usize, &mut state, &());
+        assert!(driver.is_tracing());
+        assert!(driver.cell_is_tracing(A));
+        assert!(!driver.cell_is_tracing(B));
+    }
+
+    #[test]
+    fn too_long_unwind_preserves_the_root_spared_by_the_raise_site() {
+        const ROOT: u64 = 7;
+        const CALLEE: u64 = 0xa11;
+        let mut driver = JitDriver::<ScalarWalkState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut state = ScalarWalkState::default();
+        driver.force_start_tracing(ROOT, ROOT as usize, &mut state, &());
+        assert!(driver.is_tracing());
+
+        driver.merge_point(|meta, _sym| {
+            let start = meta.trace_ctx().unwrap().get_trace_position();
+            meta.push_portal_trace_position(0, Some((CALLEE, None)), start);
+            let ctx = meta.tracing.as_mut().unwrap();
+            ctx.record_op(majit_ir::OpCode::PtrEq, &[]);
+            let end = ctx.get_trace_position();
+            ctx.set_trace_limit(0);
+            meta.push_portal_trace_position(0, None, end);
+            let reason = meta.blackhole_if_trace_too_long().unwrap();
+            assert_eq!(reason, AbortReason::TooLong);
+            assert!(meta.portal_trace_positions.is_none());
+            assert!(meta.take_pending_abort_reason().is_none());
+            TraceAction::SwitchToBlackhole(crate::SwitchToBlackhole {
+                reason: reason.as_int(),
+                raising_exception: false,
+            })
+        });
+
+        assert!(!driver.is_tracing());
+        let warmstate = driver.meta.warm_state_mut();
+        assert!(!warmstate.can_inline_callable(CALLEE));
+        assert!(warmstate.can_inline_callable(ROOT));
+        assert!(!warmstate.should_force_finish_tracing(ROOT));
+        // A fresh attempt must remain possible after the callee is disabled.
+        driver.force_start_tracing(ROOT, ROOT as usize, &mut state, &());
+        assert!(driver.is_tracing());
+        assert_eq!(
+            driver.meta.portal_trace_positions.as_ref().map(Vec::len),
+            Some(0)
+        );
+    }
+
     /// `TraceAction::AbortPermanent` retires the trace's green key through
     /// `abort_trace(true)` -> `disable_noninlinable_function`.  For a PRIMARY
     /// trace that key names the code the walk gave up on, which is
@@ -11123,6 +11191,85 @@ mod tests {
         );
         assert!(!started);
         assert!(!driver.meta.is_tracing());
+    }
+
+    #[test]
+    fn bridge_entry_preserves_the_source_driver_through_symbolic_setup() {
+        struct BridgeState;
+        impl JitState for BridgeState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+            fn build_meta(&self, _: usize, _: &()) {}
+            fn extract_live(&self, _: &()) -> Vec<i64> {
+                vec![0]
+            }
+            fn create_sym(_: &(), _: usize) {}
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                vec![]
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
+            fn rebuild_from_resumedata(
+                _: &mut (),
+                fail_arg_types: &[Type],
+                storage: Option<&Arc<crate::resume::ResumeStorage>>,
+            ) -> Option<crate::ResumeDataResult> {
+                // This guard has no live state to reload. Unlike the default
+                // trait stub, the fixture admits the symbolic setup path.
+                assert!(fail_arg_types.is_empty());
+                Some(crate::ResumeDataResult {
+                    frames: vec![],
+                    virtualizable_values: vec![],
+                    virtualref_values: vec![],
+                    storage: storage.cloned(),
+                    num_failargs: 0,
+                    fail_arg_types: vec![],
+                })
+            }
+        }
+        let mut driver = JitDriver::<BridgeState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let host_driver = driver
+            .register_descriptor(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
+        let source_driver = driver
+            .meta
+            .register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
+        assert_ne!(host_driver, source_driver);
+        let descriptor = driver.meta.staticdata.jitdrivers_sd[source_driver].clone();
+        let green_key = 406;
+        assert!(matches!(
+            driver
+                .meta
+                .force_start_tracing(green_key, (0, 0), Some(descriptor), &[Value::Int(0)],),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().unwrap();
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            ctx.capture_snapshot_for_last_guard(&[], 0, 0);
+            ctx.set_fail_args(guard, &[]);
+        }
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        let failure = driver.meta.run_compiled_detailed(green_key, &[0]).unwrap();
+        let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
+        let descr = failure.descr_arc.clone().unwrap();
+        let mut state = BridgeState;
+        assert!(driver.start_bridge_tracing(&descr, &mut state, &(), &fail_values, 0, false));
+        assert_eq!(driver.meta.active_jitdriver_sd, Some(source_driver));
+        assert_eq!(
+            driver
+                .meta
+                .trace_ctx()
+                .and_then(|ctx| ctx.driver_descriptor())
+                .and_then(|descriptor| descriptor.index),
+            Some(source_driver),
+        );
     }
 
     // ── Multi-entry point lifecycle tests ──

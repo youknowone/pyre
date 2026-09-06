@@ -1894,7 +1894,7 @@ pub extern "C" fn jit_exception_match(exc: i64, match_class: i64) -> i64 {
 }
 
 /// Ref-returning bridge for the `next(w_iterator)` residual call in
-/// `_unpackiterable_unknown_length` (the `unpackiterable_driver` portal).
+/// `unpackiterable_portal` (the `unpackiterable_driver` portal).
 ///
 /// Unlike [`jit_next`], StopIteration is published as an ordinary exception
 /// rather than collapsed to a null sentinel: the unpack loop body matches on

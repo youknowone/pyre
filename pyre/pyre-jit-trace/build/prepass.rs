@@ -239,14 +239,14 @@ fn forward_engine_env_aliases() {
     }
 }
 
-/// `PYRE_PORTAL_SPLIT=1` registers the `eval::eval_loop_jit` driver against a
-/// `warmspot.py split_graph_and_record_jitdriver` copy of the portal graph
-/// split before its `jit_merge_point`, instead of against the graph holding
-/// the marker.  Listed in `LOWERING_GATE_ENV` above, which is both hashed
-/// into `codegen_cache_key` and emitted as `cargo::rerun-if-env-changed`:
-/// without both, flipping this serves the cached metadata snapshot.
+/// `warmspot.py split_graph_and_record_jitdriver` is the default: jd0 is
+/// registered against the copy split immediately before `jit_merge_point`.
+/// `PYRE_PORTAL_SPLIT=0` restores the unsplit `eval_loop_jit` registration
+/// for A/B. Listed in `LOWERING_GATE_ENV` so the cache key follows the
+/// resolved boolean, not the raw unset string (unset used to mean unsplit).
 fn portal_split_enabled() -> bool {
-    std::env::var("PYRE_PORTAL_SPLIT").is_ok_and(|value| value == "1")
+    !std::env::var("PYRE_PORTAL_SPLIT")
+        .is_ok_and(|value| matches!(value.as_str(), "0" | "off" | "false"))
 }
 
 /// Entry of the real build: the translation prepass over the LLBC set.
@@ -1070,13 +1070,18 @@ fn real_main() {
                     split_portal: portal_split_enabled(),
                 },
                 majit_translate::JitDriverSpec {
-                    // pypy/interpreter/baseobjspace.py `_unpackiterable_unknown_length`;
-                    // greens=['greenkey'], reds='auto' (baseobjspace.py `unpackiterable_driver`).
+                    // `warmspot.py split_graph_and_record_jitdriver` copy of
+                    // `_unpackiterable_unknown_length`, cut at `jit_merge_point`.
+                    // greens=['greenkey'], reds='auto' (baseobjspace.py
+                    // `unpackiterable_driver`).
                     portal: majit_translate::CallPath::from_segments([
                         "baseobjspace",
-                        "_unpackiterable_unknown_length",
+                        "unpackiterable_portal",
                     ]),
-                    portal_runner: None,
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "ll_unpackiterable_portal_runner_shim",
+                    ])),
                     greens: vec!["greenkey".to_string()],
                     reds: vec![],
                     green_kinds: vec![majit_ir::Type::Ref],
@@ -1084,8 +1089,8 @@ fn real_main() {
                     autoreds: true,
                     virtualizables: vec![],
                     red_types: vec![],
-                    // `autoreds` drivers are not split; see the citation in
-                    // `majit_translate::register_configured_jitdrivers`.
+                    // Already the split body; `rewrite_jit_merge_point` lives
+                    // in `_unpackiterable_unknown_length` at source level.
                     split_portal: false,
                 },
             ],

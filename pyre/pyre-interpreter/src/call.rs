@@ -562,6 +562,9 @@ pub fn set_jit_param_string(text: &str) -> Result<(), ()> {
 /// `SET_JIT_PARAM_HOOK` / `EVAL_OVERRIDE` inversion pattern.
 /// `greenkey` is the merge-point green; `w_iterator` and `items` are the two
 /// `reds='auto'` values the JIT walk backs its InputArgs with.
+///
+/// `warmspot.py rewrite_can_enter_jits` inserts `can_enter_jit` at the start
+/// of a portal that has none; this hook is that `maybe_enter_jit` body.
 type UnpackMergeFn = fn(greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef);
 static UNPACK_MERGE_HOOK: OnceLock<UnpackMergeFn> = OnceLock::new();
 
@@ -575,6 +578,32 @@ pub fn register_unpack_merge_hook(f: UnpackMergeFn) {
 pub fn unpack_merge_point(greenkey: PyObjectRef, w_iterator: PyObjectRef, items: PyObjectRef) {
     if let Some(f) = UNPACK_MERGE_HOOK.get() {
         f(greenkey, w_iterator, items);
+    }
+}
+
+/// `warmspot.py rewrite_jit_merge_point`: the original portal graph ends in
+/// `return portal_runner(*args)`. pyre-interpreter cannot import pyre-jit, so
+/// the JIT registers the runner at boot. Without a hook the split portal
+/// body runs directly — the no-JIT path.
+type UnpackPortalRunnerFn =
+    fn(PyObjectRef, PyObjectRef, PyObjectRef) -> Result<PyObjectRef, crate::PyError>;
+static UNPACK_PORTAL_RUNNER_HOOK: OnceLock<UnpackPortalRunnerFn> = OnceLock::new();
+
+pub fn register_unpack_portal_runner_hook(f: UnpackPortalRunnerFn) {
+    let _ = UNPACK_PORTAL_RUNNER_HOOK.set(f);
+}
+
+/// `warmspot.py ll_portal_runner` for `unpackiterable_driver`. Falls back to
+/// [`crate::unpackiterable_portal`] when the JIT has not installed a runner.
+#[inline]
+pub fn unpack_portal_runner(
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    items: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    match UNPACK_PORTAL_RUNNER_HOOK.get() {
+        Some(f) => f(greenkey, w_iterator, items),
+        None => crate::unpackiterable_portal(greenkey, w_iterator, items),
     }
 }
 

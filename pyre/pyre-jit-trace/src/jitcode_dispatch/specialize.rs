@@ -11616,7 +11616,7 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
 /// estimated, the same `history.length() > trace_limit` decides, and what
 /// happens on a yes is the abort `mod.rs` performs one opcode later --
 /// `latch_abort_blackhole`, `note_root_trace_too_long`
-/// (`stage_abort_reason(ABORT_TOO_LONG)`), `TraceTooLong`.  The trace is
+/// and the reason-bearing `TraceTooLong` unwind. The trace is
 /// discarded whole, so the half-built expansion above this point is never
 /// published; resuming re-executes the opcode from `pc`, which is the position
 /// every guard this expansion emits already side-exits to

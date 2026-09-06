@@ -1053,7 +1053,7 @@ impl PyJitCode {
 
     /// Wrap an already-populated runtime `JitCode` core with a degenerate
     /// (identity/empty) `PyJitCodeMetadata`.  For a build-time-extracted
-    /// interpreter portal (e.g. jd1's `_unpackiterable_unknown_length`) whose
+    /// interpreter portal (e.g. jd1's `unpackiterable_portal`) whose
     /// CPython-pc↔jitcode-pc translation tables are degenerate and, on the
     /// jd1 `compile_loop`/resume path, read by no consumer — only
     /// `frame_value_count_at` runs, off the byte stream + `liveness_info`.

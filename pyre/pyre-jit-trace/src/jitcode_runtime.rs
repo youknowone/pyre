@@ -323,7 +323,7 @@ pub fn portal_jitcode() -> Option<Arc<JitCode>> {
 
 /// Resolve the portal `JitCode` for the configured driver whose portal
 /// graph has canonical key `key` (e.g. a secondary driver's
-/// `baseobjspace::_unpackiterable_unknown_length`). Per-driver analogue of
+/// `baseobjspace::unpackiterable_portal`). Per-driver analogue of
 /// [`portal_jitcode`] — `warmspot.py:281-282`
 /// `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
 pub fn portal_jitcode_for_key(key: &str) -> Option<Arc<JitCode>> {

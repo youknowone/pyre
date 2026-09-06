@@ -14935,16 +14935,34 @@ fn _unpackiterable_unknown_length(
     let items = || pyre_object::gc_roots::shadow_stack_get(items_slot);
     // baseobjspace.py `greenkey = self.iterator_greenkey(w_iterator)`.
     let greenkey = iterator_greenkey(w_iterator());
+    // `warmspot.py rewrite_jit_merge_point`: the original portal ends at
+    // `jit_merge_point` with `return portal_runner(*args)`. The split
+    // portal (`unpackiterable_portal`) owns the loop from that marker.
+    crate::call::unpack_portal_runner(greenkey, w_iterator(), items())
+}
+
+/// Split-portal body of `_unpackiterable_unknown_length`: the loop that
+/// starts at `jit_merge_point`. `warmspot.py split_graph_and_record_jitdriver`
+/// copies the original graph and cuts it immediately before the marker;
+/// `rewrite_jit_merge_point` then makes the original return
+/// `portal_runner(*args)`. `handle_jitexception` calls `portal_ptr(*args)`
+/// with the merge-point greens and reds, not the `newlist_hint` prologue.
+pub fn unpackiterable_portal(
+    greenkey: PyObjectRef,
+    w_iterator: PyObjectRef,
+    items: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_iterator);
+    let _ = pyre_object::gc_roots::pin_root(items);
+    let w_iterator = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let items_slot = root_base + 1;
+    let items = || pyre_object::gc_roots::shadow_stack_get(items_slot);
     loop {
-        // baseobjspace.py:1012
-        // `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
         unpackiterable_driver.jit_merge_point(greenkey, w_iterator(), items());
         match next(w_iterator()) {
             Ok(w_item) => unsafe { drain_append_at(items_slot, w_item) },
-            // `except OperationError as e: if not e.match(space,
-            // w_StopIteration): raise; break` — the StopIteration test rides
-            // inside the handler (`e` is bound once, consumed only on the
-            // re-raise path), not as a match guard.
             Err(e) => {
                 if e.matches_stop_iteration() {
                     break;
@@ -14953,13 +14971,6 @@ fn _unpackiterable_unknown_length(
             }
         }
     }
-    // `return items` — hand the grown `W_List` back as a single ref, matching
-    // the driver's `Type::Ref` result and RPython's `return items`. The
-    // `W_List` → `Vec` readback is caller-side host glue
-    // (`drain_collect_items`), kept out of the traced/blackholed drain body so
-    // the blackhole epilogue is a plain `ref_return` rather than a
-    // multi-word (`Vec`, sret-ABI) residual the single-register residual-call
-    // handlers cannot invoke.
     Ok(items())
 }
 
