@@ -2756,21 +2756,22 @@ impl JitCodeBuilder {
     }
 
     /// RPython `flatten.py` emits a plain `Bool` exitswitch as opname
-    /// `goto_if_not`, which is what this writes.
-    ///
-    /// `goto_if_not_int_is_true` is a real second opname upstream —
-    /// `jtransform.py optimize_goto_if_not` admits `int_is_true` into the set
-    /// of operations it folds into the exitswitch tuple, and `flatten.py` then
-    /// spells the opname `'goto_if_not_' + exitswitch[0]`. It reaches
-    /// `MIFrame.opimpl_goto_if_not_int_is_true`, which re-executes the folded
-    /// `INT_IS_TRUE` before branching. Nothing here performs that fold: every
-    /// caller's condition is a Rust `bool`, already the `0|1` the canonical
-    /// opname wants, so there is no `int_is_true` to fold away and no
-    /// operation to re-materialise. The Rust method keeps the longer name for
-    /// readability at the call site.
-    pub fn goto_if_not_int_is_true(&mut self, reg: u16, label: u16) {
+    /// `goto_if_not`. The operand is already 0 or 1; the tracer may rebind
+    /// it to `CONST_1`.
+    pub fn goto_if_not(&mut self, reg: u16, label: u16) {
         self.touch_reg(reg);
         self.write_insn("goto_if_not/iL");
+        self.push_u8(reg as u8);
+        self.push_label_ref(label);
+    }
+
+    /// `jtransform.py optimize_goto_if_not` folds `int_is_true` into the
+    /// exitswitch; `flatten.py` then emits `goto_if_not_int_is_true`.
+    /// The tracer re-executes `INT_IS_TRUE` and branches with `replace=False`,
+    /// so a general integer (`if n != 0`) must not go through `goto_if_not`.
+    pub fn goto_if_not_int_is_true(&mut self, reg: u16, label: u16) {
+        self.touch_reg(reg);
+        self.write_insn("goto_if_not_int_is_true/iL");
         self.push_u8(reg as u8);
         self.push_label_ref(label);
     }
