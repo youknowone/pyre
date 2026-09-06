@@ -13957,10 +13957,18 @@ pub(crate) fn decode_and_restore_guard_failure(
                     pyre_jit_trace::state::depth_based_vsd_for_wcode(code, resume_pc)
                 {
                     jit_state.set_valuestackdepth(corrected_vsd);
-                    jit_state.clear_stack_above(corrected_vsd);
                 }
             }
         }
+        // `write_from_resume_data_partial` writes the whole
+        // `locals_cells_stack_w` from the vable boxes, including slots
+        // above `valuestackdepth`. A popped box can still hold a young
+        // pointer; the type-9 walker traces every allocated slot, so
+        // leave those words NULL. The vsd-correction arm above already
+        // trimmed when it rewrote the depth; this covers the single-frame
+        // resume that keeps the restored vsd (`test_complex_newobj_ex`
+        // after a hot `Unpickler.load`).
+        jit_state.clear_stack_above(jit_state.valuestackdepth());
         // Outermost-first `(w_code, py_pc)` per resumed section. The caller
         // needs them to ask each frame's own exception table whether it
         // catches at its own resume pc — `resume_pc` alone only addresses the
@@ -14263,6 +14271,8 @@ fn sync_virtualizable_after_guard_failure(
 
     unsafe {
         vinfo.write_boxes_to_heap(frame_u8, &boxes);
+        let frame = &mut *(frame_u8 as *mut PyFrame);
+        frame.clear_stack_above(frame.valuestackdepth);
     }
 }
 

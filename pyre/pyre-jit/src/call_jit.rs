@@ -5656,6 +5656,18 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
          getexecutioncontext(); the eval loop must pin the execution context \
          before any residual call"
     );
+    // A residual call can collect. The caller frame's locals array is a
+    // type-9 GcArray, so the remembered-set walk traces every allocated
+    // slot, not just `0..valuestackdepth`. Compiled pops update the
+    // virtual boxes and the depth; they do not always NULL the heap
+    // word. Trim the dead prefix before the callee allocates.
+    {
+        let frame = unsafe { (*ec).gettopframe() };
+        if !frame.is_null() {
+            let frame = unsafe { &mut *frame };
+            frame.clear_stack_above(frame.valuestackdepth);
+        }
+    }
     if _roots.get(root_base).is_null() {
         let mut err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::TypeError,
