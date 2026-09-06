@@ -7346,13 +7346,9 @@ fn portal_jd_for(bh: &BlackholeInterpreter) -> Option<usize> {
 /// crate, and the split is what let a substituted runner be validated against
 /// the owning driver's declared kind.
 ///
-/// ★ The substitution is the common case, not a fault. `codewriter.rs` stamps a
-/// driver index on every portal jitcode (`jitdriver_sd_from_portal_graph`
-/// matches `jd.portal_graph == code`, and `setup_jitdriver` appends one entry
-/// per portal graph), while `eval.rs` registers exactly one
-/// `handle_jitexc_from_bh` — index 0's. So most portal frames name a driver
-/// that has no runner of its own, and refusing to substitute would withdraw
-/// portal re-entry from paths that have it today.
+/// ★ A miss still falls back to any registered runner so a test fixture
+/// that stamps a driver index without installing a hook keeps working.
+/// Production registers one hook per driver (`eval.rs` jd0 and jd1).
 ///
 /// What is withheld instead is the *kind*: a substituted runner's outcome is
 /// not validated against the owning driver's `result_type`, because that pair

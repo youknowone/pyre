@@ -2,7 +2,7 @@
 //!
 //! `baseobjspace.py:29`
 //! `unpackiterable_driver = JitDriver(greens=['greenkey'], reds='auto', ...)`
-//! drives the unknown-length unpack loop `_unpackiterable_unknown_length`
+//! drives the unknown-length unpack loop `unpackiterable_portal`
 //! (`baseobjspace.py:1003-1024`, merge at `:1012`). This module supplies the
 //! *dormant* second-driver types for the generic LLBC meta-tracer, via
 //! [`UnpackJitState`]'s [`JitState`] implementation, without touching jd0's
@@ -54,7 +54,7 @@ impl JitCodeSym for UnpackSym {
         // lowers), so discover it rather than hardcode.  The drain loop carries
         // exactly one merge point (`baseobjspace.py:1012`, no `can_enter_jit`).
         let canonical = crate::jitcode_runtime::portal_jitcode_for_key(
-            "baseobjspace::_unpackiterable_unknown_length",
+            "baseobjspace::unpackiterable_portal",
         )
         .expect("jd1 portal jitcode must be registered");
         crate::jitcode_runtime::decoded_ops(&canonical.code)
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn jd1_build_time_descrs_resolve_through_global_pool() {
         let canonical = crate::jitcode_runtime::portal_jitcode_for_key(
-            "baseobjspace::_unpackiterable_unknown_length",
+            "baseobjspace::unpackiterable_portal",
         )
         .expect("jd1's extracted main JitCode must be registered");
         // The extracted body is the walkable unpack loop: exactly one merge
