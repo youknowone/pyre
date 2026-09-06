@@ -8936,6 +8936,36 @@ mod tests {
         assert_eq!(ref_alloc.num_colors, 2);
     }
 
+    fn is_inline_ir_r_named(insn: &Insn, name: &str) -> bool {
+        matches!(
+            insn,
+            Insn::Op { opname, args, .. }
+                if opname == "inline_call_ir_r"
+                    && matches!(
+                        args.first(),
+                        Some(Operand::Descr(descr))
+                            if matches!(&**descr, DescrOperand::JitCode(jc) if jc.name() == name)
+                    )
+        )
+    }
+
+    fn is_residual_ir_r_fn(insn: &Insn, fn_idx: i64) -> bool {
+        matches!(
+            insn,
+            Insn::Op { opname, args, .. }
+                if opname == "residual_call_ir_r"
+                    && matches!(args.first(), Some(Operand::ConstInt(v)) if *v == fn_idx)
+        )
+    }
+
+    fn is_lowered_binary_op(insn: &Insn) -> bool {
+        is_inline_ir_r_named(insn, "binary_value_from_tag") || is_residual_ir_r_fn(insn, 11)
+    }
+
+    fn is_lowered_compare_op(insn: &Insn) -> bool {
+        is_inline_ir_r_named(insn, "compare_value_from_tag") || is_residual_ir_r_fn(insn, 13)
+    }
+
     #[test]
     fn flatten_graph_with_lowering_lowers_retired_family_hlops() {
         // a graph carrying one HLOp from each of the four
@@ -8989,33 +9019,24 @@ mod tests {
         let mut ssarepr = SSARepr::new("retired_families");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
 
-        // BINARY_OP `add` → residual_call_ir_r with fn_idx=11.
-        let binary = ssarepr.insns.iter().find(|insn| {
-            matches!(
-                insn,
-                Insn::Op { opname, args, .. }
-                    if opname == "residual_call_ir_r"
-                        && matches!(args.first(), Some(Operand::ConstInt(11)))
-            )
-        });
+        // BINARY_OP `add` → inline_call_ir_r when the body is bound,
+        // otherwise residual_call_ir_r with fn_idx=11.
+        let binary = ssarepr.insns.iter().find(|insn| is_lowered_binary_op(insn));
         assert!(
             binary.is_some(),
-            "expected BINARY_OP residual_call: {:?}",
+            "expected BINARY_OP inline_call or residual_call: {:?}",
             ssarepr.insns
         );
 
-        // COMPARE_OP `lt` → residual_call_ir_r with fn_idx=13.
-        let compare = ssarepr.insns.iter().find(|insn| {
-            matches!(
-                insn,
-                Insn::Op { opname, args, .. }
-                    if opname == "residual_call_ir_r"
-                        && matches!(args.first(), Some(Operand::ConstInt(13)))
-            )
-        });
+        // COMPARE_OP `lt` → inline_call_ir_r when the body is bound,
+        // otherwise residual_call_ir_r with fn_idx=13.
+        let compare = ssarepr
+            .insns
+            .iter()
+            .find(|insn| is_lowered_compare_op(insn));
         assert!(
             compare.is_some(),
-            "expected COMPARE_OP residual_call: {:?}",
+            "expected COMPARE_OP inline_call or residual_call: {:?}",
             ssarepr.insns
         );
 
@@ -9106,13 +9127,16 @@ mod tests {
         let call_pos = ssarepr
             .insns
             .iter()
-            .position(
-                |insn| matches!(insn, Insn::Op { opname, .. } if opname == "residual_call_ir_r"),
-            )
-            .unwrap_or_else(|| panic!("expected residual_call_ir_r: {:?}", ssarepr.insns));
+            .position(|insn| is_lowered_binary_op(insn))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected BINARY_OP inline_call or residual_call: {:?}",
+                    ssarepr.insns
+                )
+            });
         assert!(
             ssarepr.insns[call_pos + 1].is_live(),
-            "residual_call must be followed by a `-live-` marker, got {:?}",
+            "lowered BINARY_OP call must be followed by a `-live-` marker, got {:?}",
             &ssarepr.insns[call_pos..]
         );
     }
@@ -9221,44 +9245,29 @@ mod tests {
         let mut ssarepr = SSARepr::new("multi_block_lowering");
         flatten_graph_for_test_with_lowering(&graph, &mut ssarepr, ctx, None);
 
-        // Filter the SSARepr by `(opname, fn_idx)` mirroring the
-        // probe's per-family report.  Both families share the
-        // `residual_call_ir_r` opname, so the leading ConstInt
-        // arg distinguishes them.
+        // Filter the SSARepr by family.  A bound body emits
+        // `inline_call_ir_r` named after the helper; the unbound
+        // fallback keeps `residual_call_ir_r` and the fn_idx.
         let binary: Vec<&Insn> = ssarepr
             .insns
             .iter()
-            .filter(|insn| {
-                matches!(
-                    insn,
-                    Insn::Op { opname, args, .. }
-                        if opname == "residual_call_ir_r"
-                            && matches!(args.first(), Some(Operand::ConstInt(11)))
-                )
-            })
+            .filter(|insn| is_lowered_binary_op(insn))
             .collect();
         let compare: Vec<&Insn> = ssarepr
             .insns
             .iter()
-            .filter(|insn| {
-                matches!(
-                    insn,
-                    Insn::Op { opname, args, .. }
-                        if opname == "residual_call_ir_r"
-                            && matches!(args.first(), Some(Operand::ConstInt(13)))
-                )
-            })
+            .filter(|insn| is_lowered_compare_op(insn))
             .collect();
         assert_eq!(
             binary.len(),
             1,
-            "expected exactly one BINARY_OP residual_call across the 2-block graph: {:?}",
+            "expected exactly one BINARY_OP lowered call across the 2-block graph: {:?}",
             ssarepr.insns
         );
         assert_eq!(
             compare.len(),
             1,
-            "expected exactly one COMPARE_OP residual_call across the 2-block graph: {:?}",
+            "expected exactly one COMPARE_OP lowered call across the 2-block graph: {:?}",
             ssarepr.insns
         );
 
@@ -9268,27 +9277,13 @@ mod tests {
         let binary_pos = ssarepr
             .insns
             .iter()
-            .position(|insn| {
-                matches!(
-                    insn,
-                    Insn::Op { opname, args, .. }
-                        if opname == "residual_call_ir_r"
-                            && matches!(args.first(), Some(Operand::ConstInt(11)))
-                )
-            })
-            .expect("BINARY_OP residual_call must exist");
+            .position(|insn| is_lowered_binary_op(insn))
+            .expect("BINARY_OP lowered call must exist");
         let compare_pos = ssarepr
             .insns
             .iter()
-            .position(|insn| {
-                matches!(
-                    insn,
-                    Insn::Op { opname, args, .. }
-                        if opname == "residual_call_ir_r"
-                            && matches!(args.first(), Some(Operand::ConstInt(13)))
-                )
-            })
-            .expect("COMPARE_OP residual_call must exist");
+            .position(|insn| is_lowered_compare_op(insn))
+            .expect("COMPARE_OP lowered call must exist");
         assert!(
             binary_pos < compare_pos,
             "BINARY_OP must precede COMPARE_OP across block boundaries: pos {} vs {}",
@@ -9512,14 +9507,7 @@ mod tests {
         let mut regallocs = perform_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
 
-        let has_binary_op_lowered = ssarepr.insns.iter().any(|insn| {
-            matches!(
-                insn,
-                Insn::Op { opname, args, .. }
-                    if opname == "residual_call_ir_r"
-                        && matches!(args.first(), Some(Operand::ConstInt(11)))
-            )
-        });
+        let has_binary_op_lowered = ssarepr.insns.iter().any(|insn| is_lowered_binary_op(insn));
         let has_raw_add = ssarepr
             .insns
             .iter()
@@ -9527,7 +9515,7 @@ mod tests {
         assert!(
             has_binary_op_lowered,
             "canonical flatten_graph with cpu.lowering_ctx must lower BINARY_OP \
-             `add` HLOp to residual_call_ir_r(fn_idx=11, ...): {:?}",
+             `add` HLOp to inline_call_ir_r or residual_call_ir_r(fn_idx=11, ...): {:?}",
             ssarepr.insns
         );
         assert!(
