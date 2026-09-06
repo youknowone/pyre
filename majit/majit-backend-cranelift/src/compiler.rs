@@ -440,6 +440,19 @@ pub fn install_gc_standalone() {
     register_active_hooks(supports_guard_gc_type);
 }
 
+/// Drop this thread's boxed collector.
+///
+/// Embeddings that installed a thread-confined heap through
+/// [`CraneliftBackend::set_gc_allocator`] / [`CraneliftBackend::with_gc_allocator`]
+/// must call this before starting another runtime on the same thread.
+/// `with_cranelift_gc` prefers the leftover box over `gc_sync`, so
+/// [`install_gc_standalone`] cannot displace it. Production pyre uses
+/// [`install_gc_standalone`] and never stores a box. Matches dynasm's
+/// `clear_gc_allocator`.
+pub fn clear_gc_allocator() {
+    gc_box::clear();
+}
+
 /// Follow jf_forward chain to get the final jitframe address.
 ///
 /// RPython jitframe.py jitframe_resolve:
@@ -1546,8 +1559,7 @@ mod gc_box {
 
     /// Backend-teardown counterpart of [`store`], tolerant of a thread whose
     /// thread-locals are already being destroyed.
-    #[cfg(test)]
-    pub(super) fn clear_on_teardown() {
+    pub(super) fn clear() {
         let _ = CRANELIFT_ACTIVE_GC.try_with(|cell| {
             *cell.borrow_mut() = None;
         });
@@ -16873,16 +16885,14 @@ impl Drop for CraneliftBackend {
         for trace_id in std::mem::take(&mut self.registered_call_assembler_bridge_traces) {
             unregister_call_assembler_expectations(CallAssemblerCallerId::BridgeTrace(trace_id));
         }
-        let _ = CALL_ASSEMBLER_DEADFRAMES.try_with(|map| map.borrow_mut().clear());
-        let _ = NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.try_with(|cell| cell.set(1));
-        // The active allocator belongs to this execution thread, not to this
-        // transient backend value.  Several JitDrivers can coexist on one
-        // thread and all of their compiled entry trampolines consult this one
-        // slot; clearing it when any one backend dies silently sends every
-        // survivor through HostHeapGc.  dynasm likewise keeps the installed
-        // runtime until an explicit teardown.  Tests that install a private GC
-        // clear it through the test-only helper instead of borrowing an
-        // unrelated backend's Drop as the lifetime boundary.
+        // The active allocator and the call-assembler deadframe map belong to
+        // this execution thread, not to this transient backend value.
+        // Several JitDrivers can coexist on one thread; clearing either slot
+        // when any one backend dies sends surviving compiled loops through
+        // HostHeapGc, or panics them with an unknown deadframe handle.
+        // dynasm likewise keeps the installed runtime until an explicit
+        // teardown.  A boxed collector is released through
+        // [`clear_gc_allocator`].
     }
 }
 
@@ -20086,7 +20096,7 @@ mod tests {
     /// `HostHeapGc`; explicit runtime teardown owns that transition.
     #[test]
     fn dropping_a_backend_keeps_the_thread_gc_installed() {
-        gc_box::clear_on_teardown();
+        clear_gc_allocator();
         let owner = make_gc_backend();
         let jitframe_tid = cranelift_jitframe_type_id()
             .expect("the fixture installed a managed JITFRAME allocator");
@@ -20096,7 +20106,38 @@ mod tests {
 
         drop(owner);
         assert_eq!(cranelift_jitframe_type_id(), Some(jitframe_tid));
-        gc_box::clear_on_teardown();
+        assert!(gc_box::present());
+        clear_gc_allocator();
+        assert!(
+            !gc_box::present(),
+            "clear_gc_allocator is the production path that releases the boxed collector"
+        );
+    }
+
+    /// The call-assembler deadframe map is the same thread-owned slot as the
+    /// active GC.  Dropping a sibling backend must not wipe a live handle or
+    /// reset the counter out from under a surviving backend.
+    #[test]
+    fn dropping_a_backend_keeps_call_assembler_deadframes() {
+        let first = store_call_assembler_deadframe(DeadFrame::boxed(1u64));
+        drop(CraneliftBackend::new());
+        let second = store_call_assembler_deadframe(DeadFrame::boxed(2u64));
+        assert_ne!(
+            first, second,
+            "a sibling Drop must not reset the deadframe handle counter"
+        );
+        let first_frame = take_call_assembler_deadframe(first)
+            .expect("a sibling Drop must not clear a live call_assembler deadframe");
+        let second_frame = take_call_assembler_deadframe(second)
+            .expect("a handle stored after a sibling Drop must still be takeable");
+        match first_frame {
+            DeadFrame::Boxed(value) => assert_eq!(value.downcast_ref::<u64>(), Some(&1)),
+            _ => panic!("expected boxed first handle"),
+        }
+        match second_frame {
+            DeadFrame::Boxed(value) => assert_eq!(value.downcast_ref::<u64>(), Some(&2)),
+            _ => panic!("expected boxed second handle"),
+        }
     }
 
     /// Publish the JitFrame layout descrs so the GC rewriter's

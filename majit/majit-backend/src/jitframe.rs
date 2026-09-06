@@ -938,7 +938,11 @@ mod tests {
 
     #[test]
     fn noncollecting_entry_jitframe_stays_in_the_nursery() {
-        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let mut gc = majit_gc::collector::MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 4096,
+            ..majit_gc::collector::GcConfig::default()
+        });
         let tid = gc.register_type(jitframe_type_info());
         gc.set_jitframe_type_id(tid);
         let frame = malloc_entry_jitframe_no_collect(&mut gc, JitFrame::alloc_size(8));
@@ -946,6 +950,25 @@ mod tests {
         assert!(
             gc.is_in_nursery(frame as usize),
             "the non-collecting entry allocator must keep the ordinary nursery placement"
+        );
+
+        // A collecting nursery alloc would run a minor collection once the
+        // nursery is full and then stay young. The no-collect path must not
+        // collect; it falls back to old-gen instead.
+        let pad = gc.register_type(majit_gc::TypeInfo::simple(16));
+        loop {
+            let obj = gc.alloc_nursery_no_collect_typed(pad, 16);
+            if obj.is_null() || !gc.is_in_nursery(obj.0) {
+                break;
+            }
+        }
+        let minors_before = gc.collection_counts().0;
+        let tight = malloc_entry_jitframe_no_collect(&mut gc, JitFrame::alloc_size(8));
+        assert!(!tight.is_null());
+        assert_eq!(
+            gc.collection_counts().0,
+            minors_before,
+            "malloc_entry_jitframe_no_collect must use alloc_nursery_no_collect_typed, not the collecting nursery allocator"
         );
     }
 }

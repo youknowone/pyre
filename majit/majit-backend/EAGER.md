@@ -31,7 +31,11 @@ operation is unchanged; backend compilation errors propagate to the caller.
    cannot move to another execution thread. Drop it before reconfiguring or
    using that backend directly. Retain an `Arc` clone of the token to use the
    existing `compile_bridge`, `execute_token`, or invalidation APIs afterward.
-   Backend and runtime teardown remain the embedding's responsibility.
+   Backend and runtime teardown remain the embedding's responsibility. A
+   thread-confined boxed collector installed through
+   `CraneliftBackend::set_gc_allocator` / `DynasmBackend::set_gc_allocator`
+   is released with that backend's `clear_gc_allocator`; dropping the
+   backend value does not do it.
 
 The submission replaces the pending backend constant pool and clears it after
 success or error. Do not interleave a partially staged lower-level compilation
