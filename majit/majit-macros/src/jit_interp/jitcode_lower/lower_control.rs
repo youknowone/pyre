@@ -84,6 +84,7 @@ impl<'c> Lowerer<'c> {
                         return Some(LoweredCondition::Value {
                             binding: value,
                             negated,
+                            int_is_true: true,
                         });
                     }
                 }
@@ -109,7 +110,11 @@ impl<'c> Lowerer<'c> {
         if negated && !matches!(binding.kind, BindingKind::Int) {
             return None;
         }
-        Some(LoweredCondition::Value { binding, negated })
+        Some(LoweredCondition::Value {
+            binding,
+            negated,
+            int_is_true: false,
+        })
     }
 
     pub(super) fn lower_if_stmt(&mut self, expr_if: &ExprIf) -> Option<()> {

@@ -1655,6 +1655,10 @@ pub(super) enum LoweredCondition {
     Value {
         binding: Binding,
         negated: bool,
+        /// `true` when this value is an integer `== 0` / `!= 0` compare
+        /// rewritten as a truth test. Rust `if`/`while` conditions are
+        /// otherwise `bool`, which flatten emits as `goto_if_not`.
+        int_is_true: bool,
     },
     Compare {
         lhs: Binding,
