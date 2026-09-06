@@ -25,6 +25,9 @@ lz4_flex = { version = "0.13", default-features = false, features = [
     "safe-decode",
 ], optional = true }
 
+[target.'cfg(any(target_os = "android", target_arch = "wasm32"))'.dependencies]
+xz-core = "0.1.0-rc.0"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rustls = { workspace = true }
 rustls-webpki = { workspace = true }
