@@ -1012,7 +1012,10 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
         // is a Ref, not a runtime operation discriminator; and/or/xor must
         // remain distinct specialized graphs (`rbigint.py _bitwise`).
         assert!(
-            matches!(types.as_slice(), [ValueType::Ref(_), ValueType::Ref(_), ValueType::Ref(_)]),
+            matches!(
+                types.as_slice(),
+                [ValueType::Ref(_), ValueType::Ref(_), ValueType::Ref(_)]
+            ),
             "specialized bigint bitwise graph must carry two payloads and the GC root span: \
              {types:?}"
         );
