@@ -11,6 +11,8 @@ import json
 import marshal
 import math
 import os
+import pickle
+import re
 import subprocess
 import sys
 import tempfile
@@ -27,13 +29,6 @@ from ctypes import (
     c_void_p,
     cast,
 )
-
-# This directory contains the standalone snippet `_pickle.py`; CPython's
-# source-file finder would otherwise choose it ahead of the stdlib extension.
-_snippets_dir = os.path.realpath(os.path.dirname(__file__))
-sys.path[:] = [p for p in sys.path if os.path.realpath(p or os.curdir) != _snippets_dir]
-import pickle
-import re
 
 
 def raised(call, exc_type):

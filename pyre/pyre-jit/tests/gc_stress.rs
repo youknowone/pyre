@@ -39,6 +39,59 @@ use pyre_jit::eval::{eval_with_jit, init_jit_hooks, reset_gc_fresh_for_test};
 
 static GC_STRESS_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+/// `ResumeGuardForcedDescr.handle_async_forcing` runs before the residual
+/// returns. Its virtualizable image must not read the pending return value
+/// from a register home that compiled code has not written yet.
+#[test]
+fn pickle_async_forcing_keeps_pending_result_out_of_frame() {
+    const CHILD: &str = "PYRE_PICKLE_ASYNC_FORCE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Set nursery poisoning at process startup, not by mutating the
+        // environment underneath the other Rust test workers. The ordinary
+        // nursery can accidentally give an unwritten result home a zero.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pickle_async_forcing_keeps_pending_result_out_of_frame",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .output()
+            .expect("run isolated async-forcing regression");
+        assert!(
+            output.status.success(),
+            "async forcing read an unavailable call result:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    // test_bytes makes PyPicklerTests.loads hot. NEWOBJ_EX subsequently
+    // enters Python from its residual Unpickler.load and forces that frame.
+    // Collect after loads has returned; before the fix,
+    // its old locals array contained nursery poison above valuestackdepth.
+    run_on_worker(
+        r#"
+import gc
+try:
+    from test.test_pickle import CPicklerTests
+
+    case = CPicklerTests('test_bytes')
+    case.test_bytes()
+    case.test_complex_newobj_ex()
+    gc.collect()
+except BaseException:
+    import traceback
+    traceback.print_exc()
+    raise
+"#,
+        "pickle_async_forcing.py",
+        "async-forcing frame slots",
+        "pickle async forcing must preserve a valid frame image",
+    );
+}
+
 /// Shared harness body for every GC-stress program. Compiles and runs `program`
 /// (using `name` as its `sys.argv[0]` / filename) exactly as the `pyrex`
 /// launcher would, after installing a fresh per-worker GC heap. An uncaught

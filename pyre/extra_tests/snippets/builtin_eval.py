@@ -35,6 +35,11 @@ except TypeError as e:
 
 # Regular dict should work
 assert eval("x", {"x": 42}) == 42
+# Explicit None locals collapse to the supplied globals.  `inspect.signature(...,
+# eval_str=True)` and `annotationlib.get_annotations` call eval this way;
+# treating None as a mapping raises TypeError: 'NoneType' object is not
+# subscriptable on LOAD_NAME.
+assert eval("x", {"x": 42}, None) == 42
 
 # None should use current globals
 x = 100

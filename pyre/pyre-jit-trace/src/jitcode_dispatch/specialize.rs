@@ -4684,6 +4684,9 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
         None
     };
 
+    let Some(header) = super_attr_method_header(w_descr) else {
+        return Ok(None);
+    };
     walker_emit_constant_descr_bound_method(
         ctx,
         op_pc,
@@ -4691,6 +4694,7 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
         concrete_obj,
         w_type,
         w_descr,
+        header,
         shadow,
         dst,
         dst_bank,
@@ -4786,6 +4790,9 @@ pub(crate) fn try_walker_specialize_load_special_method<Sym: WalkSym>(
         return Ok(None);
     };
 
+    let Some(header) = super_attr_method_header(w_descr) else {
+        return Ok(None);
+    };
     walker_emit_constant_descr_bound_method(
         ctx,
         op_pc,
@@ -4793,6 +4800,7 @@ pub(crate) fn try_walker_specialize_load_special_method<Sym: WalkSym>(
         concrete_obj,
         w_type,
         w_descr,
+        header,
         None,
         dst,
         dst_bank,
@@ -4802,7 +4810,7 @@ pub(crate) fn try_walker_specialize_load_special_method<Sym: WalkSym>(
 
 /// Emit the guards and the inline `Method` a constant-descriptor bind reduces
 /// to, given a `w_descr` some caller has already proven binds through
-/// `w_method_new(w_descr, obj, w_type)` alone.
+/// `w_method_new(w_descr, obj, w_type)`, with the descriptor's header stamp.
 ///
 /// Three guards make that reduction reproducible: `guard_class` on the physical
 /// layout the `w_class` read needs, `guard_value` on the Python-level class so
@@ -4814,9 +4822,8 @@ pub(crate) fn try_walker_specialize_load_special_method<Sym: WalkSym>(
 /// The `Method` is then built inline rather than called for, which is what
 /// lets the consuming `CALL` virtualize it away.
 ///
-/// Shared by the two folds that reach this reduction from different
-/// preconditions: `LOAD_ATTR` of a plain function descriptor, and
-/// `LOAD_SPECIAL`'s type-only `__enter__` / `__exit__` lookup.
+/// Shared by `LOAD_ATTR`, builtin `getattr`, and `LOAD_SPECIAL`'s type-only
+/// `__enter__` / `__exit__` lookup, each with its own lookup preconditions.
 #[allow(clippy::too_many_arguments)]
 fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -4825,6 +4832,7 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
     w_descr: pyre_object::PyObjectRef,
+    header: (bool, pyre_object::PyObjectRef),
     shadow: Option<ShadowGuard>,
     dst: usize,
     dst_bank: char,
@@ -4856,31 +4864,24 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
         walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     }
 
-    // The header stamp is the one `w_method_new`'s allocation performs
-    // (`ob_type` comes from the NewWithVtable's size descr).
-    let func_const = ctx.trace_ctx.const_ref(w_descr as i64);
-    let header_w_class = ctx
-        .trace_ctx
-        .const_ref(pyre_object::get_instantiate(&pyre_object::function::METHOD_TYPE) as i64);
-    let method_op = crate::helpers::emit_bound_method_inline(
-        ctx.trace_ctx,
-        func_const,
+    // `baseobjspace::get` binds method descriptors through
+    // `builtin_bound_method_new`, including its w_class / w_module stores.
+    // Share the descriptor binding body with super; only lookup differs.
+    let method_op = walker_emit_super_attr_binding(
+        ctx,
+        op_pc,
         obj,
+        concrete_obj,
+        w_type,
         w_type_const,
-        header_w_class,
-    );
-    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(method_op, method_type_addr);
-    // The concrete bound method the walker's own execution must observe; a
-    // fresh `Method` per evaluation is what the interpreter's own bind produces
-    // anyway, so the trace allocating its own is not an identity divergence.
-    let bound = pyre_object::w_method_new(w_descr, concrete_obj, w_type);
-    ctx.trace_ctx.set_opref_concrete(
-        method_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(bound as usize)),
-    );
+        w_descr,
+        SuperAttrBinding::Method {
+            w_function: w_descr,
+            header,
+            bind_to_class: false,
+            slot_pin: None,
+        },
+    )?;
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_op)
 }
 
@@ -10898,13 +10899,36 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     }
     // The name is rejected before any lookup unless it is a string, and the
     // resolved bytes below stay valid only while this exact string is the
-    // operand.  A name that is not valid UTF-8 cannot match an attribute the
-    // fold's `&str` lookups can find, so it declines with the rest.
+    // operand.  Keep the WTF-8 view: PyPy's RPython string carries lone
+    // surrogates through the same traced descriptor lookup as ASCII names.
     if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
         return Ok(None);
     }
-    let Ok(name) = (unsafe { pyre_object::w_str_get_wtf8(concrete_name) }).as_str() else {
-        return Ok(None);
+    let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+
+    // Resolve the descriptor case before emitting anything.  A function-valued
+    // class attribute is not a plain class-attribute read: getattr binds it to
+    // the receiver.  PyPy traces that Method allocation and virtualizes it into
+    // the following CALL, so reproduce the same guarded allocation here.
+    let bound_method = unsafe {
+        pyre_interpreter::baseobjspace::bound_method_attr_fast_path_wtf8(concrete_obj, name)
+    };
+    let bound_method = match bound_method {
+        Some((w_type, version_tag, w_descr, owes_shadow_guard)) => {
+            let shadow = if owes_shadow_guard {
+                let Some(shadow) = (unsafe { walker_classify_shadow_guard(concrete_obj) }) else {
+                    return Ok(None);
+                };
+                Some(shadow)
+            } else {
+                None
+            };
+            let Some(header) = super_attr_method_header(w_descr) else {
+                return Ok(None);
+            };
+            Some((w_type, version_tag, w_descr, shadow, header))
+        }
+        None => None,
     };
 
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
@@ -10931,6 +10955,28 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
             &[name_ref, name_const],
         )?;
     }
+
+    if let Some((w_type, _version_tag, w_descr, shadow, header)) = bound_method {
+        walker_emit_constant_descr_bound_method(
+            ctx,
+            op.pc,
+            r_args[2],
+            concrete_obj,
+            w_type,
+            w_descr,
+            header,
+            shadow,
+            dst,
+            'r',
+        )?;
+        return Ok(Some(()));
+    }
+
+    let Ok(name) = name.as_str() else {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    };
 
     // Every shape the read declines has to leave the trace as it found it: the
     // two guards above are the premise of a fold that is no longer there, and

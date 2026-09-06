@@ -16515,7 +16515,11 @@ pub(crate) fn exec_or_eval(
     // pyopcode.py ensure_ns — the globals object is the
     // user-supplied dict, else the caller frame's globals, else a fresh
     // empty dict (`exec(src)` outside any frame, PyPy `newdict('module')`).
-    let w_globals = if !is_none_or_null(globals_arg) {
+    // Whether the caller supplied each namespace is settled here, ahead of
+    // anything that can collect: it is a property of the arguments and not of
+    // the addresses they hold, which the plant below can change.
+    let globals_supplied = !is_none_or_null(globals_arg);
+    let w_globals = if globals_supplied {
         globals_arg
     } else if !caller_frame.is_null() {
         unsafe { (*caller_frame).get_w_globals() }
@@ -16643,6 +16647,7 @@ pub(crate) fn exec_or_eval(
         let _ = ns_roots.pin_root(implicit_caller_locals);
         slot
     });
+
     // function.py Function.__init__ — build the closure carrier for
     // `exec(code, ..., closure=...)`.  A `Function` whose `__closure__` is the
     // validated cell tuple; createframe reads it back through

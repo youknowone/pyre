@@ -30,6 +30,11 @@ The runner sets `cwd` to `snippets/` so `from testutils import ...`
 works.  `testutils.py` is the helper module shipped with the snippets
 (`assert_raises`, `TestFailingBool`, etc.).
 
+Do not name a snippet after a stdlib module it or another snippet imports.
+For example, `pickle_accelerator.py` must not be called `_pickle.py`: CPython
+builds that load `_pickle` as an extension search the snippets directory first,
+while builds with a builtin `_pickle` hide that collision.
+
 ## Layout
 
 - `snippets/` — imported RustPython tests and generic pyre-authored gaps,

@@ -1,4 +1,9 @@
 # pyre-check: max-pypy-ratio=50
+# PyPy traces through builtin getattr for lone-surrogate names just as it does
+# for ordinary names.  The pyre fold keeps the WTF-8 name intact, virtualizes
+# the bound Method into its CALL, and inlines the property's Python getter.
+# Losing either path leaves a per-iteration CALL_MAY_FORCE and crosses this
+# ceiling; the folded dynasm path is about 6x faster than that residual path.
 N = 200000
 
 METH = '\udc81'   # lone surrogate naming a method on the class

@@ -25,3 +25,14 @@ repos:
         # `pre-commit run --all-files` that diff is empty and the hook is inert,
         # which is what keeps the tree's existing numbers out of scope.
         always_run: true
+
+      - id: cargo-fmt
+        name: cargo fmt --check
+        # `cargo fmt --check` is the job every other CI job waits behind, so an
+        # unformatted line throws away a whole run's worth of signal for
+        # something a local run answers in seconds. Check-only on purpose: a
+        # hook that rewrote files would change work mid-commit.
+        entry: cargo fmt --all -- --check
+        language: system
+        types_or: [rust]
+        pass_filenames: false

@@ -6,11 +6,8 @@
 # state it returns, and one that publishes none cannot be rebuilt through an
 # empty `__newobj__` call.
 #
-# `__reduce_ex__` is called directly rather than through `pickle`: this
-# directory carries its own `_pickle.py`, which shadows the stdlib extension
-# module and stops `import pickle` from working here.  That keeps this file
-# green under CPython too, unlike its `pickle_*` neighbours, which is what
-# lets it be gated.
+# Call `__reduce_ex__` directly to inspect the reduction tuple and the
+# refusal at the native object's boundary.
 import io
 import itertools
 import types

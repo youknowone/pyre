@@ -15,6 +15,7 @@
 //! opname arms stay in `handle` (mod.rs) and call into these.
 
 use majit_translate::codewriter::jitcode::DescentBlockerSummary;
+use rustpython_wtf8::Wtf8;
 
 use super::*;
 
@@ -8894,17 +8895,98 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    try_walker_inline_property_get_named(
+        ctx,
+        op,
+        code,
+        r_args,
+        call_descr,
+        obj,
+        Wtf8::new(name.as_str()),
+        dst,
+        dst_bank,
+        None,
+    )
+}
+
+/// Builtin `getattr(obj, name)` counterpart of
+/// [`try_walker_inline_property_get`].  PyPy traces through the builtin and
+/// the property's Python getter regardless of whether `name` has a UTF-8
+/// spelling; keep that route for pyre's opaque builtin-call boundary.
+pub(crate) fn try_walker_inline_builtin_getattr_property<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_name),
+    ) = (concretes[0], concretes[1], concretes[2], concretes[3])
+    else {
+        return Ok(None);
+    };
+    if callable.is_null()
+        || !null_or_self.is_null()
+        || concrete_obj.is_null()
+        || concrete_name.is_null()
+        || !pyre_interpreter::builtins::is_builtin_getattr_function(callable)
+        || !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::STR_TYPE) }
+    {
+        return Ok(None);
+    }
+    let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+    try_walker_inline_property_get_named(
+        ctx,
+        op,
+        code,
+        r_args,
+        call_descr,
+        r_args[2],
+        name,
+        dst,
+        'r',
+        Some((r_args[0], callable, r_args[3], concrete_name)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_property_get_named<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    name: &Wtf8,
+    dst: usize,
+    dst_bank: char,
+    builtin_guards: Option<(
+        OpRef,
+        pyre_object::PyObjectRef,
+        OpRef,
+        pyre_object::PyObjectRef,
+    )>,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
         return Ok(None);
     }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
         return Ok(None);
     };
-    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
-        return Ok(None);
-    };
     let Some((w_type, version_tag, w_descr, fget)) = (unsafe {
-        pyre_interpreter::objspace::std::mapdict::property_get_fast_path(concrete_obj, &name)
+        pyre_interpreter::objspace::std::mapdict::property_get_fast_path_wtf8(concrete_obj, name)
     }) else {
         return Ok(None);
     };
@@ -8937,6 +9019,29 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     // own past this point, so keep a rewind point the way the type-call fold
     // does.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    if let Some((callable_op, callable, name_op, concrete_name)) = builtin_guards {
+        if !callable_op.is_constant() {
+            let expected = ctx.trace_ctx.const_ref(callable as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op.pc,
+                OpCode::GuardValue,
+                &[callable_op, expected],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(callable_op, expected);
+        }
+        if !name_op.is_constant() {
+            let expected = ctx.trace_ctx.const_ref(concrete_name as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op.pc,
+                OpCode::GuardValue,
+                &[name_op, expected],
+            )?;
+        }
+    }
     walker_pin_descriptor_slot(ctx, op.pc, w_descr, crate::descr::property_fget_descr())?;
     let inlined = try_walker_inline_resolved_user_call(
         ctx,
