@@ -513,9 +513,12 @@ fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable
         }
         let mut root: Option<Variable> = None;
         for candidate in incoming {
-            let mut branch_seen = seen.clone();
-            let Some(candidate_root) = visit(graph, &candidate, &mut branch_seen, reachable)?
-            else {
+            // flowspace.model.FunctionGraph.iterblocks visits each identity
+            // once across the whole graph. Do the same for this backward walk:
+            // every discovered definition propagates to the query's root, so
+            // a repeated node contributes no new definition. A path-local set
+            // enumerates every path through successive diamonds exponentially.
+            let Some(candidate_root) = visit(graph, &candidate, seen, reachable)? else {
                 continue;
             };
             if root
@@ -1945,6 +1948,48 @@ mod tests {
             Some(root),
             "a constant from an unreachable predecessor must not veto alias resolution"
         );
+    }
+
+    #[test]
+    fn block_alias_converging_diamonds_share_the_visited_set() {
+        // A small graph with billions of paths. Alias resolution must inspect
+        // its definitions, not enumerate those paths; it must still reject a
+        // different root entering halfway through the converging branches.
+        for conflicting in [false, true] {
+            let mut g = FunctionGraph::new("alias_diamonds");
+            let entry = g.startblock;
+            let root = g.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+            let other = g.push_op_var(entry, OpKind::ConstInt(8), true).unwrap();
+            let cond = g.push_op_var(entry, OpKind::ConstBool(true), true).unwrap();
+            let mut block = entry;
+            let mut value = root.clone();
+            for layer in 0..32 {
+                let (left, left_args) = g.create_block_with_arg_vars(1);
+                let (right, right_args) = g.create_block_with_arg_vars(1);
+                let (join, join_args) = g.create_block_with_arg_vars(1);
+                let right_value = if conflicting && layer == 16 {
+                    other.clone()
+                } else {
+                    value.clone()
+                };
+                g.set_branch(
+                    block,
+                    cond.clone(),
+                    left,
+                    vec![value],
+                    right,
+                    vec![right_value],
+                );
+                g.set_goto(left, join, left_args);
+                g.set_goto(right, join, right_args);
+                block = join;
+                value = join_args[0].clone();
+            }
+            assert_eq!(
+                resolve_block_alias(&g, &value),
+                (!conflicting).then_some(root)
+            );
+        }
     }
 
     #[test]
