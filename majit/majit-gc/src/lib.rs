@@ -605,6 +605,35 @@ pub trait GcAllocator: Send {
         }
     }
 
+    /// The `gc_push_roots(livevars)` form of
+    /// [`Self::alloc_fast_nursery_collecting_typed_rooted`].  RPython's GC
+    /// transform publishes every live GC variable, not a distinguished single
+    /// one; this span is the direct ABI for allocation sites with more than one
+    /// native-stack livevar.
+    ///
+    /// # Safety
+    /// `roots` must address `root_count` contiguous mutable [`GcRef`] slots
+    /// which remain valid until this call returns. `needs_write_barrier` has
+    /// the same contract as the one-root form.
+    unsafe fn alloc_fast_nursery_collecting_typed_roots(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        roots: *mut GcRef,
+        root_count: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        unsafe { *needs_write_barrier = true };
+        for i in 0..root_count {
+            unsafe { self.add_root(roots.add(i)) };
+        }
+        let result = self.alloc_nursery_typed(type_id, size);
+        for i in (0..root_count).rev() {
+            self.remove_root(unsafe { roots.add(i) });
+        }
+        result
+    }
+
     /// Allocate a fixed-size object without triggering collection.
     ///
     /// Implementations may fall back to old-gen allocation when the nursery
@@ -1488,6 +1517,24 @@ impl GcAllocator for GcHandle {
     ) -> GcRef {
         gc_sync::gc_op(|gc| unsafe {
             gc.alloc_fast_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+        })
+    }
+    unsafe fn alloc_fast_nursery_collecting_typed_roots(
+        &mut self,
+        type_id: u32,
+        size: usize,
+        roots: *mut GcRef,
+        root_count: usize,
+        needs_write_barrier: *mut bool,
+    ) -> GcRef {
+        gc_sync::gc_op(|gc| unsafe {
+            gc.alloc_fast_nursery_collecting_typed_roots(
+                type_id,
+                size,
+                roots,
+                root_count,
+                needs_write_barrier,
+            )
         })
     }
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef {
@@ -2398,6 +2445,31 @@ pub unsafe fn standalone_alloc_fast_nursery_collecting_typed_rooted(
     })
 }
 
+/// [`standalone_alloc_fast_nursery_collecting_typed_rooted`] with the complete
+/// live-root span produced by an RPython-style `gc_push_roots(livevars)`.
+///
+/// # Safety
+/// `roots` must address `root_count` contiguous mutable [`GcRef`] slots for the
+/// duration of the call.
+#[inline]
+pub unsafe fn standalone_alloc_fast_nursery_collecting_typed_roots(
+    type_id: u32,
+    payload_size: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    gc_sync::gc_op(|g| unsafe {
+        g.alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            payload_size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
+    })
+}
+
 /// Process-global callback that performs a nursery allocation for the
 /// currently active backend. The callback returns `GcRef(0)` (i.e.
 /// null) on allocation failure so callers can fall back to a
@@ -2775,6 +2847,65 @@ pub unsafe fn alloc_fast_nursery_collecting_typed_rooted(
             )
         },
         Some(f) => unsafe { f(type_id, payload_size, root, needs_write_barrier) },
+        None => {
+            unsafe { *needs_write_barrier = true };
+            GcRef(0)
+        }
+    }
+}
+
+/// Process-global root-span companion of
+/// [`alloc_fast_nursery_collecting_typed_rooted`].
+pub type AllocNurseryCollectingTypedRootsFn = unsafe fn(
+    type_id: u32,
+    payload_size: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef;
+
+global_hook!(
+    static ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTS:
+        AllocNurseryCollectingTypedRootsFn
+);
+
+pub fn set_active_alloc_nursery_collecting_typed_roots(
+    hook: Option<AllocNurseryCollectingTypedRootsFn>,
+) {
+    ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTS.set(hook);
+}
+
+/// Allocate through the active `malloc_fast` root-span allocator.
+///
+/// # Safety
+/// `roots` must address `root_count` contiguous mutable [`GcRef`] slots for the
+/// duration of the call.
+pub unsafe fn alloc_fast_nursery_collecting_typed_roots(
+    type_id: u32,
+    payload_size: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTS.get() {
+        Some(_) if !gc_box_installed() => unsafe {
+            standalone_alloc_fast_nursery_collecting_typed_roots(
+                type_id,
+                payload_size,
+                roots,
+                root_count,
+                needs_write_barrier,
+            )
+        },
+        Some(f) => unsafe {
+            f(
+                type_id,
+                payload_size,
+                roots,
+                root_count,
+                needs_write_barrier,
+            )
+        },
         None => {
             unsafe { *needs_write_barrier = true };
             GcRef(0)

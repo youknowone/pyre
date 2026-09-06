@@ -322,7 +322,7 @@ fn alloc_callee_frame(
             w_globals,
             execution_context,
             PY_NULL,
-            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         ),
     )
     .into_raw();
@@ -1997,7 +1997,15 @@ fn jit_blackhole_resume_from_guard(
     raw_deadframe_ptr: *const i64,
     num_raw_deadframe: usize,
     guard_exc: i64,
+    savedata: usize,
 ) -> Option<i64> {
+    // `ResumeGuardForcedDescr.handle_fail` retains the GC-owned cache across
+    // resume preparation. The raw CALL_ASSEMBLER ABI copied jf_savedata, so
+    // root that copy too and read its forwarded value at the actual decode.
+    let savedata_slot = [savedata as i64];
+    let _savedata_root = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| savedata != 0)
+    };
     let ca_adopted_frame = CA_WALK_ADOPTED_FRAME.with(|c| c.replace(0));
     let ca_finished_frame = CA_WALK_FINISHED_FRAME.with(|c| c.replace(0));
     let ca_resume_frame = CA_WALK_RESUME_FRAME.with(|c| c.replace(0));
@@ -2011,10 +2019,16 @@ fn jit_blackhole_resume_from_guard(
     // in eval.rs. We do this BEFORE setting up resume state so deep
     // recursion through the blackhole interpreter cannot accumulate
     // further damage.
-    if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
-        // Stash for the eval loop to surface — same channel the
-        // blackhole/force callbacks already use for cross-FFI errors.
-        crate::call_jit::set_pending_ca_exception(exc);
+    if let Err(mut exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+        // This callback returns as the result of CALL_ASSEMBLER, whose caller
+        // immediately executes GUARD_NO_EXCEPTION.  Publish into the same two
+        // exception cells as every raising residual call; merely stashing the
+        // PyError for the outer eval loop would let the null call result reach
+        // bytecode consumers before that boundary (and, on AArch64, crash).
+        let exc_obj = exc.to_exc_object();
+        if exc_obj != pyre_object::PY_NULL {
+            publish_residual_call_exception(exc_obj as i64);
+        }
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
         return None;
     }
@@ -2158,16 +2172,8 @@ fn jit_blackhole_resume_from_guard(
         // result.
         // compile.py `ResumeGuardForcedDescr.handle_fail` fishes the
         // cache `handle_async_forcing` saved; no other `handle_fail` does.
-        // `fail_values[0]` IS the callee's `PyFrame*` for the Python portal
-        // (the entry-green-key recovery above relies on the same contract), so
-        // it names the frame a force would have attached its cache to.
         let all_virtuals = if descr_arc.is_guard_forced() {
-            crate::eval::take_forced_virtuals_for_frame(
-                fail_values
-                    .first()
-                    .map(|v| *v as *const pyre_interpreter::pyframe::PyFrame)
-                    .unwrap_or(std::ptr::null()),
-            )
+            majit_metainterp::allvirtuals::reveal(majit_ir::GcRef(savedata_slot[0] as usize))
         } else {
             None
         };
@@ -4770,19 +4776,11 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             {
                 return result;
             }
-            // compile.py `ResumeGuardForcedDescr.handle_fail`: only a
-            // GUARD_NOT_FORCED failure fishes the cache the force saved, keyed
-            // by the callee frame `raw_values[0]` names.
-            let forced_cache_owner = if descr_arc.is_guard_forced() {
-                callee_frame as *const pyre_interpreter::pyframe::PyFrame
-            } else {
-                std::ptr::null()
-            };
             let bh = crate::eval::resume_in_blackhole_from_exit_layout(
                 &raw_values,
                 &exit_layout,
                 guard_exc,
-                forced_cache_owner,
+                None,
                 false,
             );
             handle_blackhole_result(bh, green_key).unwrap_or(0)

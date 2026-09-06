@@ -15292,7 +15292,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 w_globals,
                 execution_context,
                 PY_NULL,
-                pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+                pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ),
         );
         drop(arg_roots);
@@ -15365,7 +15365,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
             current_globals,
             execution_context,
             current_closure,
-            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         ),
     );
     // The `drop(concrete_frame)` below relinquishes only the host handle for a

@@ -2719,6 +2719,19 @@ impl TraceCtx {
         Self::do_record_op_with_descr(&mut self.recorder, opcode, args, descr)
     }
 
+    /// pyjitpl.py `execute_new_with_vtable`: record the allocation and publish
+    /// both facts the trace-time heap cache learns from it.
+    pub fn execute_new_with_vtable(&mut self, descr: DescrRef) -> OpRef {
+        let known_class = descr.as_size_descr().map(|size| size.vtable() as i64);
+        let result =
+            Self::do_record_op_with_descr(&mut self.recorder, OpCode::NewWithVtable, &[], descr);
+        self.heap_cache.new_object(result);
+        if let Some(class) = known_class {
+            self.heap_cache.class_now_known(result, class);
+        }
+        result
+    }
+
     /// Record a guard with auto-generated FailDescr.
     ///
     /// `num_live` is the number of live integer values (for the FailDescr).

@@ -1792,30 +1792,6 @@ pub struct MetaInterp<M: Clone> {
     /// Used to derive lengths from the actual object when the interpreter
     /// does not provide them explicitly.
     pub(crate) vable_ptr: *const u8,
-    /// `compile.py` — the virtual cache `handle_async_forcing`
-    /// produced, kept for the `GUARD_NOT_FORCED` failure that must follow.
-    ///
-    /// Upstream hides an `AllVirtuals` instance in the deadframe's
-    /// `jf_savedata` GCREF slot and `ResumeGuardForcedDescr.handle_fail`
-    /// fishes it back out. pyre cannot put a Rust value in that slot — the GC
-    /// traces it as a real object reference (`jitframe_trace` in
-    /// `majit-backend/src/jitframe.rs`)
-    /// — so the cache is held here, keyed by the virtualizable that was forced.
-    /// One entry per frame, overwritten on re-force, exactly like the single
-    /// `jf_savedata` word.
-    ///
-    /// The ptr half is a GC root for as long as the entry lives, walked by
-    /// [`Self::walk_forced_virtuals_refs`]: `force_all_virtuals`
-    /// (`resume.py:969-981`) materializes every `rd_virtuals` entry, including
-    /// ones named only by a resume frame's ref registers, and those are written
-    /// nowhere else at force time — this `Vec` is their only referent until the
-    /// `GUARD_NOT_FORCED` failure consumes it. Upstream gets that edge from
-    /// `jf_savedata` being traced; here it comes from the root walker.
-    ///
-    /// An entry the guard never consumes is dropped by
-    /// [`Self::prune_forced_virtuals`] when its owner frame dies, which is what
-    /// `jf_savedata` gets for free by living on the deadframe.
-    pub(crate) forced_virtuals: Vec<(u64, Vec<i64>, Vec<i64>)>,
     /// Virtualizable array lengths for trace-entry box layout.
     pub(crate) vable_array_lengths: Vec<usize>,
     /// warmspot.py:449 jd.result_type — per-driver static result type.
@@ -2877,66 +2853,6 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// GC walker for the forced-virtual caches held in
-    /// `Self::forced_virtuals`, standing in for the trace `jf_savedata` gets
-    /// as a real GCREF field (`jitframe_trace` in
-    /// `majit-backend/src/jitframe.rs`).
-    ///
-    /// Only the ptr half is walked. The int half is `virtuals_int_cache` —
-    /// unboxed integer field values — and handing those to the visitor would
-    /// test integers as heap addresses. `prepare_resume_heap_with_roots` roots
-    /// the same one half for the same reason.
-    ///
-    /// Unmaterialized `0` cache slots pass through unchanged, as they do in
-    /// `shadow_stack::walk_resume_ref_roots`.
-    ///
-    /// The walk is unconditional, so it is a strong edge where `jf_savedata` is
-    /// an ephemeron one: a major seeds these values from `seed_major_roots`,
-    /// while [`Self::prune_forced_virtuals`] can only drop a dead owner's entry
-    /// at the *end* of marking, once VISITED is decided. An entry whose owner
-    /// died inside the cycle therefore keeps its materialized graph until the
-    /// next major — one cycle of floating garbage, bounded: the sweep clears
-    /// VISITED on every survivor and the entry is gone, and the sole writer
-    /// (`save_forced_virtuals`) is reached only by forcing a live virtualizable,
-    /// so nothing re-adds it. The prune also strictly precedes the sweep, so a
-    /// named owner's address can never be recycled underneath an entry.
-    ///
-    /// That bound holds only while no cached virtual reaches the owner frame: a
-    /// back-edge would let this walk mark the owner, `classify_owner` would then
-    /// answer `Some`, and the entry would never be pruned at all. The vable is
-    /// returned beside the cache rather than inside it (`force_from_resumedata`)
-    /// and no such edge exists today.
-    pub fn walk_forced_virtuals_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
-        for (_owner, ptrs, _ints) in self.forced_virtuals.iter_mut() {
-            for slot in ptrs.iter_mut() {
-                // SAFETY: `GcRef` is a pointer-sized newtype over the same
-                // representation these slots hold, the same reinterpret
-                // `walk_resume_ref_roots` performs on `virtuals_ptr_cache`
-                // (`majit-gc/src/shadow_stack.rs`). Walked unconditionally
-                // for both collection kinds: the minor forwards a
-                // nursery-resident virtual in place, the major seeds it as a
-                // mark root so the sweep does not free it.
-                let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
-                visitor(gcref);
-            }
-        }
-    }
-
-    /// Drop the forced-virtual caches whose owner frame died.
-    ///
-    /// `classify` answers with the owner's current address, or `None` if it did
-    /// not survive. A major collection moves nothing, so a surviving owner
-    /// answers with the key it was asked about.
-    ///
-    /// Without this, rooting the ptr half would keep an unconsumed entry's
-    /// objects alive forever and leave a stale `PyFrame` key that a later frame
-    /// at the same address could fish. Upstream is immune because `jf_savedata`
-    /// dies with its deadframe; this reproduces that lifetime.
-    pub fn prune_forced_virtuals(&mut self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
-        self.forced_virtuals
-            .retain(|(owner, _, _)| classify(*owner as usize) == Some(*owner as usize));
-    }
-
     #[inline]
     fn prepare_compiled_run_io() {
         io_buffer::io_buffer_discard();
@@ -3541,7 +3457,6 @@ impl<M: Clone> MetaInterp<M> {
             pending_token: None,
             stats: JitStatsCounters::default(),
             vable_ptr: std::ptr::null(),
-            forced_virtuals: Vec::new(),
             vable_array_lengths: Vec::new(),
             result_type: Type::Ref,
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
@@ -15085,10 +15000,9 @@ impl<M: Clone> MetaInterp<M> {
     /// RPython flow: force_now() → cpu.force(token) → handle_async_forcing()
     /// → force_from_resumedata() → materialize all virtuals → save on deadframe.
     ///
-    /// The forced virtual caches (ptr, int) are stored on
-    /// `Self::forced_virtuals` for the blackhole resumption from the
-    /// GUARD_NOT_FORCED — RPython's `AllVirtuals` via `cpu.set_savedata_ref()`.
-    /// They are also returned, which only the unit tests below read.
+    /// The returned caches are attached to the backend deadframe by
+    /// `force_virtualizable_token_with_allocator`, matching `AllVirtuals` /
+    /// `cpu.set_savedata_ref` in `ResumeGuardForcedDescr.handle_async_forcing`.
     pub fn handle_async_forcing(
         &mut self,
         green_key: u64,
@@ -15138,14 +15052,8 @@ impl<M: Clone> MetaInterp<M> {
             None => self.get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)?,
         };
 
-        // compile.py:973-985 don't interrupt me! If the stack runs out
-        // in force_from_resumedata() then we have seen cpu.force() but
-        // not self.save_data(), leaving in an inconsistent state.
-        //
-        // RPython wraps the body in try/finally. CriticalCodeGuard's
-        // Drop impl re-enables report_error on every exit — including
-        // panic unwind — matching the RPython contract.
-        let _cc_guard = crate::CriticalCodeGuard::enter();
+        // `ResumeGuardForcedDescr.force_now` owns the critical interval,
+        // including the subsequent `AllVirtuals` allocation and publication.
         // compile.py:994: force_from_resumedata(metainterp_sd, self, deadframe, vinfo, ginfo)
         // compile.py `ResumeGuardDescr` storage — borrow rd_numb /
         // rd_consts / rd_virtuals / rd_pendingfields off the guard-owned
@@ -15188,7 +15096,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
         let all_liveness = self.staticdata.liveness_info.as_slice();
-        let (all_virtuals_ptr, all_virtuals_int, virtualizable_ptr) =
+        let (all_virtuals_ptr, all_virtuals_int, _virtualizable_ptr) =
             crate::resume::force_from_resumedata(
                 &self.staticdata.profiler,
                 rd_numb,
@@ -15203,26 +15111,11 @@ impl<M: Clone> MetaInterp<M> {
                 None, // ginfo — pyre has no greenfield mechanism
                 allocator,
             );
-        drop(_cc_guard);
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][handle_async_forcing] forced {} ptr + {} int virtuals",
                 all_virtuals_ptr.len(),
                 all_virtuals_int.len(),
-            );
-        }
-        // compile.py: obj = AllVirtuals(all_virtuals)
-        //   metainterp_sd.cpu.set_savedata_ref(deadframe, obj.hide())
-        //
-        // The store lives here, inside `handle_async_forcing`, exactly as
-        // upstream — every force entry point reaching this function is covered
-        // by it, including `force_virtual_if_necessary`'s (virtualref.py)
-        // which never sees the returned caches.
-        if virtualizable_ptr != 0 {
-            self.save_forced_virtuals(
-                virtualizable_ptr as u64,
-                all_virtuals_ptr.clone(),
-                all_virtuals_int.clone(),
             );
         }
         Some((all_virtuals_ptr, all_virtuals_int))
@@ -15244,7 +15137,10 @@ impl<M: Clone> MetaInterp<M> {
         token: u64,
         allocator: &dyn crate::resume::BlackholeAllocator,
     ) {
-        let deadframe = self
+        // `ResumeGuardForcedDescr.force_now`: the critical interval includes
+        // publishing savedata, not only materializing the cache.
+        let _critical = crate::CriticalCodeGuard::enter();
+        let mut deadframe = self
             .backend
             .force(GcRef(token as usize))
             .expect("active virtualizable must have a backend deadframe");
@@ -15269,66 +15165,18 @@ impl<M: Clone> MetaInterp<M> {
             })
             .collect::<Vec<_>>();
         // compile.py: faildescr.handle_async_forcing(deadframe)
-        self.handle_async_forcing_with_allocator(
-            Some(descr),
-            green_key,
-            trace_id,
-            fail_index,
-            &fail_values,
-            allocator,
-        );
-    }
-
-    /// `compile.py cpu.set_savedata_ref(deadframe, obj.hide())`.
-    ///
-    /// `owner` is the forced virtualizable, as the guard's own resume data
-    /// named it (`resume.py:1404`). Upstream can key on the deadframe because
-    /// `handle_fail` receives it; pyre's guard-failure path surfaces the frame
-    /// rather than the jitframe, and the two ends agree on the frame: the force
-    /// runs against a named virtualizable and the GUARD_NOT_FORCED that follows
-    /// deopts that same frame's loop.
-    fn save_forced_virtuals(&mut self, owner: u64, ptrs: Vec<i64>, ints: Vec<i64>) {
-        // The key is a bare address, so the mechanism holds only while that
-        // address is stable. It is: the virtualizable is an interpreter-created
-        // frame (`FrameBox::new` → `try_gc_alloc_stable_raw`, "stable across
-        // minor and major collections (MiniMark mark-sweep does not move
-        // old-gen objects)"), never one of the frames a trace builds virtually.
-        // A nursery owner would break both ends — a minor would forward the
-        // frame out from under this key, and the pruner's classifier keeps every
-        // non-old-gen owner, so the entry could never be dropped either.
-        debug_assert!(
-            !majit_gc::gc_is_nursery_object(owner as usize),
-            "forced-virtual cache keyed on a nursery-resident virtualizable \
-             (0x{owner:x}): the key must be a move-stable address",
-        );
-        match self.forced_virtuals.iter_mut().find(|e| e.0 == owner) {
-            // A second force of the same frame overwrites, the way a second
-            // `set_savedata_ref` overwrites the one `jf_savedata` word.
-            Some(entry) => *entry = (owner, ptrs, ints),
-            None => self.forced_virtuals.push((owner, ptrs, ints)),
-        }
-    }
-
-    /// `compile.py` — `handle_fail` of a `GUARD_NOT_FORCED` fishes
-    /// the cache `handle_async_forcing` left on the deadframe and hands it
-    /// to `resume_in_blackhole`, which is what makes the blackhole reuse
-    /// the objects the force already materialized instead of building a
-    /// second set (`resume.py:1373-1374`, and the `vable_size` skip in
-    /// `consume_vref_and_vable`).
-    pub fn take_forced_virtuals(&mut self, owner: u64) -> Option<(Vec<i64>, Vec<i64>)> {
-        let index = self.forced_virtuals.iter().position(|e| e.0 == owner);
-        // Only a GUARD_NOT_FORCED reaches here (`is_guard_forced()` gates the
-        // callers), so hit/miss is the force→resume handoff itself: the
-        // counterpart of the `handle_async_forcing` line above.
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit][take_forced_virtuals] owner=0x{:x} {}",
-                owner,
-                if index.is_some() { "hit" } else { "miss" },
-            );
-        }
-        let (_, ptrs, ints) = self.forced_virtuals.swap_remove(index?);
-        Some((ptrs, ints))
+        let (ptrs, ints) = self
+            .handle_async_forcing_with_allocator(
+                Some(descr),
+                green_key,
+                trace_id,
+                fail_index,
+                &fail_values,
+                allocator,
+            )
+            .expect("forced guard must have resume data");
+        let savedata = crate::allvirtuals::allocate(ptrs, ints);
+        self.backend.set_savedata_ref(&mut deadframe, savedata);
     }
 
     pub fn is_force_token_armed(&self, token: u64) -> bool {
@@ -18789,6 +18637,9 @@ pub enum DetailedDriverRunOutcome {
         /// `_prepare_resume_from_failure`) so an exception guard unwinds
         /// to its handler instead of resuming the no-exception path.
         guard_exc: i64,
+        /// `ResumeGuardForcedDescr.handle_fail` consumes the cache saved on
+        /// this deadframe, never a cache keyed by the virtualizable's address.
+        savedata: Option<GcRef>,
     },
     Abort {
         restored: bool,
@@ -26233,9 +26084,11 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        // Unmodified static boxes are skipped; only the token reset remains.
-        assert_eq!(ops.len(), 1);
+        // pyjitpl.py gen_store_back_in_vable writes the static field and
+        // resets the token. Repeating the hint does not repeat either store.
+        assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
     }
 
     #[test]
@@ -26538,9 +26391,10 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        // Second trace is a fresh init, so the token store is recorded again.
-        assert_eq!(ops.len(), 1);
+        // A fresh trace records the static field and token stores again.
+        assert_eq!(ops.len(), 2);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
     }
 
     #[test]
@@ -26561,12 +26415,10 @@ mod tests {
         meta.opimpl_hint_force_virtualizable(OpRef::input_arg_ref(0));
 
         let ops = take_recorded_ops(&mut meta);
-        // First hint writes the token; getfield_vable consumes forced
-        // state; second hint writes the token again. Static boxes are
-        // unmodified so they are not stored.
-        assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
-        assert_eq!(ops[1].opcode, OpCode::SetfieldGc);
+        // Each hint writes the static field and token because getfield_vable
+        // consumes the forced state between the two hints.
+        assert_eq!(ops.len(), 4);
+        assert!(ops.iter().all(|op| op.opcode == OpCode::SetfieldGc));
     }
 
     #[test]

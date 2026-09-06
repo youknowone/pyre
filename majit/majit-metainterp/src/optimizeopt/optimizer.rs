@@ -1862,6 +1862,527 @@ impl Optimizer {
         crate::optimizeopt::shortpreamble::extract_short_preamble(optimized_ops)
     }
 
+    /// unroll.py OptUnroll.export_state preparation shared by
+    /// optimize_preamble and the actual optimize_bridge retrace branch.
+    /// The pass/Box plumbing lives on Optimizer in this port; keep that one
+    /// existing implementation, but invoke it only at upstream's export sites.
+    fn export_state(
+        &mut self,
+        jump: &Op,
+        pre_jump_resolved_args: Option<&[Operand]>,
+        num_inputs: usize,
+        loop_info: &mut BasicLoopInfo,
+        mut ctx: &mut OptContext,
+    ) -> Result<crate::optimizeopt::unroll::ExportedState, crate::optimize::InvalidLoop> {
+        // RPython unroll.py:454-457 order:
+        //   end_args = [force_box_for_end_of_preamble(a) for a ...]
+        //   self.optimizer.flush()
+        //   virtual_state = self.get_virtual_state(end_args)
+        // — VS captured AFTER force + flush.
+        let original_jump_args: Vec<OpRef> = pre_jump_resolved_args
+            .map(|v| v.iter().map(|b| b.to_opref()).collect())
+            .unwrap_or_else(|| {
+                jump.getarglist()
+                    .iter()
+                    .map(|a| a.get_box_replacement(false).to_opref())
+                    .collect()
+            });
+        let mut resolved_args = original_jump_args.clone();
+        // Dedup: two cases require SameAs allocation at end of preamble.
+        //
+        // Case A — duplicate args: when two JUMP slots reference the same
+        // OpRef (e.g. b and t in fib_loop after b = t aliasing), create a
+        // fresh SameAs for the second occurrence so each slot has a
+        // distinct identity.
+        //
+        // Case B — preamble inputarg position used by a non-self slot:
+        // when JUMP slot j carries OpRef::int_op(k) and k < num_inputs, k != j,
+        // the export hands Phase 2 a `next_iteration_args[j] = OpRef::int_op(k)`
+        // entry that collides with body inputarg slot k's own source
+        // position. import_state forwards both `OpRef::int_op(j) → OpRef::int_op(k)` and
+        // `OpRef::int_op(k) → nia[k]`, and get_box_replacement walks the chain
+        // through OpRef::int_op(k), making body inputarg j resolve to nia[k]
+        // instead of OpRef::int_op(k). RPython avoids this with fresh-Box identity
+        // per phase; majit's flat OpRef space needs an explicit SameAs
+        // alias so nia[j] points outside the body inputarg position range.
+        {
+            let mut seen: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+            // RPython parity: positions already holding an emitted op
+            // are phase 1 results, not body inputarg sources. Only
+            // the UNUSED positions in 0..num_inputs correspond to
+            // trace inputargs (`InputArgRef/Int/Float` in RPython).
+            let emitted_positions: indexmap::IndexSet<OpRef> = ctx
+                .new_operations
+                .iter()
+                .map(|op| op.pos.get())
+                .filter(|p| !p.is_none())
+                .collect();
+            let original_args = resolved_args.clone();
+            for (slot_idx, arg) in resolved_args.iter_mut().enumerate() {
+                if ctx
+                    .get_box_replacement_operand_opt(*arg)
+                    .and_then(|cb| cb.const_value())
+                    .is_some()
+                    || *arg == OpRef::NONE
+                {
+                    continue;
+                }
+                let is_dup = !seen.insert(*arg);
+                // Case B fires only when slot k (where `k = arg.raw()`, the
+                // position the current slot points at) holds a DIFFERENT
+                // OpRef. If slot k self-forwards (original_args[k] ==
+                // OpRef::int_op(k)), Phase 2 sets `forwarding[OpRef::int_op(k)] = OpRef::int_op(k)`
+                // which is a no-op in make_equal_to — no chain forms, so no
+                // aliasing is needed.
+                let target_slot = arg.raw() as usize;
+                let target_slot_self_forwards = original_args
+                    .get(target_slot)
+                    .is_none_or(|other| *other == *arg);
+                let is_cross_inputarg = target_slot < num_inputs
+                    && target_slot != slot_idx
+                    && !emitted_positions.contains(arg)
+                    && !target_slot_self_forwards;
+                if !is_dup && !is_cross_inputarg {
+                    continue;
+                }
+                let orig = *arg;
+                // history.py `record_same_as(box)` reads
+                // `box.type` directly to pick `same_as_i/r/f` — there is
+                // no guess-on-miss path in RPython. Match strict parity by
+                // requiring `opref_type` to resolve; a None here is a
+                // bookkeeping bug, not a recoverable case.
+                let arg_type = ctx.opref_type(orig).expect(
+                    "propagate_from_pass_range SameAs: source OpRef missing Box.type",
+                );
+                let same_as = OpCode::same_as_for_type(arg_type);
+                let fresh = ctx.alloc_op_position_typed(arg_type);
+                let arg0 = ctx.materialize_operand_at(orig);
+                let mut op = Op::new(same_as, std::slice::from_ref(&arg0));
+                op.pos.set(fresh);
+                // resoperation.py's operation IS its Box, even before
+                // shortpreamble.py add_preamble_op appends it to
+                // extra_same_as. Register that producer now so its
+                // source and forwarded info survive export_state;
+                // materializing a later zero-argument placeholder
+                // loses both (unroll.py _expand_info).
+                ctx.register_extra_producer(&std::rc::Rc::new(op.clone()));
+                // unroll.py:146 + compile.py:327 parity: accumulate the
+                // alias op in `extra_same_as` and splice it between the
+                // preamble body and the label at final assembly. Emitting
+                // directly into `ctx.new_operations` would push the op
+                // past the already-sent terminal JUMP and force the
+                // loop-tail relocation workaround below.
+                loop_info.extra_same_as.push(op);
+                let orig_box = ctx.get_box_replacement_operand_opt(orig);
+                if let Some(info) = orig_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+                    let fresh_info = match info {
+                        crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
+                            for field in &mut vinfo.fields {
+                                let orig_field = field.1.to_opref();
+                                // RPython Box type parity: the alias
+                                // inherits `box.type` from the original
+                                // field. RPython Box always carries
+                                // `box.type` (history.py:220), so a
+                                // missing type here is an unrecoverable
+                                // invariant violation — panic in release
+                                // as well as debug.
+                                let tp = ctx.opref_type(orig_field).unwrap_or_else(|| {
+                                panic!(
+                                    "virtual-field alias: orig_field {:?} has no resolvable box.type (RPython invariant violated)",
+                                    orig_field,
+                                )
+                            });
+                                // Producer-less alias resop: mint its
+                                // bound box up front and forward it to the
+                                // original field box.
+                                let (ff, b_ff) = ctx.reserve_virtual_box(tp);
+                                let b_orig = ctx.get_box_replacement_operand(orig_field);
+                                ctx.make_equal_to(&b_ff, &b_orig);
+                                let _ = ff;
+                                field.1 = b_ff;
+                            }
+                            crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
+                        }
+                        other => other,
+                    };
+                    if let Some(b) = ctx.get_box_replacement_operand_opt(fresh) {
+                        ctx.set_ptr_info(&b, fresh_info);
+                    }
+                }
+                *arg = fresh;
+                // After allocating a fresh alias for an inputarg position,
+                // update `seen` so the next slot referencing the same
+                // original OpRef goes through the duplicate path and
+                // gets its own fresh alias too.
+                if is_cross_inputarg {
+                    seen.insert(fresh);
+                }
+            }
+        }
+        // unroll.py:203 self.flush() — force lazy sets before
+        // producing short preamble ops (heap.py:53 invariant).
+        self.flush(&mut ctx)?;
+
+        // Now force all resolved (and dedup'd) args.
+        // unroll.py:454 `end_args = [force_box_for_end_of_preamble(a)
+        // for a in original_label_args]`.
+        ctx.preamble_end_args = Some(
+            resolved_args
+                .iter()
+                .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
+                .collect(),
+        );
+        // unroll.py `virtual_state = self.get_virtual_state(end_args)`.
+        // VS is captured AFTER force + flush so its `Virtual` /
+        // `VStruct` entries match the `info.is_virtual()` predicate
+        // that `enum_forced_boxes` asserts. Virtuals that were
+        // forced into concrete instances by `force_at_the_end_of_preamble`
+        // come back as `NotVirtualStateInfo` here, exactly as they
+        // do in RPython.
+        let post_force_args: Vec<OpRef> = resolved_args
+            .iter()
+            .map(|&a| {
+                let resolved = ctx.get_replacement_opref(a);
+                // bind-at-alloc: `export_state` below keys its
+                // `ExportCache` by these resolved positions. A producer-less
+                // value-bearing position resolves to a throwaway `from_opref`
+                // operand, so each `bound_from_opref` fallback returns a
+                // distinct Rc (ptr-Eq-unstable) and `export_single_value` logs it as an
+                // unbound export key. Bind the canonical `_forwarded` host
+                // once via `materialize_operand_at` (a `SameAs*` synthetic
+                // in `resop_refs`) so the
+                // export key resolves to one ptr-stable host — the identity
+                // the #188 `OpRef`→operand `ExportCache` rekey requires. The
+                // returned `OpRef` is unchanged (synthetic and orphan share
+                // the position), so the exported state is byte-identical.
+                if !resolved.is_none()
+                    && !resolved.is_constant()
+                    && ctx.get_box_replacement_operand_opt(resolved).is_none()
+                {
+                    ctx.materialize_operand_at(resolved);
+                }
+                resolved
+            })
+            .collect();
+        // RPython's `end_args` are Box objects and the same objects are
+        // carried into `next_iteration_args`.  Preserve those exact
+        // operands before ShortBoxes production mutates forwarding;
+        // retaining only their OpRef positions loses Box identity.
+        let preview_end_arg_boxes: Vec<majit_ir::operand::Operand> = post_force_args
+            .iter()
+            .map(|&arg| {
+                ctx.get_box_replacement_operand_opt(arg)
+                    .unwrap_or_else(|| ctx.materialize_operand_at(arg))
+            })
+            .collect();
+        let preview_virtual_state =
+            crate::optimizeopt::virtualstate::export_state(&post_force_args, &ctx);
+        let vs_args = &post_force_args;
+        // virtualstate.py:687-689 / unroll.py:154-158: a virtual-state
+        // mismatch here raises `VirtualStatesCantMatch` and the outer
+        // `compile_loop_body` catches it as an `InvalidLoop` to skip
+        // jump-to-existing and either retrace or fall back to the
+        // interpretive path. Propagate via the `InvalidLoop` panic
+        // payload so the existing wrapper
+        // (`unroll.rs`'s
+        // `optimize_trace_with_constants_and_inputs_vable_out`) catches
+        // and reroutes instead of crashing the worker thread.
+        let (preview_label_args, preview_virtuals, preview_label_source_positions) =
+            match preview_virtual_state.make_inputargs_and_virtuals_with_source_positions(
+                vs_args, self, &mut ctx, false,
+            ) {
+                Ok(pair) => pair,
+                Err(_) => {
+                    return Err(crate::optimize::InvalidLoop(
+                        "preview virtual state mismatch (VirtualStatesCantMatch)",
+                    ));
+                }
+            };
+        let mut preview_short_args = preview_label_args.clone();
+        preview_short_args.extend_from_slice(&preview_virtuals);
+        let mut short_boxes =
+            crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(
+                &preview_short_args,
+            );
+        for &arg in &preview_short_args {
+            // RPython shortpreamble.py:255-259 parity: each label arg
+            // is `box.type`, where Box objects intrinsically carry one
+            // of i / r / f. There is no `void` Box because Box always
+            // wraps a runtime value. Pyre recovers the same type from
+            // the typed OpRef variant or the trace's inputarg/op metadata.
+            let raw_type = ctx
+            .opref_type(arg)
+            .unwrap_or_else(|| {
+                panic!(
+                    "preview short arg missing box.type: arg={arg:?} preview_short_args={preview_short_args:?}"
+                )
+            });
+            if raw_type == majit_ir::Type::Void {
+                // shortpreamble.py reads `box.type` from a
+                // value Box and emits same_as_i/r/f. RPython has no
+                // Void value Box here; reaching Void means Rust-side
+                // OpRef/type bookkeeping lost Box identity and must not
+                // silently drop the short-preamble inputarg.
+                panic!(
+                    "preview short arg {arg:?} resolved to Type::Void; \
+                 short preamble inputargs must be int/ref/float value boxes \
+                 (shortpreamble.py:255-259)"
+                );
+            }
+            short_boxes.add_short_input_arg(&mut ctx, arg, raw_type);
+        }
+        self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
+        let produced = short_boxes.produced_ops(&mut ctx);
+        // shortpreamble.py:272-281 — the `for short_op in
+        // self.const_short_boxes:` half of `create_short_boxes`, which
+        // upstream runs on every unroll with no condition on it.
+        let produced_const = short_boxes.produced_const_ops(&mut ctx);
+        // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
+        // label_args + virtuals)` — read off the ShortBoxes object and
+        // carry to export_state through the ctx channel, together with
+        // the rooted InputArgRc pool (index-aligned, so the renamed
+        // boxes stay bound to live `InputArg`s across the export
+        // boundary instead of shedding to position-only boxes) and the
+        // short boxes below. Bound to locals here and published as one
+        // `PreviewShortState` at the group site.
+        let short_inputargs = short_boxes.create_short_inputargs(&preview_short_args);
+        let short_inputarg_refs = short_boxes.create_short_inputarg_refs();
+        // unroll.py computes virtual_state, label_args and virtuals
+        // once, then builds ShortBoxes from that exact result. Keep
+        // the same single evaluation across majit's split preview /
+        // export implementation: producing heap facts may mutate Box
+        // forwarding, so recomputing hereafter is observably different.
+        let args_state = Some((
+            preview_virtual_state.clone(),
+            preview_label_args.clone(),
+            preview_virtuals.clone(),
+            preview_label_source_positions,
+            preview_end_arg_boxes,
+        ));
+        // Single-object carry: each exported entry keeps the preview
+        // ProducedShortOp's replay Rc, so the pos/arg canonicalization
+        // below lands on the object that dep-replay operands reference
+        // (upstream exports the ResOperation objects themselves,
+        // unroll.py:478-487). The per-entry rewrites require each entry
+        // to own a distinct Rc.
+        #[cfg(debug_assertions)]
+        {
+            let mut seen: Vec<*const majit_ir::Op> = Vec::with_capacity(produced.len());
+            for (_, p) in &produced {
+                let ptr = std::rc::Rc::as_ptr(&p.preamble_op);
+                debug_assert!(
+                    !seen.contains(&ptr),
+                    "exported short boxes share a replay OpRc at {:?}",
+                    p.preamble_op.pos.get()
+                );
+                seen.push(ptr);
+            }
+        }
+        let mut convert_produced =
+            |result: OpRef,
+             produced: crate::optimizeopt::shortpreamble::ProducedShortOp,
+             const_group: bool| {
+                let canonical_result = ctx.get_replacement_opref(result);
+                let replay_result = if const_group {
+                    None
+                } else {
+                    // pure.py `produce_potential_short_preamble_ops` walks
+                    // `_newoperations`, not their replacements.  In particular,
+                    // `postprocess_GUARD_TRUE` can forward an already-emitted
+                    // pure comparison to CONST_1; PyPy still exports that
+                    // comparison Box and `PureOp.produce_op` installs it in the
+                    // next iteration's pure cache.  Keep the original result
+                    // identity for that case.  Using the inline Const as the
+                    // replay position would collapse distinct comparison Boxes
+                    // that happen to prove the same value.
+                    Some(exported_short_box_replay_result(
+                        result,
+                        canonical_result,
+                        &produced.kind,
+                    )?)
+                };
+                let preamble_op = produced.preamble_op.clone();
+                // For ShortInputArg, RPython keeps two identities:
+                // short_op.res is the original label Box and
+                // preamble_op is the fresh renamed InputArg.  Preserve
+                // the renamed replay position. Other short-op kinds
+                // replay into the canonical result position; the const
+                // channel keeps the fresh replay position minted by
+                // produced_const_ops.
+                if let Some(replay_result) = replay_result {
+                    preamble_op.pos.set(replay_result);
+                }
+                // optimizer.py force_box loop parity.
+                //
+                // Resolve POSITIONALLY when a producer is registered at
+                // this slot: replay-op args carry the dep replay handle
+                // (produce_arg, shortpreamble.py) whose forwarded slot
+                // is empty, so only the body producer registered at the
+                // same position carries the Phase-1 forwarding to the
+                // canonical end box this export boundary needs.
+                //
+                // When positional resolution finds NO producer, the carried
+                // handle is unforwarded and resolves to itself
+                // (resoperation.py:57-68): keep the handle OBJECT instead of
+                // re-minting a producer-less position-only box, so its
+                // identity (and the `Operand::Op`/`InputArg` shed) survives
+                // the export. The encoded OpRef is identical either way
+                // (`from_opref(arg.to_opref()) == arg.to_opref()`).
+                for i in 0..preamble_op.num_args() {
+                    let arg = preamble_op.arg(i);
+                    // The `OpRef::none()` sentinel has no producer box
+                    // (`materialize_operand_at` doc) — routing it through the
+                    // producer lookup is meaningless and trips the
+                    // `get_box_replacement` "box must exist" debug tripwire.
+                    if arg.is_none() {
+                        continue;
+                    }
+                    let resolved = ctx
+                        .resolve_operand_operand_opt(&arg)
+                        .unwrap_or_else(|| arg.clone());
+                    preamble_op.setarg(i, resolved);
+                }
+                if let Some(fail_args) = preamble_op.fail_args.borrow_mut().as_mut() {
+                    for arg in fail_args.iter_mut() {
+                        if arg.is_none() {
+                            continue;
+                        }
+                        *arg = ctx.get_box_replacement_operand(arg.to_opref());
+                    }
+                }
+                // Resolve the carried slot by entry kind. An InputArg
+                // label arg whose canonical result forwards away is absent
+                // from `short_boxes.label_args`, so a re-lookup of
+                // `canonical_result` returns None and the per-slot original
+                // is lost; `produced.label_arg_idx` preserves the original
+                // stamped slot through forwarding (the slot the renamed
+                // `short_inputargs[i]` pairs with — consumed by
+                // slot_to_original). For non-InputArg (Pure/LoopInvariant/
+                // Heap) entries the result_map consumer needs the FORWARDED
+                // slot: a Pure/LoopInvariant result proven equal to a label
+                // arg it did not originally occupy must reuse
+                // `short_args[slot]`, which `lookup_label_arg(canonical_
+                // result)` reports (pre-217 forwarded-slot lookup, parity
+                // with upstream Box-identity CompoundOp merge). For a label
+                // arg duplicated across `label_args + virtuals`,
+                // `lookup_label_arg` resolves to the LAST/live slot
+                // (`potential_ops[box]` overwrite), matching the InputArg
+                // branch's `live_slot` and upstream's surviving ShortInputArg.
+                let label_arg_idx = if produced.kind
+                    == crate::optimizeopt::shortpreamble::PreambleOpKind::InputArg
+                {
+                    produced.label_arg_idx
+                } else {
+                    short_boxes.lookup_label_arg(canonical_result)
+                };
+                Some(crate::optimizeopt::shortpreamble::PreambleOp {
+                    op: preamble_op,
+                    source_op: Some(produced.source_op.clone()),
+                    // short_op.res travels with the entry as the
+                    // exported `PreambleOp.res` operand; the preview
+                    // ProducedShortOp already carries the bound producer
+                    // / const operand, so it moves across unchanged.
+                    res: produced.res.clone(),
+                    kind: produced.kind,
+                    label_arg_idx,
+                    invented_name: produced.invented_name,
+                    same_as_source: produced.same_as_source.clone(),
+                })
+            };
+        let exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp> =
+            produced
+                .into_iter()
+                .filter_map(|(result, produced)| convert_produced(result, produced, false))
+                .collect();
+        let exported_const_short_boxes = produced_const
+            .into_iter()
+            .filter_map(|produced| {
+                convert_produced(produced.res.to_opref(), produced, true)
+            })
+            .collect();
+        ctx.exported_const_short_boxes = exported_const_short_boxes;
+        if crate::majit_log_enabled() {
+            for entry in &exported_short_boxes {
+                // Print args / same_as_source as OpRefs, not via the
+                // Operands' derived Debug: a bound InputArg/Op carries a
+                // `forwarded` slot whose Debug walks the whole abstract-value
+                // graph (fields, descrs, nested ops), dumping tens of MB per
+                // box and stalling the run.
+                let arg_oprefs: Vec<OpRef> =
+                    entry.op.getarglist().iter().map(|a| a.to_opref()).collect();
+                eprintln!(
+                    "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
+                    entry.kind,
+                    entry.op.pos.get(),
+                    entry.op.opcode,
+                    arg_oprefs,
+                    entry.op.getdescr().map(|d| d.index()),
+                    entry.invented_name,
+                    entry.same_as_source.as_ref().map(|o| o.to_opref()),
+                );
+            }
+        }
+        // Publish the preview's one evaluation as a single object: the
+        // forcing above (and its side effects) stays exactly where it
+        // is, only the publication is grouped, so a reader can no
+        // longer see one vector from this evaluation next to another
+        // that was never written.  Alignment is narrower than that —
+        // `short_inputargs` / `short_inputarg_refs` share an index
+        // space, `exported_short_boxes` does not.
+        ctx.preview_short_state = Some(crate::optimizeopt::PreviewShortState {
+            short_inputargs,
+            short_inputarg_refs,
+            short_boxes: exported_short_boxes,
+            args_state,
+        });
+        let jump_arglist_oprefs: Vec<OpRef> =
+            jump.getarglist().iter().map(|a| a.to_opref()).collect();
+        let exported_int_bounds =
+            self.collect_exported_int_bounds(&jump_arglist_oprefs, &mut ctx);
+        // RPython unroll.py:186-193 + compile.py: `info.renamed_inputargs`
+        // are the fresh per-iteration boxes from `trace.get_iter()`. They
+        // live in this run's iteration namespace, not the original
+        // frontend's. In pyre this maps to `[inputarg_base..inputarg_base
+        // + num_inputs)`: `inputarg_base = 0` for top-level loops
+        // (compile_loop / compile_retrace) where the frontend already
+        // owns `[0, num_inputs)`, and `inputarg_base = bridge_inputarg_base`
+        // for bridges, where `prepare_bridge_trace_for_optimizer`
+        // in pyjitpl.rs shifts
+        // the iteration into a disjoint range.  Use `num_inputs` (the
+        // external loop-entry contract count) rather than `ctx.num_inputs`
+        // (which may be widened by virtualizable expansion).
+        // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: each
+        // renamed inputarg's Box carries `.type` intrinsically
+        // (history.py:220). Mint typed variants from `inputarg_types`
+        // so the exported state's OpRefs match what Phase 2 will see
+        // under variant-aware Eq.
+        let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
+            .map(|i| {
+                // opencoder.py:259 inputarg_from_tp parity — strict
+                // box.type lookup, no InputArgVoid fallback.
+                let pos = ctx.inputarg_base + i as u32;
+                OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
+            })
+            .collect();
+        Ok(crate::optimizeopt::unroll::export_state(
+            &original_jump_args,
+            &renamed_inputargs,
+            self,
+            &mut ctx,
+            Some(&exported_int_bounds),
+        ))
+    }
+
+    /// optimizer.py _clean_optimization_info: exported_infos owns the saved
+    /// knowledge; carried Boxes must be clean before unroll.py import_state.
+    pub(crate) fn _clean_optimization_info(&mut self, lst: &[Operand]) {
+        for op in lst {
+            if !matches!(op.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
+                op.clear_forwarded();
+            }
+        }
+    }
+
     /// optimizer.py: send_extra_operation(op, ctx)
     /// Send an extra operation through the pass chain as if it were
     /// a new operation from the trace. Used by passes that need to
@@ -3173,541 +3694,25 @@ impl Optimizer {
         // `match` (not `jump.map(|jump| ...)`) so the `return Err(InvalidLoop)`
         // for the preview virtual-state mismatch below propagates out of
         // `optimize_with_constants_and_inputs_at`, not just the closure.
-        let building_bridge = self.building_bridge;
         // `Optimizer.optimize_loop` (optimizer.py) is the whole of
         // `SimpleCompileData.optimize`; there is no `optimize_preamble` behind
         // it to export for. See [`Self::simple_compile`].
-        self.exported_loop_state = match jump.filter(|_| !self.simple_compile) {
-            Some(jump) => 'export: {
-                // RPython unroll.py:454-457 order:
-                //   end_args = [force_box_for_end_of_preamble(a) for a ...]
-                //   self.optimizer.flush()
-                //   virtual_state = self.get_virtual_state(end_args)
-                // — VS captured AFTER force + flush.
-                let original_jump_args: Vec<OpRef> = pre_jump_resolved_args
-                    .clone()
-                    .map(|v| v.iter().map(|b| b.to_opref()).collect())
-                    .unwrap_or_else(|| {
-                        jump.getarglist()
-                            .iter()
-                            .map(|a| a.get_box_replacement(false).to_opref())
-                            .collect()
-                    });
-                let mut resolved_args = original_jump_args.clone();
-                // Dedup: two cases require SameAs allocation at end of preamble.
-                //
-                // Case A — duplicate args: when two JUMP slots reference the same
-                // OpRef (e.g. b and t in fib_loop after b = t aliasing), create a
-                // fresh SameAs for the second occurrence so each slot has a
-                // distinct identity.
-                //
-                // Case B — preamble inputarg position used by a non-self slot:
-                // when JUMP slot j carries OpRef::int_op(k) and k < num_inputs, k != j,
-                // the export hands Phase 2 a `next_iteration_args[j] = OpRef::int_op(k)`
-                // entry that collides with body inputarg slot k's own source
-                // position. import_state forwards both `OpRef::int_op(j) → OpRef::int_op(k)` and
-                // `OpRef::int_op(k) → nia[k]`, and get_box_replacement walks the chain
-                // through OpRef::int_op(k), making body inputarg j resolve to nia[k]
-                // instead of OpRef::int_op(k). RPython avoids this with fresh-Box identity
-                // per phase; majit's flat OpRef space needs an explicit SameAs
-                // alias so nia[j] points outside the body inputarg position range.
-                {
-                    let mut seen: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
-                    // RPython parity: positions already holding an emitted op
-                    // are phase 1 results, not body inputarg sources. Only
-                    // the UNUSED positions in 0..num_inputs correspond to
-                    // trace inputargs (`InputArgRef/Int/Float` in RPython).
-                    let emitted_positions: indexmap::IndexSet<OpRef> = ctx
-                        .new_operations
-                        .iter()
-                        .map(|op| op.pos.get())
-                        .filter(|p| !p.is_none())
-                        .collect();
-                    let original_args = resolved_args.clone();
-                    for (slot_idx, arg) in resolved_args.iter_mut().enumerate() {
-                        if ctx
-                            .get_box_replacement_operand_opt(*arg)
-                            .and_then(|cb| cb.const_value())
-                            .is_some()
-                            || *arg == OpRef::NONE
-                        {
-                            continue;
-                        }
-                        let is_dup = !seen.insert(*arg);
-                        // Case B fires only when slot k (where `k = arg.raw()`, the
-                        // position the current slot points at) holds a DIFFERENT
-                        // OpRef. If slot k self-forwards (original_args[k] ==
-                        // OpRef::int_op(k)), Phase 2 sets `forwarding[OpRef::int_op(k)] = OpRef::int_op(k)`
-                        // which is a no-op in make_equal_to — no chain forms, so no
-                        // aliasing is needed.
-                        let target_slot = arg.raw() as usize;
-                        let target_slot_self_forwards = original_args
-                            .get(target_slot)
-                            .is_none_or(|other| *other == *arg);
-                        let is_cross_inputarg = target_slot < num_inputs
-                            && target_slot != slot_idx
-                            && !emitted_positions.contains(arg)
-                            && !target_slot_self_forwards;
-                        if !is_dup && !is_cross_inputarg {
-                            continue;
-                        }
-                        let orig = *arg;
-                        // history.py `record_same_as(box)` reads
-                        // `box.type` directly to pick `same_as_i/r/f` — there is
-                        // no guess-on-miss path in RPython. Match strict parity by
-                        // requiring `opref_type` to resolve; a None here is a
-                        // bookkeeping bug, not a recoverable case.
-                        let arg_type = ctx.opref_type(orig).expect(
-                            "propagate_from_pass_range SameAs: source OpRef missing Box.type",
-                        );
-                        let same_as = OpCode::same_as_for_type(arg_type);
-                        let fresh = ctx.alloc_op_position_typed(arg_type);
-                        let arg0 = ctx.materialize_operand_at(orig);
-                        let mut op = Op::new(same_as, std::slice::from_ref(&arg0));
-                        op.pos.set(fresh);
-                        // unroll.py:146 + compile.py:327 parity: accumulate the
-                        // alias op in `extra_same_as` and splice it between the
-                        // preamble body and the label at final assembly. Emitting
-                        // directly into `ctx.new_operations` would push the op
-                        // past the already-sent terminal JUMP and force the
-                        // loop-tail relocation workaround below.
-                        loop_info.extra_same_as.push(op);
-                        let orig_box = ctx.get_box_replacement_operand_opt(orig);
-                        if let Some(info) = orig_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
-                            let fresh_info = match info {
-                                crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
-                                    for field in &mut vinfo.fields {
-                                        let orig_field = field.1.to_opref();
-                                        // RPython Box type parity: the alias
-                                        // inherits `box.type` from the original
-                                        // field. RPython Box always carries
-                                        // `box.type` (history.py:220), so a
-                                        // missing type here is an unrecoverable
-                                        // invariant violation — panic in release
-                                        // as well as debug.
-                                        let tp = ctx.opref_type(orig_field).unwrap_or_else(|| {
-                                        panic!(
-                                            "virtual-field alias: orig_field {:?} has no resolvable box.type (RPython invariant violated)",
-                                            orig_field,
-                                        )
-                                    });
-                                        // Producer-less alias resop: mint its
-                                        // bound box up front and forward it to the
-                                        // original field box.
-                                        let (ff, b_ff) = ctx.reserve_virtual_box(tp);
-                                        let b_orig = ctx.get_box_replacement_operand(orig_field);
-                                        ctx.make_equal_to(&b_ff, &b_orig);
-                                        let _ = ff;
-                                        field.1 = b_ff;
-                                    }
-                                    crate::optimizeopt::info::PtrInfo::Virtual(vinfo)
-                                }
-                                other => other,
-                            };
-                            if let Some(b) = ctx.get_box_replacement_operand_opt(fresh) {
-                                ctx.set_ptr_info(&b, fresh_info);
-                            }
-                        }
-                        *arg = fresh;
-                        // After allocating a fresh alias for an inputarg position,
-                        // update `seen` so the next slot referencing the same
-                        // original OpRef goes through the duplicate path and
-                        // gets its own fresh alias too.
-                        if is_cross_inputarg {
-                            seen.insert(fresh);
-                        }
-                    }
-                }
-                // unroll.py:203 self.flush() — force lazy sets before
-                // producing short preamble ops (heap.py:53 invariant).
-                self.flush(&mut ctx)?;
-
-                // Now force all resolved (and dedup'd) args.
-                // unroll.py:454 `end_args = [force_box_for_end_of_preamble(a)
-                // for a in original_label_args]`.
-                ctx.preamble_end_args = Some(
-                    resolved_args
-                        .iter()
-                        .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
-                        .collect(),
-                );
-                // unroll.py `virtual_state = self.get_virtual_state(end_args)`.
-                // VS is captured AFTER force + flush so its `Virtual` /
-                // `VStruct` entries match the `info.is_virtual()` predicate
-                // that `enum_forced_boxes` asserts. Virtuals that were
-                // forced into concrete instances by `force_at_the_end_of_preamble`
-                // come back as `NotVirtualStateInfo` here, exactly as they
-                // do in RPython.
-                let post_force_args: Vec<OpRef> = resolved_args
-                    .iter()
-                    .map(|&a| {
-                        let resolved = ctx.get_replacement_opref(a);
-                        // bind-at-alloc: `export_state` below keys its
-                        // `ExportCache` by these resolved positions. A producer-less
-                        // value-bearing position resolves to a throwaway `from_opref`
-                        // operand, so each `bound_from_opref` fallback returns a
-                        // distinct Rc (ptr-Eq-unstable) and `export_single_value` logs it as an
-                        // unbound export key. Bind the canonical `_forwarded` host
-                        // once via `materialize_operand_at` (a `SameAs*` synthetic
-                        // in `resop_refs`) so the
-                        // export key resolves to one ptr-stable host — the identity
-                        // the #188 `OpRef`→operand `ExportCache` rekey requires. The
-                        // returned `OpRef` is unchanged (synthetic and orphan share
-                        // the position), so the exported state is byte-identical.
-                        if !resolved.is_none()
-                            && !resolved.is_constant()
-                            && ctx.get_box_replacement_operand_opt(resolved).is_none()
-                        {
-                            ctx.materialize_operand_at(resolved);
-                        }
-                        resolved
-                    })
-                    .collect();
-                // RPython's `end_args` are Box objects and the same objects are
-                // carried into `next_iteration_args`.  Preserve those exact
-                // operands before ShortBoxes production mutates forwarding;
-                // retaining only their OpRef positions loses Box identity.
-                let preview_end_arg_boxes: Vec<majit_ir::operand::Operand> = post_force_args
-                    .iter()
-                    .map(|&arg| {
-                        ctx.get_box_replacement_operand_opt(arg)
-                            .unwrap_or_else(|| ctx.materialize_operand_at(arg))
-                    })
-                    .collect();
-                let preview_virtual_state =
-                    crate::optimizeopt::virtualstate::export_state(&post_force_args, &ctx);
-                let vs_args = &post_force_args;
-                // virtualstate.py:687-689 / unroll.py:154-158: a virtual-state
-                // mismatch here raises `VirtualStatesCantMatch` and the outer
-                // `compile_loop_body` catches it as an `InvalidLoop` to skip
-                // jump-to-existing and either retrace or fall back to the
-                // interpretive path. Propagate via the `InvalidLoop` panic
-                // payload so the existing wrapper
-                // (`unroll.rs`'s
-                // `optimize_trace_with_constants_and_inputs_vable_out`) catches
-                // and reroutes instead of crashing the worker thread.
-                let (preview_label_args, preview_virtuals, preview_label_source_positions) =
-                    match preview_virtual_state.make_inputargs_and_virtuals_with_source_positions(
-                        vs_args, self, &mut ctx, false,
-                    ) {
-                        Ok(pair) => pair,
-                        Err(_) => {
-                            // unroll.py:193,207-210: on the BRIDGE path the
-                            // short-preamble/export preview does not exist — VS
-                            // matching is deferred to `jump_to_existing_trace`,
-                            // which catches `VirtualStatesCantMatch` and falls back
-                            // to `jump_to_preamble`. Do not surface the preview
-                            // mismatch as a fatal InvalidLoop; leave
-                            // exported_loop_state = None (the flush + force above
-                            // already committed the bridge's heap writebacks into
-                            // `ctx.new_operations`) and let `optimize_bridge`'s own
-                            // ladder route the bridge to the always-matching
-                            // preamble target (unroll.py:238-242). Only the
-                            // loop/peeled-loop path (optimize_peeled_loop
-                            // unroll.py:135-145) keeps this fatal.
-                            //
-                            // Neither arm is reachable today: the preview exports
-                            // its state from `post_force_args` and re-matches that
-                            // same list, so every `state[i]` was derived from
-                            // `args[i]` and the walk is self-consistent. Probed
-                            // with five virtual-carrying fixtures (escaping tuple,
-                            // escaping instance, aliased list, varying-length
-                            // array, nested virtual), two of which do compile
-                            // bridges — zero hits, as with pyre/bench and
-                            // pyre/extra_tests. Upstream matches
-                            // against a *different* loop's stored state in
-                            // `jump_to_existing_trace` (unroll.py);
-                            // `export_state_re_matched_against_its_own_args_cannot_fail`
-                            // (virtualstate.rs) pins the self-match, so moving the
-                            // preview to the upstream shape breaks that test and
-                            // flags this branch as newly live.
-                            if building_bridge {
-                                if crate::bridge_debug_enabled() {
-                                    eprintln!(
-                                        "[bridgeB] preview virtual-state mismatch — leaving the export empty for the jump_to_existing_trace ladder"
-                                    );
-                                }
-                                break 'export None;
-                            }
-                            return Err(crate::optimize::InvalidLoop(
-                                "preview virtual state mismatch (VirtualStatesCantMatch)",
-                            ));
-                        }
-                    };
-                let mut preview_short_args = preview_label_args.clone();
-                preview_short_args.extend_from_slice(&preview_virtuals);
-                let mut short_boxes =
-                    crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(
-                        &preview_short_args,
-                    );
-                for &arg in &preview_short_args {
-                    // RPython shortpreamble.py:255-259 parity: each label arg
-                    // is `box.type`, where Box objects intrinsically carry one
-                    // of i / r / f. There is no `void` Box because Box always
-                    // wraps a runtime value. Pyre recovers the same type from
-                    // the typed OpRef variant or the trace's inputarg/op metadata.
-                    let raw_type = ctx
-                    .opref_type(arg)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "preview short arg missing box.type: arg={arg:?} preview_short_args={preview_short_args:?}"
-                        )
-                    });
-                    if raw_type == majit_ir::Type::Void {
-                        // shortpreamble.py reads `box.type` from a
-                        // value Box and emits same_as_i/r/f. RPython has no
-                        // Void value Box here; reaching Void means Rust-side
-                        // OpRef/type bookkeeping lost Box identity and must not
-                        // silently drop the short-preamble inputarg.
-                        panic!(
-                            "preview short arg {arg:?} resolved to Type::Void; \
-                         short preamble inputargs must be int/ref/float value boxes \
-                         (shortpreamble.py:255-259)"
-                        );
-                    }
-                    short_boxes.add_short_input_arg(&mut ctx, arg, raw_type);
-                }
-                self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
-                let produced = short_boxes.produced_ops(&mut ctx);
-                // shortpreamble.py:272-281 — the `for short_op in
-                // self.const_short_boxes:` half of `create_short_boxes`, which
-                // upstream runs on every unroll with no condition on it.
-                let produced_const = short_boxes.produced_const_ops(&mut ctx);
-                // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
-                // label_args + virtuals)` — read off the ShortBoxes object and
-                // carry to export_state through the ctx channel, together with
-                // the rooted InputArgRc pool (index-aligned, so the renamed
-                // boxes stay bound to live `InputArg`s across the export
-                // boundary instead of shedding to position-only boxes) and the
-                // short boxes below. Bound to locals here and published as one
-                // `PreviewShortState` at the group site.
-                let short_inputargs = short_boxes.create_short_inputargs(&preview_short_args);
-                let short_inputarg_refs = short_boxes.create_short_inputarg_refs();
-                // unroll.py computes virtual_state, label_args and virtuals
-                // once, then builds ShortBoxes from that exact result. Keep
-                // the same single evaluation across majit's split preview /
-                // export implementation: producing heap facts may mutate Box
-                // forwarding, so recomputing hereafter is observably different.
-                let args_state = Some((
-                    preview_virtual_state.clone(),
-                    preview_label_args.clone(),
-                    preview_virtuals.clone(),
-                    preview_label_source_positions,
-                    preview_end_arg_boxes,
-                ));
-                // Single-object carry: each exported entry keeps the preview
-                // ProducedShortOp's replay Rc, so the pos/arg canonicalization
-                // below lands on the object that dep-replay operands reference
-                // (upstream exports the ResOperation objects themselves,
-                // unroll.py:478-487). The per-entry rewrites require each entry
-                // to own a distinct Rc.
-                #[cfg(debug_assertions)]
-                {
-                    let mut seen: Vec<*const majit_ir::Op> = Vec::with_capacity(produced.len());
-                    for (_, p) in &produced {
-                        let ptr = std::rc::Rc::as_ptr(&p.preamble_op);
-                        debug_assert!(
-                            !seen.contains(&ptr),
-                            "exported short boxes share a replay OpRc at {:?}",
-                            p.preamble_op.pos.get()
-                        );
-                        seen.push(ptr);
-                    }
-                }
-                let mut convert_produced =
-                    |result: OpRef,
-                     produced: crate::optimizeopt::shortpreamble::ProducedShortOp,
-                     const_group: bool| {
-                        let canonical_result = ctx.get_replacement_opref(result);
-                        let replay_result = if const_group {
-                            None
-                        } else {
-                            // pure.py `produce_potential_short_preamble_ops` walks
-                            // `_newoperations`, not their replacements.  In particular,
-                            // `postprocess_GUARD_TRUE` can forward an already-emitted
-                            // pure comparison to CONST_1; PyPy still exports that
-                            // comparison Box and `PureOp.produce_op` installs it in the
-                            // next iteration's pure cache.  Keep the original result
-                            // identity for that case.  Using the inline Const as the
-                            // replay position would collapse distinct comparison Boxes
-                            // that happen to prove the same value.
-                            Some(exported_short_box_replay_result(
-                                result,
-                                canonical_result,
-                                &produced.kind,
-                            )?)
-                        };
-                        let preamble_op = produced.preamble_op.clone();
-                        // For ShortInputArg, RPython keeps two identities:
-                        // short_op.res is the original label Box and
-                        // preamble_op is the fresh renamed InputArg.  Preserve
-                        // the renamed replay position. Other short-op kinds
-                        // replay into the canonical result position; the const
-                        // channel keeps the fresh replay position minted by
-                        // produced_const_ops.
-                        if let Some(replay_result) = replay_result {
-                            preamble_op.pos.set(replay_result);
-                        }
-                        // optimizer.py force_box loop parity.
-                        //
-                        // Resolve POSITIONALLY when a producer is registered at
-                        // this slot: replay-op args carry the dep replay handle
-                        // (produce_arg, shortpreamble.py) whose forwarded slot
-                        // is empty, so only the body producer registered at the
-                        // same position carries the Phase-1 forwarding to the
-                        // canonical end box this export boundary needs.
-                        //
-                        // When positional resolution finds NO producer, the carried
-                        // handle is unforwarded and resolves to itself
-                        // (resoperation.py:57-68): keep the handle OBJECT instead of
-                        // re-minting a producer-less position-only box, so its
-                        // identity (and the `Operand::Op`/`InputArg` shed) survives
-                        // the export. The encoded OpRef is identical either way
-                        // (`from_opref(arg.to_opref()) == arg.to_opref()`).
-                        for i in 0..preamble_op.num_args() {
-                            let arg = preamble_op.arg(i);
-                            // The `OpRef::none()` sentinel has no producer box
-                            // (`materialize_operand_at` doc) — routing it through the
-                            // producer lookup is meaningless and trips the
-                            // `get_box_replacement` "box must exist" debug tripwire.
-                            if arg.is_none() {
-                                continue;
-                            }
-                            let resolved = ctx
-                                .resolve_operand_operand_opt(&arg)
-                                .unwrap_or_else(|| arg.clone());
-                            preamble_op.setarg(i, resolved);
-                        }
-                        if let Some(fail_args) = preamble_op.fail_args.borrow_mut().as_mut() {
-                            for arg in fail_args.iter_mut() {
-                                if arg.is_none() {
-                                    continue;
-                                }
-                                *arg = ctx.get_box_replacement_operand(arg.to_opref());
-                            }
-                        }
-                        // Resolve the carried slot by entry kind. An InputArg
-                        // label arg whose canonical result forwards away is absent
-                        // from `short_boxes.label_args`, so a re-lookup of
-                        // `canonical_result` returns None and the per-slot original
-                        // is lost; `produced.label_arg_idx` preserves the original
-                        // stamped slot through forwarding (the slot the renamed
-                        // `short_inputargs[i]` pairs with — consumed by
-                        // slot_to_original). For non-InputArg (Pure/LoopInvariant/
-                        // Heap) entries the result_map consumer needs the FORWARDED
-                        // slot: a Pure/LoopInvariant result proven equal to a label
-                        // arg it did not originally occupy must reuse
-                        // `short_args[slot]`, which `lookup_label_arg(canonical_
-                        // result)` reports (pre-217 forwarded-slot lookup, parity
-                        // with upstream Box-identity CompoundOp merge). For a label
-                        // arg duplicated across `label_args + virtuals`,
-                        // `lookup_label_arg` resolves to the LAST/live slot
-                        // (`potential_ops[box]` overwrite), matching the InputArg
-                        // branch's `live_slot` and upstream's surviving ShortInputArg.
-                        let label_arg_idx = if produced.kind
-                            == crate::optimizeopt::shortpreamble::PreambleOpKind::InputArg
-                        {
-                            produced.label_arg_idx
-                        } else {
-                            short_boxes.lookup_label_arg(canonical_result)
-                        };
-                        Some(crate::optimizeopt::shortpreamble::PreambleOp {
-                            op: preamble_op,
-                            source_op: Some(produced.source_op.clone()),
-                            // short_op.res travels with the entry as the
-                            // exported `PreambleOp.res` operand; the preview
-                            // ProducedShortOp already carries the bound producer
-                            // / const operand, so it moves across unchanged.
-                            res: produced.res.clone(),
-                            kind: produced.kind,
-                            label_arg_idx,
-                            invented_name: produced.invented_name,
-                            same_as_source: produced.same_as_source.clone(),
-                        })
-                    };
-                let exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp> =
-                    produced
-                        .into_iter()
-                        .filter_map(|(result, produced)| convert_produced(result, produced, false))
-                        .collect();
-                let exported_const_short_boxes = produced_const
-                    .into_iter()
-                    .filter_map(|produced| {
-                        convert_produced(produced.res.to_opref(), produced, true)
-                    })
-                    .collect();
-                ctx.exported_const_short_boxes = exported_const_short_boxes;
-                if crate::majit_log_enabled() {
-                    for entry in &exported_short_boxes {
-                        // Print args / same_as_source as OpRefs, not via the
-                        // Operands' derived Debug: a bound InputArg/Op carries a
-                        // `forwarded` slot whose Debug walks the whole abstract-value
-                        // graph (fields, descrs, nested ops), dumping tens of MB per
-                        // box and stalling the run.
-                        let arg_oprefs: Vec<OpRef> =
-                            entry.op.getarglist().iter().map(|a| a.to_opref()).collect();
-                        eprintln!(
-                            "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
-                            entry.kind,
-                            entry.op.pos.get(),
-                            entry.op.opcode,
-                            arg_oprefs,
-                            entry.op.getdescr().map(|d| d.index()),
-                            entry.invented_name,
-                            entry.same_as_source.as_ref().map(|o| o.to_opref()),
-                        );
-                    }
-                }
-                // Publish the preview's one evaluation as a single object: the
-                // forcing above (and its side effects) stays exactly where it
-                // is, only the publication is grouped, so a reader can no
-                // longer see one vector from this evaluation next to another
-                // that was never written.  Alignment is narrower than that —
-                // `short_inputargs` / `short_inputarg_refs` share an index
-                // space, `exported_short_boxes` does not.
-                ctx.preview_short_state = Some(crate::optimizeopt::PreviewShortState {
-                    short_inputargs,
-                    short_inputarg_refs,
-                    short_boxes: exported_short_boxes,
-                    args_state,
-                });
-                let jump_arglist_oprefs: Vec<OpRef> =
-                    jump.getarglist().iter().map(|a| a.to_opref()).collect();
-                let exported_int_bounds =
-                    self.collect_exported_int_bounds(&jump_arglist_oprefs, &mut ctx);
-                // RPython unroll.py:186-193 + compile.py: `info.renamed_inputargs`
-                // are the fresh per-iteration boxes from `trace.get_iter()`. They
-                // live in this run's iteration namespace, not the original
-                // frontend's. In pyre this maps to `[inputarg_base..inputarg_base
-                // + num_inputs)`: `inputarg_base = 0` for top-level loops
-                // (compile_loop / compile_retrace) where the frontend already
-                // owns `[0, num_inputs)`, and `inputarg_base = bridge_inputarg_base`
-                // for bridges, where `prepare_bridge_trace_for_optimizer`
-                // in pyjitpl.rs shifts
-                // the iteration into a disjoint range.  Use `num_inputs` (the
-                // external loop-entry contract count) rather than `ctx.num_inputs`
-                // (which may be widened by virtualizable expansion).
-                // resoperation.py:719/727/739 InputArg{Int,Ref,Float}: each
-                // renamed inputarg's Box carries `.type` intrinsically
-                // (history.py:220). Mint typed variants from `inputarg_types`
-                // so the exported state's OpRefs match what Phase 2 will see
-                // under variant-aware Eq.
-                let renamed_inputargs: Vec<OpRef> = (0..num_inputs)
-                    .map(|i| {
-                        // opencoder.py:259 inputarg_from_tp parity — strict
-                        // box.type lookup, no InputArgVoid fallback.
-                        let pos = ctx.inputarg_base + i as u32;
-                        OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
-                    })
-                    .collect();
-                Some(crate::optimizeopt::unroll::export_state(
-                    &original_jump_args,
-                    &renamed_inputargs,
-                    self,
-                    &mut ctx,
-                    Some(&exported_int_bounds),
-                ))
-            }
+        // unroll.py optimize_peeled_loop keeps the live optimizer knowledge
+        // through virtual-state matching and jump_to_existing_trace. Only
+        // optimize_preamble exports here: export_state clears the carried
+        // Boxes, so exporting the peeled iteration destroys the virtuals that
+        // its closing JUMP still has to force or carry.
+        let export_preamble = !self.simple_compile
+            && self.imported_loop_state.is_none()
+            && !self.building_bridge;
+        self.exported_loop_state = match jump.filter(|_| export_preamble) {
+            Some(jump) => Some(self.export_state(
+                &jump,
+                pre_jump_resolved_args.as_deref(),
+                num_inputs,
+                &mut loop_info,
+                &mut ctx,
+            )?),
             None => None,
         };
         // RPython parity: propagate patchguardop to ExportedState so Phase 2
@@ -4513,10 +4518,24 @@ impl Optimizer {
                     &format!("Retracing ({}/{retrace_limit})", retraced_count + 1),
                 );
             }
-            // unroll.py:231-233: export the bridge's own runtime boxes for retracing.
-            if let Some(ref mut state) = self.exported_loop_state {
-                state.runtime_boxes = runtime_boxes.to_vec();
-            }
+            // unroll.py optimize_bridge exports only here, after matching and
+            // the retrace decision. Ordinary bridges must retain their live
+            // optimizer knowledge until jump_to_preamble/short-preamble replay.
+            let mut loop_info = BasicLoopInfo::new(
+                self.trace_inputargs.clone(),
+                self.quasi_immutable_deps.clone(),
+                Some(terminal_jump.clone()),
+            );
+            let mut state = self.export_state(
+                &terminal_jump,
+                None,
+                num_inputs,
+                &mut loop_info,
+                &mut ctx,
+            )?;
+            state.runtime_boxes = runtime_boxes.to_vec();
+            state.patchguardop = self.patchguardop.clone();
+            self.exported_loop_state = Some(state);
             // unroll.py:234-236 returns `self._newoperations` whole, so the
             // retrace is built on the flush + end-of-preamble force + failed
             // match guards above, not on the body alone. `retarget_close_jump`
@@ -4526,6 +4545,9 @@ impl Optimizer {
             // heap store the bridge body performed.
             let mut result = optimized_ops;
             result.append(&mut ctx.new_operations);
+            result.extend(loop_info.extra_same_as.into_iter().map(std::rc::Rc::new));
+            let boxes: Vec<_> = result.iter().map(Operand::from_bound_op).collect();
+            self._clean_optimization_info(&boxes);
             return Ok((result, true));
         }
 
@@ -5359,22 +5381,7 @@ impl Optimizer {
         // (`assert copied_from_descr is None`).  They are never on the
         // sharing chain.  Mirrors the OptContext path in
         // `optimizeopt/mod.rs`'s `emit_guard_operation`.
-        // `op.rd_resume_position.get() < 0` is a pyre precondition with no
-        // upstream counterpart, and it is load-bearing.  Upstream shares
-        // whenever `self._last_guard_op and guard_op.getdescr() is None`,
-        // because a sharing guard resumes at the donor's position and the
-        // ops in between merely re-execute.  Pyre resumes through a
-        // *recorded snapshot* named by `rd_resume_position`, and rewinding a
-        // guard that owns one replays the recorded bytecode range, not just
-        // the residual ops: side effects already committed in that range run
-        // a second time.  Measured on `bench/synth/short_circuit_side_effects`
-        // (0903): dropping this conjunct over-counts a helper by 2 and moves
-        // the total, and takes 131 check.py fixtures that are green on main
-        // red — 12 wrong answers and 7 crashes.  Only a guard the optimizer
-        // invented (no snapshot of its own, e.g. GUARD_NO_EXCEPTION after a
-        // call — upstream's own motivating case) can safely inherit one.
         let shared = !op.has_descr()
-            && op.rd_resume_position.get() < 0
             && self.last_guard_op_idx.is_some()
             && opcode != OpCode::GuardNotForced
             && opcode != OpCode::GuardNotForced2;

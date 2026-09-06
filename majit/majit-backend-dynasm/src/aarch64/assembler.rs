@@ -6108,11 +6108,6 @@ impl<'a> AssemblerARM64<'a> {
                 .copied()
                 .expect("call_assembler missing rewritten jitframe arg");
             let vable_loc = arglocs.get(1).copied();
-            // aarch64/regalloc.py:661-664 routes CALL_ASSEMBLER through
-            // `_call(..., gc_level=2)`, which spills all managed registers.
-            // x19 is already saved by the JIT prologue, so use it as scratch
-            // here without an extra call-site stack save.
-            dynasm!(self.mc ; .arch aarch64 ; mov x19, x29);
             self.emit_load_to_rax(frame_loc);
 
             let descr_arc = op.getdescr();
@@ -6143,9 +6138,6 @@ impl<'a> AssemblerARM64<'a> {
 
             if !is_resolved {
                 let force_addr = crate::call_assembler_force_fn_addr() as i64;
-                dynasm!(self.mc ; .arch aarch64
-                    ; mov x29, x19
-                );
                 if force_addr != 0 {
                     if let Some(vloc) = vable_loc {
                         self.emit_load_to_rax(vloc);
@@ -6190,9 +6182,13 @@ impl<'a> AssemblerARM64<'a> {
             } else if let Some(entry_label) = self.self_entry_label {
                 dynasm!(self.mc ; .arch aarch64 ; bl =>entry_label);
             }
-            dynasm!(self.mc ; .arch aarch64
-                ; mov x29, x19
-            );
+            // aarch64/callbuilder.py `CallBuilderARM64.pop_gcmap` calls
+            // `AssemblerARM64._reload_frame_if_necessary` before clearing
+            // the map.  The callee footer restores the pre-call x29 from the
+            // C stack, but that address may be stale after a minor collection
+            // moved the caller jitframe.  Reload x29 from the shadow stack;
+            // keeping the old address in an allocatable callee-saved register
+            // is both non-orthodox and unsound.
             self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
 
             let fast_path = self.mc.new_dynamic_label();

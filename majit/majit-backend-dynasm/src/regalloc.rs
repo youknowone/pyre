@@ -2738,8 +2738,11 @@ impl<'a> RegAlloc<'a> {
             | GuardKind::Overflow
             | GuardKind::NotInvalidated
             | GuardKind::FutureCondition
-            | GuardKind::NotForced
             | GuardKind::AlwaysFails => self.consider_guard_no_args_j2(fail_args, i, output),
+            GuardKind::NotForced if op.opcode == OpCode::GuardNotForced2 => {
+                self.consider_guard_not_forced_2_j2(fail_args, i, output)
+            }
+            GuardKind::NotForced => self.consider_guard_no_args_j2(fail_args, i, output),
             GuardKind::Exception => {
                 self.consider_guard_exception_j2(args, fail_args, op, i, output)
             }
@@ -5222,27 +5225,29 @@ impl<'a> RegAlloc<'a> {
         }
     }
 
-    /// llsupport/regalloc.py locs_for_call_assembler parity.
-    /// RPython syncs args to stack, then before_call spills everything.
-    /// We force-sync register args to frame first via _sync_var_to_stack,
-    /// then before_call spills remaining. arglocs after before_call are
-    /// all Frame or Immed — no register-clobber issues during calloc.
+    /// llsupport/regalloc.py `locs_for_call_assembler` parity.
+    ///
+    /// RPython syncs only argument 1 (the virtualizable) to the frame. The
+    /// callee jitframe in argument 0 stays in its current location, captured
+    /// before `before_call`.
     fn consider_call_assembler(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        // llsupport/regalloc.py: self.rm._sync_var_to_stack(op.getarg(k))
-        // Force all register-held args to frame before before_call.
-        for arg in op.getarglist().iter() {
-            if arg.is_constant() {
-                continue;
-            }
-            let arg = arg.to_opref();
-            let tp = self.tp(arg);
+        assert!(matches!(op.num_args(), 1 | 2));
+        if op.num_args() == 2 {
+            let vable = op.arg(1).to_opref();
+            let tp = self.tp(vable);
             if tp == Type::Float {
                 self.xrm
-                    ._sync_var_to_stack(arg, tp, &mut self.longevity, &mut self.fm);
+                    ._sync_var_to_stack(vable, tp, &mut self.longevity, &mut self.fm);
             } else {
                 self.rm
-                    ._sync_var_to_stack(arg, tp, &mut self.longevity, &mut self.fm);
+                    ._sync_var_to_stack(vable, tp, &mut self.longevity, &mut self.fm);
             }
+        }
+
+        let mut arglocs = Vec::with_capacity(op.num_args());
+        for arg in op.getarglist().iter() {
+            let arg = arg.to_opref();
+            arglocs.push(self.loc(arg, self.tp(arg)));
         }
 
         let type_index = OpTypeIndex::from_parts(
@@ -5267,14 +5272,6 @@ impl<'a> RegAlloc<'a> {
             &mut self.pending_moves,
             &type_index,
         );
-
-        // After before_call, all args are in Frame or Const — safe for calloc.
-        let mut arglocs: Vec<Loc> = Vec::new();
-        for arg in op.getarglist().iter() {
-            let arg = arg.to_opref();
-            let tp = self.tp(arg);
-            arglocs.push(self.loc_must_exist(arg, tp));
-        }
 
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {
@@ -5299,18 +5296,22 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        for &arg in args {
-            if arg.is_constant() {
-                continue;
-            }
-            let tp = self.tp(arg);
+        assert!(matches!(args.len(), 1 | 2));
+        if args.len() == 2 {
+            let vable = args[1];
+            let tp = self.tp(vable);
             if tp == Type::Float {
                 self.xrm
-                    ._sync_var_to_stack(arg, tp, &mut self.longevity, &mut self.fm);
+                    ._sync_var_to_stack(vable, tp, &mut self.longevity, &mut self.fm);
             } else {
                 self.rm
-                    ._sync_var_to_stack(arg, tp, &mut self.longevity, &mut self.fm);
+                    ._sync_var_to_stack(vable, tp, &mut self.longevity, &mut self.fm);
             }
+        }
+
+        let mut arglocs = Vec::with_capacity(args.len());
+        for &arg in args {
+            arglocs.push(self.loc(arg, self.tp(arg)));
         }
 
         let type_index = OpTypeIndex::from_parts(
@@ -5335,12 +5336,6 @@ impl<'a> RegAlloc<'a> {
             &mut self.pending_moves,
             &type_index,
         );
-
-        let mut arglocs: Vec<Loc> = Vec::new();
-        for &arg in args {
-            let tp = self.tp(arg);
-            arglocs.push(self.loc_must_exist(arg, tp));
-        }
 
         let result_tp = op.opcode.result_type();
         let result_loc = if result_tp != Type::Void {

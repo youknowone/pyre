@@ -219,7 +219,7 @@ use std::sync::OnceLock;
 /// _prepare_resume_from_failure` hands it to the resumed frame so an
 /// exception guard unwinds into its handler instead of resuming the
 /// no-exception continuation.  `0` = no pending exception.
-pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>;
+pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64, usize) -> Option<i64>;
 
 /// Bridge compilation: raw values, descr identity, and optional GUARD_VALUE
 /// operand → compiled?
@@ -811,6 +811,10 @@ fn handle_fail_resume_guard(
     // re-reading `jf_guard_exc` here would observe the post-`grab_exc_value`
     // null and drop the exception.
     let bh_result = CA_BLACKHOLE_FN.get().and_then(|blackhole| {
+        // compile.py ResumeGuardForcedDescr.handle_fail reads savedata from
+        // this same deadframe after any bridge attempt. The libc jitframe
+        // tracer updates the field if that attempt collected the nursery.
+        let savedata = unsafe { (*frame_ptr).jf_savedata };
         blackhole(
             descr_raw,
             raw_values.as_ptr(),
@@ -818,6 +822,7 @@ fn handle_fail_resume_guard(
             raw_values.as_ptr(),
             raw_values.len(),
             guard_exc_root.0 as i64,
+            savedata,
         )
     });
     if let Some(bh_result) = bh_result {

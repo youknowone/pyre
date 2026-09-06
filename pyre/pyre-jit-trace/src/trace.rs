@@ -1059,7 +1059,7 @@ fn try_commit_midbody_abort_inner(
         w_globals,
         ec,
         pyre_object::PY_NULL,
-        pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+        pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     ) {
         Ok(frame) => frame,
         Err(_) => return Err(MidBodyDecline::BeforeRun("callee frame allocation failed")),
@@ -1095,11 +1095,9 @@ fn try_commit_midbody_abort_inner(
         };
         locals_w_mut!(frame).as_mut_slice()[stack_base + rel] = *value;
     }
-    // The array is old-gen from birth (`FrameLocalsArrayAllocation::OldGenGc`)
-    // and `FrameLocalsRoot` only forwards the field slot, not the items: the
-    // young refs just stored need the remembered set to survive the boxing
-    // allocations below, and each minor consumes the entry, so re-arm after
-    // every batch that follows a possible collection.
+    // `PyFrame.__init__` creates this as a fresh nursery array.  The barrier
+    // helper is harmless for that case and still covers the old-gen spill arm
+    // if a full nursery made `malloc_fast` reserve the block there.
     crate::state::frame_array_write_barrier(
         frame.as_mut_ptr() as *mut u8,
         locals_w_mut!(frame) as *mut _,
@@ -3005,11 +3003,14 @@ fn try_adopt_single_frame_blackhole(
         // was never written at all — it still holds the pre-walk stack (see
         // `capture_frame_stack_from_mirror`). Take the walker's OpRef mirror,
         // which the latch resolved while the concrete side tables were still
-        // live.  The segment cut stops at a boundary but at the merge point,
-        // where the array is equally unrefreshed, so it reads the mirror too.
+        // live. SegmentTrace, like ABORT_TOO_LONG, stops after the step:
+        // pyjitpl.py _create_segmented_trace_and_blackhole converts the current
+        // MIFrame and synchronized virtualizable, not the preceding opcode's
+        // entry stack. In particular a STORE_FAST before the merge point has
+        // already popped its value; restoring its entry mirror would undo that
+        // pop without undoing the MIFrame's instruction pointer.
         let takes_mirror = commit_leg == WalkEndCommitLeg::WalkAbort
-            || commit_leg == WalkEndCommitLeg::VableEscape
-            || commit_leg == WalkEndCommitLeg::SegmentTrace;
+            || commit_leg == WalkEndCommitLeg::VableEscape;
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             let from_array = crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame)
                 .map(|stack| stack.roots_snapshot());

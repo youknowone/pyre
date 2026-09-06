@@ -153,13 +153,16 @@ fn the_answer_is_the_same_at_every_carrier_depth_cap() {
 }
 
 #[test]
-fn a_recursive_carrier_bypasses_the_generic_depth_decline() {
+fn a_recursive_carrier_capture_avoids_depth_decline_and_dirty_abort() {
     // Non-vacuity: `the_answer_is_the_same_at_every_carrier_depth_cap` would
     // also pass if the program stopped reaching the drain at all.  The lowered
-    // generic cap must not decline this recursive carrier, and a successful
-    // multi-frame adoption proves the drain still handled it. `census_dump`
-    // reprints the whole map on every record, so the count is the value after
-    // the colon, never the number of occurrences.
+    // generic cap must not decline this recursive carrier.  A caller image
+    // proves the recursive inline boundary was captured; a multi-frame
+    // terminal is an optional later outcome because successful frame
+    // virtualization can now keep the same execution out of the fallback
+    // adopter entirely. `census_dump` reprints the whole map on every record,
+    // so the count is the value after the colon, never the number of
+    // occurrences.
     let out = run(&[
         ("PYRE_FBW_MULTIFRAME_DEPTH", "1"),
         ("PYRE_FBW_DEBUG_ABORT", "1"),
@@ -181,12 +184,13 @@ fn a_recursive_carrier_bypasses_the_generic_depth_decline() {
         "a recursive carrier was rejected by pyre's generic depth cap\n{}",
         report("PYRE_FBW_MULTIFRAME_DEPTH=1 census", &out)
     );
-    let adopted = text
-        .lines()
-        .any(|l| l.starts_with("[fbw-blackhole] adopted multi-frame terminal"));
+    let carrier_captured = text.lines().any(|l| {
+        l.starts_with("[fbw-blackhole] caller image")
+            || l.starts_with("[fbw-blackhole] adopted multi-frame terminal")
+    });
     assert!(
-        adopted,
-        "the drain handled no recursive multi-frame carrier\n{}",
+        carrier_captured,
+        "the walk captured no recursive carrier boundary\n{}",
         report("PYRE_FBW_MULTIFRAME_DEPTH=1 census", &out)
     );
     // The rollback the arm exists to avoid: an abort that ran effects and found

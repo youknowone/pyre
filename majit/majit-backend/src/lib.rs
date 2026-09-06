@@ -1968,6 +1968,15 @@ impl DeadFrame {
             DeadFrame::JitFrame(_) | DeadFrame::LibcJitFrame(_) => None,
         }
     }
+
+    /// Mutable erased payload for backend-specific deadframe operations.
+    #[inline]
+    pub fn boxed_data_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        match self {
+            DeadFrame::Boxed(data) => Some(&mut **data),
+            DeadFrame::JitFrame(_) | DeadFrame::LibcJitFrame(_) => None,
+        }
+    }
 }
 
 /// `compile.py` `make_and_attach_done_descrs` + `pyjitpl.py`

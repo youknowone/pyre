@@ -1214,10 +1214,12 @@ pub const FRAME_BLOCK_GC_TYPE_ID: u32 = 104;
 pub const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
 
 /// Ownership selected by the caller that decides a frame's lifetime.
-/// `FrameBox::new` call frames use `OldGenGc`; tracer-private snapshots use
-/// `StdAlloc` so their locals remain valid until deterministic `Drop`.
+/// Normal call frames use `NurseryGc`, matching `PyFrame.__init__`'s fresh
+/// `[None] * size`; frame-owned auxiliary snapshots use `OldGenGc`, and
+/// tracer-private snapshots use `StdAlloc` until deterministic `Drop`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameLocalsArrayAllocation {
+    NurseryGc,
     OldGenGc,
     StdAlloc,
 }
@@ -1279,7 +1281,25 @@ unsafe fn alloc_frame_locals_array(
     fill: pyre_object::PyObjectRef,
     allocation: FrameLocalsArrayAllocation,
 ) -> *mut FixedObjectArray {
-    if allocation == FrameLocalsArrayAllocation::OldGenGc {
+    if allocation == FrameLocalsArrayAllocation::NurseryGc {
+        let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
+            + len * std::mem::size_of::<pyre_object::PyObjectRef>();
+        if let Some(raw) = pyre_object::gc_hook::GcAllocOutcome::from_hook(
+            pyre_object::gc_hook::try_gc_alloc(pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID, payload),
+        )
+        .allocated_or_abort(payload)
+        {
+            let arr = raw as *mut FixedObjectArray;
+            unsafe {
+                (*arr).len = len;
+                let items = (*arr).items_mut_ptr();
+                for i in 0..len {
+                    items.add(i).write(fill);
+                }
+            }
+            return arr;
+        }
+    } else if allocation == FrameLocalsArrayAllocation::OldGenGc {
         let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
             + len * std::mem::size_of::<pyre_object::PyObjectRef>();
         let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
@@ -6477,7 +6497,7 @@ pub fn createframe_obj(
         execution_context,
     ));
     let locals_cells_stack_w =
-        unsafe { alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::OldGenGc) };
+        unsafe { alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::NurseryGc) };
     let frame = PyFrame {
         ob_header: frame_ob_header(),
         pycode: _roots.get(root_base) as *const (),
