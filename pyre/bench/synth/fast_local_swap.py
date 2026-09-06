@@ -1,17 +1,13 @@
-# pyre-check: max-pypy-ratio=4.5
+# pyre-check: max-pypy-ratio=2
 # The ceiling gates cranelift as well as dynasm, and `perf_gate_floor` derives
 # a floor from it as ceiling/6, so both ends of the reading spread pick it.
-# Fitted over the 38 CI jobs of 2026-09-03: macos reads 1.3x-1.6x, ubuntu
-# 1.6x-2.2x and windows 2.0x-3.1x.  The reading the old ceiling of 2 was sized
-# against -- 0.5x on macos dynasm -- no host produces any more, and windows
-# crossed 2 three times.  4.5 clears the widest by 45% and derives a 0.75x
-# floor the narrowest clears by 73%.
 # pyre-check: skip-cpython
 # cpython 1.33s vs pyre 0.24s (5.5x on the ubuntu runner), and it is not
 # gated on — only pypy is.
-# Sized so pypy's own execution clears the measurement floor: below it the
-# ratio gate divides by the floor and reads startup rather than this loop.
-N = 15162700
+# Sized so pypy's own execution clears Windows `FLOOR_GATE_MIN_BASELINE_S`
+# (~0.16s).  Below that the ceiling divides by a `?` band denominator and
+# the same binary reads 2x on one host and 3x on the next.
+N = 38000000
 
 
 def fib_swap(n):

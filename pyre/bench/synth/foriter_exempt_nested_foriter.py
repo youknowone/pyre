@@ -1,21 +1,17 @@
-# pyre-check: max-pypy-ratio=70
+# pyre-check: max-pypy-ratio=20
 # The function-entry door reading its own cell took this off the 44 it needed
 # while the door read another cell's answer, asked to trace at every call and
 # never entered the compiled loop.
 #
-# The ceiling is NOT the measured ratio.  pypy's execution-only time here lands
-# either side of EXEC_TIME_FLOOR_S, and check.py gates the ratio whenever it
-# lands above (`?`) and skips it whenever it is clamped to the floor (`~`), so
-# the same binary reads 14.6x on one runner and 45.3x on the next.  Size the
-# ceiling for the worst denominator in the gated band instead.  Over the 38 CI
-# jobs of 2026-09-03 the gated readings span 7.5x (windows) to 45.3x (ubuntu
-# cranelift); 70 clears the widest by 55%.  Lengthening the loop until pypy is
-# measurable everywhere is not open: pyre runs about 40x slower here, so a
-# baseline over FLOOR_GATE_MIN_BASELINE_S would put this fixture past 6s.
 # gh#495 guard: fbw_abort_nested_unjournaled_residual prevents the ForIterNext exemption double-advance.
 # branch-bearing callee with a SECOND FOR_ITER (nested), not the loop header.
 # Two shared generators; inner FOR_ITER advance is a non-header foriter (Finding #2).
 # Post-inner declining residual forces abort while inner item in-flight.
+# N cannot be raised to clear `FLOOR_GATE_MIN_BASELINE_S`: generator resume
+# has no merge point (`caro_no_merge_entry`), so gouter/ginner stay
+# interpreted and the true ratio is ~100x.  Lengthening only makes that
+# honest.  20000 is the original size; the 20x ceiling is the compiled
+# `run()` loop's budget, not the residual generator path.
 N = 20000
 
 

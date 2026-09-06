@@ -1,10 +1,4 @@
-# pyre-check: max-pypy-ratio=17
-# pypy's execution-only time here sits in check.py's `?` band -- above
-# EXEC_TIME_FLOOR_S, under FLOOR_GATE_MIN_BASELINE_S -- so the ceiling is
-# applied to a denominator the floor gate declines as too small to judge.  Over
-# the 38 CI jobs of 2026-09-03 unchanged code read 2.2x-12.0x across the three
-# hosts and both native backends, crossing the old ceiling of 6 on two of them.
-# 17 clears the widest by 42%.
+# pyre-check: max-pypy-ratio=6
 #
 # A recursion deeper than the inline unroll bound, driven from a loop body.
 #
@@ -39,7 +33,10 @@ def step(n, acc):
 def main():
     total = 0
     i = 0
-    while i < 300000:
+    # Sized so pypy's own execution clears Windows `FLOOR_GATE_MIN_BASELINE_S`
+    # (~0.16s).  At 300000 the baseline sat in the `?` band and the same
+    # binary read 2x-12x.
+    while i < 4300000:
         total = (total + step(8, i)) % MOD
         i += 1
     print("recursion_from_loop", total)

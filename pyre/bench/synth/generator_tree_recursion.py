@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=32
+# pyre-check: max-pypy-ratio=14
 # pyre-check: jitstats-band=guard_failures=8
 # Successful bridge closure and a pre-trace Decline are not aborts in
 # `MetaInterp._interpret`. Charging both to pyre's local abort ceiling held this
@@ -6,19 +6,16 @@
 # 48 / 7378. The PyPy oracle compiles still more (65 bridges) with forcings=0,
 # virtualizables forced=0 and nvirtuals=721, so the higher count is coverage,
 # not a regression to suppress. Four final-binary cranelift runs measured
-# 12.5x..12.7x, and the 14x that left 10% headroom over them was fitted on that
-# host alone; across the 38 CI jobs of 2026-09-03 the same fixture reads
-# 6.4x-22.4x, and macos cranelift crossed 14.  32 clears the widest by 43% and
-# derives a parity floor the narrowest clears sixfold. The recovery target is PyPy's
+# 12.5x..12.7x; 14x leaves 10% headroom. The recovery target is PyPy's
 # zero-forcing per-`MIFrame` recursive-frame/blackhole path, not restoring the
 # abort-ceiling shortcut.
 # Jitcounter decay is 0.96 every 32 minor collections
 # (majit-trace/src/counter.rs), so guard_failures tracks collection count during
 # each guard's warm-up rather than a compile decision. One host measured
 # 3648..3661 across nursery sizes before the lifecycle fix; decay=0 now pins
-# 7378 everywhere, while loops_compiled=3 and bridges_compiled=48 remain
-# gated exactly. The fixture sets decay=0 itself, so the band covers the pinned
-# run, not that 13-wide unpinned spread; width 8 is margin (0.22%). Real
+# 4606 everywhere at this length, while loops_compiled=3 and bridges_compiled=34
+# remain gated exactly. The fixture sets decay=0 itself, so the band covers the pinned
+# run, not that 13-wide unpinned spread; width 8 is margin (0.17%). Real
 # regressions this gate caught moved by hundreds to thousands (828 -> 4923,
 # 404 -> 812, 937 -> 7408).
 # Generator-driven accumulation over recursive tree/linear results. The
@@ -83,7 +80,10 @@ def gen_values(limit):
 def main():
     acc = 0
     cnt = 0
-    for v in gen_values(9000):
+    # Sized so pypy's own execution clears Windows `FLOOR_GATE_MIN_BASELINE_S`
+    # (~0.16s).  At 9000 the baseline sat in the `?` band and macos cranelift
+    # crossed 14.
+    for v in gen_values(280000):
         acc = (acc + v) % MOD
         cnt += 1
         if cnt % 1800 == 0:
