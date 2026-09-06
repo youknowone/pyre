@@ -4864,15 +4864,7 @@ fn super_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 fn super_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let fresh = crate::builtins::builtin_super(args.get(1..).unwrap_or(&[]))?;
-    unsafe {
-        pyre_object::descriptor::w_super_set_fields(
-            args[0],
-            pyre_object::descriptor::w_super_get_type(fresh),
-            pyre_object::descriptor::w_super_get_obj_type(fresh),
-            pyre_object::descriptor::w_super_get_obj(fresh),
-        )
-    };
+    crate::builtins::super_descr_init(args[0], args.get(1..).unwrap_or(&[]))?;
     Ok(w_none())
 }
 

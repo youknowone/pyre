@@ -18,6 +18,31 @@ assert superB.__self_class__ is None
 assert superB.__self__ is None
 
 
+class _SuperSubclass(super):
+    pass
+
+
+_proxy = super.__new__(_SuperSubclass)
+_receiver = testB()
+assert super.__init__(_proxy, testB, _receiver) is None
+assert type(_proxy) is _SuperSubclass
+assert _proxy.__thisclass__ is testB
+assert _proxy.__self_class__ is testB
+assert _proxy.__self__ is _receiver
+try:
+    super.__init__(_proxy, testA, object())
+except TypeError:
+    pass
+else:
+    raise AssertionError("invalid super reinitialization succeeded")
+assert _proxy.__thisclass__ is testB
+assert _proxy.__self_class__ is testB
+assert _proxy.__self__ is _receiver
+super.__init__(_proxy, testA, None)
+assert _proxy.__thisclass__ is testA
+assert _proxy.__self_class__ is _proxy.__self__ is None
+
+
 # A missing attribute on a super proxy stays on the proxy's dedicated lookup
 # path. Dispatching super.__getattribute__ through the generic builtin slot
 # path re-enters the same lookup until the native stack overflows.
