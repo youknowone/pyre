@@ -3444,11 +3444,6 @@ impl OptUnroll {
             }
         }
 
-        // unroll.py export_state: save the info separately, then clear the
-        // carried Boxes. import_state reinstalls class/virtual facts without
-        // inheriting stale non-virtual field values from the preamble.
-        optimizer._clean_optimization_info(&end_arg_boxes);
-
         // RPython unroll.py:467: next_iteration_args = end_args (post-force).
         // Aliased boxes (same resolved OpRef) are handled by export_state's
         // create_state cache + make_inputargs' position_in_notvirtuals dedup.
@@ -3588,20 +3583,7 @@ impl OptUnroll {
         if infos.contains_key(arg_box) {
             return;
         }
-        // unroll.py `_expand_info`: a SAME_AS result deliberately exports the
-        // source box's optimizer information.  The short-preamble machinery
-        // uses SAME_AS to give a collision-free name to a carried value; the
-        // alias itself has no independent `_forwarded` state in RPython.
-        let info_arg = arg_box
-            .bound_op()
-            // `optimizer.as_operation(arg)` in RPython only returns an
-            // actually emitted operation.  Pyre also binds zero-argument
-            // SAME_AS marker boxes while assembling a short preamble; those
-            // are names, not executable SAME_AS ops, and have no arg0.
-            .filter(|op| op.opcode.is_same_as() && op.num_args() > 0)
-            .map(|op| op.arg(0).to_opref())
-            .unwrap_or(arg);
-        let resolved = ctx.get_replacement_opref(info_arg);
+        let resolved = ctx.get_replacement_opref(arg);
         // RPython stores the entry only when `info` is truthy — a falsy
         // `info` (None) simply skips the insert, so downstream
         // `setinfo_from_preamble_list` at unroll.py sees "no entry"
@@ -3609,28 +3591,36 @@ impl OptUnroll {
         let Some(info) = self.collect_exported_info(resolved, ctx, exported_int_bounds) else {
             return;
         };
-        // unroll.py _expand_info tests the selected info, including when
-        // SAME_AS selected arg0's info rather than the alias's own slot.
-        let virtual_info = info
-            .get_ptr_info()
-            .filter(|ptr| ptr.borrow().is_virtual())
-            .cloned();
+        // `arg_box` is the canonical Phase-1 box, which can be position-only
+        // (a virtual field box), so read its PtrInfo directly off the box —
+        // exactly what `peek_ptr_info` does (`get_box_replacement(false)
+        // .ptr_info()`, `self`-independent) — without the `from_opref`
+        // position-only panic.
+        let arg_pi = arg_box
+            .get_box_replacement(false)
+            .ptr_info()
+            .map(|p| p.clone());
+        let has_fields = matches!(
+            arg_pi,
+            Some(pi) if pi.is_virtual() || !pi.all_items().is_empty()
+        );
         infos.insert(arg_box.clone(), info);
-        if let Some(info) = virtual_info {
-            self.expand_infos_from_virtual(&info, ctx, exported_int_bounds, infos);
+        if has_fields {
+            self.expand_infos_from_virtual(resolved, ctx, exported_int_bounds, infos);
         }
     }
 
     /// unroll.py: _expand_infos_from_virtual
     fn expand_infos_from_virtual(
         &self,
-        info: &std::rc::Rc<std::cell::RefCell<crate::optimizeopt::info::PtrInfo>>,
+        opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<
             &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
         infos: &mut indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
     ) {
+        let opref_box = ctx.get_box_replacement_operand_opt(opref);
         // unroll.py `_expand_infos_from_virtual`:
         //     items = info.all_items()
         //     for item in items:
@@ -3642,8 +3632,13 @@ impl OptUnroll {
         // (its `ptr_info_handle()` read), so the import-side reader
         // (`setinfo_from_preamble_list`) walks the same `v.fields` and the
         // box-identity (`Rc::ptr_eq`) lookup hits.
-        let items = info.borrow().all_items();
-        for (_, entry) in items {
+        let Some(info) = opref_box
+            .as_ref()
+            .and_then(|b| b.get_box_replacement(false).ptr_info().map(|p| p.clone()))
+        else {
+            return;
+        };
+        for (_, entry) in info.all_items() {
             let field_box = entry.as_seen_operand();
             if field_box.to_opref().is_none() {
                 continue;
@@ -7589,159 +7584,6 @@ mod tests {
             Some((0, MASK)),
             "live [0, MASK] bound on a non-jump-arg short-box result must be exported"
         );
-    }
-
-    #[test]
-    fn test_export_state_cleans_carried_info_before_import() {
-        // unroll.py export_state calls optimizer._clean_optimization_info
-        // after saving infos. Otherwise import_state's get_forwarded check
-        // retains a preamble field VALUE as if it were loop-invariant.
-        use crate::optimizeopt::info::PtrInfo;
-        use majit_ir::field_entry::FieldEntry;
-        use majit_ir::forwarding::Forwarded;
-        let mut optimizer = Optimizer::new();
-        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref, Type::Int]);
-        let obj_ref = OpRef::input_arg_ref(0);
-        let obj = ctx.get_box_replacement_operand(obj_ref);
-        let value = ctx.get_box_replacement_operand(OpRef::input_arg_int(1));
-        let mut info = PtrInfo::instance(Some(majit_ir::descr::make_size_descr(16)), Some(1234));
-        if let PtrInfo::Instance(info) = &mut info {
-            info.fields.push((0, FieldEntry::Value(value)));
-        }
-        ctx.set_ptr_info(&obj, info);
-        let state = export_state(&[obj_ref], &[], &mut optimizer, &mut ctx, None);
-        let exported = state
-            .exported_infos
-            .get(&obj)
-            .unwrap()
-            .get_ptr_info()
-            .unwrap();
-        assert_eq!(exported.borrow().all_items().len(), 1);
-        assert!(
-            matches!(obj.get_forwarded(), Forwarded::None),
-            "export must clear the carried Box while retaining its info separately"
-        );
-    }
-
-    #[test]
-    fn test_expand_info_exports_same_as_virtual_fields() {
-        // unroll.py _expand_info recurses through the selected source info,
-        // not the SAME_AS alias's own (empty) forwarded slot.
-        use crate::optimizeopt::info::{PtrInfo, VirtualStructInfo};
-        use crate::optimizeopt::intutils::IntBound;
-
-        let mut ctx = OptContext::with_num_inputs(4, 0);
-        let source_ref = OpRef::ref_op(20);
-        let source = ctx.materialize_operand_at(source_ref);
-        let field = ctx.materialize_operand_at(OpRef::int_op(21));
-        ctx.setintbound(&field, &IntBound::bounded(4, 9));
-        ctx.set_ptr_info(
-            &source,
-            PtrInfo::VirtualStruct(VirtualStructInfo {
-                descr: majit_ir::descr::make_size_descr(16),
-                fields: vec![(0, field.clone())],
-                last_guard_pos: -1,
-                avpi: Default::default(),
-            }),
-        );
-        let mut alias = Op::new(OpCode::SameAsR, std::slice::from_ref(&source));
-        let alias_ref = OpRef::ref_op(22);
-        alias.pos.set(alias_ref);
-        ctx.emit(alias);
-        let alias_box = ctx.get_box_replacement_operand(alias_ref);
-        let mut infos = indexmap::IndexMap::new();
-        OptUnroll::new().expand_info(alias_ref, &alias_box, &ctx, None, &mut infos);
-        assert!(infos.get(&alias_box).unwrap().is_virtual());
-        let bound = infos
-            .get(&field)
-            .expect("SAME_AS virtual fields must be exported with the alias")
-            .get_int_bound()
-            .unwrap()
-            .borrow();
-        assert_eq!((bound.lower, bound.upper), (4, 9));
-    }
-
-    #[test]
-    fn test_cross_input_preamble_alias_preserves_known_class() {
-        // unroll.py export_state/import_state carry Box identity. A rotated
-        // input with a known class must not become Unknown when pyre gives
-        // it a SAME_AS name for the next iteration (fib_loop's previous b).
-        let mut opt = UnrollOptimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&[Type::Ref, Type::Ref]);
-        let a = rooted_inputarg_operand(Type::Ref, 0);
-        let b = rooted_inputarg_operand(Type::Ref, 1);
-        let mut ops = vec![
-            Op::new(
-                OpCode::GuardClass,
-                &[a.clone(), Operand::from_opref(OpRef::const_int(1234))],
-            ),
-            Op::new(
-                OpCode::GuardClass,
-                &[b.clone(), Operand::from_opref(OpRef::const_int(1234))],
-            ),
-            Op::new(OpCode::Jump, &[b, a]),
-        ];
-        assign_positions(&mut ops, 2);
-        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
-        opt.snapshot_boxes = snapshots;
-        let mut constants = majit_ir::ConstMap::default();
-        let mut phase1 = None;
-        opt.optimize_trace_with_constants_and_inputs_vable_out(
-            &ops,
-            &mut constants,
-            2,
-            None,
-            Some(&mut phase1),
-        )
-        .expect("rotating known-class inputs should optimize");
-        let (_, exported) = phase1.expect("preamble export");
-        for arg in &exported.next_iteration_args {
-            let info = exported
-                .exported_infos
-                .get(arg)
-                .expect("preamble alias must retain source pointer info");
-            let ptr = info.get_ptr_info().unwrap().borrow();
-            assert!(
-                matches!(&*ptr, crate::optimizeopt::info::PtrInfo::Instance(info)
-                if info.known_class == Some(1234)),
-                "lost source class: {ptr:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_expand_info_exports_same_as_source_info() {
-        // unroll.py `_expand_info`: short-preamble SAME_AS aliases retain the
-        // alias as the exported-info key but read optimizer knowledge from
-        // arg0.  This is what keeps a collision-renamed loop-carried box's
-        // class/bound facts across the peel boundary.
-        use crate::optimizeopt::intutils::IntBound;
-
-        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
-        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let source_ref = OpRef::int_op(20);
-        let source = ctx.materialize_operand_at(source_ref);
-        ctx.setintbound(&source, &IntBound::bounded(4, 9));
-
-        let mut same_as = Op::new(OpCode::SameAsI, std::slice::from_ref(&source));
-        let alias_ref = OpRef::int_op(21);
-        same_as.pos.set(alias_ref);
-        assert_eq!(ctx.emit(same_as), alias_ref);
-
-        let exported = export_state(&[alias_ref], &[], &mut optimizer, &mut ctx, None);
-        let info = exported
-            .exported_infos
-            .iter()
-            .find(|(key, _)| key.to_opref() == alias_ref)
-            .map(|(_, info)| info)
-            .expect("SAME_AS result must be the exported-info key");
-        match info {
-            crate::optimizeopt::info::OpInfo::IntBound(bound) => {
-                let bound = bound.borrow();
-                assert_eq!((bound.lower, bound.upper), (4, 9));
-            }
-            other => panic!("expected source IntBound through SAME_AS, got {other:?}"),
-        }
     }
 
     #[test]
