@@ -1342,18 +1342,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_bool_value_from_truth",
         crate::opcode_ops::jit_bool_value_from_truth,
     );
-    cpa3(
-        &mut entries,
-        "pyre_interpreter::opcode_ops::jit_binary_value_from_tag",
-        "pyre_interpreter::jit_binary_value_from_tag",
-        crate::opcode_ops::jit_binary_value_from_tag,
-    );
-    cpa3(
-        &mut entries,
-        "pyre_interpreter::opcode_ops::jit_compare_value_from_tag",
-        "pyre_interpreter::jit_compare_value_from_tag",
-        crate::opcode_ops::jit_compare_value_from_tag,
-    );
     cpa1(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_unary_negative_value",
@@ -1394,7 +1382,9 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // Same binding for the BINARY/COMPARE codewriter `inline_call_ir_r`
     // graphs: the walker descends `binary_value_from_tag` /
     // `compare_value_from_tag`, and guard-failure blackholing calls the
-    // matching one-word C-ABI wrapper.
+    // matching one-word C-ABI wrapper.  The wrapper's own `jit_*` path is
+    // not registered: two leaf names on one address make
+    // `patch_constants_i_fnaddrs` ambiguous.
     cp3(
         &mut entries,
         "pyre_interpreter::opcode_ops::binary_value_from_tag",
