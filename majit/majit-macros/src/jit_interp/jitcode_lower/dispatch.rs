@@ -2247,24 +2247,28 @@ impl<'c> Lowerer<'c> {
     /// caller by the split path below.
     pub(super) fn arm_body_has_infer_call(&self, body: &Expr) -> bool {
         use syn::visit::Visit;
-        struct InferCallProbe<'a, 'c> {
+        struct LateRejectCallProbe<'a, 'c> {
             lowerer: &'a Lowerer<'c>,
             hit: bool,
         }
-        impl<'ast, 'a, 'c> Visit<'ast> for InferCallProbe<'a, 'c> {
+        impl<'ast, 'a, 'c> Visit<'ast> for LateRejectCallProbe<'a, 'c> {
             fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-                if !self.hit
-                    && matches!(
-                        self.lowerer.resolve_call_policy(&call.func),
-                        Some(CallPolicySpec::Infer)
-                    )
-                {
-                    self.hit = true;
+                if !self.hit {
+                    match self.lowerer.resolve_call_policy(&call.func) {
+                        Some(CallPolicySpec::Infer) => self.hit = true,
+                        Some(CallPolicySpec::Explicit(
+                            crate::jit_interp::CallPolicyKind::InlinePipelineInt
+                            | crate::jit_interp::CallPolicyKind::InlinePipelineRef
+                            | crate::jit_interp::CallPolicyKind::InlinePipelineFloat
+                            | crate::jit_interp::CallPolicyKind::InlinePipelineVoid,
+                        )) => self.hit = true,
+                        _ => {}
+                    }
                 }
                 syn::visit::visit_expr_call(self, call);
             }
         }
-        let mut probe = InferCallProbe {
+        let mut probe = LateRejectCallProbe {
             lowerer: self,
             hit: false,
         };
@@ -2732,9 +2736,14 @@ pub(super) fn lower_dispatch_chain(
         // transactional sub-lowerer returns an abort stub; if it can, dropping
         // the green return would resume at the old opcode. RPython keeps `pc`
         // in the caller frame across either call shape.
-        // Inferred residual calls also use this split even without the size
-        // opt-in: their resume guards belong to the callee frame, while the
-        // caller still owns green `pc`.
+        // Infer and `inline_pipeline_*` calls stay on the sub-JitCode path
+        // even without the size opt-in. Infer resume guards belong to the
+        // callee frame while the caller still owns green `pc`. Pipeline
+        // callees are resolved at install (`trailing_return_info`); a
+        // missing typed return emits `return None` via
+        // `inference_failure_tokens`, and that `None` must stay inside the
+        // per-arm IIFE so only that arm degrades. Force-inlining would
+        // make the same `return None` abort the whole dispatch JitCode.
         let has_infer_call = lowerer.arm_body_has_infer_call(&arm.original_body);
         let pc_return_increment = if (config.split_dispatch || has_infer_call)
             && pc_is_green(config)
