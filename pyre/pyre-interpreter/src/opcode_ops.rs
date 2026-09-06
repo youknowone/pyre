@@ -234,6 +234,13 @@ pub fn compare_value_from_tag(
         let result = if op_tag == 7 { !found } else { found };
         return Ok(w_bool_from(result));
     }
+    // IS_OP: tag 8 = `is`, tag 9 = `is not`. `space.is_w`, not raw pointer
+    // identity — same contract as `bh_compare_fn`. Infallible.
+    if op_tag == 8 || op_tag == 9 {
+        let same = crate::baseobjspace::is_w(a, b);
+        let result = if op_tag == 9 { !same } else { same };
+        return Ok(w_bool_from(result));
+    }
     let op = match op_tag {
         0 => CompareOp::Lt,
         1 => CompareOp::Le,
@@ -1404,6 +1411,21 @@ mod tests {
         unsafe {
             assert_eq!(w_int_get_value(neg), -4);
             assert!(w_bool_get_value(cmp));
+        }
+    }
+
+    #[test]
+    fn test_compare_value_from_tag_identity_uses_is_w() {
+        let two = w_int_new(2);
+        let two_again = w_int_new(2);
+        let seven = w_int_new(7);
+        let is_same = compare_value_from_tag(two, two_again, 8).expect("is tag 8");
+        let is_not_same = compare_value_from_tag(two, seven, 9).expect("is_not tag 9");
+        let is_diff = compare_value_from_tag(two, seven, 8).expect("is tag 8 on unequal");
+        unsafe {
+            assert!(w_bool_get_value(is_same));
+            assert!(w_bool_get_value(is_not_same));
+            assert!(!w_bool_get_value(is_diff));
         }
     }
 
