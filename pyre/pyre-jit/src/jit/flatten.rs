@@ -9976,8 +9976,9 @@ mod tests {
 
     #[test]
     fn lower_compare_op_hlop_to_insn_emits_is_op_tag() {
-        // IS_OP routes through the same compare residual as COMPARE_OP;
-        // `is` lowers to op_val tag 8 (`is_not` → 9, bh_compare_fn).
+        // IS_OP routes through the same compare helper as COMPARE_OP;
+        // `is` lowers to op_val tag 8 (`is_not` → 9). `compare_value_from_tag`
+        // handles those tags via `is_w`, matching `bh_compare_fn`.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
         let result = Variable::new(VariableId(2), Kind::Ref);
