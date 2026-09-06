@@ -12304,6 +12304,18 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     vstack_handler_landing_py: Option<u32>,
     live_before_jit_pc: usize,
     live_after_jit_pc: usize,
+    /// `pyjitpl.py finishframe` + `make_result_of_lastop`: dest write for an
+    /// `inline_call_*` SubReturn, applied when this frame is next driven.
+    /// Residual SubReturn still replays the CALL so a cut specialize
+    /// preamble is recorded again.
+    pending_subreturn: Option<PendingSubReturn>,
+}
+
+struct PendingSubReturn {
+    dst_bank: char,
+    dst: usize,
+    caller_pc: usize,
+    result: Option<OpRef>,
 }
 
 impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
@@ -12356,10 +12368,40 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 seed_callee_vstack_mirror(&mut walk_ctx, &frame);
             }
         }
+        // ChangeFrame: dest-write from the finished callee, then walk at
+        // the opcode after the CALL.  The first CALL step already ran
+        // vstack/live bookkeeping before it suspended.
+        let dest_err = if let Some(pending) = self.pending_subreturn.take() {
+            let applied = match finish_inline_callee_return(&mut walk_ctx, pending.result) {
+                Some(value) => super::residual_call::write_residual_call_result_to_dst(
+                    &mut walk_ctx,
+                    pending.caller_pc,
+                    pending.dst,
+                    pending.dst_bank,
+                    value,
+                )
+                .is_ok(),
+                None => pending.dst_bank == 'v',
+            };
+            if applied {
+                SUBWALK_DIRECT_RESUME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            } else {
+                Some(DispatchError::UnexpectedVoidSubReturn {
+                    pc: pending.caller_pc,
+                })
+            }
+        } else {
+            None
+        };
         // The bank is rooted by `SubWalkDriver::push_frame` for this frame's
         // whole residency, which outlasts this call.
         self.box_replacements.set_listening(false);
-        let result = walk(self.body.code, self.pc, &mut walk_ctx);
+        let result = if let Some(err) = dest_err {
+            Err(err)
+        } else {
+            walk(self.body.code, self.pc, &mut walk_ctx)
+        };
         self.box_replacements.set_listening(true);
         self.callee_shadow = walk_ctx.callee_shadow.take();
         self.inline_callee_consts = walk_ctx.inline_callee_consts;
@@ -12382,6 +12424,16 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         self.live_after_jit_pc = walk_ctx.live_after_jit_pc;
         result
     }
+}
+
+/// Dest of an `inline_call_*` at `caller_pc`.  Residual calls stay on
+/// the replay path so a cut specialize preamble is recorded again.
+fn inline_call_subreturn_dst(code: &[u8], caller_pc: usize) -> Option<(char, usize, usize)> {
+    let op = crate::jitcode_runtime::decode_op_at(code, caller_pc)?;
+    if !op.opname.starts_with("inline_call_") {
+        return None;
+    }
+    call_opcode_result_dst(code, caller_pc)
 }
 
 /// Dest bank, dest register, and the pc after a CALL-family opcode.
@@ -12427,6 +12479,7 @@ struct SubWalkExchange<'a, Sym: WalkSym> {
     /// paused parent (`SubWalkFrame.replay_heap_cache`) so a later
     /// `SubRaise` can still replay the CALL; a `SubReturn` drops it.
     step_heap_cache: Option<majit_metainterp::heapcache::HeapCache>,
+    residual_step: bool,
 }
 
 struct SubWalkDriver<'a, Sym: WalkSym> {
@@ -12451,6 +12504,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 step_effect_count: 0,
                 step_unjournaled: false,
                 step_heap_cache: None,
+                residual_step: false,
             },
         };
         driver.push_frame(root);
@@ -12547,6 +12601,20 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     let Some(parent) = self.frames.last_mut() else {
                         return result.map(|outcome| (outcome, class_state));
                     };
+                    if let Ok(DispatchOutcome::SubReturn { result: ret }) = &result
+                        && let Some((dst_bank, dst, next_pc)) =
+                            inline_call_subreturn_dst(parent.body.code, caller_pc)
+                    {
+                        parent.fbw_mode.class_of_last_exc_is_const = class_state;
+                        parent.pending_subreturn = Some(PendingSubReturn {
+                            dst_bank,
+                            dst,
+                            caller_pc,
+                            result: *ret,
+                        });
+                        parent.pc = next_pc;
+                        continue;
+                    }
                     SUBWALK_CALL_REPLAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     parent.pc = caller_pc;
                     self.exchange.completed = Some(CompletedSubWalk {
@@ -12575,7 +12643,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
 pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
     opname: &str,
     trace_position: majit_metainterp::recorder::TracePosition,
-    heap_cache: &majit_metainterp::heapcache::HeapCache,
+    _heap_cache: &majit_metainterp::heapcache::HeapCache,
 ) {
     SUBWALK_DRIVER.with(|slot| {
         let pointer = slot.get();
@@ -12591,16 +12659,30 @@ pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
         exchange.step_trace_position = Some(trace_position);
         exchange.step_effect_count = fbw_executed_effect_count();
         exchange.step_unjournaled = fbw_has_unjournaled_effect();
-        // Residual first entries may record before they suspend, so a
-        // `SubRaise` replay still needs the pre-CALL heap cache.
-        // `inline_call_*` records nothing before suspend; dest-write
-        // resume does not rewind it, so skip the clone.
-        exchange.step_heap_cache = if opname.starts_with("residual_call_") {
+        // `inline_call_*` records nothing before suspend.  A residual
+        // fold that fires and continues must not copy the heap cache;
+        // only a residual that actually yields clones, at the yield.
+        exchange.step_heap_cache = None;
+        exchange.residual_step = opname.starts_with("residual_call_");
+    });
+}
+
+/// Snapshot the heap cache when a residual step yields a nested walk.
+/// Folds that fire without suspending never reach here.
+pub(crate) fn snapshot_residual_heap_before_suspend<Sym: WalkSym>(
+    heap_cache: &majit_metainterp::heapcache::HeapCache,
+) {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return;
+        }
+        // SAFETY: same scoped driver pointer as `note_subwalk_driver_step`.
+        let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
+        if exchange.residual_step && exchange.step_heap_cache.is_none() {
             SUBWALK_HEAP_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Some(heap_cache.clone())
-        } else {
-            None
-        };
+            exchange.step_heap_cache = Some(heap_cache.clone());
+        }
     });
 }
 
@@ -12619,6 +12701,7 @@ mod subwalk_checkpoint_tests {
             step_effect_count: 0,
             step_unjournaled: false,
             step_heap_cache: None,
+            residual_step: false,
         };
         let _driver = SubWalkDriverGuard::install(&mut exchange);
         let position = majit_metainterp::recorder::TracePosition {
@@ -12633,7 +12716,7 @@ mod subwalk_checkpoint_tests {
         for (opname, keeps_checkpoint) in [
             ("inline_call_r_r", false),
             ("int_add", false),
-            ("residual_call_ir_i", true),
+            ("residual_call_ir_i", false),
             ("getfield_gc_r", false),
             ("goto_if_not", false),
             ("live", false),
@@ -12648,6 +12731,14 @@ mod subwalk_checkpoint_tests {
             );
             assert_eq!(exchange.step_trace_position, Some(position));
         }
+        note_subwalk_driver_step::<crate::state::PyreSym>(
+            "residual_call_ir_r",
+            position,
+            &heap_cache,
+        );
+        assert!(exchange.step_heap_cache.is_none());
+        snapshot_residual_heap_before_suspend::<crate::state::PyreSym>(&heap_cache);
+        assert!(exchange.step_heap_cache.is_some());
     }
 
     #[test]
@@ -12655,6 +12746,7 @@ mod subwalk_checkpoint_tests {
         // The driver falls back to CALL replay when the paused pc is not a
         // call opcode.  Empty code is that miss, not a void-return shape.
         assert_eq!(call_opcode_result_dst(&[], 0), None);
+        assert_eq!(inline_call_subreturn_dst(&[], 0), None);
     }
 }
 
@@ -12836,6 +12928,7 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
+        pending_subreturn: None,
     };
 
     if !driver_pointer.is_null() {
@@ -12843,6 +12936,7 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
         // CALL.  The outer driver pushes it without another Rust `walk()`
         // activation.
         let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
+        snapshot_residual_heap_before_suspend::<Sym>(ctx.trace_ctx.heap_cache());
         assert!(exchange.pending.replace(frame).is_none());
         return Err(DispatchError::SubWalkSuspended { pc });
     }
