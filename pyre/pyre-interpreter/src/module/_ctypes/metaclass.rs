@@ -575,6 +575,8 @@ fn simple_init_stginfo(cls: PyObjectRef) -> PyResult {
             );
             pyre_object::w_dict_setitem_str(roots.get(ns_slot), "_ctypes_native_peer", cls);
         }
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(cls);
         let bases = unsafe { pyre_object::typeobject::w_type_get_bases(cls) };
         let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
         let w_name = pyre_object::w_str_new(name);
@@ -582,6 +584,7 @@ fn simple_init_stginfo(cls: PyObjectRef) -> PyResult {
             pycsimpletype_type(),
             &[w_name, bases, roots.get(ns_slot)],
         )?;
+        let cls = roots.get(cls_slot);
         // The new class does not move, but nothing references it until the
         // first `set_type_attr` below completes and that store allocates its
         // key string, so it takes one pin for liveness.

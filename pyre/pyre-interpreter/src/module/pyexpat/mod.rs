@@ -2198,14 +2198,19 @@ crate::py_module! {
                 continue;
             }
             let (msg, code) = ERROR_TABLE[idx - 1];
-            let w_msg = w_str_new(msg);
-            crate::baseobjspace::setdictvalue_native(errors, name, w_msg);
+            let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = error_map_roots.pin_root(w_str_new(msg));
+            crate::baseobjspace::setdictvalue_native(
+                errors,
+                name,
+                error_map_roots.get(msg_slot),
+            );
             let w_code = w_int_new(code);
             let codes = error_map_roots.get(codes_slot);
             unsafe { w_dict_setitem_str(codes, msg, w_code) };
             let w_key = w_int_new(code);
             let messages = error_map_roots.get(messages_slot);
-            unsafe { w_dict_store(messages, w_key, w_msg) };
+            unsafe { w_dict_store(messages, w_key, error_map_roots.get(msg_slot)) };
         }
         let codes = error_map_roots.get(codes_slot);
         crate::baseobjspace::setdictvalue_native(errors, "codes", codes);

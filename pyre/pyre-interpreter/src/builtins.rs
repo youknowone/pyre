@@ -6786,27 +6786,28 @@ fn type_descr_new_with_metaclass(
         // `weak_subclasses` is weak — while the passes below allocate, so a
         // major cycle sweeps it out from under `create_all_slots` and the
         // barrier in `tag_subclass_instance` then writes through a freed
-        // header.  This is the `_entry_roots` scope's reasoning extended back
-        // to the construction; a type does not move, so the local stays a good
-        // address and the root is for liveness only.
+        // header.  `allocate_instance` puts the type in the nursery, so each
+        // collecting pass below reloads it from the slot.
+        let w_type_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_type);
+        let w_type = || pyre_object::gc_roots::shadow_stack_get(w_type_slot);
         // The type allocation may have moved the namespace, so the qualname
         // pass receives the forwarded address rather than the word above.
-        type_new_take_qualname(w_type, pyre_object::gc_roots::shadow_stack_get(dict_root))?;
+        type_new_take_qualname(w_type(), pyre_object::gc_roots::shadow_stack_get(dict_root))?;
         // typeobject.py create_all_slots parity.
         unsafe {
             crate::call::create_all_slots(
-                w_type,
+                w_type(),
                 pyre_object::gc_roots::shadow_stack_get(effective_bases_slot),
             )?
         };
         // `type_ready_fill_dict` defaults the doc entry once the slot and
         // instance descriptors own their names.
-        type_dict_set_doc(w_type);
+        type_dict_set_doc(w_type());
         // rclass.py:739-743 — set w_class (typeptr) at allocation time.
         // For type objects, w_class is the metaclass (type(C) → Meta).
         // baseobjspace.py getclass() returns the metatype.
-        crate::typedef::tag_subclass_instance(w_type, w_metaclass);
+        crate::typedef::tag_subclass_instance(w_type(), w_metaclass);
 
         // type_new_classcell — bind the captured `__classcell__` to the
         // new type so `__class__` / zero-arg `super()` in the methods
@@ -6815,23 +6816,23 @@ fn type_descr_new_with_metaclass(
         // whose `ensure_common_attributes` invokes a custom metaclass mro().
         if let Some(classcell_root) = classcell_root {
             let classcell = pyre_object::gc_roots::shadow_stack_get(classcell_root);
-            unsafe { pyre_object::w_cell_set(classcell, w_type) };
+            unsafe { pyre_object::w_cell_set(classcell, w_type()) };
         }
 
         // typeobject.py compute_mro — a custom metaclass `mro`
         // runs after the class cell is bound and before ready().
-        unsafe { crate::baseobjspace::compute_and_set_mro(w_type)? };
+        unsafe { crate::baseobjspace::compute_and_set_mro(w_type())? };
         // typeobject.py ready() — link self into each base's
         // `weak_subclasses` so `mutated()` and `__subclasses__()`
         // observe this class.
-        unsafe { pyre_object::typeobject::w_type_ready(w_type) };
+        unsafe { pyre_object::typeobject::w_type_ready(w_type()) };
 
         // CPython type_new_set_classdict precedes type_new_set_names: lazy
         // annotation thunks invoked by __set_name__ must resolve class-local
         // names through the completed type dictionary.
         if let Some(classdictcell_root) = classdictcell_root {
             let classdictcell = pyre_object::gc_roots::shadow_stack_get(classdictcell_root);
-            let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type) as PyObjectRef };
+            let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type()) as PyObjectRef };
             if !type_dict.is_null() {
                 unsafe { pyre_object::w_cell_set(classdictcell, type_dict) };
             }
@@ -6860,14 +6861,14 @@ fn type_descr_new_with_metaclass(
         // `__set_name__` runs Python, so a class body's list and dict values
         // move out from under the entries still to come.  Pin them and read
         // each back at the call that consumes it.  The owner goes in the same
-        // scope: a type never moves, so the local stays a good address, but
-        // nothing refers to a class this young — the classcell is optional and
-        // `weak_subclasses` is weak — so a major cycle under a hook would
-        // sweep it.  The scope runs to the end of the branch, which is what
-        // keeps the owner alive through `__init_subclass__` as well.
+        // scope: `allocate_instance` put it in the nursery, and nothing refers
+        // to a class this young — the classcell is optional and
+        // `weak_subclasses` is weak — so a collection under a hook would
+        // move or sweep it.  The scope runs to the end of the branch, which
+        // is what keeps the owner alive through `__init_subclass__` as well.
         let _entry_roots = pyre_object::gc_roots::push_roots();
         let mut livevars = Vec::with_capacity(set_name_entries.len() * 2 + 1);
-        livevars.push(w_type);
+        livevars.push(w_type());
         livevars.extend(
             set_name_entries
                 .iter()
@@ -6879,7 +6880,13 @@ fn type_descr_new_with_metaclass(
         for index in 0..set_name_entries.len() {
             let key = pyre_object::gc_roots::shadow_stack_get(owner_slot + 1 + index * 2);
             let value = pyre_object::gc_roots::shadow_stack_get(owner_slot + 2 + index * 2);
-            unsafe { crate::baseobjspace::set_name(w_type, key, value) }?;
+            unsafe {
+                crate::baseobjspace::set_name(
+                    pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                    key,
+                    value,
+                )
+            }?;
         }
 
         // type_new_init_subclass — fire __init_subclass__ with the
@@ -6899,12 +6906,12 @@ fn type_descr_new_with_metaclass(
             None => Vec::new(),
         };
         crate::call::call_init_subclass_on_bases(
-            w_type,
+            w_type(),
             pyre_object::gc_roots::shadow_stack_get(effective_bases_slot),
             &init_subclass_kwargs,
         )?;
 
-        return Ok(w_type);
+        return Ok(w_type());
     }
 
     unreachable!("type.__new__ argument count was checked by type_descr_new")
@@ -16705,9 +16712,16 @@ pub(crate) fn exec_or_eval(
     // (eval) dispatch on the ORIGINAL `w_globals` object so a dict-subclass
     // `setdefault` / `__contains__` / `__setitem__` override fires.
     if is_eval {
-        ensure_eval_builtins(w_globals, exec_ctx)?;
+        ensure_eval_builtins(
+            w_globals_slot.map_or(w_globals, pyre_object::gc_roots::shadow_stack_get),
+            exec_ctx,
+        )?;
     } else {
-        ensure_exec_builtins(w_globals, caller_frame, exec_ctx)?;
+        ensure_exec_builtins(
+            w_globals_slot.map_or(w_globals, pyre_object::gc_roots::shadow_stack_get),
+            caller_anchor.live(),
+            exec_ctx,
+        )?;
     }
     // Shadow the two namespace arguments with their post-collection addresses
     // rather than reading each use site, so the identity test below
@@ -16771,7 +16785,10 @@ pub(crate) fn exec_or_eval(
             pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
             name,
             pyre_object::PY_NULL,
-            closure_slot.map_or(closure, pyre_object::gc_roots::shadow_stack_get),
+            match closure_slot {
+                Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
+                None => closure,
+            },
         );
         let f = pyre_object::gc_roots::pin_root(f);
         Some(f)
