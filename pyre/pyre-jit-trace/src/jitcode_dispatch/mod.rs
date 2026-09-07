@@ -10127,12 +10127,19 @@ fn walker_pin_function_code<Sym: WalkSym>(
     op_pc: usize,
     callable: pyre_object::PyObjectRef,
 ) -> Result<(), DispatchError> {
+    walker_pin_function_quasi_field(ctx, op_pc, callable, crate::descr::function_code_descr())
+}
+
+/// `function.py:34 _immutable_fields_ = ['code?', 'w_func_globals?', ...]`
+/// marker on one `?` slot of a baked callee.
+fn walker_pin_function_quasi_field<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    callable: pyre_object::PyObjectRef,
+    descr: majit_ir::DescrRef,
+) -> Result<(), DispatchError> {
     let callable_const = ctx.trace_ctx.const_ref(callable as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        callable_const,
-        crate::descr::function_code_descr(),
-    );
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, descr);
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -11732,8 +11739,11 @@ pub(crate) fn ec_hook_installed() -> bool {
 /// read starts from the portal's own `ec` red (`interp_jit.py reds =
 /// ['frame', 'ec']`) rather than a frame field; only a bridge whose red has
 /// not been seeded needs `walker_ensure_execution_context` to recover it from
-/// the frame.  The read is registered with the heapcache, so a run of merge
-/// points with no intervening call collapses to one loop-invariant read.
+/// the frame.  The slot is `w_tracefunc?`, so the pin is a `QUASIIMMUT_FIELD`
+/// marker plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
+/// The `GuardIsnull` is the `promote(None)` half.  The read is registered
+/// with the heapcache, so a run of merge points with no intervening call
+/// collapses to one loop-invariant read.
 ///
 /// A trace recorded while the slot is ALREADY non-NULL records nothing: there
 /// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`
@@ -11767,6 +11777,12 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     {
         return Ok(());
     }
+    // `executioncontext.py gettrace`: `return jit.promote(self.w_tracefunc)`
+    // on a `w_tracefunc?` slot.  The marker plus `GUARD_NOT_INVALIDATED`
+    // is what `?` costs; `settrace` invalidates the watchers.  The
+    // `GuardIsnull` is the `promote(None)` half this portal records.
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone());
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
     let read = ctx
         .trace_ctx
         .record_op_with_descr(OpCode::GetfieldGcR, &[ec_box], descr);

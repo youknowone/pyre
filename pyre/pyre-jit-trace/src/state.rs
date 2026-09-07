@@ -5526,6 +5526,10 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
                 struct_ptr as pyre_object::PyObjectRef,
                 slot,
             )
+        } else if index == crate::descr::ec_w_tracefunc_descr().index() {
+            pyre_interpreter::executioncontext::ec_current_w_tracefunc_qmut(
+                struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
+            )
         } else {
             debug_assert!(
                 false,
