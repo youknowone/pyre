@@ -9241,6 +9241,48 @@ pub(crate) fn jitcode_is_binary_value_from_tag(
     })
 }
 
+/// Tag for a declined helper walk that is `binary_value_from_tag` or a
+/// named `add`/`sub`/`int_add` body.  Used so a bridge that cannot
+/// stamp the helper resume word still emits `int_add` instead of
+/// `CallMayForce` (`bh_binary_op_fn`).
+pub(crate) fn binary_op_tag_for_helper_index(
+    sub_index: usize,
+    int_concretes: &[ConcreteValue],
+) -> Option<i64> {
+    let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)?.name.as_str();
+    if name.contains("binary_value_from_tag") {
+        return match int_concretes.first() {
+            Some(ConcreteValue::Int(tag)) => Some(*tag),
+            _ => None,
+        };
+    }
+    binary_op_tag_for_helper_name(name)
+}
+
+fn binary_op_tag_for_helper_name(name: &str) -> Option<i64> {
+    use pyre_interpreter::bytecode::BinaryOperator as B;
+    let leaf = name.rsplit([':', '.']).next().unwrap_or(name);
+    let leaf = leaf.strip_suffix("_impl").unwrap_or(leaf);
+    let leaf = leaf.strip_prefix("shortcut_").unwrap_or(leaf);
+    let leaf = leaf.strip_prefix("int_").unwrap_or(leaf);
+    let leaf = leaf.strip_prefix("long_").unwrap_or(leaf);
+    let op = match leaf {
+        "add" => B::Add,
+        "sub" => B::Subtract,
+        "mul" => B::Multiply,
+        "floordiv" => B::FloorDivide,
+        "mod" | "mod_" => B::Remainder,
+        "truediv" => B::TrueDivide,
+        "lshift" => B::Lshift,
+        "rshift" => B::Rshift,
+        "and" | "and_" => B::And,
+        "or" | "or_" => B::Or,
+        "xor" => B::Xor,
+        _ => return None,
+    };
+    pyre_interpreter::runtime_ops::binary_op_tag(op)
+}
+
 const COMPARE_OP_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::opcode_ops::compare_value_from_tag",
     commit_label: "compare_op_commit",
@@ -9413,6 +9455,23 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
+    // Descent walks `binary_value_from_tag` → `add`.  Re-entering here
+    // from that `add` inline would recurse until the stack blows.
+    thread_local! {
+        static BINARY_OP_DESCENT_ACTIVE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+    if BINARY_OP_DESCENT_ACTIVE.with(std::cell::Cell::get) {
+        return Ok(None);
+    }
+    struct DescentGuard;
+    impl Drop for DescentGuard {
+        fn drop(&mut self) {
+            BINARY_OP_DESCENT_ACTIVE.with(|flag| flag.set(false));
+        }
+    }
+    BINARY_OP_DESCENT_ACTIVE.with(|flag| flag.set(true));
+    let _descent_guard = DescentGuard;
     // `//` and `%` descend since `int_floordiv` / `int_mod` compute the
     // floor result through the `#[oopspec("int.py_div")]` /
     // `int.py_mod` twins of rint.py's `ll_int_py_div` / `ll_int_py_mod`:
