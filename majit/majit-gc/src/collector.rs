@@ -1670,6 +1670,7 @@ impl MiniMarkGC {
         // already present a complete root set at an allocation; the young birth
         // adds no requirement they do not already meet.
         if total_size >= self.config.large_object_threshold {
+            self.maybe_collect_for_external_malloc(total_size);
             if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
                 return obj;
             }
@@ -1859,6 +1860,7 @@ impl MiniMarkGC {
         // the two births it got.
         if total_size >= self.config.large_object_threshold {
             unsafe { *needs_write_barrier = true };
+            self.maybe_collect_for_external_malloc(total_size);
             if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
                 return obj;
             }
@@ -2686,6 +2688,22 @@ impl MiniMarkGC {
     /// `malloc_zero_filled = False` (incminimark.py) no allocation tier
     /// clears, and a site that needs zeroed memory appends the clear itself —
     /// see [`alloc_in_oldgen_clear`](Self::alloc_in_oldgen_clear).
+    /// `external_malloc`: if the heap is already over the next-major
+    /// threshold, run `minor_collection_with_major_progress` *before* the
+    /// allocation, with extrasize `totalsize + nursery_size/2`.
+    ///
+    /// Only collecting entry points call this. A no-collect path still
+    /// cannot root the caller's native locals, so it keeps the deferred
+    /// breaker in `finish_alloc_*`.
+    fn maybe_collect_for_external_malloc(&mut self, totalsize: usize) {
+        if !self.threshold_reached(totalsize) {
+            return;
+        }
+        self.pending_reserving_size = totalsize.saturating_add(self.config.nursery_size / 2);
+        self.minor_collection_with_major_progress(false);
+        self.pending_reserving_size = 0;
+    }
+
     fn alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> GcRef {
         let ptr = self.oldgen.alloc(total_size);
         self.finish_alloc_in_oldgen(type_id, total_size, ptr, GcFlags::empty())
@@ -2893,14 +2911,10 @@ impl MiniMarkGC {
             total_size - GcHeader::SIZE,
             crate::BH_PROBE_ORIGIN_BORN_OLD,
         );
-        // external_malloc (incminimark.py) tests the same threshold
-        // here and drives `minor_collection_with_major_progress` before
-        // handing the block back. Collecting at this point is what pyre cannot
-        // do: the caller is holding the raw pointer on the Rust stack, which
-        // is not a root, and so is whatever else it had live. Ask the question
-        // where upstream asks it and defer only the answer — the request rides
-        // the eval-breaker word to the interpreter dispatch loop, where the
-        // frame walker sees the whole root set.
+        // Collecting entries already ran `maybe_collect_for_external_malloc`
+        // before the block exists. A no-collect path still cannot root the
+        // caller's native locals, so it only arms the eval-breaker for the
+        // dispatch loop, where the frame walker sees the whole root set.
         //
         // Only where that walk will actually happen: the threshold stays
         // reached until a major completes, so arming past a consumer that
@@ -2995,6 +3009,7 @@ impl MiniMarkGC {
         length: usize,
         has_gc_ptrs_in_var: bool,
     ) -> GcRef {
+        self.maybe_collect_for_external_malloc(total_size);
         self.try_alloc_young_nonmoving_with_cards(type_id, total_size, length, has_gc_ptrs_in_var)
             .unwrap_or_else(|| {
                 self.alloc_in_oldgen_with_cards(type_id, total_size, length, has_gc_ptrs_in_var)
@@ -3166,6 +3181,18 @@ impl MiniMarkGC {
     /// An entry naming a young rawmalloced object is a contradiction: this
     /// minor visits it as an object, and if it dies the drain would be reading
     /// a freed header. Upstream drops those entries before the walk starts.
+    /// incminimark.py `_add_to_more_objects_to_trace_if_black`.
+    ///
+    /// Upstream then clears `GCFLAG_VISITED` because its drain re-marks on
+    /// visit. pyre's `mark_object` treats a push as already black, so the
+    /// object stays VISITED across the re-push.
+    fn add_to_more_objects_to_trace_if_black(&mut self, obj_addr: usize) {
+        let hdr = unsafe { header_of(obj_addr) };
+        if unsafe { (*hdr).has_flag(GcFlags::GCFLAG_VISITED) } {
+            self.incr_state.more_gray_stack.push(obj_addr);
+        }
+    }
+
     fn remove_young_arrays_from_old_objects_pointing_to_young(&mut self) {
         let oldgen = &self.oldgen;
         self.old_objects_pointing_to_young
@@ -3217,15 +3244,17 @@ impl MiniMarkGC {
         if self.oldgen.has_young_rawmalloced() {
             self.remove_young_arrays_from_old_objects_pointing_to_young();
         }
-        // incminimark.py:1800-1807: a black old parent may expose an unpinned
-        // child that will move during this minor, so make the parent gray
-        // again before the active major marking cycle can sweep that child.
+        // incminimark.py `_minor_collection`: before any root walk, turn
+        // already-black remembered / pinned-parent objects gray again so the
+        // active marking cycle rescans what they wrote since the last visit.
         if self.gc_state == GcState::Marking {
-            for &obj_addr in &self.old_objects_pointing_to_pinned {
-                let hdr = unsafe { header_of(obj_addr) };
-                if unsafe { (*hdr).has_flag(GcFlags::GCFLAG_VISITED) } {
-                    self.incr_state.more_gray_stack.push(obj_addr);
-                }
+            for index in 0..self.old_objects_pointing_to_young.len() {
+                let obj_addr = self.old_objects_pointing_to_young[index];
+                self.add_to_more_objects_to_trace_if_black(obj_addr);
+            }
+            for index in 0..self.old_objects_pointing_to_pinned.len() {
+                let obj_addr = self.old_objects_pointing_to_pinned[index];
+                self.add_to_more_objects_to_trace_if_black(obj_addr);
             }
         }
         // incminimark.py:1826-1832: replace the list before anything can append
@@ -3394,20 +3423,6 @@ impl MiniMarkGC {
         // still point to a pinned object.
         for obj_addr in old_parents_pointing_to_pinned {
             self.trace_and_update_object(obj_addr, "minor_old_parent_pinned");
-        }
-
-        // incminimark parity: during an active marking cycle, old objects
-        // remembered by the write barrier may already be black. Requeue
-        // those black objects so the major collector rescans their new
-        // outgoing references before sweep.
-        if self.gc_state == GcState::Marking {
-            let remembered_now: Vec<usize> = self.old_objects_pointing_to_young.to_vec();
-            for obj_addr in remembered_now {
-                let hdr = unsafe { header_of(obj_addr) };
-                if unsafe { (*hdr).has_flag(GcFlags::GCFLAG_VISITED) } {
-                    self.incr_state.more_gray_stack.push(obj_addr);
-                }
-            }
         }
 
         // incminimark.py:1834-1836: a mirror the C side still references roots
