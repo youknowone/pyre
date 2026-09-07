@@ -3831,10 +3831,9 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the self-recursive `CALL_ASSEMBLER` trampoline the nested-decline
     // hazard names.  Refusing it inside `rec` aborted the inline before
     // `sys._getframe` could force a multi-frame carrier.
-    // Tagged flatten residuals bind `[lhs, rhs, tag]`.  A codewriter
-    // residual of the same helper can bind `[tag, lhs, rhs]`.  The tag
-    // is a small int; treating it as a `PyObjectRef` is a misaligned
-    // dereference (`0x1` for compare tag 1).
+    // Probe only `CallDescr` Ref slots.  The tag is an Int; guessing
+    // `[lhs, rhs]` vs `[tag, lhs, rhs]` by alignment still treats
+    // pointer-sized tags 8/16/24 as objects (`0x8` / `0x10`).
     let is_exact_int_word = |word: i64| {
         let obj = word as pyre_object::PyObjectRef;
         !obj.is_null()
@@ -3845,9 +3844,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     && pyre_object::is_exact_builtin_instance(obj)
             }
     };
-    let exact_int_binop_operands =
-        (args.len() >= 2 && is_exact_int_word(args[0]) && is_exact_int_word(args[1]))
-            || (args.len() >= 3 && is_exact_int_word(args[1]) && is_exact_int_word(args[2]));
+    let ref_operand_words: Vec<i64> = call_descr
+        .arg_types()
+        .iter()
+        .enumerate()
+        .filter(|(_, ty)| **ty == majit_ir::Type::Ref)
+        .filter_map(|(i, _)| args.get(i).copied())
+        .collect();
+    let exact_int_binop_operands = ref_operand_words.len() == 2
+        && is_exact_int_word(ref_operand_words[0])
+        && is_exact_int_word(ref_operand_words[1]);
     let observed_exact_int_binop = matches!(
         helper,
         majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
