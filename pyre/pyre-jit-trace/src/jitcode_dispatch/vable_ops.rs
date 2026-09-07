@@ -11,17 +11,20 @@
 use super::*;
 
 /// Register-bank half of `pyjitpl.MetaInterp.replace_box`, owned by a live
-/// walker frame. Rust cannot borrow a paused caller's banks while its child
-/// is using the same TraceCtx. Queue the replacement on each frame owner and
-/// apply it before that frame executes again; its resume boxes are rewritten
-/// immediately below, before any descendant can capture a guard.
+/// walker frame. Resume snapshots (`InlineParentFrame.boxes`) are rewritten
+/// immediately, as `replace_box` walks `framestack`. Register banks stay
+/// queued: Rust cannot borrow a paused caller's banks while its child holds
+/// `TraceCtx`. Convergence is one red frame per inlined call (#1731) so
+/// replace can write those banks in place.
+///
+/// Apply the queue before that frame executes again. Delivery must precede
+/// the caller continuation, not the next opcode: trace rollback can reuse
+/// an OpRef id, and a later delivery could rewrite a new value that was
+/// never present in the paused caller.
 ///
 /// Weak registration neither extends a frame's lifetime nor leaks aliases
 /// into a nested trace session. Heap-owned SubWalkFrames keep this owner
 /// across suspension; recursive callers keep it for precisely the child call.
-/// Delivery must precede the caller continuation, not the next opcode: trace
-/// rollback can reuse an OpRef id, and a later delivery could rewrite a new
-/// value that was never present in the paused caller.
 pub(super) struct FrameBoxReplacements(std::rc::Rc<FrameBoxReplacementInbox>);
 
 pub(crate) struct FrameBoxReplacementInbox {
