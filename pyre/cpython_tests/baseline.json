@@ -8,10 +8,12 @@
       "dynasm": "PASS"
     },
     "test.test__interpchannels": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython subinterpreter API; PyPy has no owner"
     },
     "test.test__interpreters": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython subinterpreter API; PyPy has no owner"
     },
     "test.test__locale": {
       "cranelift": "SKIP",
@@ -34,27 +36,29 @@
       "dynasm": "PASS"
     },
     "test.test_android": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "Android-only"
     },
     "test.test_annotationlib": {
       "cranelift": "IMPORTERROR",
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_apple": {
       "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_argparse": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_array": {
       "dynasm": "PASS"
     },
     "test.test_asdl_parser": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython Parser/asdl internals"
     },
     "test.test_ast": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_asyncgen": {
       "dynasm": "PASS"
@@ -68,7 +72,7 @@
       "dynasm": "PASS"
     },
     "test.test_audit": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_augassign": {
       "cranelift": "PASS",
@@ -81,7 +85,7 @@
       "dynasm": "PASS"
     },
     "test.test_bdb": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_bigaddrspace": {
       "cranelift": "SKIP",
@@ -114,10 +118,11 @@
       "dynasm": "PASS"
     },
     "test.test_build_details": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython build metadata"
     },
     "test.test_builtin": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_bytes": {
       "dynasm": "IMPORTERROR"
@@ -127,7 +132,8 @@
     },
     "test.test_c_locale_coercion": {
       "cranelift": "PASS",
-      "dynasm": "PASS"
+      "dynasm": "SKIP",
+      "reason": "asserts child stderr is empty, but MAJIT_STATS=1 prints a [jit-stats] line to every process's stderr"
     },
     "test.test_calendar": {
       "dynasm": "PASS"
@@ -152,7 +158,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_clinic": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython Argument Clinic"
     },
     "test.test_cmath": {
       "dynasm": "PASS"
@@ -161,7 +168,7 @@
       "dynasm": "PASS"
     },
     "test.test_cmd_line": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_cmd_line_script": {
       "dynasm": "IMPORTERROR"
@@ -229,10 +236,10 @@
       "dynasm": "PASS"
     },
     "test.test_compile": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_compileall": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_compiler_assemble": {
       "cranelift": "SKIP",
@@ -246,7 +253,7 @@
       "dynasm": "PASS"
     },
     "test.test_concurrent_futures": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_configparser": {
       "dynasm": "PASS"
@@ -283,10 +290,11 @@
       "reason": "needs C compiler / C-API"
     },
     "test.test_cprofile": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_crossinterp": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython subinterpreter API; PyPy has no owner"
     },
     "test.test_csv": {
       "dynasm": "PASS"
@@ -362,7 +370,7 @@
       "reason": "implementation detail"
     },
     "test.test_doctest": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_docxmlrpc": {
       "dynasm": "PASS"
@@ -383,7 +391,7 @@
       "dynasm": "PASS"
     },
     "test.test_email": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_embed": {
       "dynasm": "SKIP",
@@ -401,7 +409,7 @@
       "dynasm": "PASS"
     },
     "test.test_eof": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_epoll": {
       "dynasm": "IMPORTERROR"
@@ -429,16 +437,17 @@
       "dynasm": "PASS"
     },
     "test.test_extcall": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_external_inspection": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython remote-debugging helper"
     },
     "test.test_faulthandler": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_fcntl": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_file": {
       "dynasm": "PASS"
@@ -487,7 +496,8 @@
       "reason": "implementation detail"
     },
     "test.test_free_threading": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython free-threading internals"
     },
     "test.test_frozen": {
       "dynasm": "SKIP",
@@ -497,7 +507,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_ftplib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_funcattrs": {
       "dynasm": "PASS"
@@ -507,24 +517,26 @@
       "dynasm": "PASS"
     },
     "test.test_future_stmt": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_gc": {
       "dynasm": "SKIP",
       "reason": "implementation detail"
     },
     "test.test_gdb": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython gdb hooks"
     },
     "test.test_generated_cases": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython bytecode case generator"
     },
     "test.test_generator_stop": {
       "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_generators": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_genericalias": {
       "dynasm": "PASS"
@@ -537,7 +549,7 @@
       "dynasm": "PASS"
     },
     "test.test_genexps": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_getopt": {
       "dynasm": "PASS"
@@ -546,10 +558,11 @@
       "dynasm": "PASS"
     },
     "test.test_getpath": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython internal details"
     },
     "test.test_gettext": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_glob": {
       "dynasm": "PASS"
@@ -559,7 +572,7 @@
       "dynasm": "PASS"
     },
     "test.test_grammar": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_graphlib": {
       "dynasm": "PASS"
@@ -597,7 +610,7 @@
       "dynasm": "PASS"
     },
     "test.test_httplib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_httpservers": {
       "dynasm": "IMPORTERROR"
@@ -679,7 +692,8 @@
       "reason": "demands too many resources"
     },
     "test.test_launcher": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython Windows py.exe launcher"
     },
     "test.test_linecache": {
       "dynasm": "PASS"
@@ -698,7 +712,7 @@
       "dynasm": "PASS"
     },
     "test.test_logging": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_long": {
       "dynasm": "PASS"
@@ -714,7 +728,7 @@
       "dynasm": "PASS"
     },
     "test.test_marshal": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_math": {
       "dynasm": "FAIL"
@@ -730,20 +744,20 @@
       "dynasm": "PASS"
     },
     "test.test_metaclass": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_mimetypes": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_minidom": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_mmap": {
       "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_module": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_modulefinder": {
       "cranelift": "PASS",
@@ -803,7 +817,8 @@
       "dynasm": "PASS"
     },
     "test.test_optimizer": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython specializing optimizer"
     },
     "test.test_optparse": {
       "cranelift": "PASS",
@@ -813,7 +828,7 @@
       "dynasm": "CRASH"
     },
     "test.test_os": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_osx_env": {
       "cranelift": "SKIP",
@@ -840,10 +855,12 @@
       "dynasm": "PASS"
     },
     "test.test_perf_profiler": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython perf profiler hooks"
     },
     "test.test_perfmaps": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython perf map hooks"
     },
     "test.test_pickle": {
       "dynasm": "PASS"
@@ -865,10 +882,10 @@
       "dynasm": "PASS"
     },
     "test.test_platform": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_plistlib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_poll": {
       "dynasm": "FAIL"
@@ -878,14 +895,14 @@
       "dynasm": "PASS"
     },
     "test.test_poplib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_positional_only_arg": {
       "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_posix": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_posixpath": {
       "dynasm": "PASS"
@@ -901,7 +918,7 @@
       "dynasm": "PASS"
     },
     "test.test_profile": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_property": {
       "cranelift": "PASS",
@@ -924,13 +941,13 @@
       "dynasm": "PASS"
     },
     "test.test_pyclbr": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_pydoc": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_pyexpat": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_pyrepl": {
       "dynasm": "FAIL"
@@ -965,19 +982,19 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_repl": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_reprlib": {
       "dynasm": "PASS"
     },
     "test.test_resource": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "CRASH"
     },
     "test.test_richcmp": {
       "dynasm": "PASS"
     },
     "test.test_rlcompleter": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_robotparser": {
       "dynasm": "PASS"
@@ -1025,16 +1042,17 @@
       "dynasm": "FAIL"
     },
     "test.test_signal": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_site": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL",
+      "reason": "site-packages live under lib/pyre3.14t, matching PyPy's implementation-named tree; the CPython test hardcodes python3.14t"
     },
     "test.test_slice": {
       "dynasm": "PASS"
     },
     "test.test_smtplib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_smtpnet": {
       "dynasm": "PASS"
@@ -1050,7 +1068,7 @@
       "dynasm": "PASS"
     },
     "test.test_source_encoding": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_sqlite3": {
       "dynasm": "IMPORTERROR"
@@ -1106,7 +1124,7 @@
       "dynasm": "PASS"
     },
     "test.test_subprocess": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_sundry": {
       "cranelift": "PASS",
@@ -1116,16 +1134,17 @@
       "dynasm": "PASS"
     },
     "test.test_support": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_symtable": {
       "dynasm": "PASS"
     },
     "test.test_syntax": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_sys": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL",
+      "reason": "test_jit_is_active imports _testcapi/_testinternalcapi, CPython JIT test helpers PyPy does not ship"
     },
     "test.test_sys_setprofile": {
       "dynasm": "SKIP",
@@ -1136,7 +1155,7 @@
       "reason": "implementation detail"
     },
     "test.test_sysconfig": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_syslog": {
       "dynasm": "PASS"
@@ -1149,10 +1168,11 @@
       "dynasm": "TIMEOUT"
     },
     "test.test_tcl": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "needs display"
     },
     "test.test_tempfile": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_termios": {
       "dynasm": "FAIL"
@@ -1165,7 +1185,8 @@
       "dynasm": "PASS"
     },
     "test.test_thread_local_bytecode": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython specializing-interpreter internals"
     },
     "test.test_threadedtempfile": {
       "cranelift": "SKIP",
@@ -1192,7 +1213,8 @@
       "dynasm": "TIMEOUT"
     },
     "test.test_tkinter": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "needs display"
     },
     "test.test_tokenize": {
       "dynasm": "IMPORTERROR"
@@ -1205,23 +1227,24 @@
       "reason": "CPython internal build details"
     },
     "test.test_trace": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_traceback": {
       "dynasm": "FAIL"
     },
     "test.test_tracemalloc": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_tstring": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_ttk": {
       "dynasm": "SKIP",
       "reason": "needs display"
     },
     "test.test_ttk_textonly": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "needs display"
     },
     "test.test_tty": {
       "dynasm": "PASS"
@@ -1230,7 +1253,8 @@
       "dynasm": "PASS"
     },
     "test.test_turtle": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "needs display"
     },
     "test.test_type_aliases": {
       "cranelift": "FAIL",
@@ -1288,10 +1312,10 @@
       "dynasm": "PASS"
     },
     "test.test_unpack": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_unpack_ex": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_unparse": {
       "dynasm": "IMPORTERROR"
@@ -1306,7 +1330,7 @@
       "dynasm": "PASS"
     },
     "test.test_urllib2net": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_urllib_response": {
       "cranelift": "PASS",
@@ -1330,7 +1354,7 @@
       "dynasm": "PASS"
     },
     "test.test_utf8_mode": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_utf8source": {
       "cranelift": "PASS",
@@ -1395,23 +1419,25 @@
       "dynasm": "PASS"
     },
     "test.test_xml_etree": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_xml_etree_c": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_xmlrpc": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_xpickle": {
       "dynasm": "SKIP",
       "reason": "spawns per-version pythonX.Y subprocesses (PATH-dependent, can deadlock)"
     },
     "test.test_xxlimited": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython internal details"
     },
     "test.test_xxtestfuzz": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython internal details"
     },
     "test.test_yield_from": {
       "dynasm": "PASS"
@@ -1441,7 +1467,28 @@
       "dynasm": "FAIL"
     },
     "test.test_zstd": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "no PyPy owner for the _zstd accelerator"
+    },
+    "test.test_dict_version": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_bytecode_helper": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail"
+    },
+    "test.test_refcounting": {
+      "dynasm": "SKIP",
+      "reason": "implementation detail (refcount semantics)"
+    },
+    "test.test_ossaudiodev": {
+      "dynasm": "SKIP",
+      "reason": "needs low level audio"
+    },
+    "test.test_tk": {
+      "dynasm": "SKIP",
+      "reason": "needs display"
     }
   },
   "stdlib_version": "3.14.6"
