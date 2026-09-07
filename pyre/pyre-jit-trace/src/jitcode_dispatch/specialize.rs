@@ -354,6 +354,52 @@ fn walker_emit_int_div_domain_guards<Sym: WalkSym>(
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[ovf_both])
 }
 
+/// After a successful `//` / `%` dest-write, pin the same `_ovf_zer`
+/// pair the int fold records so a later zero divisor deopts before
+/// the compiled dest is stored into a Python local (`checksum +=`).
+pub(crate) fn walker_guard_int_div_domain_if_exact<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+) -> Result<(), DispatchError> {
+    if r_args.len() != 2 {
+        return Ok(());
+    }
+    let lhs = r_args[0];
+    let rhs = r_args[1];
+    let (Some(lhs_obj), Some(rhs_obj)) = (
+        walker_concrete_ref_object(ctx, lhs),
+        walker_concrete_ref_object(ctx, rhs),
+    ) else {
+        return Ok(());
+    };
+    unsafe {
+        for obj in [lhs_obj, rhs_obj] {
+            if !pyre_object::is_int(obj) || !pyre_object::is_exact_builtin_instance(obj) {
+                return Ok(());
+            }
+        }
+    }
+    let la = unsafe { pyre_object::w_int_get_value(lhs_obj) };
+    let rb = unsafe { pyre_object::w_int_get_value(rhs_obj) };
+    // Pin the boxed divisor.  `int_eq(unbox(rhs), 0)` folds away when
+    // the unbox is const 7, but a live `divisor = 7 if ... else 0`
+    // still passes 0 at runtime (`flip_floor`).
+    //
+    // A `NewWithVtable` box is unescaped and the optimizer virtualizes
+    // it; `GUARD_VALUE` on that box is `promote of a virtual`
+    // (`optimizeopt` `optimize_GUARD_VALUE`).  The pin is only for a
+    // red / already-escaped divisor whose identity can change later.
+    if !rhs.is_constant() && !ctx.trace_ctx.heap_cache().is_unescaped(rhs) {
+        let expected = ctx.trace_ctx.const_ref(rhs_obj as i64);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[rhs, expected])?;
+    }
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let lhs_raw = walker_unbox_int(ctx, op_pc, lhs, int_type_addr)?;
+    let rhs_raw = walker_unbox_int(ctx, op_pc, rhs, int_type_addr)?;
+    walker_emit_int_div_domain_guards(ctx, op_pc, lhs_raw, rhs_raw, la, rb)
+}
+
 /// jtransform.py `OS_INT_PY_DIV` / `OS_INT_PY_MOD` elidable residual call
 /// (`call_typed_with_effect_pure` → `CallI` patched via
 /// `record_result_of_call_pure`), returning the result op and its recorded
@@ -629,9 +675,16 @@ pub(crate) fn try_walker_specialize_binary_op_int_zero_div<Sym: WalkSym>(
     // `allboxes` (`executor.execute_residual_call`), not the shadow objects
     // used for the exactness gate: a stale zero in the rhs shadow must not
     // invent a `ZeroDivisionError` for `n % 2`.
-    let Some(Err(exc_i64)) = walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)
-    else {
-        return Ok(None);
+    // Native `sdiv` by zero returns 0 on some backends and the helper
+    // then dest-writes NULL instead of `Err`.  A live zero divisor is
+    // still the raising arm.
+    let exc_i64 = match walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr) {
+        Some(Err(exc)) => exc,
+        Some(Ok(0)) | None => {
+            let mut err = pyre_interpreter::PyError::zero_division("division by zero");
+            err.to_exc_object() as i64
+        }
+        Some(Ok(_)) => return Ok(None),
     };
     // The helper publishes through both the blackhole cell (drained by
     // `execute_residual_call`) and the backend exception cells.  The latter
@@ -732,9 +785,13 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
         (long_class, int_class, pyre_object::w_int_get_value(int_obj))
     };
     if int_value == 0 {
-        let Some(Err(exc_i64)) = walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)
-        else {
-            return Ok(None);
+        let exc_i64 = match walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr) {
+            Some(Err(exc)) => exc,
+            Some(Ok(0)) | None => {
+                let mut err = pyre_interpreter::PyError::zero_division("division by zero");
+                err.to_exc_object() as i64
+            }
+            Some(Ok(_)) => return Ok(None),
         };
         if let Some(cb) = crate::callbacks::try_get() {
             (cb.drain_backend_jit_exc)();
@@ -9165,6 +9222,25 @@ const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "BINARY-OP-SUBWALK",
 };
 
+/// True when `sub_body` is the `binary_value_from_tag` helper the
+/// codewriter inlines for BINARY.  The per-index name table can miss a
+/// helper that `pathed_jitcode_cached` still owns, and a name-only
+/// check then skipped descent so a declined sub-walk residualized
+/// `CallMayForce` (`bh_binary_op_fn`) on fib bridges.
+pub(crate) fn jitcode_is_binary_value_from_tag(
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    if crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+        .is_some_and(|jc| jc.name.contains("binary_value_from_tag"))
+    {
+        return true;
+    }
+    crate::jitcode_runtime::pathed_jitcode_cached(BINARY_OP_DESCENT.path).is_some_and(|jc| {
+        jc.index() == sub_index || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
+    })
+}
+
 const COMPARE_OP_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::opcode_ops::compare_value_from_tag",
     commit_label: "compare_op_commit",
@@ -9290,7 +9366,7 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
             return Err(error);
         }
     };
-    let result = match promote_published_null_return(ctx, walk_outcome) {
+    let result = match promote_published_null_return(ctx, walk_outcome, op_pc) {
         DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
             .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
         // `front::result_exc::fuse_kind_ctor_raise` removes the Rust
@@ -9303,6 +9379,10 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    // `handle_possible_exception`: a successful descent of `//` / `%`
+    // still has to carry `GUARD_NO_EXCEPTION` so a later zero divisor
+    // deopts instead of dest-writing NULL into the caller's `+=` slot.
+    super::inline_call::maybe_guard_no_exception_after_raising_binop(ctx, op_pc, &int_concretes)?;
     Ok(Some(DispatchOutcome::Continue))
 }
 
@@ -9387,12 +9467,20 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         }
         *slot = (operand, obj);
     }
+    // A live zero divisor is the raising arm (`try_walker_specialize_binary_op_int_zero_div`).
+    // Descending the success body would dest-write NULL (`sdiv`/`None`) and
+    // compile `checksum +=` against an unbound local.
+    if matches!(plain, B::FloorDivide | B::Remainder)
+        && unsafe { pyre_object::w_int_get_value(operands[1].1) } == 0
+    {
+        return Ok(None);
+    }
     let tag = if plain_tag == op_tag {
         tag
     } else {
         ctx.trace_ctx.const_int(plain_tag)
     };
-    try_walker_orthodox_descent(
+    let outcome = try_walker_orthodox_descent(
         ctx,
         op_pc,
         &[(tag, plain_tag)],
@@ -9400,7 +9488,21 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         dst,
         dst_bank,
         &BINARY_OP_DESCENT,
-    )
+    )?;
+    // `_ovf_zer` belongs to `//` / `%` only.  Emitting it after every
+    // descent promoted the freshly boxed `2` of `n < 2` / `n - 2`
+    // (`optimize_GUARD_VALUE`: promote of a virtual) and aborted the
+    // fib function-entry trace before any add could compile.
+    if matches!(
+        (&outcome, plain),
+        (
+            Some(DispatchOutcome::Continue),
+            B::FloorDivide | B::Remainder
+        )
+    ) {
+        walker_guard_int_div_domain_if_exact(ctx, op_pc, r_args)?;
+    }
+    Ok(outcome)
 }
 
 /// `COMPARE_OP` on two exact builtin machine ints (`int`, `bool`): descend

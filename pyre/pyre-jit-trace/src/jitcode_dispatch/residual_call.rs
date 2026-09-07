@@ -9151,15 +9151,30 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // CALL_MAY_FORCE, matching the retired trait-side int binop / compare
     // paths.  Falls through to the generic record for
     // non-int operands / deferred operators.
-    if matches!(
-        foldable_runtime_helper,
-        majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
-    ) {
+    //
+    // The eval-loop codewriter residual can arrive with
+    // `RuntimeHelperKind::None`; identify the helper by fnaddr so
+    // `binary_op_descent` still runs after `binary_op_int` retired.
+    let func_addr = match ctx.trace_ctx.box_value(funcptr) {
+        Some(majit_ir::Value::Int(n)) => n,
+        _ => 0,
+    };
+    let opcode_binary_fnaddr = func_addr != 0
+        && pyre_interpreter::jit_trace_fnaddrs()
+            .iter()
+            .any(|(n, a)| *a == func_addr && n.ends_with("binary_value_from_tag"));
+    let opcode_compare_fnaddr = func_addr != 0
+        && pyre_interpreter::jit_trace_fnaddrs()
+            .iter()
+            .any(|(n, a)| *a == func_addr && n.ends_with("compare_value_from_tag"));
+    let is_binary_op = foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp
+        || opcode_binary_fnaddr;
+    let is_compare_op = foldable_runtime_helper == majit_ir::RuntimeHelperKind::CompareOp
+        || opcode_compare_fnaddr;
+    if is_binary_op || is_compare_op {
         if let Some(&tag_opref) = i_args.first() {
             if let Some(majit_ir::Value::Int(op_tag)) = ctx.trace_ctx.box_value(tag_opref) {
-                let specialized = if foldable_runtime_helper
-                    == majit_ir::RuntimeHelperKind::BinaryOp
-                {
+                let specialized = if is_binary_op {
                     let is_subscr = matches!(
                         pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
                         Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
@@ -9392,14 +9407,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 if specialized.is_some() {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
-                if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp {
+                if is_binary_op {
                     if let Some(inlined) = try_walker_inline_user_binop(
                         ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
                     )? {
                         return Ok(inlined);
                     }
                 }
-                if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CompareOp {
+                if is_compare_op {
                     if let Some(inlined) = try_walker_inline_user_compareop(
                         ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
                     )? {
