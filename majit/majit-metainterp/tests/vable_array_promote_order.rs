@@ -245,6 +245,7 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     machine.run_one_step(ctx, &mut sym, &runtime);
     drop(machine);
 
+    ctx.ensure_ops_materialized();
     let promoted_index = ctx.ops().iter().any(|recorded| {
         recorded.opcode == majit_ir::OpCode::GuardValue
             && recorded

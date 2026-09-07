@@ -121,6 +121,7 @@ fn elidable_ref_canary_traces_to_call_pure_r_when_args_not_all_const() {
     );
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     let opcodes: Vec<_> = ops.iter().map(|op| op.opcode).collect();
 
@@ -179,6 +180,7 @@ fn elidable_ref_canary_all_const_args_fold_to_const_ptr_not_const_int() {
     );
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     let opcodes: Vec<_> = ops.iter().map(|op| op.opcode).collect();
 

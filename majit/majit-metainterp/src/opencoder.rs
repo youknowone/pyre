@@ -818,9 +818,27 @@ impl<'a> ByteTraceIter<'a> {
 
     /// opencoder.py `_get`.
     fn _get(&self, i: usize) -> Operand {
-        self._cache[i]
-            .clone()
-            .expect("ByteTraceIter._get: cache miss")
+        match self._cache.get(i).cloned().flatten() {
+            Some(res) => res,
+            None => panic!(
+                "ByteTraceIter._get: cache miss at {i} \
+                 (cache_len={}, filled={}, pos={}, start={}, end={}, \
+                 index={}, start_index={}, fresh={}, \
+                 max_in={}, trb_index={}, trb_count={}, n_in={})",
+                self._cache.len(),
+                self._cache.iter().filter(|s| s.is_some()).count(),
+                self.pos,
+                self.start,
+                self.end,
+                self._index,
+                self.start_index,
+                self._fresh,
+                self.trace.max_num_inputargs,
+                self.trace._index,
+                self.trace._count,
+                self.trace.inputargs.len(),
+            ),
+        }
     }
 
     /// opencoder.py `_untag` — full dispatch.
@@ -1519,9 +1537,12 @@ impl Trace {
         // `max_num_inputargs` bytes of `_ops` are reserved as placeholder
         // territory that `TraceIterator.pos = start` walks past —
         // iteration and all write positions operate in a unified
-        // [max_num_inputargs, _pos) range.
+        // [max_num_inputargs, _pos) range. Size the buffer to hold that
+        // prefix: `INIT_SIZE` alone is 4096, and a virtualizable array
+        // can reserve more inputargs than that
+        // (`create_empty_history` after `initialize_virtualizable`).
         let mut t = Trace {
-            _ops: vec![0u8; INIT_SIZE],
+            _ops: vec![0u8; INIT_SIZE.max(max_num_inputargs as usize)],
             _pos: max_num_inputargs as usize,
             _count: max_num_inputargs,
             _index: max_num_inputargs,
@@ -1660,7 +1681,7 @@ impl Trace {
     /// opencoder.py append_byte(c) — write a single byte and
     /// advance `_pos`. Doubles the buffer if needed.
     pub fn append_byte(&mut self, c: u8) {
-        if self._pos >= self._ops.len() {
+        while self._pos >= self._ops.len() {
             self._double_ops();
         }
         self._ops[self._pos] = c;
@@ -1670,15 +1691,17 @@ impl Trace {
     /// opencoder.py append_int(i). Writes a signed varint into
     /// `_ops` at `_pos` using the same 2-or-4 byte layout as
     /// `encode_varint_signed`, but inlined so the buffer-doubling check
-    /// happens once (RPython checks `_pos + 4 > len(_ops)` then writes in
-    /// place). Out-of-range values trip `tag_overflow` and encode 0.
+    /// happens before the write (RPython checks `_pos + 4 > len(_ops)`
+    /// then writes in place). Doubling loops until the reserved
+    /// `_pos = max_num_inputargs` prefix fits. Out-of-range values trip
+    /// `tag_overflow` and encode 0.
     pub fn append_int(&mut self, i: i64) {
         let mut v = i;
         if !(MIN_VALUE..=MAX_VALUE).contains(&v) {
             self.tag_overflow = true;
             v = 0;
         }
-        if self._pos + 4 > self._ops.len() {
+        while self._pos + 4 > self._ops.len() {
             self._double_ops();
         }
         let flag: u8 = if !(-(1 << 14)..(1 << 14)).contains(&v) {

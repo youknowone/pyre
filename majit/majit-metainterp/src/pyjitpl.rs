@@ -5342,7 +5342,6 @@ impl<M: Clone> MetaInterp<M> {
                 }
 
                 let mut ctx = TraceCtx::new(recorder, green_key, self.staticdata.clone());
-                ctx.attach_live_byte_recorder();
                 ctx.set_root_green_key_raw(green_key_raw);
                 // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot.
                 ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
@@ -5364,6 +5363,11 @@ impl<M: Clone> MetaInterp<M> {
                 self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
                 // pyjitpl.py initialize_virtualizable parity.
                 self.initialize_virtualizable(&mut ctx, live_values);
+                // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
+                // runs after `initialize_state_from_start`, which has already
+                // appended `virtualizable_boxes` onto `original_boxes`. Attach
+                // here so `Trace(max_num_inputargs)` sees the full cap.
+                ctx.attach_live_byte_recorder();
                 // warmstate.py:439 `force_finish_trace=bool(cell.flags &
                 // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky
                 // upstream (no clear in rpython/jit/metainterp/).
@@ -5650,7 +5654,6 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             TraceCtx::new(recorder, green_key, self.staticdata.clone())
         };
-        ctx.attach_live_byte_recorder();
         ctx.set_root_green_key_raw(green_key_raw);
         // pyjitpl.py:2789 warmrunnerstate.trace_limit — snapshot onto the
         // per-trace context so `is_too_long` can consult it without needing
@@ -5675,6 +5678,11 @@ impl<M: Clone> MetaInterp<M> {
         self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
         // pyjitpl.py initialize_virtualizable parity.
         self.initialize_virtualizable(&mut ctx, live_values);
+        // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
+        // runs after `initialize_state_from_start`, which has already
+        // appended `virtualizable_boxes` onto `original_boxes`. Attach
+        // here so `Trace(max_num_inputargs)` sees the full cap.
+        ctx.attach_live_byte_recorder();
 
         // warmstate.py:439 `force_finish_trace=bool(cell.flags &
         // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky upstream.
@@ -17746,7 +17754,7 @@ impl<M: Clone> MetaInterp<M> {
         let tracelength = self
             .tracing
             .as_ref()
-            .map(|ctx| ctx.ops().len() as i32)
+            .map(|ctx| ctx.num_ops() as i32)
             .unwrap_or(0);
         if tracelength == self.trace_length_at_last_tco {
             // pyjitpl.py:1318-1319: emit SAME_AS_I(ConstInt(tracelength))

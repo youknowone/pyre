@@ -322,10 +322,10 @@ impl Trace {
 
     /// Attach `opencoder.Trace` as the live storage. `History.__init__`
     /// (`history.py`) builds that buffer with `metainterp_sd` once the
-    /// inputarg cap is known. Called from `TraceCtx::new` after
-    /// `record_input_arg` has reserved the frontend boxes, so existing
-    /// inputargs are replayed into the buffer and later `record_*` calls
-    /// write bytes instead of `Rc<Op>`.
+    /// inputarg cap is known — after `initialize_virtualizable` has
+    /// appended every vable box (`pyjitpl.py create_empty_history`).
+    /// Existing inputargs are replayed into the buffer and later
+    /// `record_*` calls write bytes instead of `Rc<Op>`.
     pub fn attach_byte_buffer(
         &mut self,
         metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
@@ -508,6 +508,18 @@ impl Trace {
         assert!(
             self.ops.is_empty() && self.slots.is_empty(),
             "input args must be registered before any operations"
+        );
+        // opencoder.py `Trace.__init__(max_num_inputargs)` freezes the
+        // reserved prefix. `create_empty_history` therefore runs after
+        // `initialize_virtualizable` has appended every vable box
+        // (`pyjitpl.py _compile_and_run_once`). Growing the cap after
+        // `attach_byte_buffer` would shift `_start`/`_pos` under already-
+        // written ops.
+        assert!(
+            self.trb.is_none(),
+            "record_input_arg after attach_byte_buffer: History is created \
+             after every inputarg exists (pyjitpl.py create_empty_history \
+             after initialize_virtualizable)"
         );
         let index = self.inputargs.len() as u32;
         self.inputargs.push(InputArg::from_type_rc(tp, index));
@@ -1100,6 +1112,14 @@ impl Trace {
         &self.ops
     }
 
+    /// Opcode at recorded-op index `i` (`slots` in byte mode, `ops` otherwise).
+    pub fn opcode_at(&self, i: usize) -> Option<OpCode> {
+        if let Some(slot) = self.slots.get(i) {
+            return Some(slot.opcode);
+        }
+        self.ops.get(i).map(|op| op.opcode)
+    }
+
     /// Visit each `ConstPtr` box once and re-key `_refs_dict` after a moving
     /// collection. RPython's `new_ref_dict` follows moved keys as part of the
     /// translated GC; Rust's `IndexMap` does not, so the re-key is the minimal
@@ -1558,6 +1578,35 @@ mod tests {
         assert_eq!(ops[1].pos.get(), g0);
         assert_eq!(ops[1].rd_resume_position.get(), 7);
         assert_eq!(ops[2].opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn byte_buffer_materialize_jump_over_extra_inputargs() {
+        // pyjitpl.py `initialize_virtualizable` appends vable boxes onto
+        // `original_boxes` before `create_empty_history`. The byte buffer
+        // must be sized to that full cap so JUMP TAGBOX args past the
+        // portal reds resolve.
+        let mut rec = Trace::new();
+        let portal = rec.record_input_arg(Type::Int);
+        let extras: Vec<OpRef> = (0..8).map(|_| rec.record_input_arg(Type::Int)).collect();
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        let mut jump_args = vec![portal];
+        jump_args.extend(extras.iter().copied());
+        rec.close_loop(&jump_args);
+        let (inputs, ops) = rec.into_parts();
+        assert_eq!(inputs.len(), 9);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].opcode, OpCode::Jump);
+        assert_eq!(ops[0].num_args(), 9);
+    }
+
+    #[test]
+    #[should_panic(expected = "record_input_arg after attach_byte_buffer")]
+    fn record_input_arg_after_attach_is_rejected() {
+        let mut rec = Trace::new();
+        rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_input_arg(Type::Int);
     }
 
     #[test]

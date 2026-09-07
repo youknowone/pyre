@@ -3221,9 +3221,21 @@ impl TraceCtx {
 
     /// Op slice accessor — returns the raw recorded operations. After the
     /// `TraceRecordBuffer` swap this materializes via `ByteTraceIter::next`
-    /// walking the byte stream.
+    /// walking the byte stream. Call [`Self::ensure_ops_materialized`] first
+    /// when the live recorder is still in byte form.
     pub fn ops(&self) -> &[majit_ir::OpRc] {
         self.recorder.ops()
+    }
+
+    /// Materialize `opencoder.Trace.get_iter` into `ops` so [`Self::ops`]
+    /// can be read during an in-progress trace.
+    pub fn ensure_ops_materialized(&mut self) {
+        self.recorder.materialize_into_ops();
+    }
+
+    /// Opcode at recorded-op index `i` without materializing the `Op` graph.
+    pub fn opcode_at(&self, i: usize) -> Option<majit_ir::OpCode> {
+        self.recorder.opcode_at(i)
     }
 
     /// `num_inputargs()` — alias for `num_inputs()` keeping RPython

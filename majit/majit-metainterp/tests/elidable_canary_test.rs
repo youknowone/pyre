@@ -103,6 +103,7 @@ fn elidable_canary_traces_to_call_pure_i_when_args_not_all_const() {
     );
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
 
     // pyjitpl.py:3577-3579 — original CallI cut, CallPureI re-recorded.
@@ -161,6 +162,7 @@ fn elidable_canary_all_const_args_fold_to_const_and_cut_call() {
     );
 
     let ctx = meta.trace_ctx().expect("active trace");
+    ctx.ensure_ops_materialized();
     let ops = ctx.ops();
     // Neither CallI nor CallPureI may remain in the trace.
     assert!(
