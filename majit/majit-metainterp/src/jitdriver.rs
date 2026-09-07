@@ -6572,12 +6572,21 @@ impl<S: JitState> JitDriver<S> {
             // exception guard unwinds into its handler instead of resuming
             // the no-exception continuation.
             let guard_exc = result.exception.exc_value;
+            // compile.py ResumeGuardForcedDescr.handle_fail reads
+            // `cpu.get_savedata_ref(deadframe)` before the blackhole.
+            // Root the copied AllVirtuals object across the bridge
+            // attempt and resume construction.
+            let savedata = result.savedata;
             drop(result);
             // The deadframe root died with the grab and the reconstruction
             // below allocates through the blackhole allocator, so hold the
             // exception where the frontend's root walker can reach it until
             // `prepare_resume_from_failure` hands it to the blackhole.
             let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
+            let savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+            let _savedata_root = unsafe {
+                crate::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| savedata.is_some())
+            };
 
             // must_compile tick for bridge threshold counting.
             if crate::majit_log_enabled() {
@@ -6794,7 +6803,11 @@ impl<S: JitState> JitDriver<S> {
                         .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
                     None, // ginfo
                     vable_identity_override,
-                    None, // all_virtuals
+                    descr_arc
+                        .is_guard_forced()
+                        .then(|| savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)))
+                        .flatten()
+                        .and_then(crate::allvirtuals::reveal),
                     allocator,
                 );
                 let (mut bh, vable_ptr) = bh;

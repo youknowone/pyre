@@ -4457,12 +4457,19 @@ impl FrameGcMaps {
         let mut indices: Vec<_> = homes
             .iter()
             .filter_map(|(raw, home)| {
-                let ca_arg = op.opcode.is_call_assembler()
-                    && op
-                        .getarglist()
-                        .iter()
-                        .any(|arg| arg.to_opref().raw() == raw && !arg.to_opref().is_constant());
-                (live.live_across(raw, at) || ca_arg).then_some(self.home_index(home))
+                // `live_across` is `last_use > at`. RPython
+                // `RegisterManager.is_still_alive` is `last_usage >=
+                // position`, and `consider_call` force-stores every Ref
+                // argument even when this call is its last SSA use
+                // (callbuilder.py). The callee still holds the raw
+                // argument, so a collecting Call* must keep it in the
+                // gcmap. CALL_ASSEMBLER is the same rule, not a special
+                // case.
+                let call_arg = op.getarglist().iter().any(|arg| {
+                    let arg = arg.to_opref();
+                    arg.raw() == raw && !arg.is_constant()
+                });
+                (live.live_across(raw, at) || call_arg).then_some(self.home_index(home))
             })
             .collect();
         // LABEL captures are frozen spill locations shared with chained
@@ -4480,7 +4487,11 @@ impl FrameGcMaps {
             .zip(mask)
             .enumerate()
             .filter_map(|(i, (arg, live))| {
-                (live && arg.ty() == Some(Type::Ref))
+                // Only a traced home is a GC root. A constant Ref has
+                // no home; `emit_force_arm` writes it as a literal in
+                // the force slot, and `force_arg_location` would
+                // otherwise mark the unrelated positional exit slot.
+                (live && arg.ty() == Some(Type::Ref) && homes.home(arg).is_some())
                     .then(|| force_arg_location(self.frame, homes, arg, i))
             })
             .collect()
@@ -5575,47 +5586,43 @@ pub fn build_wasm_module(
         .map(|(i, &arity)| (arity, first_spill_func_idx + i as u32))
         .collect();
     let gc_maps = FrameGcMaps::new(ca.ca_reload_fn_ptr != 0 || ca.jf_top_addr.is_some(), *frame);
-    let fail_descrs: Vec<_> = guards
-        .iter()
-        .zip(
-            analysis_ops
-                .iter()
-                .filter(|op| op.opcode.is_guard() || op.opcode == OpCode::Finish),
-        )
-        .map(|(guard, op)| {
-            let rd_locs = matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2)
-                .then(|| {
-                    let mask =
-                        live_fail_arg_mask(op.getdescr().as_ref(), guard.fail_arg_refs.len());
-                    guard
-                        .fail_arg_refs
-                        .iter()
-                        .zip(mask)
-                        .enumerate()
-                        .map(|(i, (&arg, live))| {
-                            if !live || arg.is_none() {
-                                0xFFFF
-                            } else {
-                                u16::try_from(force_arg_location(*frame, &ref_homes, arg, i))
-                                    .ok()
-                                    .filter(|&loc| loc != 0xFFFF)
-                                    .expect("force failarg location exceeds rd_locs")
-                            }
-                        })
-                        .collect()
-                });
-            Arc::new(crate::failguard::WasmFailDescr {
-                fail_index: guard.fail_index,
-                trace_id: 0, // filled by the backend before publishing the code
-                fail_arg_types: guard.fail_arg_types.clone(),
-                rd_locs,
-                is_finish: guard.is_finish,
-                force_args_offset: frame.force_slot_base as u32,
-                force_gcmap_ptr: 0,
-                meta_descr: guard.meta_descr.clone(),
-            })
-        })
-        .collect();
+    let mut fail_descrs = Vec::with_capacity(guards.len());
+    for (guard, op) in guards.iter().zip(
+        analysis_ops
+            .iter()
+            .filter(|op| op.opcode.is_guard() || op.opcode == OpCode::Finish),
+    ) {
+        let rd_locs = if matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2) {
+            let mask = live_fail_arg_mask(op.getdescr().as_ref(), guard.fail_arg_refs.len());
+            let mut locs = Vec::with_capacity(guard.fail_arg_refs.len());
+            for (i, (&arg, live)) in guard.fail_arg_refs.iter().zip(mask).enumerate() {
+                if !live || arg.is_none() {
+                    locs.push(0xFFFF);
+                    continue;
+                }
+                let loc = u16::try_from(force_arg_location(*frame, &ref_homes, arg, i))
+                    .ok()
+                    .filter(|&loc| loc != 0xFFFF)
+                    .ok_or_else(|| {
+                        BackendError::Unsupported("force failarg location exceeds rd_locs".into())
+                    })?;
+                locs.push(loc);
+            }
+            Some(locs)
+        } else {
+            None
+        };
+        fail_descrs.push(Arc::new(crate::failguard::WasmFailDescr {
+            fail_index: guard.fail_index,
+            trace_id: 0, // filled by the backend before publishing the code
+            fail_arg_types: guard.fail_arg_types.clone(),
+            rd_locs,
+            is_finish: guard.is_finish,
+            force_args_offset: frame.force_slot_base as u32,
+            force_gcmap_ptr: 0,
+            meta_descr: guard.meta_descr.clone(),
+        }));
+    }
     let func = build_function(
         inputargs,
         &analysis_inputargs,
@@ -13403,6 +13410,11 @@ mod tests {
             len: 5,
         };
         let maps = FrameGcMaps::new(true, FrameGeometry::compact(8, 5, 0));
+        assert!(
+            maps.live_indices(&homes, &live, 0, &ops[0])
+                .contains(&maps.home_index(0)),
+            "a collecting Call* keeps its last-use Ref argument"
+        );
         assert_eq!(
             maps.live_indices(&homes, &live, 1, &ops[1]),
             vec![maps.home_index(1), maps.home_index(2)]

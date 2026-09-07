@@ -6012,10 +6012,13 @@ impl majit_backend::Backend for WasmBackend {
                 // Ref homes needed by the still-armed GUARD_NOT_FORCED_2.  The
                 // virtualizable token is an independent edge to this JITFRAME;
                 // its lazy force may arrive after the execution root is gone.
+                let savedata = GcRef(unsafe { (*jf).jf_savedata });
                 install_post_finish_force_gcmap(jf);
                 remember_and_drop_execution_frame(jf, saved);
 
-                return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
+                let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+                data.set_savedata_ref(savedata);
+                return DeadFrame::Boxed(data);
             }
 
             // Host-buffer frame path, for an embedder that registered no
@@ -6087,8 +6090,11 @@ impl majit_backend::Backend for WasmBackend {
             let raw_values: Vec<i64> = (0..num_outputs)
                 .map(|i| unsafe { *items.add(1 + i) })
                 .collect();
+            let savedata = GcRef(unsafe { (*jf).jf_savedata });
             drop(backing);
-            DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
+            let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+            data.set_savedata_ref(savedata);
+            DeadFrame::Boxed(data)
         }
     }
 
