@@ -2175,6 +2175,49 @@ pub fn is_pinned(gcref: GcRef) -> bool {
     ACTIVE_IS_PINNED.get().is_some_and(|f| f(gcref))
 }
 
+/// `rpython/rlib/rgc.py` `_make_sure_does_not_move`: force collections until
+/// a non-null object is permanently non-moving, or decline a pinned object.
+///
+/// `p` is the caller's local GC reference. Its root is reread after each
+/// collection and copied back on return, including when unwinding.
+/// The owner-root slot supplies the live-variable save/reload that upstream's
+/// framework GC transform inserts around `collect(i)`. Other live references
+/// in the caller still need their own roots, as for any collecting operation.
+/// The error is upstream's `NotImplementedError` for a collector that cannot
+/// make the object non-moving after trying generations -1 through 6.
+pub fn _make_sure_does_not_move(p: &mut GcRef) -> Result<bool, &'static str> {
+    assert!(!p.is_null());
+    if is_pinned(*p) {
+        // A pin can be released at any time; it is not permanent immobility.
+        return Ok(false);
+    }
+    // `BaseFrameworkGCTransformer.gct_gc__collect` saves/reloads livevars
+    // across the collecting call. A native Rust unwind must reload too: the
+    // collector can have moved the object before reporting a failure.
+    struct ReloadRoot<'a> {
+        saved: shadow_stack::OwnerRootGuard,
+        local: &'a mut GcRef,
+    }
+    impl Drop for ReloadRoot<'_> {
+        fn drop(&mut self) {
+            *self.local = self.saved.get();
+        }
+    }
+    let root = ReloadRoot {
+        saved: shadow_stack::OwnerRootGuard::new(*p),
+        local: p,
+    };
+    let mut i = -1;
+    while can_move(root.saved.get()) {
+        if i > 6 {
+            return Err("can't make object non-movable!");
+        }
+        collect_generation(i);
+        i += 1;
+    }
+    Ok(true)
+}
+
 /// x86/assembler.py:1971-1974 codegen-time bounds lookup shim used by
 /// the interpretive `GuardSubclass`. Returns
 /// `(subclassrange_min, subclassrange_max)` for the class whose vtable
