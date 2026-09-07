@@ -3831,9 +3831,18 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the self-recursive `CALL_ASSEMBLER` trampoline the nested-decline
     // hazard names.  Refusing it inside `rec` aborted the inline before
     // `sys._getframe` could force a multi-frame carrier.
-    // Probe only `CallDescr` Ref slots.  The tag is an Int; guessing
-    // `[lhs, rhs]` vs `[tag, lhs, rhs]` by alignment still treats
-    // pointer-sized tags 8/16/24 as objects (`0x8` / `0x10`).
+    // Name the helper first.  A descended `jit_bigint_*` residual also
+    // has two Ref slots, but those are `*mut BigInt` payloads, not
+    // `PyObject`s; `is_int` must not see them.
+    let opcode_binop_or_compare_fnaddr =
+        pyre_interpreter::jit_trace_fnaddrs().iter().any(|(n, a)| {
+            *a == func_ptr as i64
+                && (n.ends_with("binary_value_from_tag") || n.ends_with("compare_value_from_tag"))
+        });
+    let binop_or_compare_helper = matches!(
+        helper,
+        majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
+    ) || opcode_binop_or_compare_fnaddr;
     let is_exact_int_word = |word: i64| {
         let obj = word as pyre_object::PyObjectRef;
         !obj.is_null()
@@ -3844,16 +3853,18 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     && pyre_object::is_exact_builtin_instance(obj)
             }
     };
-    let ref_operand_words: Vec<i64> = call_descr
-        .arg_types()
-        .iter()
-        .enumerate()
-        .filter(|(_, ty)| **ty == majit_ir::Type::Ref)
-        .filter_map(|(i, _)| args.get(i).copied())
-        .collect();
-    let exact_int_binop_operands = ref_operand_words.len() == 2
-        && is_exact_int_word(ref_operand_words[0])
-        && is_exact_int_word(ref_operand_words[1]);
+    let exact_int_binop_operands = binop_or_compare_helper && {
+        let ref_operand_words: Vec<i64> = call_descr
+            .arg_types()
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| **ty == majit_ir::Type::Ref)
+            .filter_map(|(i, _)| args.get(i).copied())
+            .collect();
+        ref_operand_words.len() == 2
+            && is_exact_int_word(ref_operand_words[0])
+            && is_exact_int_word(ref_operand_words[1])
+    };
     let observed_exact_int_binop = matches!(
         helper,
         majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
@@ -3861,11 +3872,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // A codewriter residual of the same helper can arrive with
     // `RuntimeHelperKind::None`.  The fnaddr only names the helper;
     // user `__add__` / `__eq__` still mutate, so keep the exact-int gate.
-    let opcode_binop_or_compare = exact_int_binop_operands
-        && pyre_interpreter::jit_trace_fnaddrs().iter().any(|(n, a)| {
-            *a == func_ptr as i64
-                && (n.ends_with("binary_value_from_tag") || n.ends_with("compare_value_from_tag"))
-        });
+    let opcode_binop_or_compare = opcode_binop_or_compare_fnaddr && exact_int_binop_operands;
     // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
     // backing array (`pyopcode.py:1012-1020`).  Re-executing either allocation
     // cannot mutate an object visible before the call.  Upstream records list
