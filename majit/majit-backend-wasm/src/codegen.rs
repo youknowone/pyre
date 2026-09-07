@@ -453,6 +453,7 @@ enum PendingInstruction {
     I64Const(i64),
     I32Const(i32),
     I64ExtendI32U,
+    I64ExtendI32S,
 }
 
 macro_rules! forward_zero {
@@ -515,6 +516,9 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
                 }
                 PendingInstruction::I64ExtendI32U => {
                     self.sink.i64_extend_i32_u();
+                }
+                PendingInstruction::I64ExtendI32S => {
+                    self.sink.i64_extend_i32_s();
                 }
             }
         }
@@ -658,9 +662,9 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
                 self.pending
                     .push(PendingInstruction::I32Const(value as u64 as u32 as i32));
             }
-            Some(PendingInstruction::I64ExtendI32U) => {
-                // wrap(extend_u(x)) == x for an i32 address already on the
-                // stack.
+            Some(PendingInstruction::I64ExtendI32U) | Some(PendingInstruction::I64ExtendI32S) => {
+                // wrap(extend_{u,s}(x)) == x for an i32 address already on
+                // the stack.
                 self.pending.pop();
             }
             _ => {
@@ -679,6 +683,18 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         } else {
             self.flush();
             self.pending.push(PendingInstruction::I64ExtendI32U);
+        }
+        self
+    }
+
+    fn i64_extend_i32_s(&mut self) -> &mut Self {
+        if let Some(PendingInstruction::I32Const(value)) = self.pending.last().copied() {
+            self.pending.pop();
+            self.pending
+                .push(PendingInstruction::I64Const(value as i64));
+        } else {
+            self.flush();
+            self.pending.push(PendingInstruction::I64ExtendI32S);
         }
         self
     }
@@ -821,7 +837,6 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         i64_eq,
         i64_eqz,
         i64_extend32_s,
-        i64_extend_i32_s,
         i64_ge_s,
         i64_ge_u,
         i64_gt_s,
@@ -876,6 +891,7 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
     forward_two!(
         call_indirect(table_index: u32, type_index: u32),
         return_call_indirect(table_index: u32, type_index: u32),
+        memory_copy(dst_mem: u32, src_mem: u32),
     );
 }
 
@@ -1863,6 +1879,19 @@ fn emit_write_barrier_if_needed(
     // a card records one index and the next store may name another.
     if card_index.is_none() {
         wb_applied.insert(wb_key);
+    }
+}
+
+/// `rewrite.rs remember_wb` after a nursery allocation whose every arm is
+/// young. CallMallocNursery / headerless and a non-`non_moving` `New*` use
+/// the collecting nursery helper on overflow, not old-gen.
+fn remember_nursery_wb(
+    wb_applied: &mut indexmap::IndexSet<OpRef>,
+    result: OpRef,
+    same_as_forwardings: &[Option<OpRef>],
+) {
+    if result != OpRef::NONE && !result.is_constant() {
+        wb_applied.insert(resolve_same_as_forwarding(result, same_as_forwardings));
     }
 }
 
@@ -3253,8 +3282,14 @@ fn direct_helper_i64_arity(
     match op.opcode {
         // wasm_jit_alloc(type_id, size)
         OpCode::New | OpCode::NewWithVtable | OpCode::CallMallocNursery => Some(2),
+        OpCode::CallMallocNurseryHeaderless | OpCode::ThreadlocalrefGet => Some(1),
+        OpCode::CallMallocNurseryVarsizeFrame => Some(2),
         // wasm_jit_alloc_array(type_id, base_size, item_size, length, len_offset)
-        OpCode::NewArray | OpCode::NewArrayClear => Some(5),
+        OpCode::NewArray
+        | OpCode::NewArrayClear
+        | OpCode::CallMallocNurseryVarsize
+        | OpCode::Newstr
+        | OpCode::Newunicode => Some(5),
         // wasm_jit_write_barrier(base)
         _ => write_barrier_base(op, ref_values).map(|_| 1),
     }
@@ -3284,9 +3319,7 @@ fn has_trampoline_calls(
         // but neither emission arm calls anything: CheckMemoryError is an
         // inline null/exit test and RecordKnownResult is optimizer metadata.
         OpCode::CheckMemoryError | OpCode::RecordKnownResult => false,
-        // No direct helper lowering — and in fact no lowering at all: a trace
-        // carrying either is declined. Kept as a conservative superset.
-        OpCode::Newstr | OpCode::Newunicode => true,
+        OpCode::Newstr | OpCode::Newunicode => false,
         // Every residual CALL uses the trampoline unless its exact lowering
         // predicate supplies an i64, typed float, or true-void helper ABI.
         _ if op.opcode.is_call() => {
@@ -3758,6 +3791,33 @@ fn emit_nursery_ptr_increment(
     sink.i64_extend_i32_u();
 }
 
+/// Zero `len` bytes at `base_local + offset`. `base_local` holds an i32
+/// linear-memory address. Operand-stack-neutral.
+fn emit_zero_bytes(sink: &mut PeepSink<'_, '_>, base_local: u32, offset: u32, len: u32) {
+    if len == 0 {
+        return;
+    }
+    sink.local_get(base_local);
+    if offset != 0 {
+        sink.i32_const(offset as i32);
+        sink.i32_add();
+    }
+    sink.i32_const(0);
+    sink.i32_const(len as i32);
+    sink.memory_fill(0);
+}
+
+/// Zero the payload of a headered nursery object whose header is in
+/// `header_local` and whose allocated total is `total` bytes.
+fn emit_zero_headered_payload(sink: &mut PeepSink<'_, '_>, header_local: u32, total: usize) {
+    emit_zero_bytes(
+        sink,
+        header_local,
+        GcHeader::SIZE as u32,
+        total.saturating_sub(GcHeader::SIZE) as u32,
+    );
+}
+
 /// `__indirect_function_table` indices of the allocation helpers a compiled
 /// trace calls for `New*` / `NewArray*`.
 ///
@@ -3772,6 +3832,8 @@ pub struct AllocHelpers {
     pub new_array_fn_ptr: i64,
     pub new_oldgen_fn_ptr: i64,
     pub new_array_oldgen_fn_ptr: i64,
+    pub headerless_fn_ptr: i64,
+    pub threadlocal_fn_ptr: i64,
     pub fmod_fn_ptr: i64,
 }
 
@@ -5655,11 +5717,16 @@ fn build_function(
                 label_resume,
                 ref_homes,
             ) {
-                Some(next) if next.opcode == OpCode::CondCallN => {
+                Some(next)
+                    if matches!(
+                        next.opcode,
+                        OpCode::CondCallN | OpCode::CondCallValueI | OpCode::CondCallValueR
+                    ) =>
+                {
                     // Leave the comparison's i32 on the stack. CondCallN
-                    // calls when the predicate is nonzero, which is this
-                    // value; the arm opens `if` on it instead of
-                    // re-resolving and `i64.eqz`.
+                    // calls when the predicate is nonzero; CondCallValue
+                    // calls when it is zero. Both arms consume this i32
+                    // instead of re-resolving and `i64.eqz`.
                     push_cond(&mut sink, constants, value_types, op, kind);
                     fused_condcall_at = Some(op_idx + 1);
                 }
@@ -7075,16 +7142,30 @@ fn build_function(
                 let cond = op.arg(0).to_opref();
                 let func = op.arg(1).to_opref();
                 let call_args = &op.getarglist()[2..];
-
-                if has_result {
-                    emit_resolve(&mut sink, constants, value_types, cond);
-                    sink.local_set(value_types.local(vi));
+                let cond_on_stack = fused_condcall_at == Some(op_idx);
+                if cond_on_stack {
+                    fused_condcall_at = None;
                 }
-                // The predicate is a full word: `i32.wrap_i64` would read a
-                // value whose only set bits are above 32 as NULL and call on a
-                // live one, so the test has to be `i64.eqz`.
-                emit_resolve(&mut sink, constants, value_types, cond);
-                sink.i64_eqz();
+
+                if cond_on_stack {
+                    // Comparison left a 0/1 i32. CondCallValue calls on zero
+                    // and otherwise returns that predicate.
+                    sink.i64_extend_i32_u();
+                    if has_result {
+                        sink.local_tee(value_types.local(vi));
+                    }
+                    sink.i64_eqz();
+                } else {
+                    if has_result {
+                        emit_resolve(&mut sink, constants, value_types, cond);
+                        sink.local_set(value_types.local(vi));
+                    }
+                    // The predicate is a full word: `i32.wrap_i64` would read a
+                    // value whose only set bits are above 32 as NULL and call on a
+                    // live one, so the test has to be `i64.eqz`.
+                    emit_resolve(&mut sink, constants, value_types, cond);
+                    sink.i64_eqz();
+                }
                 sink.if_(BlockType::Empty);
                 if let (Some(base), Some(nargs)) = (
                     residual_type_base,
@@ -7443,35 +7524,138 @@ fn build_function(
                 // drops it — so one that still reaches here owes no code.
             }
 
-            // ── The rstr IR family: declined, not lowered ──
-            //
-            // Nothing on the pyre side lowers Python strings to these opcodes
-            // — there is no `Newstr` / `Strsetitem` / `Copystrcontent`
-            // producer outside majit's ported RPython infrastructure, so
-            // string work stays in residual interpreter calls and none of
-            // these reach a wasm trace today. The setitem pair is named here
-            // rather than left to the catch-all so the whole family declines
-            // from one place.
-            //
-            // They are declined rather than left as silent no-ops. The old
-            // arms emitted nothing for the copies and, for the allocations, a
-            // trampoline call whose host side has no string allocator (the
-            // runner's `func_ptr == 0` sentinel returns 0). Either shape
-            // produces wrong code the moment the opcode becomes reachable,
-            // with no signal — the same failure mode as the dropped
-            // `non_moving` flag. A decline keeps the trace interpreted and
-            // says so.
-            OpCode::Newstr
-            | OpCode::Newunicode
-            | OpCode::Copystrcontent
-            | OpCode::Copyunicodecontent
-            | OpCode::Strsetitem
-            | OpCode::Unicodesetitem => {
-                return Err(BackendError::Unsupported(format!(
-                    "wasm backend: {:?} is unsupported (no rstr lowering); \
-                     declining the trace",
-                    op.opcode
-                )));
+            OpCode::Newstr | OpCode::Newunicode => {
+                let vi = op.pos.get().raw();
+                let Some(base) = residual_type_base else {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: Newstr/Newunicode needs a residual alloc helper".into(),
+                    ));
+                };
+                let descr = op.getdescr().ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm codegen: Newstr/Newunicode is missing its ArrayDescr".into(),
+                    )
+                })?;
+                let ad = descr.as_array_descr().ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm codegen: Newstr/Newunicode descr is not an ArrayDescr".into(),
+                    )
+                })?;
+                let len_offset = ad.len_descr().map_or(0i64, |ld| ld.offset() as i64);
+                sink.i64_const(ad.type_id() as i64);
+                sink.i64_const(ad.base_size() as i64);
+                sink.i64_const(ad.item_size() as i64);
+                emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                sink.i64_const(len_offset);
+                sink.i32_const(alloc.new_array_fn_ptr as i32);
+                sink.call_indirect(0, base + 5);
+                if !OpRef::raw_is_constant(vi) {
+                    sink.local_set(value_types.local(vi));
+                } else {
+                    sink.drop();
+                }
+                emit_memory_error_check(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.pos.get(),
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
+                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                emit_reload_frame_if_necessary(
+                    &mut sink,
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
+                emit_reload_refs_from_homes(
+                    &mut sink,
+                    value_types,
+                    ref_homes,
+                    &liveness,
+                    op_idx,
+                    skip,
+                    frame,
+                );
+            }
+            OpCode::Strsetitem | OpCode::Unicodesetitem => {
+                let descr = op.getdescr().ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm codegen: str/unicodesetitem is missing its ArrayDescr".into(),
+                    )
+                })?;
+                let ad = descr.as_array_descr().ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm codegen: str/unicodesetitem descr is not an ArrayDescr".into(),
+                    )
+                })?;
+                let item_size = ad.item_size() as u64;
+                let base_size = if item_size == 1 {
+                    ad.base_size() as u64 - 1
+                } else {
+                    ad.base_size() as u64
+                };
+                let extra = emit_scaled_index_addr(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    item_size,
+                    base_size,
+                );
+                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
+                emit_sized_int_store(&mut sink, extra, ad.item_size());
+            }
+            OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
+                let descr = op.getdescr().ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm codegen: copystr/unicodecontent is missing its ArrayDescr".into(),
+                    )
+                })?;
+                let ad = descr.as_array_descr().ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm codegen: copystr/unicodecontent descr is not an ArrayDescr".into(),
+                    )
+                })?;
+                let item_size = ad.item_size() as u64;
+                let base_size = if item_size == 1 {
+                    ad.base_size() as u64 - 1
+                } else {
+                    ad.base_size() as u64
+                };
+                let dst_extra = emit_scaled_index_addr(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.arg(1).to_opref(),
+                    op.arg(3).to_opref(),
+                    item_size,
+                    base_size,
+                );
+                if dst_extra != 0 {
+                    sink.i32_const(dst_extra as i32);
+                    sink.i32_add();
+                }
+                let src_extra = emit_scaled_index_addr(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.arg(0).to_opref(),
+                    op.arg(2).to_opref(),
+                    item_size,
+                    base_size,
+                );
+                if src_extra != 0 {
+                    sink.i32_const(src_extra as i32);
+                    sink.i32_add();
+                }
+                emit_resolve(&mut sink, constants, value_types, op.arg(4).to_opref());
+                sink.i32_wrap_i64();
+                emit_scale_index(&mut sink, item_size);
+                sink.memory_copy(0, 0);
             }
 
             // ── Misc ops ──
@@ -7555,6 +7739,7 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
+                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, bump_size as usize);
                     sink.local_get(alloc_scratch_local);
                     sink.i32_const(GcHeader::SIZE as i32);
                     sink.i32_add();
@@ -7604,14 +7789,286 @@ fn build_function(
                         frame,
                     );
                 }
+                remember_nursery_wb(&mut wb_applied, op.pos.get(), &same_as_forwardings);
             }
-            OpCode::CallMallocNurseryHeaderless
-            | OpCode::CallMallocNurseryVarsize
-            | OpCode::CallMallocNurseryVarsizeFrame => {
-                return Err(BackendError::Unsupported(format!(
-                    "wasm codegen: {:?} is not lowered yet",
-                    op.opcode
-                )));
+            OpCode::CallMallocNurseryHeaderless => {
+                let vi = op.pos.get().raw();
+                let size_const = const_operand_value(constants, op.arg(0).to_opref());
+                let bump_size = size_const.and_then(|size| u32::try_from(size).ok());
+                let Some(base) = residual_type_base else {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: CallMallocNurseryHeaderless needs a residual alloc helper"
+                            .into(),
+                    ));
+                };
+                if alloc.headerless_fn_ptr == 0 {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: CallMallocNurseryHeaderless has no headerless helper".into(),
+                    ));
+                }
+                let inlined = matches!((nursery, bump_size), (Some(_), Some(_)));
+                if let (Some(na), Some(bump_size)) = (nursery, bump_size) {
+                    sink.i32_const(na.free_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_tee(alloc_scratch_local);
+                    sink.i32_const(bump_size as i32);
+                    sink.i32_add();
+                    sink.local_tee(alloc_size_local);
+                    sink.i32_const(na.top_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i32_const(alloc.headerless_fn_ptr as i32);
+                    sink.call_indirect(0, base + 1);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
+                    sink.else_();
+                    sink.i32_const(na.free_addr as i32);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    emit_zero_bytes(&mut sink, alloc_scratch_local, 0, bump_size);
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_extend_i32_u();
+                    sink.end();
+                } else {
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i32_const(alloc.headerless_fn_ptr as i32);
+                    sink.call_indirect(0, base + 1);
+                }
+                if !OpRef::raw_is_constant(vi) {
+                    sink.local_set(value_types.local(vi));
+                } else {
+                    sink.drop();
+                }
+                emit_memory_error_check(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.pos.get(),
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
+                if !inlined {
+                    let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        skip,
+                        frame,
+                    );
+                }
+                remember_nursery_wb(&mut wb_applied, op.pos.get(), &same_as_forwardings);
+            }
+            OpCode::CallMallocNurseryVarsize => {
+                let vi = op.pos.get().raw();
+                let Some(base) = residual_type_base else {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: CallMallocNurseryVarsize needs a residual alloc helper"
+                            .into(),
+                    ));
+                };
+                let descr = op.getdescr().ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm codegen: CallMallocNurseryVarsize is missing its ArrayDescr".into(),
+                    )
+                })?;
+                let ad = descr.as_array_descr().ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm codegen: CallMallocNurseryVarsize descr is not an ArrayDescr".into(),
+                    )
+                })?;
+                let len_offset = ad.len_descr().map_or(0i64, |ld| ld.offset() as i64);
+                sink.i64_const(ad.type_id() as i64);
+                sink.i64_const(ad.base_size() as i64);
+                emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
+                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
+                sink.i64_const(len_offset);
+                sink.i32_const(alloc.new_array_fn_ptr as i32);
+                sink.call_indirect(0, base + 5);
+                if !OpRef::raw_is_constant(vi) {
+                    sink.local_set(value_types.local(vi));
+                } else {
+                    sink.drop();
+                }
+                emit_memory_error_check(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.pos.get(),
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
+                let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                emit_reload_frame_if_necessary(
+                    &mut sink,
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
+                emit_reload_refs_from_homes(
+                    &mut sink,
+                    value_types,
+                    ref_homes,
+                    &liveness,
+                    op_idx,
+                    skip,
+                    frame,
+                );
+            }
+            OpCode::CallMallocNurseryVarsizeFrame => {
+                let vi = op.pos.get().raw();
+                let size_const = const_operand_value(constants, op.arg(0).to_opref());
+                let bump_size = size_const.and_then(|size| u32::try_from(size).ok());
+                let payload =
+                    bump_size.map(|size| i64::from(size.saturating_sub(GcHeader::SIZE as u32)));
+                let Some(base) = residual_type_base else {
+                    return Err(BackendError::Unsupported(
+                        "wasm codegen: CallMallocNurseryVarsizeFrame needs a residual alloc helper"
+                            .into(),
+                    ));
+                };
+                let inlined = matches!((nursery, bump_size, payload), (Some(_), Some(_), Some(_)));
+                if let (Some(na), Some(bump_size), Some(payload)) = (nursery, bump_size, payload) {
+                    sink.i32_const(na.free_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_tee(alloc_scratch_local);
+                    sink.i32_const(bump_size as i32);
+                    sink.i32_add();
+                    sink.local_tee(alloc_size_local);
+                    sink.i32_const(na.top_addr as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i32_gt_u();
+                    sink.if_(BlockType::Result(ValType::I64));
+                    sink.i64_const(0);
+                    sink.i64_const(payload);
+                    sink.i32_const(alloc.new_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        (!OpRef::raw_is_constant(vi)).then_some(vi),
+                        frame,
+                    );
+                    sink.else_();
+                    sink.i32_const(na.free_addr as i32);
+                    sink.local_get(alloc_size_local);
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.local_get(alloc_scratch_local);
+                    sink.i64_const(0);
+                    sink.i64_store(MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    });
+                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, bump_size as usize);
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i64_extend_i32_u();
+                    sink.end();
+                } else {
+                    sink.i64_const(0);
+                    if let Some(payload) = payload {
+                        sink.i64_const(payload);
+                    } else {
+                        emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                        sink.i64_const(GcHeader::SIZE as i64);
+                        sink.i64_sub();
+                    }
+                    sink.i32_const(alloc.new_fn_ptr as i32);
+                    sink.call_indirect(0, base + 2);
+                }
+                if !OpRef::raw_is_constant(vi) {
+                    sink.local_set(value_types.local(vi));
+                } else {
+                    sink.drop();
+                }
+                emit_memory_error_check(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    op.pos.get(),
+                    residual_type_base,
+                    ca.ca_reload_fn_ptr,
+                    ca.jf_top_addr,
+                );
+                if !inlined {
+                    let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
+                    emit_reload_frame_if_necessary(
+                        &mut sink,
+                        residual_type_base,
+                        ca.ca_reload_fn_ptr,
+                        ca.jf_top_addr,
+                    );
+                    emit_reload_refs_from_homes(
+                        &mut sink,
+                        value_types,
+                        ref_homes,
+                        &liveness,
+                        op_idx,
+                        skip,
+                        frame,
+                    );
+                }
+                remember_nursery_wb(&mut wb_applied, op.pos.get(), &same_as_forwardings);
             }
             // `GcRewriterImpl::_gen_call_malloc_gc` emits this after a residual
             // malloc. Use the same propagate-exception exit as the wasm
@@ -7704,12 +8161,19 @@ fn build_function(
                 }
             }
             OpCode::ThreadlocalrefGet => {
-                // AbstractLLCPU.execute_token passes the live execution's
-                // threadlocal_addr. Our trace ABI does not carry it yet; an
-                // unrelated fixed-size TLS allocation is not that context.
-                return Err(BackendError::Unsupported(
-                    "wasm backend: ThreadlocalrefGet requires an execution-context address".into(),
-                ));
+                let vi = op.pos.get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    let Some(base) = residual_type_base.filter(|_| alloc.threadlocal_fn_ptr != 0)
+                    else {
+                        return Err(BackendError::Unsupported(
+                            "wasm backend: ThreadlocalrefGet needs a residual TLS helper".into(),
+                        ));
+                    };
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i32_const(alloc.threadlocal_fn_ptr as i32);
+                    sink.call_indirect(0, base + 1);
+                    sink.local_set(value_types.local(vi));
+                }
             }
             // resoperation.py `LoadEffectiveAddress`:
             // base + (index << shift) + base_offset. Keep the calculation in
@@ -8399,6 +8863,12 @@ fn build_function(
                         *prev_size,
                         type_id,
                     );
+                    emit_zero_bytes(
+                        &mut sink,
+                        alloc_scratch_local,
+                        0,
+                        total_size.saturating_sub(GcHeader::SIZE) as u32,
+                    );
                     sink.else_();
                     sink.i64_const(type_id);
                     sink.i64_const(size);
@@ -8497,6 +8967,7 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
+                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
                     if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
                         sink.i32_const(1);
                         sink.local_set(alloc_batch_flag_local);
@@ -8632,10 +9103,9 @@ fn build_function(
                         frame,
                     );
                 }
-                // GcRewriterAssembler.gen_malloc_nursery remembers a result
-                // whose slow path also guarantees nursery placement. Our
-                // typed helper may fall back to old-gen (e.g. a nursery
-                // smaller than this object), so keep the runtime flag test.
+                // `New*` overflow may still return old-gen when the nursery
+                // cannot hold the object. Do not seed `wb_applied` here —
+                // the first store emits the barrier, later stores CSE it.
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
                 let vi = op.pos.get().raw();
@@ -8664,8 +9134,9 @@ fn build_function(
                 // Constant lengths keep the existing compile-time total; a
                 // runtime length uses malloc_cond_varsize's precheck against a
                 // compile-time maxlength before computing the bump size.
-                // The nursery is bulk-zeroed on reset so `NewArrayClear`'s
-                // cleared items come for free, exactly like the helper.
+                // The inline bump zeros the payload with `memory.fill`;
+                // `NewArrayClear` items come from that, not from a nursery
+                // reset fill.
                 let length_const = const_operand_value(constants, op.arg(0).to_opref());
                 let inline_nursery_total = length_const.and_then(|len| {
                     use majit_gc::header::GcHeader;
@@ -8714,7 +9185,7 @@ fn build_function(
                 let batch_role = nursery_batches.get(op_idx).and_then(|role| role.as_ref());
                 if let (
                     Some(base),
-                    Some((length, _)),
+                    Some((length, total)),
                     Some(NurseryBatchRole::Follower {
                         prev_result,
                         prev_size,
@@ -8733,6 +9204,12 @@ fn build_function(
                         *prev_result,
                         *prev_size,
                         type_id,
+                    );
+                    emit_zero_bytes(
+                        &mut sink,
+                        alloc_scratch_local,
+                        0,
+                        total.saturating_sub(GcHeader::SIZE) as u32,
                     );
                     sink.local_get(alloc_scratch_local);
                     sink.i32_const(length as i32);
@@ -8844,6 +9321,7 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
+                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
                     // Length field (usize, 4 bytes on wasm32) at
                     // `payload + len_offset`.
                     sink.local_get(alloc_scratch_local);
@@ -8981,6 +9459,17 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
+                    // Payload length = new_free - header - HDR.
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_add();
+                    sink.i32_const(0);
+                    sink.local_get(alloc_size_local);
+                    sink.local_get(alloc_scratch_local);
+                    sink.i32_sub();
+                    sink.i32_const(GcHeader::SIZE as i32);
+                    sink.i32_sub();
+                    sink.memory_fill(0);
                     // Length field (usize, 4 bytes on wasm32) at
                     // `payload + len_offset`.
                     sink.local_get(alloc_scratch_local);
@@ -10030,11 +10519,10 @@ fn emit_guard_false(
 /// the guard's `if` tests it, so the `i64.extend_i32_u`/`local.set` and the
 /// guard's own `local.get`/re-test disappear.
 ///
-/// Narrower than the dynasm port on purpose: `GuardTrue`/`GuardFalse`,
-/// whose wasm arms do nothing but re-test the boolean, and `CondCallN`,
-/// whose predicate is the same word and whose arm can consume the i32
-/// directly (`x86/regalloc.py` `next_op_can_accept_cc` also admits
-/// `COND_CALL`).
+/// Matches the dynasm port: `GuardTrue`/`GuardFalse`/`GuardIsnull`/
+/// `GuardNonnull`, whose wasm arms do nothing but re-test the boolean,
+/// and `CondCallN`/`CondCallValue*`, whose predicate is the same word
+/// and whose arm can consume the i32 directly.
 fn next_op_can_accept_cc<'a>(
     ops: &'a [Op],
     i: usize,
@@ -10049,7 +10537,13 @@ fn next_op_can_accept_cc<'a>(
     let next_op = ops.get(i + 1)?;
     if !matches!(
         next_op.opcode,
-        OpCode::GuardTrue | OpCode::GuardFalse | OpCode::CondCallN
+        OpCode::GuardTrue
+            | OpCode::GuardFalse
+            | OpCode::GuardIsnull
+            | OpCode::GuardNonnull
+            | OpCode::CondCallN
+            | OpCode::CondCallValueI
+            | OpCode::CondCallValueR
     ) {
         return None;
     }
@@ -10063,8 +10557,10 @@ fn next_op_can_accept_cc<'a>(
     }
     // BaseRegalloc.next_op_can_accept_cc: COND_CALL's callee and arguments
     // still read locals, even when their last use is this same operation.
-    if next_op.opcode == OpCode::CondCallN
-        && (1..next_op.num_args()).any(|arg| next_op.arg(arg).to_opref() == result)
+    if matches!(
+        next_op.opcode,
+        OpCode::CondCallN | OpCode::CondCallValueI | OpCode::CondCallValueR
+    ) && (1..next_op.num_args()).any(|arg| next_op.arg(arg).to_opref() == result)
     {
         return None;
     }
@@ -11201,11 +11697,14 @@ fn push_guard_failure_cond(
     kind: CondKind,
     guard_opcode: OpCode,
 ) {
-    if guard_opcode == OpCode::GuardFalse {
+    if matches!(guard_opcode, OpCode::GuardFalse | OpCode::GuardIsnull) {
         push_cond(sink, constants, value_types, op, kind);
         return;
     }
-    debug_assert_eq!(guard_opcode, OpCode::GuardTrue);
+    debug_assert!(
+        matches!(guard_opcode, OpCode::GuardTrue | OpCode::GuardNonnull),
+        "fused guard must be a boolean or nullness test"
+    );
     let inverse = match kind {
         CondKind::Int(cmp) => Some(CondKind::Int(match cmp {
             CmpOp::I64LtS => CmpOp::I64GeS,

@@ -341,8 +341,9 @@ fn classify_inline_install_error(error: &BackendError) {
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
 static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
-/// Off for the loop-body half of the class. See `inline_nonheader_enable`.
-static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(false);
+/// On: non-header regions are placed outside the header `loop`, so they
+/// do not tax the fall-through path. See `inline_nonheader_enable`.
+static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(true);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Above this many exits, duplicating a parameter bridge arm at every guard is
 /// larger and slower to compile than the shared frame-entry epilogue.
@@ -496,18 +497,16 @@ fn inline_bridge_enabled() -> bool {
 /// min of 15 interleaved runs with each arm's startup floor subtracted.
 /// `spectral_norm` measures 0.95x and `fannkuch` 0.98x on the same change.
 ///
-/// ⛔ The loop-body half stays off, on wall time rather than on correctness.
-/// Admitting it declines nothing on 81 corpus fixtures and removes 49.4M of
-/// their 257.3M crossings — 19.2%, 41 fixtures moved, none the wrong way — and
-/// buys 0.74x on `short_circuit_value_local_kept` and 0.67x on
-/// `short_circuit_boxed_int_cross_fn`. It still costs 1.23x on `spectral_norm`,
-/// which sheds 99.7% of its own crossings and gets slower anyway, because
-/// admitting a region costs the owner a re-emission and taxes its fall-through
-/// path 18 ops on every iteration that does NOT fail the guard. A preamble
-/// guard's region is not on that fall-through, which is why the two halves
-/// separate.
+/// Loop-body non-header regions are placed outside the header `loop` (the
+/// same placement as preamble regions), so they do not tax the fall-through
+/// path. On by default; [`inline_nonheader_disable`] opts out.
 pub fn inline_nonheader_enable() {
     INLINE_NONHEADER_ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Restore the pre-default policy: only preamble non-header regions merge.
+pub fn inline_nonheader_disable() {
+    INLINE_NONHEADER_ENABLED.store(false, Ordering::Relaxed);
 }
 
 fn inline_nonheader_enabled() -> bool {
@@ -926,6 +925,12 @@ fn stamp_and_publish_label_targets(
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 
+thread_local! {
+    /// Cranelift/dynasm `JIT_THREADLOCAL_SLOTS` parity: `THREADLOCALREF_GET`
+    /// indexes this array by byte offset / 8.
+    static JIT_THREADLOCAL_SLOTS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Residual-call scratch shared by emitted wasm and the host trampoline.
 /// Trampoline use is strictly LIFO: the host materialises every argument
 /// before invoking the callee, and the guest loads the result immediately on
@@ -985,6 +990,27 @@ pub fn jit_exc_type_addr() -> usize {
 /// Address of `JIT_CALL_AREA`, embedded as an immediate in JIT-emitted wasm.
 pub fn jit_call_area_addr() -> usize {
     &JIT_CALL_AREA as *const _ as usize
+}
+
+/// Read a thread-local slot at the given byte offset.
+pub extern "C" fn wasm_jit_threadlocalref_get(offset: i64) -> i64 {
+    JIT_THREADLOCAL_SLOTS.with(|slots| {
+        let slots = slots.borrow();
+        let idx = (offset / 8) as usize;
+        slots.get(idx).copied().unwrap_or(0)
+    })
+}
+
+/// Write a thread-local slot that compiled traces may read back.
+pub fn jit_threadlocalref_set(offset: i64, value: i64) {
+    JIT_THREADLOCAL_SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        let idx = (offset / 8) as usize;
+        if idx >= slots.len() {
+            slots.resize(idx + 1, 0);
+        }
+        slots[idx] = value;
+    });
 }
 
 /// The per-thread GC box, and the accessors every trampoline reaches it through.
@@ -1538,7 +1564,14 @@ fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
 /// where its collector could not see it. Returns `GcRef(0)` when no GC is
 /// bound, leaving the caller on its own path.
 fn wasm_alloc_nursery_headerless_no_collect(size: usize) -> GcRef {
-    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_headerless_no_collect(size)).unwrap_or(GcRef(0))
+    let obj = with_wasm_active_gc_mut(|gc| gc.alloc_nursery_headerless_no_collect(size))
+        .unwrap_or(GcRef(0));
+    if !obj.is_null() && size != 0 {
+        unsafe {
+            core::ptr::write_bytes(obj.0 as *mut u8, 0, size);
+        }
+    }
+    obj
 }
 
 /// Placement-reporting companion of [`wasm_alloc_nursery_typed`].
@@ -1696,7 +1729,59 @@ pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
         gc.alloc_nursery_typed(type_id as u32, size as usize).0 as i64
     })
     .unwrap_or(0);
+    zero_alloc_payload(obj, size as usize);
     oom_signal_if_zero(obj)
+}
+
+/// Headerless nursery overflow helper. Returns the raw allocation base with
+/// no GC header, matching cranelift's `gc_alloc_nursery_headerless_shim`.
+pub extern "C" fn wasm_jit_alloc_headerless(size: i64) -> i64 {
+    let size = usize::try_from(size).unwrap_or(0);
+    let obj = with_wasm_active_gc_mut(|gc| {
+        if let Some(base) = try_headerless_nursery_bump(gc, size) {
+            return base as i64;
+        }
+        gc.collect_nursery();
+        if let Some(base) = try_headerless_nursery_bump(gc, size) {
+            return base as i64;
+        }
+        0
+    })
+    .unwrap_or(0);
+    if obj != 0 && size != 0 {
+        unsafe {
+            core::ptr::write_bytes(obj as *mut u8, 0, size);
+        }
+    }
+    oom_signal_if_zero(obj)
+}
+
+fn try_headerless_nursery_bump(gc: &mut dyn majit_gc::GcAllocator, size: usize) -> Option<usize> {
+    let nf_addr = gc.nursery_free_addr();
+    let nt_addr = gc.nursery_top_addr();
+    if nf_addr == 0 || nt_addr == 0 {
+        return None;
+    }
+    unsafe {
+        let nf = nf_addr as *mut usize;
+        let nt = nt_addr as *const usize;
+        let free = nf.read();
+        let top = nt.read();
+        let new_free = free.checked_add(size)?;
+        if new_free > top {
+            return None;
+        }
+        nf.write(new_free);
+        Some(free)
+    }
+}
+
+fn zero_alloc_payload(obj: i64, payload: usize) {
+    if obj != 0 && payload != 0 {
+        unsafe {
+            core::ptr::write_bytes(obj as *mut u8, 0, payload);
+        }
+    }
 }
 
 /// JIT-trace variable-size allocation trampoline target for `NewArray` /
@@ -1721,16 +1806,17 @@ pub extern "C" fn wasm_jit_alloc_array(
             item_size as usize,
             length,
         );
-        if obj.is_null() {
-            0
-        } else {
-            unsafe {
-                *((obj.0 as *mut u8).add(len_offset as usize) as *mut usize) = length;
-            }
-            obj.0 as i64
-        }
+        if obj.is_null() { 0 } else { obj.0 as i64 }
     })
     .unwrap_or(0);
+    if obj != 0 {
+        let payload =
+            (base_size as usize).saturating_add((item_size as usize).saturating_mul(length));
+        zero_alloc_payload(obj, payload);
+        unsafe {
+            *((obj as *mut u8).add(len_offset as usize) as *mut usize) = length;
+        }
+    }
     oom_signal_if_zero(obj)
 }
 
@@ -1798,6 +1884,8 @@ fn alloc_helpers() -> codegen::AllocHelpers {
         new_array_fn_ptr: wasm_jit_alloc_array as *const () as usize as i64,
         new_oldgen_fn_ptr: wasm_jit_alloc_oldgen as *const () as usize as i64,
         new_array_oldgen_fn_ptr: wasm_jit_alloc_array_oldgen as *const () as usize as i64,
+        headerless_fn_ptr: wasm_jit_alloc_headerless as *const () as usize as i64,
+        threadlocal_fn_ptr: wasm_jit_threadlocalref_get as *const () as usize as i64,
         fmod_fn_ptr: wasm_jit_fmod as *const () as usize as i64,
     }
 }
@@ -2067,6 +2155,8 @@ pub struct WasmBackend {
     /// tokens are held for the backend's life and give `used` back with it.
     asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
     trace_counter: u64,
+    /// One-shot header PC the metainterp publishes before `compile_loop`.
+    next_header_pc: u64,
     /// Optimizer constant pool (constant-namespace OpRef → i64 value).
     constants: indexmap::IndexMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
@@ -2587,6 +2677,7 @@ impl WasmBackend {
             asm_memory_stats: std::sync::Arc::new(majit_backend::AsmMemoryManagerStats::default()),
             asm_memory_blocks: Vec::new(),
             trace_counter: 0,
+            next_header_pc: 0,
             constants: indexmap::IndexMap::new(),
             vtable_offset: None,
         }
@@ -2818,14 +2909,41 @@ impl WasmBackend {
             return;
         };
         diag_bump(55);
-        let PendingInline { owner, region } = pending;
-        let source_fail_index = region.source_fail_index;
-        if !self.install_inline_region(&owner, region) {
-            // The probe cleared the dispatch cell to get here. A merge that
-            // does not install leaves the out-of-line bridge as the only route
-            // to that guard, so put the cell back rather than leave the guard
-            // bailing to the host for the rest of the run.
-            Self::restore_dispatch_cell(&owner, source_fail_index);
+        let owner = pending.owner.clone();
+        let mut regions = vec![pending.region];
+        // Other trips for this owner would each re-emit the whole module.
+        // Fold them into this rebuild so one Cranelift compile covers them.
+        let extra_ids: Vec<i64> = TRIPPED_INLINES.with(|tripped| {
+            let mut queue = tripped.borrow_mut();
+            let mut keep = Vec::new();
+            let mut extra = Vec::new();
+            for id in queue.drain(..) {
+                let same_owner = PENDING_INLINES.with(|pending| {
+                    pending
+                        .borrow()
+                        .get(&id)
+                        .is_some_and(|item| Arc::ptr_eq(&item.owner, &owner))
+                });
+                if same_owner {
+                    extra.push(id);
+                } else {
+                    keep.push(id);
+                }
+            }
+            *queue = keep;
+            extra
+        });
+        for id in extra_ids {
+            diag_bump(55);
+            if let Some(item) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&id)) {
+                regions.push(item.region);
+            }
+        }
+        let fail_indices: Vec<u32> = regions.iter().map(|r| r.source_fail_index).collect();
+        if !self.install_inline_region_batch(&owner, regions) {
+            for source_fail_index in fail_indices {
+                Self::restore_dispatch_cell(&owner, source_fail_index);
+            }
         }
     }
 
@@ -2862,8 +2980,19 @@ impl WasmBackend {
     fn install_inline_region(
         &mut self,
         owner: &JitCellToken,
-        mut region: codegen::InlinedBridge,
+        region: codegen::InlinedBridge,
     ) -> bool {
+        self.install_inline_region_batch(owner, vec![region])
+    }
+
+    fn install_inline_region_batch(
+        &mut self,
+        owner: &JitCellToken,
+        regions: Vec<codegen::InlinedBridge>,
+    ) -> bool {
+        if regions.is_empty() {
+            return true;
+        }
         if owner.is_invalidated() {
             diag_bump(50);
             return false;
@@ -2879,24 +3008,33 @@ impl WasmBackend {
             diag_bump(35);
             return false;
         };
-        let source_fail_index = region.source_fail_index;
-        if candidate
-            .inlined_bridges
-            .iter()
-            .any(|r| r.source_fail_index == source_fail_index)
-        {
-            diag_bump(36);
+        let mut attached = 0usize;
+        for mut region in regions {
+            let source_fail_index = region.source_fail_index;
+            if candidate
+                .inlined_bridges
+                .iter()
+                .any(|r| r.source_fail_index == source_fail_index)
+            {
+                diag_bump(36);
+                continue;
+            }
+            // Re-decided here rather than carried: the candidate may have taken
+            // more regions since, and the placement depends on them. Keep a
+            // non-header region's own outside placement so a deferred install
+            // cannot drop it back inside the loop.
+            region.outside_loop = region.outside_loop
+                || codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index)
+                || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
+            if region.outside_loop {
+                diag_bump(52);
+            }
+            candidate.inlined_bridges.push(region);
+            attached += 1;
+        }
+        if attached == 0 {
             return false;
         }
-        // Re-decided here rather than carried: the candidate may have taken
-        // more regions since, and the placement depends on them.
-        region.outside_loop =
-            codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index)
-                || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
-        if region.outside_loop {
-            diag_bump(52);
-        }
-        candidate.inlined_bridges.push(region);
         let mut merged_ops = candidate.ops.clone();
         for region in &candidate.inlined_bridges {
             merged_ops.extend(region.ops.iter().cloned());
@@ -2913,19 +3051,31 @@ impl WasmBackend {
         candidate.classptr_to_typeid = self.collect_classptr_typeid_table(&merged_ops);
         candidate.guard_gc_type_info = self.collect_guard_gc_type_info(&merged_ops);
         candidate.nursery = nursery_alloc_params(&merged_ops);
-        // The merged region supersedes the bridge's own dispatch cell. Remove
-        // it before reemit so the fresh array cannot replay a contradictory
+        // The merged regions supersede their own dispatch cells. Remove
+        // them before reemit so the fresh array cannot replay a contradictory
         // slot — the bridge on the stack right now finishes its pass either
         // way, and nothing enters it again.
         let source_cells_base = source_loop.bridge_cells_base.get();
-        let old_bridge_slot = source_loop
-            .bridge_slots
-            .borrow_mut()
-            .remove(&source_fail_index);
-        #[cfg(target_arch = "wasm32")]
-        if source_cells_base != 0 {
-            let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
-            unsafe { core::ptr::write(cell, 0) };
+        let attached_fail_indices: Vec<u32> = candidate.inlined_bridges
+            [candidate.inlined_bridges.len() - attached..]
+            .iter()
+            .map(|region| region.source_fail_index)
+            .collect();
+        let mut old_bridge_slots = Vec::new();
+        for &source_fail_index in &attached_fail_indices {
+            if let Some(slot) = source_loop
+                .bridge_slots
+                .borrow_mut()
+                .remove(&source_fail_index)
+            {
+                old_bridge_slots.push((source_fail_index, slot));
+            }
+            #[cfg(target_arch = "wasm32")]
+            if source_cells_base != 0 {
+                let cell =
+                    (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
+                unsafe { core::ptr::write(cell, 0) };
+            }
         }
         // Eligibility IS the emission: `reemit_loop` runs the same
         // `build_wasm_module` over the same candidate, and nothing it does
@@ -2937,7 +3087,9 @@ impl WasmBackend {
         match self.reemit_loop(owner) {
             Ok(()) => {
                 diag_bump(31);
-                diag_bump(32);
+                for _ in 0..attached {
+                    diag_bump(32);
+                }
                 // The region runs from the owner's module, so its
                 // `GUARD_NOT_INVALIDATED` reads the owner's root flag. Name that
                 // as this compile's generation, or the quasi-immutable
@@ -2948,7 +3100,7 @@ impl WasmBackend {
             }
             Err(error) => {
                 source_loop.reemit.replace(old_inputs);
-                if let Some(slot) = old_bridge_slot {
+                for (source_fail_index, slot) in old_bridge_slots {
                     source_loop
                         .bridge_slots
                         .borrow_mut()
@@ -2959,6 +3111,7 @@ impl WasmBackend {
                             as *mut u32;
                         unsafe { core::ptr::write(cell, slot) };
                     }
+                    let _ = source_fail_index;
                 }
                 record_inline_trial_error(&error);
                 classify_inline_install_error(&error);
@@ -3854,6 +4007,7 @@ impl majit_backend::Backend for WasmBackend {
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
         diag_bump(23);
+        let _header_pc = std::mem::take(&mut self.next_header_pc);
         // `x86/assembler.py:514` parity — bump
         // `cpu.tracker.total_compiled_loops` at the same point PyPy
         // creates the `CompiledLoopToken`.
@@ -4281,8 +4435,9 @@ impl majit_backend::Backend for WasmBackend {
         failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_EXC, descr);
     }
 
-    // `set_next_header_pc` uses the trait default (no-op) — wasm does
-    // not currently honour it.
+    fn set_next_header_pc(&mut self, header_pc: u64) {
+        self.next_header_pc = header_pc;
+    }
 
     fn compile_bridge(
         &mut self,
@@ -4746,10 +4901,9 @@ impl majit_backend::Backend for WasmBackend {
                     && !inline_nonheader_enabled()
                 {
                     // Resuming at the header lets a region inside the `loop`
-                    // `br` straight to it. Resuming at an earlier LABEL from
-                    // there goes through the `loop`-wrapped dispatch, which is
-                    // correct but opt-in (`inline_nonheader_enable`) until it is
-                    // worth its re-emission.
+                    // `br` straight to it. Resuming at an earlier LABEL is
+                    // placed outside the header loop (no fall-through tax)
+                    // and is on by default.
                     diag_bump(38);
                     decline("not_header");
                 } else if inline_trip_helper_slot() == 0 {
@@ -4771,6 +4925,7 @@ impl majit_backend::Backend for WasmBackend {
                     // costs the later region its `br` to the header and not the
                     // merge.
                     let outside_loop = source_in_preamble
+                        || !resumes_at_loop_header
                         || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
                     // The `is_none` arm above already declined, so this holds.
                     let Some(merged_fail_index) = merged_source_fail_index else {

@@ -4320,6 +4320,8 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
                 new_array_fn_ptr: NEW_ARRAY_FN,
                 new_oldgen_fn_ptr: NEW_OLDGEN_FN,
                 new_array_oldgen_fn_ptr: NEW_ARRAY_OLDGEN_FN,
+                headerless_fn_ptr: 0x55,
+                threadlocal_fn_ptr: 0x66,
                 fmod_fn_ptr: 0,
             },
             wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
@@ -7060,7 +7062,97 @@ fn fused_cond_call_n_consumes_the_comparison_i32() {
 }
 
 #[test]
-fn threadlocalref_get_does_not_read_an_unrelated_tls_allocation() {
+fn fused_cond_call_value_consumes_the_comparison_i32() {
+    use majit_ir::descr::SimpleCallDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let compare = make_op(
+        OpCode::IntEq,
+        &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        OpRef::int_op(2),
+    );
+    let call = make_op(
+        OpCode::CondCallValueI,
+        &[
+            OpRef::int_op(2),
+            OpRef::const_int(0x30),
+            OpRef::input_arg_int(0),
+        ],
+        OpRef::int_op(3),
+    );
+    call.setdescr(Arc::new(SimpleCallDescr::new(
+        0x5200_0000,
+        vec![Type::Int],
+        Type::Int,
+        true,
+        8,
+        EffectInfo::default(),
+    )));
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]);
+    let (bytes, _) = build_module_default(
+        &inputargs,
+        &[compare, call, finish],
+        &indexmap::IndexMap::new(),
+    );
+    validate_wasm(&bytes);
+
+    let mut i64_eq = 0;
+    let mut i64_extend = 0;
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Eq => i64_eq += 1,
+        wasmparser::Operator::I64ExtendI32U => i64_extend += 1,
+        _ => {}
+    });
+    assert_eq!(i64_eq, 1, "the comparison must still be emitted");
+    assert_eq!(
+        i64_extend, 1,
+        "fused CondCallValue widens the i32 predicate once for the result"
+    );
+}
+
+#[test]
+fn fused_guard_isnull_uses_the_comparison_directly() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let compare = make_op(
+        OpCode::IntEq,
+        &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        OpRef::int_op(2),
+    );
+    let guard = make_guard(
+        OpCode::GuardIsnull,
+        &[OpRef::int_op(2)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
+    let (bytes, _) = build_module_default(
+        &inputargs,
+        &[compare, guard, finish],
+        &indexmap::IndexMap::new(),
+    );
+    validate_wasm(&bytes);
+    let mut i64_eq = 0;
+    let mut i64_extend = 0;
+    count_operators(&bytes, |op| match op {
+        wasmparser::Operator::I64Eq => i64_eq += 1,
+        wasmparser::Operator::I64ExtendI32U => i64_extend += 1,
+        _ => {}
+    });
+    assert_eq!(i64_eq, 1);
+    assert_eq!(
+        i64_extend, 0,
+        "fused GuardIsnull must not materialize a local"
+    );
+}
+
+#[test]
+fn threadlocalref_get_lowers_through_the_tls_helper() {
     for offset in [-8, 0, 7, 8, 512, i64::MAX] {
         let mut inputs = inline_region_inputs(
             &[],
@@ -7075,10 +7167,10 @@ fn threadlocalref_get_does_not_read_an_unrelated_tls_allocation() {
             vec![],
         );
         inputs.inputargs = vec![InputArg::from_type(Type::Int, 0)];
-        assert!(matches!(
-            codegen::build_wasm_module(&inputs),
-            Err(majit_backend::BackendError::Unsupported(_))
-        ));
+        inputs.alloc.threadlocal_fn_ptr = 0x66;
+        let (bytes, _, _) =
+            codegen::build_wasm_module(&inputs).expect("ThreadlocalrefGet should lower");
+        validate_wasm(&bytes);
     }
 }
 
@@ -7289,6 +7381,8 @@ fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInput
             new_array_fn_ptr: 0x22,
             new_oldgen_fn_ptr: 0x33,
             new_array_oldgen_fn_ptr: 0x44,
+            headerless_fn_ptr: 0x55,
+            threadlocal_fn_ptr: 0x66,
             fmod_fn_ptr: 0,
         },
         wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
@@ -7574,6 +7668,23 @@ fn call_malloc_nursery_uses_one_inline_bump() {
 }
 
 #[test]
+fn inline_nursery_new_zeros_its_payload() {
+    let inputs = nursery_new_inputs(vec![plain_new(1, 53), finish_int_arg0()], 53);
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    let mut fills = 0;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
+            fills += 1;
+        }
+    });
+    assert!(
+        fills >= 1,
+        "inline New must memory.fill its payload instead of relying on a nursery reset fill"
+    );
+}
+
+#[test]
 fn call_malloc_nursery_and_ptr_increment_share_one_bump() {
     let incr = make_op(
         OpCode::NurseryPtrIncrement,
@@ -7601,84 +7712,43 @@ fn call_malloc_nursery_and_ptr_increment_share_one_bump() {
 }
 
 #[test]
-fn unlowered_call_malloc_nursery_variants_decline() {
-    for opcode in [
+fn call_malloc_nursery_variants_lower() {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+
+    let headerless = make_op(
         OpCode::CallMallocNurseryHeaderless,
-        OpCode::CallMallocNurseryVarsize,
-        OpCode::CallMallocNurseryVarsizeFrame,
-    ] {
-        let op = make_op(opcode, &[OpRef::const_int(32)], OpRef::ref_op(1));
-        let inputs = nursery_new_inputs(vec![op, finish_int_arg0()], 53);
-        assert!(
-            matches!(
-                codegen::build_wasm_module(&inputs),
-                Err(majit_backend::BackendError::Unsupported(_))
-            ),
-            "{opcode:?} must decline until it has a malloc_cond arm"
-        );
-    }
-}
-
-fn call_malloc_nursery(result: u32, size: i64) -> Op {
-    make_op(
-        OpCode::CallMallocNursery,
-        &[OpRef::const_int(size)],
-        OpRef::ref_op(result),
-    )
-}
-
-#[test]
-fn call_malloc_nursery_uses_one_inline_bump() {
-    let inputs = nursery_new_inputs(vec![call_malloc_nursery(1, 32), finish_int_arg0()], 53);
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+        &[OpRef::const_int(32)],
+        OpRef::ref_op(1),
+    );
+    let inputs = nursery_new_inputs(vec![headerless, finish_int_arg0()], 53);
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("headerless should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
-}
 
-#[test]
-fn call_malloc_nursery_and_ptr_increment_share_one_bump() {
-    let incr = make_op(
-        OpCode::NurseryPtrIncrement,
-        &[OpRef::ref_op(1), OpRef::const_int(32)],
-        OpRef::ref_op(2),
-    );
-    let inputs = nursery_new_inputs(
-        vec![call_malloc_nursery(1, 72), incr, finish_int_arg0()],
-        53,
-    );
-    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
-    validate_wasm(&bytes);
-    assert_eq!(
-        nursery_top_compare_count(&bytes),
-        1,
-        "rewrite already combined the batch; increment is pointer math"
-    );
-    let mut adds = 0;
-    count_operators(&bytes, |op| {
-        if matches!(op, wasmparser::Operator::I64Add) {
-            adds += 1;
-        }
-    });
-    assert!(adds >= 1, "NURSERY_PTR_INCREMENT is an i64 add");
-}
-
-#[test]
-fn unlowered_call_malloc_nursery_variants_decline() {
-    for opcode in [
-        OpCode::CallMallocNurseryHeaderless,
-        OpCode::CallMallocNurseryVarsize,
+    let frame = make_op(
         OpCode::CallMallocNurseryVarsizeFrame,
-    ] {
-        let op = make_op(opcode, &[OpRef::const_int(32)], OpRef::ref_op(1));
-        let inputs = nursery_new_inputs(vec![op, finish_int_arg0()], 53);
-        assert!(
-            matches!(
-                codegen::build_wasm_module(&inputs),
-                Err(majit_backend::BackendError::Unsupported(_))
-            ),
-            "{opcode:?} must decline until it has a malloc_cond arm"
-        );
-    }
+        &[OpRef::const_int(64)],
+        OpRef::ref_op(1),
+    );
+    let inputs = nursery_new_inputs(vec![frame, finish_int_arg0()], 53);
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("varsize frame should lower");
+    validate_wasm(&bytes);
+    assert_eq!(nursery_top_compare_count(&bytes), 1);
+
+    let varsize = make_op(
+        OpCode::CallMallocNurseryVarsize,
+        &[
+            OpRef::const_int(0),
+            OpRef::const_int(8),
+            OpRef::const_int(4),
+        ],
+        OpRef::ref_op(1),
+    );
+    varsize.setdescr(Arc::new(SimpleArrayDescr::new(1, 16, 8, 53, Type::Int)));
+    let inputs = nursery_new_inputs(vec![varsize, finish_int_arg0()], 53);
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("varsize should lower");
+    validate_wasm(&bytes);
 }
 
 #[test]
