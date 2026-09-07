@@ -635,9 +635,7 @@ pub unsafe extern "C" fn PyDict_Merge(
         return -1;
     };
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(target);
-    let _ = roots.pin_root(source);
+    let base = roots.pin_roots(&[target, source]);
     let target = || pyre_object::gc_roots::shadow_stack_get(base);
     let source_now = pyre_object::gc_roots::shadow_stack_get(base + 1);
 
@@ -751,9 +749,8 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
         return -1;
     };
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(target);
-    let sequence = roots.pin_root(sequence);
+    let base = roots.pin_roots(&[target, sequence]);
+    let sequence = roots.get(base + 1);
     let target = || pyre_object::gc_roots::shadow_stack_get(base);
 
     let Some(pairs) = trap(unpack_all(pyre_object::gc_roots::shadow_stack_get(

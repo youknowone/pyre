@@ -435,6 +435,21 @@ impl WriteBarrierDescr {
             jit_wb_cards_set_singlebyte: cards_set_singlebyte,
         }
     }
+
+    /// gc.py `WriteBarrierDescr.get_write_barrier_from_array_fn`.
+    ///
+    /// Upstream asks the CPU to cast the failing-case function; a backend
+    /// without `write_barrier_from_array` answers 0. MiniMark publishes the
+    /// array barrier exactly when card marking is configured, so a non-zero
+    /// `jit_wb_cards_set` is that same answer.
+    pub fn get_write_barrier_from_array_fn(&self) -> usize {
+        if self.jit_wb_cards_set != 0 { 1 } else { 0 }
+    }
+
+    /// gc.py `WriteBarrierDescr.has_write_barrier_from_array`.
+    pub fn has_write_barrier_from_array(&self) -> bool {
+        self.get_write_barrier_from_array_fn() != 0
+    }
 }
 
 /// GC allocator interface.

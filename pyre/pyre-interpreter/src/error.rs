@@ -969,9 +969,7 @@ impl PyError {
             return;
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(self.exc_object);
-        let _ = pyre_object::gc_roots::pin_root(w_filename);
+        let base = pyre_object::gc_roots::pin_roots(&[self.exc_object, w_filename]);
         let storage = unsafe {
             pyre_object::interp_exceptions::w_exception_get_args_storage(
                 pyre_object::gc_roots::shadow_stack_get(base),
@@ -4918,24 +4916,25 @@ pub fn wrap_oserror2(
     // allocation rewrites the root SLOT and not this frame's copy of the
     // pointer.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = _roots.base();
-    let _ = _roots.pin_root(w_exc);
-    let _ = _roots.pin_root(pyre_object::w_int_new(errno as i64));
-    let _ = _roots.pin_root(pyre_object::w_str_new_managed(&msg));
-    let _ = _roots.pin_root(w_filename.unwrap_or_else(pyre_object::w_none));
-    let _ = _roots.pin_root(w_filename2.unwrap_or_else(pyre_object::w_none));
+    let filename = w_filename.unwrap_or_else(pyre_object::w_none);
+    let filename2 = w_filename2.unwrap_or_else(pyre_object::w_none);
+    let live_base = _roots.pin_roots(&[w_exc, filename, filename2]);
+    let extra = _roots.pin_roots(&[
+        pyre_object::w_int_new(errno as i64),
+        pyre_object::w_str_new_managed(&msg),
+    ]);
     // The five the constructor takes, in `_wrap_oserror2_impl`'s order.  A
     // subclass reading `filename2` sees the argument it declares rather than a
     // short call.
     let args = [
-        _roots.get(base + 1),
-        _roots.get(base + 2),
-        _roots.get(base + 3),
+        _roots.get(extra),
+        _roots.get(extra + 1),
+        _roots.get(live_base + 1),
         pyre_object::w_none(),
-        _roots.get(base + 4),
+        _roots.get(live_base + 2),
     ];
     operation_error_from_instance(
-        crate::call::call_function_impl_result(_roots.get(base), &args),
+        crate::call::call_function_impl_result(_roots.get(live_base), &args),
         || PyError::os_error_syscall(errno, pyre_object::PY_NULL),
     )
 }

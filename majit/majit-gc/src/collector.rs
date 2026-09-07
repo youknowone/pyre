@@ -4204,14 +4204,25 @@ impl MiniMarkGC {
 
     /// incminimark.py `rrc_invoke_callback`.
     ///
-    /// Called from the public collection entry points (incminimark.py:808,
-    /// :821, :862), never from inside a phase: the collector is borrowed, so
-    /// the callback may only schedule the drain, not perform it.
+    /// Called from the public collection entry points (`collect`,
+    /// `collect_step`, `minor_collection_with_major_progress`), never from
+    /// inside a phase: the collector is borrowed, so the callback may only
+    /// schedule the drain, not perform it.
+    ///
+    /// Upstream fires only when `rrc_dealloc_pending` is non-empty. A
+    /// collection that queued only `tp_finalize` work or a C-only cycle
+    /// (`c_garbage`) would then leave `drain_dead` unscheduled.
+    /// `gcmodule.c finalize_garbage` runs before `delete_garbage` and is
+    /// what those two queues implement; the extra arms keep that order
+    /// observable. Evidence: `cpyext/pyobject.rs drain_dead` drains
+    /// finalize, then `clear_garbage`, then dealloc.
     fn rrc_invoke_callback(&mut self) {
-        if self.rrc.enabled
-            && (!self.rrc.dealloc_pending.is_empty()
-                || !self.rrc.finalize_pending.is_empty()
-                || self.rrc.c_garbage)
+        if !self.rrc.enabled {
+            return;
+        }
+        let has_dealloc = !self.rrc.dealloc_pending.is_empty();
+        let has_cpyext_work = !self.rrc.finalize_pending.is_empty() || self.rrc.c_garbage;
+        if (has_dealloc || has_cpyext_work)
             && let Some(trigger) = self.rrc.dealloc_trigger
         {
             self.rrc.c_garbage = false;
@@ -8547,6 +8558,10 @@ impl MiniMarkGC {
     /// If an incremental major cycle should start, it is initiated. If a cycle
     /// is already in progress, one bounded MARKING or SWEEPING step is
     /// performed. Returns true if any GC work was done.
+    ///
+    /// incminimark.py `gc_step_until` / `debug_gc_step`: a minor before every
+    /// `major_collection_step`. `collect_step` is the same pair plus the
+    /// rawrefcount callback; this is the JIT-safepoint half without that tail.
     pub fn gc_step(&mut self) -> bool {
         if !self.enabled {
             return false;
@@ -8554,6 +8569,7 @@ impl MiniMarkGC {
         if self.gc_state == GcState::Scanning && !self.threshold_reached(0) {
             return false;
         }
+        self.minor_collection_body();
         self.major_collection_step();
         true
     }

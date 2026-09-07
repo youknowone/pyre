@@ -195,9 +195,7 @@ pub unsafe extern "C" fn PyIter_Send(
         crate::baseobjspace::next(w_iterator)
     } else {
         let roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(w_iterator);
-        let _ = roots.pin_root(sent);
+        let base = roots.pin_roots(&[w_iterator, sent]);
         let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
         crate::baseobjspace::getattr_str(reload(0), "send")
             .and_then(|send| crate::call::call_function_impl_result(send, &[reload(1)]))

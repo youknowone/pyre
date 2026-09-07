@@ -968,14 +968,13 @@ fn call_slot_method(
     arguments: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_self);
-    for &argument in arguments {
-        let _ = roots.pin_root(argument);
-    }
+    let mut live = Vec::with_capacity(arguments.len() + 2);
+    live.push(w_self);
+    live.extend_from_slice(arguments);
+    live.push(w_owner);
+    let base = roots.pin_roots(&live);
     // Last, so the indices above keep naming what they named.
-    let owner_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_owner);
+    let owner_slot = base + arguments.len() + 1;
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let function = slot_method(
         pyre_object::gc_roots::shadow_stack_get(owner_slot),
@@ -1314,10 +1313,7 @@ fn call_slot_arguments(
     kwds: *mut CPyObject,
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(callable);
-    let _ = roots.pin_root(w_self);
-    let _ = roots.pin_root(unsafe { pyobject::from_ref(kwds) });
+    let base = roots.pin_roots(&[callable, w_self, unsafe { pyobject::from_ref(kwds) }]);
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     // Minted last, so nothing pinned above it is a pre-move address.
     let starargs = match args.is_null() {
@@ -3466,13 +3462,12 @@ impl Drop for TernaryArgs {
 
 fn ternary_args(positional: &[PyObjectRef], keywords: &[(String, PyObjectRef)]) -> TernaryArgs {
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    for &argument in positional {
-        let _ = roots.pin_root(argument);
-    }
+    let mut live = Vec::with_capacity(positional.len() + keywords.len());
+    live.extend_from_slice(positional);
     for (_, value) in keywords {
-        let _ = roots.pin_root(*value);
+        live.push(*value);
     }
+    let base = roots.pin_roots(&live);
     let value_slot = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let items: Vec<PyObjectRef> = (0..positional.len()).map(value_slot).collect();
     let tuple = pyre_object::tupleobject::w_tuple_new(items);
@@ -4021,10 +4016,7 @@ fn power(
     };
     let modulus = args.get(2).copied().unwrap_or_else(pyre_object::w_none);
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(first);
-    let _ = roots.pin_root(second);
-    let _ = roots.pin_root(modulus);
+    let base = roots.pin_roots(&[first, second, modulus]);
     let owned =
         |index: usize| pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(base + index));
     let (left, right, third) = (owned(0), owned(1), owned(2));
@@ -4070,10 +4062,7 @@ fn call_ternary(
     third: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(first);
-    let _ = roots.pin_root(second);
-    let _ = roots.pin_root(third.unwrap_or_else(pyre_object::w_none));
+    let base = roots.pin_roots(&[first, second, third.unwrap_or_else(pyre_object::w_none)]);
     let owned =
         |index: usize| pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(base + index));
     let (left, right, modulus) = (owned(0), owned(1), owned(2));
@@ -4923,10 +4912,7 @@ fn set_attribute(
         ));
     }
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_self);
-    let _ = roots.pin_root(name);
-    let _ = roots.pin_root(value.unwrap_or_else(pyre_object::w_none));
+    let base = roots.pin_roots(&[w_self, name, value.unwrap_or_else(pyre_object::w_none)]);
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let receiver = pyobject::make_ref(reload(0));
     let key = pyobject::make_ref(reload(1));
@@ -4994,9 +4980,7 @@ fn set_attribute_legacy(
 ) -> Result<PyObjectRef, crate::PyError> {
     let name = legacy_attribute_name(name)?;
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_self);
-    let _ = roots.pin_root(value.unwrap_or_else(pyre_object::w_none));
+    let base = roots.pin_roots(&[w_self, value.unwrap_or_else(pyre_object::w_none)]);
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let receiver = pyobject::make_ref(reload(0));
     let item = match value {
@@ -5040,10 +5024,7 @@ fn slot_descr_get(
         return Ok(args[0]);
     }
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(args[0]);
-    let _ = roots.pin_root(args[1]);
-    let _ = roots.pin_root(args[2]);
+    let base = roots.pin_roots(&[args[0], args[1], args[2]]);
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let none = |value: PyObjectRef| unsafe { pyre_object::is_none(value) };
     let descriptor = pyobject::make_ref(reload(0));
@@ -5085,10 +5066,11 @@ fn descr_assign(
         ));
     }
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let descriptor = roots.pin_root(descriptor);
-    let _ = roots.pin_root(instance);
-    let _ = roots.pin_root(value.unwrap_or_else(pyre_object::w_none));
+    let base = roots.pin_roots(&[
+        descriptor,
+        instance,
+        value.unwrap_or_else(pyre_object::w_none),
+    ]);
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let owner = pyobject::make_ref(reload(0));
     let target = pyobject::make_ref(reload(1));

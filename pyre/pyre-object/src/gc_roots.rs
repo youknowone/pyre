@@ -522,6 +522,16 @@ impl RootScope {
         }
     }
 
+    /// Scope-local [`pin_roots`]: publish every live word, then normalize
+    /// the run. Sequential [`Self::pin_root`] would query after the first
+    /// write and leave later values invisible to a foreign collection.
+    #[majit_macros::dont_look_inside_cannot_raise]
+    pub fn pin_roots(&self, roots: &[PyObjectRef]) -> usize {
+        let base = self.publish(roots);
+        self.normalize(base, roots.len());
+        base
+    }
+
     /// Scope-local [`normalize_roots`] using the cached cell.
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn normalize(&self, base: usize, len: usize) {

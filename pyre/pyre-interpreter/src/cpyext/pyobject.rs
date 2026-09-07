@@ -464,9 +464,7 @@ pub(super) fn remember_weakref_lifeline(w_obj: PyObjectRef, lifeline: PyObjectRe
         return;
     }
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_obj);
-    let _ = roots.pin_root(lifeline);
+    let base = roots.pin_roots(&[w_obj, lifeline]);
     let lifeline_raw = make_ref(pyre_object::gc_roots::shadow_stack_get(base + 1));
     let mut blocks = BLOCK_SIZES.lock();
     let Some(block) = blocks.get_mut(&(raw as usize)) else {

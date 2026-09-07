@@ -233,18 +233,17 @@ pub fn do_combine_starstarargs_wrapped(
     // that uses it.  The two output slices are written from the published
     // pairs once the loop is done.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_starstararg);
-    let _ = pyre_object::gc_roots::pin_root(w_function);
-    let existing_base = pyre_object::gc_roots::shadow_stack_len();
     let existing_len = existingkeywords_w.map_or(0, |existing| existing.len());
-    for &w_name in existingkeywords_w.unwrap_or_default() {
-        let _ = pyre_object::gc_roots::pin_root(w_name);
+    let mut live = Vec::with_capacity(2 + existing_len + keys_w.len());
+    live.push(w_starstararg);
+    live.push(w_function);
+    if let Some(existing) = existingkeywords_w {
+        live.extend_from_slice(existing);
     }
-    let keys_base = pyre_object::gc_roots::shadow_stack_len();
-    for &key in keys_w {
-        let _ = pyre_object::gc_roots::pin_root(key);
-    }
+    live.extend_from_slice(keys_w);
+    let root_base = pyre_object::gc_roots::pin_roots(&live);
+    let existing_base = root_base + 2;
+    let keys_base = existing_base + existing_len;
     let pairs_base = pyre_object::gc_roots::shadow_stack_len();
     for _ in 0..2 * keys_w.len() {
         let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
@@ -366,9 +365,7 @@ pub fn combine_starargs_wrapped(
     // after it.
     let _roots = pyre_object::gc_roots::push_roots();
     let args_base = pyre_object::gc_roots::pin_roots(&arguments_w[..]);
-    let star_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_stararg);
-    let _ = pyre_object::gc_roots::pin_root(w_function);
+    let star_slot = pyre_object::gc_roots::pin_roots(&[w_stararg, w_function]);
     let w_stararg = || pyre_object::gc_roots::shadow_stack_get(star_slot);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(star_slot + 1);
     match crate::baseobjspace::fixedview(w_stararg(), -1) {
@@ -452,9 +449,7 @@ pub fn combine_starstarargs_wrapped(
     // afterwards to fetch each value.  Publish the mapping and the callable so
     // that later read is of the live object, not the address they had on entry.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_starstararg);
-    let _ = pyre_object::gc_roots::pin_root(w_function);
+    let root_base = pyre_object::gc_roots::pin_roots(&[w_starstararg, w_function]);
     let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     // The pairs the caller already accepted are in the same position: native
@@ -770,9 +765,11 @@ impl Arguments {
         // `arguments_w` are published here and read back where the second arm
         // uses them; none of the three sits in storage a root walker updates.
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_starstararg.unwrap_or(pyre_object::PY_NULL));
-        let w_function = pyre_object::gc_roots::pin_root(w_function);
+        let root_base = pyre_object::gc_roots::pin_roots(&[
+            w_starstararg.unwrap_or(pyre_object::PY_NULL),
+            w_function,
+        ]);
+        let w_function = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
         // argument.py — `if w_stararg is not None: self._combine_starargs_wrapped(...)`.
         if let Some(w_star) = w_stararg {
             let w_function = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
@@ -1109,20 +1106,15 @@ impl Arguments {
         // buffer or `Arguments`' own vectors are, so each word is pinned here,
         // ahead of the first allocation, and read back where it is used.
         let _roots = pyre_object::gc_roots::push_roots();
-        let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
-        let w_kw_defs = pyre_object::gc_roots::pin_root(w_kw_defs);
-        let keywords_base = pyre_object::gc_roots::shadow_stack_len();
-        if let Some(values) = self.keywords_w.as_ref() {
-            for &w_value in values {
-                let _ = pyre_object::gc_roots::pin_root(w_value);
-            }
-        }
-        let names_base = pyre_object::gc_roots::shadow_stack_len();
-        if let Some(names) = self.keyword_names_w.as_ref() {
-            for &w_name in names {
-                let _ = pyre_object::gc_roots::pin_root(w_name);
-            }
-        }
+        let keywords_w = self.keywords_w.as_deref().unwrap_or(&[]);
+        let names_w = self.keyword_names_w.as_deref().unwrap_or(&[]);
+        let mut live = Vec::with_capacity(1 + keywords_w.len() + names_w.len());
+        live.push(w_kw_defs);
+        live.extend_from_slice(keywords_w);
+        live.extend_from_slice(names_w);
+        let kw_defs_slot = pyre_object::gc_roots::pin_roots(&live);
+        let w_kw_defs = pyre_object::gc_roots::shadow_stack_get(kw_defs_slot);
+        let keywords_base = kw_defs_slot + 1;
         // The defaults arrive as a caller-owned slice — `Function`'s `defs_w`
         // reaches here through a borrow, and a gateway builds its own array —
         // so the collector rewrites neither, while the run is read out one
@@ -1534,11 +1526,12 @@ impl Arguments {
         {
             // `zip` stops at the shorter side; the pinned pairs match it.
             let npairs = names.len().min(values.len());
-            let pairs_base = pyre_object::gc_roots::shadow_stack_len();
-            for (w_key, w_value) in names.iter().zip(values.iter()) {
-                let _ = pyre_object::gc_roots::pin_root(*w_key);
-                let _ = pyre_object::gc_roots::pin_root(*w_value);
+            let mut pairs = Vec::with_capacity(npairs * 2);
+            for (w_key, w_value) in names.iter().zip(values.iter()).take(npairs) {
+                pairs.push(*w_key);
+                pairs.push(*w_value);
             }
+            let pairs_base = pyre_object::gc_roots::pin_roots(&pairs);
             for i in 0..npairs {
                 let w_key = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
                 let w_value = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
@@ -1710,16 +1703,17 @@ pub fn collect_keyword_args(
     let _roots = pyre_object::gc_roots::push_roots();
     let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_kwds);
-    let pairs_base = pyre_object::gc_roots::shadow_stack_len();
+    let mut pairs = Vec::with_capacity(keyword_names_w.len() * 2);
     for i in 0..keyword_names_w.len() {
         if mapping_contains(kwds_mapping, i as isize) {
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
+            pairs.push(pyre_object::PY_NULL);
+            pairs.push(pyre_object::PY_NULL);
             continue;
         }
-        let _ = pyre_object::gc_roots::pin_root(keyword_names_w[i]);
-        let _ = pyre_object::gc_roots::pin_root(keywords_w[i]);
+        pairs.push(keyword_names_w[i]);
+        pairs.push(keywords_w[i]);
     }
+    let pairs_base = pyre_object::gc_roots::pin_roots(&pairs);
     for i in 0..keyword_names_w.len() {
         if mapping_contains(kwds_mapping, i as isize) {
             continue;
