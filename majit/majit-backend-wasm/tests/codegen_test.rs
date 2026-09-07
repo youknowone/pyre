@@ -7187,9 +7187,13 @@ fn finish_int_arg0() -> Op {
 }
 
 fn plain_new(result: u32, type_id: u32) -> Op {
+    sized_new(result, type_id, 16)
+}
+
+fn sized_new(result: u32, type_id: u32, size: usize) -> Op {
     use majit_ir::descr::SimpleSizeDescr;
     use std::sync::Arc;
-    let descr = SimpleSizeDescr::new(0, 16, type_id);
+    let descr = SimpleSizeDescr::new(0, size, type_id);
     descr.set_non_moving(false);
     let op = make_op(OpCode::New, &[], OpRef::ref_op(result));
     op.setdescr(Arc::new(descr));
@@ -7221,6 +7225,59 @@ fn consecutive_new_ops_share_one_nursery_bump() {
         nursery_top_compare_count(&bytes),
         1,
         "gen_malloc_nursery merges consecutive New ops into one bump"
+    );
+}
+
+#[test]
+fn news_that_fill_the_nursery_threshold_keep_separate_bumps() {
+    let inputs = nursery_new_inputs(
+        vec![
+            sized_new(1, 53, 2048),
+            sized_new(2, 53, 2048),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        2,
+        "combined aligned size must stay strictly below large_threshold"
+    );
+}
+
+#[test]
+fn inlined_region_new_does_not_join_the_owners_nursery_batch() {
+    let descr = majit_ir::make_loop_target_descr(10, false);
+    let label = Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]);
+    label.setdescr(descr.clone());
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::input_arg_int(0)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))]);
+    jump.setdescr(descr);
+    let region_finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(10))]);
+    region_finish.setfailargs(smallvec![rb(OpRef::input_arg_int(10))]);
+    let mut inputs = nursery_new_inputs(vec![label, plain_new(2, 53), guard, jump], 53);
+    inputs.inlined_bridges = vec![codegen::InlinedBridge {
+        external_jump: None,
+        source_fail_index: 0,
+        outside_loop: false,
+        trace_id: 1,
+        inputargs: vec![InputArg::from_type(Type::Int, 10)],
+        ops: vec![plain_new(11, 53), region_finish],
+        gc_table_base: 0,
+        constants: indexmap::IndexMap::new(),
+    }];
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        nursery_top_compare_count(&bytes),
+        2,
+        "an inlined region must not follow an owner-side nursery leader"
     );
 }
 

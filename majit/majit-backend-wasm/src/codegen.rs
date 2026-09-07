@@ -3394,15 +3394,26 @@ fn new_inline_nursery_member(
 /// `emitting_an_operation_that_can_collect`. Combined size stays strictly
 /// below `large_threshold`, the same exclusive bound as
 /// `can_use_nursery`.
+///
+/// `region_starts` are the first op indices of inlined-bridge regions in
+/// the merged stream. Those regions are alternative control-flow paths,
+/// so a region's allocation must not follow an owner-side leader.
 fn collect_nursery_batches(
     ops: &[Op],
     nursery: Option<&NurseryAllocParams>,
     constants: &indexmap::IndexMap<u32, i64>,
+    region_starts: &[usize],
 ) -> Vec<Option<NurseryBatchRole>> {
     let mut out = vec![None; ops.len()];
     let Some(na) = nursery else {
         return out;
     };
+    let mut at_region_start = vec![false; ops.len()];
+    for &start in region_starts {
+        if let Some(slot) = at_region_start.get_mut(start) {
+            *slot = true;
+        }
+    }
     let mut run: Vec<(usize, usize, u32)> = Vec::new();
     let mut run_total = 0usize;
     let flush = |out: &mut [Option<NurseryBatchRole>], run: &mut Vec<(usize, usize, u32)>| {
@@ -3419,6 +3430,10 @@ fn collect_nursery_batches(
         run.clear();
     };
     for (i, op) in ops.iter().enumerate() {
+        if at_region_start[i] {
+            flush(&mut out, &mut run);
+            run_total = 0;
+        }
         if let Some((total, result_id)) = new_inline_nursery_member(op, na, constants) {
             if !run.is_empty() && run_total + total < na.large_threshold {
                 run.push((i, total, result_id));
@@ -3430,7 +3445,11 @@ fn collect_nursery_batches(
             run_total = total;
             continue;
         }
-        if op.opcode == OpCode::Label || op.opcode.can_malloc() {
+        if op.opcode == OpCode::Label
+            || op.opcode == OpCode::Jump
+            || op.opcode == OpCode::Finish
+            || op.opcode.can_malloc()
+        {
             flush(&mut out, &mut run);
             run_total = 0;
         }
@@ -4855,7 +4874,11 @@ fn build_function(
     // took the bump so followers can `NURSERY_PTR_INCREMENT` instead of
     // calling the helper.
     let nursery_batches = if residual_type_base.is_some() {
-        collect_nursery_batches(ops, nursery, constants)
+        let region_starts: Vec<usize> = InlinedRegionSpan::collect(ops.len(), inlined_bridges)
+            .iter()
+            .map(|span| span.ops_start)
+            .collect();
+        collect_nursery_batches(ops, nursery, constants, &region_starts)
     } else {
         Vec::new()
     };
