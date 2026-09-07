@@ -1713,9 +1713,30 @@ impl TraceCtx {
         )
     }
 
+    /// history.py `History.__init__` — bind `opencoder.Trace` once the
+    /// live JIT has `metainterp_sd` and the inputarg cap. Tests that
+    /// construct a `TraceCtx` without going through `setup_tracing` /
+    /// `start_retrace` keep the `Vec<Op>` recorder so they can emit
+    /// synthetic arities the byte encoder rejects.
+    pub fn attach_live_byte_recorder(&mut self) {
+        // `cfg(test)` here is the metainterp crate's own test build.
+        // Those fixtures emit synthetic 0-arg `PtrEq` ops the byte
+        // encoder rejects (`opencoder.py _op_start` arity). The regex
+        // / pyre-jit crates compile this lib without `cfg(test)` and
+        // take the live path. The unit test
+        // `byte_buffer_materialize_keeps_unique_positions` attaches
+        // explicitly.
+        #[cfg(not(test))]
+        self.recorder.attach_byte_buffer(self.metainterp_sd.clone());
+        #[cfg(test)]
+        let _ = self;
+    }
+
     /// Take the recorder out of this context (consumes self).
     pub fn into_recorder(self) -> Trace {
-        self.recorder
+        let mut recorder = self.recorder;
+        recorder.materialize_into_ops();
+        recorder
     }
 
     pub(crate) fn new(
@@ -3603,12 +3624,17 @@ impl TraceCtx {
         if depth == 0 {
             return None;
         }
-        let op = self.recorder.get_op_by_raw_pos(opref.raw())?;
-        if !matches!(op.opcode, OpCode::GetfieldGcR) {
-            return None;
-        }
-        let descr = op.descr.borrow().clone()?;
-        let obj = op.args.borrow().first()?.to_opref();
+        let (descr, obj) = if let Some(pair) = self.recorder.getfield_gc_r_at(opref.raw()) {
+            pair
+        } else {
+            let op = self.recorder.get_op_by_raw_pos(opref.raw())?;
+            if !matches!(op.opcode, OpCode::GetfieldGcR) {
+                return None;
+            }
+            let descr = op.descr.borrow().clone()?;
+            let obj = op.args.borrow().first()?.to_opref();
+            (descr, obj)
+        };
         let Value::Ref(obj_ref) = self.recover_ref_value(obj, depth - 1)? else {
             return None;
         };
