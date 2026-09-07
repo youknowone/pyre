@@ -10128,8 +10128,14 @@ mod tests {
     /// A block inputarg has no operation producer of its own. RPython types
     /// the phi by unioning the matching incoming link arguments, so a Bool
     /// source must retain BoolRepr after crossing the edge.
+    ///
+    /// The join has two predecessors so `simplify.py join_blocks` cannot
+    /// absorb it into startblock; a single-entry successor would be emptied
+    /// in place and this would stop observing the phi.
     #[test]
     fn a_truthify_over_a_bool_phi_is_identity() {
+        use crate::model::{ExitCase, ExitSwitch, Link};
+
         let mut graph = FunctionGraph::new("truthify_bool_phi");
         let source = graph
             .push_op_var(
@@ -10144,10 +10150,21 @@ mod tests {
             .unwrap();
         source.set_concretetype(Some(LlType::Signed));
 
+        let then_b = graph.create_block();
+        let else_b = graph.create_block();
         let (join, inputargs) = graph.create_block_with_arg_vars(1);
         let phi = inputargs[0].clone();
         phi.set_concretetype(Some(LlType::Signed));
-        graph.set_goto(graph.startblock, join, vec![source.clone()]);
+        graph.set_control_flow_metadata(
+            graph.startblock,
+            Some(ExitSwitch::Value(source.clone())),
+            vec![
+                Link::new_mixed(vec![], then_b, Some(ExitCase::Bool(true))),
+                Link::new_mixed(vec![], else_b, Some(ExitCase::Bool(false))),
+            ],
+        );
+        graph.set_goto(then_b, join, vec![source.clone()]);
+        graph.set_goto(else_b, join, vec![source.clone()]);
 
         let truthified = graph
             .push_op_var(
