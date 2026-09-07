@@ -10734,11 +10734,20 @@ impl<M: Clone> MetaInterp<M> {
             // `abort_tracing(green_key, !is_invalid_loop)`; pyre's own abort
             // ceiling (`MAX_TRACE_ABORT_COUNT`) is what retires a location
             // that keeps failing.
-            Err(_invalid_loop) => {
+            Err(invalid_loop) => {
+                if crate::majit_log_enabled() || crate::debug::have_debug_prints() {
+                    eprintln!(
+                        "[jit] finish_and_compile: InvalidLoop(\"{}\") at key={}",
+                        invalid_loop.0, green_key
+                    );
+                }
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-abort",
-                        &format!("abort finish: InvalidLoop at key={green_key}"),
+                        &format!(
+                            "abort finish: InvalidLoop(\"{}\") at key={green_key}",
+                            invalid_loop.0
+                        ),
                     );
                 }
                 self.warm_state.abort_tracing(green_key, false);

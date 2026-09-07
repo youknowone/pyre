@@ -4994,7 +4994,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             return Err(error);
         }
     };
-    match promote_published_null_return(ctx, walk_result) {
+    match promote_published_null_return(ctx, walk_result, op.pc) {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 let concrete = concrete_from_recorded_opref(ctx, value);
@@ -8131,7 +8131,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
     };
 
-    match promote_published_null_return(ctx, outcome) {
+    match promote_published_null_return(ctx, outcome, op.pc) {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
@@ -12550,26 +12550,31 @@ pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
 
 /// `jit_*_from_tag` publishes and returns NULL on raise.  A subwalk that
 /// recorded that arm looks like `SubReturn` with `last_exc_value` set.
-/// `finishframe` would clear the exception; promote to
-/// `finishframe_exception` instead of dest-writing the NULL.
+/// `finishframe` would dest-write the NULL and clear the exception;
+/// promote to `finishframe_exception` instead.
 pub(crate) fn promote_published_null_return<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     outcome: DispatchOutcome,
+    pc: usize,
 ) -> DispatchOutcome {
+    let _ = pc;
     if !matches!(outcome, DispatchOutcome::SubReturn { .. }) {
         return outcome;
     }
     match ctx.last_exc_value() {
-        Some(exc) => {
-            // `jit_publish_exception` wrote the backend cells.  Drain
-            // them here so a later compiled `GUARD_NO_EXCEPTION` in a
-            // different loop (`flip_floor` after `one_frame`) does not
-            // deopt on the leftover ZeroDivisionError.
+        Some(_) => {
+            // Recording-time cells must not leak into a later loop.
+            // The compiled path consumes them via `GUARD_EXCEPTION`
+            // (`handle_possible_exception`) so `signature()` walking a
+            // 2-frame tb after `bigint_same` does not re-raise.
             if let Some(cb) = crate::callbacks::try_get() {
                 (cb.drain_backend_jit_exc)();
             }
+            super::walker_record_guard_exception(ctx, pc);
             DispatchOutcome::SubRaise {
-                exc,
+                exc: ctx
+                    .last_exc_value()
+                    .expect("GUARD_EXCEPTION keeps last_exc_value"),
                 exc_concrete: ctx.last_exc_value_concrete(),
             }
         }
@@ -12581,7 +12586,7 @@ pub(crate) fn promote_published_null_return<Sym: WalkSym>(
 /// After a successful inline of those tags, record `GUARD_NO_EXCEPTION`
 /// so a later zero divisor deopts instead of dest-writing NULL into
 /// the caller's `+=` slot (`flip_floor`).
-fn maybe_guard_no_exception_after_raising_binop<Sym: WalkSym>(
+pub(crate) fn maybe_guard_no_exception_after_raising_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     int_arg_concretes: &[ConcreteValue],
@@ -12679,6 +12684,25 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
         | Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
             cut_declined_subwalk(ctx, pre_fold_pos);
+            // A declined helper walk must not become an opaque
+            // `CallMayForce` when the callee is BINARY: the exact-int
+            // descent emits `int_add`/`int_sub` the way PyPy's fib
+            // bridges do (`int_add_ovf` on the `n>=3` bridge).
+            if int_args.len() == 1
+                && ref_args.len() == 2
+                && let Some(ConcreteValue::Int(op_tag)) = int_arg_concretes.first().copied()
+                && let Some((dst_bank, dst, _)) = call_opcode_result_dst(code, pc)
+                && dst_bank == 'r'
+                && super::specialize::jitcode_is_binary_value_from_tag(usize::MAX, sub_body)
+            {
+                if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
+                    super::specialize::try_walker_orthodox_binary_op(
+                        ctx, pc, op_tag, int_args[0], ref_args, dst, dst_bank,
+                    )
+                })? {
+                    return Ok(outcome);
+                }
+            }
             residualize_inline_call_via_fnaddr(
                 ctx,
                 code,
@@ -12971,15 +12995,11 @@ pub(crate) fn try_finish_replayed_call_subreturn<Sym: WalkSym>(
         unreachable!("matches_subreturn required SubReturn");
     };
     ctx.fbw_mode.class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
-    if let Some(exc) = ctx.last_exc_value() {
-        if let Some(cb) = crate::callbacks::try_get() {
-            (cb.drain_backend_jit_exc)();
-        }
+    if let DispatchOutcome::SubRaise { exc, exc_concrete } =
+        promote_published_null_return(ctx, DispatchOutcome::SubReturn { result }, op.pc)
+    {
         return Some(Ok((
-            DispatchOutcome::SubRaise {
-                exc,
-                exc_concrete: ctx.last_exc_value_concrete(),
-            },
+            DispatchOutcome::SubRaise { exc, exc_concrete },
             next_pc,
         )));
     }
@@ -13119,14 +13139,14 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         // vstack/live bookkeeping before it suspended.
         let mut published_raise = None;
         let dest_err = if let Some(pending) = self.pending_subreturn.take() {
-            if let Some(exc) = walk_ctx.last_exc_value() {
-                if let Some(cb) = crate::callbacks::try_get() {
-                    (cb.drain_backend_jit_exc)();
-                }
-                published_raise = Some(DispatchOutcome::SubRaise {
-                    exc,
-                    exc_concrete: walk_ctx.last_exc_value_concrete(),
-                });
+            if let DispatchOutcome::SubRaise { exc, exc_concrete } = promote_published_null_return(
+                &mut walk_ctx,
+                DispatchOutcome::SubReturn {
+                    result: pending.result,
+                },
+                pending.caller_pc,
+            ) {
+                published_raise = Some(DispatchOutcome::SubRaise { exc, exc_concrete });
                 None
             } else {
                 let applied = match finish_inline_callee_return(&mut walk_ctx, pending.result) {
@@ -13860,7 +13880,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         &arg_concretes,
         &[],
     );
-    let callee_outcome = promote_published_null_return(ctx, callee_result?);
+    let callee_outcome = promote_published_null_return(ctx, callee_result?, op.pc);
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -14063,6 +14083,34 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // Flatten lowered BINARY to `inline_call_ir_r` of
+    // `binary_value_from_tag`, so the residual_call BINARY_OP descent
+    // gate is never consulted.  Run the same orthodox descent here
+    // before residualizing the whole helper via fnaddr.
+    let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+    let is_binary_from_tag =
+        super::specialize::jitcode_is_binary_value_from_tag(sub_index, &sub_body);
+    if is_binary_from_tag
+        && dst_bank == 'r'
+        && int_args.len() == 1
+        && ref_args.len() == 2
+        && let Some(ConcreteValue::Int(op_tag)) = int_arg_concretes.first().copied()
+    {
+        if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
+            super::specialize::try_walker_orthodox_binary_op(
+                ctx,
+                op.pc,
+                op_tag,
+                int_args[0],
+                &ref_args,
+                dst,
+                dst_bank,
+            )
+        })? {
+            return Ok((outcome, op.next_pc));
+        }
+    }
+
     let walked = run_inline_call_subwalk(
         ctx,
         code,
@@ -14075,7 +14123,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         &ref_arg_concretes,
         &[],
     )?;
-    let callee_outcome = promote_published_null_return(ctx, walked);
+    let callee_outcome = promote_published_null_return(ctx, walked, op.pc);
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -14102,6 +14150,22 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                     ),
                 }
                 maybe_guard_no_exception_after_raising_binop(ctx, op.pc, &int_arg_concretes)?;
+                if let Some(ConcreteValue::Int(tag)) = int_arg_concretes.first().copied() {
+                    use pyre_interpreter::bytecode::BinaryOperator as B;
+                    if matches!(
+                        pyre_interpreter::runtime_ops::binary_op_from_tag(tag),
+                        Some(
+                            B::FloorDivide
+                                | B::InplaceFloorDivide
+                                | B::Remainder
+                                | B::InplaceRemainder
+                        )
+                    ) {
+                        super::specialize::walker_guard_int_div_domain_if_exact(
+                            ctx, op.pc, &ref_args,
+                        )?;
+                    }
+                }
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
             None => {
@@ -14281,7 +14345,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         &ref_arg_concretes,
         &float_args,
     );
-    let callee_outcome = promote_published_null_return(ctx, callee_result?);
+    let callee_outcome = promote_published_null_return(ctx, callee_result?, op.pc);
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
