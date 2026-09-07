@@ -37,7 +37,9 @@ macro_rules! residual_scalar {
 
 // `f32` is deliberately absent: `return_type_string_to_value_type` maps it to
 // the integer class while the machine ABI returns it in the float bank.
-residual_scalar!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, bool, char, f64);
+residual_scalar!(
+    i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, bool, char, f64
+);
 
 /// `OpArg` is `#[repr(transparent)] struct OpArg(u32)` — one word.
 impl ResidualSlot for rustpython_compiler_core::bytecode::OpArg {}
@@ -5034,13 +5036,11 @@ mod tests {
         let raw_inner = pyre_object::listobject::w_list_pop_end_inner as *const () as usize as i64;
         let raw_end = pyre_object::listobject::w_list_pop_end as *const () as usize as i64;
         assert_ne!(
-            bindings["pyre_object::listobject::w_list_pop_end_inner"],
-            raw_inner,
+            bindings["pyre_object::listobject::w_list_pop_end_inner"], raw_inner,
             "must not publish the Option-returning Rust item"
         );
         assert_ne!(
-            bindings["pyre_object::listobject::w_list_pop_end"],
-            raw_end,
+            bindings["pyre_object::listobject::w_list_pop_end"], raw_end,
             "must not publish the Option-returning Rust item"
         );
     }
@@ -5450,8 +5450,7 @@ mod tests {
         let int_int = crate::objspace::descroperation::jit_bigint_lshift_int_int_result as *const ()
             as usize as i64;
         assert_eq!(
-            bindings
-                ["pyre_interpreter::objspace::descroperation::jit_bigint_lshift_int_int_result"],
+            bindings["pyre_interpreter::objspace::descroperation::jit_bigint_lshift_int_int_result"],
             int_int
         );
     }
@@ -5551,8 +5550,7 @@ mod tests {
             crate::executioncontext::ExecutionContext::_get_topmost_exception;
         let get_topmost_exception = get_topmost_exception as *const () as usize as i64;
         assert_eq!(
-            bindings
-                ["pyre_interpreter::executioncontext::ExecutionContext::_get_topmost_exception"],
+            bindings["pyre_interpreter::executioncontext::ExecutionContext::_get_topmost_exception"],
             get_topmost_exception,
         );
         assert_eq!(
