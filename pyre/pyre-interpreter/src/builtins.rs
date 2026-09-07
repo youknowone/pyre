@@ -17854,6 +17854,11 @@ pub fn init_hash_secret_from_env() -> Result<(), &'static str> {
         .flatten()
         .unwrap_or_default();
     if value.is_empty() || value.as_slice() == b"random" {
+        // Force the getrandom backend (and its optional `/dev/urandom`
+        // fallback) to run before a sandbox seccomp filter is installed.
+        // Deferring to the first digest lets the fallback's `openat` land
+        // after lockdown and kill the child with syscall 257.
+        let _ = hash_secret();
         return Ok(());
     }
     let seed = std::str::from_utf8(&value)

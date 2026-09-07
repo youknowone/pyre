@@ -133,9 +133,51 @@ extern "C" fn report_blocked_syscall(
     len += 1;
     unsafe {
         libc::write(2, buf.as_ptr() as *const libc::c_void, len);
+        // openat(2) path is the most common lockdown miss; print it so the
+        // next failure names the file instead of only syscall 257.
+        if nr == libc::SYS_openat {
+            write_openat_path(_ctx);
+        }
         libc::_exit(159);
     }
 }
+
+/// Best-effort, async-signal-safe dump of `openat`'s pathname argument.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn write_openat_path(ctx: *mut libc::c_void) {
+    if ctx.is_null() {
+        return;
+    }
+    let path = unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // `REG_RSI` is openat's pathname pointer.
+            let uc = ctx as *const libc::ucontext_t;
+            (*uc).uc_mcontext.gregs[libc::REG_RSI as usize] as *const u8
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // x1 is openat's pathname pointer.
+            let uc = ctx as *const libc::ucontext_t;
+            (*uc).uc_mcontext.regs[1] as *const u8
+        }
+    };
+    if path.is_null() {
+        return;
+    }
+    let prefix = b"pyre: sandbox seccomp openat path ";
+    unsafe { libc::write(2, prefix.as_ptr() as *const libc::c_void, prefix.len()) };
+    let mut n = 0usize;
+    while n < 256 && unsafe { *path.add(n) } != 0 {
+        n += 1;
+    }
+    unsafe { libc::write(2, path as *const libc::c_void, n) };
+    let nl = b"\n";
+    unsafe { libc::write(2, nl.as_ptr() as *const libc::c_void, 1) };
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn write_openat_path(_ctx: *mut libc::c_void) {}
 
 fn stmt(code: u16, k: u32) -> libc::sock_filter {
     libc::sock_filter {
