@@ -6608,10 +6608,11 @@ pub fn get_printable_location(
 pub fn get_unique_id(
     _next_instr: usize,
     _is_being_profiled: bool,
-    w_pycode: pyre_object::PyObjectRef,
+    _w_pycode: pyre_object::PyObjectRef,
 ) -> usize {
-    // A stable process-local unique-id equivalent using the code pointer.
-    unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) as usize }
+    // rvmprof.get_unique_id returns 0 unless register_code_object_class
+    // ran for the code class. Pyre does not register PyCode there.
+    0
 }
 
 /// warmstate.py `get_unique_id(greenkey)` for the Python portal.
@@ -11578,6 +11579,12 @@ fn compile_and_run_once(
     if !driver.is_tracing() {
         majit_metainterp::mc_diag_bump(22);
         return None;
+    }
+
+    // pyjitpl.py initialize_state_from_start: root portal frame, no
+    // greenkey. Virtualizable boxes were already seeded by setup_tracing.
+    if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
+        driver.meta_interp_mut().seed_root_portal_frame(portal);
     }
 
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);

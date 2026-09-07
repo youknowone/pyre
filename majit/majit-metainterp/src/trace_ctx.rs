@@ -270,15 +270,8 @@ pub struct TraceCtx {
     /// doing tuple-equality comparisons in [`recursive_depth`] and
     /// [`is_tracing_key`].
     pub(crate) inline_frames: Vec<(usize, usize)>,
-    /// `portal_trace_positions` entries recorded by `JitCodeMachine`
-    /// while it cannot reach `MetaInterp`. `find_biggest_function`
-    /// walks these after the MetaInterp log. Retired together with
-    /// `MetaInterp.portal_trace_positions`.
-    pub(crate) portal_trace_events: Vec<(
-        usize,
-        Option<crate::pyjitpl::PortalGreenKey>,
-        crate::recorder::TracePosition,
-    )>,
+    /// Retired. `JitCodeMachine` writes the portal log through
+    /// [`Self::portal_trace_push_fn`] into `MetaInterp.portal_trace_positions`.
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
     /// Declarative driver layout metadata, if provided by the interpreter.
@@ -451,6 +444,13 @@ pub struct TraceCtx {
     /// the cross-component flow at dispatch time) can sample the
     /// metainterp's depth counter without holding a back-reference.
     pub portal_call_depth_fn: Option<Box<dyn Fn() -> i32>>,
+    /// pyjitpl.py `self.metainterp.call_ids[-1]` at `debug_merge_point`.
+    pub current_call_id_fn: Option<Box<dyn Fn() -> u64>>,
+    /// `newframe`/`popframe` log half for a `JitCodeMachine` that cannot
+    /// borrow `MetaInterp`. Forwards to `MetaInterp.push_portal_trace_position`.
+    pub portal_trace_push_fn: Option<
+        Box<dyn Fn(usize, Option<crate::pyjitpl::PortalGreenKey>, crate::recorder::TracePosition)>,
+    >,
     /// pyjitpl.py `MetaInterp.seen_loop_header_for_jdindex` parity for
     /// walkers that drive dispatch through `TraceCtx` (the pyre full-body
     /// walker has no dispatcher struct of its own, so the per-trace flag
@@ -902,18 +902,16 @@ impl TraceCtx {
     }
 
     /// pyjitpl.py `newframe` / `popframe` log half for a JitCodeMachine
-    /// that cannot reach `MetaInterp.portal_trace_positions`.
+    /// that cannot borrow `MetaInterp`. Forwards to the MetaInterp log.
     pub fn push_portal_trace_event(
-        &mut self,
+        &self,
         jd_no: usize,
         green_key: Option<crate::pyjitpl::PortalGreenKey>,
         pos: crate::recorder::TracePosition,
     ) {
-        self.portal_trace_events.push((jd_no, green_key, pos));
-    }
-
-    pub fn clear_portal_trace_events(&mut self) {
-        self.portal_trace_events.clear();
+        if let Some(ref push) = self.portal_trace_push_fn {
+            push(jd_no, green_key, pos);
+        }
     }
 
     /// Install the `self.metainterp.cpu` analog for the cache-hit
@@ -1818,7 +1816,6 @@ impl TraceCtx {
             green_key_raw: (0, 0),
             root_green_key_raw: (0, 0),
             inline_frames: Vec::new(),
-            portal_trace_events: Vec::new(),
             green_key_values: None,
             driver_descriptor: None,
             virtualizable_boxes: None,
@@ -1871,6 +1868,8 @@ impl TraceCtx {
             declined_cross_loop_closes: Vec::new(),
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
+            current_call_id_fn: None,
+            portal_trace_push_fn: None,
             seen_loop_header_for_jdindex: -1,
             seen_loop_header_jit_pc: None,
             bridge_resume_at_position: false,
@@ -1919,7 +1918,6 @@ impl TraceCtx {
             green_key_raw: (0, 0),
             root_green_key_raw: (0, 0),
             inline_frames: Vec::new(),
-            portal_trace_events: Vec::new(),
             green_key_values: Some(green_key_values),
             driver_descriptor: None,
             virtualizable_boxes: None,
@@ -1973,6 +1971,8 @@ impl TraceCtx {
             declined_cross_loop_closes: Vec::new(),
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
+            current_call_id_fn: None,
+            portal_trace_push_fn: None,
             seen_loop_header_for_jdindex: -1,
             seen_loop_header_jit_pc: None,
             bridge_resume_at_position: false,

@@ -5496,6 +5496,20 @@ impl TraceCtx {
     /// follow-up.  `live_args_len` is plumbed through so that
     /// follow-up doesn't need to re-touch the call sites.
     pub fn has_merge_point_with_shape_assert(&self, key: u64, live_args_len: usize) -> bool {
+        self.has_merge_point_same_greenkey(key, None, live_args_len)
+    }
+
+    /// pyjitpl.py `same_greenkey(original_boxes, live_arg_boxes, num_green_args)`.
+    ///
+    /// Typed greens compare with `GreenKey::eq` (`comparekey` /
+    /// `equal_whatever`). Hash equality is only the fallback when a
+    /// fixture never carried a typed key.
+    pub fn has_merge_point_same_greenkey(
+        &self,
+        key: u64,
+        live_typed: Option<&majit_ir::GreenKey>,
+        live_args_len: usize,
+    ) -> bool {
         // pyjitpl.py:2994-2997 reverse scan:
         //   for j in range(len(self.current_merge_points) - 1, -1, -1):
         //       original_boxes, start = self.current_merge_points[j]
@@ -5537,7 +5551,11 @@ impl TraceCtx {
         // once the seed is distinguishable from a registered merge point, not
         // on a counter reading.
         for mp in self.current_merge_points.iter().rev() {
-            if mp.green_key != key {
+            let greens_match = match (mp.green_key_typed.as_ref(), live_typed) {
+                (Some(stored), Some(live)) => stored == live,
+                _ => mp.green_key == key,
+            };
+            if !greens_match {
                 continue;
             }
             if mp.green_boxes.len() == live_args_len {

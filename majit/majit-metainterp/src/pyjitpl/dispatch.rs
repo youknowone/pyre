@@ -3463,19 +3463,15 @@ where
             let mut portal_frame = self.frames.take_frame(portal, green_pc, None, Some(ctx));
             portal_frame.code_cursor = green_pc;
             ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
-            // pyjitpl.py newframe -> enter_portal_frame(jd_no, unique_id)
-            // for an inlined portal (greenkey present). `unique_id` has no
-            // warmstate source here; use `green_pc` as a stable per-entry id.
-            // Pairs with the deferred LEAVE_PORTAL_FRAME recorded by the
-            // recursive-portal merge-point cut (opimpl_jit_merge_point
-            // else-branch).
+            // pyjitpl.py newframe -> enter_portal_frame(jd_no, unique_id).
+            // rvmprof.get_unique_id is 0 when the code class is unregistered.
             let jd_box = ctx.const_int(jd_index as i64);
-            let uid_box = ctx.const_int(green_pc as i64);
+            let uid_box = ctx.const_int(0);
             ctx.record_op(OpCode::EnterPortalFrame, &[jd_box, uid_box]);
             // pyjitpl.py `newframe`: ENTER_PORTAL_FRAME and the
             // `portal_trace_positions` append sit on adjacent lines.
-            // The machine cannot reach MetaInterp, so the log half
-            // lives on TraceCtx and `find_biggest_function` reads both.
+            // The machine forwards the log half through
+            // `portal_trace_push_fn` into MetaInterp.
             if runtime.is_main_portal(jd_index) {
                 ctx.push_portal_trace_event(
                     jd_index,

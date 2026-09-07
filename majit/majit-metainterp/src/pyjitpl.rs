@@ -1868,6 +1868,8 @@ pub struct ActiveTraceSession<M: Clone> {
 
 pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
+    /// `jd.warmstate` for drivers after slot 0. Slot 0 is `warm_state`.
+    extra_warm_states: Vec<WarmEnterState>,
     pub(crate) backend: BackendImpl,
     pub(crate) compiled_loops: crate::FxIndexMap<u64, CompiledEntry<M>>,
     /// Bumped by every insertion into and removal from `compiled_loops`, in
@@ -3779,6 +3781,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn new(threshold: u32) -> Self {
         let mut this = MetaInterp {
             warm_state: WarmEnterState::new(threshold),
+            extra_warm_states: Vec::new(),
             backend: BackendImpl::new(),
             compiled_loops: crate::FxIndexMap::default(),
             compiled_loops_generation: 0,
@@ -4318,6 +4321,21 @@ impl<M: Clone> MetaInterp<M> {
     /// warmspot.py:449 — the per-driver static result_type.
     pub fn result_type(&self) -> Type {
         self.result_type
+    }
+
+    /// pyjitpl.py `jd_sd.warmstate` — slot 0 is the process warmstate;
+    /// later recursive drivers get their own cell table.
+    pub fn warm_state_for_driver(&mut self, jd_no: usize) -> &mut WarmEnterState {
+        if jd_no == 0 {
+            return &mut self.warm_state;
+        }
+        let i = jd_no - 1;
+        if self.extra_warm_states.len() <= i {
+            let threshold = self.warm_state.threshold();
+            self.extra_warm_states
+                .resize_with(i + 1, || WarmEnterState::new(threshold));
+        }
+        &mut self.extra_warm_states[i]
     }
 
     /// `call.py:46-47` `jd.index = idx; self.jitdrivers_sd.append(jd)` —
@@ -5502,6 +5520,15 @@ impl<M: Clone> MetaInterp<M> {
                         let meta = unsafe { &*(self_ptr as *const Self) };
                         meta.portal_call_depth
                     }));
+                    ctx.current_call_id_fn = Some(Box::new(move || -> u64 {
+                        let meta = unsafe { &*(self_ptr as *const Self) };
+                        meta.call_ids.last().copied().unwrap_or(0)
+                    }));
+                    let self_mut = self_ptr as *mut ();
+                    ctx.portal_trace_push_fn = Some(Box::new(move |jd, key, pos| {
+                        let meta = unsafe { &mut *(self_mut as *mut Self) };
+                        meta.push_portal_trace_position(jd, key, pos);
+                    }));
                 }
                 let pending_token =
                     self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
@@ -5823,6 +5850,15 @@ impl<M: Clone> MetaInterp<M> {
             ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
                 let meta = unsafe { &*(self_ptr as *const Self) };
                 meta.portal_call_depth
+            }));
+            ctx.current_call_id_fn = Some(Box::new(move || -> u64 {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.call_ids.last().copied().unwrap_or(0)
+            }));
+            let self_mut = self_ptr as *mut ();
+            ctx.portal_trace_push_fn = Some(Box::new(move |jd, key, pos| {
+                let meta = unsafe { &mut *(self_mut as *mut Self) };
+                meta.push_portal_trace_position(jd, key, pos);
             }));
         }
         let pending_token = self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
@@ -6726,8 +6762,12 @@ impl<M: Clone> MetaInterp<M> {
             // flag lands on the frame's own cell rather than on whatever heads
             // its bucket.
             match huge_fn_key.1.as_ref() {
-                Some(key) => self.warm_state.disable_noninlinable_function_for_key(key),
-                None => self.warm_state.disable_noninlinable_function(huge_fn_key.0),
+                Some(key) => self
+                    .warm_state_for_driver(huge_fn_jd_no)
+                    .disable_noninlinable_function_for_key(key),
+                None => self
+                    .warm_state_for_driver(huge_fn_jd_no)
+                    .disable_noninlinable_function(huge_fn_key.0),
             }
             // pyjitpl.py `self.aborted_tracing_jitdriver = jd_sd` /
             // `self.aborted_tracing_greenkey = greenkey_of_huge_function` —
@@ -15535,6 +15575,22 @@ impl<M: Clone> MetaInterp<M> {
         ctx.callinfocollection = self.callinfocollection.clone();
         self.tracing = Some(ctx);
         self.arm_portal_trace_positions();
+        let self_ptr = self as *const Self as *const ();
+        if let Some(ref mut ctx) = self.tracing {
+            ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.portal_call_depth
+            }));
+            ctx.current_call_id_fn = Some(Box::new(move || -> u64 {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.call_ids.last().copied().unwrap_or(0)
+            }));
+            let self_mut = self_ptr as *mut ();
+            ctx.portal_trace_push_fn = Some(Box::new(move |jd, key, pos| {
+                let meta = unsafe { &mut *(self_mut as *mut Self) };
+                meta.push_portal_trace_position(jd, key, pos);
+            }));
+        }
         // pyjitpl.py `MetaInterp.__init__` binds the driver passed by the
         // bridge caller. The source guard's token retains that identity even
         // after the warm cell has been redirected to a newer loop token.
@@ -17093,19 +17149,10 @@ impl<M: Clone> MetaInterp<M> {
     /// falls through to `prepare_trace_segmenting`.
     pub fn find_biggest_function(&self) -> Option<(usize, PortalGreenKey)> {
         let positions = self.portal_trace_positions.as_ref()?;
-        let machine_events = self
-            .tracing
-            .as_ref()
-            .map(|ctx| ctx.portal_trace_events.as_slice())
-            .unwrap_or(&[]);
         let mut start_stack: Vec<(usize, PortalGreenKey, usize)> = Vec::new();
         let mut max_size = 0isize;
         let mut max_key = None;
-        for (jd_no, key, pos) in positions
-            .iter()
-            .cloned()
-            .chain(machine_events.iter().cloned())
-        {
+        for (jd_no, key, pos) in positions.iter().cloned() {
             match key {
                 // pyjitpl.py:3547-3548 `if key is not None: start_stack.append`.
                 Some(key) => start_stack.push((jd_no, key, pos._pos)),
@@ -17150,16 +17197,37 @@ impl<M: Clone> MetaInterp<M> {
     /// rest of the process after the first overflow.
     fn arm_portal_trace_positions(&mut self) {
         self.portal_trace_positions = Some(Vec::new());
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.clear_portal_trace_events();
-        }
     }
 
     /// pyjitpl.py `self.portal_trace_positions = None`.
     pub fn retire_portal_trace_positions(&mut self) {
         self.portal_trace_positions = None;
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.clear_portal_trace_events();
+    }
+
+    /// pyjitpl.py `initialize_state_from_start` frame half.
+    ///
+    /// `setup_tracing` already ran `initialize_virtualizable`. This
+    /// only rebuilds the root portal `MIFrame` so `portal_call_depth`
+    /// starts at 0 and `call_ids` holds the root id, matching
+    /// `newframe(mainjitcode)` with no greenkey.
+    pub fn seed_root_portal_frame(&mut self, mainjitcode: std::sync::Arc<crate::jitcode::JitCode>) {
+        self.rebuild_portal_framestack_from_resume(mainjitcode, 1);
+    }
+
+    /// resume.py `rebuild_from_resumedata`: `newframe(jitcode)` per
+    /// encoded section, no greenkey. The root lands at
+    /// `portal_call_depth == 0`; each extra portal section increments it.
+    pub fn rebuild_portal_framestack_from_resume(
+        &mut self,
+        mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
+        nframes: usize,
+    ) {
+        self.portal_call_depth = -1;
+        self.framestack = crate::pyjitpl::MIFrameStack::empty();
+        self.call_ids.clear();
+        self.current_call_id = 0;
+        for _ in 0..nframes.max(1) {
+            let _ = self.newframe(mainjitcode.clone(), None);
         }
     }
 
@@ -17265,16 +17333,15 @@ impl<M: Clone> MetaInterp<M> {
         {
             positions.push((jd_no, Some(gk.clone()), ctx.get_trace_position()));
         }
-        // Bump the existing TraceCtx inline-depth counter so trace
-        // recorder bookkeeping (already wired through pyre's tracer)
-        // stays in sync; the canonical frame storage is `framestack`.
-        // The `newframe` path predates the raw (code_ptr, pc) greenkey
-        // and operates on sub-jitcodes rather than portal frames, so
-        // project the u64 greenkey into the raw slot verbatim —
-        // pyjitpl.py:1396-1401 element-wise parity still holds because
-        // this caller doesn't feed the recursion-depth walk.
-        let raw = (greenkey.as_ref().map_or(0, |(key, _)| *key) as usize, 0);
-        let _ = self.enter_inline_frame(raw);
+        // pyjitpl.py `_opimpl_recursive_call` walks `framestack` and
+        // skips `greenkey is None` (the root from
+        // `initialize_state_from_start`). Only an inlined portal
+        // enters `inline_frames`; pushing the root as `(0, 0)` made
+        // `recursive_depth` count a frame upstream never sees.
+        if let Some(gk) = greenkey.as_ref() {
+            let raw = (gk.0 as usize, 0);
+            let _ = self.enter_inline_frame(raw);
+        }
         // pyjitpl.py: reuse / allocate MIFrame, push onto framestack.
         let frame = if let Some(mut frame) = self.free_frames_list.pop() {
             frame.setup_reused(jitcode, 0, greenkey, self.tracing.as_mut());
@@ -17287,11 +17354,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// warmstate.py `WarmEnterState.get_unique_id(greenkey)`.
-    ///
-    /// The typed greens go to the driver's hook when both are present.
-    /// A missing hook or a hash-only key keeps the previous unique id,
-    /// the greenkey hash `newframe` used to record verbatim.
     pub fn unique_id_for_greenkey(&self, jd_no: usize, greenkey: &PortalGreenKey) -> u64 {
+        // rlib/jit.py: no hook means `lambda *args: 0`.
+        // rvmprof.get_unique_id returns 0 when the class was never
+        // registered. A hash or pointer is not a unique id.
         if let Some(hook) = self
             .staticdata
             .jitdrivers_sd
@@ -17301,7 +17367,7 @@ impl<M: Clone> MetaInterp<M> {
         {
             return hook(&typed.values) as u64;
         }
-        greenkey.0
+        0
     }
 
     /// pyjitpl.py `MetaInterp.enter_portal_frame(jd_no, unique_id)`.
@@ -17373,11 +17439,13 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py: frame.cleanup_registers().
             frame.cleanup_registers();
             // `MetaInterp.popframe`'s `self.free_frames_list.append(frame)`.
+            // Pair `enter_inline_frame` only for the greenkey-bearing
+            // push; the root has none.
+            if frame.greenkey.is_some() {
+                self.leave_inline_frame();
+            }
             self.free_frames_list.push(frame);
         }
-        // Mirror the TraceCtx inline-depth counter so trace recorder
-        // bookkeeping stays balanced with the framestack pop.
-        self.leave_inline_frame();
     }
 
     /// pyjitpl.py `MetaInterp.finishframe(resultbox, leave_portal_frame=True)`.
@@ -17456,7 +17524,11 @@ impl<M: Clone> MetaInterp<M> {
         // resultbox supplies the value, the driver supplies the type.
         // Pre-resolved here so compile_done_with_this_frame and the
         // matching DoneWithThisFrame constructor share the same value.
-        let result_type = popping_jdindex
+        // pyjitpl.py: `result_type = self.jitdriver_sd.result_type` —
+        // the outermost loop's driver, not the popping frame's.
+        let result_type = self
+            .active_jitdriver_sd
+            .or(popping_jdindex)
             .and_then(|idx| self.staticdata.jitdrivers_sd.get(idx))
             .map(|jd| jd.result_type)
             // No active jitdriver_sd (e.g. helper jitcodes that never
@@ -23748,18 +23820,17 @@ mod metainterp_static_data_tests {
         meta.push_portal_trace_position(jd_no, None, end);
         assert_eq!(meta.find_biggest_function(), Some((jd_no, (0xBEEF, None))));
 
-        // JitCodeMachine records the same pairs on TraceCtx; the walker
-        // of find_biggest_function concatenates both logs.
+        // JitCodeMachine forwards into the same MetaInterp log.
         meta.portal_trace_positions = Some(Vec::new());
         let start = meta.trace_ctx().expect("tracing").get_trace_position();
         meta.tracing
-            .as_mut()
+            .as_ref()
             .unwrap()
             .push_portal_trace_event(jd_no, Some((0xCAFE, None)), start);
         record_ops(&mut meta, 3);
         let end = meta.trace_ctx().expect("tracing").get_trace_position();
         meta.tracing
-            .as_mut()
+            .as_ref()
             .unwrap()
             .push_portal_trace_event(jd_no, None, end);
         assert_eq!(meta.find_biggest_function(), Some((jd_no, (0xCAFE, None))));
@@ -23898,7 +23969,7 @@ mod metainterp_static_data_tests {
         );
         assert_eq!(
             ctx.constants_get_value(enter.arg(1).to_opref()),
-            Some(majit_ir::Value::Int(0xfeed))
+            Some(majit_ir::Value::Int(0))
         );
         assert_eq!(
             ctx.constants_get_value(leave.arg(0).to_opref()),

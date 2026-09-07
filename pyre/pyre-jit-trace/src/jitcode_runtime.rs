@@ -321,6 +321,20 @@ pub fn portal_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
+/// `newframe` takes the metainterp wrapper around the same portal body.
+pub fn portal_metainterp_jitcode() -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    static PORTAL_META: OnceLock<Option<Arc<majit_metainterp::jitcode::JitCode>>> = OnceLock::new();
+    PORTAL_META
+        .get_or_init(|| {
+            portal_jitcode().map(|canonical| {
+                Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
+                    (*canonical).clone(),
+                ))
+            })
+        })
+        .clone()
+}
+
 /// Resolve the portal `JitCode` for the configured driver whose portal
 /// graph has canonical key `key` (e.g. a secondary driver's
 /// `baseobjspace::unpackiterable_portal`). Per-driver analogue of
@@ -3702,17 +3716,11 @@ mod tests {
         let bt_jc = portal_jitcode().expect("configured portal must resolve to a jitcode");
         assert!(!bt_jc.code.is_empty());
         // `warmspot.py split_graph_and_record_jitdriver` registers the copy
-        // cut at `jit_merge_point` (`eval::eval_loop_jit_portal`). The unsplit
-        // key remains when `PYRE_PORTAL_SPLIT=0`.
+        // cut at `jit_merge_point`.
         let eval_driver = COMPILED_JIT_DRIVERS
             .iter()
-            .find(|driver| {
-                matches!(
-                    driver.portal.canonical_key().as_str(),
-                    "eval::eval_loop_jit" | "eval::eval_loop_jit_portal"
-                )
-            })
-            .expect("compiled drivers must contain the main eval portal");
+            .find(|driver| driver.portal.canonical_key() == "eval::eval_loop_jit_portal")
+            .expect("compiled drivers must contain the split eval portal");
         assert_eq!(eval_driver.main_jitcode_index, bt_jc.index());
         assert_eq!(
             bt_jc.num_regs_and_consts_i(),

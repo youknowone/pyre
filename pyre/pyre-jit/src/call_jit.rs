@@ -3879,6 +3879,20 @@ pub fn trace_and_compile_from_bridge(
         }
         return BridgeResolution::ResumeBlackhole;
     }
+    // resume.py rebuild_from_resumedata: one newframe(jitcode) per
+    // encoded section, no greenkey. The portal jitcode is the Python
+    // driver's mainjitcode for every inlined user function.
+    if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
+        let (driver, _) = crate::eval::driver_pair();
+        let nframes = driver
+            .resume_data_result
+            .as_ref()
+            .map(|r| r.frames.len())
+            .unwrap_or(1);
+        driver
+            .meta_interp_mut()
+            .rebuild_portal_framestack_from_resume(portal, nframes);
+    }
     // `_prepare_exception_resumption` (pyjitpl.py) +
     // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception
     // guard bridges (GUARD_EXCEPTION / GUARD_NO_EXCEPTION), SAVE_EXC_CLASS +
