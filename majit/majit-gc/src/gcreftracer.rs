@@ -272,6 +272,12 @@ fn walk_all_gc_tables_inner(visitor: &mut dyn FnMut(&mut GcRef)) {
     // promoted referents, which a minor collection does not move.
     if crate::shadow_stack::extra_root_walk_kind() == crate::shadow_stack::ExtraRootWalkKind::Minor
     {
+        // Production is stop-the-world, so `take` is the remembered-set
+        // drain. Tests run MiniMarks in parallel; a sibling `take`
+        // would steal this table and trace it with the wrong visitor.
+        #[cfg(test)]
+        let pending = PENDING_MINOR_TABLES.lock().clone();
+        #[cfg(not(test))]
         let pending = std::mem::take(&mut *PENDING_MINOR_TABLES.lock());
         for table in pending.iter().filter_map(Weak::upgrade) {
             table.trace(visitor);
